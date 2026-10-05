@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.png binary
+*.sprx binary
+*.prx binary
