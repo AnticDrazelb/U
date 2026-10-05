@@ -94,7 +94,9 @@ build_zstd() {
     cmake_build zstd "$SRC/zstd/build/cmake" \
         -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_PROGRAMS=OFF \
         -DZSTD_BUILD_TESTS=OFF -DZSTD_MULTITHREAD_SUPPORT=ON -DZSTD_LEGACY_SUPPORT=OFF \
-        -DZSTD_BUILD_DICTBUILDER=OFF  # needs qsort_r, which the OpenOrbis libc lacks
+        -DZSTD_BUILD_DICTBUILDER=OFF "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -DZSTD_TRACE=0"
+    # dictBuilder needs qsort_r (missing from the OpenOrbis libc); the trace hooks are weak
+    # undefined symbols, which create-fself rejects ("missing module for symbol")
 }
 
 build_libzip() {
@@ -159,6 +161,10 @@ build_openssl() {
         no-tests no-docs no-apps no-uplink)
     make -C "$o" -j"$JOBS" build_libs
     make -C "$o" install_dev
+    # The Linux target records "-ldl -pthread" as libcrypto's dependencies; the PS4 link calls
+    # ld.lld directly (no -pthread driver flag), pthreads come from libkernel and there's no DSO.
+    sed -i 's/ -ldl -pthread//; s/-ldl -pthread//' "$PS4_SYSROOT/lib/cmake/OpenSSL/OpenSSLConfig.cmake" \
+        "$PS4_SYSROOT/lib/pkgconfig/libcrypto.pc"
 }
 
 build_curl() {

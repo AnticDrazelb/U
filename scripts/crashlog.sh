@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Fetch /data/DolphinPS4/{boot-trace,crash,dolphin}.log from the console and symbolize the
-# crash addresses against the Dolphin ELF.
+# Fetch /data/CemuPS4/{boot-trace,crash}.log and Cemu's log.txt from the console and symbolize the
+# crash addresses against the Cemu ELF (default: the newest packaged version's, from oelf/).
 #   crashlog.sh [elf]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/ps4-env.sh"
-ELF="${1:-$PS4_BUILD_ROOT/build/dolphin/Binaries/dolphin-emu-nogui}"
+ELF="${1:-$(ls -t "$PS4_BUILD_ROOT"/oelf/v*.elf 2>/dev/null | head -1)}"
 HOST="ftp://${PS4_HOST:-192.168.0.90}:${PS4_FTP_PORT:-2121}"
 OUT="$PS4_BUILD_ROOT/logs"
 mkdir -p "$OUT"
-for f in boot-trace.log crash.log dolphin.log; do
-    curl -s --max-time 30 -o "$OUT/$f" "$HOST/data/DolphinPS4/$f" || rm -f "$OUT/$f"
+for f in boot-trace.log crash.log log.txt; do
+    curl -s --max-time 30 -o "$OUT/$f" "$HOST/data/CemuPS4/$f" || rm -f "$OUT/$f"
 done
 echo "== boot-trace.log"; cat "$OUT/boot-trace.log" 2>/dev/null || echo "(none)"
-echo "== dolphin.log (last 40 lines)"; tail -40 "$OUT/dolphin.log" 2>/dev/null || echo "(none)"
+echo "== log.txt (last 60 lines)"; tail -60 "$OUT/log.txt" 2>/dev/null || echo "(none)"
 if [ -s "$OUT/crash.log" ]; then
     echo "== crash.log (last crash)"
     last="$(awk '/^=== signal/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$OUT/crash.log")"

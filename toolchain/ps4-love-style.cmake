@@ -11,7 +11,8 @@ set(PS4_RUNTIME_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_dlmalloc.c
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_crashlog.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_sampler.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_string.c)
+    ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_string.c
+    ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_random.c)
 
 # Generate code for the PS4's CPU (AMD Jaguar: SSE4.2, AVX, BMI1, F16C, MOVBE; no AVX2) rather
 # than baseline x86-64 (SSE2).

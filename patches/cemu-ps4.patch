@@ -1,0 +1,1850 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 644032c..9457f9a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -57,6 +57,11 @@ endif()
+ 
+ project(Cemu VERSION 2.0.0)
+ 
++if(PS4)
++	# the PS4 toolchain links with ld.lld directly, which doesn't take the -pthread driver flag
++	set(THREADS_PREFER_PTHREAD_FLAG FALSE)
++endif()
++
+ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+ 
+ set(CMAKE_CXX_STANDARD 20)
+@@ -73,8 +78,11 @@ add_definitions(-DEMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH})
+ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+ 
+ # enable link time optimization for release builds
+-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
++# (not on PS4: the OpenOrbis linker, ld.lld 12, can't read clang 21 bitcode)
++if(NOT PS4)
++	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
++	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
++endif()
+ 
+ if (MSVC)
+ 	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT CemuBin)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d8378c3..04af667 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -12,6 +12,11 @@ endif()
+ 
+ if(MSVC)
+ 	add_compile_definitions(WIN32_LEAN_AND_MEAN CURL_STATICLIB)
++elseif(PS4)
++	# FreeBSD kernel without a window system. OpenOrbis has no <sys/event.h>: asio uses select().
++	add_compile_definitions(BOOST_ASIO_DISABLE_KQUEUE CURL_STATICLIB)
++	add_compile_options(-Wno-ambiguous-reversed-operator -Wno-multichar -Wno-invalid-offsetof -Wno-switch
++		-Wno-ignored-attributes -Wno-deprecated-enum-enum-conversion)
+ elseif(UNIX)
+ 	if(APPLE)
+ 		if (ENABLE_VULKAN)
+@@ -229,3 +234,16 @@ endif()
+ if (BSD)
+ 	target_link_libraries(CemuBin PRIVATE execinfo SPIRV-Tools SPIRV-Tools-opt)
+ endif()
++
++if(PS4)
++	# CemuPS4 runtime (heap, mmap and clock wraps, crash log; toolchain/ps4-love-style.cmake),
++	# RADV on GNM, the system libraries, and eboot.bin.
++	target_sources(CemuBin PRIVATE ${PS4_RUNTIME_SOURCES})
++	set_source_files_properties(${PS4_RUNTIME_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
++	if(ENABLE_VULKAN)
++		ps4_link_mesa(CemuBin)
++	endif()
++	target_link_libraries(CemuBin PRIVATE
++		CemuResource SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet)
++	ps4_add_eboot(CemuBin)
++endif()
+diff --git a/src/Cafe/CMakeLists.txt b/src/Cafe/CMakeLists.txt
+index b509e72..22777eb 100644
+--- a/src/Cafe/CMakeLists.txt
++++ b/src/Cafe/CMakeLists.txt
+@@ -548,6 +548,10 @@ if (ENABLE_VULKAN)
+   )
+ endif()
+ 
++if(PS4 AND ENABLE_VULKAN)
++	target_sources(CemuCafe PRIVATE HW/Latte/Renderer/Vulkan/PS4WSI.cpp)
++endif()
++
+ if(APPLE)
+ 	target_sources(CemuCafe PRIVATE
+ 	    HW/Latte/Renderer/MetalView.mm
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
+new file mode 100644
+index 0000000..b503af7
+--- /dev/null
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
+@@ -0,0 +1,469 @@
++// PS4 window system integration for Vulkan.
++//
++// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
++// VK_KHR_surface and VK_KHR_swapchain on top of it the way DolphinPS4 presents: the swapchain
++// images are linear R8G8B8A8 images in host-visible memory (GPU address = CPU address on the
++// PS4), registered as VideoOut buffers, and presenting queues a VideoOut flip behind the GPU work
++// submitted so far (ac_ps4_submit_flip in the Mesa winsys). Cemu's renderer keeps using the
++// standard surface/swapchain API: the entry points below are handed out by the function getters.
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++
++#include <orbis/VideoOut.h>
++#include <orbis/libkernel.h>
++
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char* name);
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char* name);
++// port/mesa/ac_ps4_drm.c: queues a VideoOut flip behind the submitted GPU work (GPU-side flip).
++extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
++
++namespace
++{
++	constexpr uint32 kWidth = 1920, kHeight = 1080;
++	constexpr VkDeviceSize kFramebufferAlign = 2 << 20; // VideoOut buffer alignment
++	constexpr uint32 kMaxImages = 4;
++
++	struct PS4Surface
++	{
++		uint32 magic = 0x50533453;
++	};
++
++	struct PS4Swapchain
++	{
++		VkDevice device;
++		uint32 imageCount;
++		VkImage images[kMaxImages]{};
++		VkDeviceMemory memory[kMaxImages]{};
++		int bufferSet = -1;
++		int firstBuffer = 0;
++		uint32 nextImage = 0;
++		uint32 flipMode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
++	};
++
++	VkInstance sInstance = VK_NULL_HANDLE;
++	VkPhysicalDevice sPhysicalDevice = VK_NULL_HANDLE;
++	int sVideo = -1;
++	OrbisKernelEqueue sFlipQueue;
++	uint64 sFlipsSubmitted = 0;
++	int sNextFirstBuffer = 0;
++	std::mutex sMutex;
++
++	template<typename T>
++	T Device(VkDevice device, const char* name)
++	{
++		return (T)vk_common_GetDeviceProcAddr(device, name);
++	}
++
++	template<typename T>
++	T Instance(const char* name)
++	{
++		return (T)vk_icdGetInstanceProcAddr(sInstance, name);
++	}
++
++	bool OpenVideoOut()
++	{
++		if (sVideo >= 0)
++			return true;
++		sVideo = sceVideoOutOpen(0xFF, 0, 0, nullptr);
++		if (sVideo < 0)
++		{
++			cemuLog_log(LogType::Force, "PS4WSI: sceVideoOutOpen failed: {:#x}", (uint32)sVideo);
++			return false;
++		}
++		sceKernelCreateEqueue(&sFlipQueue, "cemu flip");
++		sceVideoOutAddFlipEvent(sFlipQueue, sVideo, nullptr);
++		return true;
++	}
++
++	// appends one extension to an enumeration result (count/properties two-call idiom)
++	VkResult AppendExtension(std::vector<VkExtensionProperties>& list, const char* name, uint32 specVersion, uint32* count, VkExtensionProperties* props)
++	{
++		VkExtensionProperties p{};
++		strncpy(p.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE - 1);
++		p.specVersion = specVersion;
++		list.push_back(p);
++		if (!props)
++		{
++			*count = (uint32)list.size();
++			return VK_SUCCESS;
++		}
++		uint32 n = std::min<uint32>(*count, (uint32)list.size());
++		memcpy(props, list.data(), n * sizeof(VkExtensionProperties));
++		*count = n;
++		return n < list.size() ? VK_INCOMPLETE : VK_SUCCESS;
++	}
++
++	std::vector<const char*> WithoutExtension(uint32 count, const char* const* names, const char* drop)
++	{
++		std::vector<const char*> result;
++		for (uint32 i = 0; i < count; i++)
++			if (strcmp(names[i], drop) != 0)
++				result.push_back(names[i]);
++		return result;
++	}
++
++	// --- instance level ---
++
++	VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char* layer, uint32* count, VkExtensionProperties* props)
++	{
++		auto real = (PFN_vkEnumerateInstanceExtensionProperties)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
++		uint32 n = 0;
++		real(layer, &n, nullptr);
++		std::vector<VkExtensionProperties> list(n);
++		real(layer, &n, list.data());
++		list.resize(n);
++		return AppendExtension(list, VK_KHR_SURFACE_EXTENSION_NAME, 25, count, props);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo* info, const VkAllocationCallbacks* alloc, VkInstance* instance)
++	{
++		auto real = (PFN_vkCreateInstance)vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
++		VkInstanceCreateInfo copy = *info;
++		auto names = WithoutExtension(info->enabledExtensionCount, info->ppEnabledExtensionNames, VK_KHR_SURFACE_EXTENSION_NAME);
++		copy.enabledExtensionCount = (uint32)names.size();
++		copy.ppEnabledExtensionNames = names.data();
++		VkResult r = real(&copy, alloc, instance);
++		if (r == VK_SUCCESS)
++			sInstance = *instance;
++		return r;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* layer, uint32* count, VkExtensionProperties* props)
++	{
++		auto real = Instance<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
++		uint32 n = 0;
++		real(physicalDevice, layer, &n, nullptr);
++		std::vector<VkExtensionProperties> list(n);
++		real(physicalDevice, layer, &n, list.data());
++		list.resize(n);
++		return AppendExtension(list, VK_KHR_SWAPCHAIN_EXTENSION_NAME, 70, count, props);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* info, const VkAllocationCallbacks* alloc, VkDevice* device)
++	{
++		auto real = Instance<PFN_vkCreateDevice>("vkCreateDevice");
++		VkDeviceCreateInfo copy = *info;
++		auto names = WithoutExtension(info->enabledExtensionCount, info->ppEnabledExtensionNames, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
++		copy.enabledExtensionCount = (uint32)names.size();
++		copy.ppEnabledExtensionNames = names.data();
++		sPhysicalDevice = physicalDevice;
++		return real(physicalDevice, &copy, alloc, device);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance, VkSurfaceKHR surface, const VkAllocationCallbacks*)
++	{
++		delete (PS4Surface*)surface;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice, uint32 queueFamily, VkSurfaceKHR, VkBool32* supported)
++	{
++		*supported = queueFamily == 0 ? VK_TRUE : VK_FALSE; // the graphics queue family
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR* caps)
++	{
++		*caps = {};
++		caps->minImageCount = 2;
++		caps->maxImageCount = 3;
++		caps->currentExtent = {kWidth, kHeight};
++		caps->minImageExtent = {kWidth, kHeight};
++		caps->maxImageExtent = {kWidth, kHeight};
++		caps->maxImageArrayLayers = 1;
++		caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++		caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++		caps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++		caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice, VkSurfaceKHR, uint32* count, VkSurfaceFormatKHR* formats)
++	{
++		// VideoOut A8B8G8R8 = R8G8B8A8 in memory (verified by DolphinPS4)
++		if (!formats)
++		{
++			*count = 1;
++			return VK_SUCCESS;
++		}
++		if (*count < 1)
++			return VK_INCOMPLETE;
++		formats[0] = {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
++		*count = 1;
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice, VkSurfaceKHR, uint32* count, VkPresentModeKHR* modes)
++	{
++		const VkPresentModeKHR supported[] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR};
++		if (!modes)
++		{
++			*count = 3;
++			return VK_SUCCESS;
++		}
++		uint32 n = std::min<uint32>(*count, 3);
++		memcpy(modes, supported, n * sizeof(VkPresentModeKHR));
++		*count = n;
++		return n < 3 ? VK_INCOMPLETE : VK_SUCCESS;
++	}
++
++	// --- device level ---
++
++	uint32 HostVisibleMemoryType(uint32 typeBits)
++	{
++		VkPhysicalDeviceMemoryProperties props;
++		Instance<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(sPhysicalDevice, &props);
++		const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++		for (uint32 i = 0; i < props.memoryTypeCount; i++)
++			if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
++				return i;
++		return UINT32_MAX;
++	}
++
++	void FreeSwapchain(PS4Swapchain* sc)
++	{
++		if (sc->bufferSet >= 0)
++			sceVideoOutUnregisterBuffers(sVideo, sc->bufferSet);
++		auto destroyImage = Device<PFN_vkDestroyImage>(sc->device, "vkDestroyImage");
++		auto freeMemory = Device<PFN_vkFreeMemory>(sc->device, "vkFreeMemory");
++		for (uint32 i = 0; i < sc->imageCount; i++)
++		{
++			if (sc->images[i])
++				destroyImage(sc->device, sc->images[i], nullptr);
++			if (sc->memory[i])
++				freeMemory(sc->device, sc->memory[i], nullptr);
++		}
++		delete sc;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks*, VkSwapchainKHR* swapchain)
++	{
++		std::lock_guard _l(sMutex);
++		if (!OpenVideoOut())
++			return VK_ERROR_INITIALIZATION_FAILED;
++		auto sc = new PS4Swapchain();
++		sc->device = device;
++		sc->imageCount = std::clamp<uint32>(info->minImageCount, 2, kMaxImages);
++		sc->flipMode = info->presentMode == VK_PRESENT_MODE_FIFO_KHR ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
++		auto createImage = Device<PFN_vkCreateImage>(device, "vkCreateImage");
++		auto getRequirements = Device<PFN_vkGetImageMemoryRequirements>(device, "vkGetImageMemoryRequirements");
++		auto allocateMemory = Device<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
++		auto mapMemory = Device<PFN_vkMapMemory>(device, "vkMapMemory");
++		auto bindMemory = Device<PFN_vkBindImageMemory>(device, "vkBindImageMemory");
++		auto getLayout = Device<PFN_vkGetImageSubresourceLayout>(device, "vkGetImageSubresourceLayout");
++		void* addresses[kMaxImages]{};
++		uint32 pitch = kWidth;
++		for (uint32 i = 0; i < sc->imageCount; i++)
++		{
++			VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++			ici.imageType = VK_IMAGE_TYPE_2D;
++			ici.format = VK_FORMAT_R8G8B8A8_UNORM;
++			ici.extent = {kWidth, kHeight, 1};
++			ici.mipLevels = 1;
++			ici.arrayLayers = 1;
++			ici.samples = VK_SAMPLE_COUNT_1_BIT;
++			ici.tiling = VK_IMAGE_TILING_LINEAR;
++			ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++			ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++			VkResult r = createImage(device, &ici, nullptr, &sc->images[i]);
++			if (r != VK_SUCCESS)
++			{
++				cemuLog_log(LogType::Force, "PS4WSI: vkCreateImage failed: {}", (sint32)r);
++				FreeSwapchain(sc);
++				return r;
++			}
++			VkMemoryRequirements req;
++			getRequirements(device, sc->images[i], &req);
++			// VideoOut wants 2 MiB aligned buffers: over-allocate, bind at an aligned offset
++			VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++			mai.allocationSize = req.size + kFramebufferAlign;
++			mai.memoryTypeIndex = HostVisibleMemoryType(req.memoryTypeBits);
++			uint8* base = nullptr;
++			r = allocateMemory(device, &mai, nullptr, &sc->memory[i]);
++			if (r == VK_SUCCESS)
++				r = mapMemory(device, sc->memory[i], 0, VK_WHOLE_SIZE, 0, (void**)&base);
++			if (r != VK_SUCCESS)
++			{
++				cemuLog_log(LogType::Force, "PS4WSI: swapchain memory failed: {}", (sint32)r);
++				FreeSwapchain(sc);
++				return r;
++			}
++			const uintptr_t baseAddress = (uintptr_t)base;
++			VkDeviceSize offset = ((baseAddress + kFramebufferAlign - 1) & ~(kFramebufferAlign - 1)) - baseAddress;
++			offset = (offset + req.alignment - 1) & ~(req.alignment - 1);
++			bindMemory(device, sc->images[i], sc->memory[i], offset);
++			VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
++			VkSubresourceLayout layout;
++			getLayout(device, sc->images[i], &sub, &layout);
++			addresses[i] = base + offset + layout.offset;
++			pitch = (uint32)(layout.rowPitch / 4);
++		}
++		OrbisVideoOutBufferAttribute attribute;
++		sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, kWidth, kHeight, pitch);
++		// alternate between two buffer index ranges so a new swapchain can register while the old one is still on screen
++		sc->firstBuffer = sNextFirstBuffer;
++		sNextFirstBuffer = sNextFirstBuffer == 0 ? 8 : 0;
++		sc->bufferSet = sceVideoOutRegisterBuffers(sVideo, sc->firstBuffer, addresses, (sint32)sc->imageCount, &attribute);
++		if (sc->bufferSet < 0)
++		{
++			cemuLog_log(LogType::Force, "PS4WSI: sceVideoOutRegisterBuffers failed: {:#x}", (uint32)sc->bufferSet);
++			FreeSwapchain(sc);
++			return VK_ERROR_INITIALIZATION_FAILED;
++		}
++		cemuLog_log(LogType::Force, "PS4WSI: swapchain of {} images {}x{} pitch {}, buffers {}+", sc->imageCount, kWidth, kHeight, pitch, sc->firstBuffer);
++		*swapchain = (VkSwapchainKHR)sc;
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks*)
++	{
++		if (!swapchain)
++			return;
++		std::lock_guard _l(sMutex);
++		Device<PFN_vkDeviceWaitIdle>(device, "vkDeviceWaitIdle")(device);
++		FreeSwapchain((PS4Swapchain*)swapchain);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL GetSwapchainImagesKHR(VkDevice, VkSwapchainKHR swapchain, uint32* count, VkImage* images)
++	{
++		auto sc = (PS4Swapchain*)swapchain;
++		if (!images)
++		{
++			*count = sc->imageCount;
++			return VK_SUCCESS;
++		}
++		uint32 n = std::min(*count, sc->imageCount);
++		memcpy(images, sc->images, n * sizeof(VkImage));
++		*count = n;
++		return n < sc->imageCount ? VK_INCOMPLETE : VK_SUCCESS;
++	}
++
++	// The image about to be rendered into must be off screen: with N images in rotation it was
++	// shown by flip n-N+1 and replaced on screen by flip n-N+2 (n = flips submitted).
++	void WaitImageOffScreen(uint32 imageCount)
++	{
++		if (sFlipsSubmitted < imageCount - 1)
++			return;
++		const sint64 needed = (sint64)(sFlipsSubmitted - (imageCount - 2));
++		for (int tries = 0; tries < 40; tries++)
++		{
++			OrbisVideoOutFlipStatus status{};
++			if (sceVideoOutGetFlipStatus(sVideo, &status) < 0 || status.flipArg >= needed)
++				return;
++			OrbisKernelEvent ev;
++			int got = 0;
++			OrbisKernelUseconds timeout = 5000;
++			sceKernelWaitEqueue(sFlipQueue, &ev, 1, &got, &timeout);
++		}
++	}
++
++	VkQueue GraphicsQueue(VkDevice device)
++	{
++		VkQueue queue = VK_NULL_HANDLE;
++		Device<PFN_vkGetDeviceQueue>(device, "vkGetDeviceQueue")(device, 0, 0, &queue);
++		return queue;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64, VkSemaphore semaphore, VkFence fence, uint32* index)
++	{
++		auto sc = (PS4Swapchain*)swapchain;
++		WaitImageOffScreen(sc->imageCount);
++		*index = sc->nextImage;
++		sc->nextImage = (sc->nextImage + 1) % sc->imageCount;
++		if (semaphore || fence)
++		{
++			// signal the acquire semaphore/fence right away: the image is free
++			VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++			si.signalSemaphoreCount = semaphore ? 1 : 0;
++			si.pSignalSemaphores = &semaphore;
++			return Device<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(GraphicsQueue(device), 1, &si, fence);
++		}
++		return VK_SUCCESS;
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		VkResult result = VK_SUCCESS;
++		for (uint32 i = 0; i < info->swapchainCount; i++)
++		{
++			auto sc = (PS4Swapchain*)info->pSwapchains[i];
++			auto queueSubmit = Device<PFN_vkQueueSubmit>(sc->device, "vkQueueSubmit");
++			// consume the wait semaphores (one queue, in order: the rendering was submitted before)
++			std::vector<VkPipelineStageFlags> stages(info->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++			VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++			si.waitSemaphoreCount = i == 0 ? info->waitSemaphoreCount : 0;
++			si.pWaitSemaphores = info->pWaitSemaphores;
++			si.pWaitDstStageMask = stages.data();
++			const uint32 buffer = (uint32)sc->firstBuffer + info->pImageIndices[i];
++			const sint64 arg = (sint64)(sFlipsSubmitted + 1);
++			int r;
++			if (si.waitSemaphoreCount)
++				queueSubmit(queue, 1, &si, VK_NULL_HANDLE);
++			// the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
++			r = ac_ps4_submit_flip(sVideo, buffer, sc->flipMode, arg);
++			if (r != 0)
++			{
++				// fallback: wait for the GPU on the CPU, then flip
++				Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
++				r = sceVideoOutSubmitFlip(sVideo, (sint32)buffer, sc->flipMode, arg);
++			}
++			if (r < 0)
++			{
++				cemuLog_log(LogType::Force, "PS4WSI: flip failed: {:#x}", (uint32)r);
++				result = VK_ERROR_SURFACE_LOST_KHR;
++			}
++			else
++				sFlipsSubmitted++;
++			if (info->pResults)
++				info->pResults[i] = r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
++		}
++		return result;
++	}
++
++	PFN_vkVoidFunction Intercept(const char* name)
++	{
++#define PS4WSI_ENTRY(fn) if (strcmp(name, "vk" #fn) == 0) return (PFN_vkVoidFunction)&fn
++		PS4WSI_ENTRY(EnumerateInstanceExtensionProperties);
++		PS4WSI_ENTRY(CreateInstance);
++		PS4WSI_ENTRY(EnumerateDeviceExtensionProperties);
++		PS4WSI_ENTRY(CreateDevice);
++		PS4WSI_ENTRY(DestroySurfaceKHR);
++		PS4WSI_ENTRY(GetPhysicalDeviceSurfaceSupportKHR);
++		PS4WSI_ENTRY(GetPhysicalDeviceSurfaceCapabilitiesKHR);
++		PS4WSI_ENTRY(GetPhysicalDeviceSurfaceFormatsKHR);
++		PS4WSI_ENTRY(GetPhysicalDeviceSurfacePresentModesKHR);
++		PS4WSI_ENTRY(CreateSwapchainKHR);
++		PS4WSI_ENTRY(DestroySwapchainKHR);
++		PS4WSI_ENTRY(GetSwapchainImagesKHR);
++		PS4WSI_ENTRY(AcquireNextImageKHR);
++		PS4WSI_ENTRY(QueuePresentKHR);
++#undef PS4WSI_ENTRY
++		return nullptr;
++	}
++
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice device, const char* name)
++	{
++		if (auto fn = Intercept(name))
++			return fn;
++		return vk_common_GetDeviceProcAddr(device, name);
++	}
++
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance, const char* name)
++	{
++		if (strcmp(name, "vkGetInstanceProcAddr") == 0)
++			return (PFN_vkVoidFunction)&GetInstanceProcAddr;
++		if (strcmp(name, "vkGetDeviceProcAddr") == 0)
++			return (PFN_vkVoidFunction)&GetDeviceProcAddr;
++		if (auto fn = Intercept(name))
++			return fn;
++		return vk_icdGetInstanceProcAddr(instance, name);
++	}
++}
++
++void* PS4GetGlobalVulkanFunction(const char* name)
++{
++	return (void*)GetInstanceProcAddr(VK_NULL_HANDLE, name);
++}
++
++VkSurfaceKHR PS4CreateVulkanSurface()
++{
++	return (VkSurfaceKHR)new PS4Surface();
++}
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
+index b7dc500..c9b170a 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
+@@ -142,6 +142,41 @@ bool InitializeDeviceVulkan(VkDevice device)
+ 	return true;
+ }
+ 
++#elif defined(__ORBIS__)
++
++// PS4: Mesa's RADV (DolphinPS4's GNM port) is linked into the executable; there is no Vulkan
++// loader. Functions come from RADV through PS4WSI.cpp, which adds the surface/swapchain layer.
++bool InitializeGlobalVulkan()
++{
++	if (g_vulkan_available)
++		return true;
++	#define VKFUNC_INIT
++	#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++	if (!vkCreateInstance || !vkEnumerateInstanceVersion)
++	{
++		cemuLog_log(LogType::Force, "RADV is missing global Vulkan functions");
++		return false;
++	}
++	g_vulkan_available = true;
++	return true;
++}
++
++bool InitializeInstanceVulkan(VkInstance instance)
++{
++	#define VKFUNC_INSTANCE_INIT
++	#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++	// physical-device level, so not available without an instance
++	vkEnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties");
++	return true;
++}
++
++bool InitializeDeviceVulkan(VkDevice device)
++{
++	#define VKFUNC_DEVICE_INIT
++	#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++	return true;
++}
++
+ #else
+ 
+ void* dlopen_vulkan_loader()
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
+index f503c10..e0f4011 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
+@@ -11,6 +11,11 @@ bool InitializeGlobalVulkan();
+ bool InitializeInstanceVulkan(VkInstance instance);
+ bool InitializeDeviceVulkan(VkDevice device);
+ extern bool g_vulkan_available;
++#ifdef __ORBIS__
++// PS4WSI.cpp: RADV entry points plus the VideoOut surface/swapchain layer
++void* PS4GetGlobalVulkanFunction(const char* name);
++VkSurfaceKHR PS4CreateVulkanSurface();
++#endif
+ 
+ #endif
+ 
+@@ -26,6 +31,8 @@ extern bool g_vulkan_available;
+ 	#if defined(VKFUNC_INIT)
+ 		#if BOOST_OS_WINDOWS
+ 		#define VKFUNC(__FUNC__) __FUNC__ = (PFN_##__FUNC__)GetProcAddress(hmodule, #__FUNC__)
++		#elif defined(__ORBIS__)
++		#define VKFUNC(__FUNC__) __FUNC__ = (PFN_##__FUNC__)PS4GetGlobalVulkanFunction(#__FUNC__)
+ 		#else
+ 		#define VKFUNC(__FUNC__) __FUNC__ = (PFN_##__FUNC__)dlsym(vulkan_so, #__FUNC__)
+ 		#endif
+@@ -130,7 +137,7 @@ VKFUNC_DEVICE(vkDestroyPipeline);
+ VKFUNC_DEVICE(vkCmdBindPipeline);
+ 
+ // swapchain
+-#if BOOST_OS_LINUX || BOOST_OS_BSD
++#if (BOOST_OS_LINUX || BOOST_OS_BSD) && !defined(__ORBIS__)
+ VKFUNC_INSTANCE(vkCreateXlibSurfaceKHR);
+ VKFUNC_INSTANCE(vkCreateXcbSurfaceKHR);
+ #ifdef HAS_WAYLAND
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
+index 599190a..1a8328e 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
+@@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
+ 	requiredExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
+ 	#if BOOST_OS_WINDOWS
+ 	requiredExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
++	#elif defined(__ORBIS__)
++	// PS4WSI.cpp: VK_KHR_surface only, no platform surface extension
+ 	#elif BOOST_OS_LINUX || BOOST_OS_BSD
+ 	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
+ 	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
+@@ -1491,6 +1493,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+ 	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
+ 	#if BOOST_OS_WINDOWS
+ 	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
++	#elif defined(__ORBIS__)
++	// PS4WSI.cpp: VK_KHR_surface only, no platform surface extension
+ 	#elif BOOST_OS_LINUX || BOOST_OS_BSD
+ 	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
+ 	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
+@@ -1578,7 +1582,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+ }
+ #endif
+ 
+-#if BOOST_OS_LINUX || BOOST_OS_BSD
++#if (BOOST_OS_LINUX || BOOST_OS_BSD) && !defined(__ORBIS__)
+ VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
+ {
+     VkXlibSurfaceCreateInfoKHR sci{};
+@@ -1642,6 +1646,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+ {
+ #if BOOST_OS_WINDOWS
+ 	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
++#elif defined(__ORBIS__)
++	return PS4CreateVulkanSurface();
+ #elif BOOST_OS_LINUX || BOOST_OS_BSD
+ 	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
+ 		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
+index d975e11..9ed1d1e 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
+@@ -212,7 +212,7 @@ public:
+ #if BOOST_OS_WINDOWS
+ 	static VkSurfaceKHR CreateWinSurface(VkInstance instance, HWND hwindow);
+ #endif
+-#if BOOST_OS_LINUX || BOOST_OS_BSD
++#if (BOOST_OS_LINUX || BOOST_OS_BSD) && !defined(__ORBIS__)
+ 	static VkSurfaceKHR CreateXlibSurface(VkInstance instance, Display* dpy, Window window);
+     static VkSurfaceKHR CreateXcbSurface(VkInstance instance, xcb_connection_t* connection, xcb_window_t window);
+ 	#ifdef HAS_WAYLAND
+diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
+index 7afbf19..e7a8749 100644
+--- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
++++ b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
+@@ -1,3 +1,11 @@
++#ifdef __ORBIS__
++// PS4: fatal signals are handled by the port's crash log (port/ps4_crashlog.cpp: registers and a
++// stack scan with ELF-relative addresses in /data/CemuPS4/crash.log); there is no execinfo.
++#include "ExceptionHandler.h"
++void ExceptionHandler_Init()
++{
++}
++#else
+ #include <signal.h>
+ #include <execinfo.h>
+ #include <string.h>
+@@ -170,3 +178,4 @@ void ExceptionHandler_Init()
+ 	sigaction(SIGSYS, &action, nullptr);
+ 	sigaction(SIGTRAP, &action, nullptr);
+ }
++#endif // __ORBIS__
+diff --git a/src/Common/GLInclude/GLInclude.h b/src/Common/GLInclude/GLInclude.h
+index e6a4e8c..e002938 100644
+--- a/src/Common/GLInclude/GLInclude.h
++++ b/src/Common/GLInclude/GLInclude.h
+@@ -6,7 +6,7 @@
+ #include "wglext.h"
+ #endif
+ 
+-#if ( BOOST_OS_LINUX || BOOST_OS_BSD ) > 0
++#if ( BOOST_OS_LINUX || BOOST_OS_BSD ) > 0 && !defined(__ORBIS__)
+ 
+ // from Xlib
+ #define Bool int
+diff --git a/src/Common/GLInclude/glFunctions.h b/src/Common/GLInclude/glFunctions.h
+index 76ff846..b24f5d4 100644
+--- a/src/Common/GLInclude/glFunctions.h
++++ b/src/Common/GLInclude/glFunctions.h
+@@ -299,7 +299,7 @@ GLFUNC(PFNWGLSWAPINTERVALEXTPROC, wglSwapIntervalEXT)
+ 
+ // x
+ 
+-#if BOOST_OS_LINUX || BOOST_OS_BSD
++#if (BOOST_OS_LINUX || BOOST_OS_BSD) && !defined(__ORBIS__)
+ EGLFUNC(PFNEGLSWAPINTERVALPROC, eglSwapInterval)
+ EGLFUNC(PFNEGLGETCURRENTDISPLAYPROC, eglGetCurrentDisplay)
+ #endif
+diff --git a/src/Common/platform.h b/src/Common/platform.h
+index 08462a9..7d1482b 100644
+--- a/src/Common/platform.h
++++ b/src/Common/platform.h
+@@ -11,9 +11,11 @@
+ #elif BOOST_OS_BSD
+ #include <endian.h>
+ #endif
++#ifndef __ORBIS__ // PS4: FreeBSD kernel, no window system
+ #include <X11/Xlib.h>
+ #include <X11/extensions/Xrender.h>
+ #include <X11/Xutil.h>
++#endif
+ #include "Common/unix/platform.h"
+ #elif BOOST_OS_MACOS
+ #include <libkern/OSByteOrder.h>
+diff --git a/src/Common/precompiled.h b/src/Common/precompiled.h
+index e037395..a832fd3 100644
+--- a/src/Common/precompiled.h
++++ b/src/Common/precompiled.h
+@@ -310,6 +310,11 @@ inline uint64 _udiv128(uint64 highDividend, uint64 lowDividend, uint64 divisor,
+ 
+ #if defined(_MSC_VER)
+     #define DEBUG_BREAK __debugbreak()
++#elif defined(__ORBIS__)
++    // PS4: an unhandled SIGTRAP kills the app (and can hang the console in its coredump); log the
++    // callers to /data/CemuPS4/boot-trace.log instead (port/ps4_crashlog.cpp) and carry on
++    extern "C" void ps4_trace_callers(const char* what);
++    #define DEBUG_BREAK ps4_trace_callers("cemu assert")
+ #else
+     #include <csignal>
+     #define DEBUG_BREAK raise(SIGTRAP) 
+diff --git a/src/gui/CMakeLists.txt b/src/gui/CMakeLists.txt
+index d66e971..49e209f 100644
+--- a/src/gui/CMakeLists.txt
++++ b/src/gui/CMakeLists.txt
+@@ -4,4 +4,7 @@ target_include_directories(CemuGui INTERFACE "interface")
+ if(ENABLE_WXWIDGETS)
+     add_subdirectory(wxgui)
+     target_link_libraries(CemuGui INTERFACE CemuWxGui)
++elseif(PS4)
++    add_subdirectory(ps4)
++    target_link_libraries(CemuGui INTERFACE CemuPS4Gui)
+ endif()
+diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
+new file mode 100644
+index 0000000..c471a05
+--- /dev/null
++++ b/src/gui/ps4/CMakeLists.txt
+@@ -0,0 +1,15 @@
++add_library(CemuPS4Gui PS4WindowSystem.cpp)
++
++set_property(TARGET CemuPS4Gui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
++cemu_use_precompiled_header(CemuPS4Gui)
++
++target_include_directories(CemuPS4Gui PUBLIC "../")
++target_link_libraries(CemuPS4Gui PRIVATE
++	CemuCafe
++	CemuCommon
++	CemuComponents
++	CemuConfig
++	CemuInput
++	CemuUtil
++	Boost::headers
++)
+diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
+new file mode 100644
+index 0000000..e09b81d
+--- /dev/null
++++ b/src/gui/ps4/PS4WindowSystem.cpp
+@@ -0,0 +1,362 @@
++// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
++// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
++// keeps the main thread for the emulator's housekeeping.
++//
++//   /app0                   packaged data: resources/, gameProfiles/
++//   /data/CemuPS4           settings, logs (log.txt, boot-trace.log, crash.log), caches
++//   /data/CemuPS4/mlc01     emulated NAND
++//   /data/CemuPS4/games     games; launch.txt (first line: a path) picks one, else the first found
++#include "interface/WindowSystem.h"
++
++#include "Cafe/CafeSystem.h"
++#include "Cafe/HW/Latte/Core/LatteOverlay.h"
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
++#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
++#include "Cafe/TitleList/TitleInfo.h"
++#include "Cafe/TitleList/TitleList.h"
++#include "Cemu/ncrypto/ncrypto.h"
++#include "config/ActiveSettings.h"
++#include "config/CemuConfig.h"
++#include "config/NetworkSettings.h"
++#include "input/ControllerFactory.h"
++#include "input/InputManager.h"
++#include "util/helpers/helpers.h"
++
++#include <orbis/Sysmodule.h>
++#include <orbis/libkernel.h>
++
++extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
++
++void CemuCommonInit(); // main.cpp
++
++namespace
++{
++	const fs::path kDataRoot = "/data/CemuPS4";
++	const fs::path kAppRoot = "/app0";
++	constexpr int kWidth = 1920, kHeight = 1080;
++
++	WindowSystem::WindowInfo sWindowInfo{};
++
++	void Trace(std::string_view text)
++	{
++		std::string line(text);
++		ps4_boot_trace(line.c_str());
++		cemuLog_log(LogType::Force, "{}", text);
++	}
++
++	void LoadSystemModules()
++	{
++		// calling into a system library whose module isn't loaded kills the app silently
++		const std::pair<const char*, uint32> modules[] = {
++			{"SystemService", 0x80000010}, {"UserService", 0x80000011}, {"VideoOut", 0x80000022},
++			{"AudioOut", 0x80000001}, {"Pad", 0x80000024}, {"Net", 0x8000001C}};
++		for (const auto& [name, id] : modules)
++		{
++			const int result = (int)sceSysmoduleLoadModuleInternal((OrbisSysModuleInternal)id);
++			if (result != 0)
++				ps4_boot_trace(fmt::format("loading system module {} failed ({:#x})", name, (uint32)result).c_str());
++		}
++	}
++
++	bool CreateDefaultMLCFiles(const fs::path& mlc)
++	{
++		std::error_code ec;
++		const fs::path directories[] = {
++			mlc, mlc / "sys", mlc / "usr", mlc / "usr/title/00050000", mlc / "usr/title/0005000c",
++			mlc / "usr/title/0005000e", mlc / "usr/save/00050010/1004a000/user/common/db",
++			mlc / "usr/save/00050010/1004a100/user/common/db", mlc / "usr/save/00050010/1004a200/user/common/db",
++			mlc / "sys/title/0005001b/1005c000/content"};
++		for (auto& path : directories)
++		{
++			fs::create_directories(path, ec);
++			if (!fs::is_directory(path, ec))
++				return false;
++		}
++		const fs::path langDir = mlc / "sys/title/0005001b/1005c000/content";
++		if (!fs::exists(langDir / "language.txt", ec))
++		{
++			std::ofstream file(langDir / "language.txt");
++			for (const char* lang : {"ja", "en", "fr", "de", "it", "es", "zh", "ko", "nl", "pt", "ru", "zh"})
++				file << fmt::format(R"("{}",)", lang) << "\n";
++		}
++		if (!fs::exists(langDir / "country.txt", ec))
++		{
++			std::ofstream file(langDir / "country.txt");
++			for (size_t i = 0; i < NCrypto::GetCountryCount(); i++)
++			{
++				const char* code = NCrypto::GetCountryAsString((sint32)i);
++				file << (boost::iequals(code, "NN") ? std::string("NULL,") : fmt::format(R"("{}",)", code)) << "\n";
++			}
++		}
++		return true;
++	}
++
++	bool IsLaunchable(const fs::path& path)
++	{
++		std::string ext = _pathToUtf8(path.extension());
++		boost::algorithm::to_lower(ext);
++		return ext == ".rpx" || ext == ".elf" || ext == ".wua" || ext == ".wuhb" || ext == ".wud" || ext == ".wux" || ext == ".iso";
++	}
++
++	fs::path FindGame()
++	{
++		std::error_code ec;
++		std::ifstream launch(kDataRoot / "launch.txt");
++		std::string line;
++		if (launch && std::getline(launch, line))
++		{
++			boost::algorithm::trim(line);
++			if (!line.empty())
++				return _utf8ToPath(line);
++		}
++		std::vector<fs::path> found;
++		for (auto it = fs::recursive_directory_iterator(kDataRoot / "games", ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
++		{
++			if (it->is_regular_file(ec) && (IsLaunchable(it->path()) || it->path().filename() == "title.tmd"))
++				found.push_back(it->path());
++		}
++		std::sort(found.begin(), found.end());
++		return found.empty() ? fs::path() : found.front();
++	}
++
++	// MainWindow::FileLoad without the dialogs
++	bool PrepareTitle(const fs::path& launchPath)
++	{
++		TitleInfo launchTitle{launchPath};
++		if (launchTitle.IsValid())
++		{
++			CafeTitleList::AddTitleFromPath(launchPath);
++			TitleId baseTitleId;
++			if (!CafeTitleList::FindBaseTitleId(launchTitle.GetAppTitleId(), baseTitleId))
++			{
++				Trace("the base files of this title were not found");
++				return false;
++			}
++			const auto r = CafeSystem::PrepareForegroundTitle(baseTitleId);
++			if (r != CafeSystem::PREPARE_STATUS_CODE::SUCCESS)
++			{
++				Trace(fmt::format("preparing the title failed ({})", (int)r));
++				return false;
++			}
++			return true;
++		}
++		const CafeTitleFileType fileType = DetermineCafeSystemFileType(launchPath);
++		if (fileType == CafeTitleFileType::RPX || fileType == CafeTitleFileType::ELF)
++		{
++			if (CafeSystem::PrepareForegroundTitleFromStandaloneRPX(launchPath) != CafeSystem::PREPARE_STATUS_CODE::SUCCESS)
++			{
++				Trace("preparing the executable failed");
++				return false;
++			}
++			return true;
++		}
++		Trace(fmt::format("not a launchable title (reason {})", (int)launchTitle.GetInvalidReason()));
++		return false;
++	}
++
++	void Run()
++	{
++		LoadSystemModules();
++		Trace("CemuPS4 starting");
++
++		std::error_code ec;
++		fs::create_directories(kDataRoot / "games", ec);
++		std::set<fs::path> failedWriteAccess;
++		ActiveSettings::SetPaths(false, kAppRoot / "eboot.bin", kDataRoot, kDataRoot, kDataRoot / "cache", kAppRoot, failedWriteAccess);
++		for (auto& path : failedWriteAccess)
++			Trace(fmt::format("cannot write to {}", _pathToUtf8(path)));
++		fs::create_directories(ActiveSettings::GetConfigPath("controllerProfiles"), ec);
++
++		GetConfigHandle().SetFilename(ActiveSettings::GetConfigPath("settings.xml").generic_wstring());
++		const bool firstStart = !fs::exists(ActiveSettings::GetConfigPath("settings.xml"), ec);
++		NetworkConfig::LoadOnce();
++		if (!firstStart)
++			GetConfigHandle().Load();
++		else
++		{
++			GetConfig().graphic_api = GraphicAPI::kVulkan;
++			GetConfigHandle().Save();
++		}
++		if (!CreateDefaultMLCFiles(ActiveSettings::GetMlcPath()))
++			Trace(fmt::format("cannot create the mlc folders in {}", _pathToUtf8(ActiveSettings::GetMlcPath())));
++		ActiveSettings::Init();
++		LatteOverlay_init();
++		Trace("common init");
++		CemuCommonInit();
++
++		// first start: the DualShock 4 becomes the Wii U GamePad (controllerProfiles/controller0.xml)
++		auto& inputManager = InputManager::instance();
++		if (!inputManager.get_controller(0))
++		{
++			try
++			{
++				auto pad = ControllerFactory::CreateController(InputAPI::PS4Pad, "0", "DualShock 4");
++				auto gamepad = inputManager.set_controller(0, EmulatedController::Type::VPAD, pad);
++				if (gamepad)
++				{
++					gamepad->set_default_mapping(pad);
++					inputManager.save(0);
++					Trace("DualShock 4 mapped to the Wii U GamePad");
++				}
++			}
++			catch (const std::exception& ex)
++			{
++				Trace(fmt::format("controller setup failed: {}", ex.what()));
++			}
++		}
++
++		sWindowInfo.app_active = true;
++		sWindowInfo.width = sWindowInfo.phys_width = kWidth;
++		sWindowInfo.height = sWindowInfo.phys_height = kHeight;
++		sWindowInfo.dpi_scale = 1.0;
++		sWindowInfo.pad_open = false;
++		sWindowInfo.is_fullscreen = true;
++
++		if (!InitializeGlobalVulkan())
++		{
++			Trace("Vulkan (RADV) is not available");
++			return;
++		}
++
++		const fs::path game = FindGame();
++		if (game.empty())
++		{
++			Trace(fmt::format("no game: put one in {} or its path in {}", _pathToUtf8(kDataRoot / "games"), _pathToUtf8(kDataRoot / "launch.txt")));
++			return;
++		}
++		Trace(fmt::format("game: {}", _pathToUtf8(game)));
++		if (!PrepareTitle(game))
++			return;
++		Trace(fmt::format("title prepared: {}", CafeSystem::GetForegroundTitleName()));
++
++		try
++		{
++			g_renderer = std::make_unique<VulkanRenderer>();
++			VulkanRenderer::GetInstance()->InitializeSurface({kWidth, kHeight}, true);
++		}
++		catch (const std::exception& ex)
++		{
++			Trace(fmt::format("Vulkan renderer: {}", ex.what()));
++			return;
++		}
++		Trace("renderer ready, launching");
++		CafeSystem::LaunchForegroundTitle();
++		Trace("launched");
++
++		// the emulator runs on its own threads; the main thread only reports progress
++		for (uint64 seconds = 0;; seconds += 10)
++		{
++			std::this_thread::sleep_for(std::chrono::seconds(10));
++			Trace(fmt::format("alive {} s", seconds + 10));
++		}
++	}
++}
++
++void WindowSystem::Create()
++{
++	SetThreadName("cemu");
++	Run();
++	// nothing more to do (an error was logged): keep the process so the logs can be read
++	for (;;)
++		std::this_thread::sleep_for(std::chrono::seconds(60));
++}
++
++void WindowSystem::ShowErrorDialog(std::string_view message, std::string_view title, std::optional<ErrorCategory>)
++{
++	Trace(fmt::format("error dialog: {}: {}", title, message));
++}
++
++WindowSystem::WindowInfo& WindowSystem::GetWindowInfo()
++{
++	return sWindowInfo;
++}
++
++void WindowSystem::UpdateWindowTitles(bool isIdle, bool isLoading, double fps)
++{
++	static auto sLast = std::chrono::steady_clock::now();
++	const auto now = std::chrono::steady_clock::now();
++	if (isIdle || isLoading || now - sLast < std::chrono::seconds(5))
++		return;
++	sLast = now;
++	ps4_boot_trace(fmt::format("fps {:.1f}", fps).c_str());
++}
++
++void WindowSystem::GetWindowSize(int& w, int& h)
++{
++	w = sWindowInfo.width;
++	h = sWindowInfo.height;
++}
++
++void WindowSystem::GetPadWindowSize(int& w, int& h)
++{
++	w = h = 0;
++}
++
++void WindowSystem::GetWindowPhysSize(int& w, int& h)
++{
++	w = sWindowInfo.phys_width;
++	h = sWindowInfo.phys_height;
++}
++
++void WindowSystem::GetPadWindowPhysSize(int& w, int& h)
++{
++	w = h = 0;
++}
++
++double WindowSystem::GetWindowDPIScale()
++{
++	return 1.0;
++}
++
++double WindowSystem::GetPadDPIScale()
++{
++	return 1.0;
++}
++
++bool WindowSystem::IsPadWindowOpen()
++{
++	return false;
++}
++
++bool WindowSystem::IsKeyDown(uint32 key)
++{
++	return sWindowInfo.get_keystate(key);
++}
++
++bool WindowSystem::IsKeyDown(PlatformKeyCodes)
++{
++	return false;
++}
++
++std::string WindowSystem::GetKeyCodeName(uint32 key)
++{
++	return fmt::format("key_{}", key);
++}
++
++bool WindowSystem::InputConfigWindowHasFocus()
++{
++	return false;
++}
++
++void WindowSystem::NotifyGameLoaded()
++{
++	Trace("game loaded");
++}
++
++void WindowSystem::NotifyGameExited()
++{
++	Trace("game exited");
++}
++
++void WindowSystem::RefreshGameList()
++{
++}
++
++bool WindowSystem::IsFullScreen()
++{
++	return true;
++}
++
++void WindowSystem::CaptureInput(const ControllerState&, const ControllerState&)
++{
++}
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index 4978ef0..62be7be 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -88,6 +88,13 @@ if (SUPPORTS_WIIMOTE)
+ endif ()
+ 
+ 
++if(PS4)
++	target_sources(CemuInput PRIVATE
++		api/PS4/PS4PadController.cpp
++		api/PS4/PS4PadController.h
++	)
++endif()
++
+ if(ENABLE_SDL)
+ 	target_sources(CemuInput PRIVATE
+ 		api/SDL/SDLController.cpp
+diff --git a/src/input/ControllerFactory.cpp b/src/input/ControllerFactory.cpp
+index 3827e1d..ed4037f 100644
+--- a/src/input/ControllerFactory.cpp
++++ b/src/input/ControllerFactory.cpp
+@@ -22,6 +22,10 @@
+ #include "input/api/SDL/SDLController.h"
+ #endif
+ 
++#ifdef __ORBIS__
++#include "input/api/PS4/PS4PadController.h"
++#endif
++
+ ControllerPtr ControllerFactory::CreateController(InputAPI::Type api, std::string_view uuid,
+                                                   std::string_view display_name)
+ {
+@@ -79,6 +83,10 @@ ControllerPtr ControllerFactory::CreateController(InputAPI::Type api, std::strin
+ 				return std::make_shared<SDLController>(guid, guid_index, display_name);
+ 		}
+ #endif
++#ifdef __ORBIS__
++	case InputAPI::PS4Pad:
++		return std::make_shared<PS4PadController>();
++#endif
+ #if HAS_DSU
+ 	case InputAPI::DSUClient:
+ 		{
+@@ -144,6 +152,10 @@ ControllerProviderPtr ControllerFactory::CreateControllerProvider(InputAPI::Type
+ 	case InputAPI::SDLController:
+ 		return std::make_shared<SDLControllerProvider>();
+ #endif
++#ifdef __ORBIS__
++	case InputAPI::PS4Pad:
++		return std::make_shared<PS4PadControllerProvider>();
++#endif
+ #if HAS_XINPUT
+ 	case InputAPI::XInput:
+ 		return std::make_shared<XInputControllerProvider>();
+diff --git a/src/input/InputManager.cpp b/src/input/InputManager.cpp
+index 42b1db2..89f92fa 100644
+--- a/src/input/InputManager.cpp
++++ b/src/input/InputManager.cpp
+@@ -5,6 +5,9 @@
+ #include <pugixml.hpp>
+ #include "Cafe/GameProfile/GameProfile.h"
+ #include "util/EventService.h"
++#ifdef __ORBIS__
++#include "input/api/PS4/PS4PadController.h"
++#endif
+ 
+ InputManager::InputManager()
+ {
+@@ -46,6 +49,9 @@ InputManager::InputManager()
+ #if HAS_WIIMOTE
+ 	create_provider<WiimoteControllerProvider>();
+ #endif
++#ifdef __ORBIS__
++	create_provider<PS4PadControllerProvider>();
++#endif
+ 
+ 	m_update_thread_shutdown.store(false);
+ 	m_update_thread = std::thread(&InputManager::update_thread, this);
+diff --git a/src/input/api/InputAPI.h b/src/input/api/InputAPI.h
+index a5f1f92..15a7b40 100644
+--- a/src/input/api/InputAPI.h
++++ b/src/input/api/InputAPI.h
+@@ -17,6 +17,8 @@ namespace InputAPI
+ 		WGIGamepad,
+ 		WGIRawController,
+ 
++		PS4Pad,
++
+ 		MAX
+ 	};
+ 
+@@ -42,6 +44,8 @@ namespace InputAPI
+ 			return "WGIRawController";
+ 		case SDLController:
+ 			return "SDLController";
++		case PS4Pad:
++			return "PS4Pad";
+ 		default:
+ 			break;
+ 		}
+@@ -65,6 +69,8 @@ namespace InputAPI
+ 			return DSUClient;
+ 		else if (str == to_string(SDLController))
+ 			return SDLController;
++		else if (str == to_string(PS4Pad))
++			return PS4Pad;
+ 		else if (str == "DSU") // legacy
+ 			return DSUClient;
+ 		
+diff --git a/src/input/api/PS4/PS4PadController.cpp b/src/input/api/PS4/PS4PadController.cpp
+new file mode 100644
+index 0000000..3731c7d
+--- /dev/null
++++ b/src/input/api/PS4/PS4PadController.cpp
+@@ -0,0 +1,89 @@
++#include "input/api/PS4/PS4PadController.h"
++
++#include <orbis/Pad.h>
++#include <orbis/UserService.h>
++
++PS4PadControllerProvider::PS4PadControllerProvider()
++{
++	// the UserService and Pad modules are loaded by the frontend before the InputManager exists
++	sceUserServiceInitialize(nullptr);
++	scePadInit();
++	int32_t user = -1;
++	if (sceUserServiceGetInitialUser(&user) != 0)
++	{
++		cemuLog_log(LogType::Force, "PS4Pad: no initial user");
++		return;
++	}
++	m_handle = scePadOpen(user, 0, 0, nullptr);
++	if (m_handle < 0)
++		cemuLog_log(LogType::Force, "PS4Pad: scePadOpen failed: {:#x}", (uint32)m_handle);
++}
++
++std::vector<std::shared_ptr<ControllerBase>> PS4PadControllerProvider::get_controllers()
++{
++	if (m_handle < 0)
++		return {};
++	return {std::make_shared<PS4PadController>()};
++}
++
++bool PS4PadControllerProvider::Read(OrbisPadData& data)
++{
++	if (m_handle < 0)
++		return false;
++	std::scoped_lock lock(m_mutex);
++	// scePadReadState: the latest state (scePadRead returned nothing for half-second stretches
++	// in DolphinPS4)
++	return scePadReadState(m_handle, &data) == 0 && data.connected;
++}
++
++PS4PadController::PS4PadController()
++	: base_type("0", "DualShock 4")
++{
++}
++
++bool PS4PadController::is_connected()
++{
++	OrbisPadData data{};
++	return m_provider && m_provider->Read(data);
++}
++
++std::string PS4PadController::get_button_name(uint64 button) const
++{
++	static const char* const kNames[] = {"Cross", "Circle", "Square", "Triangle", "Touchpad left", "Touchpad right", "Options",
++										 "L3", "R3", "L1", "R1", "Up", "Down", "Left", "Right"};
++	if (button < std::size(kNames))
++		return kNames[button];
++	return base_type::get_button_name(button);
++}
++
++ControllerState PS4PadController::raw_state()
++{
++	ControllerState result{};
++	OrbisPadData data{};
++	if (!m_provider || !m_provider->Read(data))
++		return result;
++	const uint32 b = data.buttons;
++	const std::pair<uint32, uint32> buttons[] = {
++		{ORBIS_PAD_BUTTON_CROSS, 0}, {ORBIS_PAD_BUTTON_CIRCLE, 1}, {ORBIS_PAD_BUTTON_SQUARE, 2},
++		{ORBIS_PAD_BUTTON_TRIANGLE, 3}, {ORBIS_PAD_BUTTON_OPTIONS, 6}, {ORBIS_PAD_BUTTON_L3, 7},
++		{ORBIS_PAD_BUTTON_R3, 8}, {ORBIS_PAD_BUTTON_L1, 9}, {ORBIS_PAD_BUTTON_R1, 10},
++		{ORBIS_PAD_BUTTON_UP, 11}, {ORBIS_PAD_BUTTON_DOWN, 12}, {ORBIS_PAD_BUTTON_LEFT, 13},
++		{ORBIS_PAD_BUTTON_RIGHT, 14}};
++	for (const auto& [mask, index] : buttons)
++		if (b & mask)
++			result.buttons.SetButtonState(index, true);
++	// touchpad click: left half = back (Wii U minus), right half = guide (Wii U HOME)
++	if (b & ORBIS_PAD_BUTTON_TOUCH_PAD)
++	{
++		const bool right = data.touch.fingers > 0 && data.touch.touch[0].x >= 960;
++		result.buttons.SetButtonState(right ? 5 : 4, true);
++	}
++	auto stick = [](uint8 v) { return std::clamp(((float)v - 128.0f) / 127.0f, -1.0f, 1.0f); };
++	result.axis.x = stick(data.leftStick.x);
++	result.axis.y = stick(data.leftStick.y);
++	result.rotation.x = stick(data.rightStick.x);
++	result.rotation.y = stick(data.rightStick.y);
++	result.trigger.x = (float)data.analogButtons.l2 / 255.0f;
++	result.trigger.y = (float)data.analogButtons.r2 / 255.0f;
++	return result;
++}
+diff --git a/src/input/api/PS4/PS4PadController.h b/src/input/api/PS4/PS4PadController.h
+new file mode 100644
+index 0000000..35ca183
+--- /dev/null
++++ b/src/input/api/PS4/PS4PadController.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include "input/api/Controller.h"
++#include "input/api/ControllerProvider.h"
++
++// The PS4's DualShock 4 (ScePad) of the initial user. Buttons use SDL's gamepad indices so the
++// emulated controllers' SDL default mappings apply: 0 cross, 1 circle, 2 square, 3 triangle,
++// 4 back (touchpad click, left half), 5 guide (touchpad click, right half), 6 start (OPTIONS),
++// 7/8 L3/R3, 9/10 L1/R1, 11-14 d-pad up/down/left/right.
++class PS4PadControllerProvider : public ControllerProviderBase
++{
++	friend class PS4PadController;
++public:
++	PS4PadControllerProvider();
++
++	inline static InputAPI::Type kAPIType = InputAPI::PS4Pad;
++	InputAPI::Type api() const override { return kAPIType; }
++
++	std::vector<std::shared_ptr<ControllerBase>> get_controllers() override;
++
++private:
++	bool Read(struct OrbisPadData& data);
++
++	std::mutex m_mutex;
++	int m_handle = -1;
++};
++
++class PS4PadController : public Controller<PS4PadControllerProvider>
++{
++public:
++	PS4PadController();
++
++	std::string_view api_name() const override
++	{
++		static_assert(to_string(InputAPI::PS4Pad) == "PS4Pad");
++		return to_string(InputAPI::PS4Pad);
++	}
++	InputAPI::Type api() const override { return InputAPI::PS4Pad; }
++
++	bool is_connected() override;
++	std::string get_button_name(uint64 button) const override;
++
++protected:
++	ControllerState raw_state() override;
++};
+diff --git a/src/input/emulated/VPADController.cpp b/src/input/emulated/VPADController.cpp
+index a791c5f..51ae4f5 100644
+--- a/src/input/emulated/VPADController.cpp
++++ b/src/input/emulated/VPADController.cpp
+@@ -637,6 +637,47 @@ bool VPADController::set_default_mapping(const std::shared_ptr<ControllerBase>&
+ 		}
+ 		break;
+ 	}
++#endif
++#ifdef __ORBIS__
++	case InputAPI::PS4Pad:
++	{
++		// SDL gamepad indices (PS4PadController.h), Wii U face buttons by position
++		mapping =
++		{
++			{kButtonId_A, kButton1},
++			{kButtonId_B, kButton0},
++			{kButtonId_X, kButton3},
++			{kButtonId_Y, kButton2},
++
++			{kButtonId_L, kButton9},
++			{kButtonId_R, kButton10},
++			{kButtonId_ZL, kTriggerXP},
++			{kButtonId_ZR, kTriggerYP},
++
++			{kButtonId_Plus, kButton6},
++			{kButtonId_Minus, kButton4},
++			{kButtonId_Home, kButton5},
++
++			{kButtonId_Up, kButton11},
++			{kButtonId_Down, kButton12},
++			{kButtonId_Left, kButton13},
++			{kButtonId_Right, kButton14},
++
++			{kButtonId_StickL, kButton7},
++			{kButtonId_StickR, kButton8},
++
++			{kButtonId_StickL_Up, kAxisYN},
++			{kButtonId_StickL_Down, kAxisYP},
++			{kButtonId_StickL_Left, kAxisXN},
++			{kButtonId_StickL_Right, kAxisXP},
++
++			{kButtonId_StickR_Up, kRotationYN},
++			{kButtonId_StickR_Down, kRotationYP},
++			{kButtonId_StickR_Left, kRotationXN},
++			{kButtonId_StickR_Right, kRotationXP},
++		};
++		break;
++	}
+ #endif
+ 	case InputAPI::XInput:
+ 	{
+diff --git a/src/main.cpp b/src/main.cpp
+index ab91559..e04e1d3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -257,7 +257,7 @@ int main(int argc, char *argv[])
+ 		return BreathOfTheWildChildProcessMain();
+ #endif
+ 
+-#if BOOST_OS_LINUX || BOOST_OS_BSD
++#if (BOOST_OS_LINUX || BOOST_OS_BSD) && !defined(__ORBIS__)
+     XInitThreads();
+ #endif
+ 	auto parse_rc = LaunchSettings::HandleCommandline(argc, argv);
+diff --git a/src/resource/CMakeLists.txt b/src/resource/CMakeLists.txt
+index 74cdf03..8838716 100644
+--- a/src/resource/CMakeLists.txt
++++ b/src/resource/CMakeLists.txt
+@@ -13,7 +13,7 @@ embedded/resources.cpp
+ embedded/resources.h
+ )
+ 
+-if(UNIX)
++if(UNIX OR PS4)
+     if(NOT APPLE)
+         target_sources(CemuResource PRIVATE embedded/fontawesome.S)
+     else()
+diff --git a/src/util/CMakeLists.txt b/src/util/CMakeLists.txt
+index be10d40..f8b7d12 100644
+--- a/src/util/CMakeLists.txt
++++ b/src/util/CMakeLists.txt
+@@ -74,6 +74,10 @@ if(WIN32)
+ 	target_sources(CemuUtil PRIVATE Fiber/FiberWin.cpp)
+ 	target_sources(CemuUtil PRIVATE MemMapper/MemMapperWin.cpp)
+ 	target_sources(CemuUtil PRIVATE SystemInfo/SystemInfoWin.cpp)
++elseif(PS4)
++	target_sources(CemuUtil PRIVATE Fiber/FiberPS4.cpp)
++	target_sources(CemuUtil PRIVATE MemMapper/MemMapperPS4.cpp)
++	target_sources(CemuUtil PRIVATE SystemInfo/SystemInfoStub.cpp)
+ elseif(UNIX)
+ 	target_sources(CemuUtil PRIVATE Fiber/FiberUnix.cpp)
+ 	target_sources(CemuUtil PRIVATE MemMapper/MemMapperUnix.cpp)
+diff --git a/src/util/Fiber/FiberPS4.cpp b/src/util/Fiber/FiberPS4.cpp
+new file mode 100644
+index 0000000..3784081
+--- /dev/null
++++ b/src/util/Fiber/FiberPS4.cpp
+@@ -0,0 +1,113 @@
++// PS4: fibers by stack switching. The OpenOrbis C library (musl) has no ucontext functions, so
++// the switch saves the callee-saved registers (System V x86-64) plus MXCSR and the x87 control
++// word on the current stack and swaps stack pointers.
++#include "Fiber.h"
++#include <atomic>
++
++thread_local Fiber* sCurrentFiber{};
++
++extern "C" void cemu_ps4_fiber_switch(void** saveSp, void* loadSp);
++extern "C" void cemu_ps4_fiber_start();
++
++asm(R"(
++	.text
++	.globl cemu_ps4_fiber_switch
++	.type cemu_ps4_fiber_switch, @function
++cemu_ps4_fiber_switch:
++	pushq %rbp
++	pushq %rbx
++	pushq %r12
++	pushq %r13
++	pushq %r14
++	pushq %r15
++	subq $8, %rsp
++	stmxcsr (%rsp)
++	fnstcw 4(%rsp)
++	movq %rsp, (%rdi)
++	movq %rsi, %rsp
++	ldmxcsr (%rsp)
++	fldcw 4(%rsp)
++	addq $8, %rsp
++	popq %r15
++	popq %r14
++	popq %r13
++	popq %r12
++	popq %rbx
++	popq %rbp
++	ret
++	.size cemu_ps4_fiber_switch, .-cemu_ps4_fiber_switch
++
++	.globl cemu_ps4_fiber_start
++	.type cemu_ps4_fiber_start, @function
++cemu_ps4_fiber_start:
++	movq %r12, %rdi
++	callq *%r13
++	ud2
++	.size cemu_ps4_fiber_start, .-cemu_ps4_fiber_start
++)");
++
++namespace
++{
++	struct FiberContext
++	{
++		void* sp;
++	};
++}
++
++Fiber::Fiber(void(*FiberEntryPoint)(void* userParam), void* userParam, void* privateData) : m_privateData(privateData)
++{
++	const size_t stackSize = 2 * 1024 * 1024;
++	m_stackPtr = malloc(stackSize);
++	uint64* top = (uint64*)(((uintptr_t)m_stackPtr + stackSize) & ~(uintptr_t)15);
++	// Frame popped by the first switch into this fiber; "ret" lands in cemu_ps4_fiber_start with
++	// a 16-byte aligned stack, which calls FiberEntryPoint(userParam) (r13, r12).
++	uint32 mxcsr;
++	uint16 fpuControl;
++	asm volatile("stmxcsr %0" : "=m"(mxcsr));
++	asm volatile("fnstcw %0" : "=m"(fpuControl));
++	top[-1] = (uint64)&cemu_ps4_fiber_start; // return address
++	top[-2] = 0; // rbp
++	top[-3] = 0; // rbx
++	top[-4] = (uint64)userParam; // r12
++	top[-5] = (uint64)FiberEntryPoint; // r13
++	top[-6] = 0; // r14
++	top[-7] = 0; // r15
++	top[-8] = (uint64)mxcsr | ((uint64)fpuControl << 32);
++	FiberContext* ctx = new FiberContext();
++	ctx->sp = &top[-8];
++	m_implData = ctx;
++}
++
++Fiber::Fiber(void* privateData) : m_privateData(privateData)
++{
++	m_implData = new FiberContext();
++	m_stackPtr = nullptr;
++}
++
++Fiber::~Fiber()
++{
++	if (m_stackPtr)
++		free(m_stackPtr);
++	delete (FiberContext*)m_implData;
++}
++
++Fiber* Fiber::PrepareCurrentThread(void* privateData)
++{
++	cemu_assert_debug(sCurrentFiber == nullptr);
++	sCurrentFiber = new Fiber(privateData);
++	return sCurrentFiber;
++}
++
++void Fiber::Switch(Fiber& targetFiber)
++{
++	Fiber* leavingFiber = sCurrentFiber;
++	sCurrentFiber = &targetFiber;
++	std::atomic_thread_fence(std::memory_order_seq_cst);
++	cemu_ps4_fiber_switch(&((FiberContext*)leavingFiber->m_implData)->sp, ((FiberContext*)targetFiber.m_implData)->sp);
++	std::atomic_thread_fence(std::memory_order_seq_cst);
++}
++
++void* Fiber::GetFiberPrivateData()
++{
++	return sCurrentFiber->m_privateData;
++}
+diff --git a/src/util/MemMapper/MemMapperPS4.cpp b/src/util/MemMapper/MemMapperPS4.cpp
+new file mode 100644
+index 0000000..ff346d0
+--- /dev/null
++++ b/src/util/MemMapper/MemMapperPS4.cpp
+@@ -0,0 +1,210 @@
++// PS4 memory mapping. Large PROT_NONE mmaps fail on the PS4 (4 GiB+ is ENOMEM) and regular
++// flexible memory is only ~255 MiB, so:
++//  - reservations come from sceKernelReserveVirtualRange (placed away from 0x200000000, where
++//    libkernel keeps its own objects),
++//  - committing inside a reservation maps direct memory (16 KiB pages, 4.5 GiB with the plain
++//    homebrew identity) at the fixed address, zero-filled like an anonymous mapping,
++//  - other allocations (the recompiler's RWX code blocks) are plain mmaps, which the runtime's
++//    __wrap_mmap serves from system flexible memory (RWX allowed there).
++#include "util/MemMapper/MemMapper.h"
++
++#include <sys/mman.h>
++#include <sys/types.h>
++
++extern "C"
++{
++	int32_t sceKernelReserveVirtualRange(void** addr, size_t len, int32_t flags, size_t alignment);
++	int32_t sceKernelMunmap(void* addr, size_t len);
++	int32_t sceKernelMprotect(const void* addr, size_t len, int32_t prot);
++	size_t sceKernelGetDirectMemorySize(void);
++	int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t* physOut);
++	int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
++	int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align);
++}
++
++namespace MemMapper
++{
++	constexpr size_t kPage = 16 * 1024; // direct memory maps in 16 KiB pages only
++	constexpr int32_t kMapFixed = 0x10;
++	constexpr int32_t kMemoryTypeWbOnion = 0;
++	constexpr int32_t kProtCpuRead = 0x1, kProtCpuWrite = 0x2, kProtCpuExec = 0x4;
++	constexpr off_t kNotCommitted = -1;
++
++	struct Reservation
++	{
++		uintptr_t base;
++		size_t size;
++		std::vector<off_t> phys; // physical address of each committed 16 KiB page, kNotCommitted otherwise
++	};
++	std::mutex sMutex;
++	std::vector<Reservation> sReservations;
++	uintptr_t sNextHint = 0x4000000000ull; // the app heap lives at 0x1000000000+, vss at 0x2000000000
++
++	size_t GetPageSize()
++	{
++		return kPage;
++	}
++
++	static int32_t ToSceProt(PAGE_PERMISSION permissionFlags)
++	{
++		int32_t prot = 0;
++		if (HAS_FLAG(permissionFlags, PAGE_PERMISSION::P_READ))
++			prot |= kProtCpuRead;
++		if (HAS_FLAG(permissionFlags, PAGE_PERMISSION::P_WRITE))
++			prot |= kProtCpuRead | kProtCpuWrite;
++		if (HAS_FLAG(permissionFlags, PAGE_PERMISSION::P_EXECUTE))
++			prot |= kProtCpuRead | kProtCpuExec;
++		return prot;
++	}
++
++	static int ToPosixProt(PAGE_PERMISSION permissionFlags)
++	{
++		int prot = 0;
++		if (HAS_FLAG(permissionFlags, PAGE_PERMISSION::P_READ))
++			prot |= PROT_READ;
++		if (HAS_FLAG(permissionFlags, PAGE_PERMISSION::P_WRITE))
++			prot |= PROT_READ | PROT_WRITE;
++		if (HAS_FLAG(permissionFlags, PAGE_PERMISSION::P_EXECUTE))
++			prot |= PROT_READ | PROT_EXEC;
++		return prot;
++	}
++
++	static Reservation* FindReservation(uintptr_t addr)
++	{
++		for (auto& r : sReservations)
++			if (addr >= r.base && addr < r.base + r.size)
++				return &r;
++		return nullptr;
++	}
++
++	void* ReserveMemory(void* baseAddr, size_t size, PAGE_PERMISSION permissionFlags)
++	{
++		std::lock_guard _l(sMutex);
++		size = (size + kPage - 1) & ~(kPage - 1);
++		const size_t alignment = size >= 0x10000000 ? 0x10000000 : 0x200000;
++		void* addr = baseAddr;
++		int32_t r;
++		if (baseAddr)
++			r = sceKernelReserveVirtualRange(&addr, size, kMapFixed, kPage);
++		else
++		{
++			addr = (void*)((sNextHint + alignment - 1) & ~(alignment - 1));
++			r = sceKernelReserveVirtualRange(&addr, size, 0, alignment);
++			if (r == 0 && (uintptr_t)addr < 0x400000000ull)
++				cemuLog_log(LogType::Force, "MemMapper: reservation of {:#x} bytes landed low at {}", size, addr);
++		}
++		if (r != 0)
++		{
++			cemuLog_log(LogType::Force, "MemMapper: reserving {:#x} bytes at {} failed ({:#x})", size, baseAddr, (uint32)r);
++			return nullptr;
++		}
++		sNextHint = std::max(sNextHint, (uintptr_t)addr + size + 0x10000000);
++		sReservations.push_back({(uintptr_t)addr, size, std::vector<off_t>(size / kPage, kNotCommitted)});
++		return addr;
++	}
++
++	void FreeReservation(void* baseAddr, size_t size)
++	{
++		std::lock_guard _l(sMutex);
++		for (auto it = sReservations.begin(); it != sReservations.end(); ++it)
++		{
++			if (it->base != (uintptr_t)baseAddr)
++				continue;
++			sceKernelMunmap((void*)it->base, it->size);
++			for (off_t phys : it->phys)
++				if (phys != kNotCommitted)
++					sceKernelReleaseDirectMemory(phys, kPage);
++			sReservations.erase(it);
++			return;
++		}
++	}
++
++	// Commits pages [first, last) of a reservation that aren't committed yet, run by run.
++	static bool CommitPages(Reservation& res, size_t first, size_t last, int32_t prot)
++	{
++		size_t i = first;
++		while (i < last)
++		{
++			if (res.phys[i] != kNotCommitted)
++			{
++				sceKernelMprotect((void*)(res.base + i * kPage), kPage, prot);
++				i++;
++				continue;
++			}
++			size_t runEnd = i;
++			while (runEnd < last && res.phys[runEnd] == kNotCommitted)
++				runEnd++;
++			const size_t len = (runEnd - i) * kPage;
++			off_t phys = 0;
++			int32_t r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), len, kPage, kMemoryTypeWbOnion, &phys);
++			if (r != 0)
++			{
++				cemuLog_log(LogType::Force, "MemMapper: out of direct memory for {:#x} bytes ({:#x})", len, (uint32)r);
++				return false;
++			}
++			void* addr = (void*)(res.base + i * kPage);
++			r = sceKernelMapDirectMemory(&addr, len, prot | kProtCpuRead | kProtCpuWrite, kMapFixed, phys, kPage);
++			if (r != 0 || addr != (void*)(res.base + i * kPage))
++			{
++				cemuLog_log(LogType::Force, "MemMapper: mapping {:#x} bytes at {:#x} failed ({:#x})", len, res.base + i * kPage, (uint32)r);
++				sceKernelReleaseDirectMemory(phys, len);
++				return false;
++			}
++			memset(addr, 0, len); // direct memory isn't zeroed; committed memory must read as zero
++			if ((prot & kProtCpuWrite) == 0)
++				sceKernelMprotect(addr, len, prot);
++			for (size_t p = i; p < runEnd; p++)
++				res.phys[p] = phys + (off_t)((p - i) * kPage);
++			i = runEnd;
++		}
++		return true;
++	}
++
++	void* AllocateMemory(void* baseAddr, size_t size, PAGE_PERMISSION permissionFlags, bool fromReservation)
++	{
++		if (!fromReservation)
++		{
++			void* r = mmap(baseAddr, size, ToPosixProt(permissionFlags), MAP_PRIVATE | MAP_ANON, -1, 0);
++			return r == MAP_FAILED ? nullptr : r;
++		}
++		std::lock_guard _l(sMutex);
++		Reservation* res = FindReservation((uintptr_t)baseAddr);
++		if (!res || (uintptr_t)baseAddr + size > res->base + res->size)
++		{
++			cemuLog_log(LogType::Force, "MemMapper: commit of {:#x} bytes at {} outside any reservation", size, baseAddr);
++			return nullptr;
++		}
++		const size_t first = ((uintptr_t)baseAddr - res->base) / kPage;
++		const size_t last = ((uintptr_t)baseAddr + size - res->base + kPage - 1) / kPage;
++		if (!CommitPages(*res, first, last, ToSceProt(permissionFlags)))
++			return nullptr;
++		return baseAddr;
++	}
++
++	void FreeMemory(void* baseAddr, size_t size, bool fromReservation)
++	{
++		if (!fromReservation)
++		{
++			munmap(baseAddr, size);
++			return;
++		}
++		std::lock_guard _l(sMutex);
++		Reservation* res = FindReservation((uintptr_t)baseAddr);
++		if (!res)
++			return;
++		// only pages entirely inside the range: a partly covered page may still back other data
++		const size_t first = ((uintptr_t)baseAddr - res->base + kPage - 1) / kPage;
++		const size_t last = std::min(((uintptr_t)baseAddr + size - res->base) / kPage, res->phys.size());
++		for (size_t i = first; i < last; i++)
++		{
++			if (res->phys[i] == kNotCommitted)
++				continue;
++			void* addr = (void*)(res->base + i * kPage);
++			sceKernelMunmap(addr, kPage);
++			sceKernelReleaseDirectMemory(res->phys[i], kPage);
++			res->phys[i] = kNotCommitted;
++			// unmapping also dropped the reservation of this page: take it back
++			sceKernelReserveVirtualRange(&addr, kPage, kMapFixed, kPage);
++		}
++	}
++};

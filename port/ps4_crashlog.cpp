@@ -44,12 +44,7 @@ int g_traceFd = -1;
 int traceFd() {
     if (g_traceFd < 0) {
         mkdir("/data/CemuPS4", 0777);
-        // A game start (launch.txt from the XMB) writes boot-trace.log; the XMB writes
-        // xmb-trace.log, so restarting into the XMB keeps the last game's trace.
-        struct stat st;
-        const bool game = stat("/data/CemuPS4/launch.txt", &st) == 0;
-        g_traceFd = open(game ? "/data/CemuPS4/boot-trace.log" : "/data/CemuPS4/xmb-trace.log",
-                         O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        g_traceFd = open("/data/CemuPS4/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;
 }
@@ -126,10 +121,10 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     if (traceFd() >= 0)
         writeAll(traceFd(), "crashed (see crash.log)\n");
 
-    // Back to the default action: returning re-executes the faulting instruction, which now
-    // ends the process with the system's crash report.
-    setHandler(sig, nullptr, 0);
-    s_depth = 0;
+    // End the process here rather than with the system's crash report: on FW 13.52 that
+    // coredump of a homebrew app never finished and hung the console until a hard power-off
+    // (DolphinPS4), and the report itself is encrypted.
+    _exit(128 + sig);
 }
 
 // std::terminate (e.g. an uncaught exception): record what was thrown, then abort as usual.
