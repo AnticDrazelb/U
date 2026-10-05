@@ -88,8 +88,11 @@ void setHandler(int sig, void (*handler)(int, siginfo_t*, void*), int flags) {
 
 void crashHandler(int sig, siginfo_t* info, void* context) {
     static volatile int s_depth = 0;
+    // Crashed while reporting (typically the stack scan running off the end of a small thread
+    // stack): end the process now. Returning re-ran the faulting read forever, leaving the crashed
+    // thread spinning and the app hanging on a black screen.
     if (s_depth++ > 0)
-        return;  // crashed while reporting: give up
+        _exit(128 + sig);
 
     const int fd = open("/data/CemuPS4/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
@@ -132,9 +135,16 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     char message[512] = "std::terminate called";
     if (const std::type_info* type = abi::__cxa_current_exception_type()) {
         int status = 0;
-        // Type only: Dolphin builds with -fno-exceptions, so what() can't be fetched here.
         char* name = abi::__cxa_demangle(type->name(), nullptr, nullptr, &status);
-        snprintf(message, sizeof(message), "uncaught exception %s", name ? name : type->name());
+        const char* what = "";
+        try {
+            if (std::exception_ptr current = std::current_exception())
+                std::rethrow_exception(current);
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+        }
+        snprintf(message, sizeof(message), "uncaught exception %s: %s", name ? name : type->name(), what);
     }
     const int fd = open("/data/CemuPS4/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {

@@ -78,10 +78,10 @@ index b509e72..22777eb 100644
  	    HW/Latte/Renderer/MetalView.mm
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..b503af7
+index 0000000..91283f2
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,481 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -458,7 +458,10 @@ index 0000000..b503af7
 +			VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 +			si.signalSemaphoreCount = semaphore ? 1 : 0;
 +			si.pSignalSemaphores = &semaphore;
-+			return Device<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(GraphicsQueue(device), 1, &si, fence);
++			const VkResult r = Device<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(GraphicsQueue(device), 1, &si, fence);
++			if (r != VK_SUCCESS)
++				cemuLog_log(LogType::Force, "PS4WSI: acquire signal submit failed: {}", (sint32)r);
++			return r;
 +		}
 +		return VK_SUCCESS;
 +	}
@@ -480,10 +483,15 @@ index 0000000..b503af7
 +			const sint64 arg = (sint64)(sFlipsSubmitted + 1);
 +			int r;
 +			if (si.waitSemaphoreCount)
-+				queueSubmit(queue, 1, &si, VK_NULL_HANDLE);
++			{
++				const VkResult sr = queueSubmit(queue, 1, &si, VK_NULL_HANDLE);
++				if (sr != VK_SUCCESS)
++					cemuLog_log(LogType::Force, "PS4WSI: present semaphore submit failed: {}", (sint32)sr);
++			}
 +			// the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
 +			r = ac_ps4_submit_flip(sVideo, buffer, sc->flipMode, arg);
-+			if (r != 0)
++			const bool gpuFlip = r == 0;
++			if (!gpuFlip)
 +			{
 +				// fallback: wait for the GPU on the CPU, then flip
 +				Device<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
@@ -495,7 +503,11 @@ index 0000000..b503af7
 +				result = VK_ERROR_SURFACE_LOST_KHR;
 +			}
 +			else
++			{
 +				sFlipsSubmitted++;
++				if (sFlipsSubmitted <= 3)
++					cemuLog_log(LogType::Force, "PS4WSI: flip {} of buffer {} ({})", sFlipsSubmitted, buffer, gpuFlip ? "GPU-side" : "CPU wait");
++			}
 +			if (info->pResults)
 +				info->pResults[i] = r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
 +		}
@@ -551,6 +563,37 @@ index 0000000..b503af7
 +{
 +	return (VkSurfaceKHR)new PS4Surface();
 +}
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp
+index b27aae0..eed31fa 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp
+@@ -228,7 +228,14 @@ bool SwapchainInfoVk::AcquireImage()
+ 	ResetAvailableFence();
+ 
+ 	VkSemaphore acquireSemaphore = m_acquireSemaphores[m_acquireIndex];
++#ifdef __ORBIS__
++	// PS4WSI.cpp: acquire waits on the CPU until the image is off screen, and there is one in-order
++	// queue, so there is nothing for the GPU to wait for (and no empty submit to signal it)
++	acquireSemaphore = VK_NULL_HANDLE;
++	VkResult result = vkAcquireNextImageKHR(m_logicalDevice, m_swapchain, 1'000'000'000, VK_NULL_HANDLE, VK_NULL_HANDLE, &swapchainImageIndex);
++#else
+ 	VkResult result = vkAcquireNextImageKHR(m_logicalDevice, m_swapchain, 1'000'000'000, acquireSemaphore, m_imageAvailableFence, &swapchainImageIndex);
++#endif
+ 	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+ 		m_shouldRecreate = true;
+ 	if (result == VK_TIMEOUT)
+@@ -245,7 +252,11 @@ bool SwapchainInfoVk::AcquireImage()
+ 		return false;
+ 	}
+ 	m_currentSemaphore = acquireSemaphore;
++#ifdef __ORBIS__
++	m_awaitableFence = VK_NULL_HANDLE;
++#else
+ 	m_awaitableFence = m_imageAvailableFence;
++#endif
+ 	m_acquireIndex = (m_acquireIndex + 1) % m_swapchainImages.size();
+ 
+ 	return true;
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
 index b7dc500..c9b170a 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
@@ -632,7 +675,7 @@ index f503c10..e0f4011 100644
  VKFUNC_INSTANCE(vkCreateXcbSurfaceKHR);
  #ifdef HAS_WAYLAND
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..1a8328e 100644
+index 599190a..eb92485 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -671,6 +714,28 @@ index 599190a..1a8328e 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
+@@ -3038,7 +3044,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+ 
+ 	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
+ 
++#ifdef __ORBIS__
++	// PS4WSI.cpp queues the flip behind this submit on the same in-order queue: no semaphore needed
++	VkSemaphore presentSemaphore = VK_NULL_HANDLE;
++#else
+ 	VkSemaphore presentSemaphore = chainInfo.m_presentSemaphores[chainInfo.swapchainImageIndex];
++#endif
+ 	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
+ 
+ 	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
+@@ -3057,7 +3068,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+ 	presentInfo.pSwapchains = &chainInfo.m_swapchain;
+ 	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
+ 	// wait on command buffer semaphore
+-	presentInfo.waitSemaphoreCount = 1;
++	presentInfo.waitSemaphoreCount = presentSemaphore != VK_NULL_HANDLE ? 1 : 0;
+ 	presentInfo.pWaitSemaphores = &presentSemaphore;
+ 
+ 	// if present_wait is available and enabled, add frame markers to present requests
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 index d975e11..9ed1d1e 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
