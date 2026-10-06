@@ -12,6 +12,12 @@ mkdir -p "$OUT"
 for f in boot-trace.log crash.log log.txt; do
     curl -s --max-time 30 -o "$OUT/$f" "$HOST/data/CemuPS4/$f" || rm -f "$OUT/$f"
 done
+# TV screenshots the frontend takes during a run (PS4WindowSystem.cpp)
+rm -rf "$OUT/screenshots"; mkdir -p "$OUT/screenshots"
+for f in $(curl -s --max-time 30 --list-only "$HOST/data/CemuPS4/screenshots/" | grep '\.png$'); do
+    curl -s --max-time 60 -o "$OUT/screenshots/$f" "$HOST/data/CemuPS4/screenshots/$f"
+done
+echo "== screenshots: $(ls "$OUT/screenshots" | tr '\n' ' ')"
 echo "== boot-trace.log"; cat "$OUT/boot-trace.log" 2>/dev/null || echo "(none)"
 echo "== log.txt (last 60 lines)"; tail -60 "$OUT/log.txt" 2>/dev/null || echo "(none)"
 if [ -s "$OUT/crash.log" ]; then

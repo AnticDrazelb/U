@@ -904,10 +904,10 @@ index d66e971..49e209f 100644
  endif()
 diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
 new file mode 100644
-index 0000000..c471a05
+index 0000000..a20b8c8
 --- /dev/null
 +++ b/src/gui/ps4/CMakeLists.txt
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +add_library(CemuPS4Gui PS4WindowSystem.cpp)
 +
 +set_property(TARGET CemuPS4Gui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -922,13 +922,14 @@ index 0000000..c471a05
 +	CemuInput
 +	CemuUtil
 +	Boost::headers
++	PNG::PNG
 +)
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..e09b81d
+index 0000000..5787a3a
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,405 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -952,6 +953,8 @@ index 0000000..e09b81d
 +#include "input/ControllerFactory.h"
 +#include "input/InputManager.h"
 +#include "util/helpers/helpers.h"
++
++#include <png.h>
 +
 +#include <orbis/Sysmodule.h>
 +#include <orbis/libkernel.h>
@@ -1020,6 +1023,32 @@ index 0000000..e09b81d
 +			}
 +		}
 +		return true;
++	}
++
++	bool WritePNG(const fs::path& path, const std::vector<uint8>& rgb, int width, int height)
++	{
++		if (rgb.size() < (size_t)width * height * 3)
++			return false;
++		FILE* file = fopen(_pathToUtf8(path).c_str(), "wb");
++		if (!file)
++			return false;
++		png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
++		png_infop info = png ? png_create_info_struct(png) : nullptr;
++		bool ok = false;
++		if (png && info && setjmp(png_jmpbuf(png)) == 0)
++		{
++			png_init_io(png, file);
++			png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
++			png_set_compression_level(png, 3);
++			png_write_info(png, info);
++			for (int y = 0; y < height; y++)
++				png_write_row(png, rgb.data() + (size_t)y * width * 3);
++			png_write_end(png, nullptr);
++			ok = true;
++		}
++		png_destroy_write_struct(&png, &info);
++		fclose(file);
++		return ok;
 +	}
 +
 +	bool IsLaunchable(const fs::path& path)
@@ -1174,11 +1203,26 @@ index 0000000..e09b81d
 +		CafeSystem::LaunchForegroundTitle();
 +		Trace("launched");
 +
-+		// the emulator runs on its own threads; the main thread only reports progress
-+		for (uint64 seconds = 0;; seconds += 10)
++		// The emulator runs on its own threads; the main thread reports progress and takes TV
++		// screenshots (5, 15 and 30 s after launch, then tv-latest.png every minute) so a run can
++		// be checked from the files alone.
++		fs::create_directories(kDataRoot / "screenshots", ec);
++		for (uint64 seconds = 1;; seconds++)
 +		{
-+			std::this_thread::sleep_for(std::chrono::seconds(10));
-+			Trace(fmt::format("alive {} s", seconds + 10));
++			std::this_thread::sleep_for(std::chrono::seconds(1));
++			if (seconds % 10 == 0)
++				Trace(fmt::format("alive {} s", seconds));
++			if (seconds == 5 || seconds == 15 || seconds == 30 || seconds % 60 == 0)
++			{
++				const std::string name = seconds % 60 == 0 ? "tv-latest.png" : fmt::format("tv-{:03}s.png", seconds);
++				g_renderer->RequestScreenshot([name](const std::vector<uint8>& rgb, int width, int height, bool mainWindow) -> std::optional<std::string> {
++					if (!mainWindow)
++						return std::nullopt;
++					const fs::path path = kDataRoot / "screenshots" / name;
++					Trace(fmt::format("screenshot {} ({}x{}): {}", name, width, height, WritePNG(path, rgb, width, height) ? "saved" : "failed"));
++					return std::nullopt;
++				});
++			}
 +		}
 +	}
 +}
