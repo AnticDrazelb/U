@@ -76,6 +76,31 @@ index b509e72..22777eb 100644
  if(APPLE)
  	target_sources(CemuCafe PRIVATE
  	    HW/Latte/Renderer/MetalView.mm
+diff --git a/src/Cafe/HW/Espresso/PPCTimer.cpp b/src/Cafe/HW/Espresso/PPCTimer.cpp
+index 257973a..67a596c 100644
+--- a/src/Cafe/HW/Espresso/PPCTimer.cpp
++++ b/src/Cafe/HW/Espresso/PPCTimer.cpp
+@@ -75,10 +75,20 @@ int PPCTimer_initThread()
+ 	return 0;
+ }
+ 
++#ifdef __ORBIS__
++extern "C" uint64_t sceKernelGetTscFrequency();
++#endif
++
+ void PPCTimer_init()
+ {
++#ifdef __ORBIS__
++	// PS4: the kernel knows the exact TSC frequency
++	_rdtscFrequency = sceKernelGetTscFrequency();
++	cemuLog_log(LogType::Force, "TSC frequency: {} Hz", _rdtscFrequency);
++#else
+ 	std::thread t(PPCTimer_initThread);
+ 	t.detach();
++#endif
+ 	_rdtscLastMeasure = __rdtsc();
+ }
+ 
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
 index 0000000..4978912
@@ -1950,3 +1975,18 @@ index 0000000..ff346d0
 +		}
 +	}
 +};
+diff --git a/src/util/highresolutiontimer/HighResolutionTimer.cpp b/src/util/highresolutiontimer/HighResolutionTimer.cpp
+index 6bb96a8..8c7108e 100644
+--- a/src/util/highresolutiontimer/HighResolutionTimer.cpp
++++ b/src/util/highresolutiontimer/HighResolutionTimer.cpp
+@@ -31,7 +31,9 @@ uint64 HighResolutionTimer::m_freq = []() -> uint64 {
+ 	LARGE_INTEGER freq;
+ 	QueryPerformanceFrequency(&freq);
+ 	return (uint64)(freq.QuadPart);
+-#elif BOOST_OS_MACOS
++#elif BOOST_OS_MACOS || defined(__ORBIS__)
++	// PS4: ticks are nanoseconds; the OpenOrbis (musl) clock_getres issues a Linux syscall number to
++	// the FreeBSD kernel and returned garbage, which skewed the emulated clock
+ 	return 1000000000;
+ #elif BOOST_OS_BSD
+ 	timespec pc;
