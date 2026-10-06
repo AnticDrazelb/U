@@ -78,10 +78,10 @@ index b509e72..22777eb 100644
  	    HW/Latte/Renderer/MetalView.mm
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..91283f2
+index 0000000..4978912
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,518 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -247,7 +247,7 @@ index 0000000..91283f2
 +	VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR* caps)
 +	{
 +		*caps = {};
-+		caps->minImageCount = 2;
++		caps->minImageCount = 3; // as DolphinPS4: render into one while one is shown and one is queued
 +		caps->maxImageCount = 3;
 +		caps->currentExtent = {kWidth, kHeight};
 +		caps->minImageExtent = {kWidth, kHeight};
@@ -422,21 +422,57 @@ index 0000000..91283f2
 +
 +	// The image about to be rendered into must be off screen: with N images in rotation it was
 +	// shown by flip n-N+1 and replaced on screen by flip n-N+2 (n = flips submitted).
++	// present statistics, logged every 5 s (QueuePresentKHR)
++	struct
++	{
++		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++		uint64 flips = 0;
++		uint64 waitNs = 0;
++		uint32 timeouts = 0;
++		sint64 lastFlipArg = 0;
++	} sStats;
++
 +	void WaitImageOffScreen(uint32 imageCount)
 +	{
 +		if (sFlipsSubmitted < imageCount - 1)
 +			return;
 +		const sint64 needed = (sint64)(sFlipsSubmitted - (imageCount - 2));
-+		for (int tries = 0; tries < 40; tries++)
++		const auto t0 = std::chrono::steady_clock::now();
++		bool done = false;
++		for (int tries = 0; tries < 40 && !done; tries++)
 +		{
 +			OrbisVideoOutFlipStatus status{};
-+			if (sceVideoOutGetFlipStatus(sVideo, &status) < 0 || status.flipArg >= needed)
-+				return;
++			if (sceVideoOutGetFlipStatus(sVideo, &status) < 0)
++				break;
++			sStats.lastFlipArg = status.flipArg;
++			if (status.flipArg >= needed)
++			{
++				done = true;
++				break;
++			}
 +			OrbisKernelEvent ev;
 +			int got = 0;
 +			OrbisKernelUseconds timeout = 5000;
 +			sceKernelWaitEqueue(sFlipQueue, &ev, 1, &got, &timeout);
 +		}
++		if (!done)
++			sStats.timeouts++;
++		sStats.waitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++	}
++
++	void CountPresent()
++	{
++		sStats.flips++;
++		const auto now = std::chrono::steady_clock::now();
++		const double secs = std::chrono::duration<double>(now - sStats.start).count();
++		if (secs < 5.0)
++			return;
++		cemuLog_log(LogType::Force, "PS4WSI: {:.1f} flips/s, acquire waits {:.0f} ms/s, {} timeouts, flipArg {} of {} submitted",
++			sStats.flips / secs, sStats.waitNs / 1e6 / secs, sStats.timeouts, sStats.lastFlipArg, sFlipsSubmitted);
++		sStats.start = now;
++		sStats.flips = 0;
++		sStats.waitNs = 0;
++		sStats.timeouts = 0;
 +	}
 +
 +	VkQueue GraphicsQueue(VkDevice device)
@@ -505,6 +541,7 @@ index 0000000..91283f2
 +			else
 +			{
 +				sFlipsSubmitted++;
++				CountPresent();
 +				if (sFlipsSubmitted <= 3)
 +					cemuLog_log(LogType::Force, "PS4WSI: flip {} of buffer {} ({})", sFlipsSubmitted, buffer, gpuFlip ? "GPU-side" : "CPU wait");
 +			}
