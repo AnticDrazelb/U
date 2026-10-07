@@ -1806,10 +1806,10 @@ index 0000000..14bb922
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..9e1d524
+index 0000000..7be8971
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,570 @@
+@@ -0,0 +1,661 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -1973,6 +1973,96 @@ index 0000000..9e1d524
 +			}
 +		}
 +		return true;
++	}
++
++	// A placeholder for the Wii U's Mii parts resources (FFLResHigh.dat etc. in system title
++	// 0005001B10056000), from scripts/make-placeholder-ffl.py. Games link the Mii library (FFL)
++	// statically; without its resource NSMBU dereferences a null model later and crashes. This one
++	// holds no Nintendo data: every 3D part is empty (FFL draws nothing for an empty shape) and every
++	// texture part is one blank 64x64 texture (a texture can't be empty: FFL reads its footer from
++	// the end of the data), so Miis are invisible. Layout from github.com/aboood40091/ffl.
++	std::vector<uint8> MakePlaceholderMiiResource()
++	{
++		constexpr uint32 kHeaderSize = 0x4A00, kSide = 64, kUncompressed = 5;
++		// parts per texture type (beard, cap, eye, eyebrow, faceline, face makeup, glass, mole,
++		// mouth, mustache, noseline) and per shape type (beard, cap 1/2, faceline, glass, mask,
++		// noseline, nose, hair 1/2, forehead 1/2)
++		constexpr uint32 kTextureParts[] = {3, 132, 62, 24, 12, 12, 9, 2, 37, 6, 18};
++		constexpr uint32 kShapeParts[] = {4, 132, 132, 12, 1, 12, 18, 18, 132, 132, 132, 132};
++		// 64x64 RGBA8 (format 2), one mip, transparent; then the footer: mip offset, width, height,
++		// mip count, format
++		constexpr uint32 kTextureSize = kSide * kSide * 4 + 12;
++
++		std::vector<uint8> data;
++		auto put32 = [&](uint32 v) { for (int s = 24; s >= 0; s -= 8) data.push_back((uint8)(v >> s)); };
++		auto put16 = [&](uint16 v) { data.push_back((uint8)(v >> 8)); data.push_back((uint8)v); };
++		auto zeros = [&](size_t n) { data.insert(data.end(), n, 0); };
++
++		// magic, version, uncompress buffer size (nothing is compressed), unused, "is expand" (no)
++		data.insert(data.end(), {'F', 'F', 'R', 'A'});
++		put32(0x00070000);
++		put32(kTextureSize);
++		zeros(4);
++		put32(0);
++		// texture header: largest part per type, then every part's info (data position, size,
++		// compressed size, compress level, window bits, memory level, strategy); all share one texture
++		for (size_t i = 0; i < std::size(kTextureParts); i++)
++			put32(kTextureSize);
++		for (uint32 n : kTextureParts)
++			for (uint32 i = 0; i < n; i++)
++			{
++				put32(kHeaderSize);
++				put32(kTextureSize);
++				put32(kTextureSize);
++				data.insert(data.end(), {0, 0, 0, (uint8)kUncompressed});
++			}
++		// shape header: every part empty
++		uint32 shapeParts = 0;
++		for (uint32 n : kShapeParts)
++			shapeParts += n;
++		zeros(4 * std::size(kShapeParts) + 0x10 * shapeParts);
++		cemu_assert(data.size() <= kHeaderSize);
++		zeros(kHeaderSize - data.size());
++
++		zeros(kSide * kSide * 4);
++		put32(0);
++		put16(kSide);
++		put16(kSide);
++		data.insert(data.end(), {1, 2, 0, 0});
++		// FFL reads parts in sizes rounded up to 0x40
++		zeros((0x40 - data.size() % 0x40) % 0x40);
++		return data;
++	}
++
++	// Writes the placeholder Mii resources where they are missing, or (setting off) removes the ones
++	// written earlier. A real dump is never touched: only files identical to the placeholder are
++	// removed.
++	void SetupMiiResources(const fs::path& mlc, bool placeholder)
++	{
++		const fs::path dir = mlc / "sys/title/0005001b/10056000/content";
++		const std::vector<uint8> resource = MakePlaceholderMiiResource();
++		std::error_code ec;
++		for (const char* name : {"FFLResHigh.dat", "FFLResMiddle.dat", "FFLResHighLG.dat", "FFLResMiddleLG.dat"})
++		{
++			const fs::path path = dir / name;
++			const bool exists = fs::exists(path, ec);
++			if (placeholder && !exists)
++			{
++				fs::create_directories(dir, ec);
++				std::ofstream file(path, std::ios::binary);
++				file.write((const char*)resource.data(), (std::streamsize)resource.size());
++				Trace(fmt::format("Mii data missing: wrote the placeholder {}", name));
++			}
++			else if (!placeholder && exists && fs::file_size(path, ec) == resource.size())
++			{
++				std::ifstream file(path, std::ios::binary);
++				std::vector<uint8> current(resource.size());
++				file.read((char*)current.data(), (std::streamsize)current.size());
++				file.close();
++				if (current == resource && fs::remove(path, ec))
++					Trace(fmt::format("Mii data placeholder off: removed {}", name));
++			}
++		}
 +	}
 +
 +	bool WritePNG(const fs::path& path, const std::vector<uint8>& rgb, int width, int height)
@@ -2214,6 +2304,7 @@ index 0000000..9e1d524
 +		const uint64 titleId = CafeSystem::GetForegroundTitleId();
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
++		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) == "placeholder");
 +		PS4PauseMenu::Install(gameId, _pathToUtf8(game));
 +		sPerfLog = CremaSettings::On("perf_log", gameId);
 +		sFreezeReports = CremaSettings::On("freeze_reports", gameId);
@@ -2641,10 +2732,10 @@ index 0000000..bc4f953
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..909a5aa
+index 0000000..3a5a14f
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,357 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -2693,6 +2784,9 @@ index 0000000..909a5aa
 +				{"pt", "Português"}, {"nl", "Nederlands"}, {"pl", "Polski"}, {"tr", "Türkçe"}, {"ru", "Русский"},
 +				{"ja", "日本語"}, {"zh", "中文 (简体)"}, {"ko", "한국어"}},
 +			"en", false, "The menus' language, and the Wii U's system language where it has it."},
++		{"mii_data", "Mii Data When Missing", "Emulation",
++			{{"placeholder", "Blank Placeholder"}, {"off", "None"}}, "placeholder", false,
++			"Without a dump of the Wii U's Mii data, games that show Miis (New Super Mario Bros. U) crash. The placeholder makes Miis invisible instead. A real dump is never replaced."},
 +		// Audio
 +		{"game_volume", "Game Volume", "Audio",
 +			{{"100", "100"}, {"90", "90"}, {"80", "80"}, {"70", "70"}, {"60", "60"}, {"50", "50"},
