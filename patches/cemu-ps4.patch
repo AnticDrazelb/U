@@ -1003,6 +1003,28 @@ index d975e11..9ed1d1e 100644
  	static VkSurfaceKHR CreateXlibSurface(VkInstance instance, Display* dpy, Window window);
      static VkSurfaceKHR CreateXcbSurface(VkInstance instance, xcb_connection_t* connection, xcb_window_t window);
  	#ifdef HAS_WAYLAND
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit.cpp b/src/Cafe/OS/libs/coreinit/coreinit.cpp
+index 4d454e0..2b66546 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit.cpp
+@@ -256,8 +256,17 @@ namespace coreinit
+ 		return 0;
+ 	}
+ 
++#ifdef __ORBIS__
++}
++std::string g_crema_last_panic; // gui/ps4/PS4WindowSystem.cpp: shown when the game then exits
++namespace coreinit
++{
++#endif
+ 	void OSPanic(const char* file, sint32 lineNumber, const char* msg)
+ 	{
++#ifdef __ORBIS__
++		g_crema_last_panic = fmt::format("{} ({}:{})", msg ? msg : "", file ? file : "", lineNumber);
++#endif
+ 		cemuLog_log(LogType::Force, "OSPanic!");
+ 		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
+ 		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 index 9fe4bea..64cc2d3 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
@@ -1176,6 +1198,53 @@ index e037395..a832fd3 100644
  #else
      #include <csignal>
      #define DEBUG_BREAK raise(SIGTRAP) 
+diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
+index b54d3ef..0a02cb8 100644
+--- a/src/Common/unix/FileStream_unix.cpp
++++ b/src/Common/unix/FileStream_unix.cpp
+@@ -99,11 +99,19 @@ uint64 FileStream::GetSize()
+ 	return fs;
+ }
+ 
++// The file ends at the current position (FSTruncateFile, FSSetFileLength). It used to report
++// success and do nothing: a save rewritten shorter kept its old tail, which games then read back
++// as data (suspected in Minecraft: Wii U Edition crashing as it loads its own saved chunks).
+ bool FileStream::SetEndOfFile()
+ {
+-	assert_dbg();
+-	return true;
+-	//return ::SetEndOfFile(m_hFile) != 0;
++	cemu_assert(m_isValid);
++	const std::streampos pos = m_prevOperationWasWrite ? m_fileStream.tellp() : m_fileStream.tellg();
++	if (pos < 0)
++		return false;
++	m_fileStream.flush();
++	std::error_code ec;
++	fs::resize_file(m_path, (uintmax_t)pos, ec);
++	return !ec;
+ }
+ 
+ void FileStream::extract(std::vector<uint8>& data)
+@@ -213,6 +221,7 @@ FileStream::~FileStream()
+ FileStream::FileStream(const fs::path& path, bool isOpen, bool isWriteable)
+ {
+ 	fs::path CIPath = findPathCI(path);
++	m_path = CIPath;
+ 	if (isOpen)
+ 	{
+ 		m_fileStream.open(CIPath, isWriteable ? (std::ios_base::in | std::ios_base::out | std::ios_base::binary) : (std::ios_base::in | std::ios_base::binary));
+diff --git a/src/Common/unix/FileStream_unix.h b/src/Common/unix/FileStream_unix.h
+index 29261dd..1dc6ba1 100644
+--- a/src/Common/unix/FileStream_unix.h
++++ b/src/Common/unix/FileStream_unix.h
+@@ -55,6 +55,7 @@ class FileStream
+ 	FileStream(const fs::path& path, bool isOpen, bool isWriteable);
+ 
+ 	bool m_isValid{};
++	fs::path m_path; // SetEndOfFile
+ 	std::fstream m_fileStream;
+ 	bool m_prevOperationWasWrite{false};
+ 
 diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
 index 7f2d626..44e8f36 100644
 --- a/src/audio/CMakeLists.txt
@@ -3173,10 +3242,10 @@ index 0000000..489dc96
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..6c3dfad
+index 0000000..0c951e4
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,690 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -3209,6 +3278,9 @@ index 0000000..6c3dfad
 +
 +#include <png.h>
 +
++#include <fcntl.h>
++#include <unistd.h>
++
 +#include <orbis/Pad.h>
 +#include <orbis/Sysmodule.h>
 +#include <orbis/libkernel.h>
@@ -3222,6 +3294,7 @@ index 0000000..6c3dfad
 +extern "C" void ac_ps4_get_gpu_busy(uint64_t* busy_ticks, uint64_t* span_ticks); // port/mesa/ac_ps4_drm.c
 +
 +void CemuCommonInit(); // main.cpp
++extern std::string g_crema_last_panic; // Cafe/OS/libs/coreinit/coreinit.cpp: the game's last OSPanic
 +
 +namespace
 +{
@@ -3441,6 +3514,50 @@ index 0000000..6c3dfad
 +		return found.empty() ? fs::path() : found.front();
 +	}
 +
++	// When a game stops (it crashed, or ended itself with an error), the app restarts into the
++	// launcher, which shows why: data_dir/last-stop.txt, its first line the panel's title, then
++	// the lines shown (Launcher.cpp reads and removes it). The game's details and whether it has its
++	// update and DLC are prepared at game start, so the crash handler only has to write them.
++	char sStopInfo[1024] = {};
++
++	std::string StopInfoText(const std::string& name, uint64 titleId)
++	{
++		std::error_code ec;
++		const std::string low = fmt::format("{:08x}", (uint32)titleId);
++		const fs::path titles = ActiveSettings::GetMlcPath() / "usr/title";
++		const bool update = fs::exists(titles / "0005000e" / low, ec);
++		const bool dlc = fs::exists(titles / "0005000c" / low, ec);
++		std::string text = name + "\n\n";
++		text += update ? fmt::format("Update: installed (v{})\n", CafeSystem::GetForegroundTitleVersion()) : "Update: not installed\n";
++		text += dlc ? "DLC: installed\n" : "DLC: not installed\n";
++		if (!update)
++			text += "\nGames often need their latest update.\nPut it in mlc01/usr/title/0005000e/" + low + "\n";
++		text += "\nDetails are in crash.log and log.txt.\n";
++		return text;
++	}
++
++	void WriteStopNote(const char* headline, const char* detail)
++	{
++		const int fd = open((kDataRoot / "last-stop.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
++		if (fd < 0)
++			return;
++		auto put = [fd](const char* text) {
++			if (text)
++				write(fd, text, strlen(text));
++		};
++		put("Game Stopped\n");
++		put(headline);
++		put("\n");
++		if (detail && *detail)
++		{
++			put(detail);
++			put("\n");
++		}
++		put("\n");
++		put(sStopInfo);
++		close(fd);
++	}
++
 +	// Cemu's frontend callbacks: when the game ends its process (it quit, or gave up with an error),
 +	// the app restarts into the launcher, as the Wii U returns to its menu.
 +	class PS4SystemImplementation : public CafeSystem::SystemImplementation
@@ -3449,12 +3566,38 @@ index 0000000..6c3dfad
 +		void CafeRecreateCanvas() override {}
 +		void CafePPCProcessExit() override
 +		{
-+			Trace(fmt::format("the game ended (exit status {}): back to the launcher", CafeSystem::GetForegroundTitleReturnStatus().value_or(-1)));
++			const sint32 status = CafeSystem::GetForegroundTitleReturnStatus().value_or(-1);
++			Trace(fmt::format("the game ended (exit status {}): back to the launcher", status));
++			if (status != 0)
++			{
++				const std::string headline = fmt::format("The game closed itself with an error ({}).", status);
++				const std::string detail = g_crema_last_panic.empty() ? std::string() : "Game error: " + g_crema_last_panic;
++				WriteStopNote(headline.c_str(), detail.c_str());
++			}
 +			std::error_code ec;
 +			fs::remove(kDataRoot / "launch.txt", ec);
 +			sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
 +		}
 +	} sSystemImplementation;
++} // namespace
++
++// The port's crash handler (port/ps4_crashlog.cpp), once crash.log is written: the note for the
++// launcher (only write(), as in a signal handler), then back into the launcher. Before a game
++// started (the launcher itself) there's no note and no restart.
++extern "C" void ps4_crash_note()
++{
++	if (sStopInfo[0])
++		WriteStopNote("The game crashed.", nullptr);
++}
++
++extern "C" void ps4_crash_restart()
++{
++	if (sStopInfo[0])
++		sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
++}
++
++namespace
++{
 +
 +	// What to boot: launch.txt (written by the launcher or by hand) starts that game once; else
 +	// the default game (unless L1 is held); else the launcher, which writes launch.txt and
@@ -3618,6 +3761,7 @@ index 0000000..6c3dfad
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
 +		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) != "off");
++		snprintf(sStopInfo, sizeof(sStopInfo), "%s", StopInfoText(CafeSystem::GetForegroundTitleName(), titleId).c_str());
 +		PS4PauseMenu::LoadGameControls(gameId);
 +		PS4PauseMenu::Install(gameId, _pathToUtf8(game));
 +		sPerfLog = CremaSettings::On("perf_log", gameId);
@@ -4485,10 +4629,10 @@ index 0000000..4937718
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..49111f4
+index 0000000..dc4b03b
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,2972 @@
+@@ -0,0 +1,3007 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -6143,6 +6287,15 @@ index 0000000..49111f4
 +						}
 +						m_panel.lines.push_back("Format: " + game.format);
 +						m_panel.lines.push_back("File: " + fs::path(game.path).filename().string());
++						if (!game.homebrew && game.id.size() == 16)
++						{
++							// update and DLC in Cemu's place for them (mlc01/usr/title/0005000e|c/<low ID>)
++							std::error_code ec;
++							const std::string titles = m_dataDir + "/mlc01/usr/title/";
++							const std::string low = game.id.substr(8);
++							m_panel.lines.push_back(std::string("Update: ") + (fs::exists(titles + "0005000e/" + low, ec) ? "installed" : "not installed"));
++							m_panel.lines.push_back(std::string("DLC: ") + (fs::exists(titles + "0005000c/" + low, ec) ? "installed" : "not installed"));
++						}
 +						Play("confirm");
 +						return;
 +					}
@@ -7388,6 +7541,32 @@ index 0000000..49111f4
 +			OpenSettingPanel(SET_STYLE);
 +			m_panel.title = "Choose a Menu Style";
 +			m_firstStyle = true;
++		}
++		else
++		{
++			// A game stopped (crashed, or ended itself with an error): why, from the game process
++			// (PS4WindowSystem.cpp: last-stop.txt, its first line the title), shown once, no intro.
++			const std::string notePath = m_dataDir + "/last-stop.txt";
++			const std::string note = ReadFile(notePath);
++			if (!note.empty())
++			{
++				std::vector<std::string> lines;
++				size_t start = 0;
++				while (start < note.size())
++				{
++					const size_t end = note.find('\n', start);
++					lines.push_back(note.substr(start, end == std::string::npos ? std::string::npos : end - start));
++					start = end == std::string::npos ? note.size() : end + 1;
++				}
++				m_panel = SidePanel{};
++				m_panel.open = true;
++				m_panel.title = lines.front();
++				m_panel.lines.assign(lines.begin() + 1, lines.end());
++				m_intro = false;
++				Log("game stopped: " + (lines.size() > 1 ? lines[1] : std::string()));
++				std::error_code ec;
++				fs::remove(notePath, ec);
++			}
 +		}
 +		Log("menu: " + std::to_string(m_games.size()) + " games, " + std::to_string(m_wallpapers.size()) + " wallpapers");
 +		// Covers missing for any game are fetched in the background every time the launcher opens.

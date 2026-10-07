@@ -29,6 +29,16 @@
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" __attribute__((weak)) void ps4_crash_guest_info();  // the emulator's, if it has one
 extern "C" __attribute__((weak)) void ps4_crash_guest_regs(int fd);  // lock-free, into crash.log
+// the emulator's note for its menu, and its restart into the menu (Crema: PS4WindowSystem.cpp)
+extern "C" __attribute__((weak)) void ps4_crash_note();
+extern "C" __attribute__((weak)) void ps4_crash_restart();
+
+// Back into the emulator's menu if it has one, else the process ends.
+[[noreturn]] static void endAfterCrash(int status) {
+    if (ps4_crash_restart)
+        ps4_crash_restart();
+    _exit(status);
+}
 
 // FreeBSD's stack_t (the OpenOrbis musl header has Linux's field order, which the kernel misreads)
 struct BsdSignalStack {
@@ -158,13 +168,15 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     }
     if (traceFd() >= 0)
         writeAll(traceFd(), "crashed (see crash.log)\n");
+    if (ps4_crash_note)
+        ps4_crash_note();
 
     // What else to record takes locks and allocates, which a crash may have left held: a timer
-    // thread ends the process if it doesn't finish.
+    // thread ends the process (or restarts into the menu) if it doesn't finish.
     pthread_t timer;
     __real_pthread_create(&timer, nullptr, [](void*) -> void* {
         sleep(15);
-        _exit(126);
+        endAfterCrash(126);
     }, nullptr);
     // Where every other thread was (stacks, and the lock each one waits on), after the crash.
     ps4_dump_thread_stacks("/data/CemuPS4/crash.log", "every thread at the crash");
@@ -176,10 +188,10 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
             writeAll(traceFd(), "guest state written to log.txt\n");
     }
 
-    // End the process here rather than with the system's crash report: on FW 13.52 that
-    // coredump of a homebrew app never finished and hung the console until a hard power-off
-    // (DolphinPS4), and the report itself is encrypted.
-    _exit(128 + sig);
+    // End the process here (or restart into the menu) rather than with the system's crash report:
+    // on FW 13.52 that coredump of a homebrew app never finished and hung the console until a
+    // hard power-off (DolphinPS4), and the report itself is encrypted.
+    endAfterCrash(128 + sig);
 }
 
 // std::terminate (e.g. an uncaught exception): record what was thrown, then abort as usual.
