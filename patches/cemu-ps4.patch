@@ -2289,10 +2289,10 @@ index 0000000..59a3de1
 +} // namespace CremaMii
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 0000000..f5d2815
+index 0000000..2a93151
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,748 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -2305,6 +2305,9 @@ index 0000000..f5d2815
 +#include "imgui/imgui_extension.h"
 +#include "input/InputManager.h"
 +#include "input/api/Controller.h"
++#include "input/emulated/VPADController.h"
++
++#include "gui/ps4/launcher/PS4Glyphs.h"
 +
 +#include <imgui.h>
 +
@@ -2333,6 +2336,7 @@ index 0000000..f5d2815
 +		ROW_POINTER,
 +		ROW_TOUCHPAD,
 +		ROW_MOTION,
++		ROW_CONTROLS,
 +		ROW_VOLUME,
 +		ROW_FPS,
 +		ROW_RESTART,
@@ -2403,6 +2407,280 @@ index 0000000..f5d2815
 +			g_padAudio->SetVolume(volume);
 +	}
 +
++	// ---- Controls: the Wii U GamePad's inputs on the DualShock 4, as in DolphinPS4's Controls
++	// lists (PS4XMB.cpp, PS4Controls.cpp): a layout for all games (controllerProfiles/controller0)
++	// or the game's own (controllerProfiles/crema-<title ID>); the control's icon (PS4Glyphs) beside
++	// each input; Cross waits for the pad to be at rest and takes the next press (5 s: cancel);
++	// sticks choose Left Stick / Right Stick / D-Pad.
++
++	// a DualShock 4 control: PS4PadController's button id, PS4Glyphs's name, and the text shown
++	// for it where there's no icon
++	struct PadInput
++	{
++		uint64 button;
++		const char* glyph;
++		const char* text;
++	};
++	constexpr PadInput kPadInputs[] = {
++		{kButton0, "Cross", "Cross"}, {kButton1, "Circle", "Circle"}, {kButton2, "Square", "Square"},
++		{kButton3, "Triangle", "Triangle"}, {kButton4, "", "Touchpad Left"}, {kButton5, "", "Touchpad Right"},
++		{kButton6, "Options", "Options"}, {kButton7, "L3", "L3"}, {kButton8, "R3", "R3"}, {kButton9, "L1", "L1"},
++		{kButton10, "R1", "R1"}, {kButton11, "Pad N", "D-Pad Up"}, {kButton12, "Pad S", "D-Pad Down"},
++		{kButton13, "Pad W", "D-Pad Left"}, {kButton14, "Pad E", "D-Pad Right"}, {kTriggerXP, "L2 Click", "L2"},
++		{kTriggerYP, "R2 Click", "R2"}, {kAxisYN, "Left Y-", "Left Stick Up"}, {kAxisYP, "Left Y+", "Left Stick Down"},
++		{kAxisXN, "Left X-", "Left Stick Left"}, {kAxisXP, "Left X+", "Left Stick Right"},
++		{kRotationYN, "Right Y-", "Right Stick Up"}, {kRotationYP, "Right Y+", "Right Stick Down"},
++		{kRotationXN, "Right X-", "Right Stick Left"}, {kRotationXP, "Right X+", "Right Stick Right"},
++	};
++
++	// stick groups: up, down, left, right
++	struct StickChoice
++	{
++		const char* name;
++		uint64 up, down, left, right;
++	};
++	constexpr StickChoice kSticks[] = {
++		{"Left Stick", kAxisYN, kAxisYP, kAxisXN, kAxisXP},
++		{"Right Stick", kRotationYN, kRotationYP, kRotationXN, kRotationXP},
++		{"D-Pad", kButton11, kButton12, kButton13, kButton14},
++	};
++
++	struct Binding
++	{
++		const char* label;
++		uint64 mapping; // VPADController::ButtonId; a stick group's first (Up)
++		bool stickGroup;
++	};
++	constexpr Binding kBindings[] = {
++		{"A", VPADController::kButtonId_A, false}, {"B", VPADController::kButtonId_B, false},
++		{"X", VPADController::kButtonId_X, false}, {"Y", VPADController::kButtonId_Y, false},
++		{"L", VPADController::kButtonId_L, false}, {"R", VPADController::kButtonId_R, false},
++		{"ZL", VPADController::kButtonId_ZL, false}, {"ZR", VPADController::kButtonId_ZR, false},
++		{"Plus", VPADController::kButtonId_Plus, false}, {"Minus", VPADController::kButtonId_Minus, false},
++		{"HOME", VPADController::kButtonId_Home, false},
++		{"D-Pad Up", VPADController::kButtonId_Up, false}, {"D-Pad Down", VPADController::kButtonId_Down, false},
++		{"D-Pad Left", VPADController::kButtonId_Left, false}, {"D-Pad Right", VPADController::kButtonId_Right, false},
++		{"Left Stick", VPADController::kButtonId_StickL_Up, true}, {"Right Stick", VPADController::kButtonId_StickR_Up, true},
++		{"Left Stick Click", VPADController::kButtonId_StickL, false}, {"Right Stick Click", VPADController::kButtonId_StickR, false},
++	};
++
++	// the controls page's rows: Apply To (a game only), the bindings, Reset to Default
++	enum ControlRowKind
++	{
++		CTL_SCOPE,
++		CTL_BINDING,
++		CTL_RESET,
++	};
++	struct ControlRow
++	{
++		ControlRowKind kind;
++		int binding;
++	};
++
++	bool sControls = false; // the controls page is open
++	int sControlsSelected = 0;
++	float sControlsScroll = 0.0f;
++	bool sCapture = false, sCaptureReleased = false;
++	double sCaptureStart = 0.0;
++	int sCaptureBinding = 0;
++
++	std::string GameLayoutName()
++	{
++		return "crema-" + sGameId;
++	}
++
++	bool HasGameLayout()
++	{
++		std::error_code ec;
++		return !sGameId.empty() && fs::exists(ActiveSettings::GetConfigPath("controllerProfiles/{}.xml", GameLayoutName()), ec);
++	}
++
++	std::vector<ControlRow> ControlRows()
++	{
++		std::vector<ControlRow> rows;
++		if (!sGameId.empty())
++			rows.push_back({CTL_SCOPE, 0});
++		for (int i = 0; i < (int)std::size(kBindings); i++)
++			rows.push_back({CTL_BINDING, i});
++		rows.push_back({CTL_RESET, 0});
++		return rows;
++	}
++
++	EmulatedControllerPtr GamePad()
++	{
++		return InputManager::instance().get_controller(0);
++	}
++
++	std::shared_ptr<ControllerBase> Pad(const EmulatedControllerPtr& gamepad)
++	{
++		for (const auto& controller : gamepad->get_controllers())
++			if (controller->api() == InputAPI::PS4Pad)
++				return controller;
++		return nullptr;
++	}
++
++	// the DualShock 4 control a GamePad input is on, or null (none, or another controller)
++	const PadInput* BoundInput(const EmulatedControllerPtr& gamepad, uint64 mapping)
++	{
++		const auto pad = gamepad->get_mapping_controller(mapping);
++		if (!pad || pad->api() != InputAPI::PS4Pad)
++			return nullptr;
++		const std::string name = gamepad->get_mapping_name(mapping);
++		for (const PadInput& input : kPadInputs)
++			if (pad->get_button_name(input.button) == name)
++				return &input;
++		return nullptr;
++	}
++
++	const StickChoice* BoundStick(const EmulatedControllerPtr& gamepad, uint64 up)
++	{
++		for (const StickChoice& stick : kSticks)
++		{
++			const uint64 parts[4] = {stick.up, stick.down, stick.left, stick.right};
++			bool all = true;
++			for (int i = 0; i < 4; i++)
++			{
++				const PadInput* input = BoundInput(gamepad, up + i);
++				all = all && input && input->button == parts[i];
++			}
++			if (all)
++				return &stick;
++		}
++		return nullptr;
++	}
++
++	// The layout in use is saved where it came from: the game's own, or the one for all games.
++	void SaveLayout()
++	{
++		if (HasGameLayout())
++			InputManager::instance().save(0, GameLayoutName());
++		else
++			InputManager::instance().save(0);
++	}
++
++	// This Game: the game gets its own layout, starting from the current one. All Games: it's
++	// removed and the layout for all games is loaded again.
++	void ToggleScope()
++	{
++		std::error_code ec;
++		if (HasGameLayout())
++		{
++			fs::remove(ActiveSettings::GetConfigPath("controllerProfiles/{}.xml", GameLayoutName()), ec);
++			InputManager::instance().load(0);
++			ps4_boot_trace("in-game menu: controls for all games");
++		}
++		else
++		{
++			InputManager::instance().save(0, GameLayoutName());
++			ps4_boot_trace("in-game menu: controls for this game");
++		}
++	}
++
++	void ResetLayout()
++	{
++		auto gamepad = GamePad();
++		auto pad = gamepad ? Pad(gamepad) : nullptr;
++		if (!pad)
++			return;
++		gamepad->clear_mappings();
++		gamepad->set_default_mapping(pad);
++		SaveLayout();
++	}
++
++	void SetStick(int binding, int direction)
++	{
++		auto gamepad = GamePad();
++		auto pad = gamepad ? Pad(gamepad) : nullptr;
++		if (!pad)
++			return;
++		const uint64 up = kBindings[binding].mapping;
++		const StickChoice* current = BoundStick(gamepad, up);
++		const int count = (int)std::size(kSticks);
++		int index = current ? (int)(current - kSticks) : 0;
++		index = ((index + direction) % count + count) % count;
++		const StickChoice& stick = kSticks[index];
++		const uint64 parts[4] = {stick.up, stick.down, stick.left, stick.right};
++		for (int i = 0; i < 4; i++)
++			gamepad->set_mapping(up + i, pad, parts[i]);
++		SaveLayout();
++	}
++
++	// PS4Controls::IsAtRest / Capture: no button, trigger or stick in use; else the control pressed
++	bool IsAtRest(const OrbisPadData& now)
++	{
++		auto centred = [](uint8 v) { return v > 78 && v < 178; };
++		return now.buttons == 0 && now.analogButtons.l2 < 40 && now.analogButtons.r2 < 40 && centred(now.leftStick.x) &&
++			   centred(now.leftStick.y) && centred(now.rightStick.x) && centred(now.rightStick.y);
++	}
++
++	std::optional<uint64> Capture(const OrbisPadData& now)
++	{
++		if ((now.buttons & ORBIS_PAD_BUTTON_L2) || now.analogButtons.l2 > 180)
++			return kTriggerXP;
++		if ((now.buttons & ORBIS_PAD_BUTTON_R2) || now.analogButtons.r2 > 180)
++			return kTriggerYP;
++		const std::pair<uint32, uint64> buttons[] = {
++			{ORBIS_PAD_BUTTON_CROSS, kButton0}, {ORBIS_PAD_BUTTON_CIRCLE, kButton1}, {ORBIS_PAD_BUTTON_SQUARE, kButton2},
++			{ORBIS_PAD_BUTTON_TRIANGLE, kButton3}, {ORBIS_PAD_BUTTON_L1, kButton9}, {ORBIS_PAD_BUTTON_R1, kButton10},
++			{ORBIS_PAD_BUTTON_L3, kButton7}, {ORBIS_PAD_BUTTON_R3, kButton8}, {ORBIS_PAD_BUTTON_OPTIONS, kButton6},
++			{ORBIS_PAD_BUTTON_UP, kButton11}, {ORBIS_PAD_BUTTON_DOWN, kButton12}, {ORBIS_PAD_BUTTON_LEFT, kButton13},
++			{ORBIS_PAD_BUTTON_RIGHT, kButton14}};
++		for (const auto& [bit, button] : buttons)
++			if (now.buttons & bit)
++				return button;
++		if (now.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) // the touchpad's left or right half
++			return now.touch.fingers > 0 && now.touch.touch[0].x >= 960 ? kButton5 : kButton4;
++		if (now.leftStick.x < 40)
++			return kAxisXN;
++		if (now.leftStick.x > 215)
++			return kAxisXP;
++		if (now.leftStick.y < 40)
++			return kAxisYN;
++		if (now.leftStick.y > 215)
++			return kAxisYP;
++		if (now.rightStick.x < 40)
++			return kRotationXN;
++		if (now.rightStick.x > 215)
++			return kRotationXP;
++		if (now.rightStick.y < 40)
++			return kRotationYN;
++		if (now.rightStick.y > 215)
++			return kRotationYP;
++		return std::nullopt;
++	}
++
++	// A capture in progress: waits until the pad is at rest, then takes the next press (5 s
++	// without one cancels). True while it has the pad.
++	bool UpdateCapture(const OrbisPadData& data, bool read, double now)
++	{
++		if (!sCapture)
++			return false;
++		if (!read)
++			return true;
++		if (!sCaptureReleased)
++		{
++			sCaptureReleased = IsAtRest(data);
++			return true;
++		}
++		if (now - sCaptureStart > 5.0)
++		{
++			sCapture = false;
++			return true;
++		}
++		const auto button = Capture(data);
++		if (!button)
++			return true;
++		auto gamepad = GamePad();
++		auto pad = gamepad ? Pad(gamepad) : nullptr;
++		if (pad)
++		{
++			gamepad->set_mapping(kBindings[sCaptureBinding].mapping, pad, *button);
++			SaveLayout();
++		}
++		sCapture = false;
++		return true;
++	}
++
 +	std::string ValueOf(int row)
 +	{
 +		switch (row)
@@ -2411,6 +2689,7 @@ index 0000000..f5d2815
 +		case ROW_POINTER: return g_crema_touch_pointer ? "On" : "Off";
 +		case ROW_TOUCHPAD: return g_crema_touchpad_buttons ? "Minus / HOME" : "GamePad Touch Screen";
 +		case ROW_MOTION: return MotionOn() ? "On" : "Off";
++		case ROW_CONTROLS: return HasGameLayout() ? "This Game" : "All Games";
 +		case ROW_VOLUME: return std::to_string(Volume());
 +		case ROW_FPS: return GetConfig().overlay.position != ScreenPosition::kDisabled ? "On" : "Off";
 +		default: return {};
@@ -2420,7 +2699,7 @@ index 0000000..f5d2815
 +	const char* LabelOf(int row)
 +	{
 +		static const char* const LABELS[ROW_COUNT] = {"Resume", "TV Shows", "Touch Pointer", "Touchpad", "Motion Controls",
-+			"Game Volume", "FPS Counter", "Restart Game", "Quit to Launcher"};
++			"Controls", "Game Volume", "FPS Counter", "Restart Game", "Quit to Launcher"};
 +		return LABELS[row];
 +	}
 +
@@ -2470,6 +2749,14 @@ index 0000000..f5d2815
 +			Save("motion", on ? "on" : "off");
 +			break;
 +		}
++		case ROW_CONTROLS:
++			if (direction > 0)
++			{
++				sControls = true;
++				sControlsSelected = 0;
++				sControlsScroll = 0.0f;
++			}
++			break;
 +		case ROW_VOLUME:
 +		{
 +			const int volume = std::clamp(Volume() + (direction < 0 ? -10 : 10), 0, 100);
@@ -2506,6 +2793,116 @@ index 0000000..f5d2815
 +		B_CIRCLE = 32,
 +	};
 +
++	void ControlsInput(uint32 pressed, double now)
++	{
++		const auto rows = ControlRows();
++		const int count = (int)rows.size();
++		if (pressed & B_UP)
++			sControlsSelected = (sControlsSelected + count - 1) % count;
++		if (pressed & B_DOWN)
++			sControlsSelected = (sControlsSelected + 1) % count;
++		sControlsSelected = std::clamp(sControlsSelected, 0, count - 1);
++		const ControlRow& row = rows[sControlsSelected];
++		const bool stick = row.kind == CTL_BINDING && kBindings[row.binding].stickGroup;
++		if (pressed & (B_LEFT | B_RIGHT))
++		{
++			if (row.kind == CTL_SCOPE)
++				ToggleScope();
++			else if (stick)
++				SetStick(row.binding, (pressed & B_LEFT) ? -1 : 1);
++		}
++		if (pressed & B_CROSS)
++		{
++			if (row.kind == CTL_SCOPE)
++				ToggleScope();
++			else if (row.kind == CTL_RESET)
++				ResetLayout();
++			else if (stick)
++				SetStick(row.binding, 1);
++			else
++			{
++				sCapture = true;
++				sCaptureReleased = false;
++				sCaptureStart = now;
++				sCaptureBinding = row.binding;
++			}
++		}
++		if (pressed & B_CIRCLE)
++			sControls = false;
++	}
++
++	// the controls page, in the panel from x0 to W
++	void DrawControls(ImDrawList* dl, ImFont* title, ImFont* font, ImFont* small, float x0, float W, float H, float a, float dt)
++	{
++		constexpr uint32 ACCENT = 0x9B7BFF, TEXT = 0xFFFFFF;
++		dl->AddText(title, 44.0f, ImVec2(x0 + 50, 90), Rgba(TEXT, a), "Controls");
++		dl->AddText(small, 24.0f, ImVec2(x0 + 52, 148), Rgba(ACCENT, a), "Wii U GamePad");
++		const auto rows = ControlRows();
++		const auto gamepad = GamePad();
++		constexpr float ROW_H = 54.0f, TOP = 210.0f;
++		const float bottom = H - 150.0f;
++		// keep the selection in view
++		const float selY = sControlsSelected * ROW_H;
++		float target = sControlsScroll;
++		if (selY - target < ROW_H)
++			target = std::max(0.0f, selY - ROW_H);
++		if (selY - target > bottom - TOP - 2 * ROW_H)
++			target = selY - (bottom - TOP - 2 * ROW_H);
++		sControlsScroll += (target - sControlsScroll) * (1.0f - std::exp(-18.0f * dt));
++		dl->PushClipRect(ImVec2(x0, TOP - 10), ImVec2(W, bottom), true);
++		for (int i = 0; i < (int)rows.size(); i++)
++		{
++			const ControlRow& row = rows[i];
++			const float y = TOP + i * ROW_H - sControlsScroll + (row.kind == CTL_RESET ? 14.0f : 0.0f);
++			if (row.kind == CTL_RESET)
++				dl->AddLine(ImVec2(x0 + 50, y - 10), ImVec2(W - 50, y - 10), Rgba(ACCENT, 0.35f * a), 1.5f);
++			const bool sel = i == sControlsSelected;
++			if (sel)
++				dl->AddRectFilled(ImVec2(x0 + 30, y - 4), ImVec2(W - 30, y + 46), Rgba(ACCENT, 0.30f * a), 10.0f);
++			const char* label = row.kind == CTL_SCOPE ? "Apply To" : row.kind == CTL_RESET ? "Reset to Default" : kBindings[row.binding].label;
++			dl->AddText(font, 30.0f, ImVec2(x0 + 60, y + 4), Rgba(TEXT, a), label);
++			std::string glyph, value;
++			if (row.kind == CTL_SCOPE)
++				value = HasGameLayout() ? "This Game" : "All Games";
++			else if (row.kind == CTL_BINDING && sCapture && row.binding == sCaptureBinding)
++				value = "Press a button...";
++			else if (row.kind == CTL_BINDING && gamepad && kBindings[row.binding].stickGroup)
++			{
++				const StickChoice* stick = BoundStick(gamepad, kBindings[row.binding].mapping);
++				glyph = stick ? stick->name : "";
++				value = stick ? stick->name : "Custom";
++			}
++			else if (row.kind == CTL_BINDING && gamepad)
++			{
++				const PadInput* input = BoundInput(gamepad, kBindings[row.binding].mapping);
++				glyph = input ? input->glyph : "";
++				value = input ? input->text : "None";
++			}
++			constexpr float GLYPH_H = 36.0f;
++			const float gw = glyph.empty() ? 0.0f : PS4Glyphs::Width(glyph, GLYPH_H);
++			if (gw > 0.0f)
++				PS4Glyphs::Draw(dl, font, glyph, W - 70 - gw, y + 21, GLYPH_H, a);
++			else if (!value.empty())
++			{
++				const float tw = font->CalcTextSizeA(26.0f, FLT_MAX, 0.0f, value.c_str()).x;
++				dl->AddText(font, 26.0f, ImVec2(W - 70 - tw, y + 8), Rgba(sCapture && row.binding == sCaptureBinding ? ACCENT : TEXT, 0.85f * a), value.c_str());
++			}
++		}
++		dl->PopClipRect();
++		const ControlRow& row = rows[std::clamp(sControlsSelected, 0, (int)rows.size() - 1)];
++		std::string help;
++		if (sCapture)
++			help = std::string("Press the DualShock 4 button for ") + kBindings[sCaptureBinding].label + "...  (5 s: cancel)";
++		else if (row.kind == CTL_SCOPE)
++			help = "This Game: a layout for this game only. All Games: the normal layout.";
++		else if (row.kind == CTL_RESET)
++			help = "Back to the default layout.";
++		else
++			help = "Cross: press a new button for it. Sticks: Left/Right to choose.";
++		dl->AddText(small, 24.0f, ImVec2(x0 + 50, H - 110), Rgba(TEXT, 0.7f * a), help.c_str());
++		dl->AddText(small, 24.0f, ImVec2(x0 + 50, H - 76), Rgba(TEXT, 0.5f * a), "Circle: back");
++	}
++
 +	void Frame(sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight)
 +	{
 +		OrbisPadData data{};
@@ -2513,10 +2910,11 @@ index 0000000..f5d2815
 +		const uint32 b = read ? data.buttons : 0;
 +		// L3 + R3: open, or close
 +		const bool combo = (b & ORBIS_PAD_BUTTON_L3) && (b & ORBIS_PAD_BUTTON_R3);
-+		if (combo && !sComboHeld)
++		if (combo && !sComboHeld && !sCapture)
 +		{
 +			sOpen = !sOpen;
 +			sSelected = 0;
++			sControls = false;
 +			ps4_boot_trace(sOpen ? "in-game menu: open" : "in-game menu: closed");
 +		}
 +		sComboHeld = combo;
@@ -2562,7 +2960,10 @@ index 0000000..f5d2815
 +			sRepeat = now + 0.35;
 +		}
 +		sHeld = held;
-+		if (sOpen && !combo)
++		const bool capturing = sOpen && UpdateCapture(data, read, now);
++		if (sOpen && !combo && !capturing && sControls)
++			ControlsInput(pressed, now);
++		else if (sOpen && !combo && !capturing)
 +		{
 +			if (pressed & B_UP)
 +				sSelected = (sSelected + ROW_COUNT - 1) % ROW_COUNT;
@@ -2570,7 +2971,7 @@ index 0000000..f5d2815
 +				sSelected = (sSelected + 1) % ROW_COUNT;
 +			if (pressed & (B_LEFT | B_RIGHT))
 +			{
-+				if (sSelected != ROW_RESUME && sSelected != ROW_RESTART && sSelected != ROW_QUIT)
++				if (sSelected != ROW_RESUME && sSelected != ROW_CONTROLS && sSelected != ROW_RESTART && sSelected != ROW_QUIT)
 +					Change(sSelected, (pressed & B_LEFT) ? -1 : 1);
 +			}
 +			if (pressed & B_CROSS)
@@ -2592,6 +2993,11 @@ index 0000000..f5d2815
 +		const float width = 780.0f, x0 = W - width * a;
 +		dl->AddRectFilled(ImVec2(x0, 0), ImVec2(W, H), Rgba(0x0B0A1A, 0.92f * a));
 +		dl->AddLine(ImVec2(x0, 0), ImVec2(x0, H), Rgba(ACCENT, 0.9f * a), 2.0f);
++		if (sControls)
++		{
++			DrawControls(dl, title, font, small, x0, W, H, a, dt);
++			return;
++		}
 +		dl->AddText(title, 44.0f, ImVec2(x0 + 50, 90), Rgba(TEXT, a), "Crema");
 +		const std::string name = CafeSystem::GetForegroundTitleName();
 +		dl->AddText(small, 24.0f, ImVec2(x0 + 52, 148), Rgba(ACCENT, a), name.c_str());
@@ -2621,6 +3027,13 @@ index 0000000..f5d2815
 +	}
 +} // namespace
 +
++void LoadGameControls(const std::string& gameId)
++{
++	sGameId = gameId;
++	if (HasGameLayout() && InputManager::instance().load(0, GameLayoutName()))
++		ps4_boot_trace("controls: this game's own layout");
++}
++
 +void Install(const std::string& gameId, const std::string& launchPath)
 +{
 +	sGameId = gameId;
@@ -2630,30 +3043,32 @@ index 0000000..f5d2815
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4PauseMenu.h b/src/gui/ps4/PS4PauseMenu.h
 new file mode 100644
-index 0000000..14bb922
+index 0000000..489dc96
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +// Crema's in-game menu (L3 + R3), after DolphinPS4's: settings that apply at once (TV or GamePad
-+// screen, touch pointer, touchpad mode, motion, volume, FPS counter), Restart Game and Quit to
-+// Launcher. Drawn over the game in the renderer's ImGui pass; the game keeps running behind it
-+// but gets no controller input while it is open (Cemu has no pause).
++// screen, touch pointer, touchpad mode, motion, controls mapping, volume, FPS counter), Restart
++// Game and Quit to Launcher. Drawn over the game in the renderer's ImGui pass; the game keeps
++// running behind it but gets no controller input while it is open (Cemu has no pause).
 +#pragma once
 +
 +#include <string>
 +
 +namespace PS4PauseMenu
 +{
++// At game start: the game's own controls layout (set in the menu's Controls page), if it has one.
++void LoadGameControls(const std::string& gameId);
 +// The game being played: its title ID (crema.ini section, empty for homebrew) and the path it
 +// was started from (Restart Game).
 +void Install(const std::string& gameId, const std::string& launchPath);
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..63e4d97
+index 0000000..a76703e
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,608 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -3095,6 +3510,7 @@ index 0000000..63e4d97
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
 +		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) != "off");
++		PS4PauseMenu::LoadGameControls(gameId);
 +		PS4PauseMenu::Install(gameId, _pathToUtf8(game));
 +		sPerfLog = CremaSettings::On("perf_log", gameId);
 +		sFreezeReports = CremaSettings::On("freeze_reports", gameId);
