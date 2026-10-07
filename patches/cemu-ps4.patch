@@ -4327,10 +4327,10 @@ index 0000000..bc4f953
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..d0d5a08
+index 0000000..bf54e04
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,366 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -4374,6 +4374,9 @@ index 0000000..d0d5a08
 +		{"shader_compile", "Shader Compilation", "Emulation",
 +			{{"async", "Asynchronous"}, {"sync", "Synchronous"}}, "async", false,
 +			"Asynchronous: no stutter, but objects appear a moment late the first time. Synchronous: everything shows at once, with stutter."},
++		{"gpu_accuracy", "Graphics Accuracy", "Emulation",
++			{{"accurate", "Accurate"}, {"fast", "Fast"}}, "accurate", false,
++			"Fast: the CPU doesn't wait for the GPU when a game asks it to, and fewer GPU barriers. Faster in busy games (Minecraft), but some games may flicker or show glitches."},
 +		{"language", "Language", "Emulation",
 +			{{"en", "English"}, {"es", "Español"}, {"fr", "Français"}, {"de", "Deutsch"}, {"it", "Italiano"},
 +				{"pt", "Português"}, {"nl", "Nederlands"}, {"pl", "Polski"}, {"tr", "Türkçe"}, {"ru", "Русский"},
@@ -4651,6 +4654,10 @@ index 0000000..d0d5a08
 +			get("tv_shows") == "gamepad");
 +	}
 +	config.async_compile = get("shader_compile") != "sync";
++	// Cemu's "Full sync at GX2DrawDone" and "Accurate barriers"
++	const bool accurate = get("gpu_accuracy") != "fast";
++	config.gx2drawdone_sync = accurate;
++	config.vk_accurate_barriers = accurate;
 +	const std::string upscale = get("upscale_filter");
 +	config.upscale_filter = upscale == "linear" ? kLinearFilter : upscale == "hermite" ? kBicubicHermiteFilter :
 +		upscale == "nearest" ? kNearestNeighborFilter : kBicubicFilter;
@@ -4685,9 +4692,9 @@ index 0000000..d0d5a08
 +
 +	g_crema_touchpad_buttons = get("touchpad") == "buttons" ? 1 : 0;
 +	g_crema_touch_pointer = get("touch_pointer") == "on" ? 1 : 0;
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, TV shows {}, touchpad {}, motion {}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, TV shows {}, touchpad {}, motion {}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("tv_shows"), get("touchpad"), get("motion"));
++		get("gpu_accuracy"), get("tv_shows"), get("touchpad"), get("motion"));
 +}
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/CremaSettings.h b/src/gui/ps4/launcher/CremaSettings.h
