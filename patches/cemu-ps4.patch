@@ -124,14 +124,24 @@ index 257973a..67a596c 100644
  }
  
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..df1748b 100644
+index e466deb..100597b 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-@@ -738,6 +738,29 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -9,6 +9,9 @@
+ #include "Common/cpu_features.h"
+ #include <boost/container/static_vector.hpp>
+ 
++// Crema (Diagnostics > Fast Shifts): slw/srw/rlwnm by CL without BMI2; off: Cemu's own fallback
++bool g_crema_cl_shifts = true;
++
+ static x86Assembler64::GPR32 _reg32(IMLReg physReg)
+ {
+ 	cemu_assert_debug(physReg.GetRegFormat() == IMLRegFormat::I32);
+@@ -738,6 +741,29 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  			x64Gen_shlx_reg64_reg64_reg64(x64GenContext, rRegResult, rRegOperand1, rRegOperand2);
  			x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
  		}
-+		else if (rRegOperand2 == X86_REG_ECX)
++		else if (g_crema_cl_shifts && rRegOperand2 == X86_REG_ECX)
 +		{
 +			// the amount in CL (IMLRegisterAllocator: without BMI2): a 64-bit shift of the zero-extended
 +			// value by rB & 63, as SHRX/SHLX above (amounts of 32 or more leave 0 in the low half)
@@ -157,11 +167,11 @@ index e466deb..df1748b 100644
  		else
  		{
  			// lazy and slow way to do shift by register without relying on ECX/CL or BMI2
-@@ -766,8 +789,15 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -766,8 +792,15 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  	else if( imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE )
  	{
  		// todo: Use BMI2 rotate if available
-+		if (rRegOperand2 == X86_REG_RCX)
++		if (g_crema_cl_shifts && rRegOperand2 == X86_REG_RCX)
 +		{
 +			// the amount already in CL (IMLRegisterAllocator: without BMI2)
 +			x64Gen_mov_reg64_reg64(x64GenContext, REG_RESV_TEMP, rRegOperand1);
@@ -175,18 +185,28 @@ index e466deb..df1748b 100644
  			// swap operand 2 with RCX
  			x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..01bd371 100644
+index 935e61a..8dace29 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -156,7 +156,10 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+@@ -15,6 +15,8 @@
+ 
+ #include "Common/cpu_features.h"
+ 
++extern bool g_crema_cl_shifts; // BackendX64.cpp (Crema: Fast Shifts)
++
+ #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
+ #define DEBUG_RA_INSTRUCTION_GEN 0
+ 
+@@ -156,7 +158,11 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
  
  	if (instruction->type == PPCREC_IML_TYPE_R_R_R)
  	{
 -		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U)
 +		// without BMI2 the shift amount goes in CL: also slw/srw and rlwnm (PS4: the Jaguar has no
-+		// BMI2; they used a bit-by-bit fallback, BackendX64.cpp)
-+		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U ||
-+			instruction->operation == PPCREC_IML_OP_SLW || instruction->operation == PPCREC_IML_OP_SRW || instruction->operation == PPCREC_IML_OP_LEFT_ROTATE)
++		// BMI2; they used a bit-by-bit fallback, BackendX64.cpp), unless Crema's Fast Shifts is off
++		const bool clShift = g_crema_cl_shifts &&
++			(instruction->operation == PPCREC_IML_OP_SLW || instruction->operation == PPCREC_IML_OP_SRW || instruction->operation == PPCREC_IML_OP_LEFT_ROTATE);
++		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U || clShift)
  		{
  			if(!g_CPUFeatures.x86.bmi2)
  			{
@@ -4689,10 +4709,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..8f65dfb
+index 0000000..74ab332
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,380 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -4701,6 +4721,8 @@ index 0000000..8f65dfb
 +#include "config/ActiveSettings.h"
 +#include "config/CemuConfig.h"
 +#include "config/NetworkSettings.h"
++
++extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
 +
 +#include <fstream>
 +#include <map>
@@ -4777,6 +4799,8 @@ index 0000000..8f65dfb
 +			"Pictures of the TV at 5, 15 and 30 s and every minute (screenshots folder). Each one costs a short stutter."},
 +		{"file_log", "File Access Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every file a game opens, and the game's own messages, in log.txt (finds missing files). Slows loading."},
++		{"fast_shifts", "Fast Shifts", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
++			"On: the Wii U's variable shifts in one PS4 instruction (Crema 1.33). Off: Cemu's original slower code, to check whether a game that misbehaves since 1.33 is affected."},
 +		{"profiler", "Profiler", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -5027,6 +5051,7 @@ index 0000000..8f65dfb
 +	const bool accurate = get("gpu_accuracy") != "fast";
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
++	g_crema_cl_shifts = get("fast_shifts") != "off";
 +	// the online service of the account in use (Cemu: per account): Pretendo, or none
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), get("online") == "pretendo" ? NetworkService::Pretendo : NetworkService::Offline);
 +	const std::string upscale = get("upscale_filter");
