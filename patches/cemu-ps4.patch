@@ -1199,52 +1199,182 @@ index e037395..a832fd3 100644
      #include <csignal>
      #define DEBUG_BREAK raise(SIGTRAP) 
 diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
-index b54d3ef..0a02cb8 100644
+index b54d3ef..c89db6a 100644
 --- a/src/Common/unix/FileStream_unix.cpp
 +++ b/src/Common/unix/FileStream_unix.cpp
-@@ -99,11 +99,19 @@ uint64 FileStream::GetSize()
- 	return fs;
+@@ -1,5 +1,14 @@
+ #include "Common/unix/FileStream_unix.h"
+ #include <cstdarg>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++// The file through the system's own calls (pread / pwrite at the stream's position, ftruncate,
++// fstat), as the Windows version uses its file handle: nothing is buffered in between. With
++// std::fstream a write sat in the stream's buffer and a read came from its cache, so a game
++// reading a file through one handle while writing it through another read stale data back
++// (suspected in Minecraft: Wii U Edition losing its saved chunks), and SetEndOfFile did nothing.
+ 
+ fs::path findPathCI(const fs::path& path)
+ {
+@@ -82,28 +91,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
+ void FileStream::SetPosition(uint64 pos)
+ {
+ 	cemu_assert(m_isValid);
+-	if (m_prevOperationWasWrite)
+-		m_fileStream.seekp((std::streampos)pos);
+-	else
+-		m_fileStream.seekg((std::streampos)pos);
++	m_pos = pos;
  }
  
-+// The file ends at the current position (FSTruncateFile, FSSetFileLength). It used to report
-+// success and do nothing: a save rewritten shorter kept its old tail, which games then read back
-+// as data (suspected in Minecraft: Wii U Edition crashing as it loads its own saved chunks).
+ uint64 FileStream::GetSize()
+ {
+ 	cemu_assert(m_isValid);
+-	auto currentPos = m_fileStream.tellg();
+-	m_fileStream.seekg(0, std::ios::end);
+-	auto fileSize = m_fileStream.tellg();
+-	m_fileStream.seekg(currentPos, std::ios::beg);
+-	uint64 fs = (uint64)fileSize;
+-	return fs;
++	struct stat st;
++	if (fstat(m_fd, &st) != 0)
++		return 0;
++	return (uint64)st.st_size;
+ }
+ 
++// The file ends at the current position (FSTruncateFile, FSSetFileLength).
  bool FileStream::SetEndOfFile()
  {
 -	assert_dbg();
 -	return true;
 -	//return ::SetEndOfFile(m_hFile) != 0;
 +	cemu_assert(m_isValid);
-+	const std::streampos pos = m_prevOperationWasWrite ? m_fileStream.tellp() : m_fileStream.tellg();
-+	if (pos < 0)
-+		return false;
-+	m_fileStream.flush();
-+	std::error_code ec;
-+	fs::resize_file(m_path, (uintmax_t)pos, ec);
-+	return !ec;
++	return ftruncate(m_fd, (off_t)m_pos) == 0;
  }
  
  void FileStream::extract(std::vector<uint8>& data)
-@@ -213,6 +221,7 @@ FileStream::~FileStream()
+@@ -116,15 +120,21 @@ void FileStream::extract(std::vector<uint8>& data)
+ 
+ void FileStream::Flush()
+ {
+-    m_fileStream.flush();
++	// writes go straight to the system
+ }
+ 
+ uint32 FileStream::readData(void* data, uint32 length)
+ {
+-	SyncReadWriteSeek(false);
+-	m_fileStream.read((char*)data, length);
+-	size_t bytesRead = m_fileStream.gcount();
+-	return (uint32)bytesRead;
++	uint32 total = 0;
++	while (total < length)
++	{
++		const ssize_t n = pread(m_fd, (uint8*)data + total, length - total, (off_t)(m_pos + total));
++		if (n <= 0)
++			break;
++		total += (uint32)n;
++	}
++	m_pos += total;
++	return total;
+ }
+ 
+ bool FileStream::readU64(uint64& v)
+@@ -161,9 +171,16 @@ bool FileStream::readLine(std::string& line)
+ 
+ sint32 FileStream::writeData(const void* data, sint32 length)
+ {
+-	SyncReadWriteSeek(true);
+-	m_fileStream.write((const char*)data, length);
+-	return length;
++	sint32 total = 0;
++	while (total < length)
++	{
++		const ssize_t n = pwrite(m_fd, (const uint8*)data + total, length - total, (off_t)(m_pos + total));
++		if (n <= 0)
++			break;
++		total += (sint32)n;
++	}
++	m_pos += total;
++	return total;
+ }
+ 
+ void FileStream::writeU64(uint64 v)
+@@ -203,46 +220,26 @@ void FileStream::writeLine(const char* str)
+ 
+ FileStream::~FileStream()
+ {
+-	if (m_isValid)
+-	{
+-		m_fileStream.close();
+-	}
++	if (m_fd >= 0)
++		close(m_fd);
+ 	//	CloseHandle(m_hFile);
+ }
+ 
  FileStream::FileStream(const fs::path& path, bool isOpen, bool isWriteable)
  {
  	fs::path CIPath = findPathCI(path);
+-	if (isOpen)
+-	{
+-		m_fileStream.open(CIPath, isWriteable ? (std::ios_base::in | std::ios_base::out | std::ios_base::binary) : (std::ios_base::in | std::ios_base::binary));
+-		m_isValid = m_fileStream.is_open();
+-	}
+-	else
+-	{
+-		m_fileStream.open(CIPath, std::ios_base::in | std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+-		m_isValid = m_fileStream.is_open();
+-	}
 +	m_path = CIPath;
- 	if (isOpen)
++	const int flags = isOpen ? (isWriteable ? O_RDWR : O_RDONLY) : (O_RDWR | O_CREAT | O_TRUNC);
++	m_fd = open(CIPath.c_str(), flags, 0666);
++	m_isValid = m_fd >= 0;
+ 	if(m_isValid && fs::is_directory(path))
  	{
- 		m_fileStream.open(CIPath, isWriteable ? (std::ios_base::in | std::ios_base::out | std::ios_base::binary) : (std::ios_base::in | std::ios_base::binary));
+ 		m_isValid = false;
+-		m_fileStream.close();
++		close(m_fd);
++		m_fd = -1;
+ 	}
+ }
+ 
+-void FileStream::SyncReadWriteSeek(bool nextOpIsWrite)
+-{
+-	// nextOpIsWrite == false -> read. Otherwise write
+-	if (nextOpIsWrite == m_prevOperationWasWrite)
+-		return;
+-	if (nextOpIsWrite)
+-		m_fileStream.seekp(m_fileStream.tellg(), std::ios::beg);
+-	else
+-		m_fileStream.seekg(m_fileStream.tellp(), std::ios::beg);
+-
+-	m_prevOperationWasWrite = nextOpIsWrite;
+-}
+-
+ bool FileStream::WriteFileAtomic(const fs::path& path, std::span<uint8> fileData, bool allowTargetFileRename)
+ {
+ 	std::error_code ec;
 diff --git a/src/Common/unix/FileStream_unix.h b/src/Common/unix/FileStream_unix.h
-index 29261dd..1dc6ba1 100644
+index 29261dd..92c87f4 100644
 --- a/src/Common/unix/FileStream_unix.h
 +++ b/src/Common/unix/FileStream_unix.h
-@@ -55,6 +55,7 @@ class FileStream
+@@ -51,11 +51,11 @@ class FileStream
+ 	static bool WriteFileAtomic(const fs::path& path, std::span<uint8> fileData, bool allowTargetFileRename = false);
+ 
+  private:
+-	void SyncReadWriteSeek(bool nextOpIsWrite);
  	FileStream(const fs::path& path, bool isOpen, bool isWriteable);
  
  	bool m_isValid{};
-+	fs::path m_path; // SetEndOfFile
- 	std::fstream m_fileStream;
- 	bool m_prevOperationWasWrite{false};
+-	std::fstream m_fileStream;
+-	bool m_prevOperationWasWrite{false};
++	fs::path m_path; // the file (as found, case-insensitively)
++	int m_fd = -1;   // the file (open, pread, pwrite)
++	uint64 m_pos{}; // where the next read or write goes
  
+ };
 diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
 index 7f2d626..44e8f36 100644
 --- a/src/audio/CMakeLists.txt
