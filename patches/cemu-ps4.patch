@@ -1447,10 +1447,10 @@ index 0000000..2b7c2bd
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
 diff --git a/src/gui/ps4/CremaMii.cpp b/src/gui/ps4/CremaMii.cpp
 new file mode 100644
-index 0000000..9300778
+index 0000000..5081720
 --- /dev/null
 +++ b/src/gui/ps4/CremaMii.cpp
-@@ -0,0 +1,813 @@
+@@ -0,0 +1,815 @@
 +// Crema's own Mii parts resource (see CremaMii.h). Layout from the FFL decompilation
 +// (github.com/aboood40091/ffl): a 0x4A00 byte header (texture and shape parts tables), then the
 +// parts. Textures are GX2 surfaces in the tile mode GX2 picks (FFL calls GX2InitTexture on them)
@@ -1483,7 +1483,7 @@ index 0000000..9300778
 +{
 +	constexpr uint32 kMagic = 0x46465241;		 // "FFRA"
 +	constexpr uint32 kMagicCrema = 0x43524D41; // "CRMA" in the header's unused word at 0xC
-+	constexpr uint32 kVersion = 1;				 // at kVersionOffset (unused space); bump when the parts change
++	constexpr uint32 kVersion = 2;				 // at kVersionOffset (unused space); bump when the parts change
 +	constexpr uint32 kVersionOffset = 0x49D0;
 +	constexpr uint32 kHeaderSize = 0x4A00;
 +	constexpr uint32 kTextureAlign = 0x800, kShapeAlign = 0x40, kAttribAlign = 0x40, kIndexAlign = 0x20;
@@ -1789,8 +1789,9 @@ index 0000000..9300778
 +				mesh.pos.push_back(p);
 +				mesh.normal.push_back(n);
 +				mesh.tangent.push_back(Dot(ds, ds) > 1e-12f ? Normalize(ds) : Vec3{1, 0, 0});
-+				if (uv)
-+					mesh.uv.push_back(uv(s, t, p));
++				// every shape has texture coordinates (the grid's where it has no texture): a game's
++				// own Mii shader may read them
++				mesh.uv.push_back(uv ? uv(s, t, p) : std::pair{s, t});
 +			}
 +			return (uint16)slot;
 +		};
@@ -1876,10 +1877,11 @@ index 0000000..9300778
 +			for (float v : {t.x, t.y, t.z, 0.0f})
 +				Put8(d, (uint8)(sint8)std::lround(std::clamp(v, -1.0f, 1.0f) * 127));
 +		size[3] = (uint32)(d.size() - pos[3]);
-+		begin(4, kAttribAlign); // one color for every vertex
-+		for (uint8 v : {0, 0, 0, 255})
-+			Put8(d, v);
-+		size[4] = 4;
++		begin(4, kAttribAlign); // a color per vertex (FFL allows one for all; a game's shader may not)
++		for (size_t i = 0; i < mesh.pos.size(); i++)
++			for (uint8 v : {0, 0, 0, 255})
++				Put8(d, v);
++		size[4] = (uint32)(d.size() - pos[4]);
 +		begin(5, kIndexAlign);
 +		for (uint16 i : mesh.index)
 +			Put16(d, i);
