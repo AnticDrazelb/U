@@ -123,6 +123,73 @@ index 257973a..67a596c 100644
  	_rdtscLastMeasure = __rdtsc();
  }
  
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
+index e466deb..df1748b 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
+@@ -738,6 +738,29 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+ 			x64Gen_shlx_reg64_reg64_reg64(x64GenContext, rRegResult, rRegOperand1, rRegOperand2);
+ 			x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
+ 		}
++		else if (rRegOperand2 == X86_REG_ECX)
++		{
++			// the amount in CL (IMLRegisterAllocator: without BMI2): a 64-bit shift of the zero-extended
++			// value by rB & 63, as SHRX/SHLX above (amounts of 32 or more leave 0 in the low half)
++			bool useTempReg = rRegResult == X86_REG_ECX && rRegOperand1 != X86_REG_ECX;
++			auto origRegResult = rRegResult;
++			if (useTempReg)
++			{
++				x64GenContext->emitter->MOV_dd(REG_RESV_TEMP, rRegOperand1);
++				rRegResult = REG_RESV_TEMP;
++			}
++			if (rRegOperand1 != rRegResult)
++				x64Gen_mov_reg64_reg64(x64GenContext, rRegResult, rRegOperand1);
++			if (imlInstruction->operation == PPCREC_IML_OP_SRW)
++				x64GenContext->emitter->SHR_q_CL(rRegResult);
++			else
++			{
++				x64GenContext->emitter->SHL_q_CL(rRegResult);
++				x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
++			}
++			if (useTempReg)
++				x64GenContext->emitter->MOV_dd(origRegResult, REG_RESV_TEMP);
++		}
+ 		else
+ 		{
+ 			// lazy and slow way to do shift by register without relying on ECX/CL or BMI2
+@@ -766,8 +789,15 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+ 	else if( imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE )
+ 	{
+ 		// todo: Use BMI2 rotate if available
++		if (rRegOperand2 == X86_REG_RCX)
++		{
++			// the amount already in CL (IMLRegisterAllocator: without BMI2)
++			x64Gen_mov_reg64_reg64(x64GenContext, REG_RESV_TEMP, rRegOperand1);
++			x64Gen_rol_reg64Low32_cl(x64GenContext, REG_RESV_TEMP);
++			x64Gen_mov_reg64_reg64(x64GenContext, rRegResult, REG_RESV_TEMP);
++		}
+ 		// check if CL/ECX/RCX is available
+-		if( rRegResult != X86_REG_RCX && rRegOperand1 != X86_REG_RCX && rRegOperand2 != X86_REG_RCX )
++		else if( rRegResult != X86_REG_RCX && rRegOperand1 != X86_REG_RCX && rRegOperand2 != X86_REG_RCX )
+ 		{
+ 			// swap operand 2 with RCX
+ 			x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
+index 935e61a..01bd371 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
+@@ -156,7 +156,10 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+ 
+ 	if (instruction->type == PPCREC_IML_TYPE_R_R_R)
+ 	{
+-		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U)
++		// without BMI2 the shift amount goes in CL: also slw/srw and rlwnm (PS4: the Jaguar has no
++		// BMI2; they used a bit-by-bit fallback, BackendX64.cpp)
++		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U ||
++			instruction->operation == PPCREC_IML_OP_SLW || instruction->operation == PPCREC_IML_OP_SRW || instruction->operation == PPCREC_IML_OP_LEFT_ROTATE)
+ 		{
+ 			if(!g_CPUFeatures.x86.bmi2)
+ 			{
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..03ba035 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -210,6 +277,32 @@ index f1556f8..1cc9d33 100644
 +#endif
  	g_renderer->ImguiEnd();
  }
+ 
+diff --git a/src/Cafe/HW/Latte/Core/LatteThread.cpp b/src/Cafe/HW/Latte/Core/LatteThread.cpp
+index 743ab67..b1fc494 100644
+--- a/src/Cafe/HW/Latte/Core/LatteThread.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteThread.cpp
+@@ -18,6 +18,10 @@
+ #include "config/ActiveSettings.h"
+ 
+ #include "Cafe/CafeSystem.h"
++#if defined(__ORBIS__)
++extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
++extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
++#endif
+ 
+ LatteGPUState_t LatteGPUState = {};
+ 
+@@ -115,6 +119,10 @@ void LatteThread_HandleOSScreen()
+ int Latte_ThreadEntry()
+ {
+ 	SetThreadName("LatteThread");
++#if defined(__ORBIS__)
++	ps4_sampler_register_thread("LatteThread");
++	ps4_boost_thread();
++#endif
+ 	sint32 w,h;
+ 	WindowSystem::GetWindowPhysSize(w,h);
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
@@ -1026,20 +1119,22 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..64cc2d3 100644
+index 9fe4bea..4a48dde 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-@@ -47,6 +47,9 @@ sint32 activeThreadCount = 0;
+@@ -47,6 +47,11 @@ sint32 activeThreadCount = 0;
  
  void nnNfp_update();
  
 +#if defined(__ORBIS__)
 +extern "C" void ps4_thread_cpu_tick(); // port/ps4_sampler.cpp
++extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
++extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
 +#endif
  namespace coreinit
  {
  #ifdef __arm64__
-@@ -1180,6 +1183,9 @@ namespace coreinit
+@@ -1180,6 +1185,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -1049,6 +1144,18 @@ index 9fe4bea..64cc2d3 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
+@@ -1391,6 +1399,11 @@ namespace coreinit
+ 	{
+ 		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
+ 		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
++#if defined(__ORBIS__)
++		static const char* const kProfiledNames[] = {"OSSched[core=0]", "OSSched[core=1]", "OSSched[core=2]"};
++		ps4_sampler_register_thread(kProfiledNames[std::min<uintptr_t>((uintptr_t)_assignedCoreIndex, 2)]);
++		ps4_boost_thread();
++#endif
+ 
+ 		ConfigureHostFloatingPointEnvironment();
+ 
 diff --git a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp b/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
 index 821fe8a..49807b9 100644
 --- a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
@@ -3372,10 +3479,10 @@ index 0000000..489dc96
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..0c951e4
+index 0000000..b4c16c2
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,690 @@
+@@ -0,0 +1,693 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -3419,6 +3526,7 @@ index 0000000..0c951e4
 +extern "C" int g_crema_pad_handle; // input/api/PS4/PS4PadController.cpp: the DualShock 4's ScePad handle
 +
 +extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
++extern "C" void ps4_sampler_start(); // port/ps4_sampler.cpp: the profiler (samples.log)
 +extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason); // port/ps4_sampler.cpp
 +extern "C" void ps4_thread_busy_report(char* out, size_t size, int min_percent); // port/ps4_sampler.cpp
 +extern "C" void ac_ps4_get_gpu_busy(uint64_t* busy_ticks, uint64_t* span_ticks); // port/mesa/ac_ps4_drm.c
@@ -3899,6 +4007,8 @@ index 0000000..0c951e4
 +		sTvScreenshots = CremaSettings::On("tv_screenshots", gameId);
 +		// RADV's per-draw trace markers and the PS4 winsys's flight recorder (port/mesa/ac_ps4_drm.c:
 +		// /data/DolphinPS4/flight), read when the device is created (after this)
++		if (CremaSettings::On("profiler", gameId))
++			ps4_sampler_start();
 +		if (CremaSettings::On("gpu_trace", gameId))
 +		{
 +			setenv("RADV_PS4_TRACE", "1", 1);
@@ -4327,10 +4437,10 @@ index 0000000..bc4f953
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..bf54e04
+index 0000000..26506e4
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,368 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -4410,6 +4520,8 @@ index 0000000..bf54e04
 +			"Pictures of the TV at 5, 15 and 30 s and every minute (screenshots folder). Each one costs a short stutter."},
 +		{"file_log", "File Access Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every file a game opens, and the game's own messages, in log.txt (finds missing files). Slows loading."},
++		{"profiler", "Profiler", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"When the PS4 closes a game with error CE-34878-0 (a GPU fault), the GPU's last commands are kept for the logs. Slightly slower."},
 +	};
