@@ -1176,13 +1176,13 @@ index 821fe8a..49807b9 100644
  			{
  				m_decodeSem.decrementWithWait();
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-index 7afbf19..a14e54d 100644
+index 7afbf19..502c484 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 +++ b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 @@ -1,3 +1,62 @@
 +#ifdef __ORBIS__
 +// PS4: fatal signals are handled by the port's crash log (port/ps4_crashlog.cpp: registers and a
-+// stack scan with ELF-relative addresses in /data/CemuPS4/crash.log); there is no execinfo.
++// stack scan with ELF-relative addresses in /data/Crema/crash.log); there is no execinfo.
 +#include "ExceptionHandler.h"
 +void ExceptionHandler_Init()
 +{
@@ -1290,7 +1290,7 @@ index 08462a9..7d1482b 100644
  #elif BOOST_OS_MACOS
  #include <libkern/OSByteOrder.h>
 diff --git a/src/Common/precompiled.h b/src/Common/precompiled.h
-index e037395..a832fd3 100644
+index e037395..16d1086 100644
 --- a/src/Common/precompiled.h
 +++ b/src/Common/precompiled.h
 @@ -310,6 +310,11 @@ inline uint64 _udiv128(uint64 highDividend, uint64 lowDividend, uint64 divisor,
@@ -1299,7 +1299,7 @@ index e037395..a832fd3 100644
      #define DEBUG_BREAK __debugbreak()
 +#elif defined(__ORBIS__)
 +    // PS4: an unhandled SIGTRAP kills the app (and can hang the console in its coredump); log the
-+    // callers to /data/CemuPS4/boot-trace.log instead (port/ps4_crashlog.cpp) and carry on
++    // callers to /data/Crema/boot-trace.log instead (port/ps4_crashlog.cpp) and carry on
 +    extern "C" void ps4_trace_callers(const char* what);
 +    #define DEBUG_BREAK ps4_trace_callers("cemu assert")
  #else
@@ -3479,18 +3479,18 @@ index 0000000..489dc96
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..b4c16c2
+index 0000000..a9a09a7
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,739 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
 +//
 +//   /app0                   packaged data: resources/, gameProfiles/
-+//   /data/CemuPS4           settings, logs (log.txt, boot-trace.log, crash.log, hang.log), caches
-+//   /data/CemuPS4/mlc01     emulated NAND
-+//   /data/CemuPS4/games     games; launch.txt (first line: a path) picks one, else the first found
++//   /data/Crema           settings, logs (log.txt, boot-trace.log, crash.log, hang.log), caches
++//   /data/Crema/mlc01     emulated NAND
++//   /data/Crema/games     games; launch.txt (first line: a path) picks one, else the first found
 +#include "interface/WindowSystem.h"
 +
 +#include "Cafe/CafeSystem.h"
@@ -3536,7 +3536,7 @@ index 0000000..b4c16c2
 +
 +namespace
 +{
-+	const fs::path kDataRoot = "/data/CemuPS4";
++	const fs::path kDataRoot = "/data/Crema";
 +	const fs::path kAppRoot = "/app0";
 +	constexpr int kWidth = 1920, kHeight = 1080;
 +
@@ -3919,10 +3919,56 @@ index 0000000..b4c16c2
 +		return false;
 +	}
 +
++	// The old folder from before the app was renamed (/data/CemuPS4) when the new one already
++	// existed, so it wasn't simply renamed (port/ps4_crashlog.cpp): what isn't in the new one yet
++	// is moved over, entry by entry.
++	void MergeOldDataFolder()
++	{
++		const fs::path old = "/data/CemuPS4";
++		std::error_code ec;
++		if (!fs::is_directory(old, ec))
++			return;
++		int moved = 0;
++		for (const auto& entry : fs::directory_iterator(old, ec))
++		{
++			const fs::path target = kDataRoot / entry.path().filename();
++			if (fs::exists(target, ec))
++			{
++				// a folder in both (games, mlc01, ...): what's only in the old one
++				if (entry.is_directory(ec) && fs::is_directory(target, ec))
++					for (const auto& inner : fs::directory_iterator(entry.path(), ec))
++						if (!fs::exists(target / inner.path().filename(), ec))
++						{
++							fs::rename(inner.path(), target / inner.path().filename(), ec);
++							moved += ec ? 0 : 1;
++						}
++				continue;
++			}
++			fs::rename(entry.path(), target, ec);
++			moved += ec ? 0 : 1;
++		}
++		// paths kept in files (last and default game, games folder, ...) to the new place
++		for (const char* name : {"launcher.ini", "launch.txt", "played.ini", "settings.xml"})
++		{
++			const fs::path path = kDataRoot / name;
++			std::string text;
++			{
++				std::ifstream in(path, std::ios::binary);
++				text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++			}
++			if (text.find("/data/CemuPS4") == std::string::npos)
++				continue;
++			boost::replace_all(text, "/data/CemuPS4", _pathToUtf8(kDataRoot));
++			std::ofstream(path, std::ios::binary | std::ios::trunc) << text;
++		}
++		Trace(fmt::format("moved {} entries from /data/CemuPS4 into {}", moved, _pathToUtf8(kDataRoot)));
++	}
++
 +	void Run()
 +	{
 +		LoadSystemModules();
-+		Trace("CemuPS4 starting");
++		Trace("Crema starting");
++		MergeOldDataFolder();
 +
 +		std::error_code ec;
 +		fs::create_directories(kDataRoot / "games", ec);
@@ -4405,12 +4451,12 @@ index 0000000..a41c48a
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaCovers.h b/src/gui/ps4/launcher/CremaCovers.h
 new file mode 100644
-index 0000000..bc4f953
+index 0000000..27140be
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaCovers.h
 @@ -0,0 +1,26 @@
 +// Box art for the launcher (from DolphinPS4's PS4Covers), downloaded from GameTDB for the games
-+// the user has, into /data/CemuPS4/covers/<ID>.jpg. IDs are GameTDB's Wii U ones: the product code
++// the user has, into /data/Crema/covers/<ID>.jpg. IDs are GameTDB's Wii U ones: the product code
 +// from meta.xml and the company code (ARDE01 = Super Mario 3D World, USA). A <ID>.png the user puts
 +// there is used instead.
 +#pragma once
@@ -4811,12 +4857,12 @@ index 0000000..26506e4
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/CremaSettings.h b/src/gui/ps4/launcher/CremaSettings.h
 new file mode 100644
-index 0000000..4937718
+index 0000000..2743734
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.h
 @@ -0,0 +1,61 @@
 +// Crema settings (from DolphinPS4's PS4Settings), shared by the launcher and the game process.
-+// The user's choices are kept in /data/CemuPS4/crema.ini: a [global] section and one section per
++// The user's choices are kept in /data/Crema/crema.ini: a [global] section and one section per
 +// title ID (16 hex digits) for games set to their own settings ("custom=on"). A setting never
 +// changed uses its default below.
 +//
@@ -4878,7 +4924,7 @@ index 0000000..4937718
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..dc4b03b
+index 0000000..f056b35
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
 @@ -0,0 +1,3007 @@
@@ -4928,7 +4974,7 @@ index 0000000..dc4b03b
 +	constexpr float W = (float)Display::WIDTH;
 +	constexpr float H = (float)Display::HEIGHT;
 +
-+	// The launcher's own log (/data/CemuPS4/launcher.log): log.txt and the boot trace start over
++	// The launcher's own log (/data/Crema/launcher.log): log.txt and the boot trace start over
 +	// when the app restarts into a game.
 +	FILE* s_log = nullptr;
 +
@@ -7891,7 +7937,7 @@ index 0000000..dc4b03b
 +} // namespace CremaLauncher
 diff --git a/src/gui/ps4/launcher/Launcher.h b/src/gui/ps4/launcher/Launcher.h
 new file mode 100644
-index 0000000..ba1c59d
+index 0000000..75abc8b
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.h
 @@ -0,0 +1,19 @@
@@ -7906,7 +7952,7 @@ index 0000000..ba1c59d
 +namespace CremaLauncher
 +{
 +// Shows the launcher until a game is picked (returns its path) or it can't run (empty).
-+// dataDir: /data/CemuPS4 (launcher.ini, crema.ini, themes/); assetsDir: /app0 (xmb/: fonts,
++// dataDir: /data/Crema (launcher.ini, crema.ini, themes/); assetsDir: /app0 (xmb/: fonts,
 +// sounds, languages; launcher/: the intro and the logo).
 +std::string Run(const std::string& dataDir, const std::string& assetsDir, const std::string& version);
 +

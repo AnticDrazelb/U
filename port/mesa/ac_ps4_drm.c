@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -242,7 +243,8 @@ ps4_log(const char *fmt, ...)
    /* Also straight to a file: the app may not route stderr anywhere. */
    static int fd = -2;
    if (fd == -2)
-      fd = open("/data/DolphinPS4/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      mkdir("/data/Crema/gpu", 0777);
+      fd = open("/data/Crema/gpu/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (fd >= 0)
       write(fd, line, strlen(line));
 }
@@ -412,7 +414,7 @@ ps4_walk_ib(ac_drm_device *dev, FILE *f, const uint32_t *ib, unsigned num_dw, in
 }
 
 /* Writes the command buffers of the first submission the GPU hasn't finished, decoded by Mesa's
- * IB parser, to /data/DolphinPS4/gpu-hang.txt (once). */
+ * IB parser, to /data/Crema/gpu/gpu-hang.txt (once). */
 static void
 ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
 {
@@ -421,10 +423,10 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
    dev->hang_reported = true;
    const uint64_t completed = ps4_completed(dev);
    ps4_log("radv/ps4: GPU hang? waiting for %llu, completed %llu, submitted %llu - writing "
-           "/data/DolphinPS4/gpu-hang.txt\n",
+           "/data/Crema/gpu/gpu-hang.txt\n",
            (unsigned long long)waited_seq, (unsigned long long)completed,
            (unsigned long long)dev->last_seq);
-   FILE *f = fopen("/data/DolphinPS4/gpu-hang.txt", "w");
+   FILE *f = fopen("/data/Crema/gpu/gpu-hang.txt", "w");
    if (!f)
       return;
    fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
@@ -544,7 +546,7 @@ ps4_load_gnm(ac_drm_device *dev)
  *    there (+0 valid, +0x90 protection fault timestamp, ...). Its pointer is GnmDriver data
  *    +0x10508 (firmware 12.00: sceGnmIsCoredumpValid at +0x690 reads it).
  *  - sceKernelAddGpuExceptionEvent(eq, udata): kevent filter -20 on GPU exceptions.
- * Everything is written to /data/DolphinPS4/gpu-fault.txt, with the recent submissions and every
+ * Everything is written to /data/Crema/gpu/gpu-fault.txt, with the recent submissions and every
  * live buffer, so a fault address can be mapped to its buffer.
  */
 int sceKernelGetModuleList(int *handles, size_t num, size_t *actual);
@@ -601,7 +603,7 @@ static int
 ps4_coredump_handler(void *arg)
 {
    (void)arg;
-   FILE *f = fopen("/data/DolphinPS4/gpu-fault.txt", "w");
+   FILE *f = fopen("/data/Crema/gpu/gpu-fault.txt", "w");
    if (f) {
       fprintf(f, "==== core dump handler (the system is killing the app)\n");
       ps4_dump_state(f, ps4_fault_dev);
@@ -618,7 +620,7 @@ ps4_gpu_exception_thread(void *eq)
       int n = 0;
       if (sceKernelWaitEqueue(eq, ev, 4, &n, NULL) || n <= 0)
          continue;
-      FILE *f = fopen("/data/DolphinPS4/gpu-fault.txt", "a");
+      FILE *f = fopen("/data/Crema/gpu/gpu-fault.txt", "a");
       for (int i = 0; i < n; i++) {
          ps4_log("radv/ps4: GPU EXCEPTION event: ident %#llx filter/flags/fflags %#llx data %#llx "
                  "udata %#llx\n", (unsigned long long)ev[i][0], (unsigned long long)ev[i][1],
@@ -656,9 +658,9 @@ ps4_find_symbol(const char *name)
  * Flight recorder (with RADV_PS4_TRACE, ps4.ini radv_trace=on). Nothing reports a GPU fault on a
  * retail PS4 - the app is just gone, and its core dump is encrypted - but data written with
  * write() sits in the kernel's page cache and survives the kill. So:
- *  - /data/DolphinPS4/flight/ib-N.bin: the complete command stream of each submission (every IB,
+ *  - /data/Crema/gpu/flight/ib-N.bin: the complete command stream of each submission (every IB,
  *    chained and nested), in a ring of 8 files (N = submission % 8);
- *  - /data/DolphinPS4/flight/progress.log: submissions, the GPU's completed submission, and the
+ *  - /data/Crema/gpu/flight/progress.log: submissions, the GPU's completed submission, and the
  *    last RADV trace id (written by the CP as it reaches each draw), every millisecond it changes.
  * After a kill, the last trace id locates the draw the GPU died on inside the saved stream.
  */
@@ -773,7 +775,7 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
    if (ps4_progress_fd < 0)
       return;
    char path[64];
-   snprintf(path, sizeof(path), "/data/DolphinPS4/flight/ib-%u.bin", (unsigned)(seq % 8));
+   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/ib-%u.bin", (unsigned)(seq % 8));
    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (fd < 0)
       return;
@@ -788,13 +790,14 @@ ps4_start_flight_recorder(ac_drm_device *dev)
 {
    if (!getenv("RADV_PS4_TRACE") || ps4_progress_fd >= 0)
       return;
-   mkdir("/data/DolphinPS4/flight", 0777);
-   ps4_progress_fd = open("/data/DolphinPS4/flight/progress.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   mkdir("/data/Crema/gpu", 0777);
+   mkdir("/data/Crema/gpu/flight", 0777);
+   ps4_progress_fd = open("/data/Crema/gpu/flight/progress.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (ps4_progress_fd < 0)
       return;
    pthread_t t;
    pthread_create(&t, NULL, ps4_progress_thread, dev);
-   ps4_log("radv/ps4: flight recorder on (/data/DolphinPS4/flight)\n");
+   ps4_log("radv/ps4: flight recorder on (/data/Crema/gpu/flight)\n");
 }
 
 static void
@@ -1885,7 +1888,7 @@ ps4_check_ib_chain(ac_drm_device *dev, const uint32_t *ib, unsigned num_dw, uint
          if (ps4_corrupt_reports++ < 4) {
             ps4_log("radv/ps4: submission %llu: IB %p (%u dwords) %s (first dword %#x) - see "
                     "ib-corrupt.txt\n", (unsigned long long)seq, (void *)ib, num_dw, problem, ib[0]);
-            FILE *f = fopen("/data/DolphinPS4/ib-corrupt.txt", "a");
+            FILE *f = fopen("/data/Crema/gpu/ib-corrupt.txt", "a");
             if (f) {
                fprintf(f, "==== submission %llu, chain link %u: IB %p, %u dwords, %s\n",
                        (unsigned long long)seq, link, (void *)ib, num_dw, problem);

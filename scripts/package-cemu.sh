@@ -3,8 +3,7 @@
 # (IV0000-CREM00001_00-CREMA00000000000.pkg; before v01.17 it was CEMU00001): eboot.bin, Cemu's
 # data folders (resources, gameProfiles) and the launcher's assets in /app0.
 #   CEMU_PS4_VERSION=01.00 package-cemu.sh [upload]
-# upload: puts the pkg in the console's /data/pkg (install it with GoldHEN's Package Installer) and
-# the test homebrew from tests/out in /data/CemuPS4/games.
+# upload: puts the pkg in the console's /data/pkg (install it with GoldHEN's Package Installer).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/ps4-env.sh"
@@ -43,9 +42,6 @@ if [ "${1:-}" = upload ]; then
     # the package from before the rename (CEMU00001), superseded: /data/pkg stays clean
     curl -sS -Q "DELE /data/pkg/IV0000-CEMU00001_00-CEMUPS4000000000.pkg" "$HOST/" -o /dev/null 2>/dev/null &&
         echo "removed the old IV0000-CEMU00001_00-CEMUPS4000000000.pkg from /data/pkg" || true
-    for game in "$HERE/../tests/out/"*.rpx; do
-        [ -f "$game" ] || continue
-        curl -sS --ftp-create-dirs -T "$game" "$HOST/data/CemuPS4/games/"
-        echo "uploaded $(basename "$game") to /data/CemuPS4/games"
-    done
+    # (The test homebrew in tests/out is uploaded by hand now: creating data_dir/games from here
+    # before the app has run made it skip moving the old /data/CemuPS4 into /data/Crema.)
 fi

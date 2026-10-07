@@ -2,9 +2,9 @@
 //
 // PS4 coredumps are encrypted and klog is shared with other tools, so the app reports its own
 // crashes: a constructor that runs before all others (priority 101) starts
-// /data/CemuPS4/boot-trace.log and installs a handler for fatal signals that appends the
+// /data/Crema/boot-trace.log and installs a handler for fatal signals that appends the
 // signal, fault address, registers and the code addresses found on the stack to
-// /data/CemuPS4/crash.log. Addresses are printed relative to the start of .text, i.e. as ELF
+// /data/Crema/crash.log. Addresses are printed relative to the start of .text, i.e. as ELF
 // virtual addresses: symbolize with `llvm-symbolizer --obj=<elf> 0x...`.
 //
 // Handlers installed later (Dolphin's fastmem handler) chain to this one for faults they don't
@@ -79,11 +79,52 @@ constexpr uintptr_t kTextWindow = 0x4000000;  // 64 MiB covers the eboot's code
 
 int g_traceFd = -1;
 
+// The app's folder was /data/CemuPS4 before the app was renamed Crema (v01.34): moved once, before
+// anything opens a file there, and the paths kept in its files changed to the new place.
+void migrateDataFolder() {
+    struct stat st;
+    if (stat("/data/Crema", &st) == 0 || stat("/data/CemuPS4", &st) != 0)
+        return;
+    if (rename("/data/CemuPS4", "/data/Crema") != 0)
+        return;
+    const char* const files[] = {"/data/Crema/launcher.ini", "/data/Crema/launch.txt", "/data/Crema/played.ini",
+                                 "/data/Crema/settings.xml"};
+    const char kOld[] = "/data/CemuPS4", kNew[] = "/data/Crema";
+    for (const char* path : files) {
+        const int in = open(path, O_RDONLY);
+        if (in < 0)
+            continue;
+        const off_t size = lseek(in, 0, SEEK_END);
+        lseek(in, 0, SEEK_SET);
+        // no malloc: this can run while the heap is being set up (it logs here)
+        static char text[1 << 20];
+        const bool read_all = size > 0 && size < static_cast<off_t>(sizeof(text)) && read(in, text, size) == size;
+        close(in);
+        if (!read_all)
+            continue;
+        text[size] = 0;
+        const int out = open(path, O_WRONLY | O_TRUNC);
+        if (out >= 0) {
+            for (const char* p = text; *p;) {
+                const char* found = strstr(p, kOld);
+                const size_t keep = found ? static_cast<size_t>(found - p) : strlen(p);
+                write(out, p, keep);
+                if (!found)
+                    break;
+                write(out, kNew, sizeof(kNew) - 1);
+                p = found + sizeof(kOld) - 1;
+            }
+            close(out);
+        }
+    }
+}
+
 // Opened on first use: the heap may log before this file's constructor runs.
 int traceFd() {
     if (g_traceFd < 0) {
-        mkdir("/data/CemuPS4", 0777);
-        g_traceFd = open("/data/CemuPS4/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        migrateDataFolder();
+        mkdir("/data/Crema", 0777);
+        g_traceFd = open("/data/Crema/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;
 }
@@ -133,7 +174,7 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     if (s_depth++ > 0)
         _exit(128 + sig);
 
-    const int fd = open("/data/CemuPS4/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    const int fd = open("/data/Crema/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
         const uint64_t rip = regs[kRipIndex];
@@ -179,7 +220,7 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         endAfterCrash(126);
     }, nullptr);
     // Where every other thread was (stacks, and the lock each one waits on), after the crash.
-    ps4_dump_thread_stacks("/data/CemuPS4/crash.log", "every thread at the crash");
+    ps4_dump_thread_stacks("/data/Crema/crash.log", "every thread at the crash");
     // The emulator's view of the crash (Cemu: the guest CPU state, stack trace and threads, into
     // log.txt).
     if (ps4_crash_guest_info) {
@@ -210,7 +251,7 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         }
         snprintf(message, sizeof(message), "uncaught exception %s: %s", name ? name : type->name(), what);
     }
-    const int fd = open("/data/CemuPS4/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    const int fd = open("/data/Crema/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         writeFormat(fd, "\n=== %s\n", message);
         close(fd);
@@ -254,7 +295,7 @@ extern "C" __attribute__((noinline)) void ps4_trace_callers(const char* what) {
     ps4_boot_trace(line);
 }
 
-// Appends a line to /data/CemuPS4/boot-trace.log (startup milestones), prefixed with the
+// Appends a line to /data/Crema/boot-trace.log (startup milestones), prefixed with the
 // seconds since the first trace line.
 extern "C" void ps4_boot_trace(const char* stage) {
     const int fd = traceFd();

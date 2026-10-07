@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch /data/CemuPS4/{boot-trace,crash,hang}.log and Cemu's log.txt from the console and symbolize
+# Fetch /data/Crema/{boot-trace,crash,hang}.log and Cemu's log.txt from the console and symbolize
 # the crash and hang addresses against the Cemu ELF (default: the newest packaged version's, from
 # oelf/).
 #   crashlog.sh [elf]
@@ -11,7 +11,7 @@ HOST="ftp://${PS4_HOST:-192.168.0.90}:${PS4_FTP_PORT:-2121}"
 OUT="$PS4_BUILD_ROOT/logs"
 mkdir -p "$OUT"
 for f in boot-trace.log crash.log hang.log log.txt; do
-    curl -s --max-time 30 -o "$OUT/$f" "$HOST/data/CemuPS4/$f" || rm -f "$OUT/$f"
+    curl -s --max-time 30 -o "$OUT/$f" "$HOST/data/Crema/$f" || rm -f "$OUT/$f"
 done
 symbolize() {
     llvm-symbolizer-21 --obj="$ELF" --functions=linkage --demangle --no-inlines "$1" | head -2 | paste -sd' '
@@ -36,8 +36,8 @@ print_thread_dump() {
 }
 # TV screenshots the frontend takes during a run (PS4WindowSystem.cpp)
 rm -rf "$OUT/screenshots"; mkdir -p "$OUT/screenshots"
-for f in $(curl -s --max-time 30 --list-only "$HOST/data/CemuPS4/screenshots/" | grep '\.png$'); do
-    curl -s --max-time 60 -o "$OUT/screenshots/$f" "$HOST/data/CemuPS4/screenshots/$f"
+for f in $(curl -s --max-time 30 --list-only "$HOST/data/Crema/screenshots/" | grep '\.png$'); do
+    curl -s --max-time 60 -o "$OUT/screenshots/$f" "$HOST/data/Crema/screenshots/$f"
 done
 echo "== screenshots: $(ls "$OUT/screenshots" | tr '\n' ' ')"
 echo "== boot-trace.log"; cat "$OUT/boot-trace.log" 2>/dev/null || echo "(none)"
@@ -68,10 +68,10 @@ if [ -s "$OUT/crash.log" ] && grep -q "crashed" "$OUT/boot-trace.log" 2>/dev/nul
 else
     echo "== crash.log: no crash in this run"
 fi
-# the GPU driver's files (port/mesa/ac_ps4_drm.c, still under DolphinPS4's folder): its log, a GPU
+# the GPU driver's files (port/mesa/ac_ps4_drm.c, in data_dir/gpu): its log, a GPU
 # fault report, and with Diagnostics > GPU Fault Recorder the flight recorder (progress.log: the
 # last submission and per-draw trace id the GPU reached; ib-N.bin: the last 8 command streams)
-G="$HOST/data/DolphinPS4"
+G="$HOST/data/Crema/gpu"
 rm -rf "$OUT/gpu"; mkdir -p "$OUT/gpu"
 for f in radv-ps4.log gpu-fault.txt; do
     curl -s --max-time 30 -o "$OUT/gpu/$f" "$G/$f" || rm -f "$OUT/gpu/$f"
