@@ -456,6 +456,7 @@ static void readIfMapped(uint64_t address, uint32_t (&words)[4]) {
 }
 
 extern "C" __attribute__((weak)) void ps4_crash_jit_info(int fd, uint64_t rip, int brief);
+extern "C" __attribute__((weak)) void ps4_recompiler_status(int fd);  // the emulator's (Crema)
 
 // Writes every watched thread's stack to `path` (appending), headed by `reason`.
 extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
@@ -466,6 +467,8 @@ extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
     snprintf(line, sizeof(line), "==== %s (eboot addresses relative to .text, symbolize with "
                                  "llvm-symbolizer --obj=<oelf>)\n", reason);
     writeLine(fd, line);
+    if (ps4_recompiler_status)
+        ps4_recompiler_status(fd);
     const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
     const int count = std::min(g_watched_count.load(std::memory_order_acquire), kMaxWatched);
     for (int i = 0; i < count; i++) {

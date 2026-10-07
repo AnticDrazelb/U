@@ -231,10 +231,18 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..7b46034 100644
+index c9758f3..4fff996 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-@@ -59,6 +59,87 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -11,6 +11,7 @@
+ #include "util/helpers/fspinlock.h"
+ #include "util/helpers/helpers.h"
+ #include "util/MemMapper/MemMapper.h"
++#include <ctime>
+ 
+ #include "IML/IML.h"
+ #include "IML/IMLRegisterAllocator.h"
+@@ -59,6 +60,117 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -255,6 +263,18 @@ index c9758f3..7b46034 100644
 +	constexpr uint32 kCremaJitRanges = 1 << 15;
 +	CremaJitRange s_cremaJitRanges[kCremaJitRanges];
 +	std::atomic<uint32> s_cremaJitNext{0};
++
++	// the function the recompiler thread is compiling (0: none) and since when (ns, monotonic)
++	std::atomic<uint32> s_cremaCompiling{0};
++	std::atomic<uint64> s_cremaCompileStart{0};
++	std::atomic<uint32> s_cremaQueued{0};
++
++	uint64 CremaNowNs()
++	{
++		timespec now;
++		clock_gettime(CLOCK_MONOTONIC, &now);
++		return (uint64)now.tv_sec * 1000000000ull + (uint64)now.tv_nsec;
++	}
 +
 +	void CremaJitRecord(PPCRecFunction_t* func)
 +	{
@@ -317,12 +337,30 @@ index c9758f3..7b46034 100644
 +	if (!brief)
 +		out(snprintf(line, sizeof(line), "jit: host 0x%llx is not in a recompiled function (%u recorded)\n", (unsigned long long)rip, count));
 +}
++
++// hang.log: what the recompiler thread is doing (one thread compiles everything: while it is busy
++// with one function, newly reached game code runs in the much slower interpreter)
++extern "C" void ps4_recompiler_status(int fd)
++{
++	char line[200];
++	const uint32 address = s_cremaCompiling.load();
++	int n;
++	if (address)
++		n = snprintf(line, sizeof(line), "recompiler: compiling the game function at %08x for %.1f s; %u addresses queued\n", address,
++			(double)(CremaNowNs() - s_cremaCompileStart.load()) / 1e9, s_cremaQueued.load());
++	else
++		n = snprintf(line, sizeof(line), "recompiler: idle; %u addresses queued\n", s_cremaQueued.load());
++	if (n > 0)
++		write(fd, line, std::min<size_t>((size_t)n, sizeof(line) - 1));
++}
++
++extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
 +#endif
 +
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -419,6 +500,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +531,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -332,6 +370,34 @@ index c9758f3..7b46034 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
+@@ -486,9 +601,27 @@ void PPCRecompiler_thread()
+ 				s_ppcRecompilerState.recompilerSpinlock.unlock();
+ 				continue;
+ 			}
++#ifdef __ORBIS__
++			s_cremaQueued.store((uint32)s_ppcRecompilerState.targetQueue.size());
++#endif
+ 			s_ppcRecompilerState.recompilerSpinlock.unlock();
+ 
++#ifdef __ORBIS__
++			const uint64 compileStart = CremaNowNs();
++			s_cremaCompileStart.store(compileStart);
++			s_cremaCompiling.store(enterAddress);
++#endif
+ 			PPCRecompiler_recompileAtAddress(enterAddress);
++#ifdef __ORBIS__
++			s_cremaCompiling.store(0);
++			const double seconds = (double)(CremaNowNs() - compileStart) / 1e9;
++			if (seconds >= 1.0)
++			{
++				char text[160];
++				snprintf(text, sizeof(text), "recompiler: the game function at %08x took %.1f s to compile", enterAddress, seconds);
++				ps4_boot_trace(text);
++			}
++#endif
+ 			if(s_ppcRecompilerState.workerThreadStopSignal)
+ 				return;
+ 		}
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..03ba035 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
