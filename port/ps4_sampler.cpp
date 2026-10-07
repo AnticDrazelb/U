@@ -455,6 +455,8 @@ static void readIfMapped(uint64_t address, uint32_t (&words)[4]) {
     memcpy(words, reinterpret_cast<const void*>(address), sizeof(words));
 }
 
+extern "C" __attribute__((weak)) void ps4_crash_jit_info(int fd, uint64_t rip, int brief);
+
 // Writes every watched thread's stack to `path` (appending), headed by `reason`.
 extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
     const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
@@ -487,6 +489,9 @@ extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
                  in_eboot ? "elf " : "(system/JIT) ",
                  static_cast<unsigned long long>(in_eboot ? t.rip - text : t.rip));
         writeLine(fd, line);
+        // in recompiled game code: which game function (the emulator's, Crema: PPCRecompiler.cpp)
+        if (!in_eboot && ps4_crash_jit_info)
+            ps4_crash_jit_info(fd, t.rip, 1);
         if (t.in_umtx) {
             readIfMapped(t.umtx_obj, t.umtx_words);
             readIfMapped(t.umtx_obj2, t.umtx_words2);

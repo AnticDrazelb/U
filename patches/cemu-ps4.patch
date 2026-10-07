@@ -231,10 +231,10 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..6542b19 100644
+index c9758f3..7b46034 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-@@ -59,6 +59,83 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +59,87 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -269,9 +269,10 @@ index c9758f3..6542b19 100644
 +	}
 +}
 +
-+// crash.log: which recompiled function the host address is in, and that function's x86 code
-+// around it and the game's code, to disassemble offline (scripts/guest-code.py)
-+extern "C" void ps4_crash_jit_info(int fd, uint64 rip)
++// crash.log: which recompiled function the host address is in, and (brief: not) that function's
++// x86 code around it and the game's code, to disassemble offline (scripts/guest-code.py). Brief
++// (hang reports): only that line, nothing for an address outside recompiled code.
++extern "C" void ps4_crash_jit_info(int fd, uint64 rip, int brief)
 +{
 +	char line[200];
 +	auto out = [&](int n) {
@@ -292,6 +293,8 @@ index c9758f3..6542b19 100644
 +		const uint32 offset = (uint32)(rip - start);
 +		out(snprintf(line, sizeof(line), "jit: host 0x%llx is +0x%x in the recompiled game function %08x-%08x (x86 size 0x%x)\n",
 +			(unsigned long long)rip, offset, ppcStart, ppcStart + ppcSize, size));
++		if (brief)
++			return;
 +		// x86 code: up to 0x600 bytes before the fault and 0x100 after
 +		const uint32 from = offset > 0x600 ? (offset - 0x600) & ~0xFu : 0;
 +		const uint32 to = std::min<uint32>(size, offset + 0x100);
@@ -311,14 +314,15 @@ index c9758f3..6542b19 100644
 +				memory_readU32(at + 24), memory_readU32(at + 28)));
 +		return;
 +	}
-+	out(snprintf(line, sizeof(line), "jit: host 0x%llx is not in a recompiled function (%u recorded)\n", (unsigned long long)rip, count));
++	if (!brief)
++		out(snprintf(line, sizeof(line), "jit: host 0x%llx is not in a recompiled function (%u recorded)\n", (unsigned long long)rip, count));
 +}
 +#endif
 +
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -419,6 +496,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +500,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
