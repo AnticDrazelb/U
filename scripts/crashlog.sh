@@ -10,7 +10,7 @@ ELF="${1:-$(ls -t "$PS4_BUILD_ROOT"/oelf/v*.elf 2>/dev/null | head -1)}"
 HOST="ftp://${PS4_HOST:-192.168.0.90}:${PS4_FTP_PORT:-2121}"
 OUT="$PS4_BUILD_ROOT/logs"
 mkdir -p "$OUT"
-for f in boot-trace.log crash.log hang.log log.txt; do
+for f in boot-trace.log boot-trace-game.log crash.log hang.log log.txt; do
     curl -s --max-time 30 -o "$OUT/$f" "$HOST/data/Crema/$f" || rm -f "$OUT/$f"
 done
 symbolize() {
@@ -41,9 +41,13 @@ for f in $(curl -s --max-time 30 --list-only "$HOST/data/Crema/screenshots/" | g
 done
 echo "== screenshots: $(ls "$OUT/screenshots" | tr '\n' ' ')"
 echo "== boot-trace.log"; cat "$OUT/boot-trace.log" 2>/dev/null || echo "(none)"
+# a game that stopped and went back to the launcher: its own trace (the launcher's is above)
+if [ -s "$OUT/boot-trace-game.log" ] && grep -q "game stopped" "$OUT/boot-trace.log" 2>/dev/null; then
+    echo "== boot-trace-game.log (the game that stopped)"; grep -v "mmap:" "$OUT/boot-trace-game.log" | tail -40
+fi
 echo "== log.txt (last 60 lines)"; tail -60 "$OUT/log.txt" 2>/dev/null || echo "(none)"
 # crash.log collects every run's crashes: only the last one, and only if this run crashed
-if [ -s "$OUT/crash.log" ] && grep -q "crashed" "$OUT/boot-trace.log" 2>/dev/null; then
+if [ -s "$OUT/crash.log" ] && grep -q "crashed\|game stopped: The game crashed" "$OUT/boot-trace.log" "$OUT/boot-trace-game.log" 2>/dev/null; then
     echo "== crash.log (last crash)"
     last="$(awk '/^=== /{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$OUT/crash.log")"
     # the crashing thread (before the other threads' dump)
@@ -55,6 +59,14 @@ if [ -s "$OUT/crash.log" ] && grep -q "crashed" "$OUT/boot-trace.log" 2>/dev/nul
             printf '%s  ' "$addr"
             symbolize "$addr"
         done
+    # the game's code around the crash (guest code lines), disassembled
+    if printf '%s
+' "$crashed" | grep -q "^guest code "; then
+        echo "== the game's code around the crash (LR, then the callers)"
+        printf '%s
+' "$crashed" > "$OUT/crash-block.txt"
+        python3 "$HERE/guest-code.py" "$OUT/crash-block.txt"
+    fi
     # every other thread at the crash (ps4_dump_thread_stacks), symbolized like hang.log
     if printf '%s\n' "$last" | grep -q "^==== "; then
         echo "== the other threads at the crash"

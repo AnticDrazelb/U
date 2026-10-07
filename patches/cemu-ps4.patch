@@ -1176,10 +1176,10 @@ index 821fe8a..49807b9 100644
  			{
  				m_decodeSem.decrementWithWait();
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-index 7afbf19..502c484 100644
+index 7afbf19..8ee0335 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 +++ b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-@@ -1,3 +1,62 @@
+@@ -1,3 +1,85 @@
 +#ifdef __ORBIS__
 +// PS4: fatal signals are handled by the port's crash log (port/ps4_crashlog.cpp: registers and a
 +// stack scan with ELF-relative addresses in /data/Crema/crash.log); there is no execinfo.
@@ -1226,6 +1226,29 @@ index 7afbf19..502c484 100644
 +	}
 +	n += snprintf(line + n, sizeof(line) - n, "\n");
 +	out(n);
++	// the game's code around LR (where the crashed function last called out) and its callers'
++	// return addresses, to disassemble offline (llvm-objdump --triple=powerpc), as the game's
++	// files may be encrypted on the console only
++	uint32 addresses[4] = {hCPU->spr.LR, 0, 0, 0};
++	sp = hCPU->gpr[1];
++	for (int i = 1; i < 4 && sp >= 0x01000000 && sp < 0xF0000000 && (sp & 3) == 0; i++)
++	{
++		const uint32 next = memory_readU32(sp);
++		if (next <= sp || next >= 0xF0000000)
++			break;
++		addresses[i] = memory_readU32(next + 4);
++		sp = next;
++	}
++	for (uint32 address : addresses)
++	{
++		if (address < 0x01000000 || address >= 0x10000000 || (address & 3))
++			continue;
++		const uint32 start = address - 0x40;
++		for (uint32 at = start; at < address + 0xC0; at += 0x20)
++			out(snprintf(line, sizeof(line), "guest code %08x: %08x %08x %08x %08x %08x %08x %08x %08x\n", at, memory_readU32(at),
++				memory_readU32(at + 4), memory_readU32(at + 8), memory_readU32(at + 12), memory_readU32(at + 16), memory_readU32(at + 20),
++				memory_readU32(at + 24), memory_readU32(at + 28)));
++	}
 +}
 +
 +// Called by the port's crash handler after crash.log: the emulated side of the crash (the active
@@ -1242,7 +1265,7 @@ index 7afbf19..502c484 100644
  #include <signal.h>
  #include <execinfo.h>
  #include <string.h>
-@@ -170,3 +229,4 @@ void ExceptionHandler_Init()
+@@ -170,3 +252,4 @@ void ExceptionHandler_Init()
  	sigaction(SIGSYS, &action, nullptr);
  	sigaction(SIGTRAP, &action, nullptr);
  }

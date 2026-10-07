@@ -124,6 +124,11 @@ int traceFd() {
     if (g_traceFd < 0) {
         migrateDataFolder();
         mkdir("/data/Crema", 0777);
+        // After a game stopped, the launcher starts: the game's trace is kept as
+        // boot-trace-game.log (the note for the launcher is there until it shows it).
+        struct stat st;
+        if (stat("/data/Crema/last-stop.txt", &st) == 0)
+            rename("/data/Crema/boot-trace.log", "/data/Crema/boot-trace-game.log");
         g_traceFd = open("/data/Crema/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;
