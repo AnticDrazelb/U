@@ -125,7 +125,7 @@ index 257973a..67a596c 100644
  }
  
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..7ff947d 100644
+index e466deb..1316a67 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -9,6 +9,9 @@
@@ -138,43 +138,44 @@ index e466deb..7ff947d 100644
  static x86Assembler64::GPR32 _reg32(IMLReg physReg)
  {
  	cemu_assert_debug(physReg.GetRegFormat() == IMLRegFormat::I32);
-@@ -738,6 +741,26 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -738,6 +741,23 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  			x64Gen_shlx_reg64_reg64_reg64(x64GenContext, rRegResult, rRegOperand1, rRegOperand2);
  			x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
  		}
-+		else if (g_crema_cl_shifts && rRegOperand2 == X86_REG_ECX)
++		else if (g_crema_cl_shifts)
 +		{
-+			// the amount in CL (IMLRegisterAllocator: without BMI2): a 64-bit shift of the zero-extended
-+			// value by rB & 63, as SHRX/SHLX above (amounts of 32 or more leave 0 in the low half). The
-+			// 32-bit move zero-extends: the upper half must not shift down into the result.
-+			bool useTempReg = rRegResult == X86_REG_ECX && rRegOperand1 != X86_REG_ECX;
-+			auto origRegResult = rRegResult;
-+			if (useTempReg)
-+				rRegResult = REG_RESV_TEMP;
-+			x64GenContext->emitter->MOV_dd(rRegResult, rRegOperand1);
++			// Crema (Fast Shifts, no BMI2): the amount through CL without the register allocator
++			// (pinning rB to ECX kept it there past calls, which clobber RCX: Tekken Tag Tournament 2's
++			// heap broke). The zero-extended value is shifted in the reserved temporary by rB & 63 (as
++			// SHRX/SHLX above: 32 or more leaves 0 in the low half), rB swapped into RCX meanwhile.
++			x64GenContext->emitter->MOV_dd(REG_RESV_TEMP, rRegOperand1);
++			if (rRegOperand2 != X86_REG_RCX)
++				x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
 +			if (imlInstruction->operation == PPCREC_IML_OP_SRW)
-+				x64GenContext->emitter->SHR_q_CL(rRegResult);
++				x64GenContext->emitter->SHR_q_CL(REG_RESV_TEMP);
 +			else
-+			{
-+				x64GenContext->emitter->SHL_q_CL(rRegResult);
-+				x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
-+			}
-+			if (useTempReg)
-+				x64GenContext->emitter->MOV_dd(origRegResult, REG_RESV_TEMP);
++				x64GenContext->emitter->SHL_q_CL(REG_RESV_TEMP);
++			if (rRegOperand2 != X86_REG_RCX)
++				x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
++			x64GenContext->emitter->MOV_dd(rRegResult, REG_RESV_TEMP); // the low 32 bits
 +		}
  		else
  		{
  			// lazy and slow way to do shift by register without relying on ECX/CL or BMI2
-@@ -766,8 +789,15 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -766,8 +786,19 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  	else if( imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE )
  	{
  		// todo: Use BMI2 rotate if available
-+		if (g_crema_cl_shifts && rRegOperand2 == X86_REG_RCX)
++		if (g_crema_cl_shifts)
 +		{
-+			// the amount already in CL (IMLRegisterAllocator: without BMI2)
-+			x64Gen_mov_reg64_reg64(x64GenContext, REG_RESV_TEMP, rRegOperand1);
++			// Crema (Fast Shifts): rotated in the reserved temporary, rB swapped into RCX meanwhile
++			x64GenContext->emitter->MOV_dd(REG_RESV_TEMP, rRegOperand1);
++			if (rRegOperand2 != X86_REG_RCX)
++				x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
 +			x64Gen_rol_reg64Low32_cl(x64GenContext, REG_RESV_TEMP);
-+			x64Gen_mov_reg64_reg64(x64GenContext, rRegResult, REG_RESV_TEMP);
++			if (rRegOperand2 != X86_REG_RCX)
++				x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
++			x64GenContext->emitter->MOV_dd(rRegResult, REG_RESV_TEMP);
 +		}
  		// check if CL/ECX/RCX is available
 -		if( rRegResult != X86_REG_RCX && rRegOperand1 != X86_REG_RCX && rRegOperand2 != X86_REG_RCX )
@@ -229,32 +230,6 @@ index d4b41b9..b111c13 100644
  	else if( srcRegister >= 4 )
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
-diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..8dace29 100644
---- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-+++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -15,6 +15,8 @@
- 
- #include "Common/cpu_features.h"
- 
-+extern bool g_crema_cl_shifts; // BackendX64.cpp (Crema: Fast Shifts)
-+
- #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
- #define DEBUG_RA_INSTRUCTION_GEN 0
- 
-@@ -156,7 +158,11 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
- 
- 	if (instruction->type == PPCREC_IML_TYPE_R_R_R)
- 	{
--		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U)
-+		// without BMI2 the shift amount goes in CL: also slw/srw and rlwnm (PS4: the Jaguar has no
-+		// BMI2; they used a bit-by-bit fallback, BackendX64.cpp), unless Crema's Fast Shifts is off
-+		const bool clShift = g_crema_cl_shifts &&
-+			(instruction->operation == PPCREC_IML_OP_SLW || instruction->operation == PPCREC_IML_OP_SRW || instruction->operation == PPCREC_IML_OP_LEFT_ROTATE);
-+		if (instruction->operation == PPCREC_IML_OP_LEFT_SHIFT || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_S || instruction->operation == PPCREC_IML_OP_RIGHT_SHIFT_U || clShift)
- 		{
- 			if(!g_CPUFeatures.x86.bmi2)
- 			{
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 index c9758f3..6542b19 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
@@ -5876,10 +5851,10 @@ index 0000000..2743734
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..04ca525
+index 0000000..406f51d
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3126 @@
+@@ -0,0 +1,3236 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -6689,6 +6664,8 @@ index 0000000..04ca525
 +		void UpdateKeyboard();
 +		std::string GamesFolder() const { return m_prefs.gamesDir.empty() ? m_dataDir + "/games" : m_prefs.gamesDir; }
 +		void RefreshGames();
++		std::string DeleteTarget(const Game& game) const;
++		std::vector<std::string> DeleteGame(const Game& game, bool withAddOns);
 +		void OpenFolderBrowser(const std::string& path);
 +		void BuildSettingRows();
 +		void ChangeSettingRow(int direction);
@@ -6992,6 +6969,70 @@ index 0000000..04ca525
 +	}
 +
 +	// Square on the games, or a new Game Folder: the folder is read again.
++	// What deleting a game removes: its folder (title.tmd's, or the one holding code/<name>.rpx),
++	// or its file (.wua, .wud, .wux, .wuhb, .rpx, .elf). Empty: not strictly inside the games
++	// folder (files straight in it, or somewhere else), so nothing is deleted.
++	std::string Menu::DeleteTarget(const Game& game) const
++	{
++		const fs::path path = _utf8ToPath(game.path);
++		const std::string name = Lower(path.filename().string());
++		fs::path target = path;
++		if (name == "title.tmd")
++			target = path.parent_path();
++		else if (Lower(path.extension().string()) == ".rpx" && Lower(path.parent_path().filename().string()) == "code")
++			target = path.parent_path().parent_path();
++		const std::string games = _pathToUtf8(_utf8ToPath(GamesFolder()).lexically_normal());
++		const std::string candidate = _pathToUtf8(target.lexically_normal());
++		const std::string prefix = games.back() == '/' ? games : games + "/";
++		if (candidate.size() <= prefix.size() || candidate.compare(0, prefix.size(), prefix) != 0)
++			return {};
++		return candidate;
++	}
++
++	// Deletes the game (and its update and DLC in mlc01), refreshes the list; the lines to show.
++	std::vector<std::string> Menu::DeleteGame(const Game& game, bool withAddOns)
++	{
++		std::vector<std::string> lines = {game.title, ""};
++		const std::string target = DeleteTarget(game);
++		if (target.empty())
++		{
++			lines.push_back("Not deleted: it isn't in its own place in the games folder.");
++			return lines;
++		}
++		std::error_code ec;
++		const uintmax_t removed = fs::remove_all(_utf8ToPath(target), ec);
++		Log("delete: " + target + (ec ? " failed: " + ec.message() : " (" + std::to_string(removed) + " files)"));
++		if (ec)
++		{
++			lines.push_back("Couldn't delete it: " + ec.message());
++			return lines;
++		}
++		lines.push_back("Deleted.");
++		if (withAddOns && game.id.size() == 16)
++		{
++			const std::string titles = m_dataDir + "/mlc01/usr/title/";
++			const std::string low = game.id.substr(8);
++			for (const char* kind : {"0005000e", "0005000c"})
++			{
++				const std::string folder = titles + kind + "/" + low;
++				std::error_code ec2;
++				if (fs::exists(folder, ec2) && fs::remove_all(folder, ec2) > 0 && !ec2)
++				{
++					Log("delete: " + folder);
++					lines.push_back(std::string(kind) == "0005000e" ? "Its update: deleted." : "Its DLC: deleted.");
++				}
++			}
++		}
++		lines.push_back("Saves are kept.");
++		if (m_prefs.defaultGame == game.path)
++		{
++			m_prefs.defaultGame.clear();
++			m_prefs.Save(m_dataDir + "/launcher.ini");
++		}
++		RefreshGames();
++		return lines;
++	}
++
 +	void Menu::RefreshGames()
 +	{
 +		const int gamesIndex = (int)Category::Games;
@@ -7612,6 +7653,24 @@ index 0000000..04ca525
 +						return; // the menu style list is open now
 +					}
 +				}
++				else if (m_panel.title == "Delete")
++				{
++					const Item& item = m_items[m_category][m_selected[m_category]];
++					const std::string choice = m_panel.options[m_panel.selected];
++					if (choice == "Cancel" || item.game < 0)
++					{
++						m_panel.open = false;
++						Play("back");
++						return;
++					}
++					const Game game = m_games[item.game];
++					const std::vector<std::string> result = DeleteGame(game, choice != "Delete Game");
++					m_panel.title = "Delete";
++					m_panel.options.clear();
++					m_panel.lines = result;
++					Play("confirm");
++					return;
++				}
 +				else if (m_panel.title == "Game")
 +				{
 +					const Item& item = m_items[m_category][m_selected[m_category]];
@@ -7621,6 +7680,31 @@ index 0000000..04ca525
 +					{
 +						m_panel.open = false;
 +						ActivateItem(item);
++						return;
++					}
++					if (choice == "Delete")
++					{
++						const std::string target = DeleteTarget(game);
++						m_panel.title = "Delete";
++						m_panel.selected = 0;
++						m_panel.lines = {game.title, ""};
++						if (target.empty())
++						{
++							m_panel.options.clear();
++							m_panel.lines.push_back("Its files are straight in the games folder:");
++							m_panel.lines.push_back("remove them over FTP.");
++						}
++						else
++						{
++							m_panel.lines.push_back(fs::is_directory(target) ? "Deletes its folder:" : "Deletes its file:");
++							m_panel.lines.push_back(fs::path(target).filename().string());
++							m_panel.lines.push_back("");
++							m_panel.lines.push_back("Saves are kept.");
++							m_panel.options = {"Cancel", "Delete Game"};
++							if (!game.homebrew)
++								m_panel.options.push_back("Delete Game, Update and DLC");
++						}
++						Play("confirm");
 +						return;
 +					}
 +					if (choice == "Game Settings")
@@ -7772,6 +7856,7 @@ index 0000000..04ca525
 +					m_panel.options.push_back("Game Settings");
 +				m_panel.options.push_back("Information");
 +				m_panel.options.push_back(m_prefs.defaultGame == game.path ? "Remove Default Game" : "Set as Default Game");
++				m_panel.options.push_back("Delete");
 +				Play("menu");
 +			}
 +		}
