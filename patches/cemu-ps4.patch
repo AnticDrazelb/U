@@ -1806,10 +1806,10 @@ index 0000000..14bb922
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..7be8971
+index 0000000..31e48d6
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,677 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -2034,8 +2034,23 @@ index 0000000..7be8971
 +		return data;
 +	}
 +
-+	// Writes the placeholder Mii resources where they are missing, or (setting off) removes the ones
-+	// written earlier. A real dump is never touched: only files identical to the placeholder are
++	// Games that crash without the Mii resources (the "Mii Data When Missing" setting's Auto). The
++	// placeholder isn't for every game: Mario Kart 8 loads it and then crashes at its title movie
++	// (null shader and uniforms passed to GX2), where players without it run the game.
++	bool NeedsMiiPlaceholder(uint64 titleId)
++	{
++		const uint64 base = titleId & ~0xF00000000ull; // the game, not its update or DLC
++		for (uint64 id : {
++				 0x0005000010101C00ull, 0x0005000010101D00ull, 0x0005000010101E00ull, // New Super Mario Bros. U
++				 0x000500001014B700ull, 0x000500001014B800ull, // New Super Mario Bros. U + New Super Luigi U
++			 })
++			if (base == id)
++				return true;
++		return false;
++	}
++
++	// Writes the placeholder Mii resources where they are missing, or (placeholder off) removes the
++	// ones written earlier, so that they never reach a game they break. A real dump is never touched: only files identical to the placeholder are
 +	// removed.
 +	void SetupMiiResources(const fs::path& mlc, bool placeholder)
 +	{
@@ -2304,7 +2319,8 @@ index 0000000..7be8971
 +		const uint64 titleId = CafeSystem::GetForegroundTitleId();
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
-+		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) == "placeholder");
++		const std::string miiData = CremaSettings::Get("mii_data", gameId);
++		SetupMiiResources(ActiveSettings::GetMlcPath(), miiData == "placeholder" || (miiData == "auto" && NeedsMiiPlaceholder(titleId)));
 +		PS4PauseMenu::Install(gameId, _pathToUtf8(game));
 +		sPerfLog = CremaSettings::On("perf_log", gameId);
 +		sFreezeReports = CremaSettings::On("freeze_reports", gameId);
@@ -2732,7 +2748,7 @@ index 0000000..bc4f953
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..3a5a14f
+index 0000000..83e131f
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
 @@ -0,0 +1,357 @@
@@ -2785,8 +2801,8 @@ index 0000000..3a5a14f
 +				{"ja", "日本語"}, {"zh", "中文 (简体)"}, {"ko", "한국어"}},
 +			"en", false, "The menus' language, and the Wii U's system language where it has it."},
 +		{"mii_data", "Mii Data When Missing", "Emulation",
-+			{{"placeholder", "Blank Placeholder"}, {"off", "None"}}, "placeholder", false,
-+			"Without a dump of the Wii U's Mii data, games that show Miis (New Super Mario Bros. U) crash. The placeholder makes Miis invisible instead. A real dump is never replaced."},
++			{{"auto", "Auto"}, {"placeholder", "Blank Placeholder"}, {"off", "None"}}, "auto", false,
++			"Without a dump of the Wii U's Mii data, New Super Mario Bros. U crashes; a blank placeholder makes its Miis invisible instead. Other games (Mario Kart 8) can crash with the placeholder. Auto: the placeholder only for games that need it. A real dump is never replaced."},
 +		// Audio
 +		{"game_volume", "Game Volume", "Audio",
 +			{{"100", "100"}, {"90", "90"}, {"80", "80"}, {"70", "70"}, {"60", "60"}, {"50", "50"},
