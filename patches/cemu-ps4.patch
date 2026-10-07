@@ -125,7 +125,7 @@ index 257973a..67a596c 100644
  }
  
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..79a3904 100644
+index e466deb..7ff947d 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -9,6 +9,9 @@
@@ -133,7 +133,7 @@ index e466deb..79a3904 100644
  #include <boost/container/static_vector.hpp>
  
 +// Crema (Diagnostics > Fast Shifts): slw/srw/rlwnm by CL without BMI2; off: Cemu's own fallback
-+bool g_crema_cl_shifts = true;
++bool g_crema_cl_shifts = false;
 +
  static x86Assembler64::GPR32 _reg32(IMLReg physReg)
  {
@@ -353,72 +353,6 @@ index c9758f3..6542b19 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..d7c5731 100644
---- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-+++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-@@ -7,6 +7,11 @@
- #include "IML/IMLRegisterAllocatorRanges.h"
- #include "PPCFunctionBoundaryTracker.h"
- #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
-+#include "Common/cpu_features.h"
-+
-+#if defined(ARCH_X86_64)
-+extern bool g_crema_cl_shifts; // BackendX64.cpp (Crema: Fast Shifts)
-+#endif
- 
- bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
- 
-@@ -1115,6 +1120,22 @@ bool PPCRecompilerImlGen_RLWIMI(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
- 	return true;
- }
- 
-+// Crema: without BMI2 the shift amount of slw, srw and rlwnm goes in ECX (IMLRegisterAllocator,
-+// Fast Shifts). As for SRAW it is first masked into a temporary: pinning the guest register itself
-+// to ECX broke Tekken Tag Tournament 2's heap (Crema 1.33-1.40).
-+static IMLReg PPCRecompilerImlGen_ShiftAmount(ppcImlGenContext_t* ppcImlGenContext, IMLReg regB, sint32 mask)
-+{
-+#if defined(ARCH_X86_64)
-+	if (g_crema_cl_shifts && !g_CPUFeatures.x86.bmi2)
-+	{
-+		IMLReg regTmp = _GetRegTemporary(ppcImlGenContext, 0);
-+		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regTmp, regB, mask);
-+		return regTmp;
-+	}
-+#endif
-+	return regB;
-+}
-+
- bool PPCRecompilerImlGen_RLWNM(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
- {
- 	sint32 rS, rA, rB, MB, ME;
-@@ -1123,7 +1144,7 @@ bool PPCRecompilerImlGen_RLWNM(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
- 	IMLReg regS = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0+rS);
- 	IMLReg regB = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0+rB);
- 	IMLReg regA = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0+rA);
--	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_LEFT_ROTATE, regA, regS, regB);
-+	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_LEFT_ROTATE, regA, regS, PPCRecompilerImlGen_ShiftAmount(ppcImlGenContext, regB, 0x1F));
- 	if( mask != 0xFFFFFFFF )
- 		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_AND, regA, regA, (sint32)mask);
- 	if (opcode & PPC_OPC_RC)
-@@ -1209,7 +1230,7 @@ bool PPCRecompilerImlGen_SLW(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode
- 	IMLReg regS = _GetRegGPR(ppcImlGenContext, rS);
- 	IMLReg regB = _GetRegGPR(ppcImlGenContext, rB);
- 	IMLReg regA = _GetRegGPR(ppcImlGenContext, rA);
--	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_SLW, regA, regS, regB);
-+	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_SLW, regA, regS, PPCRecompilerImlGen_ShiftAmount(ppcImlGenContext, regB, 0x3F));
- 	if ((opcode & PPC_OPC_RC))
- 		PPCImlGen_UpdateCR0(ppcImlGenContext, regA);
- 	return true;
-@@ -1222,7 +1243,7 @@ bool PPCRecompilerImlGen_SRW(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode
- 	IMLReg regS = _GetRegGPR(ppcImlGenContext, rS);
- 	IMLReg regB = _GetRegGPR(ppcImlGenContext, rB);
- 	IMLReg regA = _GetRegGPR(ppcImlGenContext, rA);
--	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_SRW, regA, regS, regB);
-+	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_SRW, regA, regS, PPCRecompilerImlGen_ShiftAmount(ppcImlGenContext, regB, 0x3F));
- 	if (opcode & PPC_OPC_RC)
- 		PPCImlGen_UpdateCR0(ppcImlGenContext, regA);
- 	return true;
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..03ba035 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -5344,10 +5278,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..a4d7f0c
+index 0000000..56e74b8
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,382 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -5434,8 +5368,9 @@ index 0000000..a4d7f0c
 +			"Pictures of the TV at 5, 15 and 30 s and every minute (screenshots folder). Each one costs a short stutter."},
 +		{"file_log", "File Access Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every file a game opens, and the game's own messages, in log.txt (finds missing files). Slows loading."},
-+		{"fast_shifts", "Fast Shifts", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
-+			"On: the Wii U's variable shifts in one PS4 instruction (Crema 1.33). Off: Cemu's original slower code, to check whether a game that misbehaves since 1.33 is affected."},
++		// (key "fast_shifts" until 1.41, on by default: a new key so games that kept "on" get Off)
++		{"cl_shifts", "Fast Shifts (Experimental)", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: the Wii U's variable shifts in one PS4 instruction, slightly faster, but some games break (Tekken Tag Tournament 2 crashes). Off: Cemu's original code."},
 +		{"profiler", "Profiler", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -5686,7 +5621,7 @@ index 0000000..a4d7f0c
 +	const bool accurate = get("gpu_accuracy") != "fast";
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
-+	g_crema_cl_shifts = get("fast_shifts") != "off";
++	g_crema_cl_shifts = get("cl_shifts") == "on";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
 +	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
