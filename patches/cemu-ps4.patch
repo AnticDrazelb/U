@@ -1384,10 +1384,10 @@ index 821fe8a..49807b9 100644
  			{
  				m_decodeSem.decrementWithWait();
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-index 7afbf19..8ee0335 100644
+index 7afbf19..bee0598 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 +++ b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-@@ -1,3 +1,85 @@
+@@ -1,3 +1,147 @@
 +#ifdef __ORBIS__
 +// PS4: fatal signals are handled by the port's crash log (port/ps4_crashlog.cpp: registers and a
 +// stack scan with ELF-relative addresses in /data/Crema/crash.log); there is no execinfo.
@@ -1398,6 +1398,7 @@ index 7afbf19..8ee0335 100644
 +
 +#include "Cafe/HW/Espresso/PPCState.h"
 +#include "Cafe/HW/MMU/MMU.h"
++#include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
 +#include <unistd.h>
 +
 +// Called by the port's crash handler while it writes crash.log (fd): the crashed thread's PPC
@@ -1459,6 +1460,67 @@ index 7afbf19..8ee0335 100644
 +	}
 +}
 +
++// hang.log: every emulated (PPC) thread: name, state, where it stopped (saved IP and LR) and its
++// callers' return addresses, and what it waits on. Reads guest memory only, without locks (the
++// list may be changing; a hang report tolerates that).
++extern "C" void ps4_hang_guest_threads(int fd)
++{
++	char line[256];
++	auto out = [&](int n) {
++		if (n > 0)
++			write(fd, line, std::min<size_t>((size_t)n, sizeof(line) - 1));
++	};
++	const sint32 count = std::min<sint32>(activeThreadCount, 256);
++	out(snprintf(line, sizeof(line), "guest threads: %d\n", count));
++	for (sint32 i = 0; i < count; i++)
++	{
++		const MPTR threadPtr = activeThread[i];
++		if (threadPtr < 0x01000000 || threadPtr >= 0xF0000000)
++			continue;
++		OSThread_t* thread = (OSThread_t*)memory_getPointerFromVirtualOffset(threadPtr);
++		const char* state = "?";
++		if (thread->suspendCounter != 0)
++			state = "SUSPENDED";
++		else if (thread->state == OSThread_t::THREAD_STATE::STATE_READY)
++			state = "READY";
++		else if (thread->state == OSThread_t::THREAD_STATE::STATE_RUNNING)
++			state = "RUNNING";
++		else if (thread->state == OSThread_t::THREAD_STATE::STATE_WAITING)
++			state = "WAITING";
++		else if (thread->state == OSThread_t::THREAD_STATE::STATE_MORIBUND)
++			state = "MORIBUND";
++		else if (thread->state == OSThread_t::THREAD_STATE::STATE_NONE)
++			state = "NONE";
++		char name[48] = "?";
++		const MPTR namePtr = thread->threadName.GetMPTR();
++		if (namePtr >= 0x01000000 && namePtr < 0xF0000000)
++		{
++			const char* text = (const char*)memory_getPointerFromVirtualOffset(namePtr);
++			size_t n = 0;
++			for (; n + 1 < sizeof(name) && text[n] && text[n] >= ' ' && text[n] < 0x7F; n++)
++				name[n] = text[n];
++			name[n] = 0;
++		}
++		int n = snprintf(line, sizeof(line), "  %08x %-9s Aff %d Pri %2d IP %08x LR %08x wait queue %08x mutex %08x fast mutex %08x  %s\n",
++			threadPtr, state, (int)(uint8)thread->attr, (int)thread->effectivePriority, thread->context.srr0, _swapEndianU32(thread->context.lr),
++			thread->currentWaitQueue.GetMPTR(), thread->waitingForMutex.GetMPTR(), thread->waitingForFastMutex.GetMPTR(), name);
++		out(n);
++		// the back chain from the saved stack pointer
++		n = snprintf(line, sizeof(line), "      return addresses");
++		uint32 sp = _swapEndianU32(thread->context.gpr[1]);
++		for (int f = 0; f < 12 && sp >= 0x01000000 && sp < 0xF0000000 && (sp & 3) == 0 && n < 230; f++)
++		{
++			const uint32 next = memory_readU32(sp);
++			if (next <= sp || next >= 0xF0000000)
++				break;
++			n += snprintf(line + n, sizeof(line) - n, " %08x", memory_readU32(next + 4));
++			sp = next;
++		}
++		n += snprintf(line + n, sizeof(line) - n, "\n");
++		out(n);
++	}
++}
++
 +// Called by the port's crash handler after crash.log: the emulated side of the crash (the active
 +// PPC instance's registers and stack trace, all PPC threads) into log.txt, as on other platforms.
 +extern "C" void ps4_crash_guest_info()
@@ -1473,7 +1535,7 @@ index 7afbf19..8ee0335 100644
  #include <signal.h>
  #include <execinfo.h>
  #include <string.h>
-@@ -170,3 +252,4 @@ void ExceptionHandler_Init()
+@@ -170,3 +314,4 @@ void ExceptionHandler_Init()
  	sigaction(SIGSYS, &action, nullptr);
  	sigaction(SIGTRAP, &action, nullptr);
  }
