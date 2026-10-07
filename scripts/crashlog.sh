@@ -68,6 +68,22 @@ if [ -s "$OUT/crash.log" ] && grep -q "crashed" "$OUT/boot-trace.log" 2>/dev/nul
 else
     echo "== crash.log: no crash in this run"
 fi
+# the GPU driver's files (port/mesa/ac_ps4_drm.c, still under DolphinPS4's folder): its log, a GPU
+# fault report, and with Diagnostics > GPU Fault Recorder the flight recorder (progress.log: the
+# last submission and per-draw trace id the GPU reached; ib-N.bin: the last 8 command streams)
+G="$HOST/data/DolphinPS4"
+rm -rf "$OUT/gpu"; mkdir -p "$OUT/gpu"
+for f in radv-ps4.log gpu-fault.txt; do
+    curl -s --max-time 30 -o "$OUT/gpu/$f" "$G/$f" || rm -f "$OUT/gpu/$f"
+done
+for f in $(curl -s --max-time 30 --list-only "$G/flight/" | grep -E '\.(log|bin)$'); do
+    curl -s --max-time 60 -o "$OUT/gpu/$f" "$G/flight/$f"
+done
+[ -s "$OUT/gpu/gpu-fault.txt" ] && { echo "== gpu-fault.txt"; head -40 "$OUT/gpu/gpu-fault.txt"; }
+if [ -s "$OUT/gpu/progress.log" ]; then
+    echo "== GPU flight recorder (last lines of progress.log; command streams in $OUT/gpu)"
+    tail -15 "$OUT/gpu/progress.log"
+fi
 # hang.log: the watchdog's stack dumps of every named thread (PS4WindowSystem.cpp)
 if [ -s "$OUT/hang.log" ]; then
     echo "== hang.log (last dump, symbolized; stacks may include stale return addresses)"

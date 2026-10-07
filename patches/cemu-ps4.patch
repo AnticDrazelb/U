@@ -3067,10 +3067,10 @@ index 0000000..489dc96
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..a76703e
+index 0000000..6c3dfad
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,615 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -3517,6 +3517,13 @@ index 0000000..a76703e
 +		sPerfLog = CremaSettings::On("perf_log", gameId);
 +		sFreezeReports = CremaSettings::On("freeze_reports", gameId);
 +		sTvScreenshots = CremaSettings::On("tv_screenshots", gameId);
++		// RADV's per-draw trace markers and the PS4 winsys's flight recorder (port/mesa/ac_ps4_drm.c:
++		// /data/DolphinPS4/flight), read when the device is created (after this)
++		if (CremaSettings::On("gpu_trace", gameId))
++		{
++			setenv("RADV_PS4_TRACE", "1", 1);
++			Trace("GPU fault recorder on");
++		}
 +		if (auto gamepad = inputManager.get_controller(0))
 +		{
 +			const bool motion = CremaSettings::On("motion", gameId);
@@ -3940,10 +3947,10 @@ index 0000000..bc4f953
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..6c2ac23
+index 0000000..d0d5a08
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,359 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -4020,6 +4027,8 @@ index 0000000..6c2ac23
 +			"Pictures of the TV at 5, 15 and 30 s and every minute (screenshots folder). Each one costs a short stutter."},
 +		{"file_log", "File Access Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every file a game opens, and the game's own messages, in log.txt (finds missing files). Slows loading."},
++		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"When the PS4 closes a game with error CE-34878-0 (a GPU fault), the GPU's last commands are kept for the logs. Slightly slower."},
 +	};
 +	const std::vector<const char*> CATEGORIES = {"Display", "Emulation", "Audio", "Controls", "Diagnostics"};
 +
