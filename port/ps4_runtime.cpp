@@ -686,7 +686,7 @@ extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
 extern "C" void ps4_install_signal_stack();        // port/ps4_crashlog.cpp
 
 namespace {
-constexpr uint64_t kAppCores = 0x3F;
+constexpr uint64_t kAppCores = 0x7F;  // every core the app may use (the 7th is shared with the system)
 // Every thread gets at least this much stack. The system's default is far smaller than a PC's
 // (logged at the first thread), and shader translation (glslang) and the driver's shader
 // compiler recurse deeply on large shaders; a thread out of stack is ended by the system with
