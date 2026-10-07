@@ -1400,12 +1400,14 @@ index d66e971..49e209f 100644
  endif()
 diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
 new file mode 100644
-index 0000000..f306343
+index 0000000..2b7c2bd
 --- /dev/null
 +++ b/src/gui/ps4/CMakeLists.txt
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +add_library(CemuPS4Gui
 +	PS4WindowSystem.cpp
++	CremaMii.cpp
++	CremaMii.h
 +	PS4PauseMenu.cpp
 +	PS4PauseMenu.h
 +	launcher/CremaCovers.cpp
@@ -1443,6 +1445,848 @@ index 0000000..f306343
 +	/opt/pacbrew/ps4/openorbis/usr/lib/libturbojpeg.a
 +)
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
+diff --git a/src/gui/ps4/CremaMii.cpp b/src/gui/ps4/CremaMii.cpp
+new file mode 100644
+index 0000000..9300778
+--- /dev/null
++++ b/src/gui/ps4/CremaMii.cpp
+@@ -0,0 +1,813 @@
++// Crema's own Mii parts resource (see CremaMii.h). Layout from the FFL decompilation
++// (github.com/aboood40091/ffl): a 0x4A00 byte header (texture and shape parts tables), then the
++// parts. Textures are GX2 surfaces in the tile mode GX2 picks (FFL calls GX2InitTexture on them)
++// followed by a 12 byte footer; shapes are big-endian vertex attributes and 16-bit indices behind a
++// 0x90 byte header. Every slot holds a part (games may not cope with empty ones), reusing a few
++// variants per part type.
++//
++// Units are FFL's: the head is about 46 high with its chin near y = 7, facing +z. The face's
++// features are drawn by FFL into a "mask" texture in a 64x64 unit space (FFLiRawMask.cpp: eyes at
++// y 31.4, mouth at 43.3), which the mask shape maps onto the front of the head (MaskUV).
++#include "gui/ps4/CremaMii.h"
++
++#include "Cafe/OS/libs/gx2/GX2_Resource.h"
++#include "Cafe/OS/libs/gx2/GX2_Surface.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <functional>
++#include <map>
++
++// GX2_Surface_Copy.cpp: copies between tile modes on the CPU
++void gx2SurfaceCopySoftware(uint8* inputData, sint32 surfSrcHeight, sint32 srcPitch, sint32 srcDepth, uint32 srcSlice, uint32 srcSwizzle, uint32 srcHwTileMode,
++	uint8* outputData, sint32 surfDstHeight, sint32 dstPitch, sint32 dstDepth, uint32 dstSlice, uint32 dstSwizzle, uint32 dstHwTileMode,
++	uint32 copyWidth, uint32 copyHeight, uint32 copyBpp);
++
++namespace CremaMii
++{
++namespace
++{
++	constexpr uint32 kMagic = 0x46465241;		 // "FFRA"
++	constexpr uint32 kMagicCrema = 0x43524D41; // "CRMA" in the header's unused word at 0xC
++	constexpr uint32 kVersion = 1;				 // at kVersionOffset (unused space); bump when the parts change
++	constexpr uint32 kVersionOffset = 0x49D0;
++	constexpr uint32 kHeaderSize = 0x4A00;
++	constexpr uint32 kTextureAlign = 0x800, kShapeAlign = 0x40, kAttribAlign = 0x40, kIndexAlign = 0x20;
++	constexpr uint8 kUncompressed = 5;
++	constexpr float kPi = 3.14159265f;
++
++	constexpr uint32 kTextureParts[] = {3, 132, 62, 24, 12, 12, 9, 2, 37, 6, 18};
++	enum TexType { TexBeard, TexCap, TexEye, TexEyebrow, TexFaceline, TexFaceMakeup, TexGlass, TexMole, TexMouth, TexMustache, TexNoseline, TexTypes };
++	constexpr uint32 kShapeParts[] = {4, 132, 132, 12, 1, 12, 18, 18, 132, 132, 132, 132};
++	enum ShapeType { ShBeard, ShCap1, ShCap2, ShFaceline, ShGlass, ShMask, ShNoseline, ShNose, ShHair1, ShHair2, ShForehead1, ShForehead2, ShapeTypes };
++
++	// ---- big-endian writing
++
++	void Put8(std::vector<uint8>& d, uint8 v) { d.push_back(v); }
++	void Put16(std::vector<uint8>& d, uint16 v) { d.push_back((uint8)(v >> 8)); d.push_back((uint8)v); }
++	void Put32(std::vector<uint8>& d, uint32 v) { for (int s = 24; s >= 0; s -= 8) d.push_back((uint8)(v >> s)); }
++	void PutF(std::vector<uint8>& d, float f) { uint32 v; memcpy(&v, &f, 4); Put32(d, v); }
++	void Set32(std::vector<uint8>& d, size_t at, uint32 v) { for (int i = 0; i < 4; i++) d[at + i] = (uint8)(v >> (24 - 8 * i)); }
++	void Align(std::vector<uint8>& d, size_t a) { d.resize((d.size() + a - 1) / a * a, 0); }
++
++	// ---- textures
++
++	// An image drawn with shapes given as "inside" tests in pixel units, 4x4 samples per pixel.
++	struct Image
++	{
++		int w, h, ch; // ch 1: R8, 2: RG8, 4: RGBA8
++		std::vector<uint8> px;
++		Image(int w, int h, int ch) : w(w), h(h), ch(ch), px((size_t)w * h * ch, 0) {}
++
++		void Paint(std::initializer_list<uint8> value, const std::function<bool(float, float)>& inside)
++		{
++			for (int y = 0; y < h; y++)
++				for (int x = 0; x < w; x++)
++				{
++					int hits = 0;
++					for (int sy = 0; sy < 4; sy++)
++						for (int sx = 0; sx < 4; sx++)
++							hits += inside(x + (sx + 0.5f) / 4, y + (sy + 0.5f) / 4) ? 1 : 0;
++					if (hits == 0)
++						continue;
++					uint8* p = &px[((size_t)y * w + x) * ch];
++					int c = 0;
++					for (uint8 v : value)
++						if (c < ch)
++						{
++							p[c] = (uint8)(p[c] + (v - p[c]) * hits / 16);
++							c++;
++						}
++				}
++		}
++	};
++
++	float Clamp01(float v) { return std::min(1.0f, std::max(0.0f, v)); }
++
++	// distance from p to the segment ab
++	float SegmentDistance(float px, float py, float ax, float ay, float bx, float by)
++	{
++		const float dx = bx - ax, dy = by - ay;
++		const float t = Clamp01(((px - ax) * dx + (py - ay) * dy) / std::max(1e-6f, dx * dx + dy * dy));
++		const float ex = px - (ax + t * dx), ey = py - (ay + t * dy);
++		return std::sqrt(ex * ex + ey * ey);
++	}
++
++	// a stroke along a quadratic curve from a to b bending through c, width tapering from w0 to w1
++	std::function<bool(float, float)> Stroke(float ax, float ay, float cx, float cy, float bx, float by, float w0, float w1)
++	{
++		return [=](float x, float y) {
++			constexpr int kSteps = 16;
++			float lx = ax, ly = ay;
++			for (int i = 1; i <= kSteps; i++)
++			{
++				const float t = (float)i / kSteps, u = 1 - t;
++				const float nx = u * u * ax + 2 * u * t * cx + t * t * bx, ny = u * u * ay + 2 * u * t * cy + t * t * by;
++				const float width = w0 + (w1 - w0) * (i - 0.5f) / kSteps;
++				if (SegmentDistance(x, y, lx, ly, nx, ny) < width / 2)
++					return true;
++				lx = nx;
++				ly = ny;
++			}
++			return false;
++		};
++	}
++
++	std::function<bool(float, float)> Ellipse(float cx, float cy, float rx, float ry)
++	{
++		return [=](float x, float y) { const float dx = (x - cx) / rx, dy = (y - cy) / ry; return dx * dx + dy * dy <= 1; };
++	}
++
++	// Eyes (RGBA, FFL mode 2: color = R * fixed + G * white + B * eye color): the white is G, the
++	// iris B, outline and pupil black. The inner corner (nose side) is at the right (u = 1).
++	Image DrawEye(int variant)
++	{
++		Image img(64, 64, 4);
++		if (variant % 8 == 7) // closed, happy
++		{
++			img.Paint({0, 0, 0, 255}, Stroke(8, 38, 32, 18, 56, 38, 4, 4));
++			return img;
++		}
++		const float open = 0.45f + 0.55f * ((variant * 5) % 8) / 7.0f;
++		const float ry = 9 + 9 * open, rx = 24 - (variant % 3) * 2;
++		const float cx = 32, cy = 34;
++		const float lid = (variant % 5 == 3) ? cy - ry * 0.45f : -1; // sleepy: flat upper lid
++		auto inEye = [=](float x, float y) { return Ellipse(cx, cy, rx, ry)(x, y) && y >= lid; };
++		img.Paint({0, 0, 0, 255}, [=](float x, float y) { return Ellipse(cx, cy, rx + 2.5f, ry + 2.5f)(x, y) && y >= lid - 2.5f; });
++		img.Paint({0, 255, 0, 255}, inEye);
++		const float ir = std::min(ry * 0.95f, 11.5f), ix = cx + 3;
++		img.Paint({0, 0, 255, 255}, [=](float x, float y) { return inEye(x, y) && Ellipse(ix, cy, ir, ir)(x, y); });
++		img.Paint({0, 0, 0, 255}, [=](float x, float y) { return inEye(x, y) && Ellipse(ix, cy, ir * 0.45f, ir * 0.45f)(x, y); });
++		img.Paint({0, 255, 0, 255}, [=](float x, float y) { return inEye(x, y) && Ellipse(ix + ir * 0.35f, cy - ir * 0.35f, 2.2f, 2.2f)(x, y); });
++		// upper lid line
++		img.Paint({0, 0, 0, 255}, [=](float x, float y) {
++			return Ellipse(cx, cy, rx + 3, ry + 3.5f)(x, y) && !Ellipse(cx, cy + 1.5f, rx + 0.5f, ry + 0.5f)(x, y) && y < cy;
++		});
++		if (variant % 4 == 1) // lashes at the outer corner
++		{
++			img.Paint({0, 0, 0, 255}, Stroke(cx - rx + 2, cy - 2, cx - rx - 2, cy - 6, cx - rx - 5, cy - 9, 2.5f, 1));
++			img.Paint({0, 0, 0, 255}, Stroke(cx - rx + 6, cy - ry * 0.6f, cx - rx + 3, cy - ry * 0.8f - 3, cx - rx + 1, cy - ry - 5, 2.5f, 1));
++		}
++		return img;
++	}
++
++	// Eyebrows (R8, mode 3: alpha = R): outer end at the left, inner at the right (u = 1).
++	Image DrawEyebrow(int variant)
++	{
++		Image img(64, 32, 1);
++		const float thick = 4 + (variant % 4) * 1.5f, bend = -2.0f - (variant % 3) * 3.0f;
++		const float outerY = 20 + (variant % 5) - 2.0f, innerY = 16 + ((variant / 5) % 3) * 2.0f;
++		img.Paint({255}, Stroke(6, outerY, 32, 16 + bend, 58, innerY, thick * 0.6f, thick));
++		return img;
++	}
++
++	// Mouths (RGBA, mode 2: color = R * lip color + G * darker lip color + B * white).
++	Image DrawMouth(int variant)
++	{
++		Image img(64, 64, 4);
++		const float w = 22 - (variant % 3) * 3.0f;
++		switch (variant % 4)
++		{
++		case 0: // closed smile
++			img.Paint({0, 255, 0, 255}, Stroke(32 - w, 28, 32, 40 - (variant % 2) * 4.0f, 32 + w, 28, 3.5f, 3.5f));
++			break;
++		case 1: // open smile with teeth
++		{
++			auto inMouth = [=](float x, float y) { return Ellipse(32, 28, w, 14)(x, y) && y >= 28; };
++			img.Paint({255, 0, 0, 255}, [=](float x, float y) { return Ellipse(32, 28, w + 2.5f, 16.5f)(x, y) && y >= 25.5f; });
++			img.Paint({0, 255, 0, 255}, inMouth);
++			img.Paint({0, 0, 255, 255}, [=](float x, float y) { return inMouth(x, y) && y < 33; });
++			break;
++		}
++		case 2: // straight
++			img.Paint({0, 255, 0, 255}, Stroke(32 - w * 0.8f, 32, 32, 33, 32 + w * 0.8f, 32, 3.5f, 3.5f));
++			break;
++		default: // small open
++			img.Paint({255, 0, 0, 255}, Ellipse(32, 32, w * 0.45f + 2.5f, 11));
++			img.Paint({0, 255, 0, 255}, Ellipse(32, 32, w * 0.45f, 8.5f));
++			break;
++		}
++		return img;
++	}
++
++	// Mustaches (R8, mode 3), the right half: the middle of the face at u = 1.
++	Image DrawMustache(int variant)
++	{
++		Image img(64, 32, 1);
++		if (variant == 0)
++			return img;
++		const float drop = (variant % 3) * 5.0f, thick = 7 + (variant % 2) * 4.0f;
++		img.Paint({255}, Stroke(64, 12, 34, 8, 8, 14 + drop, thick, thick * 0.35f));
++		return img;
++	}
++
++	Image DrawMole(int variant)
++	{
++		Image img(16, 16, 1);
++		if (variant != 0)
++			img.Paint({255}, Ellipse(8, 8, 6, 6));
++		return img;
++	}
++
++	// The line under the nose (R8, mode 3).
++	Image DrawNoseline(int variant)
++	{
++		Image img(32, 32, 1);
++		const float w = 7 + (variant % 3) * 2.0f;
++		img.Paint({255}, Stroke(16 - w, 18, 16, 26 + (variant % 2) * 2.0f, 16 + w, 18, 2.5f, 2.5f));
++		return img;
++	}
++
++	// Glasses (RG8, mode 4: alpha = R, color = glass color * G): both lenses, frames solid,
++	// lenses lightly tinted (dark for the last ones: sunglasses).
++	Image DrawGlass(int variant)
++	{
++		Image img(128, 64, 2);
++		const bool sun = variant >= 6;
++		const float rx = 22 + (variant % 3) * 3.0f, ry = 16 - (variant % 2) * 3.0f;
++		for (float cx : {32.0f, 96.0f})
++		{
++			img.Paint({255, 255}, Ellipse(cx, 32, rx + 3, ry + 3));
++			img.Paint({(uint8)(sun ? 220 : 50), (uint8)(sun ? 30 : 255)}, Ellipse(cx, 32, rx, ry));
++		}
++		img.Paint({255, 255}, Stroke(32 + rx, 28, 64, 24, 96 - rx, 28, 3, 3));
++		return img;
++	}
++
++	Image DrawFacelineBeard(int variant)
++	{
++		Image img(32, 32, 1);
++		if (variant != 0)
++			for (int i = 0; i < 40 * variant; i++)
++			{
++				const float x = (float)((i * 37) % 32), y = (float)((i * 59 + i / 3) % 32);
++				img.Paint({160}, Ellipse(x, y, 0.8f, 0.8f));
++			}
++		return img;
++	}
++
++	Image DrawCap()
++	{
++		Image img(32, 32, 1);
++		img.Paint({255}, [](float, float) { return true; });
++		img.Paint({190}, [](float, float y) { return y > 22 && y < 26; });
++		return img;
++	}
++
++	// The image as a resource texture: the surface in GX2's tile mode, then the footer (mip offset,
++	// width, height, mip count, FFLiTextureFormat).
++	std::vector<uint8> EncodeTexture(const Image& img)
++	{
++		GX2Surface surface;
++		memset(&surface, 0, sizeof(surface));
++		surface.dim = Latte::E_DIM::DIM_2D;
++		surface.width = img.w;
++		surface.height = img.h;
++		surface.depth = 1;
++		surface.numLevels = 1;
++		surface.format = img.ch == 1 ? Latte::E_GX2SURFFMT::R8_UNORM : img.ch == 2 ? Latte::E_GX2SURFFMT::R8_G8_UNORM : Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
++		surface.resFlag = GX2_RESFLAG_USAGE_TEXTURE;
++		surface.tileMode = Latte::E_GX2TILEMODE::TM_LINEAR_GENERAL; // GX2's "default": it picks one, as for FFL's textures
++		GX2::GX2CalcSurfaceSizeAndAlignment(&surface);
++
++		std::vector<uint8> data(surface.imageSize);
++		std::vector<uint8> linear = img.px;
++		gx2SurfaceCopySoftware(linear.data(), img.h, img.w, 1, 0, 0, 0,
++			data.data(), (sint32)(uint32)surface.height, (sint32)(uint32)surface.pitch, 1, 0, (uint32)surface.swizzle, (uint32)surface.tileMode.value(),
++			img.w, img.h, 8 * img.ch);
++		Put32(data, 0);
++		Put16(data, (uint16)img.w);
++		Put16(data, (uint16)img.h);
++		Put8(data, 1);
++		Put8(data, (uint8)(img.ch == 1 ? 0 : img.ch == 2 ? 1 : 2));
++		Put16(data, 0); // the footer is 12 bytes
++		return data;
++	}
++
++	// ---- shapes
++
++	struct Vec3
++	{
++		float x, y, z;
++	};
++	Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
++	Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
++	Vec3 operator*(Vec3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
++	float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
++	Vec3 Cross(Vec3 a, Vec3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
++	Vec3 Normalize(Vec3 a)
++	{
++		const float l = std::sqrt(Dot(a, a));
++		return l > 1e-6f ? a * (1 / l) : Vec3{0, 0, 1};
++	}
++
++	struct Mesh
++	{
++		std::vector<Vec3> pos, normal, tangent;
++		std::vector<std::pair<float, float>> uv; // empty: no texture coordinates
++		std::vector<uint16> index;
++	};
++
++	using PointFn = std::function<Vec3(float s, float t)>;
++	using KeepFn = std::function<bool(float s, float t, Vec3 p)>;
++	using UVFn = std::function<std::pair<float, float>(float s, float t, Vec3 p)>;
++
++	// A surface over a grid of (s, t) in [0, 1]^2: the cells kept, facing away from `inside`.
++	Mesh Grid(int ns, int nt, const PointFn& point, const KeepFn& keep, const UVFn& uv, Vec3 inside)
++	{
++		Mesh mesh;
++		std::vector<int> remap((size_t)(ns + 1) * (nt + 1), -1);
++		auto vertex = [&](int i, int j) -> uint16 {
++			int& slot = remap[(size_t)j * (ns + 1) + i];
++			if (slot < 0)
++			{
++				const float s = (float)i / ns, t = (float)j / nt, e = 1e-3f;
++				const Vec3 p = point(s, t);
++				const Vec3 ds = point(std::min(1.0f, s + e), t) - point(std::max(0.0f, s - e), t);
++				const Vec3 dt = point(s, std::min(1.0f, t + e)) - point(s, std::max(0.0f, t - e));
++				Vec3 n = Cross(ds, dt);
++				if (Dot(n, n) < 1e-12f)
++					n = p - inside;
++				n = Normalize(n);
++				if (Dot(n, p - inside) < 0)
++					n = n * -1;
++				slot = (int)mesh.pos.size();
++				mesh.pos.push_back(p);
++				mesh.normal.push_back(n);
++				mesh.tangent.push_back(Dot(ds, ds) > 1e-12f ? Normalize(ds) : Vec3{1, 0, 0});
++				if (uv)
++					mesh.uv.push_back(uv(s, t, p));
++			}
++			return (uint16)slot;
++		};
++		auto triangle = [&](uint16 a, uint16 b, uint16 c) {
++			const Vec3 pa = mesh.pos[a], pb = mesh.pos[b], pc = mesh.pos[c];
++			const Vec3 n = Cross(pb - pa, pc - pa);
++			if (Dot(n, n) < 1e-10f)
++				return;
++			if (Dot(n, (pa + pb + pc) * (1.0f / 3) - inside) < 0)
++				std::swap(b, c);
++			mesh.index.insert(mesh.index.end(), {a, b, c});
++		};
++		for (int j = 0; j < nt; j++)
++			for (int i = 0; i < ns; i++)
++			{
++				const float s = (i + 0.5f) / ns, t = (j + 0.5f) / nt;
++				if (!keep(s, t, point(s, t)))
++					continue;
++				const uint16 a = vertex(i, j), b = vertex(i + 1, j), c = vertex(i + 1, j + 1), d = vertex(i, j + 1);
++				triangle(a, b, c);
++				triangle(a, c, d);
++			}
++		return mesh;
++	}
++
++	Mesh Merged(Mesh a, const Mesh& b)
++	{
++		const uint16 base = (uint16)a.pos.size();
++		a.pos.insert(a.pos.end(), b.pos.begin(), b.pos.end());
++		a.normal.insert(a.normal.end(), b.normal.begin(), b.normal.end());
++		a.tangent.insert(a.tangent.end(), b.tangent.begin(), b.tangent.end());
++		a.uv.insert(a.uv.end(), b.uv.begin(), b.uv.end());
++		for (uint16 i : b.index)
++			a.index.push_back((uint16)(base + i));
++		return a;
++	}
++
++	Mesh Translated(Mesh mesh, Vec3 by)
++	{
++		for (Vec3& p : mesh.pos)
++			p = p - by;
++		return mesh;
++	}
++
++	// The shape's data: header (attribute positions and sizes, bounding box, transform), then the
++	// attributes and indices. Index "size" is their count.
++	std::vector<uint8> EncodeShape(const Mesh& mesh, const std::vector<Vec3>& transform)
++	{
++		std::vector<uint8> d(0x90, 0);
++		uint32 pos[6] = {}, size[6] = {};
++		auto begin = [&](int element, size_t align) {
++			Align(d, align);
++			pos[element] = (uint32)d.size();
++		};
++		begin(0, kAttribAlign);
++		for (const Vec3& p : mesh.pos)
++		{
++			PutF(d, p.x);
++			PutF(d, p.y);
++			PutF(d, p.z);
++			PutF(d, 0);
++		}
++		size[0] = (uint32)(d.size() - pos[0]);
++		begin(1, kAttribAlign);
++		for (const Vec3& n : mesh.normal)
++		{
++			auto snorm10 = [](float v) { return (uint32)(sint32)std::lround(std::clamp(v, -1.0f, 1.0f) * 511) & 0x3FF; };
++			Put32(d, snorm10(n.x) | snorm10(n.y) << 10 | snorm10(n.z) << 20);
++		}
++		size[1] = (uint32)(d.size() - pos[1]);
++		if (!mesh.uv.empty())
++		{
++			begin(2, kAttribAlign);
++			for (const auto& [u, v] : mesh.uv)
++			{
++				PutF(d, u);
++				PutF(d, v);
++			}
++			size[2] = (uint32)(d.size() - pos[2]);
++		}
++		begin(3, kAttribAlign);
++		for (const Vec3& t : mesh.tangent)
++			for (float v : {t.x, t.y, t.z, 0.0f})
++				Put8(d, (uint8)(sint8)std::lround(std::clamp(v, -1.0f, 1.0f) * 127));
++		size[3] = (uint32)(d.size() - pos[3]);
++		begin(4, kAttribAlign); // one color for every vertex
++		for (uint8 v : {0, 0, 0, 255})
++			Put8(d, v);
++		size[4] = 4;
++		begin(5, kIndexAlign);
++		for (uint16 i : mesh.index)
++			Put16(d, i);
++		size[5] = (uint32)mesh.index.size();
++		Align(d, kShapeAlign);
++
++		std::vector<uint8> header;
++		for (uint32 v : pos)
++			Put32(header, v);
++		for (uint32 v : size)
++			Put32(header, v);
++		Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
++		for (const Vec3& p : mesh.pos)
++		{
++			lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
++			hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
++		}
++		for (float v : {lo.x, lo.y, lo.z, hi.x, hi.y, hi.z})
++			PutF(header, v);
++		for (const Vec3& v : transform)
++		{
++			PutF(header, v.x);
++			PutF(header, v.y);
++			PutF(header, v.z);
++		}
++		header.resize(0x90, 0);
++		std::copy(header.begin(), header.end(), d.begin());
++		return d;
++	}
++
++	// ---- the head
++
++	constexpr Vec3 kHeadCenter{0, 30, 0};
++	constexpr float kHeadRx = 21, kHeadRy = 23, kHeadRz = 20;
++	constexpr Vec3 kHairPos{0, 50, 0}, kBeardPos{0, 12, 12};
++	constexpr float kFaceCenterY = 23;
++	// mask texture space (64 units, y down) to the head: K units per mask unit, eyes at kEyeY
++	constexpr float kMaskK = 0.8f, kEyeY = 27, kMaskEyeY = 31.36f;
++
++	std::pair<float, float> MaskUV(Vec3 p)
++	{
++		return {(p.x / kMaskK + 32) / 64, (kMaskEyeY - (p.y - kEyeY) / kMaskK) / 64};
++	}
++
++	struct Face
++	{
++		float width, jaw; // jaw: how narrow the chin gets
++	};
++	Face FaceOf(int type)
++	{
++		static const float kWidth[12] = {1.0f, 0.97f, 1.03f, 0.95f, 1.0f, 1.05f, 0.98f, 1.02f, 0.96f, 1.0f, 1.04f, 0.99f};
++		static const float kJaw[12] = {0.80f, 0.72f, 0.86f, 0.76f, 0.90f, 0.82f, 0.70f, 0.88f, 0.78f, 0.84f, 0.74f, 0.92f};
++		return {kWidth[type % 12], kJaw[type % 12]};
++	}
++
++	// a point of the head at azimuth theta (0: front) and elevation phi, grown by `grow`
++	Vec3 HeadPoint(const Face& face, float theta, float phi, float grow, bool narrowChin = true)
++	{
++		float scale = 1;
++		if (narrowChin && phi < 0)
++			scale = 1 + (face.jaw - 1) * std::pow(std::sin(-phi), 1.5f);
++		return {(kHeadRx * face.width + grow) * scale * std::cos(phi) * std::sin(theta),
++			kHeadCenter.y + (kHeadRy + grow) * std::sin(phi),
++			(kHeadRz + grow) * scale * std::cos(phi) * std::cos(theta)};
++	}
++
++	float Theta(float s) { return (s * 2 - 1) * kPi; }
++	float Phi(float t) { return (t - 0.5f) * kPi; }
++
++	Vec3 FaceCenter(const Face& face)
++	{
++		const float phi = std::asin((kFaceCenterY - kHeadCenter.y) / kHeadRy);
++		return HeadPoint(face, 0, phi, 0);
++	}
++
++	auto FacelineUV = [](float, float, Vec3 p) { auto [u, v] = MaskUV(p); return std::pair{Clamp01(u), Clamp01(v)}; };
++
++	// the head and its ears
++	Mesh MakeFaceline(int type)
++	{
++		const Face face = FaceOf(type);
++		Mesh head = Grid(40, 28, [=](float s, float t) { return HeadPoint(face, Theta(s), Phi(t), 0); },
++			[](float, float, Vec3) { return true; }, FacelineUV, kHeadCenter);
++		const float earY = kEyeY - 3;
++		for (float side : {-1.0f, 1.0f})
++		{
++			const Vec3 at = HeadPoint(face, side * kPi / 2, std::asin((earY - kHeadCenter.y) / kHeadRy), -1.2f);
++			head = Merged(head, Grid(12, 10, [=](float s, float t) {
++				const float th = Theta(s), ph = Phi(t);
++				return Vec3{at.x + side * 2.6f * std::cos(ph) * std::cos(th) + side * 1.2f, at.y + 4.6f * std::sin(ph), at.z - 1 + 3.2f * std::cos(ph) * std::sin(th)};
++			}, [](float, float, Vec3) { return true; }, FacelineUV, at));
++		}
++		return head;
++	}
++
++	Mesh MakeMask(int type)
++	{
++		const Face face = FaceOf(type);
++		return Grid(48, 36, [=](float s, float t) { return HeadPoint(face, (s - 0.5f) * kPi * 0.9f, Phi(t), 0.12f); },
++			[](float, float, Vec3 p) { auto [u, v] = MaskUV(p); return p.z > kHeadRz * 0.3f && u >= 0 && u <= 1 && v >= 0 && v <= 1; },
++			[](float, float, Vec3 p) { return MaskUV(p); }, kHeadCenter);
++	}
++
++	struct Nose
++	{
++		Vec3 center;
++		float rx, ry, rz;
++	};
++	Nose NoseOf(int type) { return {{0, -0.6f, -1.2f}, 2.2f + 0.1f * (type % 6), 2.6f + 0.15f * (type % 4), 2.6f + 0.2f * (type % 3)}; }
++
++	Mesh MakeNose(int type)
++	{
++		const Nose n = NoseOf(type);
++		return Grid(16, 12, [=](float s, float t) {
++			const float th = Theta(s), ph = Phi(t);
++			return Vec3{n.center.x + n.rx * std::cos(ph) * std::sin(th), n.center.y + n.ry * std::sin(ph), n.center.z + n.rz * std::cos(ph) * std::cos(th)};
++		}, [](float, float, Vec3) { return true; }, nullptr, n.center);
++	}
++
++	// a flat rectangle facing +z with texture coordinates (v = 0 at the top)
++	Mesh MakeQuad(Vec3 center, float w, float h)
++	{
++		return Grid(1, 1, [=](float s, float t) { return Vec3{center.x + (s - 0.5f) * w, center.y + (0.5f - t) * h, center.z}; },
++			[](float, float, Vec3) { return true; }, [](float s, float t, Vec3) { return std::pair{s, t}; }, center - Vec3{0, 0, 10});
++	}
++
++	Mesh MakeNoseline(int type)
++	{
++		const Nose n = NoseOf(type);
++		return MakeQuad({0, n.center.y - 1.2f, n.center.z + n.rz + 0.05f}, 5.5f, 4);
++	}
++
++	Mesh MakeBeard(int type)
++	{
++		const Face face = FaceOf(0);
++		const float chin = -0.62f - 0.05f * type; // below the mouth, higher at the sides
++		return Translated(Grid(36, 12, [=](float s, float t) {
++			const float th = (s * 2 - 1) * 1.9f, side = Clamp01((std::abs(th) - 0.55f) / 0.4f);
++			const float edge = chin + (-0.15f - chin) * side * side * (3 - 2 * side);
++			return HeadPoint(face, th, -kPi / 2 + (edge + kPi / 2) * t, 0.8f);
++		}, [](float, float, Vec3) { return true; }, nullptr, kHeadCenter), kBeardPos);
++	}
++
++	// Hair styles: where the hair ends (elevation, degrees) at the front, side and back, and how far
++	// it stands off the head.
++	struct HairStyle
++	{
++		float front, side, back, grow, top;
++	};
++	constexpr HairStyle kHairStyles[] = {
++		{12, -2, -35, 2.0f, 0},	  // short
++		{3, -6, -40, 2.2f, 0},	  // bangs
++		{4, -4, -38, 2.2f, 0},	  // side part (higher on one side)
++		{9, -55, -70, 2.4f, 0},	  // long
++		{2, -32, -40, 2.6f, 0},	  // bob
++		{15, 2, -28, 1.0f, 0},	  // buzz
++		{13, -4, -36, 2.0f, 5},	  // tall
++		{10, -3, -34, 2.4f, 0},	  // spiky
++	};
++	int StyleOf(int hairType) { return (hairType * 5 + hairType / 7) % 8; }
++
++	float HairEdge(int style, float theta)
++	{
++		const HairStyle& h = kHairStyles[style];
++		const float a = std::abs(theta);
++		auto smooth = [](float x) { return x * x * (3 - 2 * x); };
++		float edge = a < kPi / 2 ? h.front + (h.side - h.front) * smooth(a / (kPi / 2)) : h.side + (h.back - h.side) * smooth((a - kPi / 2) / (kPi / 2));
++		if (style == 2 && theta > 0 && a < kPi / 2)
++			edge += 10 * (1 - a / (kPi / 2));
++		if (style == 7)
++			edge += 4 * std::sin(theta * 14);
++		return edge * kPi / 180;
++	}
++
++	Vec3 HairPoint(int style, float theta, float phi, float extra)
++	{
++		const HairStyle& h = kHairStyles[style];
++		float grow = h.grow + extra;
++		if (style == 7 && phi > 0)
++			grow += 1.5f * std::sin(phi) * (0.5f + 0.5f * std::sin(theta * 9));
++		Vec3 p = HeadPoint(FaceOf(0), theta, phi, grow, false);
++		if (phi > 0)
++			p.y += h.top * std::sin(phi);
++		return p;
++	}
++
++	// hair1: the hair; hair2: what shows under a hat. The grid runs from the hair's edge up, so the
++	// edge is smooth.
++	Mesh MakeHair(int hairType, bool underHat)
++	{
++		const int style = StyleOf(hairType);
++		const float top = underHat ? 0.3f : kPi / 2;
++		return Translated(Grid(64, 24, [=](float s, float t) {
++			const float th = Theta(s), edge = std::min(HairEdge(style, th), top - 0.05f);
++			return HairPoint(style, th, edge + (top - edge) * t, 0);
++		}, [](float, float, Vec3) { return true; }, nullptr, kHeadCenter), kHairPos);
++	}
++
++	// The forehead part (skin where the hair leaves gaps) isn't needed with these heads: a small
++	// patch on the crown, under every hair style, so the part isn't empty.
++	Mesh MakeForehead()
++	{
++		return Translated(Grid(12, 3, [=](float s, float t) { return HeadPoint(FaceOf(0), Theta(s), 1.2f + 0.3f * t, 0.3f, false); },
++			[](float, float, Vec3) { return true; }, nullptr, kHeadCenter), kHairPos);
++	}
++
++	Mesh MakeCap(float from)
++	{
++		return Translated(Grid(36, 20, [=](float s, float t) { return HeadPoint(FaceOf(0), Theta(s), Phi(t), 3.4f, false); },
++			[=](float, float t, Vec3) { return Phi(t) > from; }, [](float s, float t, Vec3) { return std::pair{s, 1 - t}; }, kHeadCenter), kHairPos);
++	}
++
++	// ---- the file
++
++	// Parts data deduplicated (slots share variants); each slot points at one.
++	struct Table
++	{
++		std::vector<std::vector<uint8>> data;
++		std::map<std::vector<uint8>, uint32> known;
++		std::vector<std::vector<uint32>> slots; // [type][index] -> data
++
++		uint32 Add(std::vector<uint8> part)
++		{
++			auto it = known.find(part);
++			if (it != known.end())
++				return it->second;
++			const uint32 id = (uint32)data.size();
++			known.emplace(part, id);
++			data.push_back(std::move(part));
++			return id;
++		}
++	};
++
++	std::vector<uint8> Build()
++	{
++		Table textures, shapes;
++		textures.slots.resize(TexTypes);
++		shapes.slots.resize(ShapeTypes);
++		auto texture = [&](int type, const Image& img) { textures.slots[type].push_back(textures.Add(EncodeTexture(img))); };
++		auto shape = [&](int type, const Mesh& mesh, const std::vector<Vec3>& transform = {}) { shapes.slots[type].push_back(shapes.Add(EncodeShape(mesh, transform))); };
++
++		for (int i = 0; i < 3; i++)
++			texture(TexBeard, DrawFacelineBeard(i));
++		const Image cap = DrawCap();
++		for (int i = 0; i < 132; i++)
++			texture(TexCap, cap);
++		for (int i = 0; i < 62; i++)
++			texture(TexEye, DrawEye(i % 16));
++		for (int i = 0; i < 24; i++)
++			texture(TexEyebrow, DrawEyebrow(i));
++		for (int i = 0; i < 12; i++)
++			texture(TexFaceline, Image(32, 32, 1)); // no wrinkles
++		for (int i = 0; i < 12; i++)
++			texture(TexFaceMakeup, Image(32, 32, 4)); // no makeup
++		for (int i = 0; i < 9; i++)
++			texture(TexGlass, DrawGlass(i));
++		for (int i = 0; i < 2; i++)
++			texture(TexMole, DrawMole(i));
++		for (int i = 0; i < 37; i++)
++			texture(TexMouth, DrawMouth(i % 12));
++		for (int i = 0; i < 6; i++)
++			texture(TexMustache, DrawMustache(i));
++		for (int i = 0; i < 18; i++)
++			texture(TexNoseline, DrawNoseline(i));
++
++		for (int i = 0; i < 4; i++)
++			shape(ShBeard, MakeBeard(i));
++		const Mesh cap1 = MakeCap(0.3f), cap2 = MakeCap(0.2f);
++		for (int i = 0; i < 132; i++)
++			shape(ShCap1, cap1);
++		for (int i = 0; i < 132; i++)
++			shape(ShCap2, cap2);
++		for (int i = 0; i < 12; i++) // transform: hair, face center and beard positions
++			shape(ShFaceline, MakeFaceline(i), {kHairPos, FaceCenter(FaceOf(i)), kBeardPos});
++		shape(ShGlass, MakeQuad({0, 0, 0}, 36, 13));
++		for (int i = 0; i < 12; i++)
++			shape(ShMask, MakeMask(i));
++		for (int i = 0; i < 18; i++)
++			shape(ShNoseline, MakeNoseline(i));
++		for (int i = 0; i < 18; i++)
++			shape(ShNose, MakeNose(i));
++		// hair transform: where games put things on the head (front, side, top: translation, rotation)
++		const std::vector<Vec3> hairTransform = {{0, 38, 23}, {0, 0, 0}, {23, 33, 0}, {0, 0, 0}, {0, 55, 0}, {0, 0, 0}};
++		std::vector<Mesh> hair1, hair2;
++		const Mesh forehead = MakeForehead();
++		for (int style = 0; style < 8; style++)
++		{
++			hair1.push_back(MakeHair(style, false));
++			hair2.push_back(MakeHair(style, true));
++		}
++		for (int i = 0; i < 132; i++)
++			shape(ShHair1, hair1[StyleOf(i)], hairTransform);
++		for (int i = 0; i < 132; i++)
++			shape(ShHair2, hair2[StyleOf(i)]);
++		for (int i = 0; i < 132; i++)
++			shape(ShForehead1, forehead);
++		for (int i = 0; i < 132; i++)
++			shape(ShForehead2, forehead);
++
++		// parts data after the header: textures aligned for GX2, shapes for FS reads
++		std::vector<uint8> file(kHeaderSize, 0);
++		std::vector<uint32> texturePos, shapePos;
++		for (const auto& part : textures.data)
++		{
++			Align(file, kTextureAlign);
++			texturePos.push_back((uint32)file.size());
++			file.insert(file.end(), part.begin(), part.end());
++		}
++		for (const auto& part : shapes.data)
++		{
++			Align(file, kShapeAlign);
++			shapePos.push_back((uint32)file.size());
++			file.insert(file.end(), part.begin(), part.end());
++		}
++		Align(file, 0x40); // FFL reads in sizes rounded up to 0x40
++
++		uint32 largest = 0;
++		std::vector<uint8> header;
++		Put32(header, kMagic);
++		Put32(header, 0x00070000);
++		Put32(header, 0); // uncompress buffer size, set below
++		Put32(header, kMagicCrema);
++		Put32(header, 0); // not expanded: parts are read one by one
++		auto tables = [&](const Table& table, const std::vector<uint32>& partPos) {
++			for (const auto& slots : table.slots)
++			{
++				uint32 maxSize = 0;
++				for (uint32 id : slots)
++					maxSize = std::max(maxSize, (uint32)table.data[id].size());
++				largest = std::max(largest, maxSize);
++				Put32(header, maxSize);
++			}
++			for (const auto& slots : table.slots)
++				for (uint32 id : slots)
++				{
++					const uint32 size = (uint32)table.data[id].size();
++					Put32(header, partPos[id]);
++					Put32(header, size);
++					Put32(header, size);
++					for (uint8 v : {0, 0, 0, (int)kUncompressed})
++						Put8(header, v);
++				}
++		};
++		tables(textures, texturePos);
++		cemu_assert(header.size() == 0x14 + 0x13FC);
++		tables(shapes, shapePos);
++		cemu_assert(header.size() == kVersionOffset);
++		Put32(header, kVersion);
++		Set32(header, 8, largest);
++		std::copy(header.begin(), header.end(), file.begin());
++		return file;
++	}
++
++	uint32 Get32(const std::vector<uint8>& d, size_t at)
++	{
++		return (uint32)d[at] << 24 | (uint32)d[at + 1] << 16 | (uint32)d[at + 2] << 8 | d[at + 3];
++	}
++
++	// v01.20/21's blank placeholder (scripts/make-placeholder-ffl.py): 35392 bytes, magic and a
++	// zero word where these parts have "CRMA"
++	bool IsBlankPlaceholder(const std::vector<uint8>& d)
++	{
++		return d.size() == 35392 && Get32(d, 0) == kMagic && Get32(d, 8) == 64 * 64 * 4 + 12 && Get32(d, 12) == 0 &&
++			   Get32(d, 0x14) == 64 * 64 * 4 + 12 && Get32(d, 0x14 + 11 * 4) == kHeaderSize;
++	}
++} // namespace
++
++std::vector<uint8> BuildPartsResource()
++{
++	return Build();
++}
++
++bool IsCremaFile(const std::vector<uint8>& data)
++{
++	if (data.size() < kHeaderSize || Get32(data, 0) != kMagic)
++		return false;
++	return Get32(data, 12) == kMagicCrema || IsBlankPlaceholder(data);
++}
++
++bool IsCurrent(const std::vector<uint8>& data)
++{
++	return data.size() >= kHeaderSize && Get32(data, 0) == kMagic && Get32(data, 12) == kMagicCrema && Get32(data, kVersionOffset) == kVersion;
++}
++} // namespace CremaMii
+diff --git a/src/gui/ps4/CremaMii.h b/src/gui/ps4/CremaMii.h
+new file mode 100644
+index 0000000..59a3de1
+--- /dev/null
++++ b/src/gui/ps4/CremaMii.h
+@@ -0,0 +1,17 @@
++// Crema's own Mii parts: a resource in the format of the Wii U's Mii parts (FFLRes*.dat in system
++// title 0005001B10056000) built from simple shapes and textures drawn here, so that games show Miis
++// on consoles without a dump of the Wii U's. Holds no Nintendo data.
++#pragma once
++
++#include <vector>
++
++namespace CremaMii
++{
++	// FFLResHigh.dat / FFLResMiddle.dat (and their LG variants: same content)
++	std::vector<uint8> BuildPartsResource();
++	// A file Crema wrote (these parts, or the blank placeholder of v01.20/21), which it may replace
++	// or remove; never a dump of the Wii U's.
++	bool IsCremaFile(const std::vector<uint8>& data);
++	// Whether the file is the current version of Crema's parts.
++	bool IsCurrent(const std::vector<uint8>& data);
++} // namespace CremaMii
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
 index 0000000..f5d2815
@@ -1806,10 +2650,10 @@ index 0000000..14bb922
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..31e48d6
+index 0000000..63e4d97
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,607 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -1835,6 +2679,7 @@ index 0000000..31e48d6
 +#include "input/InputManager.h"
 +#include "util/helpers/helpers.h"
 +
++#include "gui/ps4/CremaMii.h"
 +#include "gui/ps4/PS4PauseMenu.h"
 +#include "gui/ps4/launcher/CremaSettings.h"
 +#include "gui/ps4/launcher/Launcher.h"
@@ -1975,108 +2820,38 @@ index 0000000..31e48d6
 +		return true;
 +	}
 +
-+	// A placeholder for the Wii U's Mii parts resources (FFLResHigh.dat etc. in system title
-+	// 0005001B10056000), from scripts/make-placeholder-ffl.py. Games link the Mii library (FFL)
-+	// statically; without its resource NSMBU dereferences a null model later and crashes. This one
-+	// holds no Nintendo data: every 3D part is empty (FFL draws nothing for an empty shape) and every
-+	// texture part is one blank 64x64 texture (a texture can't be empty: FFL reads its footer from
-+	// the end of the data), so Miis are invisible. Layout from github.com/aboood40091/ffl.
-+	std::vector<uint8> MakePlaceholderMiiResource()
-+	{
-+		constexpr uint32 kHeaderSize = 0x4A00, kSide = 64, kUncompressed = 5;
-+		// parts per texture type (beard, cap, eye, eyebrow, faceline, face makeup, glass, mole,
-+		// mouth, mustache, noseline) and per shape type (beard, cap 1/2, faceline, glass, mask,
-+		// noseline, nose, hair 1/2, forehead 1/2)
-+		constexpr uint32 kTextureParts[] = {3, 132, 62, 24, 12, 12, 9, 2, 37, 6, 18};
-+		constexpr uint32 kShapeParts[] = {4, 132, 132, 12, 1, 12, 18, 18, 132, 132, 132, 132};
-+		// 64x64 RGBA8 (format 2), one mip, transparent; then the footer: mip offset, width, height,
-+		// mip count, format
-+		constexpr uint32 kTextureSize = kSide * kSide * 4 + 12;
-+
-+		std::vector<uint8> data;
-+		auto put32 = [&](uint32 v) { for (int s = 24; s >= 0; s -= 8) data.push_back((uint8)(v >> s)); };
-+		auto put16 = [&](uint16 v) { data.push_back((uint8)(v >> 8)); data.push_back((uint8)v); };
-+		auto zeros = [&](size_t n) { data.insert(data.end(), n, 0); };
-+
-+		// magic, version, uncompress buffer size (nothing is compressed), unused, "is expand" (no)
-+		data.insert(data.end(), {'F', 'F', 'R', 'A'});
-+		put32(0x00070000);
-+		put32(kTextureSize);
-+		zeros(4);
-+		put32(0);
-+		// texture header: largest part per type, then every part's info (data position, size,
-+		// compressed size, compress level, window bits, memory level, strategy); all share one texture
-+		for (size_t i = 0; i < std::size(kTextureParts); i++)
-+			put32(kTextureSize);
-+		for (uint32 n : kTextureParts)
-+			for (uint32 i = 0; i < n; i++)
-+			{
-+				put32(kHeaderSize);
-+				put32(kTextureSize);
-+				put32(kTextureSize);
-+				data.insert(data.end(), {0, 0, 0, (uint8)kUncompressed});
-+			}
-+		// shape header: every part empty
-+		uint32 shapeParts = 0;
-+		for (uint32 n : kShapeParts)
-+			shapeParts += n;
-+		zeros(4 * std::size(kShapeParts) + 0x10 * shapeParts);
-+		cemu_assert(data.size() <= kHeaderSize);
-+		zeros(kHeaderSize - data.size());
-+
-+		zeros(kSide * kSide * 4);
-+		put32(0);
-+		put16(kSide);
-+		put16(kSide);
-+		data.insert(data.end(), {1, 2, 0, 0});
-+		// FFL reads parts in sizes rounded up to 0x40
-+		zeros((0x40 - data.size() % 0x40) % 0x40);
-+		return data;
-+	}
-+
-+	// Games that crash without the Mii resources (the "Mii Data When Missing" setting's Auto). The
-+	// placeholder isn't for every game: Mario Kart 8 loads it and then crashes at its title movie
-+	// (null shader and uniforms passed to GX2), where players without it run the game.
-+	bool NeedsMiiPlaceholder(uint64 titleId)
-+	{
-+		const uint64 base = titleId & ~0xF00000000ull; // the game, not its update or DLC
-+		for (uint64 id : {
-+				 0x0005000010101C00ull, 0x0005000010101D00ull, 0x0005000010101E00ull, // New Super Mario Bros. U
-+				 0x000500001014B700ull, 0x000500001014B800ull, // New Super Mario Bros. U + New Super Luigi U
-+			 })
-+			if (base == id)
-+				return true;
-+		return false;
-+	}
-+
-+	// Writes the placeholder Mii resources where they are missing, or (placeholder off) removes the
-+	// ones written earlier, so that they never reach a game they break. A real dump is never touched: only files identical to the placeholder are
-+	// removed.
-+	void SetupMiiResources(const fs::path& mlc, bool placeholder)
++	// The Wii U's Mii parts (FFLRes*.dat in system title 0005001B10056000): games link the Mii
++	// library statically, and without its resource NSMBU crashes and Nintendo Land's Miis have no
++	// heads. Where they're missing, Crema writes its own (CremaMii.cpp), and replaces older ones it
++	// wrote (the blank placeholder of v01.20/21, an older version of its parts); with the setting
++	// off it removes them. A dump of the Wii U's is never touched.
++	void SetupMiiResources(const fs::path& mlc, bool cremaMiis)
 +	{
 +		const fs::path dir = mlc / "sys/title/0005001b/10056000/content";
-+		const std::vector<uint8> resource = MakePlaceholderMiiResource();
++		std::vector<uint8> parts; // built on first use
 +		std::error_code ec;
 +		for (const char* name : {"FFLResHigh.dat", "FFLResMiddle.dat", "FFLResHighLG.dat", "FFLResMiddleLG.dat"})
 +		{
 +			const fs::path path = dir / name;
++			std::vector<uint8> current;
 +			const bool exists = fs::exists(path, ec);
-+			if (placeholder && !exists)
-+			{
-+				fs::create_directories(dir, ec);
-+				std::ofstream file(path, std::ios::binary);
-+				file.write((const char*)resource.data(), (std::streamsize)resource.size());
-+				Trace(fmt::format("Mii data missing: wrote the placeholder {}", name));
-+			}
-+			else if (!placeholder && exists && fs::file_size(path, ec) == resource.size())
++			if (exists)
 +			{
 +				std::ifstream file(path, std::ios::binary);
-+				std::vector<uint8> current(resource.size());
-+				file.read((char*)current.data(), (std::streamsize)current.size());
-+				file.close();
-+				if (current == resource && fs::remove(path, ec))
-+					Trace(fmt::format("Mii data placeholder off: removed {}", name));
++				current.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 +			}
++			const bool ours = exists && CremaMii::IsCremaFile(current);
++			if (cremaMiis && (!exists || (ours && !CremaMii::IsCurrent(current))))
++			{
++				if (parts.empty())
++					parts = CremaMii::BuildPartsResource();
++				fs::create_directories(dir, ec);
++				std::ofstream file(path, std::ios::binary);
++				file.write((const char*)parts.data(), (std::streamsize)parts.size());
++				Trace(fmt::format("Mii parts: wrote Crema's {} ({} bytes)", name, parts.size()));
++			}
++			else if (!cremaMiis && ours && fs::remove(path, ec))
++				Trace(fmt::format("Mii parts: removed Crema's {}", name));
 +		}
 +	}
 +
@@ -2319,8 +3094,7 @@ index 0000000..31e48d6
 +		const uint64 titleId = CafeSystem::GetForegroundTitleId();
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
-+		const std::string miiData = CremaSettings::Get("mii_data", gameId);
-+		SetupMiiResources(ActiveSettings::GetMlcPath(), miiData == "placeholder" || (miiData == "auto" && NeedsMiiPlaceholder(titleId)));
++		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) != "off");
 +		PS4PauseMenu::Install(gameId, _pathToUtf8(game));
 +		sPerfLog = CremaSettings::On("perf_log", gameId);
 +		sFreezeReports = CremaSettings::On("freeze_reports", gameId);
@@ -2748,7 +3522,7 @@ index 0000000..bc4f953
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..83e131f
+index 0000000..6c2ac23
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
 @@ -0,0 +1,357 @@
@@ -2801,8 +3575,8 @@ index 0000000..83e131f
 +				{"ja", "日本語"}, {"zh", "中文 (简体)"}, {"ko", "한국어"}},
 +			"en", false, "The menus' language, and the Wii U's system language where it has it."},
 +		{"mii_data", "Mii Data When Missing", "Emulation",
-+			{{"auto", "Auto"}, {"placeholder", "Blank Placeholder"}, {"off", "None"}}, "auto", false,
-+			"Without a dump of the Wii U's Mii data, New Super Mario Bros. U crashes; a blank placeholder makes its Miis invisible instead. Other games (Mario Kart 8) can crash with the placeholder. Auto: the placeholder only for games that need it. A real dump is never replaced."},
++			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
++			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
 +		// Audio
 +		{"game_volume", "Game Volume", "Audio",
 +			{{"100", "100"}, {"90", "90"}, {"80", "80"}, {"70", "70"}, {"60", "60"}, {"50", "50"},
