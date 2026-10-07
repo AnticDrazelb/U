@@ -5851,10 +5851,10 @@ index 0000000..2743734
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..406f51d
+index 0000000..9da921a
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3236 @@
+@@ -0,0 +1,3293 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -5885,6 +5885,12 @@ index 0000000..406f51d
 +#include <fstream>
 +#include <map>
 +#include <thread>
++
++#include <dirent.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstring>
 +
 +#include <orbis/AudioOut.h>
 +#include <orbis/CommonDialog.h>
@@ -6969,6 +6975,53 @@ index 0000000..406f51d
 +	}
 +
 +	// Square on the games, or a new Game Folder: the folder is read again.
++	// Deletes a file, or a folder with everything in it (std::filesystem::remove_all fails on the
++	// PS4 with "function not implemented": the OpenOrbis C library lacks the *at() calls it uses).
++	// Counts what it removed; false and the reason on the first failure.
++	bool RemoveTree(const std::string& path, uintmax_t& count, std::string& error)
++	{
++		struct stat info;
++		if (lstat(path.c_str(), &info) != 0)
++		{
++			error = strerror(errno);
++			return false;
++		}
++		if (S_ISDIR(info.st_mode))
++		{
++			DIR* dir = opendir(path.c_str());
++			if (!dir)
++			{
++				error = strerror(errno);
++				return false;
++			}
++			std::vector<std::string> names;
++			while (dirent* entry = readdir(dir))
++			{
++				const std::string name = entry->d_name;
++				if (name != "." && name != "..")
++					names.push_back(name);
++			}
++			closedir(dir);
++			for (const std::string& name : names)
++			{
++				if (!RemoveTree(path + "/" + name, count, error))
++					return false;
++			}
++			if (rmdir(path.c_str()) != 0)
++			{
++				error = strerror(errno);
++				return false;
++			}
++		}
++		else if (unlink(path.c_str()) != 0)
++		{
++			error = strerror(errno);
++			return false;
++		}
++		count++;
++		return true;
++	}
++
 +	// What deleting a game removes: its folder (title.tmd's, or the one holding code/<name>.rpx),
 +	// or its file (.wua, .wud, .wux, .wuhb, .rpx, .elf). Empty: not strictly inside the games
 +	// folder (files straight in it, or somewhere else), so nothing is deleted.
@@ -6999,12 +7052,14 @@ index 0000000..406f51d
 +			lines.push_back("Not deleted: it isn't in its own place in the games folder.");
 +			return lines;
 +		}
-+		std::error_code ec;
-+		const uintmax_t removed = fs::remove_all(_utf8ToPath(target), ec);
-+		Log("delete: " + target + (ec ? " failed: " + ec.message() : " (" + std::to_string(removed) + " files)"));
-+		if (ec)
++		uintmax_t removed = 0;
++		std::string error;
++		const bool ok = RemoveTree(target, removed, error);
++		Log("delete: " + target + (ok ? " (" + std::to_string(removed) + " entries)" : " failed after " + std::to_string(removed) + " entries: " + error));
++		if (!ok)
 +		{
-+			lines.push_back("Couldn't delete it: " + ec.message());
++			lines.push_back("Couldn't delete it all: " + error);
++			RefreshGames();
 +			return lines;
 +		}
 +		lines.push_back("Deleted.");
@@ -7016,7 +7071,9 @@ index 0000000..406f51d
 +			{
 +				const std::string folder = titles + kind + "/" + low;
 +				std::error_code ec2;
-+				if (fs::exists(folder, ec2) && fs::remove_all(folder, ec2) > 0 && !ec2)
++				uintmax_t count = 0;
++				std::string error2;
++				if (fs::exists(folder, ec2) && RemoveTree(folder, count, error2))
 +				{
 +					Log("delete: " + folder);
 +					lines.push_back(std::string(kind) == "0005000e" ? "Its update: deleted." : "Its DLC: deleted.");
