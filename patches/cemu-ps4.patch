@@ -1015,16 +1015,56 @@ index 821fe8a..49807b9 100644
  			{
  				m_decodeSem.decrementWithWait();
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-index 7afbf19..85f6d0c 100644
+index 7afbf19..a14e54d 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 +++ b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-@@ -1,3 +1,22 @@
+@@ -1,3 +1,62 @@
 +#ifdef __ORBIS__
 +// PS4: fatal signals are handled by the port's crash log (port/ps4_crashlog.cpp: registers and a
 +// stack scan with ELF-relative addresses in /data/CemuPS4/crash.log); there is no execinfo.
 +#include "ExceptionHandler.h"
 +void ExceptionHandler_Init()
 +{
++}
++
++#include "Cafe/HW/Espresso/PPCState.h"
++#include "Cafe/HW/MMU/MMU.h"
++#include <unistd.h>
++
++// Called by the port's crash handler while it writes crash.log (fd): the crashed thread's PPC
++// registers and the return addresses on its guest stack. No locks and no allocation: the full
++// report below (ps4_crash_guest_info) can deadlock on a lock another thread held at the crash.
++extern "C" void ps4_crash_guest_regs(int fd)
++{
++	char line[200];
++	auto out = [&](int n) {
++		if (n > 0)
++			write(fd, line, std::min<size_t>((size_t)n, sizeof(line) - 1));
++	};
++	PPCInterpreter_t* hCPU = PPCInterpreter_getCurrentInstance();
++	if (!hCPU)
++	{
++		out(snprintf(line, sizeof(line), "guest: no PPC thread on this host thread\n"));
++		return;
++	}
++	out(snprintf(line, sizeof(line), "guest: IP %08x LR %08x (the IP is only updated at calls into the OS)\n", hCPU->instructionPointer, hCPU->spr.LR));
++	for (int i = 0; i < 32; i += 8)
++		out(snprintf(line, sizeof(line), "guest: r%-2d %08x %08x %08x %08x %08x %08x %08x %08x\n", i, hCPU->gpr[i], hCPU->gpr[i + 1],
++			hCPU->gpr[i + 2], hCPU->gpr[i + 3], hCPU->gpr[i + 4], hCPU->gpr[i + 5], hCPU->gpr[i + 6], hCPU->gpr[i + 7]));
++	// the back chain from r1: each frame's first word is the caller's frame, its second the
++	// return address
++	int n = snprintf(line, sizeof(line), "guest: return addresses");
++	uint32 sp = hCPU->gpr[1];
++	for (int i = 0; i < 16 && sp >= 0x01000000 && sp < 0xF0000000 && (sp & 3) == 0 && n < 180; i++)
++	{
++		const uint32 next = memory_readU32(sp);
++		if (next <= sp || next >= 0xF0000000)
++			break;
++		n += snprintf(line + n, sizeof(line) - n, " %08x", memory_readU32(next + 4));
++		sp = next;
++	}
++	n += snprintf(line + n, sizeof(line) - n, "\n");
++	out(n);
 +}
 +
 +// Called by the port's crash handler after crash.log: the emulated side of the crash (the active
@@ -1041,7 +1081,7 @@ index 7afbf19..85f6d0c 100644
  #include <signal.h>
  #include <execinfo.h>
  #include <string.h>
-@@ -170,3 +189,4 @@ void ExceptionHandler_Init()
+@@ -170,3 +229,4 @@ void ExceptionHandler_Init()
  	sigaction(SIGSYS, &action, nullptr);
  	sigaction(SIGTRAP, &action, nullptr);
  }

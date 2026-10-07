@@ -28,6 +28,7 @@
 
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" __attribute__((weak)) void ps4_crash_guest_info();  // the emulator's, if it has one
+extern "C" __attribute__((weak)) void ps4_crash_guest_regs(int fd);  // lock-free, into crash.log
 
 // FreeBSD's stack_t (the OpenOrbis musl header has Linux's field order, which the kernel misreads)
 struct BsdSignalStack {
@@ -140,6 +141,10 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
                         i % 4 == 3 ? "\n" : "  ");
         if (address < rsp && rsp - address < 0x10000)
             writeAll(fd, "\nthe fault is just below the stack pointer: this thread ran out of stack\n");
+        if (ps4_crash_guest_regs) {
+            writeAll(fd, "\n");
+            ps4_crash_guest_regs(fd);
+        }
         writeAll(fd, "\ncode addresses on the stack (elf):\n");
         const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
         int found = 0;
