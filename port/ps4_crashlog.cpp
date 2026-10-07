@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -27,6 +28,28 @@
 
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" __attribute__((weak)) void ps4_crash_guest_info();  // the emulator's, if it has one
+
+// FreeBSD's stack_t (the OpenOrbis musl header has Linux's field order, which the kernel misreads)
+struct BsdSignalStack {
+    void* sp;
+    size_t size;
+    int flags;
+};
+extern "C" int ps4_sigaltstack(const BsdSignalStack* stack, BsdSignalStack* old) __asm__("sigaltstack");
+
+// The calling thread's own stack for the crash handler: a thread that runs out of stack faults on
+// its guard page, and without another stack the handler can't run at all; the system then ends
+// the app with error CE-34878-0 and nothing in crash.log. Every thread gets one
+// (ps4_runtime.cpp: __wrap_pthread_create; the main thread: earlyInit below).
+extern "C" void ps4_install_signal_stack() {
+    constexpr size_t kSignalStackSize = 64 * 1024;
+    void* stack = malloc(kSignalStackSize);
+    if (!stack)
+        return;
+    const BsdSignalStack signalStack{stack, kSignalStackSize, 0};
+    if (ps4_sigaltstack(&signalStack, nullptr) != 0)
+        free(stack);
+}
 extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason);  // ps4_sampler.cpp
 // the system's (ps4_runtime.cpp wraps pthread_create with an allocation; a crash may hold the heap)
 extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
@@ -35,7 +58,7 @@ namespace {
 
 // FreeBSD values (the PS4 kernel's); the OpenOrbis musl headers may carry Linux ones.
 constexpr int kSigIll = 4, kSigAbrt = 6, kSigFpe = 8, kSigBus = 10, kSigSegv = 11;
-constexpr int kSaSiginfo = 0x40;
+constexpr int kSaSiginfo = 0x40, kSaOnstack = 0x1;
 constexpr int kMcontextOffset = 0x40;  // measured on hardware
 // Registers in FreeBSD mcontext order (after mc_onstack).
 constexpr const char* kRegNames[] = {"rdi", "rsi", "rdx", "rcx", "r8",  "r9",  "rax", "rbx",
@@ -115,6 +138,8 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         for (int i = 0; i < 15; i++)
             writeFormat(fd, "%s 0x%llx%s", kRegNames[i], static_cast<unsigned long long>(regs[1 + i]),
                         i % 4 == 3 ? "\n" : "  ");
+        if (address < rsp && rsp - address < 0x10000)
+            writeAll(fd, "\nthe fault is just below the stack pointer: this thread ran out of stack\n");
         writeAll(fd, "\ncode addresses on the stack (elf):\n");
         const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
         int found = 0;
@@ -182,9 +207,10 @@ __attribute__((constructor(101))) void earlyInit() {
     if (traceFd() >= 0)
         writeFormat(traceFd(), "static init (text at %p)\n", static_cast<void*>(__text_start));
     std::set_terminate(terminateHandler);
+    ps4_install_signal_stack();
     const int signals[] = {kSigIll, kSigAbrt, kSigFpe, kSigBus, kSigSegv};
     for (int sig : signals)
-        setHandler(sig, crashHandler, kSaSiginfo);
+        setHandler(sig, crashHandler, kSaSiginfo | kSaOnstack);
 }
 
 }  // namespace

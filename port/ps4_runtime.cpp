@@ -683,9 +683,15 @@ extern "C" void scePthreadSetaffinity();  // libkernel: (ScePthread, SceKernelCp
 extern "C" void scePthreadGetaffinity();  // libkernel: (ScePthread, SceKernelCpumask*)
 extern "C" void ps4_boot_trace(const char* stage);
 extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
+extern "C" void ps4_install_signal_stack();        // port/ps4_crashlog.cpp
 
 namespace {
 constexpr uint64_t kAppCores = 0x3F;
+// Every thread gets at least this much stack. The system's default is far smaller than a PC's
+// (logged at the first thread), and shader translation (glslang) and the driver's shader
+// compiler recurse deeply on large shaders; a thread out of stack is ended by the system with
+// error CE-34878-0 (suspected when Minecraft's menus appear).
+constexpr size_t kMinThreadStack = 2 * 1024 * 1024;
 using SetAffinityFn = int (*)(void*, uint64_t);
 using GetAffinityFn = int (*)(void*, uint64_t*);
 
@@ -698,6 +704,7 @@ void* startOnAppCores(void* raw) {
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
     reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kAppCores);
+    ps4_install_signal_stack();
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name
     ps4_watch_thread("(unnamed)");
@@ -706,22 +713,44 @@ void* startOnAppCores(void* raw) {
 }  // namespace
 
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
+    // the stack: at least kMinThreadStack
+    pthread_attr_t local;
+    bool ownAttr = false;
+    size_t stack = 0;
+    if (attr) {
+        pthread_attr_getstacksize(attr, &stack);
+        if (stack < kMinThreadStack)
+            pthread_attr_setstacksize(const_cast<pthread_attr_t*>(attr), kMinThreadStack);
+    } else if (pthread_attr_init(&local) == 0) {
+        ownAttr = true;
+        pthread_attr_getstacksize(&local, &stack);
+        if (stack < kMinThreadStack)
+            pthread_attr_setstacksize(&local, kMinThreadStack);
+        attr = &local;
+    }
     static std::atomic<bool> s_logged{false};
     if (!s_logged.exchange(true)) {
         uint64_t mask = 0;
         reinterpret_cast<GetAffinityFn>(&scePthreadGetaffinity)(scePthreadSelf(), &mask);
-        char line[96];
-        snprintf(line, sizeof(line), "threads: first creator's cores %#llx, new threads get %#llx",
-                 static_cast<unsigned long long>(mask), static_cast<unsigned long long>(kAppCores));
+        char line[160];
+        snprintf(line, sizeof(line),
+                 "threads: first creator's cores %#llx, new threads get %#llx; stack %zu KiB by default, at least %zu KiB",
+                 static_cast<unsigned long long>(mask), static_cast<unsigned long long>(kAppCores), stack / 1024,
+                 kMinThreadStack / 1024);
         ps4_boot_trace(line);
     }
+    int result;
     auto* wrapped = static_cast<ThreadStart*>(malloc(sizeof(ThreadStart)));
-    if (!wrapped)
-        return __real_pthread_create(thread, attr, start, arg);
-    *wrapped = {start, arg};
-    const int result = __real_pthread_create(thread, attr, startOnAppCores, wrapped);
-    if (result != 0)
-        free(wrapped);
+    if (!wrapped) {
+        result = __real_pthread_create(thread, attr, start, arg);
+    } else {
+        *wrapped = {start, arg};
+        result = __real_pthread_create(thread, attr, startOnAppCores, wrapped);
+        if (result != 0)
+            free(wrapped);
+    }
+    if (ownAttr)
+        pthread_attr_destroy(&local);
     return result;
 }
 
