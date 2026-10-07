@@ -3650,10 +3650,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..737c0e2
+index 0000000..778221a
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,740 @@
+@@ -0,0 +1,751 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -3664,6 +3664,7 @@ index 0000000..737c0e2
 +//   /data/Crema/games     games; launch.txt (first line: a path) picks one, else the first found
 +#include "interface/WindowSystem.h"
 +
++#include "Cafe/Account/Account.h"
 +#include "Cafe/CafeSystem.h"
 +#include "Cafe/HW/Latte/Core/Latte.h"
 +#include "Cafe/HW/Latte/Core/LatteOverlay.h"
@@ -4217,6 +4218,16 @@ index 0000000..737c0e2
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
 +		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) != "off");
++		if (CremaSettings::Get("online", gameId) == "pretendo")
++		{
++			// what online play needs from the user's own Wii U (Dumpling's online files)
++			std::error_code ec;
++			const bool account = Account::GetAccount(ActiveSettings::GetPersistentId()).IsValidOnlineAccount();
++			Trace(fmt::format("online: Pretendo; otp.bin {}, seeprom.bin {}, certificates and keys {}, account {}: {}",
++				fs::exists(kDataRoot / "otp.bin", ec) ? "found" : "missing", fs::exists(kDataRoot / "seeprom.bin", ec) ? "found" : "missing",
++				ActiveSettings::HasRequiredOnlineFiles() ? "ok" : "missing", account ? "linked" : "not an online account",
++				ActiveSettings::IsOnlineEnabled() ? "online" : "offline"));
++		}
 +		snprintf(sStopInfo, sizeof(sStopInfo), "%s", StopInfoText(CafeSystem::GetForegroundTitleName(), titleId).c_str());
 +		PS4PauseMenu::LoadGameControls(gameId);
 +		PS4PauseMenu::Install(gameId, _pathToUtf8(game));
@@ -4655,16 +4666,18 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..26506e4
+index 0000000..8f65dfb
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,375 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
 +#include "Cafe/GameProfile/GameProfile.h"
 +#include "Cemu/Logging/CemuLogging.h"
++#include "config/ActiveSettings.h"
 +#include "config/CemuConfig.h"
++#include "config/NetworkSettings.h"
 +
 +#include <fstream>
 +#include <map>
@@ -4729,6 +4742,9 @@ index 0000000..26506e4
 +			"Touch Screen: a click touches the GamePad screen at your finger, two fingers press Minus (left) or HOME (right). Minus / HOME: the touchpad's halves are those buttons."},
 +		{"motion", "Motion Controls", "Controls", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"The DualShock 4's motion sensors move the GamePad: tilt and turn it."},
++		// Online
++		{"online", "Online", "Online", {{"off", "Off"}, {"pretendo", "Pretendo"}}, "off", false,
++			"Pretendo Network, for online play. Needs your Wii U's own online files: otp.bin and seeprom.bin in /data/Crema, your account (with a Pretendo account) and the console's certificates in mlc01. Dump them with Dumpling."},
 +		// Diagnostics
 +		{"perf_log", "Performance Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every 5 s, the GPU's and each thread's load in log.txt (what limits the frame rate)."},
@@ -4743,7 +4759,7 @@ index 0000000..26506e4
 +		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"When the PS4 closes a game with error CE-34878-0 (a GPU fault), the GPU's last commands are kept for the logs. Slightly slower."},
 +	};
-+	const std::vector<const char*> CATEGORIES = {"Display", "Emulation", "Audio", "Controls", "Diagnostics"};
++	const std::vector<const char*> CATEGORIES = {"Display", "Emulation", "Audio", "Controls", "Online", "Diagnostics"};
 +
 +	std::mutex s_mutex;
 +	std::string s_path;
@@ -4988,6 +5004,8 @@ index 0000000..26506e4
 +	const bool accurate = get("gpu_accuracy") != "fast";
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
++	// the online service of the account in use (Cemu: per account): Pretendo, or none
++	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), get("online") == "pretendo" ? NetworkService::Pretendo : NetworkService::Offline);
 +	const std::string upscale = get("upscale_filter");
 +	config.upscale_filter = upscale == "linear" ? kLinearFilter : upscale == "hermite" ? kBicubicHermiteFilter :
 +		upscale == "nearest" ? kNearestNeighborFilter : kBicubicFilter;

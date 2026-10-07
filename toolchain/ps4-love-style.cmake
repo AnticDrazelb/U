@@ -11,6 +11,7 @@ set(PS4_RUNTIME_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_dlmalloc.c
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_crashlog.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_sampler.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_net.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_string.c
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_random.c)
 
@@ -95,6 +96,8 @@ string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=mmap")
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=clock_gettime")
 # New threads on all of the app's cores, not just their creator's (port/ps4_runtime.cpp).
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=pthread_create")
+# Host names through the PS4's resolver: the C library has no DNS on the PS4 (port/ps4_net.cpp).
+string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=getaddrinfo --wrap=gethostbyname")
 
 # Program authority ID: the system Piglet (OpenGL ES) only gives a display to processes with a
 # system authority ID. This is RetroArch for PS4's value, as used by love-ps4.
