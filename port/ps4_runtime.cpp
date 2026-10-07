@@ -672,6 +672,59 @@ int __wrap_pthread_once(pthread_once_t* once, void (*init)(void)) {
     return 0;
 }
 
+// pthread_create for every caller (--wrap): a PS4 thread inherits its creator's CPU affinity, so a
+// worker started from an emulator thread that runs on one core (Cemu's H.264 decoder, started from
+// an emulated CPU core's thread; DolphinPS4's shader compilers) would share that busy core and
+// starve. New threads start on all of the app's cores (0-5) instead; a thread that wants one core
+// sets it itself.
+extern "C" int __real_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg);
+extern "C" void* scePthreadSelf();
+extern "C" void scePthreadSetaffinity();  // libkernel: (ScePthread, SceKernelCpumask)
+extern "C" void scePthreadGetaffinity();  // libkernel: (ScePthread, SceKernelCpumask*)
+extern "C" void ps4_boot_trace(const char* stage);
+extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
+
+namespace {
+constexpr uint64_t kAppCores = 0x3F;
+using SetAffinityFn = int (*)(void*, uint64_t);
+using GetAffinityFn = int (*)(void*, uint64_t*);
+
+struct ThreadStart {
+    void* (*start)(void*);
+    void* arg;
+};
+
+void* startOnAppCores(void* raw) {
+    const ThreadStart start = *static_cast<ThreadStart*>(raw);
+    free(raw);
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kAppCores);
+    // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
+    // (SetThreadName) updates the name
+    ps4_watch_thread("(unnamed)");
+    return start.start(start.arg);
+}
+}  // namespace
+
+int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true)) {
+        uint64_t mask = 0;
+        reinterpret_cast<GetAffinityFn>(&scePthreadGetaffinity)(scePthreadSelf(), &mask);
+        char line[96];
+        snprintf(line, sizeof(line), "threads: first creator's cores %#llx, new threads get %#llx",
+                 static_cast<unsigned long long>(mask), static_cast<unsigned long long>(kAppCores));
+        ps4_boot_trace(line);
+    }
+    auto* wrapped = static_cast<ThreadStart*>(malloc(sizeof(ThreadStart)));
+    if (!wrapped)
+        return __real_pthread_create(thread, attr, start, arg);
+    *wrapped = {start, arg};
+    const int result = __real_pthread_create(thread, attr, startOnAppCores, wrapped);
+    if (result != 0)
+        free(wrapped);
+    return result;
+}
+
 int __cxa_thread_atexit_impl(void (*dtor)(void*), void* obj, void* /*dso_symbol*/) {
     pthread_once(&g_threadDtorOnce, createThreadDtorKey);
     auto* entry = static_cast<ThreadDtor*>(malloc(sizeof(ThreadDtor)));

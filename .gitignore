@@ -3,3 +3,4 @@ modules/
 *.elf
 *.oelf
 tests/out/
+out/

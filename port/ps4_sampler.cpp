@@ -312,7 +312,10 @@ void* samplerThread(void*) {
 // first). Used by DolphinNoGUI's watchdog when emulation stops advancing.
 namespace {
 constexpr int kSigDump = 30;  // SIGUSR1 (FreeBSD)
-constexpr int kMaxWatched = 16, kMaxFrames = 48;
+constexpr int kMaxWatched = 96, kMaxFrames = 48;  // every thread of the app (pthread_create wrap)
+// A thread away from its registered stack (Cemu's CPU threads run the emulated threads on fiber
+// stacks): this much above rsp is scanned, within its mapping.
+constexpr uintptr_t kForeignStackScan = 16 * 1024;
 
 struct WatchedThread {
     std::atomic<pthread_t> thread{};
@@ -371,8 +374,19 @@ void dumpHandler(int, siginfo_t*, void* context) {
         const bool same_thread = pthread_getthreadid_np() == t.tid;
         const bool sane = t.stack_limit > rsp && t.stack_limit - rsp <= (1u << 20);
         const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
-        const auto* limit =
-            reinterpret_cast<const uint64_t*>(same_thread && sane ? t.stack_limit : rsp);
+        uintptr_t limit_address = rsp;
+        if (same_thread && sane) {
+            limit_address = t.stack_limit;
+        } else if (same_thread) {
+            void* start = nullptr;
+            void* end = nullptr;
+            uint32_t protection = 0;
+            if (sceKernelQueryMemoryProtection(reinterpret_cast<void*>(rsp), &start, &end,
+                                               &protection) == 0 && (protection & 1))
+                limit_address = std::min<uintptr_t>(rsp + kForeignStackScan,
+                                                    reinterpret_cast<uintptr_t>(end));
+        }
+        const auto* limit = reinterpret_cast<const uint64_t*>(limit_address);
         int n = 0;
         for (const uint64_t* p = stack; p < limit && n < kMaxFrames; p++) {
             if (*p >= text && *p < text + kTextWindow)
@@ -405,8 +419,12 @@ extern "C" void ps4_watch_thread(const char* name) {
     ps4_heap_private_arena(name);
     const pthread_t self = pthread_self();
     for (int i = 0; i < std::min(g_watched_count.load(), kMaxWatched); i++) {
-        if (g_watched[i].thread.load() == self)
-            return;  // already watched (e.g. registered for sampling and named)
+        if (g_watched[i].thread.load() == self) {
+            // already watched (every thread is, from its start): the name it gives itself
+            if (name)
+                snprintf(g_watched[i].name, sizeof(g_watched[i].name), "%s", name);
+            return;
+        }
     }
     const int index = g_watched_count.fetch_add(1);
     if (index >= kMaxWatched)
@@ -530,6 +548,79 @@ extern "C" double ps4_thread_cpu_seconds(int slot) {
     if (slot < 0 || slot > 1)
         return 0;
     return g_thread_cpu_ns[slot].load(std::memory_order_relaxed) / 1e9;
+}
+
+// The PS4 doesn't let a thread read another thread's CPU clock (pthread_getcpuclockid fails), so
+// busy threads report their own: ps4_thread_cpu_tick() in their loops stores the thread's CPU
+// time in its watched slot, at most every ~10 ms (rdtsc check; the clock read is a system call).
+namespace {
+std::atomic<uint64_t> g_watched_cpu_ns[kMaxWatched];
+}  // namespace
+
+extern "C" void ps4_thread_cpu_tick() {
+    static thread_local int t_slot = -2;
+    static thread_local uint64_t t_last = 0;
+    const uint64_t now = __builtin_ia32_rdtsc();
+    if (now - t_last < 16000000)  // ~10 ms at 1.6 GHz
+        return;
+    t_last = now;
+    if (t_slot == -2) {
+        t_slot = -1;
+        const pthread_t self = pthread_self();
+        for (int i = 0; i < std::min(g_watched_count.load(), kMaxWatched); i++) {
+            if (g_watched[i].thread.load() == self)
+                t_slot = i;
+        }
+    }
+    timespec ts;
+    if (t_slot >= 0 && clock_gettime(kThreadCpuClock, &ts) == 0) {
+        g_watched_cpu_ns[t_slot].store(static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec,
+                                       std::memory_order_relaxed);
+    }
+}
+
+// How busy each watched thread was since the previous call: its self-reported CPU time
+// (ps4_thread_cpu_tick), else its CPU clock read from here (pthread_getcpuclockid, where the
+// system allows it). "name N%" for those at or above min_percent, busiest first, into `out`.
+// One caller (the monitor); no allocations.
+extern "C" void ps4_thread_busy_report(char* out, size_t size, int min_percent) {
+    static uint64_t s_prev_cpu[kMaxWatched];
+    static uint64_t s_prev_wall = 0;
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t wall = static_cast<uint64_t>(now.tv_sec) * 1000000000ull + now.tv_nsec;
+    const uint64_t elapsed = s_prev_wall ? wall - s_prev_wall : 0;
+    s_prev_wall = wall;
+    int percents[kMaxWatched];
+    const int count = std::min(g_watched_count.load(std::memory_order_acquire), kMaxWatched);
+    for (int i = 0; i < count; i++) {
+        percents[i] = -1;
+        uint64_t ns = g_watched_cpu_ns[i].load(std::memory_order_relaxed);
+        if (ns == 0) {
+            clockid_t clock;
+            timespec cpu;
+            if (pthread_getcpuclockid(g_watched[i].thread.load(), &clock) != 0 ||
+                clock_gettime(clock, &cpu) != 0)
+                continue;
+            ns = static_cast<uint64_t>(cpu.tv_sec) * 1000000000ull + cpu.tv_nsec;
+        }
+        if (elapsed && s_prev_cpu[i] && ns >= s_prev_cpu[i])
+            percents[i] = static_cast<int>((ns - s_prev_cpu[i]) * 100 / elapsed);
+        s_prev_cpu[i] = ns;
+    }
+    size_t length = 0;
+    out[0] = 0;
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < count; i++)
+            if (percents[i] >= min_percent && (best < 0 || percents[i] > percents[best]))
+                best = i;
+        if (best < 0 || length + 40 >= size)
+            break;
+        length += snprintf(out + length, size - length, "%s%s %d%%", length ? ", " : "",
+                           g_watched[best].name, percents[best]);
+        percents[best] = -1;
+    }
 }
 
 extern "C" void ps4_sampler_register_thread(const char* name) {

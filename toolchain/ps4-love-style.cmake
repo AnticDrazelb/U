@@ -93,6 +93,8 @@ string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=pthread_once")
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=mmap")
 # CLOCK_MONOTONIC from the time stamp counter instead of a system call (port/ps4_runtime.cpp).
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=clock_gettime")
+# New threads on all of the app's cores, not just their creator's (port/ps4_runtime.cpp).
+string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=pthread_create")
 
 # Program authority ID: the system Piglet (OpenGL ES) only gives a display to processes with a
 # system authority ID. This is RetroArch for PS4's value, as used by love-ps4.

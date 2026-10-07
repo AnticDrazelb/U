@@ -2400,18 +2400,26 @@ ps4_wait_common(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigne
    }
 }
 
+/* Failures also set errno, like the drmSyncobj ioctls: vk_drm_syncobj tells a timeout (fence not
+ * signalled yet, e.g. vkGetFenceStatus) from an error by errno == ETIME, not by the return value. */
 static int
 ps4_wait(struct util_sync_provider *p, uint32_t *handles, unsigned count, int64_t timeout_nsec,
          unsigned flags, uint32_t *first)
 {
-   return ps4_wait_common((ac_drm_device *)p, handles, NULL, count, timeout_nsec, flags, first);
+   const int r = ps4_wait_common((ac_drm_device *)p, handles, NULL, count, timeout_nsec, flags, first);
+   if (r)
+      errno = -r;
+   return r;
 }
 
 static int
 ps4_timeline_wait(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
                   unsigned count, int64_t timeout_nsec, unsigned flags, uint32_t *first)
 {
-   return ps4_wait_common((ac_drm_device *)p, handles, points, count, timeout_nsec, flags, first);
+   const int r = ps4_wait_common((ac_drm_device *)p, handles, points, count, timeout_nsec, flags, first);
+   if (r)
+      errno = -r;
+   return r;
 }
 
 static int

@@ -11,6 +11,7 @@
 // handle.
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -25,6 +26,10 @@
 #include <typeinfo>
 
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
+extern "C" __attribute__((weak)) void ps4_crash_guest_info();  // the emulator's, if it has one
+extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason);  // ps4_sampler.cpp
+// the system's (ps4_runtime.cpp wraps pthread_create with an allocation; a crash may hold the heap)
+extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 
 namespace {
 
@@ -123,6 +128,23 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     }
     if (traceFd() >= 0)
         writeAll(traceFd(), "crashed (see crash.log)\n");
+
+    // What else to record takes locks and allocates, which a crash may have left held: a timer
+    // thread ends the process if it doesn't finish.
+    pthread_t timer;
+    __real_pthread_create(&timer, nullptr, [](void*) -> void* {
+        sleep(15);
+        _exit(126);
+    }, nullptr);
+    // Where every other thread was (stacks, and the lock each one waits on), after the crash.
+    ps4_dump_thread_stacks("/data/CemuPS4/crash.log", "every thread at the crash");
+    // The emulator's view of the crash (Cemu: the guest CPU state, stack trace and threads, into
+    // log.txt).
+    if (ps4_crash_guest_info) {
+        ps4_crash_guest_info();
+        if (traceFd() >= 0)
+            writeAll(traceFd(), "guest state written to log.txt\n");
+    }
 
     // End the process here rather than with the system's crash report: on FW 13.52 that
     // coredump of a homebrew app never finished and hung the console until a hard power-off
