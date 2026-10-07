@@ -29,6 +29,8 @@
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" __attribute__((weak)) void ps4_crash_guest_info();  // the emulator's, if it has one
 extern "C" __attribute__((weak)) void ps4_crash_guest_regs(int fd);  // lock-free, into crash.log
+// the recompiled game function a host address is in, and its code (lock-free, into crash.log)
+extern "C" __attribute__((weak)) void ps4_crash_jit_info(int fd, uint64_t rip);
 // the emulator's note for its menu, and its restart into the menu (Crema: PS4WindowSystem.cpp)
 extern "C" __attribute__((weak)) void ps4_crash_note();
 extern "C" __attribute__((weak)) void ps4_crash_restart();
@@ -201,6 +203,8 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
             writeAll(fd, "\n");
             ps4_crash_guest_regs(fd);
         }
+        if (ps4_crash_jit_info && !isCode(rip))
+            ps4_crash_jit_info(fd, rip);
         writeAll(fd, "\ncode addresses on the stack (elf):\n");
         const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
         int found = 0;

@@ -2,6 +2,8 @@
 # lines (ExceptionHandler_posix.cpp: around the crashed function's LR and its callers' return
 # addresses) into a minimal big-endian PPC ELF, then llvm-objdump.
 #   python3 guest-code.py crash-block.txt
+# Also the recompiled x86 code of the crashed game function ("jit code +offset: bytes" lines,
+# PPCRecompiler.cpp's ps4_crash_jit_info), at its offsets in that function.
 import re
 import struct
 import subprocess
@@ -9,12 +11,29 @@ import sys
 import tempfile
 
 words = {}
+jit = {}
 for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"jit code \+([0-9a-f]+):((?: [0-9a-f]{2})+)", line.strip())
+    if m:
+        for i, b in enumerate(m.group(2).split()):
+            jit[int(m.group(1), 16) + i] = int(b, 16)
     m = re.match(r"guest code ([0-9a-f]{8}): ((?:[0-9a-f]{8} ?){8})", line.strip())
     if m:
         base = int(m.group(1), 16)
         for i, w in enumerate(m.group(2).split()):
             words[base + 4 * i] = int(w, 16)
+if jit:
+    start = min(jit)
+    raw = bytes(jit.get(a, 0xCC) for a in range(start, max(jit) + 1))
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        f.write(raw)
+    subprocess.run(["llvm-objcopy-21", "-I", "binary", "-O", "elf64-x86-64", "--rename-section", ".data=.text,code", f.name, f.name + ".o"], check=True)
+    out = subprocess.run(["llvm-objdump-21", "-d", "--no-show-raw-insn", f.name + ".o"], capture_output=True, text=True).stdout
+    print("Recompiled x86 code (offsets in the function):")
+    for l in out.splitlines():
+        m = re.match(r"\s*([0-9a-f]+):(.*)", l)
+        if m:
+            print("  +%05x:%s" % (start + int(m.group(1), 16), m.group(2)))
 if not words:
     sys.exit()
 

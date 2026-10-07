@@ -29,7 +29,7 @@ index 644032c..9457f9a 100644
  if (MSVC)
  	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT CemuBin)
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index d8378c3..04af667 100644
+index d8378c3..a27c3df 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -12,6 +12,11 @@ endif()
@@ -44,7 +44,7 @@ index d8378c3..04af667 100644
  elseif(UNIX)
  	if(APPLE)
  		if (ENABLE_VULKAN)
-@@ -229,3 +234,16 @@ endif()
+@@ -229,3 +234,17 @@ endif()
  if (BSD)
  	target_link_libraries(CemuBin PRIVATE execinfo SPIRV-Tools SPIRV-Tools-opt)
  endif()
@@ -58,7 +58,8 @@ index d8378c3..04af667 100644
 +		ps4_link_mesa(CemuBin)
 +	endif()
 +	target_link_libraries(CemuBin PRIVATE
-+		CemuResource SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet)
++		CemuResource SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet
++		SceCommonDialog SceImeDialog)
 +	ps4_add_eboot(CemuBin)
 +endif()
 diff --git a/src/Cafe/CMakeLists.txt b/src/Cafe/CMakeLists.txt
@@ -210,6 +211,104 @@ index 935e61a..8dace29 100644
  		{
  			if(!g_CPUFeatures.x86.bmi2)
  			{
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
+index c9758f3..6542b19 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
+@@ -59,6 +59,83 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+ 
+ PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
+ 
++#ifdef __ORBIS__
++#include <unistd.h>
++// Crema: the newest recompiled functions' host code ranges, so a crash in recompiled code can be
++// traced back to the game's function (ps4_crash_jit_info, called by the port's crash handler
++// without locks). Written under recompilerSpinlock; a stale entry is only compared, never read.
++namespace
++{
++	struct CremaJitRange
++	{
++		std::atomic<uintptr_t> x86Start{0};
++		std::atomic<uint32> x86Size{0};
++		std::atomic<uint32> ppcStart{0};
++		std::atomic<uint32> ppcSize{0};
++	};
++	constexpr uint32 kCremaJitRanges = 1 << 15;
++	CremaJitRange s_cremaJitRanges[kCremaJitRanges];
++	std::atomic<uint32> s_cremaJitNext{0};
++
++	void CremaJitRecord(PPCRecFunction_t* func)
++	{
++		const uint32 slot = s_cremaJitNext.load(std::memory_order_relaxed) % kCremaJitRanges;
++		CremaJitRange& r = s_cremaJitRanges[slot];
++		r.x86Start.store(0, std::memory_order_relaxed);
++		r.x86Size.store((uint32)func->x86Size, std::memory_order_relaxed);
++		r.ppcStart.store(func->ppcAddress, std::memory_order_relaxed);
++		r.ppcSize.store(func->ppcSize, std::memory_order_relaxed);
++		r.x86Start.store((uintptr_t)func->x86Code, std::memory_order_release);
++		s_cremaJitNext.fetch_add(1, std::memory_order_release);
++	}
++}
++
++// crash.log: which recompiled function the host address is in, and that function's x86 code
++// around it and the game's code, to disassemble offline (scripts/guest-code.py)
++extern "C" void ps4_crash_jit_info(int fd, uint64 rip)
++{
++	char line[200];
++	auto out = [&](int n) {
++		if (n > 0)
++			write(fd, line, std::min<size_t>((size_t)n, sizeof(line) - 1));
++	};
++	const uint32 count = s_cremaJitNext.load(std::memory_order_acquire);
++	const uint32 total = std::min(count, kCremaJitRanges);
++	for (uint32 i = 0; i < total; i++)
++	{
++		const CremaJitRange& r = s_cremaJitRanges[(count - 1 - i) % kCremaJitRanges];
++		const uintptr_t start = r.x86Start.load(std::memory_order_acquire);
++		const uint32 size = r.x86Size.load(std::memory_order_relaxed);
++		if (start == 0 || rip < start || rip >= start + size)
++			continue;
++		const uint32 ppcStart = r.ppcStart.load(std::memory_order_relaxed);
++		const uint32 ppcSize = r.ppcSize.load(std::memory_order_relaxed);
++		const uint32 offset = (uint32)(rip - start);
++		out(snprintf(line, sizeof(line), "jit: host 0x%llx is +0x%x in the recompiled game function %08x-%08x (x86 size 0x%x)\n",
++			(unsigned long long)rip, offset, ppcStart, ppcStart + ppcSize, size));
++		// x86 code: up to 0x600 bytes before the fault and 0x100 after
++		const uint32 from = offset > 0x600 ? (offset - 0x600) & ~0xFu : 0;
++		const uint32 to = std::min<uint32>(size, offset + 0x100);
++		for (uint32 at = from; at < to; at += 32)
++		{
++			int n = snprintf(line, sizeof(line), "jit code +%05x:", at);
++			for (uint32 b = at; b < std::min<uint32>(to, at + 32); b++)
++				n += snprintf(line + n, sizeof(line) - n, " %02x", ((const uint8*)start)[b]);
++			n += snprintf(line + n, sizeof(line) - n, "\n");
++			out(n);
++		}
++		// the game's code of the whole function (up to 2 KiB)
++		const uint32 ppcEnd = ppcStart + std::min<uint32>(ppcSize, 0x800);
++		for (uint32 at = ppcStart & ~0x1Fu; at < ppcEnd; at += 0x20)
++			out(snprintf(line, sizeof(line), "guest code %08x: %08x %08x %08x %08x %08x %08x %08x %08x\n", at, memory_readU32(at),
++				memory_readU32(at + 4), memory_readU32(at + 8), memory_readU32(at + 12), memory_readU32(at + 16), memory_readU32(at + 20),
++				memory_readU32(at + 24), memory_readU32(at + 28)));
++		return;
++	}
++	out(snprintf(line, sizeof(line), "jit: host 0x%llx is not in a recompiled function (%u recorded)\n", (unsigned long long)rip, count));
++}
++#endif
++
+ #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
+ static std::mutex s_singleRecompilationMutex;
+ #endif
+@@ -419,6 +496,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+ 	{
+ 		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
+ 	}
++#ifdef __ORBIS__
++	CremaJitRecord(ppcRecFunc);
++#endif
+ 	s_ppcRecompilerState.recompilerSpinlock.unlock();
+ 	return true;
+ }
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..03ba035 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -1855,14 +1954,16 @@ index d66e971..49e209f 100644
  endif()
 diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
 new file mode 100644
-index 0000000..2b7c2bd
+index 0000000..fa9c78d
 --- /dev/null
 +++ b/src/gui/ps4/CMakeLists.txt
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,43 @@
 +add_library(CemuPS4Gui
 +	PS4WindowSystem.cpp
 +	CremaMii.cpp
 +	CremaMii.h
++	CremaOnline.cpp
++	CremaOnline.h
 +	PS4PauseMenu.cpp
 +	PS4PauseMenu.h
 +	launcher/CremaCovers.cpp
@@ -2744,6 +2845,411 @@ index 0000000..59a3de1
 +	// Whether the file is the current version of Crema's parts.
 +	bool IsCurrent(const std::vector<uint8>& data);
 +} // namespace CremaMii
+diff --git a/src/gui/ps4/CremaOnline.cpp b/src/gui/ps4/CremaOnline.cpp
+new file mode 100644
+index 0000000..62925e8
+--- /dev/null
++++ b/src/gui/ps4/CremaOnline.cpp
+@@ -0,0 +1,352 @@
++#include "gui/ps4/CremaOnline.h"
++
++#include "config/CemuConfig.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <vector>
++
++namespace CremaOnline
++{
++namespace
++{
++	namespace stdfs = std::filesystem;
++
++	const char* kCertsDir = "sys/title/0005001b/10054000/content";
++	const char* kActDir = "usr/save/system/act";
++	const char* kConsoleFiles[] = {"otp.bin", "seeprom.bin"};
++
++	const char* kReadmePretendo =
++		"Crema online: Pretendo Network (the public servers)\n"
++		"\n"
++		"Put your own Wii U's online files here (Dumpling dumps them on your Wii U):\n"
++		"  otp.bin\n"
++		"  seeprom.bin\n"
++		"  mlc01/sys/title/0005001b/10054000/content/ccerts/   (the console's certificates)\n"
++		"  mlc01/sys/title/0005001b/10054000/content/scerts/\n"
++		"  mlc01/usr/save/system/act/80000001/account.dat     (your account, linked to a Pretendo Network ID)\n"
++		"\n"
++		"Then in Crema: Settings > Online > Online: Pretendo.\n"
++		"When a game starts, Crema puts these files in place; with Online: Off (or the private\n"
++		"server) your other files come back.\n";
++
++	const char* kReadmePrivate =
++		"Crema online: Private Server (your own Pretendo server, for example pretendo-docker)\n"
++		"\n"
++		"Put the files for your server here, in the same layout as the Pretendo folder:\n"
++		"  otp.bin\n"
++		"  seeprom.bin\n"
++		"  mlc01/sys/title/0005001b/10054000/content/ccerts/\n"
++		"  mlc01/sys/title/0005001b/10054000/content/scerts/\n"
++		"  mlc01/usr/save/system/act/<account id>/account.dat  (an account made on your server)\n"
++		"\n"
++		"Then in Crema: Settings > Online > Online: Private Server, and Server Address: your\n"
++		"server's proxy, for example 192.168.0.10:8888. Crema sends its online requests through it.\n"
++		"When a game starts, Crema puts these files in place; with Online: Off (or Pretendo) your\n"
++		"other files come back.\n";
++
++	struct Paths
++	{
++		stdfs::path data;
++		stdfs::path mlc;
++	};
++
++	// what online/active.txt says is staged
++	struct State
++	{
++		std::string world = "off";
++		uint32 offlinePid = 0;          // the account selected before the world's
++		std::vector<std::string> files; // "data:otp.bin", "mlc:usr/save/..."
++	};
++
++	bool IsFile(const stdfs::path& path)
++	{
++		std::error_code ec;
++		return stdfs::is_regular_file(path, ec);
++	}
++
++	uintmax_t SizeOf(const stdfs::path& path)
++	{
++		std::error_code ec;
++		const uintmax_t size = stdfs::file_size(path, ec);
++		return ec ? 0 : size;
++	}
++
++	stdfs::file_time_type TimeOf(const stdfs::path& path)
++	{
++		std::error_code ec;
++		const auto time = stdfs::last_write_time(path, ec);
++		return ec ? stdfs::file_time_type::min() : time;
++	}
++
++	// Written next to the target and renamed over it.
++	bool CopyFile(const stdfs::path& from, const stdfs::path& to)
++	{
++		std::error_code ec;
++		stdfs::create_directories(to.parent_path(), ec);
++		FILE* in = fopen(from.c_str(), "rb");
++		if (!in)
++			return false;
++		const stdfs::path temp = to.string() + ".crema-new";
++		FILE* out = fopen(temp.c_str(), "wb");
++		if (!out)
++		{
++			fclose(in);
++			return false;
++		}
++		char buffer[16384];
++		bool ok = true;
++		size_t n;
++		while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0)
++		{
++			if (fwrite(buffer, 1, n, out) != n)
++			{
++				ok = false;
++				break;
++			}
++		}
++		if (ferror(in))
++			ok = false;
++		fclose(in);
++		if (fclose(out) != 0)
++			ok = false;
++		if (ok)
++			stdfs::rename(temp, to, ec);
++		if (!ok || ec)
++		{
++			stdfs::remove(temp, ec);
++			return false;
++		}
++		return true;
++	}
++
++	void CopyTree(const stdfs::path& from, const stdfs::path& to)
++	{
++		std::error_code ec;
++		for (auto it = stdfs::recursive_directory_iterator(from, ec); !ec && it != stdfs::recursive_directory_iterator(); it.increment(ec))
++		{
++			if (it->is_regular_file(ec))
++				CopyFile(it->path(), to / stdfs::relative(it->path(), from, ec));
++		}
++	}
++
++	stdfs::path WorldPath(const Paths& paths, const std::string& world)
++	{
++		return paths.data / "online" / world;
++	}
++
++	// an entry's file in place, in a world's folder, and its backup
++	stdfs::path Live(const Paths& paths, const std::string& entry)
++	{
++		return entry.rfind("data:", 0) == 0 ? paths.data / entry.substr(5) : paths.mlc / entry.substr(4);
++	}
++
++	stdfs::path InWorld(const Paths& paths, const std::string& world, const std::string& entry)
++	{
++		return entry.rfind("data:", 0) == 0 ? WorldPath(paths, world) / entry.substr(5) : WorldPath(paths, world) / "mlc01" / entry.substr(4);
++	}
++
++	stdfs::path Backup(const Paths& paths, const std::string& entry)
++	{
++		return paths.data / "online" / "backup" / (entry.rfind("data:", 0) == 0 ? "data" : "mlc") / entry.substr(entry.find(':') + 1);
++	}
++
++	std::vector<std::string> WorldEntries(const Paths& paths, const std::string& world)
++	{
++		std::vector<std::string> entries;
++		const stdfs::path folder = WorldPath(paths, world);
++		for (const char* name : kConsoleFiles)
++		{
++			if (IsFile(folder / name))
++				entries.push_back(std::string("data:") + name);
++		}
++		std::error_code ec;
++		const stdfs::path mlc = folder / "mlc01";
++		for (auto it = stdfs::recursive_directory_iterator(mlc, ec); !ec && it != stdfs::recursive_directory_iterator(); it.increment(ec))
++		{
++			const std::string name = it->path().filename().string();
++			if (!it->is_regular_file(ec) || (name.size() > 10 && name.compare(name.size() - 10, 10, ".crema-new") == 0))
++				continue;
++			entries.push_back("mlc:" + stdfs::relative(it->path(), mlc, ec).generic_string());
++		}
++		std::sort(entries.begin(), entries.end());
++		return entries;
++	}
++
++	State ReadState(const Paths& paths)
++	{
++		State state;
++		std::ifstream file(paths.data / "online" / "active.txt");
++		std::string line;
++		while (std::getline(file, line))
++		{
++			if (line.rfind("world=", 0) == 0)
++				state.world = line.substr(6);
++			else if (line.rfind("offline_pid=", 0) == 0)
++				state.offlinePid = (uint32)strtoul(line.c_str() + 12, nullptr, 16);
++			else if (line.rfind("file=", 0) == 0)
++				state.files.push_back(line.substr(5));
++		}
++		std::sort(state.files.begin(), state.files.end());
++		return state;
++	}
++
++	void WriteState(const Paths& paths, const State& state)
++	{
++		const stdfs::path path = paths.data / "online" / "active.txt";
++		{
++			std::ofstream file(path.string() + ".new", std::ios::trunc);
++			file << "# Crema: the online world whose files are in place (see README.txt in each folder)\n";
++			file << "world=" << state.world << "\n";
++			if (state.offlinePid)
++				file << "offline_pid=" << fmt::format("{:08x}", state.offlinePid) << "\n";
++			for (const std::string& entry : state.files)
++				file << "file=" << entry << "\n";
++		}
++		std::error_code ec;
++		stdfs::rename(path.string() + ".new", path, ec);
++	}
++} // namespace
++
++std::string WorldFolder(const std::string& dataDir, const std::string& world)
++{
++	return dataDir + "/online/" + world;
++}
++
++void CreateFolders(const std::string& dataDir, const std::string& mlcDir)
++{
++	const Paths paths{dataDir, mlcDir};
++	for (const char* world : {"pretendo", "private"})
++	{
++		const stdfs::path folder = WorldPath(paths, world);
++		std::error_code ec;
++		const bool fresh = !stdfs::exists(folder, ec);
++		stdfs::create_directories(folder / "mlc01", ec);
++		if (!IsFile(folder / "README.txt"))
++		{
++			std::ofstream readme(folder / "README.txt");
++			readme << (std::string(world) == "pretendo" ? kReadmePretendo : kReadmePrivate);
++		}
++		// Crema 1.36: the Wii U's files went straight into place, for Pretendo
++		if (fresh && std::string(world) == "pretendo" && !IsFile(paths.data / "online" / "active.txt"))
++		{
++			for (const char* name : kConsoleFiles)
++			{
++				if (IsFile(paths.data / name))
++					CopyFile(paths.data / name, folder / name);
++			}
++			for (const char* certs : {"ccerts", "scerts"})
++				CopyTree(paths.mlc / kCertsDir / certs, folder / "mlc01" / kCertsDir / certs);
++		}
++	}
++}
++
++Status Check(const std::string& dataDir, const std::string& world)
++{
++	Status status;
++	const stdfs::path folder = WorldFolder(dataDir, world);
++	status.otp = SizeOf(folder / "otp.bin") == 1024;
++	status.seeprom = SizeOf(folder / "seeprom.bin") == 512;
++	std::error_code ec;
++	status.certs = stdfs::exists(folder / "mlc01" / kCertsDir / "ccerts", ec);
++	std::vector<std::string> accounts;
++	for (auto it = stdfs::directory_iterator(folder / "mlc01" / kActDir, ec); !ec && it != stdfs::directory_iterator(); it.increment(ec))
++	{
++		const std::string name = it->path().filename().string();
++		if (name.size() == 8 && name.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos && IsFile(it->path() / "account.dat"))
++			accounts.push_back(name);
++	}
++	std::sort(accounts.begin(), accounts.end());
++	if (!accounts.empty())
++		status.account = accounts.front();
++	return status;
++}
++
++std::string Stage(const std::string& dataDir, const std::string& mlcDir, const std::string& requested)
++{
++	const Paths paths{dataDir, mlcDir};
++	const std::string world = requested == "pretendo" || requested == "private" ? requested : "off";
++	const State state = ReadState(paths);
++	const std::vector<std::string> wanted = world == "off" ? std::vector<std::string>() : WorldEntries(paths, world);
++	const auto stagedAt = TimeOf(paths.data / "online" / "active.txt");
++
++	// already in place, and the world's files not changed since
++	if (state.world == world)
++	{
++		bool same = state.files == wanted;
++		for (size_t i = 0; same && i < wanted.size(); i++)
++			same = IsFile(Live(paths, wanted[i])) && TimeOf(InWorld(paths, world, wanted[i])) <= stagedAt;
++		if (same)
++			return fmt::format("online: {}, {} files in place", world, wanted.size());
++	}
++
++	// the staged world's files go back to its folder if the game changed them (the account),
++	// and the files they replaced come back
++	int restored = 0;
++	if (state.world != "off")
++	{
++		for (const std::string& entry : state.files)
++		{
++			const stdfs::path live = Live(paths, entry);
++			const stdfs::path inWorld = InWorld(paths, state.world, entry);
++			const stdfs::path backup = Backup(paths, entry);
++			if (IsFile(live) && IsFile(inWorld) && TimeOf(live) > stagedAt && TimeOf(inWorld) <= stagedAt)
++				CopyFile(live, inWorld);
++			std::error_code ec;
++			if (IsFile(backup))
++			{
++				if (CopyFile(backup, live))
++					stdfs::remove(backup, ec);
++			}
++			else
++			{
++				stdfs::remove(live, ec);
++			}
++			restored++;
++		}
++		if (state.offlinePid)
++			GetConfig().account.m_persistent_id = state.offlinePid;
++	}
++
++	State next;
++	next.world = world;
++	int staged = 0;
++	std::string account;
++	if (world != "off")
++	{
++		next.offlinePid = GetConfig().account.m_persistent_id.GetValue();
++		for (const std::string& entry : wanted)
++		{
++			const stdfs::path live = Live(paths, entry);
++			if (IsFile(live))
++				CopyFile(live, Backup(paths, entry));
++			if (CopyFile(InWorld(paths, world, entry), live))
++			{
++				next.files.push_back(entry);
++				staged++;
++			}
++		}
++		account = Check(dataDir, world).account;
++		if (!account.empty())
++			GetConfig().account.m_persistent_id = (uint32)strtoul(account.c_str(), nullptr, 16);
++	}
++	GetConfigHandle().Save();
++	WriteState(paths, next);
++	return fmt::format("online: {} -> {}: {} files put back, {} staged{}", state.world, world, restored, staged,
++		account.empty() ? std::string() : ", account " + account);
++}
++
++std::string ProxyUrl(const std::string& address)
++{
++	const size_t first = address.find_first_not_of(" \t");
++	if (first == std::string::npos)
++		return {};
++	const std::string trimmed = address.substr(first, address.find_last_not_of(" \t") - first + 1);
++	if (trimmed.rfind("http://", 0) == 0 || trimmed.rfind("https://", 0) == 0)
++		return trimmed;
++	return "http://" + trimmed;
++}
++} // namespace CremaOnline
+diff --git a/src/gui/ps4/CremaOnline.h b/src/gui/ps4/CremaOnline.h
+new file mode 100644
+index 0000000..e00d2d5
+--- /dev/null
++++ b/src/gui/ps4/CremaOnline.h
+@@ -0,0 +1,41 @@
++// Crema's two online worlds: Pretendo Network's public servers, and a private server (your own
++// Pretendo server, e.g. pretendo-docker, reached through its proxy). Each world keeps its own
++// console and account files in /data/Crema/online/<world>/:
++//   otp.bin, seeprom.bin                                   -> /data/Crema
++//   mlc01/sys/title/0005001b/10054000/content/(ccerts, scerts), mlc01/usr/save/system/act/<id>/...
++//                                                          -> the mlc01 folder in use
++// At start (before Cemu reads them) the chosen world's files are put in place; the files they
++// replace are kept in online/backup and put back when the world changes (Online: Off restores the
++// offline files). online/active.txt lists what is staged.
++#pragma once
++
++#include <string>
++
++namespace CremaOnline
++{
++// "pretendo" / "private": the world folders' paths
++std::string WorldFolder(const std::string& dataDir, const std::string& world);
++
++// Creates online/pretendo and online/private with their README.txt. The first time, otp.bin,
++// seeprom.bin and the console certificates already in place (Crema 1.36's layout) are copied
++// into the Pretendo folder.
++void CreateFolders(const std::string& dataDir, const std::string& mlcDir);
++
++// What a world folder has
++struct Status
++{
++	bool otp = false;     // otp.bin, 1024 bytes
++	bool seeprom = false; // seeprom.bin, 512 bytes
++	bool certs = false;   // mlc01/sys/title/0005001b/10054000/content/ccerts
++	std::string account;  // the account's persistent ID (mlc01/usr/save/system/act/<id>/account.dat)
++	int Missing() const { return !otp + !seeprom + !certs + account.empty(); }
++};
++Status Check(const std::string& dataDir, const std::string& world);
++
++// Game process, before Cemu reads the console files and accounts: puts the world's files in place
++// ("off": the offline ones) and selects its account. Returns a line for the boot trace.
++std::string Stage(const std::string& dataDir, const std::string& mlcDir, const std::string& world);
++
++// The proxy for the private server's address ("192.168.0.10:8888" -> "http://192.168.0.10:8888")
++std::string ProxyUrl(const std::string& address);
++} // namespace CremaOnline
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
 index 0000000..45bbb1f
@@ -3693,10 +4199,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..778221a
+index 0000000..64942d5
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,751 @@
+@@ -0,0 +1,770 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -3724,6 +4230,7 @@ index 0000000..778221a
 +#include "util/helpers/helpers.h"
 +
 +#include "gui/ps4/CremaMii.h"
++#include "gui/ps4/CremaOnline.h"
 +#include "gui/ps4/PS4PauseMenu.h"
 +#include "gui/ps4/launcher/CremaSettings.h"
 +#include "gui/ps4/launcher/Launcher.h"
@@ -4203,6 +4710,11 @@ index 0000000..778221a
 +			GetConfig().graphic_api = GraphicAPI::kVulkan;
 +			GetConfigHandle().Save();
 +		}
++		// the online world's console files and account in place before Cemu reads them
++		// (CremaOnline.h): Pretendo's, the private server's, or the offline ones
++		CremaSettings::Load(_pathToUtf8(kDataRoot));
++		CremaOnline::CreateFolders(_pathToUtf8(kDataRoot), _pathToUtf8(ActiveSettings::GetMlcPath()));
++		Trace(CremaOnline::Stage(_pathToUtf8(kDataRoot), _pathToUtf8(ActiveSettings::GetMlcPath()), CremaSettings::Get("online")));
 +		if (!CreateDefaultMLCFiles(ActiveSettings::GetMlcPath()))
 +			Trace(fmt::format("cannot create the mlc folders in {}", _pathToUtf8(ActiveSettings::GetMlcPath())));
 +		ActiveSettings::Init();
@@ -4232,6 +4744,16 @@ index 0000000..778221a
 +		}
 +		PS4PauseMenu::SetupPlayers(); // players 2-4 (local multiplayer)
 +		CremaSettings::Load(_pathToUtf8(kDataRoot));
++		// the private server: Cemu's online requests go through its proxy (pretendo-docker's
++		// mitmproxy sends Pretendo's names to the server); Cemu's config was loaded again above
++		const std::string onlineWorld = CremaSettings::Get("online");
++		GetConfig().proxy_server = onlineWorld == "private" ? CremaOnline::ProxyUrl(CremaSettings::Get("online_server")) : std::string();
++		if (!GetConfig().proxy_server.GetValue().empty())
++		{
++			// and the games' own web requests (nlibcurl: libcurl reads these when a request has no proxy)
++			setenv("http_proxy", GetConfig().proxy_server.GetValue().c_str(), 1);
++			setenv("https_proxy", GetConfig().proxy_server.GetValue().c_str(), 1);
++		}
 +
 +		sWindowInfo.app_active = true;
 +		sWindowInfo.width = sWindowInfo.phys_width = kWidth;
@@ -4261,12 +4783,15 @@ index 0000000..778221a
 +		const std::string gameId = titleId ? fmt::format("{:016x}", titleId) : std::string();
 +		CremaSettings::Apply(gameId);
 +		SetupMiiResources(ActiveSettings::GetMlcPath(), CremaSettings::Get("mii_data", gameId) != "off");
-+		if (CremaSettings::Get("online", gameId) == "pretendo")
++		if (onlineWorld != "off")
 +		{
-+			// what online play needs from the user's own Wii U (Dumpling's online files)
++			// what online play needs: the world's console files and account (CremaOnline.h)
 +			std::error_code ec;
 +			const bool account = Account::GetAccount(ActiveSettings::GetPersistentId()).IsValidOnlineAccount();
-+			Trace(fmt::format("online: Pretendo; otp.bin {}, seeprom.bin {}, certificates and keys {}, account {}: {}",
++			Trace(fmt::format("online: {}{}; account {:08x}; otp.bin {}, seeprom.bin {}, certificates and keys {}, account {}: {}",
++				onlineWorld == "private" ? "private server" : "Pretendo",
++				onlineWorld == "private" ? fmt::format(" through {}", GetConfig().proxy_server.GetValue().empty() ? std::string("(no Server Address)") : GetConfig().proxy_server.GetValue()) : std::string(),
++				ActiveSettings::GetPersistentId(),
 +				fs::exists(kDataRoot / "otp.bin", ec) ? "found" : "missing", fs::exists(kDataRoot / "seeprom.bin", ec) ? "found" : "missing",
 +				ActiveSettings::HasRequiredOnlineFiles() ? "ok" : "missing", account ? "linked" : "not an online account",
 +				ActiveSettings::IsOnlineEnabled() ? "online" : "offline"));
@@ -4709,10 +5234,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..74ab332
+index 0000000..a4d7f0c
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,381 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -4788,8 +5313,8 @@ index 0000000..74ab332
 +		{"motion", "Motion Controls", "Controls", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"The DualShock 4's motion sensors move the GamePad: tilt and turn it."},
 +		// Online
-+		{"online", "Online", "Online", {{"off", "Off"}, {"pretendo", "Pretendo"}}, "off", false,
-+			"Pretendo Network, for online play. Needs your Wii U's own online files: otp.bin and seeprom.bin in /data/Crema, your account (with a Pretendo account) and the console's certificates in mlc01. Dump them with Dumpling."},
++		{"online", "Online", "Online", {{"off", "Off"}, {"pretendo", "Pretendo"}, {"private", "Private Server"}}, "off", false,
++			"Pretendo: Pretendo Network's public servers, with your own Wii U's files (Dumpling) in /data/Crema/online/pretendo. Private Server: your own Pretendo server (pretendo-docker) at the Server Address, with its files in /data/Crema/online/private. Off: your offline files come back. For all consoles and games."},
 +		// Diagnostics
 +		{"perf_log", "Performance Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every 5 s, the GPU's and each thread's load in log.txt (what limits the frame rate)."},
@@ -5052,8 +5577,9 @@ index 0000000..74ab332
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("fast_shifts") != "off";
-+	// the online service of the account in use (Cemu: per account): Pretendo, or none
-+	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), get("online") == "pretendo" ? NetworkService::Pretendo : NetworkService::Offline);
++	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
++	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
++	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
 +	const std::string upscale = get("upscale_filter");
 +	config.upscale_filter = upscale == "linear" ? kLinearFilter : upscale == "hermite" ? kBicubicHermiteFilter :
 +		upscale == "nearest" ? kNearestNeighborFilter : kBicubicFilter;
@@ -5162,10 +5688,10 @@ index 0000000..2743734
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..f056b35
+index 0000000..04ca525
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3007 @@
+@@ -0,0 +1,3126 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -5174,6 +5700,7 @@ index 0000000..f056b35
 +#include "gui/ps4/launcher/Launcher.h"
 +
 +#include "gui/ps4/launcher/CremaCovers.h"
++#include "gui/ps4/CremaOnline.h"
 +#include "gui/ps4/launcher/CremaSettings.h"
 +#include "gui/ps4/launcher/LauncherDisplay.h"
 +#include "gui/ps4/launcher/PS4Glyphs.h"
@@ -5197,6 +5724,9 @@ index 0000000..f056b35
 +#include <thread>
 +
 +#include <orbis/AudioOut.h>
++#include <orbis/CommonDialog.h>
++#include <orbis/ImeDialog.h>
++#include <orbis/Sysmodule.h>
 +#include <orbis/Pad.h>
 +#include <orbis/SystemService.h>
 +#include <orbis/UserService.h>
@@ -5922,6 +6452,7 @@ index 0000000..f056b35
 +		bool header = false; // category title
 +		bool scope = false;  // "Apply To: All Games / This Game" (game settings)
 +		bool note = false;   // takes effect at the next game start
++		std::string help;    // rows that aren't settings (the online worlds' files)
 +	};
 +
 +	// A PSP-style panel on the right: options to pick from, information text, or a settings list.
@@ -5965,6 +6496,9 @@ index 0000000..f056b35
 +		void OpenSettingPanel(int setting);
 +		void ApplySettingOption(int setting, int option);
 +		void OpenSettingsList(const std::string& category, const std::string& gameId);
++		void AddOnlineRows(std::vector<SettingRow>& rows);
++		void OpenKeyboard(const std::string& title, const std::string& text);
++		void UpdateKeyboard();
 +		std::string GamesFolder() const { return m_prefs.gamesDir.empty() ? m_dataDir + "/games" : m_prefs.gamesDir; }
 +		void RefreshGames();
 +		void OpenFolderBrowser(const std::string& path);
@@ -6010,6 +6544,9 @@ index 0000000..f056b35
 +		}
 +
 +		std::string m_dataDir, m_assetsDir, m_version;
++		int m_user = 0;                          // the user who started Crema (the keyboard's owner)
++		bool m_keyboard = false;                 // the PS4 keyboard is open (Server Address)
++		std::u16string m_keyboardText;           // its text (UTF-16)
 +		Preferences m_prefs;
 +		std::vector<Game> m_games;
 +		std::vector<std::string> m_wallpapers;
@@ -6581,16 +7118,104 @@ index 0000000..f056b35
 +			{
 +				if (std::string(setting.category) != category)
 +					continue;
-+				// the menus' language is per console, not per game
-+				if (!game.empty() && std::string(setting.key) == "language")
++				// the menus' language and the online world are per console, not per game
++				if (!game.empty() && (std::string(setting.key) == "language" || std::string(setting.key) == "online"))
 +					continue;
 +				rows.push_back({setting.label, CremaSettings::LabelOf(setting, CremaSettings::Get(setting.key, game)),
 +					setting.key, false, false, !setting.live});
++				if (game.empty() && std::string(setting.key) == "online")
++					AddOnlineRows(rows);
 +			}
 +		}
 +		rows.push_back({"", "", "", true});
 +		rows.push_back({game.empty() ? "Reset to Defaults" : "Reset This Game", "", "__reset__"});
 +		m_panel.rows = std::move(rows);
++	}
++
++	// Settings > Online, under "Online": the private server's address, and what each world's
++	// folder has (CremaOnline.h; Cross looks again).
++	void Menu::AddOnlineRows(std::vector<SettingRow>& rows)
++	{
++		const std::string server = CremaSettings::Get("online_server");
++		SettingRow address{"Server Address", server.empty() ? "Not Set" : server, "__server__"};
++		address.help = "Your private server's proxy: address and port, for example 192.168.0.10:8888 (pretendo-docker). Cross: type it. Used with Online: Private Server.";
++		rows.push_back(address);
++		const std::pair<const char*, const char*> worlds[] = {{"pretendo", "Pretendo Files"}, {"private", "Private Server Files"}};
++		for (const auto& [world, label] : worlds)
++		{
++			const CremaOnline::Status status = CremaOnline::Check(m_dataDir, world);
++			const int missing = status.Missing();
++			SettingRow row{label, missing == 0 ? "Ready" : fmt::format("{} Missing", missing), std::string("__files__") + world};
++			auto item = [](bool found) { return found ? "found" : "missing"; };
++			row.help = fmt::format("{}: otp.bin {}, seeprom.bin {}, certificates {}, account {}. README.txt there lists the files. Cross: look again.",
++				CremaOnline::WorldFolder(m_dataDir, world), item(status.otp), item(status.seeprom), item(status.certs),
++				status.account.empty() ? std::string("missing") : status.account);
++			row.note = missing != 0;
++			rows.push_back(row);
++		}
++	}
++
++	// The PS4's keyboard over the menu; UpdateKeyboard (every frame) takes its text when it closes.
++	void Menu::OpenKeyboard(const std::string& title, const std::string& text)
++	{
++		static bool s_loaded = false;
++		if (!s_loaded)
++		{
++			sceSysmoduleLoadModule(ORBIS_SYSMODULE_IME_DIALOG);
++			sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_COMMON_DIALOG);
++			sceCommonDialogInitialize();
++			s_loaded = true;
++		}
++		// the dialog works in UTF-16 (the PS4's wchar_t); the text buffer must outlive it
++		static char16_t s_title[64];
++		m_keyboardText.assign(text.begin(), text.end());
++		m_keyboardText.resize(128, u'\0');
++		size_t i = 0;
++		for (; i + 1 < std::size(s_title) && i < title.size(); i++)
++			s_title[i] = (char16_t)(unsigned char)title[i];
++		s_title[i] = u'\0';
++		OrbisImeDialogSetting setting = {};
++		setting.userId = (uint32_t)m_user;
++		setting.type = ORBIS_TYPE_TYPE_URL;
++		setting.enterLabel = ORBIS_BUTTON_LABEL_DEFAULT;
++		setting.maxTextLength = 120;
++		setting.inputTextBuffer = reinterpret_cast<wchar_t*>(m_keyboardText.data());
++		setting.posx = 1920.0f / 2;
++		setting.posy = 1080.0f / 2;
++		setting.horizontalAlignment = ORBIS_H_CENTER;
++		setting.verticalAlignment = ORBIS_V_CENTER;
++		setting.title = reinterpret_cast<const wchar_t*>(s_title);
++		const int result = sceImeDialogInit(&setting, nullptr);
++		Log(fmt::format("keyboard: open {:#x}", (unsigned)result));
++		m_keyboard = result >= 0;
++	}
++
++	void Menu::UpdateKeyboard()
++	{
++		if (!m_keyboard)
++			return;
++		const OrbisDialogStatus status = sceImeDialogGetStatus();
++		if (status == ORBIS_DIALOG_STATUS_RUNNING)
++			return;
++		OrbisDialogResult result = {};
++		if (status == ORBIS_DIALOG_STATUS_STOPPED)
++			sceImeDialogGetResult(&result);
++		sceImeDialogTerm();
++		m_keyboard = false;
++		if (status != ORBIS_DIALOG_STATUS_STOPPED || result.endstatus != ORBIS_DIALOG_OK)
++			return;
++		// the address is ASCII
++		std::string text;
++		for (char16_t c : m_keyboardText)
++		{
++			if (c == u'\0')
++				break;
++			if (c > u' ' && c < 0x7F)
++				text += (char)c;
++		}
++		CremaSettings::Set("online_server", text);
++		BuildSettingRows();
++		Play("confirm");
 +	}
 +
 +	// Moves the selection by direction (0: onto the nearest selectable row), skipping headers.
@@ -6627,6 +7252,17 @@ index 0000000..f056b35
 +				RefreshGames();
 +				Play("confirm");
 +			}
++			return;
++		}
++		if (row.key == "__server__")
++		{
++			if (direction > 0)
++				OpenKeyboard("Server Address", CremaSettings::Get("online_server"));
++			return;
++		}
++		if (row.key.rfind("__files__", 0) == 0)
++		{
++			BuildSettingRows(); // looks at the folders again
 +			return;
 +		}
 +		if (row.scope)
@@ -7355,6 +7991,8 @@ index 0000000..f056b35
 +					help = "Cross: look for games in this folder.";
 +				else if (row.scope)
 +					help = "All Games: this game follows the global settings. This Game: its own.";
++				else if (!row.help.empty())
++					help = row.help;
 +				else if (const CremaSettings::Setting* setting = CremaSettings::Find(row.key))
 +					help = std::string(setting->help) + (setting->live ? "" : " (Next game start.)");
 +				const std::string wrapped = WrapText(m_font, 25, PS4Lang::T(help), width - 100);
@@ -8013,6 +8651,7 @@ index 0000000..f056b35
 +		int user = 0;
 +		sceUserServiceInitialize(nullptr);
 +		sceUserServiceGetInitialUser(&user);
++		m_user = user;
 +
 +		IMGUI_CHECKVERSION();
 +		ImGuiContext* context = ImGui::CreateContext();
@@ -8128,6 +8767,12 @@ index 0000000..f056b35
 +				// Any button: straight to the dissolve.
 +				if (m_input.Poll(dt) != 0)
 +					m_introTime = std::max(m_introTime, 2.6f);
++			}
++			else if (m_keyboard)
++			{
++				// the PS4's keyboard has the controller
++				m_input.Poll(dt);
++				UpdateKeyboard();
 +			}
 +			else
 +			{
