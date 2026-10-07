@@ -3296,10 +3296,10 @@ index 0000000..e00d2d5
 +} // namespace CremaOnline
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 0000000..45bbb1f
+index 0000000..d45f6c5
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,1059 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -3322,6 +3322,7 @@ index 0000000..45bbb1f
 +#include "gui/ps4/launcher/PS4Glyphs.h"
 +
 +#include <imgui.h>
++#include <atomic>
 +
 +#include <orbis/Pad.h>
 +
@@ -3336,6 +3337,7 @@ index 0000000..45bbb1f
 +extern void (*g_crema_overlay)(sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight);
 +extern std::shared_mutex g_audioMutex;
 +extern AudioAPIPtr g_padAudio;
++extern std::atomic<uint32> g_crema_blow_buttons[4]; // input/emulated/VPADController.cpp: the blow combination
 +
 +namespace PS4PauseMenu
 +{
@@ -3457,6 +3459,63 @@ index 0000000..45bbb1f
 +		{"D-Pad", kButton11, kButton12, kButton13, kButton14},
 +	};
 +
++	// The GamePad microphone's blow (Captain Toad, ...) on two or more DualShock 4 controls held
++	// together (VPADController.cpp); crema.ini blow_combo: the controls' ids joined by '+', or off.
++	// Default: L2 + R2.
++	constexpr uint32 kBlowNone = 0xFFFFFFFF;
++	const std::vector<uint32> kBlowDefault = {(uint32)kTriggerXP, (uint32)kTriggerYP};
++
++	std::vector<uint32> BlowCombo()
++	{
++		std::vector<uint32> combo;
++		for (auto& button : g_crema_blow_buttons)
++		{
++			const uint32 value = button.load();
++			if (value != kBlowNone)
++				combo.push_back(value);
++		}
++		return combo;
++	}
++
++	void UseBlowCombo(const std::vector<uint32>& combo)
++	{
++		for (size_t i = 0; i < std::size(g_crema_blow_buttons); i++)
++			g_crema_blow_buttons[i].store(i < combo.size() && combo.size() >= 2 ? combo[i] : kBlowNone);
++	}
++
++	void SetBlowCombo(const std::vector<uint32>& combo)
++	{
++		UseBlowCombo(combo);
++		std::string text;
++		for (uint32 button : BlowCombo())
++			text += (text.empty() ? "" : "+") + std::to_string(button);
++		CremaSettings::Set("blow_combo", text.empty() ? "off" : text);
++		ps4_boot_trace(fmt::format("in-game menu: blow on {}", text.empty() ? "nothing" : text).c_str());
++	}
++
++	void LoadBlowCombo()
++	{
++		const std::string text = CremaSettings::Get("blow_combo");
++		if (text.empty())
++		{
++			UseBlowCombo(kBlowDefault);
++			return;
++		}
++		std::vector<uint32> combo;
++		size_t start = 0;
++		while (start < text.size() && combo.size() < std::size(g_crema_blow_buttons))
++		{
++			const size_t end = text.find('+', start);
++			const std::string part = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
++			if (!part.empty() && part.find_first_not_of("0123456789") == std::string::npos)
++				combo.push_back((uint32)std::stoul(part));
++			if (end == std::string::npos)
++				break;
++			start = end + 1;
++		}
++		UseBlowCombo(combo); // "off" or fewer than two: none
++	}
++
 +	struct Binding
 +	{
 +		const char* label;
@@ -3537,6 +3596,7 @@ index 0000000..45bbb1f
 +		CTL_KIND,
 +		CTL_SCOPE,
 +		CTL_BINDING,
++		CTL_BLOW, // the GamePad's microphone (player 1)
 +		CTL_RESET,
 +	};
 +	struct ControlRow
@@ -3552,6 +3612,9 @@ index 0000000..45bbb1f
 +	bool sCapture = false, sCaptureReleased = false;
 +	double sCaptureStart = 0.0;
 +	int sCaptureBinding = 0;
++	bool sCaptureBlow = false;          // the capture is for the blow combination
++	std::vector<uint64> sBlowPressed;   // the controls held during it
++	double sBlowMessageUntil = 0.0;     // "two or more" shown until
 +
 +	EmulatedControllerPtr PlayerController(int player)
 +	{
@@ -3609,6 +3672,8 @@ index 0000000..45bbb1f
 +		const int count = (int)BindingsOf(KindOf(PlayerController(sPlayer))).size();
 +		for (int i = 0; i < count; i++)
 +			rows.push_back({CTL_BINDING, i});
++		if (KindOf(PlayerController(sPlayer)) == KIND_GAMEPAD)
++			rows.push_back({CTL_BLOW, 0});
 +		rows.push_back({CTL_RESET, 0});
 +		return rows;
 +	}
@@ -3712,6 +3777,8 @@ index 0000000..45bbb1f
 +		controller->clear_mappings();
 +		controller->set_default_mapping(pad);
 +		SaveLayout(player);
++		if (KindOf(controller) == KIND_GAMEPAD)
++			SetBlowCombo(kBlowDefault);
 +	}
 +
 +	void SetStick(int player, int binding, int direction)
@@ -3748,12 +3815,14 @@ index 0000000..45bbb1f
 +			   centred(now.leftStick.y) && centred(now.rightStick.x) && centred(now.rightStick.y);
 +	}
 +
-+	std::optional<uint64> Capture(const OrbisPadData& now)
++	// every control in use (Capture: the first)
++	std::vector<uint64> CaptureAll(const OrbisPadData& now)
 +	{
++		std::vector<uint64> held;
 +		if ((now.buttons & ORBIS_PAD_BUTTON_L2) || now.analogButtons.l2 > 180)
-+			return kTriggerXP;
++			held.push_back(kTriggerXP);
 +		if ((now.buttons & ORBIS_PAD_BUTTON_R2) || now.analogButtons.r2 > 180)
-+			return kTriggerYP;
++			held.push_back(kTriggerYP);
 +		const std::pair<uint32, uint64> buttons[] = {
 +			{ORBIS_PAD_BUTTON_CROSS, kButton0}, {ORBIS_PAD_BUTTON_CIRCLE, kButton1}, {ORBIS_PAD_BUTTON_SQUARE, kButton2},
 +			{ORBIS_PAD_BUTTON_TRIANGLE, kButton3}, {ORBIS_PAD_BUTTON_L1, kButton9}, {ORBIS_PAD_BUTTON_R1, kButton10},
@@ -3762,26 +3831,34 @@ index 0000000..45bbb1f
 +			{ORBIS_PAD_BUTTON_RIGHT, kButton14}};
 +		for (const auto& [bit, button] : buttons)
 +			if (now.buttons & bit)
-+				return button;
++				held.push_back(button);
 +		if (now.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) // the touchpad's left or right half
-+			return now.touch.fingers > 0 && now.touch.touch[0].x >= 960 ? kButton5 : kButton4;
++			held.push_back(now.touch.fingers > 0 && now.touch.touch[0].x >= 960 ? kButton5 : kButton4);
 +		if (now.leftStick.x < 40)
-+			return kAxisXN;
++			held.push_back(kAxisXN);
 +		if (now.leftStick.x > 215)
-+			return kAxisXP;
++			held.push_back(kAxisXP);
 +		if (now.leftStick.y < 40)
-+			return kAxisYN;
++			held.push_back(kAxisYN);
 +		if (now.leftStick.y > 215)
-+			return kAxisYP;
++			held.push_back(kAxisYP);
 +		if (now.rightStick.x < 40)
-+			return kRotationXN;
++			held.push_back(kRotationXN);
 +		if (now.rightStick.x > 215)
-+			return kRotationXP;
++			held.push_back(kRotationXP);
 +		if (now.rightStick.y < 40)
-+			return kRotationYN;
++			held.push_back(kRotationYN);
 +		if (now.rightStick.y > 215)
-+			return kRotationYP;
-+		return std::nullopt;
++			held.push_back(kRotationYP);
++		return held;
++	}
++
++	std::optional<uint64> Capture(const OrbisPadData& now)
++	{
++		const auto held = CaptureAll(now);
++		if (held.empty())
++			return std::nullopt;
++		return held.front();
 +	}
 +
 +	// A capture in progress: waits until the pad is at rest, then takes the next press (5 s
@@ -3795,6 +3872,35 @@ index 0000000..45bbb1f
 +		if (!sCaptureReleased)
 +		{
 +			sCaptureReleased = IsAtRest(data);
++			return true;
++		}
++		if (sCaptureBlow)
++		{
++			// the controls held together, taken when all are let go: two or more
++			for (uint64 button : CaptureAll(data))
++				if (std::find(sBlowPressed.begin(), sBlowPressed.end(), button) == sBlowPressed.end())
++					sBlowPressed.push_back(button);
++			if (sBlowPressed.empty())
++			{
++				if (now - sCaptureStart > 5.0)
++					sCapture = false;
++				return true;
++			}
++			if (!IsAtRest(data))
++				return true;
++			if (sBlowPressed.size() >= 2)
++			{
++				std::vector<uint32> combo;
++				for (uint64 button : sBlowPressed)
++					if (combo.size() < std::size(g_crema_blow_buttons))
++						combo.push_back((uint32)button);
++				SetBlowCombo(combo);
++			}
++			else
++			{
++				sBlowMessageUntil = now + 3.0;
++			}
++			sCapture = false;
 +			return true;
 +		}
 +		if (now - sCaptureStart > 5.0)
@@ -3956,10 +4062,22 @@ index 0000000..45bbb1f
 +			else if (row.kind == CTL_BINDING && (pressed & B_CROSS))
 +			{
 +				sCapture = true;
++				sCaptureBlow = false;
 +				sCaptureReleased = false;
 +				sCaptureStart = now;
 +				sCaptureBinding = row.binding;
 +			}
++			else if (row.kind == CTL_BLOW && (pressed & B_CROSS))
++			{
++				sCapture = true;
++				sCaptureBlow = true;
++				sBlowPressed.clear();
++				sBlowMessageUntil = 0.0;
++				sCaptureReleased = false;
++				sCaptureStart = now;
++			}
++			else if (row.kind == CTL_BLOW)
++				SetBlowCombo(BlowCombo().empty() ? kBlowDefault : std::vector<uint32>()); // Left/Right: off, or L2 + R2
 +			// a new player or controller type has other rows
 +			sControlsSelected = std::clamp(sControlsSelected, 0, (int)ControlRows().size() - 1);
 +		}
@@ -3999,7 +4117,7 @@ index 0000000..45bbb1f
 +			if (sel)
 +				dl->AddRectFilled(ImVec2(x0 + 30, y - 4), ImVec2(W - 30, y + 46), Rgba(ACCENT, 0.30f * a), 10.0f);
 +			const char* label = row.kind == CTL_PLAYER ? "Player" : row.kind == CTL_KIND ? "Controller" : row.kind == CTL_SCOPE ? "Apply To" :
-+				row.kind == CTL_RESET ? "Reset to Default" : bindings[row.binding].label;
++				row.kind == CTL_RESET ? "Reset to Default" : row.kind == CTL_BLOW ? "Blow (Mic)" : bindings[row.binding].label;
 +			dl->AddText(font, 30.0f, ImVec2(x0 + 60, y + 4), Rgba(TEXT, a), label);
 +			std::string glyph, value;
 +			uint32 colour = TEXT;
@@ -4013,10 +4131,28 @@ index 0000000..45bbb1f
 +				value = kKindNames[kind];
 +			else if (row.kind == CTL_SCOPE)
 +				value = HasGameLayout(sPlayer) ? "This Game" : "All Games";
-+			else if (row.kind == CTL_BINDING && sCapture && row.binding == sCaptureBinding)
++			else if (row.kind == CTL_BINDING && sCapture && !sCaptureBlow && row.binding == sCaptureBinding)
 +			{
 +				value = "Press a button...";
 +				colour = ACCENT;
++			}
++			else if (row.kind == CTL_BLOW && sCapture && sCaptureBlow)
++			{
++				value = "Hold them together...";
++				colour = ACCENT;
++			}
++			else if (row.kind == CTL_BLOW)
++			{
++				for (uint32 button : BlowCombo())
++				{
++					const char* text = "?";
++					for (const PadInput& input : kPadInputs)
++						if (input.button == button)
++							text = input.text;
++					value += (value.empty() ? "" : " + ") + std::string(text);
++				}
++				if (value.empty())
++					value = "Off";
 +			}
 +			else if (row.kind == CTL_BINDING && controller && bindings[row.binding].stickGroup)
 +			{
@@ -4043,8 +4179,14 @@ index 0000000..45bbb1f
 +		dl->PopClipRect();
 +		const ControlRow& row = rows[std::clamp(sControlsSelected, 0, (int)rows.size() - 1)];
 +		std::string help;
-+		if (sCapture)
++		if (sCapture && sCaptureBlow)
++			help = "Hold two or more DualShock 4 buttons together, then let go.  (5 s: cancel)";
++		else if (sCapture)
 +			help = std::string("Press the DualShock 4 button for ") + bindings[sCaptureBinding].label + "...  (5 s: cancel)";
++		else if (row.kind == CTL_BLOW && Now() < sBlowMessageUntil)
++			help = "Blowing needs two or more buttons held together: nothing changed.";
++		else if (row.kind == CTL_BLOW)
++			help = "Blowing into the GamePad's microphone while these are held together (their own actions wait). Cross: new buttons. Left/Right: Off / L2 + R2.";
 +		else if (row.kind == CTL_PLAYER)
 +			help = "Left/Right: the player to set up. Players 2-4: a second PS4 user signs in with their DualShock 4.";
 +		else if (row.kind == CTL_KIND)
@@ -4188,6 +4330,7 @@ index 0000000..45bbb1f
 +void LoadGameControls(const std::string& gameId)
 +{
 +	sGameId = gameId;
++	LoadBlowCombo();
 +	for (int player = 0; player < kPlayers; player++)
 +	{
 +		if (HasGameLayout(player) && InputManager::instance().load(player, GameLayoutName(player)))
@@ -10573,10 +10716,81 @@ index bb584c1..74ea432 100644
  	case InputAPI::XInput:
  	{
 diff --git a/src/input/emulated/VPADController.cpp b/src/input/emulated/VPADController.cpp
-index a791c5f..51ae4f5 100644
+index a791c5f..8b92f4e 100644
 --- a/src/input/emulated/VPADController.cpp
 +++ b/src/input/emulated/VPADController.cpp
-@@ -637,6 +637,47 @@ bool VPADController::set_default_mapping(const std::shared_ptr<ControllerBase>&
+@@ -8,6 +8,16 @@
+ #include "Cafe/HW/Latte/Core/Latte.h"
+ #include "Cafe/CafeSystem.h"
+ 
++#ifdef __ORBIS__
++#include <algorithm>
++#include <atomic>
++// Crema: the GamePad microphone's blow on a combination of the DualShock 4's controls (two or
++// more; PS4PauseMenu's Controls page): while all of them are held the game hears a blow, and their
++// own mappings are held back. Unused entries: kCremaBlowNone.
++constexpr uint32 kCremaBlowNone = 0xFFFFFFFF;
++std::atomic<uint32> g_crema_blow_buttons[4] = {kCremaBlowNone, kCremaBlowNone, kCremaBlowNone, kCremaBlowNone};
++#endif
++
+ enum ControllerVPADMapping2 : uint32
+ {
+ 	VPAD_A = 0x8000,
+@@ -51,6 +61,42 @@ void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
+ 	controllers_update_states();
+ 	m_mic_active = false;
+ 	m_screen_active = false;
++#ifdef __ORBIS__
++	uint32 blowButtons[4];
++	int blowCount = 0;
++	for (auto& button : g_crema_blow_buttons)
++	{
++		const uint32 value = button.load(std::memory_order_relaxed);
++		if (value != kCremaBlowNone)
++			blowButtons[blowCount++] = value;
++	}
++	std::shared_ptr<ControllerBase> blowPad;
++	bool blow = false;
++	if (blowCount >= 2)
++	{
++		for (const auto& controller : get_controllers())
++		{
++			if (controller->api() == InputAPI::PS4Pad)
++			{
++				blowPad = controller;
++				break;
++			}
++		}
++		blow = blowPad != nullptr;
++		for (int b = 0; blow && b < blowCount; b++)
++			blow = blowPad->get_state().buttons.GetButtonState(blowButtons[b]);
++	}
++	// a mapping on one of the combination's controls, while the combination is held
++	auto heldBack = [&](uint32 mapping) {
++		std::shared_lock lock(m_mutex);
++		const auto it = m_mappings.find(mapping);
++		if (it == m_mappings.cend() || it->second.controller.lock() != blowPad)
++			return false;
++		return std::find(blowButtons, blowButtons + blowCount, (uint32)it->second.button) != blowButtons + blowCount;
++	};
++	if (blow)
++		m_mic_active = true;
++#endif
+ 	for (uint32 i = kButtonId_A; i < kButtonId_Max; ++i)
+ 	{
+ 		// axis will be aplied later
+@@ -59,6 +105,10 @@ void VPADController::VPADRead(VPADStatus_t& status, const BtnRepeat& repeat)
+ 
+ 		if (is_mapping_down(i))
+ 		{
++#ifdef __ORBIS__
++			if (blow && heldBack(i))
++				continue;
++#endif
+ 			const uint32 value = get_emulated_button_flag(i);
+ 			if (value == 0)
+ 			{
+@@ -637,6 +687,47 @@ bool VPADController::set_default_mapping(const std::shared_ptr<ControllerBase>&
  		}
  		break;
  	}
