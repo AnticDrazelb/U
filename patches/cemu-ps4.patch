@@ -125,7 +125,7 @@ index 257973a..67a596c 100644
  }
  
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..100597b 100644
+index e466deb..79a3904 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -9,6 +9,9 @@
@@ -138,23 +138,20 @@ index e466deb..100597b 100644
  static x86Assembler64::GPR32 _reg32(IMLReg physReg)
  {
  	cemu_assert_debug(physReg.GetRegFormat() == IMLRegFormat::I32);
-@@ -738,6 +741,29 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -738,6 +741,26 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  			x64Gen_shlx_reg64_reg64_reg64(x64GenContext, rRegResult, rRegOperand1, rRegOperand2);
  			x64Gen_and_reg64Low32_reg64Low32(x64GenContext, rRegResult, rRegResult); // trim result to 32bit
  		}
 +		else if (g_crema_cl_shifts && rRegOperand2 == X86_REG_ECX)
 +		{
 +			// the amount in CL (IMLRegisterAllocator: without BMI2): a 64-bit shift of the zero-extended
-+			// value by rB & 63, as SHRX/SHLX above (amounts of 32 or more leave 0 in the low half)
++			// value by rB & 63, as SHRX/SHLX above (amounts of 32 or more leave 0 in the low half). The
++			// 32-bit move zero-extends: the upper half must not shift down into the result.
 +			bool useTempReg = rRegResult == X86_REG_ECX && rRegOperand1 != X86_REG_ECX;
 +			auto origRegResult = rRegResult;
 +			if (useTempReg)
-+			{
-+				x64GenContext->emitter->MOV_dd(REG_RESV_TEMP, rRegOperand1);
 +				rRegResult = REG_RESV_TEMP;
-+			}
-+			if (rRegOperand1 != rRegResult)
-+				x64Gen_mov_reg64_reg64(x64GenContext, rRegResult, rRegOperand1);
++			x64GenContext->emitter->MOV_dd(rRegResult, rRegOperand1);
 +			if (imlInstruction->operation == PPCREC_IML_OP_SRW)
 +				x64GenContext->emitter->SHR_q_CL(rRegResult);
 +			else
@@ -168,7 +165,7 @@ index e466deb..100597b 100644
  		else
  		{
  			// lazy and slow way to do shift by register without relying on ECX/CL or BMI2
-@@ -766,8 +792,15 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
+@@ -766,8 +789,15 @@ bool PPCRecompilerX64Gen_imlInstruction_r_r_r(PPCRecFunction_t* PPCRecFunction,
  	else if( imlInstruction->operation == PPCREC_IML_OP_LEFT_ROTATE )
  	{
  		// todo: Use BMI2 rotate if available
@@ -185,6 +182,53 @@ index e466deb..100597b 100644
  		{
  			// swap operand 2 with RCX
  			x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
+index d4b41b9..b111c13 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
+@@ -191,7 +191,7 @@ void x64Gen_movSignExtend_reg64Low32_mem8Reg64PlusReg64(x64GenContext_t* x64GenC
+ 	else if (memRegisterA64 >= 8 && memRegisterB64 >= 8)
+ 		x64Gen_writeU8(x64GenContext, 0x43);
+ 	else if (dstRegister >= 8 && memRegisterB64 >= 8)
+-		x64Gen_writeU8(x64GenContext, 0x42);
++		x64Gen_writeU8(x64GenContext, 0x46); // REX.R and REX.X (Crema: was 0x42, losing REX.R)
+ 	else if (dstRegister >= 8 && memRegisterA64 >= 8)
+ 		x64Gen_writeU8(x64GenContext, 0x45);
+ 	else if (dstRegister >= 8)
+@@ -485,12 +485,14 @@ void x64Gen_cmovcc_reg64Low32_reg64Low32(x64GenContext_t* x64GenContext, uint32
+ void x64Gen_movSignExtend_reg64Low32_reg64Low16(x64GenContext_t* x64GenContext, sint32 destRegister, sint32 srcRegister)
+ {
+ 	// MOVSX <destReg64_lowDWORD>, <srcReg64_lowWORD>
++	// (Crema: REX.R/REX.B only. With REX.W a destination of R8-R15 got the 64-bit sign extension,
++	// and the upper half's ones broke code that relies on it being zero: 64-bit srw on the PS4)
+ 	if( destRegister >= 8 && srcRegister >= 8 )
+-		x64Gen_writeU8(x64GenContext, 0x4D);
++		x64Gen_writeU8(x64GenContext, 0x45);
+ 	else if( srcRegister >= 8 )
+ 		x64Gen_writeU8(x64GenContext, 0x41);
+ 	else if( destRegister >= 8 )
+-		x64Gen_writeU8(x64GenContext, 0x4C);
++		x64Gen_writeU8(x64GenContext, 0x44);
+ 	x64Gen_writeU8(x64GenContext, 0x0F);
+ 	x64Gen_writeU8(x64GenContext, 0xBF);
+ 	x64Gen_writeU8(x64GenContext, 0xC0+(srcRegister&7)+(destRegister&7)*8);
+@@ -513,12 +515,14 @@ void x64Gen_movZeroExtend_reg64Low32_reg64Low16(x64GenContext_t* x64GenContext,
+ void x64Gen_movSignExtend_reg64Low32_reg64Low8(x64GenContext_t* x64GenContext, sint32 destRegister, sint32 srcRegister)
+ {
+ 	// MOVSX <destReg64_lowDWORD>, <srcReg64_lowBYTE>
++	// (Crema: REX.R/REX.B only. With REX.W a destination of R8-R15 got the 64-bit sign extension,
++	// and the upper half's ones broke code that relies on it being zero: 64-bit srw on the PS4)
+ 	if( destRegister >= 8 && srcRegister >= 8 )
+-		x64Gen_writeU8(x64GenContext, 0x4D);
++		x64Gen_writeU8(x64GenContext, 0x45);
+ 	else if( srcRegister >= 8 )
+ 		x64Gen_writeU8(x64GenContext, 0x41);
+ 	else if( destRegister >= 8 )
+-		x64Gen_writeU8(x64GenContext, 0x4C);
++		x64Gen_writeU8(x64GenContext, 0x44);
+ 	else if( srcRegister >= 4 )
+ 		x64Gen_writeU8(x64GenContext, 0x40);
+ 	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 index 935e61a..8dace29 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
