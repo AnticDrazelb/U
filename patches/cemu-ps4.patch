@@ -2703,10 +2703,10 @@ index 0000000..59a3de1
 +} // namespace CremaMii
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 0000000..2a93151
+index 0000000..45bbb1f
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,916 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -2719,7 +2719,12 @@ index 0000000..2a93151
 +#include "imgui/imgui_extension.h"
 +#include "input/InputManager.h"
 +#include "input/api/Controller.h"
++#include "input/ControllerFactory.h"
++#include "input/api/PS4/PS4PadController.h"
++#include "input/emulated/ClassicController.h"
++#include "input/emulated/ProController.h"
 +#include "input/emulated/VPADController.h"
++#include "input/emulated/WiimoteController.h"
 +
 +#include "gui/ps4/launcher/PS4Glyphs.h"
 +
@@ -2862,25 +2867,81 @@ index 0000000..2a93151
 +	struct Binding
 +	{
 +		const char* label;
-+		uint64 mapping; // VPADController::ButtonId; a stick group's first (Up)
++		uint64 mapping; // the controller type's ButtonId; a stick group's first (Up, then Down, Left, Right)
 +		bool stickGroup;
 +	};
-+	constexpr Binding kBindings[] = {
-+		{"A", VPADController::kButtonId_A, false}, {"B", VPADController::kButtonId_B, false},
-+		{"X", VPADController::kButtonId_X, false}, {"Y", VPADController::kButtonId_Y, false},
-+		{"L", VPADController::kButtonId_L, false}, {"R", VPADController::kButtonId_R, false},
-+		{"ZL", VPADController::kButtonId_ZL, false}, {"ZR", VPADController::kButtonId_ZR, false},
-+		{"Plus", VPADController::kButtonId_Plus, false}, {"Minus", VPADController::kButtonId_Minus, false},
-+		{"HOME", VPADController::kButtonId_Home, false},
-+		{"D-Pad Up", VPADController::kButtonId_Up, false}, {"D-Pad Down", VPADController::kButtonId_Down, false},
-+		{"D-Pad Left", VPADController::kButtonId_Left, false}, {"D-Pad Right", VPADController::kButtonId_Right, false},
-+		{"Left Stick", VPADController::kButtonId_StickL_Up, true}, {"Right Stick", VPADController::kButtonId_StickR_Up, true},
-+		{"Left Stick Click", VPADController::kButtonId_StickL, false}, {"Right Stick Click", VPADController::kButtonId_StickR, false},
-+	};
 +
-+	// the controls page's rows: Apply To (a game only), the bindings, Reset to Default
++	// Each player's controller: a Wii U GamePad (player 1), Pro or Classic Controller, or a Wii
++	// Remote alone (held sideways) or with a Nunchuk (held upright), on that player's DualShock 4.
++	enum Kind
++	{
++		KIND_GAMEPAD,
++		KIND_PRO,
++		KIND_CLASSIC,
++		KIND_WIIMOTE,
++		KIND_NUNCHUK,
++		KIND_COUNT,
++	};
++	const char* const kKindNames[KIND_COUNT] = {"Wii U GamePad", "Pro Controller", "Classic Controller", "Wii Remote", "Wii Remote + Nunchuk"};
++	constexpr int kPlayers = PS4PadControllerProvider::kMaxPads;
++
++	const std::vector<Binding>& BindingsOf(int kind)
++	{
++		using V = VPADController;
++		using P = ProController;
++		using C = ClassicController;
++		using W = WiimoteController;
++		static const std::vector<Binding> gamepad = {
++			{"A", V::kButtonId_A, false}, {"B", V::kButtonId_B, false}, {"X", V::kButtonId_X, false}, {"Y", V::kButtonId_Y, false},
++			{"L", V::kButtonId_L, false}, {"R", V::kButtonId_R, false}, {"ZL", V::kButtonId_ZL, false}, {"ZR", V::kButtonId_ZR, false},
++			{"Plus", V::kButtonId_Plus, false}, {"Minus", V::kButtonId_Minus, false}, {"HOME", V::kButtonId_Home, false},
++			{"D-Pad Up", V::kButtonId_Up, false}, {"D-Pad Down", V::kButtonId_Down, false},
++			{"D-Pad Left", V::kButtonId_Left, false}, {"D-Pad Right", V::kButtonId_Right, false},
++			{"Left Stick", V::kButtonId_StickL_Up, true}, {"Right Stick", V::kButtonId_StickR_Up, true},
++			{"Left Stick Click", V::kButtonId_StickL, false}, {"Right Stick Click", V::kButtonId_StickR, false}};
++		static const std::vector<Binding> pro = {
++			{"A", P::kButtonId_A, false}, {"B", P::kButtonId_B, false}, {"X", P::kButtonId_X, false}, {"Y", P::kButtonId_Y, false},
++			{"L", P::kButtonId_L, false}, {"R", P::kButtonId_R, false}, {"ZL", P::kButtonId_ZL, false}, {"ZR", P::kButtonId_ZR, false},
++			{"Plus", P::kButtonId_Plus, false}, {"Minus", P::kButtonId_Minus, false}, {"HOME", P::kButtonId_Home, false},
++			{"D-Pad Up", P::kButtonId_Up, false}, {"D-Pad Down", P::kButtonId_Down, false},
++			{"D-Pad Left", P::kButtonId_Left, false}, {"D-Pad Right", P::kButtonId_Right, false},
++			{"Left Stick", P::kButtonId_StickL_Up, true}, {"Right Stick", P::kButtonId_StickR_Up, true},
++			{"Left Stick Click", P::kButtonId_StickL, false}, {"Right Stick Click", P::kButtonId_StickR, false}};
++		static const std::vector<Binding> classic = {
++			{"a", C::kButtonId_A, false}, {"b", C::kButtonId_B, false}, {"x", C::kButtonId_X, false}, {"y", C::kButtonId_Y, false},
++			{"L", C::kButtonId_L, false}, {"R", C::kButtonId_R, false}, {"ZL", C::kButtonId_ZL, false}, {"ZR", C::kButtonId_ZR, false},
++			{"Plus", C::kButtonId_Plus, false}, {"Minus", C::kButtonId_Minus, false}, {"HOME", C::kButtonId_Home, false},
++			{"D-Pad Up", C::kButtonId_Up, false}, {"D-Pad Down", C::kButtonId_Down, false},
++			{"D-Pad Left", C::kButtonId_Left, false}, {"D-Pad Right", C::kButtonId_Right, false},
++			{"Left Stick", C::kButtonId_StickL_Up, true}, {"Right Stick", C::kButtonId_StickR_Up, true}};
++		static const std::vector<Binding> wiimote = {
++			{"A", W::kButtonId_A, false}, {"B", W::kButtonId_B, false}, {"1", W::kButtonId_1, false}, {"2", W::kButtonId_2, false},
++			{"Plus", W::kButtonId_Plus, false}, {"Minus", W::kButtonId_Minus, false}, {"HOME", W::kButtonId_Home, false},
++			{"D-Pad Up", W::kButtonId_Up, false}, {"D-Pad Down", W::kButtonId_Down, false},
++			{"D-Pad Left", W::kButtonId_Left, false}, {"D-Pad Right", W::kButtonId_Right, false}};
++		static const std::vector<Binding> nunchuk = [] {
++			std::vector<Binding> b = wiimote;
++			b.push_back({"Nunchuk Stick", W::kButtonId_Nunchuck_Up, true});
++			b.push_back({"C", W::kButtonId_Nunchuck_C, false});
++			b.push_back({"Z", W::kButtonId_Nunchuck_Z, false});
++			return b;
++		}();
++		switch (kind)
++		{
++		case KIND_PRO: return pro;
++		case KIND_CLASSIC: return classic;
++		case KIND_WIIMOTE: return wiimote;
++		case KIND_NUNCHUK: return nunchuk;
++		default: return gamepad;
++		}
++	}
++
++	// the controls page's rows: Player, Controller, Apply To (a game only), the bindings, Reset to
++	// Default
 +	enum ControlRowKind
 +	{
++		CTL_PLAYER,
++		CTL_KIND,
 +		CTL_SCOPE,
 +		CTL_BINDING,
 +		CTL_RESET,
@@ -2894,59 +2955,85 @@ index 0000000..2a93151
 +	bool sControls = false; // the controls page is open
 +	int sControlsSelected = 0;
 +	float sControlsScroll = 0.0f;
++	int sPlayer = 0; // the player the page shows
 +	bool sCapture = false, sCaptureReleased = false;
 +	double sCaptureStart = 0.0;
 +	int sCaptureBinding = 0;
 +
-+	std::string GameLayoutName()
++	EmulatedControllerPtr PlayerController(int player)
 +	{
-+		return "crema-" + sGameId;
++		return InputManager::instance().get_controller(player);
 +	}
 +
-+	bool HasGameLayout()
++	int KindOf(const EmulatedControllerPtr& controller)
++	{
++		if (!controller)
++			return KIND_PRO;
++		switch (controller->type())
++		{
++		case EmulatedController::Type::VPAD: return KIND_GAMEPAD;
++		case EmulatedController::Type::Classic: return KIND_CLASSIC;
++		case EmulatedController::Type::Wiimote:
++			return std::static_pointer_cast<WiimoteController>(controller)->get_device_type() == kWAPDevFreestyle ? KIND_NUNCHUK : KIND_WIIMOTE;
++		default: return KIND_PRO;
++		}
++	}
++
++	std::shared_ptr<ControllerBase> Pad(const EmulatedControllerPtr& controller)
++	{
++		for (const auto& c : controller->get_controllers())
++			if (c->api() == InputAPI::PS4Pad)
++				return c;
++		return nullptr;
++	}
++
++	// A Wii Remote points while a finger is on the touchpad; the GamePad's screen is touched by a click.
++	void ApplyPointerMode(int player)
++	{
++		auto controller = PlayerController(player);
++		auto pad = controller ? std::dynamic_pointer_cast<PS4PadController>(Pad(controller)) : nullptr;
++		if (pad)
++			pad->set_hover_pointer(controller->type() == EmulatedController::Type::Wiimote);
++	}
++
++	// the game's own layouts: controllerProfiles/crema-<title ID> (player 1), crema-<title ID>-p2 ...
++	std::string GameLayoutName(int player)
++	{
++		return player == 0 ? "crema-" + sGameId : fmt::format("crema-{}-p{}", sGameId, player + 1);
++	}
++
++	bool HasGameLayout(int player)
 +	{
 +		std::error_code ec;
-+		return !sGameId.empty() && fs::exists(ActiveSettings::GetConfigPath("controllerProfiles/{}.xml", GameLayoutName()), ec);
++		return !sGameId.empty() && fs::exists(ActiveSettings::GetConfigPath("controllerProfiles/{}.xml", GameLayoutName(player)), ec);
 +	}
 +
 +	std::vector<ControlRow> ControlRows()
 +	{
-+		std::vector<ControlRow> rows;
++		std::vector<ControlRow> rows = {{CTL_PLAYER, 0}, {CTL_KIND, 0}};
 +		if (!sGameId.empty())
 +			rows.push_back({CTL_SCOPE, 0});
-+		for (int i = 0; i < (int)std::size(kBindings); i++)
++		const int count = (int)BindingsOf(KindOf(PlayerController(sPlayer))).size();
++		for (int i = 0; i < count; i++)
 +			rows.push_back({CTL_BINDING, i});
 +		rows.push_back({CTL_RESET, 0});
 +		return rows;
 +	}
 +
-+	EmulatedControllerPtr GamePad()
++	// the DualShock 4 control an input is on, or null (none, or another controller)
++	const PadInput* BoundInput(const EmulatedControllerPtr& controller, uint64 mapping)
 +	{
-+		return InputManager::instance().get_controller(0);
-+	}
-+
-+	std::shared_ptr<ControllerBase> Pad(const EmulatedControllerPtr& gamepad)
-+	{
-+		for (const auto& controller : gamepad->get_controllers())
-+			if (controller->api() == InputAPI::PS4Pad)
-+				return controller;
-+		return nullptr;
-+	}
-+
-+	// the DualShock 4 control a GamePad input is on, or null (none, or another controller)
-+	const PadInput* BoundInput(const EmulatedControllerPtr& gamepad, uint64 mapping)
-+	{
-+		const auto pad = gamepad->get_mapping_controller(mapping);
++		const auto pad = controller->get_mapping_controller(mapping);
 +		if (!pad || pad->api() != InputAPI::PS4Pad)
 +			return nullptr;
-+		const std::string name = gamepad->get_mapping_name(mapping);
++		const std::string name = controller->get_mapping_name(mapping);
 +		for (const PadInput& input : kPadInputs)
 +			if (pad->get_button_name(input.button) == name)
 +				return &input;
 +		return nullptr;
 +	}
 +
-+	const StickChoice* BoundStick(const EmulatedControllerPtr& gamepad, uint64 up)
++	const StickChoice* BoundStick(const EmulatedControllerPtr& controller, uint64 up)
 +	{
 +		for (const StickChoice& stick : kSticks)
 +		{
@@ -2954,7 +3041,7 @@ index 0000000..2a93151
 +			bool all = true;
 +			for (int i = 0; i < 4; i++)
 +			{
-+				const PadInput* input = BoundInput(gamepad, up + i);
++				const PadInput* input = BoundInput(controller, up + i);
 +				all = all && input && input->button == parts[i];
 +			}
 +			if (all)
@@ -2964,59 +3051,100 @@ index 0000000..2a93151
 +	}
 +
 +	// The layout in use is saved where it came from: the game's own, or the one for all games.
-+	void SaveLayout()
++	void SaveLayout(int player)
 +	{
-+		if (HasGameLayout())
-+			InputManager::instance().save(0, GameLayoutName());
++		if (HasGameLayout(player))
++			InputManager::instance().save(player, GameLayoutName(player));
 +		else
-+			InputManager::instance().save(0);
++			InputManager::instance().save(player);
 +	}
 +
 +	// This Game: the game gets its own layout, starting from the current one. All Games: it's
 +	// removed and the layout for all games is loaded again.
-+	void ToggleScope()
++	void ToggleScope(int player)
 +	{
 +		std::error_code ec;
-+		if (HasGameLayout())
++		if (HasGameLayout(player))
 +		{
-+			fs::remove(ActiveSettings::GetConfigPath("controllerProfiles/{}.xml", GameLayoutName()), ec);
-+			InputManager::instance().load(0);
-+			ps4_boot_trace("in-game menu: controls for all games");
++			fs::remove(ActiveSettings::GetConfigPath("controllerProfiles/{}.xml", GameLayoutName(player)), ec);
++			InputManager::instance().load(player);
++			ApplyPointerMode(player);
++			ps4_boot_trace(fmt::format("in-game menu: player {} controls for all games", player + 1).c_str());
 +		}
 +		else
 +		{
-+			InputManager::instance().save(0, GameLayoutName());
-+			ps4_boot_trace("in-game menu: controls for this game");
++			InputManager::instance().save(player, GameLayoutName(player));
++			ps4_boot_trace(fmt::format("in-game menu: player {} controls for this game", player + 1).c_str());
 +		}
 +	}
 +
-+	void ResetLayout()
++	// The player's controller becomes a `kind` on their DualShock 4, with its default layout.
++	void SetKind(int player, int kind)
 +	{
-+		auto gamepad = GamePad();
-+		auto pad = gamepad ? Pad(gamepad) : nullptr;
++		static const EmulatedController::Type kTypes[KIND_COUNT] = {EmulatedController::Type::VPAD, EmulatedController::Type::Pro,
++			EmulatedController::Type::Classic, EmulatedController::Type::Wiimote, EmulatedController::Type::Wiimote};
++		auto& input = InputManager::instance();
++		auto old = PlayerController(player);
++		std::shared_ptr<ControllerBase> pad = old ? Pad(old) : nullptr;
 +		if (!pad)
++			pad = ControllerFactory::CreateController(InputAPI::PS4Pad, std::to_string(player), "DualShock 4");
++		auto controller = input.set_controller(player, kTypes[kind], pad);
++		if (!controller)
 +			return;
-+		gamepad->clear_mappings();
-+		gamepad->set_default_mapping(pad);
-+		SaveLayout();
++		if (kind == KIND_WIIMOTE || kind == KIND_NUNCHUK)
++			std::static_pointer_cast<WiimoteController>(controller)->set_device_type(kind == KIND_NUNCHUK ? kWAPDevFreestyle : kWAPDevCore);
++		controller->clear_mappings();
++		controller->set_default_mapping(pad);
++		ApplyPointerMode(player);
++		SaveLayout(player);
++		ps4_boot_trace(fmt::format("in-game menu: player {} uses a {}", player + 1, kKindNames[kind]).c_str());
 +	}
 +
-+	void SetStick(int binding, int direction)
++	// Left/Right: the next controller type (the GamePad for player 1 only: Cemu has two at most,
++	// and games expect it first).
++	void StepKind(int player, int direction)
 +	{
-+		auto gamepad = GamePad();
-+		auto pad = gamepad ? Pad(gamepad) : nullptr;
++		const int first = player == 0 ? KIND_GAMEPAD : KIND_PRO;
++		const int count = KIND_COUNT - first;
++		const int current = std::max(KindOf(PlayerController(player)), first) - first;
++		SetKind(player, first + ((current + direction) % count + count) % count);
++	}
++
++	void ResetLayout(int player)
++	{
++		auto controller = PlayerController(player);
++		auto pad = controller ? Pad(controller) : nullptr;
 +		if (!pad)
 +			return;
-+		const uint64 up = kBindings[binding].mapping;
-+		const StickChoice* current = BoundStick(gamepad, up);
++		controller->clear_mappings();
++		controller->set_default_mapping(pad);
++		SaveLayout(player);
++	}
++
++	void SetStick(int player, int binding, int direction)
++	{
++		auto controller = PlayerController(player);
++		auto pad = controller ? Pad(controller) : nullptr;
++		if (!pad)
++			return;
++		const uint64 up = BindingsOf(KindOf(controller))[binding].mapping;
++		const StickChoice* current = BoundStick(controller, up);
 +		const int count = (int)std::size(kSticks);
 +		int index = current ? (int)(current - kSticks) : 0;
 +		index = ((index + direction) % count + count) % count;
 +		const StickChoice& stick = kSticks[index];
 +		const uint64 parts[4] = {stick.up, stick.down, stick.left, stick.right};
 +		for (int i = 0; i < 4; i++)
-+			gamepad->set_mapping(up + i, pad, parts[i]);
-+		SaveLayout();
++			controller->set_mapping(up + i, pad, parts[i]);
++		SaveLayout(player);
++	}
++
++	// whether the player's DualShock 4 is there (a signed-in user with a pad)
++	bool PadConnected(int player)
++	{
++		auto controller = PlayerController(player);
++		auto pad = controller ? Pad(controller) : nullptr;
++		return pad && pad->is_connected();
 +	}
 +
 +	// PS4Controls::IsAtRest / Capture: no button, trigger or stick in use; else the control pressed
@@ -3084,12 +3212,12 @@ index 0000000..2a93151
 +		const auto button = Capture(data);
 +		if (!button)
 +			return true;
-+		auto gamepad = GamePad();
-+		auto pad = gamepad ? Pad(gamepad) : nullptr;
++		auto controller = PlayerController(sPlayer);
++		auto pad = controller ? Pad(controller) : nullptr;
 +		if (pad)
 +		{
-+			gamepad->set_mapping(kBindings[sCaptureBinding].mapping, pad, *button);
-+			SaveLayout();
++			controller->set_mapping(BindingsOf(KindOf(controller))[sCaptureBinding].mapping, pad, *button);
++			SaveLayout(sPlayer);
 +		}
 +		sCapture = false;
 +		return true;
@@ -3103,7 +3231,7 @@ index 0000000..2a93151
 +		case ROW_POINTER: return g_crema_touch_pointer ? "On" : "Off";
 +		case ROW_TOUCHPAD: return g_crema_touchpad_buttons ? "Minus / HOME" : "GamePad Touch Screen";
 +		case ROW_MOTION: return MotionOn() ? "On" : "Off";
-+		case ROW_CONTROLS: return HasGameLayout() ? "This Game" : "All Games";
++		case ROW_CONTROLS: return HasGameLayout(0) ? "This Game" : "All Games";
 +		case ROW_VOLUME: return std::to_string(Volume());
 +		case ROW_FPS: return GetConfig().overlay.position != ScreenPosition::kDisabled ? "On" : "Off";
 +		default: return {};
@@ -3209,37 +3337,38 @@ index 0000000..2a93151
 +
 +	void ControlsInput(uint32 pressed, double now)
 +	{
-+		const auto rows = ControlRows();
-+		const int count = (int)rows.size();
++		auto rows = ControlRows();
++		int count = (int)rows.size();
 +		if (pressed & B_UP)
 +			sControlsSelected = (sControlsSelected + count - 1) % count;
 +		if (pressed & B_DOWN)
 +			sControlsSelected = (sControlsSelected + 1) % count;
 +		sControlsSelected = std::clamp(sControlsSelected, 0, count - 1);
-+		const ControlRow& row = rows[sControlsSelected];
-+		const bool stick = row.kind == CTL_BINDING && kBindings[row.binding].stickGroup;
-+		if (pressed & (B_LEFT | B_RIGHT))
++		const ControlRow row = rows[sControlsSelected];
++		const auto& bindings = BindingsOf(KindOf(PlayerController(sPlayer)));
++		const bool stick = row.kind == CTL_BINDING && bindings[row.binding].stickGroup;
++		const int direction = (pressed & B_LEFT) ? -1 : 1;
++		if (pressed & (B_LEFT | B_RIGHT | B_CROSS))
 +		{
-+			if (row.kind == CTL_SCOPE)
-+				ToggleScope();
++			if (row.kind == CTL_PLAYER)
++				sPlayer = ((sPlayer + direction) % kPlayers + kPlayers) % kPlayers;
++			else if (row.kind == CTL_KIND)
++				StepKind(sPlayer, direction);
++			else if (row.kind == CTL_SCOPE)
++				ToggleScope(sPlayer);
 +			else if (stick)
-+				SetStick(row.binding, (pressed & B_LEFT) ? -1 : 1);
-+		}
-+		if (pressed & B_CROSS)
-+		{
-+			if (row.kind == CTL_SCOPE)
-+				ToggleScope();
-+			else if (row.kind == CTL_RESET)
-+				ResetLayout();
-+			else if (stick)
-+				SetStick(row.binding, 1);
-+			else
++				SetStick(sPlayer, row.binding, direction);
++			else if (row.kind == CTL_RESET && (pressed & B_CROSS))
++				ResetLayout(sPlayer);
++			else if (row.kind == CTL_BINDING && (pressed & B_CROSS))
 +			{
 +				sCapture = true;
 +				sCaptureReleased = false;
 +				sCaptureStart = now;
 +				sCaptureBinding = row.binding;
 +			}
++			// a new player or controller type has other rows
++			sControlsSelected = std::clamp(sControlsSelected, 0, (int)ControlRows().size() - 1);
 +		}
 +		if (pressed & B_CIRCLE)
 +			sControls = false;
@@ -3248,11 +3377,14 @@ index 0000000..2a93151
 +	// the controls page, in the panel from x0 to W
 +	void DrawControls(ImDrawList* dl, ImFont* title, ImFont* font, ImFont* small, float x0, float W, float H, float a, float dt)
 +	{
-+		constexpr uint32 ACCENT = 0x9B7BFF, TEXT = 0xFFFFFF;
++		constexpr uint32 ACCENT = 0x9B7BFF, TEXT = 0xFFFFFF, WARN = 0xFFC870;
++		const auto controller = PlayerController(sPlayer);
++		const int kind = KindOf(controller);
++		const auto& bindings = BindingsOf(kind);
 +		dl->AddText(title, 44.0f, ImVec2(x0 + 50, 90), Rgba(TEXT, a), "Controls");
-+		dl->AddText(small, 24.0f, ImVec2(x0 + 52, 148), Rgba(ACCENT, a), "Wii U GamePad");
++		const std::string subtitle = fmt::format("Player {}: {}", sPlayer + 1, kKindNames[kind]);
++		dl->AddText(small, 24.0f, ImVec2(x0 + 52, 148), Rgba(ACCENT, a), subtitle.c_str());
 +		const auto rows = ControlRows();
-+		const auto gamepad = GamePad();
 +		constexpr float ROW_H = 54.0f, TOP = 210.0f;
 +		const float bottom = H - 150.0f;
 +		// keep the selection in view
@@ -3273,22 +3405,35 @@ index 0000000..2a93151
 +			const bool sel = i == sControlsSelected;
 +			if (sel)
 +				dl->AddRectFilled(ImVec2(x0 + 30, y - 4), ImVec2(W - 30, y + 46), Rgba(ACCENT, 0.30f * a), 10.0f);
-+			const char* label = row.kind == CTL_SCOPE ? "Apply To" : row.kind == CTL_RESET ? "Reset to Default" : kBindings[row.binding].label;
++			const char* label = row.kind == CTL_PLAYER ? "Player" : row.kind == CTL_KIND ? "Controller" : row.kind == CTL_SCOPE ? "Apply To" :
++				row.kind == CTL_RESET ? "Reset to Default" : bindings[row.binding].label;
 +			dl->AddText(font, 30.0f, ImVec2(x0 + 60, y + 4), Rgba(TEXT, a), label);
 +			std::string glyph, value;
-+			if (row.kind == CTL_SCOPE)
-+				value = HasGameLayout() ? "This Game" : "All Games";
-+			else if (row.kind == CTL_BINDING && sCapture && row.binding == sCaptureBinding)
-+				value = "Press a button...";
-+			else if (row.kind == CTL_BINDING && gamepad && kBindings[row.binding].stickGroup)
++			uint32 colour = TEXT;
++			if (row.kind == CTL_PLAYER)
 +			{
-+				const StickChoice* stick = BoundStick(gamepad, kBindings[row.binding].mapping);
++				const bool connected = PadConnected(sPlayer);
++				value = fmt::format("{}{}", sPlayer + 1, connected ? "" : "  (no controller)");
++				colour = connected ? TEXT : WARN;
++			}
++			else if (row.kind == CTL_KIND)
++				value = kKindNames[kind];
++			else if (row.kind == CTL_SCOPE)
++				value = HasGameLayout(sPlayer) ? "This Game" : "All Games";
++			else if (row.kind == CTL_BINDING && sCapture && row.binding == sCaptureBinding)
++			{
++				value = "Press a button...";
++				colour = ACCENT;
++			}
++			else if (row.kind == CTL_BINDING && controller && bindings[row.binding].stickGroup)
++			{
++				const StickChoice* stick = BoundStick(controller, bindings[row.binding].mapping);
 +				glyph = stick ? stick->name : "";
 +				value = stick ? stick->name : "Custom";
 +			}
-+			else if (row.kind == CTL_BINDING && gamepad)
++			else if (row.kind == CTL_BINDING && controller)
 +			{
-+				const PadInput* input = BoundInput(gamepad, kBindings[row.binding].mapping);
++				const PadInput* input = BoundInput(controller, bindings[row.binding].mapping);
 +				glyph = input ? input->glyph : "";
 +				value = input ? input->text : "None";
 +			}
@@ -3299,14 +3444,20 @@ index 0000000..2a93151
 +			else if (!value.empty())
 +			{
 +				const float tw = font->CalcTextSizeA(26.0f, FLT_MAX, 0.0f, value.c_str()).x;
-+				dl->AddText(font, 26.0f, ImVec2(W - 70 - tw, y + 8), Rgba(sCapture && row.binding == sCaptureBinding ? ACCENT : TEXT, 0.85f * a), value.c_str());
++				dl->AddText(font, 26.0f, ImVec2(W - 70 - tw, y + 8), Rgba(colour, 0.85f * a), value.c_str());
 +			}
 +		}
 +		dl->PopClipRect();
 +		const ControlRow& row = rows[std::clamp(sControlsSelected, 0, (int)rows.size() - 1)];
 +		std::string help;
 +		if (sCapture)
-+			help = std::string("Press the DualShock 4 button for ") + kBindings[sCaptureBinding].label + "...  (5 s: cancel)";
++			help = std::string("Press the DualShock 4 button for ") + bindings[sCaptureBinding].label + "...  (5 s: cancel)";
++		else if (row.kind == CTL_PLAYER)
++			help = "Left/Right: the player to set up. Players 2-4: a second PS4 user signs in with their DualShock 4.";
++		else if (row.kind == CTL_KIND)
++			help = kind == KIND_WIIMOTE ? "Left/Right: the controller. A Wii Remote alone is held sideways; touchpad: pointer." :
++				kind == KIND_NUNCHUK ? "Left/Right: the controller. Held upright: left stick = Nunchuk; touchpad: pointer." :
++				"Left/Right: the controller the game sees for this player.";
 +		else if (row.kind == CTL_SCOPE)
 +			help = "This Game: a layout for this game only. All Games: the normal layout.";
 +		else if (row.kind == CTL_RESET)
@@ -3444,8 +3595,25 @@ index 0000000..2a93151
 +void LoadGameControls(const std::string& gameId)
 +{
 +	sGameId = gameId;
-+	if (HasGameLayout() && InputManager::instance().load(0, GameLayoutName()))
-+		ps4_boot_trace("controls: this game's own layout");
++	for (int player = 0; player < kPlayers; player++)
++	{
++		if (HasGameLayout(player) && InputManager::instance().load(player, GameLayoutName(player)))
++			ps4_boot_trace(fmt::format("controls: player {} uses this game's own layout", player + 1).c_str());
++		ApplyPointerMode(player);
++	}
++}
++
++void SetupPlayers()
++{
++	// players 2-4: a Pro Controller each on their DualShock 4 the first time (not connected until
++	// a second, third or fourth PS4 user signs in with a pad); then what the menu set
++	for (int player = 1; player < kPlayers; player++)
++	{
++		if (!PlayerController(player))
++			SetKind(player, KIND_PRO);
++		ApplyPointerMode(player);
++	}
++	ApplyPointerMode(0);
 +}
 +
 +void Install(const std::string& gameId, const std::string& launchPath)
@@ -3457,10 +3625,10 @@ index 0000000..2a93151
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4PauseMenu.h b/src/gui/ps4/PS4PauseMenu.h
 new file mode 100644
-index 0000000..489dc96
+index 0000000..7c96bca
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,19 @@
 +// Crema's in-game menu (L3 + R3), after DolphinPS4's: settings that apply at once (TV or GamePad
 +// screen, touch pointer, touchpad mode, motion, controls mapping, volume, FPS counter), Restart
 +// Game and Quit to Launcher. Drawn over the game in the renderer's ImGui pass; the game keeps
@@ -3471,7 +3639,10 @@ index 0000000..489dc96
 +
 +namespace PS4PauseMenu
 +{
-+// At game start: the game's own controls layout (set in the menu's Controls page), if it has one.
++// At startup: players 2-4 (a Pro Controller each on their DualShock 4 the first time).
++void SetupPlayers();
++// At game start: each player's own controls layout for the game (set in the menu's Controls
++// page), if it has one.
 +void LoadGameControls(const std::string& gameId);
 +// The game being played: its title ID (crema.ini section, empty for homebrew) and the path it
 +// was started from (Restart Game).
@@ -3479,10 +3650,10 @@ index 0000000..489dc96
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..a9a09a7
+index 0000000..737c0e2
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,740 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -4015,6 +4186,7 @@ index 0000000..a9a09a7
 +				Trace(fmt::format("controller setup failed: {}", ex.what()));
 +			}
 +		}
++		PS4PauseMenu::SetupPlayers(); // players 2-4 (local multiplayer)
 +		CremaSettings::Load(_pathToUtf8(kDataRoot));
 +
 +		sWindowInfo.app_active = true;
@@ -9085,7 +9257,7 @@ index 4978ef0..62be7be 100644
  	target_sources(CemuInput PRIVATE
  		api/SDL/SDLController.cpp
 diff --git a/src/input/ControllerFactory.cpp b/src/input/ControllerFactory.cpp
-index 3827e1d..ed4037f 100644
+index 3827e1d..734a9fe 100644
 --- a/src/input/ControllerFactory.cpp
 +++ b/src/input/ControllerFactory.cpp
 @@ -22,6 +22,10 @@
@@ -9105,7 +9277,7 @@ index 3827e1d..ed4037f 100644
  #endif
 +#ifdef __ORBIS__
 +	case InputAPI::PS4Pad:
-+		return std::make_shared<PS4PadController>();
++		return std::make_shared<PS4PadController>(uuid);
 +#endif
  #if HAS_DSU
  	case InputAPI::DSUClient:
@@ -9178,10 +9350,10 @@ index a5f1f92..15a7b40 100644
  		
 diff --git a/src/input/api/PS4/PS4PadController.cpp b/src/input/api/PS4/PS4PadController.cpp
 new file mode 100644
-index 0000000..53ccb9f
+index 0000000..fb2c965
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.cpp
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,264 @@
 +#include "input/api/PS4/PS4PadController.h"
 +
 +#include <orbis/Pad.h>
@@ -9224,53 +9396,109 @@ index 0000000..53ccb9f
 +		cemuLog_log(LogType::Force, "PS4Pad: no initial user");
 +		return;
 +	}
-+	m_handle = scePadOpen(user, 0, 0, nullptr);
-+	g_crema_pad_handle = m_handle;
-+	if (m_handle < 0)
++	Open(0, user);
++	g_crema_pad_handle = m_pads[0].handle;
++	if (m_pads[0].handle >= 0)
 +	{
-+		cemuLog_log(LogType::Force, "PS4Pad: scePadOpen failed: {:#x}", (uint32)m_handle);
++		OrbisPadInformation info{};
++		if (scePadGetControllerInformation(m_pads[0].handle, &info) == 0 && info.touchResolutionX > 1 && info.touchResolutionY > 1)
++		{
++			m_touchMaxX = (float)(info.touchResolutionX - 1);
++			m_touchMaxY = (float)(info.touchResolutionY - 1);
++		}
++		cemuLog_log(LogType::Force, "PS4Pad: touchpad {}x{}", m_touchMaxX + 1, m_touchMaxY + 1);
++	}
++	Refresh(true);
++}
++
++// A user's pad into a slot, with its motion sensors on (off until enabled; the header declares
++// scePadSetMotionSensorState without parameters).
++void PS4PadControllerProvider::Open(int slot, int32_t user)
++{
++	Pad& pad = m_pads[slot];
++	pad.user = user;
++	pad.handle = scePadOpen(user, 0, 0, nullptr);
++	if (pad.handle < 0)
++	{
++		cemuLog_log(LogType::Force, "PS4Pad: scePadOpen for player {} (user {:#x}) failed: {:#x}", slot + 1, (uint32)user, (uint32)pad.handle);
 +		return;
 +	}
-+	OrbisPadInformation info{};
-+	if (scePadGetControllerInformation(m_handle, &info) == 0 && info.touchResolutionX > 1 && info.touchResolutionY > 1)
++	const int32_t motion = reinterpret_cast<int32_t (*)(int32_t, bool)>(&scePadSetMotionSensorState)(pad.handle, true);
++	pad.motion = motion == 0;
++	cemuLog_log(LogType::Force, "PS4Pad: player {} is user {:#x}{}", slot + 1, (uint32)user, pad.motion ? "" : " (no motion sensors)");
++}
++
++void PS4PadControllerProvider::Refresh(bool force)
++{
++	const auto now = std::chrono::steady_clock::now();
 +	{
-+		m_touchMaxX = (float)(info.touchResolutionX - 1);
-+		m_touchMaxY = (float)(info.touchResolutionY - 1);
++		std::scoped_lock lock(m_mutex);
++		if (!force && now - m_lastRefresh < std::chrono::seconds(3))
++			return;
++		m_lastRefresh = now;
 +	}
-+	cemuLog_log(LogType::Force, "PS4Pad: touchpad {}x{}", m_touchMaxX + 1, m_touchMaxY + 1);
-+	// the motion sensors are off until enabled (the header declares it without parameters)
-+	const int32_t motion = reinterpret_cast<int32_t (*)(int32_t, bool)>(&scePadSetMotionSensorState)(m_handle, true);
-+	m_hasMotion = motion == 0;
-+	if (!m_hasMotion)
-+		cemuLog_log(LogType::Force, "PS4Pad: scePadSetMotionSensorState failed: {:#x}", (uint32)motion);
++	OrbisUserServiceLoginUserIdList users{};
++	if (sceUserServiceGetLoginUserIdList(&users) != 0)
++		return;
++	std::scoped_lock lock(m_mutex);
++	for (int32_t user : users.userId)
++	{
++		if (user == ORBIS_USER_SERVICE_USER_ID_INVALID)
++			continue;
++		bool known = false;
++		for (const Pad& pad : m_pads)
++			known = known || pad.user == user;
++		for (int slot = 0; !known && slot < kMaxPads; slot++)
++		{
++			if (m_pads[slot].user != -1)
++				continue;
++			Open(slot, user);
++			known = true;
++		}
++	}
 +}
 +
 +std::vector<std::shared_ptr<ControllerBase>> PS4PadControllerProvider::get_controllers()
 +{
-+	if (m_handle < 0)
-+		return {};
-+	return {std::make_shared<PS4PadController>()};
++	Refresh(true);
++	std::vector<std::shared_ptr<ControllerBase>> result;
++	std::scoped_lock lock(m_mutex);
++	for (int slot = 0; slot < kMaxPads; slot++)
++		if (m_pads[slot].handle >= 0)
++			result.push_back(std::make_shared<PS4PadController>(std::to_string(slot)));
++	return result;
 +}
 +
-+bool PS4PadControllerProvider::Read(OrbisPadData& data)
++bool PS4PadControllerProvider::Read(int slot, OrbisPadData& data)
 +{
-+	if (m_handle < 0)
++	if (slot < 0 || slot >= kMaxPads)
 +		return false;
++	if (slot != 0)
++		Refresh(); // a player who signs in during the game
 +	std::scoped_lock lock(m_mutex);
++	if (m_pads[slot].handle < 0)
++		return false;
 +	// scePadReadState: the latest state (scePadRead returned nothing for half-second stretches
 +	// in DolphinPS4)
-+	return scePadReadState(m_handle, &data) == 0 && data.connected;
++	return scePadReadState(m_pads[slot].handle, &data) == 0 && data.connected;
 +}
 +
-+PS4PadController::PS4PadController()
-+	: base_type("0", "DualShock 4")
++bool PS4PadControllerProvider::HasMotion(int slot)
 +{
++	std::scoped_lock lock(m_mutex);
++	return slot >= 0 && slot < kMaxPads && m_pads[slot].motion;
++}
++
++PS4PadController::PS4PadController(std::string_view uuid)
++	: base_type(uuid, uuid == "0" ? "DualShock 4" : fmt::format("DualShock 4 (player {})", std::atoi(std::string(uuid).c_str()) + 1))
++{
++	m_slot = std::clamp(std::atoi(std::string(uuid).c_str()), 0, PS4PadControllerProvider::kMaxPads - 1);
 +}
 +
 +bool PS4PadController::is_connected()
 +{
 +	OrbisPadData data{};
-+	return m_provider && m_provider->Read(data);
++	return m_provider && m_provider->Read(m_slot, data);
 +}
 +
 +std::string PS4PadController::get_button_name(uint64 button) const
@@ -9287,7 +9515,7 @@ index 0000000..53ccb9f
 +bool PS4PadController::ReadTouch(glm::vec2& position)
 +{
 +	OrbisPadData data{};
-+	const bool read = !g_crema_touchpad_buttons && !g_crema_menu_open && m_provider && m_provider->Read(data);
++	const bool read = !g_crema_touchpad_buttons && !g_crema_menu_open && m_provider && m_provider->Read(m_slot, data);
 +	const bool finger = read && data.touch.fingers > 0;
 +	const bool touching = finger && data.touch.fingers == 1 && (data.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD);
 +	if (finger)
@@ -9295,12 +9523,14 @@ index 0000000..53ccb9f
 +		position.x = std::clamp((float)data.touch.touch[0].x / m_provider->m_touchMaxX, 0.0f, 1.0f);
 +		position.y = std::clamp((float)data.touch.touch[0].y / m_provider->m_touchMaxY, 0.0f, 1.0f);
 +	}
++	if (m_slot != 0)
++		return m_hoverPointer ? finger : touching; // the overlay's cursor is player 1's
 +	std::scoped_lock lock(sCursorMutex);
 +	sCursorFinger = finger;
 +	sCursorTouching = touching;
 +	if (finger)
 +		sCursorPosition = position;
-+	return touching;
++	return m_hoverPointer ? finger : touching;
 +}
 +
 +bool PS4PadController::has_position()
@@ -9323,7 +9553,7 @@ index 0000000..53ccb9f
 +MotionSample PS4PadController::get_motion_sample()
 +{
 +	OrbisPadData data{};
-+	if (!has_motion() || !m_provider->Read(data))
++	if (!has_motion() || !m_provider->Read(m_slot, data))
 +		return {};
 +	const vec_float3& acceleration = data.vel;
 +	const vec_float3& angularVelocity = data.acell;
@@ -9354,7 +9584,7 @@ index 0000000..53ccb9f
 +{
 +	ControllerState result{};
 +	OrbisPadData data{};
-+	if (g_crema_menu_open || !m_provider || !m_provider->Read(data))
++	if (g_crema_menu_open || !m_provider || !m_provider->Read(m_slot, data))
 +		return result;
 +	const uint32 b = data.buttons;
 +	const std::pair<uint32, uint32> buttons[] = {
@@ -9390,17 +9620,19 @@ index 0000000..53ccb9f
 +}
 diff --git a/src/input/api/PS4/PS4PadController.h b/src/input/api/PS4/PS4PadController.h
 new file mode 100644
-index 0000000..0668b7c
+index 0000000..2f3151f
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,91 @@
 +#pragma once
 +
 +#include "input/api/Controller.h"
 +#include "input/api/ControllerProvider.h"
 +#include "input/motion/MotionHandler.h"
 +
-+// The PS4's DualShock 4 (ScePad) of the initial user. Buttons use SDL's gamepad indices so the
++// The PS4's DualShock 4s (ScePad): one per signed-in user, up to four (local multiplayer). Slot 0
++// is the initial user's pad (the menus read it too); users who sign in later get the next free
++// slot, a controller's uuid is its slot ("0" .. "3"). Buttons use SDL's gamepad indices so the
 +// emulated controllers' SDL default mappings apply: 0 cross, 1 circle, 2 square, 3 triangle,
 +// 4 back (two-finger touchpad click, left half), 5 guide (two-finger touchpad click, right half),
 +// 6 start (OPTIONS), 7/8 L3/R3, 9/10 L1/R1, 11-14 d-pad up/down/left/right.
@@ -9418,19 +9650,31 @@ index 0000000..0668b7c
 +
 +	std::vector<std::shared_ptr<ControllerBase>> get_controllers() override;
 +
-+private:
-+	bool Read(struct OrbisPadData& data);
++	static constexpr int kMaxPads = 4;
 +
++private:
++	bool Read(int slot, struct OrbisPadData& data);
++	bool HasMotion(int slot);
++	// opens the pads of users who signed in since (at most every few seconds)
++	void Refresh(bool force = false);
++	void Open(int slot, int32_t user);
++
++	struct Pad
++	{
++		int handle = -1;
++		int32_t user = -1;
++		bool motion = false;
++	};
 +	std::mutex m_mutex;
-+	int m_handle = -1;
-+	bool m_hasMotion = false;
++	Pad m_pads[kMaxPads];
++	std::chrono::steady_clock::time_point m_lastRefresh{};
 +	float m_touchMaxX = 1919.0f, m_touchMaxY = 942.0f; // touchpad coordinate range
 +};
 +
 +class PS4PadController : public Controller<PS4PadControllerProvider>
 +{
 +public:
-+	PS4PadController();
++	explicit PS4PadController(std::string_view uuid = "0");
 +
 +	std::string_view api_name() const override
 +	{
@@ -9445,7 +9689,11 @@ index 0000000..0668b7c
 +	bool has_position() override;
 +	glm::vec2 get_position() override;
 +
-+	bool has_motion() override { return m_provider && m_provider->m_hasMotion; }
++	bool has_motion() override { return m_provider && m_provider->HasMotion(m_slot); }
++	// a Wii Remote's pointer: a finger on the touchpad points (no click needed); the GamePad's
++	// touch screen is touched by a click
++	void set_hover_pointer(bool hover) { m_hoverPointer = hover; }
++	int slot() const { return m_slot; }
 +	MotionSample get_motion_sample() override;
 +
 +protected:
@@ -9454,6 +9702,8 @@ index 0000000..0668b7c
 +private:
 +	bool ReadTouch(glm::vec2& position);
 +
++	int m_slot = 0;
++	bool m_hoverPointer = false;
 +	std::mutex m_motionMutex;
 +	WiiUMotionHandler m_motionHandler;
 +	MotionSample m_motionSample{};
@@ -9465,6 +9715,107 @@ index 0000000..0668b7c
 +// The finger on the touchpad, for the pointer over the game image (LatteRenderTarget.cpp): false
 +// without a finger, else its position (0..1 on the screen) and whether it touches the screen.
 +bool PS4Pad_GetTouchCursor(glm::vec2& position, bool& touching);
+diff --git a/src/input/emulated/ClassicController.cpp b/src/input/emulated/ClassicController.cpp
+index 8328a10..cddc6b1 100644
+--- a/src/input/emulated/ClassicController.cpp
++++ b/src/input/emulated/ClassicController.cpp
+@@ -209,6 +209,44 @@ bool ClassicController::set_default_mapping(const std::shared_ptr<ControllerBase
+ 			};
+ 		}
+ 	}
++#endif
++#ifdef __ORBIS__
++	case InputAPI::PS4Pad:
++	{
++		// the DualShock 4 (PS4PadController.h: SDL gamepad indices), Wii U face buttons by position
++		mapping =
++		{
++			{kButtonId_A, kButton1},
++			{kButtonId_B, kButton0},
++			{kButtonId_X, kButton3},
++			{kButtonId_Y, kButton2},
++
++			{kButtonId_L, kButton9},
++			{kButtonId_R, kButton10},
++			{kButtonId_ZL, kTriggerXP},
++			{kButtonId_ZR, kTriggerYP},
++
++			{kButtonId_Plus, kButton6},
++			{kButtonId_Minus, kButton4},
++			{kButtonId_Home, kButton5},
++
++			{kButtonId_Up, kButton11},
++			{kButtonId_Down, kButton12},
++			{kButtonId_Left, kButton13},
++			{kButtonId_Right, kButton14},
++
++			{kButtonId_StickL_Up, kAxisYN},
++			{kButtonId_StickL_Down, kAxisYP},
++			{kButtonId_StickL_Left, kAxisXN},
++			{kButtonId_StickL_Right, kAxisXP},
++
++			{kButtonId_StickR_Up, kRotationYN},
++			{kButtonId_StickR_Down, kRotationYP},
++			{kButtonId_StickR_Left, kRotationXN},
++			{kButtonId_StickR_Right, kRotationXP},
++		};
++		break;
++	}
+ #endif
+ 	case InputAPI::XInput:
+ 	{
+diff --git a/src/input/emulated/ProController.cpp b/src/input/emulated/ProController.cpp
+index bb584c1..74ea432 100644
+--- a/src/input/emulated/ProController.cpp
++++ b/src/input/emulated/ProController.cpp
+@@ -222,6 +222,47 @@ bool ProController::set_default_mapping(const std::shared_ptr<ControllerBase>& c
+ 		}
+ 		break;
+ 	}
++#endif
++#ifdef __ORBIS__
++	case InputAPI::PS4Pad:
++	{
++		// the DualShock 4 (PS4PadController.h: SDL gamepad indices), Wii U face buttons by position
++		mapping =
++		{
++			{kButtonId_A, kButton1},
++			{kButtonId_B, kButton0},
++			{kButtonId_X, kButton3},
++			{kButtonId_Y, kButton2},
++
++			{kButtonId_L, kButton9},
++			{kButtonId_R, kButton10},
++			{kButtonId_ZL, kTriggerXP},
++			{kButtonId_ZR, kTriggerYP},
++
++			{kButtonId_Plus, kButton6},
++			{kButtonId_Minus, kButton4},
++			{kButtonId_Home, kButton5},
++
++			{kButtonId_Up, kButton11},
++			{kButtonId_Down, kButton12},
++			{kButtonId_Left, kButton13},
++			{kButtonId_Right, kButton14},
++
++			{kButtonId_StickL, kButton7},
++			{kButtonId_StickR, kButton8},
++
++			{kButtonId_StickL_Up, kAxisYN},
++			{kButtonId_StickL_Down, kAxisYP},
++			{kButtonId_StickL_Left, kAxisXN},
++			{kButtonId_StickL_Right, kAxisXP},
++
++			{kButtonId_StickR_Up, kRotationYN},
++			{kButtonId_StickR_Down, kRotationYP},
++			{kButtonId_StickR_Left, kRotationXN},
++			{kButtonId_StickR_Right, kRotationXP},
++		};
++		break;
++	}
+ #endif
+ 	case InputAPI::XInput:
+ 	{
 diff --git a/src/input/emulated/VPADController.cpp b/src/input/emulated/VPADController.cpp
 index a791c5f..51ae4f5 100644
 --- a/src/input/emulated/VPADController.cpp
@@ -9517,6 +9868,69 @@ index a791c5f..51ae4f5 100644
  #endif
  	case InputAPI::XInput:
  	{
+diff --git a/src/input/emulated/WiimoteController.cpp b/src/input/emulated/WiimoteController.cpp
+index 46921f8..268badf 100644
+--- a/src/input/emulated/WiimoteController.cpp
++++ b/src/input/emulated/WiimoteController.cpp
+@@ -56,7 +56,58 @@ bool WiimoteController::set_default_mapping(const std::shared_ptr<ControllerBase
+ 			{kButtonId_Nunchuck_Left, kAxisXN},
+ 			{kButtonId_Nunchuck_Right, kAxisXP},
+ 		};
++		break;
+ 	}
++#ifdef __ORBIS__
++	case InputAPI::PS4Pad:
++	{
++		// the DualShock 4 (PS4PadController.h: SDL gamepad indices)
++		if (m_device_type == kWAPDevFreestyle)
++		{
++			// upright with the Nunchuk: its stick on the left stick, Z and C on L2 and L1
++			mapping =
++			{
++				{kButtonId_A, kButton0},
++				{kButtonId_B, kTriggerYP},
++				{kButtonId_1, kButton2},
++				{kButtonId_2, kButton1},
++				{kButtonId_Plus, kButton6},
++				{kButtonId_Minus, kButton4},
++				{kButtonId_Home, kButton5},
++				{kButtonId_Up, kButton11},
++				{kButtonId_Down, kButton12},
++				{kButtonId_Left, kButton13},
++				{kButtonId_Right, kButton14},
++				{kButtonId_Nunchuck_Z, kTriggerXP},
++				{kButtonId_Nunchuck_C, kButton9},
++				{kButtonId_Nunchuck_Up, kAxisYN},
++				{kButtonId_Nunchuck_Down, kAxisYP},
++				{kButtonId_Nunchuck_Left, kAxisXN},
++				{kButtonId_Nunchuck_Right, kAxisXP},
++			};
++		}
++		else
++		{
++			// alone, held sideways (the D-pad on the left): turned a quarter, so the DualShock 4's
++			// left is the remote's up; 2 and 1 under the right thumb
++			mapping =
++			{
++				{kButtonId_2, kButton0},
++				{kButtonId_1, kButton2},
++				{kButtonId_A, kButton1},
++				{kButtonId_B, kButton3},
++				{kButtonId_Plus, kButton6},
++				{kButtonId_Minus, kButton4},
++				{kButtonId_Home, kButton5},
++				{kButtonId_Up, kButton13},
++				{kButtonId_Down, kButton14},
++				{kButtonId_Left, kButton12},
++				{kButtonId_Right, kButton11},
++			};
++		}
++		break;
++	}
++#endif
+ 	}
+ 
+ 	bool mapping_updated = false;
 diff --git a/src/main.cpp b/src/main.cpp
 index ab91559..e04e1d3 100644
 --- a/src/main.cpp
