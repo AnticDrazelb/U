@@ -129,7 +129,18 @@ int traceFd() {
         // After a game stopped, the launcher starts: the game's trace is kept as
         // boot-trace-game.log (the note for the launcher is there until it shows it).
         struct stat st;
-        if (stat("/data/Crema/last-stop.txt", &st) == 0)
+        // ... and after any game run (its trace names the game early on), so a game that ended
+        // by itself - the HOME button, its own exit - keeps its trace too
+        static char head[2048];
+        bool gameRun = false;
+        const int previous = open("/data/Crema/boot-trace.log", O_RDONLY);
+        if (previous >= 0) {
+            const ssize_t n = read(previous, head, sizeof(head) - 1);
+            close(previous);
+            head[n > 0 ? n : 0] = 0;
+            gameRun = strstr(head, "] game: ") != nullptr;
+        }
+        if (gameRun || stat("/data/Crema/last-stop.txt", &st) == 0)
             rename("/data/Crema/boot-trace.log", "/data/Crema/boot-trace-game.log");
         g_traceFd = open("/data/Crema/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
