@@ -2345,10 +2345,10 @@ index e037395..16d1086 100644
      #include <csignal>
      #define DEBUG_BREAK raise(SIGTRAP) 
 diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
-index b54d3ef..60421e5 100644
+index b54d3ef..f500fd3 100644
 --- a/src/Common/unix/FileStream_unix.cpp
 +++ b/src/Common/unix/FileStream_unix.cpp
-@@ -1,5 +1,129 @@
+@@ -1,5 +1,165 @@
  #include "Common/unix/FileStream_unix.h"
  #include <cstdarg>
 +#include <cerrno>
@@ -2368,13 +2368,15 @@ index b54d3ef..60421e5 100644
 +#if defined(__ORBIS__)
 +#include <map>
 +#include <mutex>
++#include <set>
++#include <dirent.h>
 +// Crema: the open file streams, to find what fills the PS4's descriptor table (1.71: Tekken Tag
 +// Tournament 2 crashed after 10 min with EMFILE at ~268 descriptors). ps4_filestream_report()
 +// writes the folders with the most open files to the boot trace.
 +namespace
 +{
 +	std::mutex s_openStreamsLock;
-+	std::map<const FileStream*, std::string> s_openStreams;
++	std::map<const FileStream*, std::pair<std::string, int>> s_openStreams; // path, descriptor
 +}
 +
 +extern "C" void ps4_boot_trace(const char* stage);
@@ -2387,8 +2389,9 @@ index b54d3ef..60421e5 100644
 +	{
 +		std::lock_guard lock(s_openStreamsLock);
 +		total = s_openStreams.size();
-+		for (auto& [stream, path] : s_openStreams)
++		for (auto& [stream, entry] : s_openStreams)
 +		{
++			const std::string& path = entry.first;
 +			const size_t slash = path.find_last_of('/');
 +			perFolder[slash == std::string::npos ? path : path.substr(0, slash)]++;
 +		}
@@ -2408,69 +2411,102 @@ index b54d3ef..60421e5 100644
 +	ps4_open_files_report();
 +}
 +
-+// Every open file of the process, from the kernel (FreeBSD's kern.proc.filedesc): v01.73 showed only
-+// ~95 of the ~250 open files were FileStreams, and the PS4 refuses new files at ~250 distinct opens
-+// (a dup()ed descriptor costs nothing: 4096 dups worked).
-+extern "C" int sysctl(const int* name, unsigned int namelen, void* oldp, size_t* oldlenp, const void* newp, size_t newlen);
++// The open regular files that aren't FileStreams, named by matching their inode against the files
++// under /data/Crema and /app0: v01.73 showed only ~95 of the ~250 open files were FileStreams, the
++// rest grew during play, and the PS4 refuses new files at ~250 distinct opens (a dup()ed descriptor
++// costs nothing: 4096 dups worked). The kernel's file list (kern.proc.filedesc) has no paths here.
++namespace
++{
++	using FileKey = std::pair<uint64_t, uint64_t>; // device, inode
++
++	// one descriptor per folder level while it runs
++	void FindFiles(const std::string& folder, std::map<FileKey, std::string>& wanted, size_t& left, int depth)
++	{
++		if (left == 0 || depth > 12)
++			return;
++		DIR* dir = opendir(folder.c_str());
++		if (!dir)
++			return;
++		std::vector<std::string> subfolders;
++		while (dirent* entry = readdir(dir))
++		{
++			if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
++				continue;
++			std::string path = folder == "/" ? "/" + std::string(entry->d_name) : folder + "/" + entry->d_name;
++			struct stat info;
++			if (lstat(path.c_str(), &info) != 0)
++				continue;
++			if (S_ISDIR(info.st_mode))
++				subfolders.push_back(std::move(path));
++			else if (S_ISREG(info.st_mode))
++			{
++				auto it = wanted.find({(uint64_t)info.st_dev, (uint64_t)info.st_ino});
++				if (it != wanted.end() && it->second.empty())
++				{
++					it->second = std::move(path);
++					left--;
++				}
++			}
++		}
++		closedir(dir);
++		for (auto& subfolder : subfolders)
++			FindFiles(subfolder, wanted, left, depth + 1);
++	}
++}
 +
 +extern "C" void ps4_open_files_report()
 +{
-+	// FreeBSD 9 struct kinfo_file: kf_structsize, kf_type, kf_fd ... kf_path at byte 368; the
-+	// records are packed (each kf_structsize long)
-+	constexpr size_t kPathOffset = 368, kFullSize = 1392;
-+	const int mib[4] = {1 /* CTL_KERN */, 14 /* KERN_PROC */, 33 /* KERN_PROC_FILEDESC */, (int)getpid()};
-+	char line[400];
-+	size_t size = 0;
-+	if (sysctl(mib, 4, nullptr, &size, nullptr, 0) != 0)
++	std::set<int> streamFds;
 +	{
-+		snprintf(line, sizeof(line), "open files (kernel): not available (errno %d)", errno);
-+		ps4_boot_trace(line);
-+		return;
++		std::lock_guard lock(s_openStreamsLock);
++		for (auto& [stream, entry] : s_openStreams)
++			streamFds.insert(entry.second);
 +	}
-+	size += size / 4;
-+	std::vector<char> buffer(size);
-+	if (sysctl(mib, 4, buffer.data(), &size, nullptr, 0) != 0)
++	struct Other
 +	{
-+		snprintf(line, sizeof(line), "open files (kernel): not available (errno %d)", errno);
-+		ps4_boot_trace(line);
-+		return;
-+	}
-+	std::map<std::string, int> perFolder;
-+	std::map<int, int> perType;
-+	int total = 0, unnamed = 0;
-+	std::string sample;
-+	for (size_t at = 0; at + kPathOffset <= size;)
++		int fd;
++		FileKey key;
++		uint64_t size;
++	};
++	std::vector<Other> others;
++	std::map<FileKey, std::string> names;
++	for (int fd = 0; fd < 4096; fd++)
 +	{
-+		const char* record = buffer.data() + at;
-+		int recordSize, type;
-+		memcpy(&recordSize, record, 4);
-+		memcpy(&type, record + 4, 4);
-+		if (recordSize < (int)kPathOffset || recordSize > (int)kFullSize || at + recordSize > size)
-+			break;
-+		total++;
-+		perType[type]++;
-+		std::string path(record + kPathOffset, strnlen(record + kPathOffset, recordSize - kPathOffset));
-+		if (path.empty())
-+			unnamed++;
-+		else
-+		{
-+			const size_t slash = path.find_last_of('/');
-+			perFolder[slash == std::string::npos || slash == 0 ? path : path.substr(0, slash)]++;
-+		}
-+		at += recordSize;
++		struct stat info;
++		if (streamFds.count(fd) || fstat(fd, &info) != 0 || !S_ISREG(info.st_mode))
++			continue;
++		const FileKey key{(uint64_t)info.st_dev, (uint64_t)info.st_ino};
++		others.push_back({fd, key, (uint64_t)info.st_size});
++		names.emplace(key, std::string());
 +	}
-+	std::string types;
-+	for (auto& [type, count] : perType)
-+		types += (types.empty() ? "type " : ", type ") + std::to_string(type) + ": " + std::to_string(count);
-+	snprintf(line, sizeof(line), "open files (kernel): %d, %d without a path (%s)", total, unnamed, types.c_str());
-+	ps4_boot_trace(line);
++	size_t left = names.size();
++	for (const char* root : {"/data/Crema", "/app0"})
++		FindFiles(root, names, left, 0);
++	// by file (several descriptors may be the same file), most first
++	std::map<std::string, int> perFile;
++	for (auto& other : others)
++	{
++		const std::string& name = names[other.key];
++		perFile[name.empty() ? "? inode " + std::to_string(other.key.second) + ", " + std::to_string(other.size) + " bytes" : name]++;
++	}
 +	std::vector<std::pair<int, std::string>> sorted;
-+	for (auto& [folder, count] : perFolder)
-+		sorted.emplace_back(count, folder);
++	for (auto& [file, count] : perFile)
++		sorted.emplace_back(count, file);
 +	std::sort(sorted.rbegin(), sorted.rend());
++	char line[400];
++	snprintf(line, sizeof(line), "other open files: %zu descriptors, %zu files, %zu not found by name", others.size(), names.size(), left);
++	ps4_boot_trace(line);
 +	for (size_t i = 0; i < sorted.size() && i < 16; i++)
 +	{
-+		snprintf(line, sizeof(line), "  %d in %s", sorted[i].first, sorted[i].second.c_str());
++		snprintf(line, sizeof(line), "  %dx %s", sorted[i].first, sorted[i].second.c_str());
++		ps4_boot_trace(line);
++	}
++	// the newest (descriptors are given lowest first, so the latest leaks have the highest numbers)
++	for (size_t i = others.size() > 6 ? others.size() - 6 : 0; i < others.size(); i++)
++	{
++		const std::string& name = names[others[i].key];
++		snprintf(line, sizeof(line), "  newest: fd %d %s (%llu bytes)", others[i].fd, name.empty() ? "?" : name.c_str(),
++			(unsigned long long)others[i].size);
 +		ps4_boot_trace(line);
 +	}
 +}
@@ -2478,7 +2514,7 @@ index b54d3ef..60421e5 100644
  
  fs::path findPathCI(const fs::path& path)
  {
-@@ -82,28 +206,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
+@@ -82,28 +242,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
  void FileStream::SetPosition(uint64 pos)
  {
  	cemu_assert(m_isValid);
@@ -2515,7 +2551,7 @@ index b54d3ef..60421e5 100644
  }
  
  void FileStream::extract(std::vector<uint8>& data)
-@@ -116,15 +235,21 @@ void FileStream::extract(std::vector<uint8>& data)
+@@ -116,15 +271,21 @@ void FileStream::extract(std::vector<uint8>& data)
  
  void FileStream::Flush()
  {
@@ -2542,7 +2578,7 @@ index b54d3ef..60421e5 100644
  }
  
  bool FileStream::readU64(uint64& v)
-@@ -161,9 +286,16 @@ bool FileStream::readLine(std::string& line)
+@@ -161,9 +322,16 @@ bool FileStream::readLine(std::string& line)
  
  sint32 FileStream::writeData(const void* data, sint32 length)
  {
@@ -2562,7 +2598,7 @@ index b54d3ef..60421e5 100644
  }
  
  void FileStream::writeU64(uint64 v)
-@@ -203,44 +335,38 @@ void FileStream::writeLine(const char* str)
+@@ -203,44 +371,38 @@ void FileStream::writeLine(const char* str)
  
  FileStream::~FileStream()
  {
@@ -2621,7 +2657,7 @@ index b54d3ef..60421e5 100644
 +	if (m_fd >= 0)
 +	{
 +		std::lock_guard lock(s_openStreamsLock);
-+		s_openStreams[this] = m_path.generic_string();
++		s_openStreams[this] = {m_path.generic_string(), m_fd};
 +	}
 +#endif
  }
