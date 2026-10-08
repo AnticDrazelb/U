@@ -230,6 +230,130 @@ index d4b41b9..b111c13 100644
  	else if( srcRegister >= 4 )
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
+index 935e61a..0ca1801 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
+@@ -1585,12 +1585,34 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
+ 	IMLRA_extendAbstractRangeToBeginningOfSegment(ctx, route[routeDepth - 1], regId);
+ }
+ 
+-void _IMLRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegment* currentSegment, IMLRegID regID, sint32 distanceLeft, IMLSegment** route, sint32 routeDepth)
++// Crema: the search below looked at every path through the following segments, without
++// remembering any: a chain of n small if/else blocks gives 2^n paths, and the recompiler took
++// seconds per function (up to 38 s) on the PS4. Now each segment remembers, per search, the
++// largest budget it was explored with (and at which depth) and the smallest budget that reaches
++// a range from it. A later arrival with no more budget only connects its own route up to that
++// segment when a range is reachable: the segments past it were already extended by the first
++// exploration, and range extension only ever widens, so the result is the same.
++namespace
++{
++	struct RaExtendMemo
++	{
++		uint32 stamp = 0;
++		sint32 exploredBudget = 0;
++		sint32 exploredDepth = 0;
++		sint32 minNeeded = 0; // budget needed here to reach a range; kNoRange: none within exploredBudget
++	};
++	constexpr sint32 kNoRange = 0x3FFFFFFF;
++	thread_local std::vector<RaExtendMemo> t_raExtendMemo;
++	thread_local uint32 t_raExtendStamp = 0;
++}
++
++// returns the budget needed at currentSegment to reach a range (kNoRange: none found)
++static sint32 _IMLRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegment* currentSegment, IMLRegID regID, sint32 distanceLeft, IMLSegment** route, sint32 routeDepth)
+ {
+ 	if (routeDepth >= 64)
+ 	{
+ 		cemuLog_logDebug(LogType::Force, "Recompiler RA route maximum depth exceeded\n");
+-		return;
++		return kNoRange;
+ 	}
+ 	route[routeDepth] = currentSegment;
+ 
+@@ -1598,29 +1620,53 @@ void _IMLRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegment*
+ 
+ 	if (!range)
+ 	{
++		const sint32 segmentSize = (sint32)currentSegment->imlList.size();
++		RaExtendMemo* memo = nullptr;
++		if ((size_t)currentSegment->momentaryIndex < t_raExtendMemo.size())
++			memo = &t_raExtendMemo[currentSegment->momentaryIndex];
++		if (memo && memo->stamp == t_raExtendStamp && distanceLeft <= memo->exploredBudget && routeDepth >= memo->exploredDepth)
++		{
++			// explored before with at least this budget and depth
++			if (memo->minNeeded <= distanceLeft)
++				IMLRA_connectAbstractRanges(ctx, regID, route, routeDepth + 1);
++			return memo->minNeeded;
++		}
+ 		// measure distance over entire segment
+-		distanceLeft -= (sint32)currentSegment->imlList.size();
+-		if (distanceLeft > 0)
++		sint32 childNeeded = kNoRange;
++		const sint32 remaining = distanceLeft - segmentSize;
++		if (remaining > 0)
+ 		{
+ 			if (currentSegment->nextSegmentBranchNotTaken)
+-				_IMLRA_checkAndTryExtendRange(ctx, currentSegment->nextSegmentBranchNotTaken, regID, distanceLeft, route, routeDepth + 1);
++				childNeeded = std::min(childNeeded, _IMLRA_checkAndTryExtendRange(ctx, currentSegment->nextSegmentBranchNotTaken, regID, remaining, route, routeDepth + 1));
+ 			if (currentSegment->nextSegmentBranchTaken)
+-				_IMLRA_checkAndTryExtendRange(ctx, currentSegment->nextSegmentBranchTaken, regID, distanceLeft, route, routeDepth + 1);
++				childNeeded = std::min(childNeeded, _IMLRA_checkAndTryExtendRange(ctx, currentSegment->nextSegmentBranchTaken, regID, remaining, route, routeDepth + 1));
+ 		}
+-		return;
++		// a child is entered with remaining > 0 and must reach its range within remaining
++		const sint32 needed = childNeeded == kNoRange ? kNoRange : segmentSize + std::max(childNeeded, 1);
++		if (memo)
++		{
++			memo->stamp = t_raExtendStamp;
++			memo->exploredBudget = distanceLeft;
++			memo->exploredDepth = routeDepth;
++			memo->minNeeded = needed;
++		}
++		return needed;
+ 	}
+ 	else
+ 	{
+ 		// measure distance to range
++		sint32 needed;
+ 		if (range->usageStart == RA_INTER_RANGE_END)
+-		{
+-			if (distanceLeft < (sint32)currentSegment->imlList.size())
+-				return; // range too far away
+-		}
+-		else if (range->usageStart != RA_INTER_RANGE_START && range->usageStart > distanceLeft)
+-			return; // out of range
++			needed = (sint32)currentSegment->imlList.size();
++		else if (range->usageStart == RA_INTER_RANGE_START)
++			needed = 0;
++		else
++			needed = range->usageStart;
++		if (needed > distanceLeft)
++			return needed; // range too far away
+ 		// found close range -> connect ranges
+ 		IMLRA_connectAbstractRanges(ctx, regID, route, routeDepth + 1);
++		return needed;
+ 	}
+ }
+ 
+@@ -1638,6 +1684,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+ 	if (remainingScanDist <= 0)
+ 		return; // can't reach end
+ 
++	// a new search: the memo entries of earlier ones are stale
++	const size_t segmentCount = ctx.deprGenContext->segmentList2.size();
++	if (t_raExtendMemo.size() < segmentCount)
++		t_raExtendMemo.resize(segmentCount);
++	if (++t_raExtendStamp == 0)
++	{
++		for (auto& entry : t_raExtendMemo)
++			entry.stamp = 0;
++		t_raExtendStamp = 1;
++	}
++
+ 	IMLSegment* route[64];
+ 	route[0] = currentSegment;
+ 	if (currentSegment->nextSegmentBranchNotTaken)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 index c9758f3..e69427f 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
