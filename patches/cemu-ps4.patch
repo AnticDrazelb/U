@@ -837,6 +837,58 @@ index c9758f3..e2e4788 100644
      // clean up queues
      while(!s_ppcRecompilerState.targetQueue.empty())
          s_ppcRecompilerState.targetQueue.pop();
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
+index 89e805d..a7f3142 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
+@@ -8,6 +8,8 @@
+ #include "PPCFunctionBoundaryTracker.h"
+ #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
+ 
++extern bool g_crema_fast_cycles;
++
+ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
+ 
+ struct PPCBasicBlockInfo
+@@ -3115,6 +3117,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+ 	}
+ }
+ 
++bool g_crema_fast_cycles = true; // Crema: Settings > Emulation > Cycle Counting (CremaSettings.cpp)
++
+ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
+ {
+ 	std::vector<PPCBasicBlockInfo> basicBlockList = PPCRecompiler_DetermineBasicBlockRange(boundaryTracker, entryAddresses);
+@@ -3164,6 +3168,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+ 
+ 	// generate cycle counters
+ 	// in theory we could generate these as part of FillBasicBlock() but in the future we might use more complex logic to emit fewer operations
++	// Crema (Cycle Counting: Fast): the count is only checked at loop back-edges (and after HLE
++	// calls), where a thread can be preempted, so only loop latches (the loop's length) and entries
++	// (the function's length, at most 64) count; the other blocks' read-modify-write of
++	// remainingCycles (6% of the PS4's recompiled instructions in Tekken Tag Tournament 2) is gone.
++	uint32 functionInstructionCount = 0;
++	for (auto& bb : basicBlockList)
++		functionInstructionCount += (bb.lastAddress - bb.startAddress + 4) / 4;
+ 	for (size_t i = 0; i < basicBlockList.size(); i++)
+ 	{
+ 		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
+@@ -3171,6 +3182,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+ 
+ 		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
+ 		cemu_assert_debug(ppcInstructionCount > 0);
++		if (g_crema_fast_cycles)
++		{
++			if (basicBlockInfo.hasBranchTarget && basicBlockInfo.branchTarget <= basicBlockInfo.startAddress)
++				ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.branchTarget + 4) / 4;
++			else if (basicBlockInfo.isEnterable)
++				ppcInstructionCount = std::min<uint32>(functionInstructionCount, 64);
++			else
++				continue;
++		}
+ 
+ 		PPCRecompiler_pushBackIMLInstructions(seg, 0, 1);
+ 		seg->imlList[0].type = PPCREC_IML_TYPE_MACRO;
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..03ba035 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -6054,10 +6106,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..816b35f
+index 0000000..135cf3b
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,391 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -6068,6 +6120,7 @@ index 0000000..816b35f
 +#include "config/NetworkSettings.h"
 +
 +extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
++extern bool g_crema_fast_cycles; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Cycle Counting
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +
 +#include <atomic>
@@ -6118,6 +6171,8 @@ index 0000000..816b35f
 +		{"mii_data", "Mii Data When Missing", "Emulation",
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
++		{"cycle_counting", "Cycle Counting", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
++			"Fast: the recompiled code counts the emulated CPU's work only at loops and function starts (faster on the PS4). Exact: every block, as Cemu does. Use Exact if a game's timing misbehaves."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"When a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get turns (10 ms after waiting 10 ms). Fixes games that stop while loading (Tekken Tag Tournament 2's fights); sound may stutter there. Off: the Wii U's strict priorities."},
 +		// Audio
@@ -6402,6 +6457,7 @@ index 0000000..816b35f
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
++	g_crema_fast_cycles = get("cycle_counting") != "exact";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
 +	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
