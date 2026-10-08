@@ -1327,10 +1327,19 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..4a48dde 100644
+index 9fe4bea..e204912 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-@@ -47,6 +47,11 @@ sint32 activeThreadCount = 0;
+@@ -23,6 +23,8 @@
+ #endif
+ #endif
+ 
++extern uint64 _rdtscFrequency; // PPCTimer.cpp
++
+ static void ConfigureHostFloatingPointEnvironment()
+ {
+ #if defined(ARCH_X86_64)
+@@ -47,6 +49,11 @@ sint32 activeThreadCount = 0;
  
  void nnNfp_update();
  
@@ -1342,7 +1351,7 @@ index 9fe4bea..4a48dde 100644
  namespace coreinit
  {
  #ifdef __arm64__
-@@ -1180,6 +1185,9 @@ namespace coreinit
+@@ -1180,6 +1187,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -1352,7 +1361,81 @@ index 9fe4bea..4a48dde 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1391,6 +1399,11 @@ namespace coreinit
+@@ -1192,6 +1202,63 @@ namespace coreinit
+ 		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
+ 	}
+ 
++#if defined(__ORBIS__)
++	// Crema: Thread Fairness. The Wii U always runs the highest priority ready thread; a busy one
++	// that the PS4's slower cores can't finish in time (Tekken Tag Tournament 2's music decoder
++	// during a fight's loading) then keeps the lower ones from ever running, and the game stops.
++	// When a lower priority ready thread has waited kStarveTicks, the core gives the waiting ones
++	// kRescueTicks of turns (oldest first, round robin), then back to priorities.
++	std::atomic<bool> g_crema_thread_fairness{true};
++	uint64 s_starveSince[PPC_CORE_COUNT]{};
++	uint64 s_rescueUntil[PPC_CORE_COUNT]{};
++	uint64 s_fairnessRescues = 0;
++	extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
++
++	OSThread_t* __OSCremaFairnessPick(uint32 coreIndex, OSThreadQueue* runQueue, OSThread_t* selectedThread)
++	{
++		if (!g_crema_thread_fairness.load(std::memory_order_relaxed))
++			return selectedThread;
++		// the oldest ready thread of lower priority than the one chosen
++		OSThread_t* waiting = nullptr;
++		for (OSThread_t* t = runQueue->head.GetPtr(); t; t = t->linkRun[coreIndex].next.GetPtr())
++		{
++			if (t != selectedThread && t->effectivePriority > selectedThread->effectivePriority)
++			{
++				waiting = t;
++				break;
++			}
++		}
++		if (!waiting)
++		{
++			s_starveSince[coreIndex] = 0;
++			return selectedThread;
++		}
++		const uint64 now = PPCTimer_getRawTsc();
++		const uint64 starveTicks = ::_rdtscFrequency / 50;  // 20 ms
++		const uint64 rescueTicks = ::_rdtscFrequency / 200; // 5 ms
++		if (now < s_rescueUntil[coreIndex])
++			return waiting;
++		if (s_starveSince[coreIndex] == 0)
++		{
++			s_starveSince[coreIndex] = now;
++			return selectedThread;
++		}
++		if (now - s_starveSince[coreIndex] < starveTicks)
++			return selectedThread;
++		s_starveSince[coreIndex] = 0;
++		s_rescueUntil[coreIndex] = now + rescueTicks;
++		if ((s_fairnessRescues++ & 0x3FF) == 0)
++		{
++			char line[160];
++			snprintf(line, sizeof(line), "thread fairness: core %u gives waiting threads a turn (rescue %llu; thread %08x pri %d waited behind pri %d)",
++				coreIndex, (unsigned long long)s_fairnessRescues, memory_getVirtualOffsetFromPointer(waiting), (int)waiting->effectivePriority,
++				(int)selectedThread->effectivePriority);
++			ps4_boot_trace(line);
++		}
++		return waiting;
++	}
++#endif
++
+ 	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
+ 	{
+ 		cemu_assert_debug(__OSHasSchedulerLock());
+@@ -1210,6 +1277,9 @@ namespace coreinit
+ 				selectedThread = threadItr;
+ 			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
+ 		}
++#if defined(__ORBIS__)
++		selectedThread = __OSCremaFairnessPick(coreIndex, runQueue, selectedThread);
++#endif
+ 
+ 		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
+ 
+@@ -1391,6 +1461,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -5528,10 +5611,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..56e74b8
+index 0000000..f2fa5c7
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,387 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -5542,7 +5625,9 @@ index 0000000..56e74b8
 +#include "config/NetworkSettings.h"
 +
 +extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
++namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +
++#include <atomic>
 +#include <fstream>
 +#include <map>
 +#include <mutex>
@@ -5590,6 +5675,8 @@ index 0000000..56e74b8
 +		{"mii_data", "Mii Data When Missing", "Emulation",
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
++		{"thread_fairness", "Thread Fairness", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
++			"When a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get a short turn every 20 ms. Fixes games that stop while loading (Tekken Tag Tournament 2's fights); sound may stutter there. Off: the Wii U's strict priorities."},
 +		// Audio
 +		{"game_volume", "Game Volume", "Audio",
 +			{{"100", "100"}, {"90", "90"}, {"80", "80"}, {"70", "70"}, {"60", "60"}, {"50", "50"},
@@ -5872,6 +5959,7 @@ index 0000000..56e74b8
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
++	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
 +	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
