@@ -981,7 +981,7 @@ index c9758f3..e4481c0 100644
      while(!s_ppcRecompilerState.targetQueue.empty())
          s_ppcRecompilerState.targetQueue.pop();
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..31e8f41 100644
+index 89e805d..58a4f31 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -1024,7 +1024,7 @@ index 89e805d..31e8f41 100644
  	}
  }
  
-+bool g_crema_fast_cycles = true; // Crema: Settings > Emulation > Cycle Counting (CremaSettings.cpp)
++bool g_crema_fast_cycles = false; // Crema: off - Fast froze and crashed Tekken Tag Tournament 2 (1.63-1.65), the setting was removed
 +
  bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
  {
@@ -6277,10 +6277,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..b28b1da
+index 0000000..d03cb38
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,392 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -6345,8 +6345,6 @@ index 0000000..b28b1da
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
 +		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
-+		{"cycle_counting", "Cycle Counting", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
-+			"Fast: the recompiled code counts the emulated CPU's work only at loops and function starts (faster on the PS4). Exact: every block, as Cemu does. Use Exact if a game's timing misbehaves."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"When a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get turns (10 ms after waiting 10 ms). Fixes games that stop while loading (Tekken Tag Tournament 2's fights); sound may stutter there. Off: the Wii U's strict priorities."},
 +		// Audio
@@ -6631,7 +6629,6 @@ index 0000000..b28b1da
 +	config.gx2drawdone_sync = accurate;
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
-+	g_crema_fast_cycles = get("cycle_counting") != "exact";
 +	g_crema_fast_compares = get("compare_results") != "exact";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
