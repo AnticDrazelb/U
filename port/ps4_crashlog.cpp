@@ -193,9 +193,15 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     if (s_depth++ > 0)
         _exit(128 + sig);
 
-    const int fd = open("/data/Crema/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd < 0 && traceFd() >= 0)  // (1.69: a crash left no report; opening files was failing)
-        writeFormat(traceFd(), "signal %d: crash.log cannot be opened (errno %d)\n", sig, errno);
+    int fd = open("/data/Crema/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    const bool ownFile = fd >= 0;
+    if (!ownFile && traceFd() >= 0) {  // (1.69: a crash left no report; opening files was failing)
+        // the report then goes to the boot trace, which is already open (1.73: the PS4's open file
+        // limit was reached and the crash left no report)
+        writeFormat(traceFd(), "signal %d: crash.log cannot be opened (errno %d), the report follows here\n", sig,
+                    errno);
+        fd = traceFd();
+    }
     if (fd >= 0) {
         const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
         const uint64_t rip = regs[kRipIndex];
@@ -228,10 +234,11 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
                 found++;
             }
         }
-        close(fd);
+        if (ownFile)
+            close(fd);
     }
     if (traceFd() >= 0)
-        writeAll(traceFd(), "crashed (see crash.log)\n");
+        writeAll(traceFd(), ownFile ? "crashed (see crash.log)\n" : "crashed\n");
     if (ps4_crash_note)
         ps4_crash_note();
 
