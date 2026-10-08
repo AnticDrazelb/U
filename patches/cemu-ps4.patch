@@ -5239,10 +5239,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..4f7621e
+index 0000000..058f853
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,796 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5278,6 +5278,7 @@ index 0000000..4f7621e
 +#include <png.h>
 +
 +#include <fcntl.h>
++#include <sys/stat.h>
 +#include <unistd.h>
 +
 +#include <orbis/Pad.h>
@@ -5326,7 +5327,27 @@ index 0000000..4f7621e
 +		sPrevSpan = span;
 +		char threads[640];
 +		ps4_thread_busy_report(threads, sizeof(threads), 10);
-+		Trace(fmt::format("perf: gpu {}% | {}", spanDelta ? busyDelta * 100 / spanDelta : 0, threads));
++		// open file descriptors by kind (1.67: after 10 min of Tekken Tag Tournament 2 no file could
++		// be opened any more - its save and hang.log failed - and the game froze)
++		int files = 0, sockets = 0, pipes = 0, devices = 0, others = 0;
++		for (int fd = 0; fd < 4096; fd++)
++		{
++			struct stat info;
++			if (fstat(fd, &info) != 0)
++				continue;
++			if (S_ISREG(info.st_mode))
++				files++;
++			else if (S_ISSOCK(info.st_mode))
++				sockets++;
++			else if (S_ISFIFO(info.st_mode))
++				pipes++;
++			else if (S_ISCHR(info.st_mode))
++				devices++;
++			else
++				others++;
++		}
++		Trace(fmt::format("perf: gpu {}% | {} | fds {} (files {}, sockets {}, pipes {}, devices {}, other {})",
++			spanDelta ? busyDelta * 100 / spanDelta : 0, threads, files + sockets + pipes + devices + others, files, sockets, pipes, devices, others));
 +	}
 +
 +	// Hang watchdog: when the main loop's heartbeat or the TV frames stop for 15 s, the stacks of

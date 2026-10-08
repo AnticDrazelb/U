@@ -13,6 +13,7 @@
 // Started by ps4_sampler_start() (DolphinNoGUI, ps4.ini profile=on); threads register
 // themselves with ps4_sampler_register_thread().
 
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -462,8 +463,12 @@ extern "C" __attribute__((weak)) void ps4_hang_guest_threads(int fd);  // the em
 // Writes every watched thread's stack to `path` (appending), headed by `reason`.
 extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
     const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd < 0)
+    if (fd < 0) {
+        char line[200];
+        snprintf(line, sizeof(line), "hang report: cannot open %s (errno %d)", path, errno);
+        ps4_boot_trace(line);
         return;
+    }
     char line[256];
     snprintf(line, sizeof(line), "==== %s (eboot addresses relative to .text, symbolize with "
                                  "llvm-symbolizer --obj=<oelf>)\n", reason);
