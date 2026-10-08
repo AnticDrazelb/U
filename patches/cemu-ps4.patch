@@ -250,15 +250,14 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..9af8651 100644
+index 935e61a..612f403 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -14,10 +14,24 @@
+@@ -14,10 +14,23 @@
  #include <boost/container/small_vector.hpp>
  
  #include "Common/cpu_features.h"
 +#include <atomic>
-+#include <memory_resource>
  
  #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
  #define DEBUG_RA_INSTRUCTION_GEN 0
@@ -278,26 +277,20 @@ index 935e61a..9af8651 100644
  struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per register and segment
  {
  	IMLRARegAbstractLiveness(IMLRegFormat regBaseFormat, sint32 usageStart, sint32 usageEnd)
-@@ -35,17 +49,24 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
+@@ -35,6 +48,8 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
  	IMLRegFormat regBaseFormat;
  };
  
-+// Crema: the per segment range maps' entries come from one arena per register allocation instead
-+// of an allocation each (much of the range merging's time on the PS4). Still std::unordered_map:
-+// the merging inserts into maps it iterates, which Boost's node map (1.60) did not survive - the
-+// app froze.
-+using IMLRAAbstractRangeMap = std::pmr::unordered_map<IMLRegID, IMLRARegAbstractLiveness>;
++using IMLRAAbstractRangeMap = std::unordered_map<IMLRegID, IMLRARegAbstractLiveness>;
 +
  struct IMLRegisterAllocatorContext
  {
  	IMLRegisterAllocatorParameters* raParam;
- 	ppcImlGenContext_t* deprGenContext; // deprecated. Try to decouple IMLRA from other parts of IML/PPCRec
+@@ -42,10 +57,10 @@ struct IMLRegisterAllocatorContext
  
  	std::unordered_map<IMLRegID, IMLRegFormat> regIdToBaseFormat;
--	// first pass
+ 	// first pass
 -	std::vector<std::unordered_map<IMLRegID, IMLRARegAbstractLiveness>> perSegmentAbstractRanges;
-+	// first pass (the arena before the maps: it outlives them)
-+	std::pmr::monotonic_buffer_resource rangeArena{64 * 1024};
 +	std::vector<IMLRAAbstractRangeMap> perSegmentAbstractRanges;
  
  	// helper methods
@@ -306,7 +299,7 @@ index 935e61a..9af8651 100644
  	{
  		return perSegmentAbstractRanges[imlSegment->momentaryIndex];
  	}
-@@ -196,9 +217,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+@@ -196,9 +211,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
  
  uint32 IMLRA_GetNextIterationIndex()
  {
@@ -318,7 +311,7 @@ index 935e61a..9af8651 100644
  }
  
  bool _detectLoop(IMLSegment* currentSegment, sint32 depth, uint32 iterationIndex, IMLSegment* imlSegmentLoopBase)
-@@ -1569,6 +1589,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
+@@ -1569,6 +1583,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
  
  void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regId, IMLSegment** route, sint32 routeDepth)
  {
@@ -326,7 +319,7 @@ index 935e61a..9af8651 100644
  #ifdef CEMU_DEBUG_ASSERT
  	if (routeDepth < 2)
  		assert_dbg();
-@@ -1585,42 +1606,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
+@@ -1585,42 +1600,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
  	IMLRA_extendAbstractRangeToBeginningOfSegment(ctx, route[routeDepth - 1], regId);
  }
  
@@ -432,7 +425,7 @@ index 935e61a..9af8651 100644
  	}
  }
  
-@@ -1638,6 +1709,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+@@ -1638,6 +1703,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
  	if (remainingScanDist <= 0)
  		return; // can't reach end
  
@@ -450,7 +443,7 @@ index 935e61a..9af8651 100644
  	IMLSegment* route[64];
  	route[0] = currentSegment;
  	if (currentSegment->nextSegmentBranchNotTaken)
-@@ -1698,8 +1780,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
+@@ -1698,8 +1774,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
  	}
  }
  
@@ -478,17 +471,6 @@ index 935e61a..9af8651 100644
  	for (size_t s = 0; s < ctx.deprGenContext->segmentList2.size(); s++)
  	{
  		IMLSegment* imlSegment = ctx.deprGenContext->segmentList2[s];
-@@ -2192,7 +2293,9 @@ void IMLRegisterAllocator_AllocateRegisters(ppcImlGenContext_t* ppcImlGenContext
- 
- 	IMLRA_ReshapeForRegisterAllocation(ppcImlGenContext);
- 	ppcImlGenContext->UpdateSegmentIndices(); // update momentaryIndex of each segment
--	ctx.perSegmentAbstractRanges.resize(ppcImlGenContext->segmentList2.size());
-+	ctx.perSegmentAbstractRanges.reserve(ppcImlGenContext->segmentList2.size());
-+	for (size_t i = 0; i < ppcImlGenContext->segmentList2.size(); i++)
-+		ctx.perSegmentAbstractRanges.emplace_back(std::pmr::polymorphic_allocator<std::pair<const IMLRegID, IMLRARegAbstractLiveness>>(&ctx.rangeArena));
- 	IMLRA_CalculateLivenessRanges(ctx);
- 	IMLRA_ProcessFlowAndCalculateLivenessRanges(ctx);
- 	IMLRA_AssignRegisters(ctx, ppcImlGenContext);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocatorRanges.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocatorRanges.cpp
 index fc03753..e652458 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocatorRanges.cpp

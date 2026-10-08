@@ -9,6 +9,10 @@
 #define ONLY_MSPACES 1
 #define MSPACES 1
 #define USE_LOCKS 1
+/* Blocking locks, not dlmalloc's spin-and-sched_yield ones: a waiter of higher priority only
+ * yields to its equals, so a lower priority thread holding the lock never got to release it
+ * (Crema 1.61: every busy thread stuck in mspace_malloc behind a recompiler worker). */
+#define USE_SPIN_LOCKS 0
 #define HAVE_MMAP 0
 #define HAVE_MREMAP 0
 #define HAVE_MORECORE 0
