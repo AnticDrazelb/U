@@ -5239,10 +5239,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..058f853
+index 0000000..731aec9
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,803 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5279,6 +5279,7 @@ index 0000000..058f853
 +
 +#include <fcntl.h>
 +#include <sys/stat.h>
++#include <sys/resource.h>
 +#include <unistd.h>
 +
 +#include <orbis/Pad.h>
@@ -5755,6 +5756,12 @@ index 0000000..058f853
 +	{
 +		LoadSystemModules();
 +		Trace("Crema starting");
++		{
++			// how many files the app may have open (1.67: a freeze when opening files began to fail)
++			struct rlimit files;
++			if (getrlimit(RLIMIT_NOFILE, &files) == 0)
++				Trace(fmt::format("open file limit: {} (hard {})", (long long)files.rlim_cur, (long long)files.rlim_max));
++		}
 +		MergeOldDataFolder();
 +
 +		std::error_code ec;
@@ -12329,6 +12336,60 @@ index 0000000..ff346d0
 +		}
 +	}
 +};
+diff --git a/src/util/helpers/fspinlock.h b/src/util/helpers/fspinlock.h
+index 3994299..d361bba 100644
+--- a/src/util/helpers/fspinlock.h
++++ b/src/util/helpers/fspinlock.h
+@@ -3,6 +3,11 @@
+ // minimal but efficient non-recursive spinlock implementation
+ 
+ #include <atomic>
++#if defined(__ORBIS__)
++#include <sched.h>
++#include <time.h>
++#include <immintrin.h>
++#endif
+ 
+ class FSpinlock
+ {
+@@ -15,6 +20,29 @@ public:
+ 	// implement BasicLockable and Lockable
+ 	void lock() const
+ 	{
++#if defined(__ORBIS__)
++		// Crema: the PS4 schedules by strict priority on few cores; a waiter spinning forever could
++		// keep a preempted lower priority holder off every core (1.68: seven pipeline cache threads
++		// spun while the holder waited for the heap). Spin, then yield, then sleep 50 us.
++		uint32_t spins = 0;
++		while (true)
++		{
++			if (!m_lockBool.exchange(true, std::memory_order_acquire))
++				break;
++			while (m_lockBool.load(std::memory_order_relaxed))
++			{
++				if (++spins < 64)
++					_mm_pause();
++				else if (spins < 1024)
++					sched_yield();
++				else
++				{
++					const timespec pause = {0, 50000};
++					nanosleep(&pause, nullptr);
++				}
++			}
++		}
++#else
+ 		while (true)
+ 		{
+ 			if (!m_lockBool.exchange(true, std::memory_order_acquire))
+@@ -22,6 +50,7 @@ public:
+ 			while (m_lockBool.load(std::memory_order_relaxed)) 
+                 _mm_pause();
+ 		}
++#endif
+ 	}
+ 
+ 	bool try_lock() const
 diff --git a/src/util/helpers/helpers.cpp b/src/util/helpers/helpers.cpp
 index d13a31a..dd0bcf6 100644
 --- a/src/util/helpers/helpers.cpp
