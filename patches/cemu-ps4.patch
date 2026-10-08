@@ -231,7 +231,7 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..22c96e2 100644
+index c9758f3..e69427f 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,7 @@
@@ -379,23 +379,25 @@ index c9758f3..22c96e2 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -452,8 +576,15 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -452,8 +576,17 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
  }
  
 +#ifdef __ORBIS__
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
++extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +#endif
 +
  void PPCRecompiler_thread()
  {
 +#ifdef __ORBIS__
 +	ps4_boost_thread();
++	ps4_sampler_register_thread("PPCRecompiler");
 +#endif
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,9 +617,29 @@ void PPCRecompiler_thread()
+@@ -486,9 +619,29 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
