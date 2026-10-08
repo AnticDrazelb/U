@@ -279,8 +279,8 @@ int g_errors = 0;
 // gets a private dlmalloc arena carved out of the main heap; with FOOTERS every chunk records
 // its arena, so free/realloc from any thread return memory to the right one. A full arena falls
 // back to the main heap.
-constexpr size_t ARENA_SIZE = 8 * MB;
-constexpr int MAX_ARENAS = 12;
+constexpr size_t ARENA_SIZE = 10 * MB;
+constexpr int MAX_ARENAS = 16;
 __attribute__((tls_model("initial-exec"))) thread_local mspace t_arena = nullptr;
 std::atomic<int> g_arenaCount{0};
 // Arenas of threads that have exited, for the next busy thread (the audio thread is recreated
@@ -311,9 +311,11 @@ void releaseArena(void* arena) {
 
 // Checks the heap's control block before every operation; the first time it is found
 // overwritten, logs when (operation number, current and previous caller) and what it now holds.
-unsigned long long g_ops = 0;
-const char* g_prevOp = "none";
-const void* g_prevCaller = nullptr;
+// (per thread: shared counters written by every allocation made the cores fight over one cache
+// line, Crema 1.50 and before)
+__attribute__((tls_model("initial-exec"))) thread_local unsigned long long g_ops = 0;
+__attribute__((tls_model("initial-exec"))) thread_local const char* g_prevOp = "none";
+__attribute__((tls_model("initial-exec"))) thread_local const void* g_prevCaller = nullptr;
 bool g_heapBroken = false;
 
 void checkHeap(const char* op, const void* caller) {
@@ -471,12 +473,14 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     return p;
 }
 
-// Gives the calling thread a private arena if it is one of Dolphin's busy threads (called when
-// a thread names itself: Common::SetCurrentThreadName -> ps4_watch_thread).
+// Gives the calling thread a private arena if it is one of the emulator's busy threads (called
+// when a thread names itself: SetThreadName -> ps4_watch_thread). Crema's (Cemu's) names: until
+// 1.51 only DolphinPS4's were listed, so every Cemu thread shared the one locked heap and the
+// recompiler (allocation heavy) took seconds per function.
 void ps4_heap_private_arena(const char* name) {
-    static const char* const busy[] = {"CPU thread", "CPU-GPU thread", "Video thread",
-                                       "VK submission thread", "AsyncShaderCompiler Worker",
-                                       "DVD thread", "Audio thread - PS4"};
+    static const char* const busy[] = {"PPCRecompiler", "OSSched[core=0]", "OSSched[core=1]", "OSSched[core=2]",
+                                       "LatteThread", "compilePl", "vkShaderComp", "plCacheCompiler",
+                                       "vkDriverPlCache", "fileCache", "PS4AudioOut", "H264Decoder"};
     if (t_arena || !name || !getHeap())
         return;
     bool wanted = false;

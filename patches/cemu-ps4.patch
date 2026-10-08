@@ -1327,7 +1327,7 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..e204912 100644
+index 9fe4bea..c18344b 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -1397,8 +1397,8 @@ index 9fe4bea..e204912 100644
 +			return selectedThread;
 +		}
 +		const uint64 now = PPCTimer_getRawTsc();
-+		const uint64 starveTicks = ::_rdtscFrequency / 50;  // 20 ms
-+		const uint64 rescueTicks = ::_rdtscFrequency / 200; // 5 ms
++		const uint64 starveTicks = ::_rdtscFrequency / 100; // 10 ms
++		const uint64 rescueTicks = ::_rdtscFrequency / 100; // 10 ms
 +		if (now < s_rescueUntil[coreIndex])
 +			return waiting;
 +		if (s_starveSince[coreIndex] == 0)
@@ -5611,7 +5611,7 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..f2fa5c7
+index 0000000..816b35f
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
 @@ -0,0 +1,387 @@
@@ -5676,7 +5676,7 @@ index 0000000..f2fa5c7
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
-+			"When a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get a short turn every 20 ms. Fixes games that stop while loading (Tekken Tag Tournament 2's fights); sound may stutter there. Off: the Wii U's strict priorities."},
++			"When a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get turns (10 ms after waiting 10 ms). Fixes games that stop while loading (Tekken Tag Tournament 2's fights); sound may stutter there. Off: the Wii U's strict priorities."},
 +		// Audio
 +		{"game_volume", "Game Volume", "Audio",
 +			{{"100", "100"}, {"90", "90"}, {"80", "80"}, {"70", "70"}, {"60", "60"}, {"50", "50"},
