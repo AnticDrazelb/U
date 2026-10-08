@@ -250,16 +250,15 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..5a6ba2d 100644
+index 935e61a..9af8651 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -14,10 +14,25 @@
+@@ -14,10 +14,24 @@
  #include <boost/container/small_vector.hpp>
  
  #include "Common/cpu_features.h"
 +#include <atomic>
 +#include <memory_resource>
-+#include <boost/unordered/unordered_node_map.hpp>
  
  #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
  #define DEBUG_RA_INSTRUCTION_GEN 0
@@ -270,7 +269,7 @@ index 935e61a..5a6ba2d 100644
 +	// segments), and in very large functions it cascades: every connection adds ranges to other
 +	// segments, which then search too (Tekken Tag Tournament 2: 30 s for one function on the PS4).
 +	// Past kRaMergeBudget steps per function the merging stops; the code stays correct.
-+	constexpr uint64 kRaMergeBudget = 1000000; // (with the node maps; 200k in 1.56-1.59)
++	constexpr uint64 kRaMergeBudget = 200000; // (1M: 27 s for the largest functions on the PS4)
 +	thread_local uint64 t_raMergeSteps = 0;
 +	thread_local uint64 t_raMergeCapped = 0;
 +	inline bool RaMergeBudgetLeft() { return t_raMergeSteps < kRaMergeBudget; }
@@ -279,16 +278,15 @@ index 935e61a..5a6ba2d 100644
  struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per register and segment
  {
  	IMLRARegAbstractLiveness(IMLRegFormat regBaseFormat, sint32 usageStart, sint32 usageEnd)
-@@ -35,17 +50,25 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
+@@ -35,17 +49,24 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
  	IMLRegFormat regBaseFormat;
  };
  
-+// Crema: the per segment range maps were std::unordered_map: an allocation per entry and a
-+// division per lookup, most of the range merging's time on the PS4. Boost's node map keeps the
-+// entries where they are (pointers to them are held across inserts) and hashes to a power of two;
-+// its nodes come from one arena per register allocation.
-+using IMLRAAbstractRangeMap = boost::unordered_node_map<IMLRegID, IMLRARegAbstractLiveness, boost::hash<IMLRegID>, std::equal_to<IMLRegID>,
-+	std::pmr::polymorphic_allocator<std::pair<const IMLRegID, IMLRARegAbstractLiveness>>>;
++// Crema: the per segment range maps' entries come from one arena per register allocation instead
++// of an allocation each (much of the range merging's time on the PS4). Still std::unordered_map:
++// the merging inserts into maps it iterates, which Boost's node map (1.60) did not survive - the
++// app froze.
++using IMLRAAbstractRangeMap = std::pmr::unordered_map<IMLRegID, IMLRARegAbstractLiveness>;
 +
  struct IMLRegisterAllocatorContext
  {
@@ -308,7 +306,7 @@ index 935e61a..5a6ba2d 100644
  	{
  		return perSegmentAbstractRanges[imlSegment->momentaryIndex];
  	}
-@@ -196,9 +219,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+@@ -196,9 +217,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
  
  uint32 IMLRA_GetNextIterationIndex()
  {
@@ -320,7 +318,7 @@ index 935e61a..5a6ba2d 100644
  }
  
  bool _detectLoop(IMLSegment* currentSegment, sint32 depth, uint32 iterationIndex, IMLSegment* imlSegmentLoopBase)
-@@ -1569,6 +1591,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
+@@ -1569,6 +1589,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
  
  void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regId, IMLSegment** route, sint32 routeDepth)
  {
@@ -328,7 +326,7 @@ index 935e61a..5a6ba2d 100644
  #ifdef CEMU_DEBUG_ASSERT
  	if (routeDepth < 2)
  		assert_dbg();
-@@ -1585,42 +1608,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
+@@ -1585,42 +1606,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
  	IMLRA_extendAbstractRangeToBeginningOfSegment(ctx, route[routeDepth - 1], regId);
  }
  
@@ -434,7 +432,7 @@ index 935e61a..5a6ba2d 100644
  	}
  }
  
-@@ -1638,6 +1711,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+@@ -1638,6 +1709,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
  	if (remainingScanDist <= 0)
  		return; // can't reach end
  
@@ -452,7 +450,7 @@ index 935e61a..5a6ba2d 100644
  	IMLSegment* route[64];
  	route[0] = currentSegment;
  	if (currentSegment->nextSegmentBranchNotTaken)
-@@ -1698,8 +1782,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
+@@ -1698,8 +1780,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
  	}
  }
  
@@ -480,7 +478,7 @@ index 935e61a..5a6ba2d 100644
  	for (size_t s = 0; s < ctx.deprGenContext->segmentList2.size(); s++)
  	{
  		IMLSegment* imlSegment = ctx.deprGenContext->segmentList2[s];
-@@ -2192,7 +2295,9 @@ void IMLRegisterAllocator_AllocateRegisters(ppcImlGenContext_t* ppcImlGenContext
+@@ -2192,7 +2293,9 @@ void IMLRegisterAllocator_AllocateRegisters(ppcImlGenContext_t* ppcImlGenContext
  
  	IMLRA_ReshapeForRegisterAllocation(ppcImlGenContext);
  	ppcImlGenContext->UpdateSegmentIndices(); // update momentaryIndex of each segment
@@ -5035,10 +5033,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..64942d5
+index 0000000..dc60c93
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,770 @@
+@@ -0,0 +1,774 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5134,6 +5132,9 @@ index 0000000..64942d5
 +		std::error_code ec;
 +		fs::remove(kDataRoot / "hang.log", ec);
 +		std::thread([path] {
++			// above the busy threads (650): a freeze that keeps every core busy still gets its
++			// report (it sleeps almost always)
++			scePthreadSetprio(scePthreadSelf(), 450);
 +			uint64 lastBeat = sHeartbeat.load(), lastFrame = LatteGPUState.frameCounter;
 +			int beatStall = 0, frameStall = 0, dumps = 0, sinceDump = 60;
 +			char reason[160], line[200];
@@ -5678,6 +5679,7 @@ index 0000000..64942d5
 +		fs::create_directories(kDataRoot / "screenshots", ec);
 +		if (sFreezeReports)
 +			StartHangWatchdog();
++		scePthreadSetprio(scePthreadSelf(), 450); // the heartbeat and performance lines (sleeps)
 +		for (uint64 seconds = 1;; seconds++)
 +		{
 +			std::this_thread::sleep_for(std::chrono::seconds(1));
