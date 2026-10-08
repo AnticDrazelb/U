@@ -5237,10 +5237,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..dc60c93
+index 0000000..4f7621e
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,775 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5348,7 +5348,8 @@ index 0000000..dc60c93
 +				const uint64 beat = sHeartbeat.load();
 +				const uint64 frame = LatteGPUState.frameCounter;
 +				beatStall = beat == lastBeat ? beatStall + 1 : 0;
-+				frameStall = frame == lastFrame && frame != 0 ? frameStall + 1 : 0; // after the first frame
++				// after the first frame, or (still none) 30 s after launch: a hang while the caches load
++				frameStall = frame == lastFrame && (frame != 0 || seconds > 30) ? frameStall + 1 : 0;
 +				lastBeat = beat;
 +				lastFrame = frame;
 +				sinceDump++;
