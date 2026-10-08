@@ -2345,12 +2345,14 @@ index e037395..16d1086 100644
      #include <csignal>
      #define DEBUG_BREAK raise(SIGTRAP) 
 diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
-index b54d3ef..c89db6a 100644
+index b54d3ef..5c1bf0c 100644
 --- a/src/Common/unix/FileStream_unix.cpp
 +++ b/src/Common/unix/FileStream_unix.cpp
-@@ -1,5 +1,14 @@
+@@ -1,5 +1,58 @@
  #include "Common/unix/FileStream_unix.h"
  #include <cstdarg>
++#include <algorithm>
++#include <vector>
 +#include <fcntl.h>
 +#include <sys/stat.h>
 +#include <unistd.h>
@@ -2360,10 +2362,52 @@ index b54d3ef..c89db6a 100644
 +// std::fstream a write sat in the stream's buffer and a read came from its cache, so a game
 +// reading a file through one handle while writing it through another read stale data back
 +// (suspected in Minecraft: Wii U Edition losing its saved chunks), and SetEndOfFile did nothing.
++
++#if defined(__ORBIS__)
++#include <map>
++#include <mutex>
++// Crema: the open file streams, to find what fills the PS4's descriptor table (1.71: Tekken Tag
++// Tournament 2 crashed after 10 min with EMFILE at ~268 descriptors). ps4_filestream_report()
++// writes the folders with the most open files to the boot trace.
++namespace
++{
++	std::mutex s_openStreamsLock;
++	std::map<const FileStream*, std::string> s_openStreams;
++}
++
++extern "C" void ps4_boot_trace(const char* stage);
++
++extern "C" void ps4_filestream_report(const char* why)
++{
++	std::map<std::string, int> perFolder;
++	size_t total = 0;
++	{
++		std::lock_guard lock(s_openStreamsLock);
++		total = s_openStreams.size();
++		for (auto& [stream, path] : s_openStreams)
++		{
++			const size_t slash = path.find_last_of('/');
++			perFolder[slash == std::string::npos ? path : path.substr(0, slash)]++;
++		}
++	}
++	std::vector<std::pair<int, std::string>> sorted;
++	for (auto& [folder, count] : perFolder)
++		sorted.emplace_back(count, folder);
++	std::sort(sorted.rbegin(), sorted.rend());
++	char line[400];
++	snprintf(line, sizeof(line), "open file streams (%s): %zu in %zu folders", why, total, perFolder.size());
++	ps4_boot_trace(line);
++	for (size_t i = 0; i < sorted.size() && i < 8; i++)
++	{
++		snprintf(line, sizeof(line), "  %d in %s", sorted[i].first, sorted[i].second.c_str());
++		ps4_boot_trace(line);
++	}
++}
++#endif
  
  fs::path findPathCI(const fs::path& path)
  {
-@@ -82,28 +91,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
+@@ -82,28 +135,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
  void FileStream::SetPosition(uint64 pos)
  {
  	cemu_assert(m_isValid);
@@ -2400,7 +2444,7 @@ index b54d3ef..c89db6a 100644
  }
  
  void FileStream::extract(std::vector<uint8>& data)
-@@ -116,15 +120,21 @@ void FileStream::extract(std::vector<uint8>& data)
+@@ -116,15 +164,21 @@ void FileStream::extract(std::vector<uint8>& data)
  
  void FileStream::Flush()
  {
@@ -2427,7 +2471,7 @@ index b54d3ef..c89db6a 100644
  }
  
  bool FileStream::readU64(uint64& v)
-@@ -161,9 +171,16 @@ bool FileStream::readLine(std::string& line)
+@@ -161,9 +215,16 @@ bool FileStream::readLine(std::string& line)
  
  sint32 FileStream::writeData(const void* data, sint32 length)
  {
@@ -2447,14 +2491,19 @@ index b54d3ef..c89db6a 100644
  }
  
  void FileStream::writeU64(uint64 v)
-@@ -203,46 +220,26 @@ void FileStream::writeLine(const char* str)
+@@ -203,44 +264,38 @@ void FileStream::writeLine(const char* str)
  
  FileStream::~FileStream()
  {
 -	if (m_isValid)
--	{
++#if defined(__ORBIS__)
++	if (m_fd >= 0)
+ 	{
 -		m_fileStream.close();
--	}
++		std::lock_guard lock(s_openStreamsLock);
++		s_openStreams.erase(this);
+ 	}
++#endif
 +	if (m_fd >= 0)
 +		close(m_fd);
  	//	CloseHandle(m_hFile);
@@ -2484,8 +2533,8 @@ index b54d3ef..c89db6a 100644
 +		close(m_fd);
 +		m_fd = -1;
  	}
- }
- 
+-}
+-
 -void FileStream::SyncReadWriteSeek(bool nextOpIsWrite)
 -{
 -	// nextOpIsWrite == false -> read. Otherwise write
@@ -2497,11 +2546,16 @@ index b54d3ef..c89db6a 100644
 -		m_fileStream.seekg(m_fileStream.tellp(), std::ios::beg);
 -
 -	m_prevOperationWasWrite = nextOpIsWrite;
--}
--
++#if defined(__ORBIS__)
++	if (m_fd >= 0)
++	{
++		std::lock_guard lock(s_openStreamsLock);
++		s_openStreams[this] = m_path.generic_string();
++	}
++#endif
+ }
+ 
  bool FileStream::WriteFileAtomic(const fs::path& path, std::span<uint8> fileData, bool allowTargetFileRename)
- {
- 	std::error_code ec;
 diff --git a/src/Common/unix/FileStream_unix.h b/src/Common/unix/FileStream_unix.h
 index 29261dd..92c87f4 100644
 --- a/src/Common/unix/FileStream_unix.h
@@ -5239,10 +5293,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..bdebdf4
+index 0000000..b1368b6
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,808 @@
+@@ -0,0 +1,839 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5285,6 +5339,8 @@ index 0000000..bdebdf4
 +#include <orbis/Pad.h>
 +#include <orbis/Sysmodule.h>
 +#include <orbis/libkernel.h>
++
++extern "C" void ps4_filestream_report(const char* why); // Common/unix/FileStream_unix.cpp
 +
 +extern "C" int sceSystemServiceLoadExec(const char* path, char* const argv[]); // libSceSystemService
 +extern "C" int g_crema_pad_handle; // input/api/PS4/PS4PadController.cpp: the DualShock 4's ScePad handle
@@ -5347,8 +5403,16 @@ index 0000000..bdebdf4
 +			else
 +				others++;
 +		}
++		const int totalFds = files + sockets + pipes + devices + others;
 +		Trace(fmt::format("perf: gpu {}% | {} | fds {} (files {}, sockets {}, pipes {}, devices {}, other {})",
-+			spanDelta ? busyDelta * 100 / spanDelta : 0, threads, files + sockets + pipes + devices + others, files, sockets, pipes, devices, others));
++			spanDelta ? busyDelta * 100 / spanDelta : 0, threads, totalFds, files, sockets, pipes, devices, others));
++		// what they are, at 250 and every 25 more
++		static int sReportedAt = 225;
++		if (totalFds >= sReportedAt + 25)
++		{
++			sReportedAt = totalFds - totalFds % 25;
++			ps4_filestream_report(fmt::format("{} descriptors", totalFds).c_str());
++		}
 +	}
 +
 +	// Hang watchdog: when the main loop's heartbeat or the TV frames stop for 15 s, the stacks of
@@ -5766,6 +5830,27 @@ index 0000000..bdebdf4
 +			struct rlimit files;
 +			if (getrlimit(RLIMIT_NOFILE, &files) == 0)
 +				Trace(fmt::format("open file limit: {} (hard {})", (long long)files.rlim_cur, (long long)files.rlim_max));
++			// the real one: duplicate a descriptor until the system refuses (1.71 hit EMFILE at ~268)
++			const int probe = open("/app0/eboot.bin", O_RDONLY);
++			if (probe >= 0)
++			{
++				std::vector<int> extra;
++				for (int i = 0; i < 4096; i++)
++				{
++					const int fd = dup(probe);
++					if (fd < 0)
++						break;
++					extra.push_back(fd);
++				}
++				const int err = errno;
++				int highest = probe;
++				for (int fd : extra)
++					highest = std::max(highest, fd);
++				Trace(fmt::format("open file probe: {} more descriptors before errno {} (highest {})", extra.size(), err, highest));
++				for (int fd : extra)
++					close(fd);
++				close(probe);
++			}
 +		}
 +		MergeOldDataFolder();
 +
