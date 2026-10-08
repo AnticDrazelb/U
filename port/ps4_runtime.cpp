@@ -14,6 +14,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +41,13 @@ int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t
                                       off_t* physOut);
 int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
                                  size_t align);
+int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
+struct SceKernelSwVersion {
+    size_t size;
+    char text[0x1C];
+    uint32_t version;
+};
+int32_t sceKernelGetSystemSwVersion(SceKernelSwVersion* version);
 
 // dlmalloc mspace API (port/ps4_dlmalloc.c).
 typedef void* mspace;
@@ -587,10 +595,162 @@ int ps4_jit_in_system_pool = 1;           // executable mappings from the system
 unsigned long long ps4_fault_count = 0;   // fastmem faults seen by Dolphin's handler
 
 void* __real_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset);
+
+// Executable memory (the recompiler's code blocks). On GoldHEN 12.00/13.52 consoles system
+// flexible memory mapped RWX runs code; on a firmware 11.00 console that mapping succeeded but its
+// pages did not execute: every game crashed at its first recompiled block (SIGSEGV code 2 with rip
+// = the block). So each source is tried once with a one-instruction function (ret) before it
+// serves executable mappings; a fault there is caught and the next source is tried.
+namespace {
+
+enum ExecSource { kExecSystemPool, kExecRegular, kExecDirect, kExecNone };
+const char* const kExecSourceNames[] = {"system flexible memory", "regular flexible memory", "direct memory",
+                                        "nothing"};
+constexpr int kSigBusFreeBsd = 10, kSigSegvFreeBsd = 11, kSaSiginfoFreeBsd = 0x40;
+constexpr int kMcontextOffset = 0x40, kRipIndex = 20, kRspIndex = 23;  // as port/ps4_crashlog.cpp
+const int32_t PROT_CPU_RWX = 0x7;
+
+volatile uintptr_t g_probeCode = 0;
+volatile int g_probeFaulted = 0;
+struct sigaction g_oldSegv, g_oldBus;
+
+void execProbeHandler(int, siginfo_t*, void* context) {
+    auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
+    if (g_probeCode && regs[kRipIndex] == g_probeCode) {
+        // as if the ret ran: back to the caller
+        regs[kRipIndex] = *reinterpret_cast<const uint64_t*>(regs[kRspIndex]);
+        regs[kRspIndex] += 8;
+        g_probeFaulted = 1;
+        return;
+    }
+    // another fault: the previous handlers get it when the instruction runs again
+    sigaction(kSigSegvFreeBsd, &g_oldSegv, nullptr);
+    sigaction(kSigBusFreeBsd, &g_oldBus, nullptr);
+}
+
+// Whether code placed at `code` (mapped RWX) runs.
+bool runsCode(void* code) {
+    static_cast<volatile uint8_t*>(code)[0] = 0xC3;  // ret
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    void (*handler)(int, siginfo_t*, void*) = execProbeHandler;
+    memcpy(&action, &handler, sizeof(handler));  // the handler union is the first member
+    action.sa_flags = kSaSiginfoFreeBsd;
+    sigemptyset(&action.sa_mask);
+    g_probeFaulted = 0;
+    g_probeCode = reinterpret_cast<uintptr_t>(code);
+    sigaction(kSigSegvFreeBsd, &action, &g_oldSegv);
+    sigaction(kSigBusFreeBsd, &action, &g_oldBus);
+    void (*volatile function)() = reinterpret_cast<void (*)()>(code);
+    function();
+    sigaction(kSigSegvFreeBsd, &g_oldSegv, nullptr);
+    sigaction(kSigBusFreeBsd, &g_oldBus, nullptr);
+    g_probeCode = 0;
+    return !g_probeFaulted;
+}
+
+void* mapSystemPoolExecutable(size_t size) {
+    void* base = reserveAwayFromKernel(size);
+    if (!base)
+        return nullptr;
+    const int32_t ret = sceKernelMapNamedSystemFlexibleMemory(&base, size, PROT_CPU_RWX, MAP_FIXED_FLAG, "cemu code");
+    if (ret != 0) {
+        heapLog("[cemu] mmap: %zu KiB of executable system flexible memory not possible (0x%x)\n", size / 1024,
+                ret);
+        sceKernelMunmap(base, size);
+        return nullptr;
+    }
+    return base;
+}
+
+// Direct memory isn't given back by munmap: code blocks are kept for the whole run anyway.
+void* mapDirectExecutable(size_t size, off_t* physOut = nullptr) {
+    off_t phys = 0;
+    int32_t ret = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, PAGE, 0, &phys);
+    if (ret != 0) {
+        heapLog("[cemu] mmap: %zu KiB of direct memory not available (0x%x)\n", size / 1024, ret);
+        return nullptr;
+    }
+    void* base = reserveAwayFromKernel(size);
+    ret = base ? sceKernelMapDirectMemory(&base, size, PROT_CPU_RWX, MAP_FIXED_FLAG, phys, PAGE) : -1;
+    if (ret != 0) {
+        heapLog("[cemu] mmap: %zu KiB of executable direct memory not possible (0x%x)\n", size / 1024, ret);
+        if (base)
+            sceKernelMunmap(base, size);
+        sceKernelReleaseDirectMemory(phys, size);
+        return nullptr;
+    }
+    if (physOut)
+        *physOut = phys;
+    return base;
+}
+
+ExecSource chooseExecSource() {
+    SceKernelSwVersion version;
+    memset(&version, 0, sizeof(version));
+    version.size = sizeof(version);
+    if (sceKernelGetSystemSwVersion(&version) == 0) {
+        version.text[sizeof(version.text) - 1] = 0;
+        heapLog("[cemu] firmware %s (0x%08x)\n", version.text, version.version);
+    }
+    if (ps4_jit_in_system_pool) {
+        void* code = mapSystemPoolExecutable(PAGE);
+        if (code) {
+            const bool ok = runsCode(code);
+            sceKernelMunmap(code, PAGE);
+            heapLog("[cemu] executable memory: system flexible memory %s\n", ok ? "runs code" : "does not run code");
+            if (ok)
+                return kExecSystemPool;
+        }
+    }
+    void* code = __real_mmap(nullptr, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (code != MAP_FAILED) {
+        const bool ok = runsCode(code);
+        munmap(code, PAGE);
+        heapLog("[cemu] executable memory: regular flexible memory %s\n", ok ? "runs code" : "does not run code");
+        if (ok)
+            return kExecRegular;
+    } else {
+        heapLog("[cemu] executable memory: regular flexible memory cannot be mapped RWX\n");
+    }
+    off_t phys = 0;
+    code = mapDirectExecutable(PAGE, &phys);
+    if (code) {
+        const bool ok = runsCode(code);
+        sceKernelMunmap(code, PAGE);
+        sceKernelReleaseDirectMemory(phys, PAGE);
+        heapLog("[cemu] executable memory: direct memory %s\n", ok ? "runs code" : "does not run code");
+        if (ok)
+            return kExecDirect;
+    }
+    heapLog("[cemu] executable memory: NONE runs code - this console's jailbreak does not let homebrew run "
+            "generated code; games will crash\n");
+    return kExecNone;
+}
+
+}  // namespace
+
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     const bool anonymous = fd == -1 && (flags & MAP_ANON) && !(flags & MAP_FIXED);
-    const bool allowed = !(prot & PROT_EXEC) || ps4_jit_in_system_pool;
-    if (anonymous && allowed && len >= MB) {
+    if (anonymous && (prot & PROT_EXEC)) {
+        static const ExecSource source = chooseExecSource();
+        const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
+        void* base = nullptr;
+        if (source == kExecSystemPool)
+            base = mapSystemPoolExecutable(size);
+        else if (source == kExecDirect)
+            base = mapDirectExecutable(size);
+        if (base) {
+            heapLog("[cemu] mmap: %zu KiB prot %d from %s at %p, caller elf 0x%llx\n", size / 1024, prot,
+                    kExecSourceNames[source], base, elf(__builtin_return_address(0)));
+            return base;
+        }
+        void* result = __real_mmap(addr, len, prot, flags, fd, offset);
+        heapLog("[cemu] mmap: %zu KiB prot %d from regular flexible memory = %p, caller elf 0x%llx\n", len / 1024,
+                prot, result, elf(__builtin_return_address(0)));
+        return result;
+    }
+    if (anonymous && len >= MB) {
         const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
         void* base = reserveAwayFromKernel(size);
         if (base) {
