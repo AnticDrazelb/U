@@ -240,13 +240,27 @@ ps4_log(const char *fmt, ...)
    va_end(args);
    fputs(line, stderr);
    sceKernelDebugOutText(0, line);
-   /* Also straight to a file: the app may not route stderr anywhere. */
+   /* Also straight to a file: the app may not route stderr anywhere. Opened once: without braces
+    * here every line opened (and truncated) the file again and never closed it, ~one descriptor
+    * per 7 s in Tekken Tag Tournament 2 until the PS4's ~250 open file limit stopped the game's own
+    * file loads (Crema 1.71-1.77). */
    static int fd = -2;
-   if (fd == -2)
+   int current = __atomic_load_n(&fd, __ATOMIC_ACQUIRE);
+   if (current == -2) {
       mkdir("/data/Crema/gpu", 0777);
-      fd = open("/data/Crema/gpu/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-   if (fd >= 0)
-      write(fd, line, strlen(line));
+      int opened = open("/data/Crema/gpu/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      int expected = -2;
+      if (__atomic_compare_exchange_n(&fd, &expected, opened, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+         current = opened;
+      } else {
+         /* another thread opened it first */
+         if (opened >= 0)
+            close(opened);
+         current = expected;
+      }
+   }
+   if (current >= 0)
+      write(current, line, strlen(line));
 }
 
 #undef fprintf
