@@ -231,7 +231,7 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..4fff996 100644
+index c9758f3..22c96e2 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,7 @@
@@ -242,7 +242,7 @@ index c9758f3..4fff996 100644
  
  #include "IML/IML.h"
  #include "IML/IMLRegisterAllocator.h"
-@@ -59,6 +60,117 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +60,126 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -273,6 +273,15 @@ index c9758f3..4fff996 100644
 +	{
 +		timespec now;
 +		clock_gettime(CLOCK_MONOTONIC, &now);
++		return (uint64)now.tv_sec * 1000000000ull + (uint64)now.tv_nsec;
++	}
++
++	// this thread's CPU time (FreeBSD CLOCK_THREAD_CPUTIME_ID)
++	uint64 CremaThreadCpuNs()
++	{
++		timespec now;
++		if (clock_gettime((clockid_t)14, &now) != 0)
++			return 0;
 +		return (uint64)now.tv_sec * 1000000000ull + (uint64)now.tv_nsec;
 +	}
 +
@@ -360,7 +369,7 @@ index c9758f3..4fff996 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -419,6 +531,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +540,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -370,7 +379,23 @@ index c9758f3..4fff996 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -486,9 +601,27 @@ void PPCRecompiler_thread()
+@@ -452,8 +576,15 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+ 	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
+ }
+ 
++#ifdef __ORBIS__
++extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
++#endif
++
+ void PPCRecompiler_thread()
+ {
++#ifdef __ORBIS__
++	ps4_boost_thread();
++#endif
+ 	SetThreadName("PPCRecompiler");
+ #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
+ 	return;
+@@ -486,9 +617,29 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -381,6 +406,7 @@ index c9758f3..4fff996 100644
  
 +#ifdef __ORBIS__
 +			const uint64 compileStart = CremaNowNs();
++			const uint64 compileCpuStart = CremaThreadCpuNs();
 +			s_cremaCompileStart.store(compileStart);
 +			s_cremaCompiling.store(enterAddress);
 +#endif
@@ -391,7 +417,8 @@ index c9758f3..4fff996 100644
 +			if (seconds >= 1.0)
 +			{
 +				char text[160];
-+				snprintf(text, sizeof(text), "recompiler: the game function at %08x took %.1f s to compile", enterAddress, seconds);
++				snprintf(text, sizeof(text), "recompiler: the game function at %08x took %.1f s to compile (%.1f s of CPU time)", enterAddress, seconds,
++					(double)(CremaThreadCpuNs() - compileCpuStart) / 1e9);
 +				ps4_boot_trace(text);
 +			}
 +#endif
