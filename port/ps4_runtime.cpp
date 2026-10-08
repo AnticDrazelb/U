@@ -280,7 +280,7 @@ int g_errors = 0;
 // its arena, so free/realloc from any thread return memory to the right one. A full arena falls
 // back to the main heap.
 constexpr size_t ARENA_SIZE = 10 * MB;
-constexpr int MAX_ARENAS = 16;
+constexpr int MAX_ARENAS = 20;
 __attribute__((tls_model("initial-exec"))) thread_local mspace t_arena = nullptr;
 std::atomic<int> g_arenaCount{0};
 // Arenas of threads that have exited, for the next busy thread (the audio thread is recreated

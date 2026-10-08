@@ -100,7 +100,7 @@ index 06c2a13..8cee1b0 100644
  	uint64_t m_title_id = 0;
  	bool m_is_loaded = false;
 diff --git a/src/Cafe/HW/Espresso/PPCTimer.cpp b/src/Cafe/HW/Espresso/PPCTimer.cpp
-index 257973a..67a596c 100644
+index 257973a..96fafc6 100644
 --- a/src/Cafe/HW/Espresso/PPCTimer.cpp
 +++ b/src/Cafe/HW/Espresso/PPCTimer.cpp
 @@ -75,10 +75,20 @@ int PPCTimer_initThread()
@@ -124,6 +124,25 @@ index 257973a..67a596c 100644
  	_rdtscLastMeasure = __rdtsc();
  }
  
+@@ -150,7 +160,18 @@ uint64 PPCTimer_getFromRDTSC()
+ 	#endif
+ 
+ 	uint64 remainder;
++#if defined(__ORBIS__)
++	// Crema: one DIV instead of libgcc's software 128-bit division (__udivmodti4, slow on the
++	// PS4's Jaguar). The quotient fits in 64 bits: high is the remainder carried over (below the
++	// frequency) plus the high half of one interval's product.
++	uint64 elapsedTick;
++	if (_rdtscAcc.high < _rdtscFrequency)
++		asm("divq %4" : "=a"(elapsedTick), "=d"(remainder) : "a"(_rdtscAcc.low), "d"(_rdtscAcc.high), "r"(_rdtscFrequency));
++	else
++		elapsedTick = _udiv128(_rdtscAcc.high, _rdtscAcc.low, _rdtscFrequency, &remainder);
++#else
+ 	uint64 elapsedTick = _udiv128(_rdtscAcc.high, _rdtscAcc.low, _rdtscFrequency, &remainder);
++#endif
+ 
+ 	_rdtscAcc.low = remainder;
+ 	_rdtscAcc.high = 0;
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 index e466deb..1316a67 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
@@ -231,10 +250,15 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..f45fef4 100644
+index 935e61a..ee64dfb 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -18,6 +18,18 @@
+@@ -14,10 +14,23 @@
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "Common/cpu_features.h"
++#include <atomic>
+ 
  #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
  #define DEBUG_RA_INSTRUCTION_GEN 0
  
@@ -253,6 +277,18 @@ index 935e61a..f45fef4 100644
  struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per register and segment
  {
  	IMLRARegAbstractLiveness(IMLRegFormat regBaseFormat, sint32 usageStart, sint32 usageEnd)
+@@ -196,9 +209,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+ 
+ uint32 IMLRA_GetNextIterationIndex()
+ {
+-	static uint32 recRACurrentIterationIndex = 0;
+-	recRACurrentIterationIndex++;
+-	return recRACurrentIterationIndex;
++	static std::atomic<uint32> recRACurrentIterationIndex{0}; // (Crema: several recompiler workers)
++	return ++recRACurrentIterationIndex;
+ }
+ 
+ bool _detectLoop(IMLSegment* currentSegment, sint32 depth, uint32 iterationIndex, IMLSegment* imlSegmentLoopBase)
 @@ -1569,6 +1581,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
  
  void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regId, IMLSegment** route, sint32 routeDepth)
@@ -414,18 +450,53 @@ index 935e61a..f45fef4 100644
  	{
  		IMLSegment* imlSegment = ctx.deprGenContext->segmentList2[s];
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..e69427f 100644
+index c9758f3..f53b974 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,8 @@
  #include "util/helpers/fspinlock.h"
  #include "util/helpers/helpers.h"
  #include "util/MemMapper/MemMapper.h"
 +#include <ctime>
++#include <algorithm>
  
  #include "IML/IML.h"
  #include "IML/IMLRegisterAllocator.h"
-@@ -59,6 +60,126 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -27,10 +29,23 @@ struct ppcInvalidationRange
+ {
+ 	MPTR startAddress;
+ 	uint32 size;
++	uint64 seq = 0; // Crema: invalidations in order, for several recompiler workers
+ 
+ 	ppcInvalidationRange(MPTR _startAddress, uint32 _size) : startAddress(_startAddress), size(_size) {};
+ };
+ 
++// Crema: on the PS4 several workers recompile at once (one took seconds per large function and
++// thousands of addresses waited, running in the interpreter meanwhile). Each records the
++// invalidation sequence number when it takes an address; its function is dropped if a newer
++// invalidation overlaps it, and invalidations are kept until no worker started before them.
++#ifdef __ORBIS__
++constexpr int kRecompilerWorkers = 3;
++#else
++constexpr int kRecompilerWorkers = 1;
++#endif
++thread_local int t_recompilerWorker = -1;
++thread_local uint64 t_compileStartSeq = 0;
++
+ struct ppcRecompilerFuncRange
+ {
+ 	MPTR	ppcStart;
+@@ -45,6 +60,9 @@ struct
+ 	FSpinlock recompilerSpinlock;
+ 	std::queue<MPTR> targetQueue;
+ 	std::vector<ppcInvalidationRange> invalidationRanges;
++	uint64 invalidationSeq = 0;
++	uint64 workerStartSeq[kRecompilerWorkers];
++	std::vector<std::thread> extraWorkers;
+ 	std::atomic_int_fast32_t recompilerEnableCount{0};
+ 	// recompiler thread
+ 	std::thread workerThread;
+@@ -59,6 +77,126 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -552,7 +623,33 @@ index c9758f3..e69427f 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -419,6 +540,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +515,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+ 	bool isInvalidated = false;
+ 	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
+ 	{
++		if (invRange.seq <= t_compileStartSeq)
++			continue; // before this compile started
+ 		MPTR rStartAddr = invRange.startAddress;
+ 		MPTR rEndAddr = rStartAddr + invRange.size;
+ 		for (auto& recFuncRange : ppcRecFunc->list_ranges)
+@@ -388,7 +528,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+ 			}
+ 		}
+ 	}
+-	s_ppcRecompilerState.invalidationRanges.clear();
++	{
++		// keep what the other workers' compiles (started earlier) still have to check
++		uint64 oldestActive = ~0ull;
++		for (int w = 0; w < kRecompilerWorkers; w++)
++			if (w != t_recompilerWorker)
++				oldestActive = std::min(oldestActive, s_ppcRecompilerState.workerStartSeq[w]);
++		auto& ranges = s_ppcRecompilerState.invalidationRanges;
++		ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [oldestActive](const ppcInvalidationRange& r) { return r.seq <= oldestActive; }), ranges.end());
++	}
+ 	if (isInvalidated)
+ 	{
+ 		s_ppcRecompilerState.recompilerSpinlock.unlock();
+@@ -419,6 +567,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -562,31 +659,39 @@ index c9758f3..e69427f 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -452,8 +576,17 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -452,8 +603,22 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
  }
  
+-void PPCRecompiler_thread()
 +#ifdef __ORBIS__
 +extern "C" void ps4_boost_thread(); // port/ps4_runtime.cpp: above the default priority
 +extern "C" void ps4_sampler_register_thread(const char* name); // port/ps4_sampler.cpp: the profiler
 +#endif
 +
- void PPCRecompiler_thread()
++void PPCRecompiler_thread(int workerIndex)
  {
++	t_recompilerWorker = workerIndex;
 +#ifdef __ORBIS__
-+	ps4_boost_thread();
-+	ps4_sampler_register_thread("PPCRecompiler");
++	// the first worker above the default priority (and profiled); the others take spare time
++	if (workerIndex == 0)
++	{
++		ps4_boost_thread();
++		ps4_sampler_register_thread("PPCRecompiler");
++	}
 +#endif
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,9 +619,29 @@ void PPCRecompiler_thread()
+@@ -486,9 +651,34 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
 +#ifdef __ORBIS__
 +			s_cremaQueued.store((uint32)s_ppcRecompilerState.targetQueue.size());
 +#endif
++			t_compileStartSeq = s_ppcRecompilerState.invalidationSeq;
++			s_ppcRecompilerState.workerStartSeq[workerIndex] = t_compileStartSeq;
  			s_ppcRecompilerState.recompilerSpinlock.unlock();
  
 +#ifdef __ORBIS__
@@ -596,6 +701,9 @@ index c9758f3..e69427f 100644
 +			s_cremaCompiling.store(enterAddress);
 +#endif
  			PPCRecompiler_recompileAtAddress(enterAddress);
++			s_ppcRecompilerState.recompilerSpinlock.lock();
++			s_ppcRecompilerState.workerStartSeq[workerIndex] = ~0ull;
++			s_ppcRecompilerState.recompilerSpinlock.unlock();
 +#ifdef __ORBIS__
 +			s_cremaCompiling.store(0);
 +			const double seconds = (double)(CremaNowNs() - compileStart) / 1e9;
@@ -610,6 +718,38 @@ index c9758f3..e69427f 100644
  			if(s_ppcRecompilerState.workerThreadStopSignal)
  				return;
  		}
+@@ -609,6 +799,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+ 		PPCRecompiler_deleteFunction(rFunc);
+ 	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
+ 	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
++	s_ppcRecompilerState.invalidationRanges.back().seq = ++s_ppcRecompilerState.invalidationSeq;
+ 
+ 	s_ppcRecompilerState.recompilerSpinlock.unlock();
+ }
+@@ -702,7 +893,11 @@ void PPCRecompiler_init()
+ 
+ 	// launch recompilation thread
+     s_ppcRecompilerState.workerThreadStopSignal = false;
+-    s_ppcRecompilerState.workerThread = std::thread(PPCRecompiler_thread);
++    for (int w = 0; w < kRecompilerWorkers; w++)
++        s_ppcRecompilerState.workerStartSeq[w] = ~0ull;
++    s_ppcRecompilerState.workerThread = std::thread(PPCRecompiler_thread, 0);
++    for (int w = 1; w < kRecompilerWorkers; w++)
++        s_ppcRecompilerState.extraWorkers.emplace_back(PPCRecompiler_thread, w);
+ }
+ 
+ void PPCRecompiler_Shutdown()
+@@ -711,6 +906,10 @@ void PPCRecompiler_Shutdown()
+     s_ppcRecompilerState.workerThreadStopSignal = true;
+     if(s_ppcRecompilerState.workerThread.joinable())
+         s_ppcRecompilerState.workerThread.join();
++    for (auto& worker : s_ppcRecompilerState.extraWorkers)
++        if (worker.joinable())
++            worker.join();
++    s_ppcRecompilerState.extraWorkers.clear();
+     // clean up queues
+     while(!s_ppcRecompilerState.targetQueue.empty())
+         s_ppcRecompilerState.targetQueue.pop();
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..03ba035 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp

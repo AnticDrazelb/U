@@ -471,6 +471,33 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
    ps4_log("radv/ps4: hang report written\n");
 }
 
+/* Crema: how the CPU waits for the GPU, every 5 s in the boot trace (waits per second, their
+ * average length, and how many sleeps ended by the 1 ms timeout instead of the interrupt). */
+void ps4_boot_trace(const char *stage);
+static struct {
+   uint64_t waits, wait_ns, sleeps, timeouts, since_ns;
+} s_wait_stats;
+
+static void
+ps4_wait_stats_report(int64_t now)
+{
+   if (!s_wait_stats.since_ns) {
+      s_wait_stats.since_ns = now;
+      return;
+   }
+   const int64_t span = now - (int64_t)s_wait_stats.since_ns;
+   if (span < 5000000000ll)
+      return;
+   char line[200];
+   snprintf(line, sizeof(line), "gpu waits: %.0f/s, average %.0f us, %.0f%% of the time; %llu sleeps, %llu ended by the 1 ms timeout",
+            s_wait_stats.waits * 1e9 / span, s_wait_stats.waits ? s_wait_stats.wait_ns / 1e3 / s_wait_stats.waits : 0.0,
+            s_wait_stats.wait_ns * 100.0 / span, (unsigned long long)s_wait_stats.sleeps,
+            (unsigned long long)s_wait_stats.timeouts);
+   ps4_boot_trace(line);
+   s_wait_stats.waits = s_wait_stats.wait_ns = s_wait_stats.sleeps = s_wait_stats.timeouts = 0;
+   s_wait_stats.since_ns = now;
+}
+
 /* Waits for the next GPU end-of-pipe interrupt (any submission's fence write), at most 1 ms. */
 static void
 ps4_sleep(ac_drm_device *dev)
@@ -480,6 +507,9 @@ ps4_sleep(ac_drm_device *dev)
       int count = 0;
       unsigned timeout = 1000;
       sceKernelWaitEqueue(dev->eop_queue, events, 8, &count, &timeout);
+      s_wait_stats.sleeps++;
+      if (count <= 0)
+         s_wait_stats.timeouts++;
    } else {
       sceKernelUsleep(50);
    }
@@ -502,6 +532,12 @@ ps4_wait_seq(ac_drm_device *dev, uint64_t seq, int64_t abs_timeout_ns)
       }
       if (++spins > 64)
          ps4_sleep(dev);
+   }
+   if (spins) {
+      const int64_t end = os_time_get_nano();
+      s_wait_stats.waits++;
+      s_wait_stats.wait_ns += end - start;
+      ps4_wait_stats_report(end);
    }
    return true;
 }
