@@ -231,10 +231,37 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..0ca1801 100644
+index 935e61a..bd5dcaf 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -1585,12 +1585,34 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
+@@ -18,6 +18,18 @@
+ #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
+ #define DEBUG_RA_INSTRUCTION_GEN 0
+ 
++namespace
++{
++	// Crema: merging close ranges is only an optimization (values stay in registers between
++	// segments), and in very large functions it cascades: every connection adds ranges to other
++	// segments, which then search too (Tekken Tag Tournament 2: 30 s for one function on the PS4).
++	// Past kRaMergeBudget steps per function the merging stops; the code stays correct.
++	constexpr uint64 kRaMergeBudget = 1000000;
++	thread_local uint64 t_raMergeSteps = 0;
++	thread_local uint64 t_raMergeCapped = 0;
++	inline bool RaMergeBudgetLeft() { return t_raMergeSteps < kRaMergeBudget; }
++}
++
+ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per register and segment
+ {
+ 	IMLRARegAbstractLiveness(IMLRegFormat regBaseFormat, sint32 usageStart, sint32 usageEnd)
+@@ -1569,6 +1581,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
+ 
+ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regId, IMLSegment** route, sint32 routeDepth)
+ {
++	t_raMergeSteps += (uint64)routeDepth * 2;
+ #ifdef CEMU_DEBUG_ASSERT
+ 	if (routeDepth < 2)
+ 		assert_dbg();
+@@ -1585,42 +1598,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
  	IMLRA_extendAbstractRangeToBeginningOfSegment(ctx, route[routeDepth - 1], regId);
  }
  
@@ -258,6 +285,7 @@ index 935e61a..0ca1801 100644
 +	constexpr sint32 kNoRange = 0x3FFFFFFF;
 +	thread_local std::vector<RaExtendMemo> t_raExtendMemo;
 +	thread_local uint32 t_raExtendStamp = 0;
++
 +}
 +
 +// returns the budget needed at currentSegment to reach a range (kNoRange: none found)
@@ -269,9 +297,12 @@ index 935e61a..0ca1801 100644
 -		return;
 +		return kNoRange;
  	}
++	if (!RaMergeBudgetLeft())
++		return kNoRange;
++	t_raMergeSteps++;
  	route[routeDepth] = currentSegment;
  
-@@ -1598,29 +1620,53 @@ void _IMLRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegment*
+ 	IMLRARegAbstractLiveness* range = _GetAbstractRange(ctx, currentSegment, regID);
  
  	if (!range)
  	{
@@ -336,7 +367,7 @@ index 935e61a..0ca1801 100644
  	}
  }
  
-@@ -1638,6 +1684,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+@@ -1638,6 +1701,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
  	if (remainingScanDist <= 0)
  		return; // can't reach end
  
@@ -354,6 +385,34 @@ index 935e61a..0ca1801 100644
  	IMLSegment* route[64];
  	route[0] = currentSegment;
  	if (currentSegment->nextSegmentBranchNotTaken)
+@@ -1698,8 +1772,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
+ 	}
+ }
+ 
++extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
++
+ void IMLRA_MergeCloseAbstractRanges(IMLRegisterAllocatorContext& ctx)
+ {
++	t_raMergeSteps = 0;
++	struct ReportCap
++	{
++		size_t segments;
++		~ReportCap()
++		{
++			if (RaMergeBudgetLeft())
++				return;
++			if ((t_raMergeCapped++ & 0x3F) == 0)
++			{
++				char line[160];
++				snprintf(line, sizeof(line), "recompiler: range merging stopped at its budget in a function of %zu segments (%llu times so far)",
++					segments, (unsigned long long)t_raMergeCapped);
++				ps4_boot_trace(line);
++			}
++		}
++	} reportCap{ctx.deprGenContext->segmentList2.size()};
+ 	for (size_t s = 0; s < ctx.deprGenContext->segmentList2.size(); s++)
+ 	{
+ 		IMLSegment* imlSegment = ctx.deprGenContext->segmentList2[s];
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 index c9758f3..e69427f 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
