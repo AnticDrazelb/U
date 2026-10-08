@@ -465,7 +465,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..f53b974 100644
+index c9758f3..e2e4788 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -501,17 +501,20 @@ index c9758f3..f53b974 100644
  struct ppcRecompilerFuncRange
  {
  	MPTR	ppcStart;
-@@ -45,6 +60,9 @@ struct
+@@ -45,6 +60,12 @@ struct
  	FSpinlock recompilerSpinlock;
  	std::queue<MPTR> targetQueue;
  	std::vector<ppcInvalidationRange> invalidationRanges;
 +	uint64 invalidationSeq = 0;
 +	uint64 workerStartSeq[kRecompilerWorkers];
++	// Crema: the ranges the workers are compiling now (start, end; 0 0: idle)
++	uint32 workerRangeStart[kRecompilerWorkers]{};
++	uint32 workerRangeEnd[kRecompilerWorkers]{};
 +	std::vector<std::thread> extraWorkers;
  	std::atomic_int_fast32_t recompilerEnableCount{0};
  	// recompiler thread
  	std::thread workerThread;
-@@ -59,6 +77,126 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +80,126 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -638,7 +641,7 @@ index c9758f3..f53b974 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -377,6 +515,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +518,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -647,7 +650,7 @@ index c9758f3..f53b974 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +528,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +531,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -664,7 +667,7 @@ index c9758f3..f53b974 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +567,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +570,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -674,8 +677,55 @@ index c9758f3..f53b974 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -452,8 +603,22 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
- 	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
+@@ -443,17 +597,66 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+ 	s_ppcRecompilerState.recompilerSpinlock.lock();
+ 	std::set<uint32> entryAddresses;
+ 	entryAddresses.emplace(address);
++	// Crema: another worker compiling the same code already: this address goes back to
++	// unvisited, so it is queued again if it runs before that function covers it
++	if (t_recompilerWorker >= 0)
++	{
++		const uint32 rangeEnd = range.startAddress + range.length;
++		for (int w = 0; w < kRecompilerWorkers; w++)
++		{
++			if (w == t_recompilerWorker || s_ppcRecompilerState.workerRangeEnd[w] == 0)
++				continue;
++			if (range.startAddress < s_ppcRecompilerState.workerRangeEnd[w] && rangeEnd > s_ppcRecompilerState.workerRangeStart[w])
++			{
++				if (ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[address / 4] == PPCRecompiler_leaveRecompilerCode_visited)
++					ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[address / 4] = PPCRecompiler_leaveRecompilerCode_unvisited;
++				s_ppcRecompilerState.recompilerSpinlock.unlock();
++				return;
++			}
++		}
++		s_ppcRecompilerState.workerRangeStart[t_recompilerWorker] = range.startAddress;
++		s_ppcRecompilerState.workerRangeEnd[t_recompilerWorker] = rangeEnd;
++	}
+ 	s_ppcRecompilerState.recompilerSpinlock.unlock();
+ 
++	// Crema: large functions one at a time (their compiles take tens of MiB each; three at once
++	// filled the heap, 1.58)
++	static std::mutex s_largeFunctionMutex;
++	std::unique_lock<std::mutex> largeLock(s_largeFunctionMutex, std::defer_lock);
++	if (t_recompilerWorker >= 0 && range.length > 0x2000)
++		largeLock.lock();
++
+ 	std::vector<std::pair<MPTR, uint32>> functionEntryPoints;
+ 	PPCRecFunction_t* func = PPCRecompiler_recompileFunction(range, entryAddresses, functionEntryPoints, funcBoundaries);
+-	if (!func)
+-		return; // recompilation failed
+-	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
++	if (func && !PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints))
++		delete func; // not used (Crema: was leaked)
++	if (largeLock.owns_lock())
++		largeLock.unlock();
++	if (t_recompilerWorker >= 0)
++	{
++		s_ppcRecompilerState.recompilerSpinlock.lock();
++		s_ppcRecompilerState.workerRangeStart[t_recompilerWorker] = 0;
++		s_ppcRecompilerState.workerRangeEnd[t_recompilerWorker] = 0;
++		s_ppcRecompilerState.recompilerSpinlock.unlock();
++	}
  }
  
 -void PPCRecompiler_thread()
@@ -698,7 +748,7 @@ index c9758f3..f53b974 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,9 +651,34 @@ void PPCRecompiler_thread()
+@@ -486,9 +689,34 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -733,7 +783,7 @@ index c9758f3..f53b974 100644
  			if(s_ppcRecompilerState.workerThreadStopSignal)
  				return;
  		}
-@@ -609,6 +799,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +837,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -741,7 +791,7 @@ index c9758f3..f53b974 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +893,11 @@ void PPCRecompiler_init()
+@@ -702,7 +931,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -754,7 +804,7 @@ index c9758f3..f53b974 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +906,10 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +944,10 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
