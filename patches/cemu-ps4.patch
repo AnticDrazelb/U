@@ -487,7 +487,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..e2e4788 100644
+index c9758f3..e4481c0 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -663,7 +663,150 @@ index c9758f3..e2e4788 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -377,6 +518,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -340,6 +481,132 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+ 	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
+ }
+ 
++// Crema (Settings > Emulation > Compare Results: Fast): removes writes of condition register bits
++// that are overwritten before any read. Cemu's register allocator stores every written guest
++// register at the end of its range, so each compare stored its CR bits (and copied XER.SO) even
++// when the next compare overwrote them: ~15% of the recompiled instructions in Tekken Tag
++// Tournament 2. Liveness of the 32 CR bits is solved over the function's segments; where control
++// leaves the function every bit is live, except that a call or a return (bl, bctrl, blr, an HLE
++// call) leaves cr0, cr1 and cr5-cr7 dead: the PowerPC EABI makes those fields volatile.
++bool g_crema_fast_compares = true;
++
++static void PPCRecompiler_RemoveDeadCRWrites(ppcImlGenContext_t& ctx)
++{
++	// the CR bits' register ids
++	std::unordered_map<IMLRegID, uint32> crBitOf;
++	for (auto& [name, reg] : ctx.mappedRegs)
++		if (name >= PPCREC_NAME_CR && name <= PPCREC_NAME_CR_LAST)
++			crBitOf.emplace(reg.GetRegID(), name - PPCREC_NAME_CR);
++	if (crBitOf.empty())
++		return;
++	constexpr uint32 kAll = 0xFFFFFFFFu;
++	constexpr uint32 kNonVolatile = 0x000FFF00u; // cr2-cr4 (bits 8-19)
++	auto bitsOf = [&](const IMLReg& reg) -> uint32 {
++		if (!reg.IsValid())
++			return 0;
++		auto it = crBitOf.find(reg.GetRegID());
++		return it == crBitOf.end() ? 0 : (1u << it->second);
++	};
++	// what the code after the segment may read when control leaves the function
++	auto exitLiveness = [&](IMLSegment* seg) -> uint32 {
++		if (seg->imlList.empty())
++			return kAll;
++		IMLInstruction* last = seg->GetLastInstruction();
++		if (last->type != PPCREC_IML_TYPE_MACRO)
++			return kAll;
++		switch (last->operation)
++		{
++		case PPCREC_IML_MACRO_BL:
++		case PPCREC_IML_MACRO_HLE:
++			return kNonVolatile;
++		case PPCREC_IML_MACRO_B_TO_REG:
++			return last->op_macro.paramU16 != 0 ? kNonVolatile : kAll;
++		default:
++			return kAll; // B_FAR, LEAVE (back to the interpreter at this function's code), ...
++		}
++	};
++
++	const size_t count = ctx.segmentList2.size();
++	std::vector<uint32> use(count), def(count), liveIn(count), liveOut(count);
++	for (size_t i = 0; i < count; i++)
++	{
++		IMLSegment* seg = ctx.segmentList2[i];
++		seg->momentaryIndex = (uint32)i;
++		uint32 u = 0, d = 0;
++		for (auto& inst : seg->imlList)
++		{
++			IMLUsedRegisters regs;
++			inst.CheckRegisterUsage(&regs);
++			uint32 read = 0, written = 0;
++			regs.ForEachReadGPR([&](IMLReg r) { read |= bitsOf(r); });
++			regs.ForEachWrittenGPR([&](IMLReg r) { written |= bitsOf(r); });
++			u |= read & ~d;
++			d |= written;
++		}
++		use[i] = u;
++		def[i] = d;
++	}
++	auto successorLiveness = [&](size_t i) -> uint32 {
++		IMLSegment* seg = ctx.segmentList2[i];
++		uint32 out = 0;
++		const bool hasSuccessor = seg->nextSegmentBranchTaken || seg->nextSegmentBranchNotTaken;
++		if (seg->nextSegmentIsUncertain || !hasSuccessor)
++			out |= exitLiveness(seg);
++		if (seg->nextSegmentBranchTaken)
++			out |= liveIn[seg->nextSegmentBranchTaken->momentaryIndex];
++		if (seg->nextSegmentBranchNotTaken)
++			out |= liveIn[seg->nextSegmentBranchNotTaken->momentaryIndex];
++		return out;
++	};
++	for (bool changed = true; changed;)
++	{
++		changed = false;
++		for (size_t n = count; n-- > 0;)
++		{
++			const uint32 out = successorLiveness(n);
++			const uint32 in = use[n] | (out & ~def[n]);
++			if (out != liveOut[n] || in != liveIn[n])
++			{
++				liveOut[n] = out;
++				liveIn[n] = in;
++				changed = true;
++			}
++		}
++	}
++	// backwards through each segment: a write of only dead CR bits by an instruction without other
++	// effects goes
++	for (size_t i = 0; i < count; i++)
++	{
++		IMLSegment* seg = ctx.segmentList2[i];
++		uint32 live = liveOut[i];
++		for (size_t k = seg->imlList.size(); k-- > 0;)
++		{
++			IMLInstruction& inst = seg->imlList[k];
++			IMLUsedRegisters regs;
++			inst.CheckRegisterUsage(&regs);
++			uint32 written = 0;
++			bool writesOther = false;
++			regs.ForEachWrittenGPR([&](IMLReg r) {
++				const uint32 bit = bitsOf(r);
++				written |= bit;
++				if (!bit)
++					writesOther = true;
++			});
++			const bool pure = inst.type == PPCREC_IML_TYPE_COMPARE || inst.type == PPCREC_IML_TYPE_COMPARE_S32 ||
++				inst.type == PPCREC_IML_TYPE_R_R || inst.type == PPCREC_IML_TYPE_R_S32 ||
++				inst.type == PPCREC_IML_TYPE_R_R_S32 || inst.type == PPCREC_IML_TYPE_R_R_R;
++			if (pure && written && !writesOther && (written & live) == 0)
++			{
++				inst.make_no_op();
++				continue;
++			}
++			uint32 read = 0;
++			regs.ForEachReadGPR([&](IMLReg r) { read |= bitsOf(r); });
++			live = (live & ~written) | read;
++		}
++	}
++}
++
+ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+ {
+ 	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
+@@ -355,6 +622,9 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+ 
+ 	IMLOptimizer_OptimizeSinglePrecisionStores(ppcImlGenContext);
+ 
++	if (g_crema_fast_compares)
++		PPCRecompiler_RemoveDeadCRWrites(ppcImlGenContext);
++
+ 	PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext);
+ 
+ 	return true;
+@@ -377,6 +647,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -672,7 +815,7 @@ index c9758f3..e2e4788 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +531,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +660,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -689,7 +832,7 @@ index c9758f3..e2e4788 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +570,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +699,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -699,7 +842,7 @@ index c9758f3..e2e4788 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +597,66 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +726,66 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -770,7 +913,7 @@ index c9758f3..e2e4788 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,9 +689,34 @@ void PPCRecompiler_thread()
+@@ -486,9 +818,34 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -805,7 +948,7 @@ index c9758f3..e2e4788 100644
  			if(s_ppcRecompilerState.workerThreadStopSignal)
  				return;
  		}
-@@ -609,6 +837,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +966,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -813,7 +956,7 @@ index c9758f3..e2e4788 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +931,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1060,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -826,7 +969,7 @@ index c9758f3..e2e4788 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +944,10 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1073,10 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -838,7 +981,7 @@ index c9758f3..e2e4788 100644
      while(!s_ppcRecompilerState.targetQueue.empty())
          s_ppcRecompilerState.targetQueue.pop();
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..a7f3142 100644
+index 89e805d..31e8f41 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -850,7 +993,34 @@ index 89e805d..a7f3142 100644
  bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
  
  struct PPCBasicBlockInfo
-@@ -3115,6 +3117,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -729,6 +731,9 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 		regCRBit = _GetRegCR(ppcImlGenContext, crRegister, crBit);
+ 
+ 	IMLReg branchDestReg = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_SPR0 + sprReg);
++	// Crema: for the CR write elimination (PPCRecompiler.cpp): 1 a return (blr), 2 a call
++	// (bctrl/blrl), 0 another computed branch (bctr: jump tables, tail calls)
++	const uint16 branchKind = LK ? 2 : (sprReg == SPR_LR ? 1 : 0);
+ 	if (LK)
+ 	{
+ 		if (sprReg == SPR_LR)
+@@ -756,14 +761,14 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 		PPCBasicBlockInfo* currentBasicBlock = ppcImlGenContext->currentBasicBlock;
+ 		IMLSegment* bctrSeg = PPCIMLGen_CreateNewSegmentAsBranchTarget(*ppcImlGenContext, *currentBasicBlock);
+ 		ppcImlGenContext->emitInst().make_conditional_jump(regCRBit, !BO.conditionInverted());
+-		bctrSeg->AppendInstruction()->make_macro(PPCREC_IML_MACRO_B_TO_REG, 0, 0, 0, branchDestReg);
++		bctrSeg->AppendInstruction()->make_macro(PPCREC_IML_MACRO_B_TO_REG, 0, 0, branchKind, branchDestReg);
+ 	}
+ 	else
+ 	{
+ 		// branch always, no condition and no decrementer check
+ 		cemu_assert_debug(!ppcImlGenContext->currentBasicBlock->hasContinuedFlow);
+ 		cemu_assert_debug(!ppcImlGenContext->currentBasicBlock->hasBranchTarget);
+-		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_B_TO_REG, 0, 0, 0, branchDestReg);
++		ppcImlGenContext->emitInst().make_macro(PPCREC_IML_MACRO_B_TO_REG, 0, 0, branchKind, branchDestReg);
+ 	}
+ 	return true;
+ }
+@@ -3115,6 +3120,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  	}
  }
  
@@ -859,7 +1029,7 @@ index 89e805d..a7f3142 100644
  bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
  {
  	std::vector<PPCBasicBlockInfo> basicBlockList = PPCRecompiler_DetermineBasicBlockRange(boundaryTracker, entryAddresses);
-@@ -3164,6 +3168,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3164,6 +3171,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  	// generate cycle counters
  	// in theory we could generate these as part of FillBasicBlock() but in the future we might use more complex logic to emit fewer operations
@@ -873,7 +1043,7 @@ index 89e805d..a7f3142 100644
  	for (size_t i = 0; i < basicBlockList.size(); i++)
  	{
  		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
-@@ -3171,6 +3182,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3171,6 +3185,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
  		cemu_assert_debug(ppcInstructionCount > 0);
@@ -6106,10 +6276,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..135cf3b
+index 0000000..b28b1da
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,395 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -6121,6 +6291,7 @@ index 0000000..135cf3b
 +
 +extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
 +extern bool g_crema_fast_cycles; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Cycle Counting
++extern bool g_crema_fast_compares; // Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp: Compare Results
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +
 +#include <atomic>
@@ -6171,6 +6342,8 @@ index 0000000..135cf3b
 +		{"mii_data", "Mii Data When Missing", "Emulation",
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
++		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
++			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
 +		{"cycle_counting", "Cycle Counting", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the recompiled code counts the emulated CPU's work only at loops and function starts (faster on the PS4). Exact: every block, as Cemu does. Use Exact if a game's timing misbehaves."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
@@ -6458,6 +6631,7 @@ index 0000000..135cf3b
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
 +	g_crema_fast_cycles = get("cycle_counting") != "exact";
++	g_crema_fast_compares = get("compare_results") != "exact";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
 +	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
