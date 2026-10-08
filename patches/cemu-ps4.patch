@@ -5239,10 +5239,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..731aec9
+index 0000000..bdebdf4
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,808 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5566,7 +5566,12 @@ index 0000000..731aec9
 +	{
 +		const int fd = open((kDataRoot / "last-stop.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
 +		if (fd < 0)
++		{
++			char line[96];
++			snprintf(line, sizeof(line), "stop note: last-stop.txt cannot be opened (errno %d)", errno);
++			ps4_boot_trace(line);
 +			return;
++		}
 +		auto put = [fd](const char* text) {
 +			if (text)
 +				write(fd, text, strlen(text));

@@ -10,6 +10,7 @@
 // Handlers installed later (Dolphin's fastmem handler) chain to this one for faults they don't
 // handle.
 
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -193,6 +194,8 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         _exit(128 + sig);
 
     const int fd = open("/data/Crema/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0 && traceFd() >= 0)  // (1.69: a crash left no report; opening files was failing)
+        writeFormat(traceFd(), "signal %d: crash.log cannot be opened (errno %d)\n", sig, errno);
     if (fd >= 0) {
         const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
         const uint64_t rip = regs[kRipIndex];
@@ -271,7 +274,11 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         }
         snprintf(message, sizeof(message), "uncaught exception %s: %s", name ? name : type->name(), what);
     }
+    if (traceFd() >= 0)
+        writeFormat(traceFd(), "%s\n", message);
     const int fd = open("/data/Crema/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0 && traceFd() >= 0)
+        writeFormat(traceFd(), "crash.log cannot be opened (errno %d)\n", errno);
     if (fd >= 0) {
         writeFormat(fd, "\n=== %s\n", message);
         close(fd);
