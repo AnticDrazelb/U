@@ -2345,12 +2345,14 @@ index e037395..16d1086 100644
      #include <csignal>
      #define DEBUG_BREAK raise(SIGTRAP) 
 diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
-index b54d3ef..5c1bf0c 100644
+index b54d3ef..60421e5 100644
 --- a/src/Common/unix/FileStream_unix.cpp
 +++ b/src/Common/unix/FileStream_unix.cpp
-@@ -1,5 +1,58 @@
+@@ -1,5 +1,129 @@
  #include "Common/unix/FileStream_unix.h"
  #include <cstdarg>
++#include <cerrno>
++#include <cstring>
 +#include <algorithm>
 +#include <vector>
 +#include <fcntl.h>
@@ -2376,6 +2378,7 @@ index b54d3ef..5c1bf0c 100644
 +}
 +
 +extern "C" void ps4_boot_trace(const char* stage);
++extern "C" void ps4_open_files_report();
 +
 +extern "C" void ps4_filestream_report(const char* why)
 +{
@@ -2402,12 +2405,80 @@ index b54d3ef..5c1bf0c 100644
 +		snprintf(line, sizeof(line), "  %d in %s", sorted[i].first, sorted[i].second.c_str());
 +		ps4_boot_trace(line);
 +	}
++	ps4_open_files_report();
++}
++
++// Every open file of the process, from the kernel (FreeBSD's kern.proc.filedesc): v01.73 showed only
++// ~95 of the ~250 open files were FileStreams, and the PS4 refuses new files at ~250 distinct opens
++// (a dup()ed descriptor costs nothing: 4096 dups worked).
++extern "C" int sysctl(const int* name, unsigned int namelen, void* oldp, size_t* oldlenp, const void* newp, size_t newlen);
++
++extern "C" void ps4_open_files_report()
++{
++	// FreeBSD 9 struct kinfo_file: kf_structsize, kf_type, kf_fd ... kf_path at byte 368; the
++	// records are packed (each kf_structsize long)
++	constexpr size_t kPathOffset = 368, kFullSize = 1392;
++	const int mib[4] = {1 /* CTL_KERN */, 14 /* KERN_PROC */, 33 /* KERN_PROC_FILEDESC */, (int)getpid()};
++	char line[400];
++	size_t size = 0;
++	if (sysctl(mib, 4, nullptr, &size, nullptr, 0) != 0)
++	{
++		snprintf(line, sizeof(line), "open files (kernel): not available (errno %d)", errno);
++		ps4_boot_trace(line);
++		return;
++	}
++	size += size / 4;
++	std::vector<char> buffer(size);
++	if (sysctl(mib, 4, buffer.data(), &size, nullptr, 0) != 0)
++	{
++		snprintf(line, sizeof(line), "open files (kernel): not available (errno %d)", errno);
++		ps4_boot_trace(line);
++		return;
++	}
++	std::map<std::string, int> perFolder;
++	std::map<int, int> perType;
++	int total = 0, unnamed = 0;
++	std::string sample;
++	for (size_t at = 0; at + kPathOffset <= size;)
++	{
++		const char* record = buffer.data() + at;
++		int recordSize, type;
++		memcpy(&recordSize, record, 4);
++		memcpy(&type, record + 4, 4);
++		if (recordSize < (int)kPathOffset || recordSize > (int)kFullSize || at + recordSize > size)
++			break;
++		total++;
++		perType[type]++;
++		std::string path(record + kPathOffset, strnlen(record + kPathOffset, recordSize - kPathOffset));
++		if (path.empty())
++			unnamed++;
++		else
++		{
++			const size_t slash = path.find_last_of('/');
++			perFolder[slash == std::string::npos || slash == 0 ? path : path.substr(0, slash)]++;
++		}
++		at += recordSize;
++	}
++	std::string types;
++	for (auto& [type, count] : perType)
++		types += (types.empty() ? "type " : ", type ") + std::to_string(type) + ": " + std::to_string(count);
++	snprintf(line, sizeof(line), "open files (kernel): %d, %d without a path (%s)", total, unnamed, types.c_str());
++	ps4_boot_trace(line);
++	std::vector<std::pair<int, std::string>> sorted;
++	for (auto& [folder, count] : perFolder)
++		sorted.emplace_back(count, folder);
++	std::sort(sorted.rbegin(), sorted.rend());
++	for (size_t i = 0; i < sorted.size() && i < 16; i++)
++	{
++		snprintf(line, sizeof(line), "  %d in %s", sorted[i].first, sorted[i].second.c_str());
++		ps4_boot_trace(line);
++	}
 +}
 +#endif
  
  fs::path findPathCI(const fs::path& path)
  {
-@@ -82,28 +135,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
+@@ -82,28 +206,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
  void FileStream::SetPosition(uint64 pos)
  {
  	cemu_assert(m_isValid);
@@ -2444,7 +2515,7 @@ index b54d3ef..5c1bf0c 100644
  }
  
  void FileStream::extract(std::vector<uint8>& data)
-@@ -116,15 +164,21 @@ void FileStream::extract(std::vector<uint8>& data)
+@@ -116,15 +235,21 @@ void FileStream::extract(std::vector<uint8>& data)
  
  void FileStream::Flush()
  {
@@ -2471,7 +2542,7 @@ index b54d3ef..5c1bf0c 100644
  }
  
  bool FileStream::readU64(uint64& v)
-@@ -161,9 +215,16 @@ bool FileStream::readLine(std::string& line)
+@@ -161,9 +286,16 @@ bool FileStream::readLine(std::string& line)
  
  sint32 FileStream::writeData(const void* data, sint32 length)
  {
@@ -2491,7 +2562,7 @@ index b54d3ef..5c1bf0c 100644
  }
  
  void FileStream::writeU64(uint64 v)
-@@ -203,44 +264,38 @@ void FileStream::writeLine(const char* str)
+@@ -203,44 +335,38 @@ void FileStream::writeLine(const char* str)
  
  FileStream::~FileStream()
  {
@@ -5293,10 +5364,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..b1368b6
+index 0000000..92f8cfd
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,845 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5406,11 +5477,17 @@ index 0000000..b1368b6
 +		const int totalFds = files + sockets + pipes + devices + others;
 +		Trace(fmt::format("perf: gpu {}% | {} | fds {} (files {}, sockets {}, pipes {}, devices {}, other {})",
 +			spanDelta ? busyDelta * 100 / spanDelta : 0, threads, totalFds, files, sockets, pipes, devices, others));
-+		// what they are, at 250 and every 25 more
-+		static int sReportedAt = 225;
-+		if (totalFds >= sReportedAt + 25)
++		// what they are: once the game runs (at 30 s), then at 220 and every 15 more (the PS4
++		// refuses new files at ~250)
++		static int sReportedAt = 0;
++		static int sPerfLines = 0; // one every 5 s
++		if (++sPerfLines == 6)
 +		{
-+			sReportedAt = totalFds - totalFds % 25;
++			ps4_filestream_report(fmt::format("{} descriptors, 30 s", totalFds).c_str());
++		}
++		if (totalFds >= std::max(sReportedAt + 15, 220))
++		{
++			sReportedAt = totalFds;
 +			ps4_filestream_report(fmt::format("{} descriptors", totalFds).c_str());
 +		}
 +	}
