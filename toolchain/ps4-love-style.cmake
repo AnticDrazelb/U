@@ -92,6 +92,8 @@ endforeach ()
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=pthread_once")
 # Large anonymous mmaps go to the system flexible pool, keeping regular flexible memory for Piglet.
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=mmap")
+# Every open() and close() is recorded, to name files left open (port/ps4_crashlog.cpp).
+string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=open --wrap=close")
 # CLOCK_MONOTONIC from the time stamp counter instead of a system call (port/ps4_runtime.cpp).
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=clock_gettime")
 # New threads on all of the app's cores, not just their creator's (port/ps4_runtime.cpp).

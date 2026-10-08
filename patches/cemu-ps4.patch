@@ -2345,10 +2345,10 @@ index e037395..16d1086 100644
      #include <csignal>
      #define DEBUG_BREAK raise(SIGTRAP) 
 diff --git a/src/Common/unix/FileStream_unix.cpp b/src/Common/unix/FileStream_unix.cpp
-index b54d3ef..f500fd3 100644
+index b54d3ef..7488543 100644
 --- a/src/Common/unix/FileStream_unix.cpp
 +++ b/src/Common/unix/FileStream_unix.cpp
-@@ -1,5 +1,165 @@
+@@ -1,5 +1,174 @@
  #include "Common/unix/FileStream_unix.h"
  #include <cstdarg>
 +#include <cerrno>
@@ -2381,6 +2381,7 @@ index b54d3ef..f500fd3 100644
 +
 +extern "C" void ps4_boot_trace(const char* stage);
 +extern "C" void ps4_open_files_report();
++extern "C" void ps4_open_calls_report(const unsigned char* skip);
 +
 +extern "C" void ps4_filestream_report(const char* why)
 +{
@@ -2462,6 +2463,14 @@ index b54d3ef..f500fd3 100644
 +		for (auto& [stream, entry] : s_openStreams)
 +			streamFds.insert(entry.second);
 +	}
++	// who opened the others and where (port/ps4_crashlog.cpp: every open() is recorded)
++	{
++		std::vector<unsigned char> skip(4096, 0);
++		for (int fd : streamFds)
++			if (fd >= 0 && fd < 4096)
++				skip[fd] = 1;
++		ps4_open_calls_report(skip.data());
++	}
 +	struct Other
 +	{
 +		int fd;
@@ -2514,7 +2523,7 @@ index b54d3ef..f500fd3 100644
  
  fs::path findPathCI(const fs::path& path)
  {
-@@ -82,28 +242,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
+@@ -82,28 +251,23 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
  void FileStream::SetPosition(uint64 pos)
  {
  	cemu_assert(m_isValid);
@@ -2551,7 +2560,7 @@ index b54d3ef..f500fd3 100644
  }
  
  void FileStream::extract(std::vector<uint8>& data)
-@@ -116,15 +271,21 @@ void FileStream::extract(std::vector<uint8>& data)
+@@ -116,15 +280,21 @@ void FileStream::extract(std::vector<uint8>& data)
  
  void FileStream::Flush()
  {
@@ -2578,7 +2587,7 @@ index b54d3ef..f500fd3 100644
  }
  
  bool FileStream::readU64(uint64& v)
-@@ -161,9 +322,16 @@ bool FileStream::readLine(std::string& line)
+@@ -161,9 +331,16 @@ bool FileStream::readLine(std::string& line)
  
  sint32 FileStream::writeData(const void* data, sint32 length)
  {
@@ -2598,7 +2607,7 @@ index b54d3ef..f500fd3 100644
  }
  
  void FileStream::writeU64(uint64 v)
-@@ -203,44 +371,38 @@ void FileStream::writeLine(const char* str)
+@@ -203,44 +380,38 @@ void FileStream::writeLine(const char* str)
  
  FileStream::~FileStream()
  {

@@ -357,3 +357,142 @@ extern "C" void ps4_boot_trace(const char* stage) {
         line[sizeof(line) - 2] = '\n';
     writeAll(fd, line);
 }
+
+// Every open() and close() of the app's own code (Cemu, Mesa, libc++, and the C library's fopen,
+// which calls open; linker --wrap, toolchain/ps4-love-style.cmake): the path, when, and the code
+// addresses that opened it, so files left open can be named with their opener. The PS4 refuses
+// new files at ~250 distinct opens, and Tekken Tag Tournament 2 leaked one every ~7 s until its
+// own file loads failed and it stopped itself (1.75). Sony's libraries open files directly
+// through the kernel and aren't seen here.
+namespace {
+
+constexpr int kTrackedFds = 4096;
+struct OpenRecord {
+    char path[104];
+    uint32_t callers[5];  // elf addresses of code on the stack at the open, innermost first
+    float seconds;
+    bool used;
+};
+OpenRecord g_openRecords[kTrackedFds];
+uint64_t g_trackStart = 0;
+
+float secondsSinceStart() {
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t ns = static_cast<uint64_t>(now.tv_sec) * 1000000000ull + now.tv_nsec;
+    if (g_trackStart == 0)
+        g_trackStart = ns;
+    return static_cast<float>((ns - g_trackStart) / 1e9);
+}
+
+}  // namespace
+
+extern "C" int __real_open(const char* path, int flags, ...);
+extern "C" int __real_close(int fd);
+
+extern "C" __attribute__((noinline)) int __wrap_open(const char* path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    const int mode = va_arg(args, int);  // always passed on: harmless when the call had none
+    va_end(args);
+    const int fd = __real_open(path, flags, mode);
+    if (fd >= 0 && fd < kTrackedFds) {
+        OpenRecord& record = g_openRecords[fd];
+        // the end of the path is the telling part
+        const size_t length = path ? strlen(path) : 0;
+        const char* tail = length >= sizeof(record.path) ? path + length - (sizeof(record.path) - 1) : path;
+        memset(record.callers, 0, sizeof(record.callers));
+        const auto* stack = static_cast<const uint64_t*>(__builtin_frame_address(0));
+        for (int i = 0, found = 0; i < 400 && found < 5; i++) {
+            if (isCode(stack[i])) {
+                record.callers[found++] = static_cast<uint32_t>(toElf(stack[i]));
+            }
+        }
+        snprintf(record.path, sizeof(record.path), "%s", tail ? tail : "(null)");
+        record.seconds = secondsSinceStart();
+        record.used = true;
+    }
+    return fd;
+}
+
+extern "C" int __wrap_close(int fd) {
+    if (fd >= 0 && fd < kTrackedFds)
+        g_openRecords[fd].used = false;
+    return __real_close(fd);
+}
+
+// The files open now, except the descriptors in `skip` (a byte per descriptor, nonzero to skip:
+// Cemu's FileStreams, which it reports itself): grouped by folder and opener, then the newest.
+extern "C" void ps4_open_calls_report(const unsigned char* skip) {
+    struct Group {
+        char folder[104];
+        uint32_t caller;
+        int count;
+    };
+    static Group groups[64];
+    int groupCount = 0, total = 0;
+    const float now = secondsSinceStart();
+    for (int fd = 0; fd < kTrackedFds; fd++) {
+        const OpenRecord& record = g_openRecords[fd];
+        if (!record.used || (skip && skip[fd]))
+            continue;
+        total++;
+        char folder[104];
+        snprintf(folder, sizeof(folder), "%s", record.path);
+        if (char* slash = strrchr(folder, '/'))
+            *slash = 0;
+        // the opener: the first caller outside the C library's own open paths is not known here,
+        // so the group key is the folder and the outermost of the first three callers
+        const uint32_t caller = record.callers[2] ? record.callers[2] : record.callers[0];
+        int g = 0;
+        while (g < groupCount && (groups[g].caller != caller || strcmp(groups[g].folder, folder) != 0))
+            g++;
+        if (g == groupCount) {
+            if (groupCount == 64)
+                continue;
+            snprintf(groups[g].folder, sizeof(groups[g].folder), "%s", folder);
+            groups[g].caller = caller;
+            groups[g].count = 0;
+            groupCount++;
+        }
+        groups[g].count++;
+    }
+    char line[300];
+    snprintf(line, sizeof(line), "open() files still open (not file streams): %d in %d groups", total, groupCount);
+    ps4_boot_trace(line);
+    for (int shown = 0; shown < 12; shown++) {
+        int best = -1;
+        for (int g = 0; g < groupCount; g++)
+            if (groups[g].count > 0 && (best < 0 || groups[g].count > groups[best].count))
+                best = g;
+        if (best < 0)
+            break;
+        snprintf(line, sizeof(line), "  %dx %s (opener elf 0x%x)", groups[best].count, groups[best].folder,
+                 groups[best].caller);
+        ps4_boot_trace(line);
+        groups[best].count = -groups[best].count;  // shown
+    }
+    // the six opened last that are still open
+    int newest[6] = {-1, -1, -1, -1, -1, -1};
+    for (int fd = 0; fd < kTrackedFds; fd++) {
+        const OpenRecord& record = g_openRecords[fd];
+        if (!record.used || (skip && skip[fd]))
+            continue;
+        // replace the oldest kept one (an empty slot first) if this one is newer
+        int oldest = 0;
+        for (int i = 1; i < 6 && newest[oldest] >= 0; i++)
+            if (newest[i] < 0 || g_openRecords[newest[i]].seconds < g_openRecords[newest[oldest]].seconds)
+                oldest = i;
+        if (newest[oldest] < 0 || g_openRecords[newest[oldest]].seconds < record.seconds)
+            newest[oldest] = fd;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (newest[i] < 0)
+            continue;
+        const OpenRecord& record = g_openRecords[newest[i]];
+        snprintf(line, sizeof(line), "  newest: fd %d at %.0f s (%.0f s ago) %s, callers elf 0x%x 0x%x 0x%x 0x%x 0x%x",
+                 newest[i], record.seconds, now - record.seconds, record.path, record.callers[0], record.callers[1],
+                 record.callers[2], record.callers[3], record.callers[4]);
+        ps4_boot_trace(line);
+    }
+}
