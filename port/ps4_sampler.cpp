@@ -190,6 +190,36 @@ struct ModuleInfo {
 extern "C" int32_t sceKernelGetModuleList(int32_t* handles, size_t count, size_t* available);
 extern "C" int32_t sceKernelGetModuleInfo(int32_t handle, ModuleInfo* info);
 
+extern "C" int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
+
+void writeKernelSymbols(int fd, int32_t handle) {
+    static const char* const kNames[] = {
+        "sched_yield", "nanosleep", "usleep", "sceKernelUsleep", "sceKernelNanosleep", "clock_gettime",
+        "gettimeofday", "sceKernelGettimeofday", "sceKernelGetProcessTime", "sceKernelReadTsc",
+        "sceKernelGetTscFrequency", "pthread_mutex_lock", "pthread_mutex_unlock", "pthread_mutex_trylock",
+        "pthread_mutex_timedlock", "pthread_cond_wait", "pthread_cond_timedwait", "pthread_cond_signal",
+        "pthread_cond_broadcast", "pthread_rwlock_rdlock", "pthread_rwlock_wrlock", "pthread_rwlock_unlock",
+        "pthread_rwlock_tryrdlock", "scePthreadMutexLock", "scePthreadMutexUnlock", "scePthreadMutexTrylock",
+        "scePthreadCondWait", "scePthreadCondTimedwait", "scePthreadCondSignal", "scePthreadCondBroadcast",
+        "scePthreadYield", "pthread_yield", "pthread_self", "pthread_getspecific", "pthread_setspecific",
+        "pthread_kill", "pthread_sigmask", "sigprocmask", "sigaction", "sigsuspend", "sigwait", "_umtx_op",
+        "sem_wait", "sem_post", "sem_timedwait", "sceKernelWaitSema", "sceKernelSignalSema",
+        "sceKernelWaitEventFlag", "sceKernelSetEventFlag", "sceKernelWaitEqueue", "sceKernelTriggerUserEvent",
+        "kevent", "poll", "select", "read", "write", "pread", "pwrite", "open", "close", "ioctl", "fstat",
+        "mmap", "munmap", "mprotect", "sceKernelMprotect", "madvise", "getpid", "getrusage",
+        "sceKernelGetCurrentCpu", "__tls_get_addr", "__error", "sceKernelMapNamedFlexibleMemory",
+        "sceKernelVirtualQuery", "sceKernelSendNotificationRequest", "sceKernelGetCpumode",
+        "sceKernelIsNeoMode", "pthread_create", "pthread_join", "pthread_exit", "sceKernelDebugOutText"};
+    char line[160];
+    for (const char* name : kNames) {
+        void* address = nullptr;
+        if (sceKernelDlsym(handle, name, &address) == 0 && address) {
+            snprintf(line, sizeof(line), "symbol %s %p\n", name, address);
+            writeLine(fd, line);
+        }
+    }
+}
+
 void writeModuleList(int fd) {
     int32_t handles[256];
     size_t count = 0;
@@ -210,6 +240,10 @@ void writeModuleList(int fd) {
                             info.segments[g].address, info.segments[g].size, info.segments[g].prot);
         snprintf(line + len, sizeof(line) - len, "\n");
         writeLine(fd, line);
+        // Sony's libraries have no symbols: name the kernel library's entry points where time
+        // goes (profile.py maps a sample to the nearest one below it)
+        if (strstr(info.name, "libkernel"))
+            writeKernelSymbols(fd, handles[m]);
     }
 }
 
