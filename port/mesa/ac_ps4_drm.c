@@ -224,6 +224,8 @@ static void ps4_scan_writes(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, u
 struct ps4_deferred;
 static void ps4_defer(ac_drm_device *dev, struct ps4_deferred d);
 static void ps4_run_deferred(ac_drm_device *dev);
+static void ps4_run_deferred_ex(ac_drm_device *dev, bool force);
+#define PS4_QUARANTINE_BYTES (96ull << 20)
 static int ps4_do_unmap(ac_drm_device *dev, struct amdgpu_bo *b, uint32_t bo_handle, uint64_t addr,
                         uint64_t size);
 static void ps4_do_free(ac_drm_device *dev, struct amdgpu_bo *b);
@@ -1134,10 +1136,10 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
    int r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
                                          align, type, &bo->phys);
    if (r && dev->num_deferred) {
-      /* Memory still waiting for the GPU: let it finish, then try again. */
+      /* Memory still waiting for the GPU (or in quarantine): let it finish, then try again. */
       ps4_wait_seq(dev, dev->last_seq, INT64_MAX);
       simple_mtx_lock(&dev->lock);
-      ps4_run_deferred(dev);
+      ps4_run_deferred_ex(dev, true);
       simple_mtx_unlock(&dev->lock);
       r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
                                         align, type, &bo->phys);
@@ -1556,17 +1558,31 @@ ps4_do_va_free(amdgpu_va_handle va)
 
 /* Runs the deferred operations whose submissions have completed, in order. dev->lock held. */
 static void
-ps4_run_deferred(ac_drm_device *dev)
+ps4_run_deferred_ex(ac_drm_device *dev, bool force)
 {
+   /* Quarantine: buffers the GPU is done with stay mapped (and their address ranges allocated)
+    * until more than PS4_QUARANTINE_BYTES wait, oldest released first. On Linux and Windows a
+    * GPU write to an unmapped address is dropped and the app goes on; on the PS4 it is a GPU page
+    * fault that ends the app, and Cemu does write through stale descriptors: Donkey Kong Country:
+    * Tropical Freeze (1.84) wrote into a buffer freed ~500 submissions (8 s) earlier at its save
+    * menu. Such writes now land in the old buffer's own memory. (A shared "sink" page can't back
+    * the freed ranges instead: the PS4 maps direct memory only once.) */
    const uint64_t done = ps4_completed(dev);
+   unsigned ready = 0;
+   uint64_t held = 0;
+   for (; ready < dev->num_deferred && dev->deferred[ready].seq <= done; ready++)
+      if (dev->deferred[ready].op == 'F' && dev->deferred[ready].bo)
+         held += dev->deferred[ready].bo->size;
    unsigned n = 0;
-   for (; n < dev->num_deferred && dev->deferred[n].seq <= done; n++) {
+   for (; n < ready && (force || held > PS4_QUARANTINE_BYTES); n++) {
       struct ps4_deferred *d = &dev->deferred[n];
       switch (d->op) {
       case 'U':
          ps4_do_unmap(dev, d->bo, d->handle, d->addr, d->size);
          break;
       case 'F':
+         if (d->bo)
+            held -= MIN2(held, d->bo->size);
          ps4_do_free(dev, d->bo);
          break;
       case 'V':
@@ -1578,6 +1594,12 @@ ps4_run_deferred(ac_drm_device *dev)
       dev->num_deferred -= n;
       memmove(dev->deferred, dev->deferred + n, dev->num_deferred * sizeof(*dev->deferred));
    }
+}
+
+static void
+ps4_run_deferred(ac_drm_device *dev)
+{
+   ps4_run_deferred_ex(dev, false);
 }
 
 static void
