@@ -487,7 +487,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..67e22fb 100644
+index c9758f3..bd687ae 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -536,7 +536,7 @@ index c9758f3..67e22fb 100644
  	std::atomic_int_fast32_t recompilerEnableCount{0};
  	// recompiler thread
  	std::thread workerThread;
-@@ -59,6 +80,220 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +80,260 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -545,7 +545,10 @@ index c9758f3..67e22fb 100644
 +#include <mutex>
 +#include <unordered_set>
 +#include "Cafe/CafeSystem.h"
++#include <unordered_map>
 +extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
++extern "C" size_t ps4rt_heap_size(void); // port/ps4_runtime.cpp
++extern "C" size_t ps4rt_heap_footprint(void);
 +// Crema: the newest recompiled functions' host code ranges, so a crash in recompiled code can be
 +// traced back to the game's function (ps4_crash_jit_info, called by the port's crash handler
 +// without locks). Written under recompilerSpinlock; a stale entry is only compared, never read.
@@ -593,6 +596,7 @@ index c9758f3..67e22fb 100644
 +	std::vector<std::pair<uint32, uint32>> s_cremaWarmList; // address, code hash, in first-compiled order
 +	size_t s_cremaWarmNext = 0;
 +	std::unordered_set<uint32> s_cremaWarmRecorded; // addresses in the file
++	std::unordered_set<uint32> s_cremaWarmCosted; // ... with their cost
 +	std::string s_cremaWarmPending; // lines not written yet
 +	std::string s_cremaWarmPath;
 +	bool s_cremaWarmLoaded = false;
@@ -600,6 +604,11 @@ index c9758f3..67e22fb 100644
 +	uint64 s_cremaWarmLastFlush = 0;
 +	uint32 s_cremaWarmDone = 0, s_cremaWarmSkipped = 0;
 +	thread_local bool t_cremaWarmCompile = false;
++	// the last compile's CPU time per phase (intermediate code, passes, register allocation, x86
++	// code) and its segment count, for the slow compile lines
++	thread_local uint64 t_cremaPhaseNs[4];
++	thread_local uint32 t_cremaSegments = 0;
++	thread_local uint32 t_cremaLastCostMs = 0;
 +
 +	uint32 CremaCodeHash(uint32 address)
 +	{
@@ -625,17 +634,35 @@ index c9758f3..67e22fb 100644
 +		std::error_code ec;
 +		fs::create_directories(folder, ec);
 +		s_cremaWarmPath = _pathToUtf8(folder / fmt::format("{:016x}.txt", titleId));
++		// "address hash" lines, and "address hash cost" (CPU ms) for the expensive ones (1.81)
++		std::unordered_map<uint32, uint32> cost;
 +		if (FILE* file = fopen(s_cremaWarmPath.c_str(), "r"))
 +		{
-+			unsigned int address, hash;
-+			while (s_cremaWarmList.size() < kCremaWarmMax && fscanf(file, "%x %x", &address, &hash) == 2)
-+				if (s_cremaWarmRecorded.insert(address).second)
++			char line[64];
++			while (fgets(line, sizeof(line), file))
++			{
++				unsigned int address, hash, ms = 0;
++				if (sscanf(line, "%x %x %u", &address, &hash, &ms) < 2)
++					continue;
++				if (ms)
++				{
++					cost[address] = std::max(cost[address], (uint32)ms);
++					s_cremaWarmCosted.insert(address);
++				}
++				if (s_cremaWarmList.size() < kCremaWarmMax && s_cremaWarmRecorded.insert(address).second)
 +					s_cremaWarmList.emplace_back(address, hash);
++			}
 +			fclose(file);
 +		}
-+		char text[200];
-+		snprintf(text, sizeof(text), "recompiler: %zu game functions remembered from earlier sessions (%s)", s_cremaWarmList.size(),
-+			s_cremaWarmPath.c_str());
++		// the expensive ones first (they are what makes the game stutter), the rest in the order the
++		// game first needed them
++		std::stable_sort(s_cremaWarmList.begin(), s_cremaWarmList.end(), [&](const auto& a, const auto& b) {
++			const auto ca = cost.find(a.first), cb = cost.find(b.first);
++			return (ca == cost.end() ? 0 : ca->second) > (cb == cost.end() ? 0 : cb->second);
++		});
++		char text[220];
++		snprintf(text, sizeof(text), "recompiler: %zu game functions remembered from earlier sessions, %zu of them expensive (%s)",
++			s_cremaWarmList.size(), cost.size(), s_cremaWarmPath.c_str());
 +		ps4_boot_trace(text);
 +		return true;
 +	}
@@ -657,18 +684,31 @@ index c9758f3..67e22fb 100644
 +		s_cremaWarmPending.clear();
 +	}
 +
-+	// a function compiled and made active: remembered for the next session
-+	void CremaWarmRecord(uint32 address)
++	// a function compiled and made active: remembered for the next session, with its cost (CPU
++	// ms) when that was at least kCremaWarmCostly
++	constexpr uint32 kCremaWarmCostly = 50;
++	void CremaWarmRecord(uint32 address, uint32 costMs)
 +	{
 +		const uint32 hash = CremaCodeHash(address);
 +		std::lock_guard lock(s_cremaWarmLock);
 +		s_cremaWarmStarted.store(true, std::memory_order_relaxed);
-+		if (!CremaWarmLoad() || hash == 0 || s_cremaWarmRecorded.size() >= kCremaWarmMax)
++		if (!CremaWarmLoad() || hash == 0)
 +			return;
-+		if (!s_cremaWarmRecorded.insert(address).second)
++		const bool costly = costMs >= kCremaWarmCostly;
++		const bool known = s_cremaWarmRecorded.count(address) != 0;
++		if (known && (!costly || s_cremaWarmCosted.count(address)))
 +			return;
-+		char line[24];
-+		snprintf(line, sizeof(line), "%08x %08x\n", address, hash);
++		if (!known && s_cremaWarmRecorded.size() >= kCremaWarmMax)
++			return;
++		s_cremaWarmRecorded.insert(address);
++		char line[40];
++		if (costly)
++		{
++			s_cremaWarmCosted.insert(address);
++			snprintf(line, sizeof(line), "%08x %08x %u\n", address, hash, costMs);
++		}
++		else
++			snprintf(line, sizeof(line), "%08x %08x\n", address, hash);
 +		s_cremaWarmPending += line;
 +		CremaWarmFlushLocked(false);
 +	}
@@ -757,7 +797,44 @@ index c9758f3..67e22fb 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -340,6 +575,132 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -207,7 +482,16 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+ 	// generate intermediate code
+ 	ppcImlGenContext_t ppcImlGenContext = { 0 };
+ 	ppcImlGenContext.debug_entryPPCAddress = range.startAddress;
++#ifdef __ORBIS__
++	for (auto& phase : t_cremaPhaseNs)
++		phase = 0;
++	uint64 phaseStart = CremaThreadCpuNs();
++#endif
+ 	bool compiledSuccessfully = PPCRecompiler_generateIntermediateCode(ppcImlGenContext, ppcRecFunc, entryAddresses, boundaryTracker);
++#ifdef __ORBIS__
++	t_cremaPhaseNs[0] = CremaThreadCpuNs() - phaseStart;
++	phaseStart = CremaThreadCpuNs();
++#endif
+ 	if (compiledSuccessfully == false)
+ 	{
+ 		delete ppcRecFunc;
+@@ -232,10 +516,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+ 		delete ppcRecFunc;
+ 		return nullptr;
+ 	}
++#ifdef __ORBIS__
++	// the passes without the register allocation (timed inside)
++	t_cremaPhaseNs[1] = CremaThreadCpuNs() - phaseStart - t_cremaPhaseNs[2];
++	t_cremaSegments = (uint32)ppcImlGenContext.segmentList2.size();
++	phaseStart = CremaThreadCpuNs();
++#endif
+ 
+ #if defined(ARCH_X86_64)
+ 	// emit x64 code
+ 	bool x64GenerationSuccess = PPCRecompiler_generateX64Code(ppcRecFunc, &ppcImlGenContext);
++#ifdef __ORBIS__
++	t_cremaPhaseNs[3] = CremaThreadCpuNs() - phaseStart;
++#endif
+ 	if (x64GenerationSuccess == false)
+ 	{
+ 		return nullptr;
+@@ -340,6 +633,132 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -890,7 +967,7 @@ index c9758f3..67e22fb 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,6 +712,11 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +770,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -902,7 +979,18 @@ index c9758f3..67e22fb 100644
  	IMLOptimizer_StandardOptimizationPass(ppcImlGenContext);
  
  	IMLOptimizer_OptimizeSinglePrecisionStores(ppcImlGenContext);
-@@ -377,6 +743,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+ 
++#ifdef __ORBIS__
++	const uint64 regallocStart = CremaThreadCpuNs();
++#endif
+ 	PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext);
++#ifdef __ORBIS__
++	t_cremaPhaseNs[2] = CremaThreadCpuNs() - regallocStart;
++#endif
+ 
+ 	return true;
+ }
+@@ -377,6 +807,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -911,7 +999,7 @@ index c9758f3..67e22fb 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +756,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +820,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -928,7 +1016,7 @@ index c9758f3..67e22fb 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +795,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +859,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -938,7 +1026,7 @@ index c9758f3..67e22fb 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +822,95 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +886,112 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -965,14 +1053,25 @@ index c9758f3..67e22fb 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  
 +	// Crema: large functions one at a time (their compiles take tens of MiB each; three at once
-+	// filled the heap, 1.58)
-+	static std::mutex s_largeFunctionMutex;
-+	std::unique_lock<std::mutex> largeLock(s_largeFunctionMutex, std::defer_lock);
++	// filled the heap, 1.58), or two while less than 60% of the heap was ever touched (1.81: each
++	// took 1-2 s of CPU, and the game stuttered while they waited for each other)
++	static std::mutex s_largeFunctionMutex[2];
++	std::unique_lock<std::mutex> largeLock(s_largeFunctionMutex[0], std::defer_lock);
 +	if (t_recompilerWorker >= 0 && range.length > 0x2000)
 +	{
 +#ifdef __ORBIS__
++		if (!largeLock.try_lock())
++		{
++			const size_t heapSize = ps4rt_heap_size();
++			if (heapSize && ps4rt_heap_footprint() < heapSize / 10 * 6)
++			{
++				std::unique_lock<std::mutex> second(s_largeFunctionMutex[1], std::try_to_lock);
++				if (second.owns_lock())
++					largeLock = std::move(second);
++			}
++		}
 +		// a remembered function (CremaWarmTake) doesn't hold up one the game waits for: later
-+		if (t_cremaWarmCompile && !largeLock.try_lock())
++		if (t_cremaWarmCompile && !largeLock.owns_lock())
 +		{
 +			s_ppcRecompilerState.recompilerSpinlock.lock();
 +			if (ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[address / 4] == PPCRecompiler_leaveRecompilerCode_visited)
@@ -991,10 +1090,16 @@ index c9758f3..67e22fb 100644
 +	}
 +
  	std::vector<std::pair<MPTR, uint32>> functionEntryPoints;
++#ifdef __ORBIS__
++	const uint64 compileCpuStart = CremaThreadCpuNs();
++#endif
  	PPCRecFunction_t* func = PPCRecompiler_recompileFunction(range, entryAddresses, functionEntryPoints, funcBoundaries);
 -	if (!func)
 -		return; // recompilation failed
 -	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
++#ifdef __ORBIS__
++	t_cremaLastCostMs = (uint32)((CremaThreadCpuNs() - compileCpuStart) / 1000000);
++#endif
 +	bool activated = false;
 +	if (func)
 +	{
@@ -1006,7 +1111,7 @@ index c9758f3..67e22fb 100644
 +		largeLock.unlock();
 +#ifdef __ORBIS__
 +	if (activated)
-+		CremaWarmRecord(address);
++		CremaWarmRecord(address, t_cremaLastCostMs);
 +#endif
 +	if (t_recompilerWorker >= 0)
 +	{
@@ -1038,7 +1143,7 @@ index c9758f3..67e22fb 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +943,74 @@ void PPCRecompiler_thread()
+@@ -486,12 +1024,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1064,9 +1169,10 @@ index c9758f3..67e22fb 100644
 +			const double seconds = (double)(CremaNowNs() - compileStart) / 1e9;
 +			if (seconds >= 1.0)
 +			{
-+				char text[160];
-+				snprintf(text, sizeof(text), "recompiler: the game function at %08x took %.1f s to compile (%.1f s of CPU time)", enterAddress, seconds,
-+					(double)(CremaThreadCpuNs() - compileCpuStart) / 1e9);
++				char text[260];
++				snprintf(text, sizeof(text), "recompiler: the game function at %08x took %.1f s to compile (%.1f s of CPU time: code %.2f, passes %.2f, "
++					"registers %.2f, x86 %.2f; %u segments)", enterAddress, seconds, (double)(CremaThreadCpuNs() - compileCpuStart) / 1e9,
++					t_cremaPhaseNs[0] / 1e9, t_cremaPhaseNs[1] / 1e9, t_cremaPhaseNs[2] / 1e9, t_cremaPhaseNs[3] / 1e9, t_cremaSegments);
 +				ps4_boot_trace(text);
 +			}
 +#endif
@@ -1092,8 +1198,16 @@ index c9758f3..67e22fb 100644
 +			s_ppcRecompilerState.workerStartSeq[workerIndex] = t_compileStartSeq;
 +			s_ppcRecompilerState.recompilerSpinlock.unlock();
 +			t_cremaWarmCompile = true;
++			t_cremaLastCostMs = 0;
 +			PPCRecompiler_recompileAtAddress(warmAddress);
 +			t_cremaWarmCompile = false;
++			if (t_cremaLastCostMs >= 1000)
++			{
++				char text[120];
++				snprintf(text, sizeof(text), "recompiler: remembered function %08x compiled ahead (%.1f s of CPU time)", warmAddress,
++					t_cremaLastCostMs / 1000.0);
++				ps4_boot_trace(text);
++			}
 +			s_ppcRecompilerState.recompilerSpinlock.lock();
 +			s_ppcRecompilerState.workerStartSeq[workerIndex] = ~0ull;
 +			s_ppcRecompilerState.recompilerSpinlock.unlock();
@@ -1113,7 +1227,7 @@ index c9758f3..67e22fb 100644
  	}
  }
  
-@@ -504,6 +1023,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1113,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1155,7 +1269,7 @@ index c9758f3..67e22fb 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1163,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1253,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1163,7 +1277,7 @@ index c9758f3..67e22fb 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1257,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1347,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1176,7 +1290,7 @@ index c9758f3..67e22fb 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1270,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1360,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();

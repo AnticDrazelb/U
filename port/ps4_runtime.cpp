@@ -948,5 +948,10 @@ size_t ps4rt_heap_size(void) {
     getHeap();
     return g_heapSize;
 }
+// How much of the heap has been touched: an upper bound of what is in use (freed chunks below the
+// top count too).
+size_t ps4rt_heap_footprint(void) {
+    return mspace_footprint(getHeap());
+}
 
 }  // extern "C"
