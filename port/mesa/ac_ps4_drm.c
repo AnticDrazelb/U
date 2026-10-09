@@ -290,6 +290,8 @@ ps4_completed(ac_drm_device *dev)
 }
 
 /* Waits until submission `seq` has finished; returns false on timeout. */
+static void ps4_progress(const char *fmt, ...);
+
 /* GPU addresses are CPU addresses: the IB parser can follow chained IBs directly. */
 static void
 ps4_record(ac_drm_device *dev, char what, struct amdgpu_bo *b, uint64_t va, uint64_t size)
@@ -301,6 +303,12 @@ ps4_record(ac_drm_device *dev, char what, struct amdgpu_bo *b, uint64_t va, uint
    e->size = size;
    e->phys = b ? b->phys : -1;
    e->seq = dev->last_seq;
+   /* Also to the flight recorder (when on): a GPU page fault kills the app before anything can
+    * be asked, so the buffers mapped at the faulting address are looked up there afterwards
+    * (Donkey Kong Country: Tropical Freeze, 1.82: a GPU write to an unmapped page). */
+   ps4_progress("%c bo %u va %#llx size %#llx heap %#x seq %llu\n", what, e->handle,
+                (unsigned long long)va, (unsigned long long)size, b ? b->heap : 0,
+                (unsigned long long)dev->last_seq);
 }
 
 /* Which live buffer maps `va`, and what happened recently around it. */
