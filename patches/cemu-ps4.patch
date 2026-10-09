@@ -487,7 +487,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..bd687ae 100644
+index c9758f3..1901b14 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -834,7 +834,7 @@ index c9758f3..bd687ae 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +633,132 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +633,139 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -871,13 +871,20 @@ index c9758f3..bd687ae 100644
 +		IMLInstruction* last = seg->GetLastInstruction();
 +		if (last->type != PPCREC_IML_TYPE_MACRO)
 +			return kAll;
++		// A call's callee reads cr1's EQ bit (CR bit 6) at entry when it takes variable arguments: the
++		// caller sets it (crset/crclr 6) to say whether floating point arguments are in registers,
++		// so it stays live into calls (1.93: it was removed with the volatile fields).
++		constexpr uint32 kVarargsFloatBit = 1u << 6;
 +		switch (last->operation)
 +		{
 +		case PPCREC_IML_MACRO_BL:
 +		case PPCREC_IML_MACRO_HLE:
-+			return kNonVolatile;
++			return kNonVolatile | kVarargsFloatBit;
 +		case PPCREC_IML_MACRO_B_TO_REG:
-+			return last->op_macro.paramU16 != 0 ? kNonVolatile : kAll;
++			// 2: a call (bctrl/blrl), 1: a return (blr), 0: another computed branch
++			if (last->op_macro.paramU16 == 2)
++				return kNonVolatile | kVarargsFloatBit;
++			return last->op_macro.paramU16 == 1 ? kNonVolatile : kAll;
 +		default:
 +			return kAll; // B_FAR, LEAVE (back to the interpreter at this function's code), ...
 +		}
@@ -967,7 +974,7 @@ index c9758f3..bd687ae 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +770,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +777,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -990,7 +997,7 @@ index c9758f3..bd687ae 100644
  
  	return true;
  }
-@@ -377,6 +807,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +814,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -999,7 +1006,7 @@ index c9758f3..bd687ae 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +820,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +827,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1016,7 +1023,7 @@ index c9758f3..bd687ae 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +859,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +866,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1026,7 +1033,7 @@ index c9758f3..bd687ae 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +886,112 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +893,112 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1143,7 +1150,7 @@ index c9758f3..bd687ae 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1024,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1031,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1227,7 +1234,7 @@ index c9758f3..bd687ae 100644
  	}
  }
  
-@@ -504,6 +1113,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1120,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1269,7 +1276,7 @@ index c9758f3..bd687ae 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1253,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1260,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1277,7 +1284,7 @@ index c9758f3..bd687ae 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1347,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1354,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1290,7 +1297,7 @@ index c9758f3..bd687ae 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1360,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1367,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
