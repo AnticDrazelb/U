@@ -2436,7 +2436,7 @@ index 9fe4bea..c18344b 100644
  		ConfigureHostFloatingPointEnvironment();
  
 diff --git a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp b/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
-index 821fe8a..4683b2b 100644
+index 821fe8a..f24e24f 100644
 --- a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
 +++ b/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
 @@ -1,5 +1,6 @@
@@ -2446,21 +2446,16 @@ index 821fe8a..4683b2b 100644
  
  extern "C"
  {
-@@ -82,7 +83,13 @@ namespace H264
+@@ -82,6 +83,8 @@ namespace H264
  			m_codecCtx->pv_fxns = (void*)&ih264d_api_function;
  			m_codecCtx->u4_size = sizeof(iv_obj_t);
  
-+#if defined(__ORBIS__)
-+			// Crema: the PS4's 1.6 GHz cores decode a 720p video too slowly on one (Tekken Tag
-+			// Tournament 2's intro); libavc splits a frame's work over up to 4
-+			SetDecoderCoreCount(3);
-+#else
++			// (Crema 1.80 used 3 on the PS4: Donkey Kong Country: Tropical Freeze died as its title
++			// video started, without a crash report; 1 as in Cemu)
  			SetDecoderCoreCount(1);
-+#endif
  
  			m_isBufferedMode = isBufferedMode;
- 
-@@ -478,6 +485,7 @@ namespace H264
+@@ -478,6 +481,7 @@ namespace H264
  	  private:
  		void DecoderThread()
  		{
