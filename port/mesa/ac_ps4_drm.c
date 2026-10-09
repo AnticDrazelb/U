@@ -224,7 +224,8 @@ static void ps4_scan_writes(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, u
 struct ps4_deferred;
 static void ps4_defer(ac_drm_device *dev, struct ps4_deferred d);
 static void ps4_run_deferred(ac_drm_device *dev);
-static void ps4_run_deferred_ex(ac_drm_device *dev, bool force);
+static void ps4_run_deferred_ex(ac_drm_device *dev, uint64_t keep);
+static void ps4_note_released(uint32_t handle, uint64_t va, uint64_t size, uint64_t seq);
 #define PS4_QUARANTINE_BYTES (96ull << 20)
 static int ps4_do_unmap(ac_drm_device *dev, struct amdgpu_bo *b, uint32_t bo_handle, uint64_t addr,
                         uint64_t size);
@@ -1136,13 +1137,22 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
    int r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
                                          align, type, &bo->phys);
    if (r && dev->num_deferred) {
-      /* Memory still waiting for the GPU (or in quarantine): let it finish, then try again. */
+      /* Memory still waiting for the GPU (or in quarantine): let it finish, then release the
+       * quarantine's older half at a time (the newest stays protected longest) until it fits. */
       ps4_wait_seq(dev, dev->last_seq, INT64_MAX);
-      simple_mtx_lock(&dev->lock);
-      ps4_run_deferred_ex(dev, true);
-      simple_mtx_unlock(&dev->lock);
-      r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
-                                        align, type, &bo->phys);
+      for (uint64_t keep = PS4_QUARANTINE_BYTES / 2; r; keep /= 2) {
+         simple_mtx_lock(&dev->lock);
+         ps4_run_deferred_ex(dev, keep);
+         simple_mtx_unlock(&dev->lock);
+         r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bo->size + PS4_TAIL,
+                                           align, type, &bo->phys);
+         if (!keep)
+            break;
+      }
+      static unsigned logged;
+      if (logged++ < 8)
+         ps4_log("radv/ps4: %llu bytes did not fit: quarantine released (%s)\n",
+                 (unsigned long long)bo->size, r ? "still no memory" : "fits now");
    }
    if (r) {
       ps4_log("radv/ps4: allocating %llu bytes of direct memory failed (%#x)\n",
@@ -1452,6 +1462,8 @@ ps4_do_unmap(ac_drm_device *dev, struct amdgpu_bo *b, uint32_t bo_handle, uint64
       }
       if (b && b->cpu == (void *)(uintptr_t)addr && !b->cpu_owned)
          b->cpu = NULL;
+      if (b && addr == b->last_va)
+         ps4_note_released(b->handle, addr, b->size, dev->last_seq);
       ps4_record(dev, 'U', b, addr, size);
       /* Unmap explicitly, then put the reservation back so the window stays ours. (Reserving
        * over a live mapping isn't guaranteed to replace it; a mapping left behind would vanish
@@ -1558,7 +1570,7 @@ ps4_do_va_free(amdgpu_va_handle va)
 
 /* Runs the deferred operations whose submissions have completed, in order. dev->lock held. */
 static void
-ps4_run_deferred_ex(ac_drm_device *dev, bool force)
+ps4_run_deferred_ex(ac_drm_device *dev, uint64_t keep)
 {
    /* Quarantine: buffers the GPU is done with stay mapped (and their address ranges allocated)
     * until more than PS4_QUARANTINE_BYTES wait, oldest released first. On Linux and Windows a
@@ -1574,7 +1586,7 @@ ps4_run_deferred_ex(ac_drm_device *dev, bool force)
       if (dev->deferred[ready].op == 'F' && dev->deferred[ready].bo)
          held += dev->deferred[ready].bo->size;
    unsigned n = 0;
-   for (; n < ready && (force || held > PS4_QUARANTINE_BYTES); n++) {
+   for (; n < ready && held > keep; n++) {
       struct ps4_deferred *d = &dev->deferred[n];
       switch (d->op) {
       case 'U':
@@ -1599,7 +1611,7 @@ ps4_run_deferred_ex(ac_drm_device *dev, bool force)
 static void
 ps4_run_deferred(ac_drm_device *dev)
 {
-   ps4_run_deferred_ex(dev, false);
+   ps4_run_deferred_ex(dev, PS4_QUARANTINE_BYTES);
 }
 
 static void
@@ -1814,6 +1826,152 @@ ps4_bo_at(ac_drm_device *dev, uint64_t va)
          return b;
    }
    return NULL;
+}
+
+/* Released buffers' address ranges (whole-buffer unmaps), for finding stale descriptors. */
+struct ps4_released_range {
+   uint64_t va, size, seq;
+   uint32_t handle;
+};
+static struct ps4_released_range ps4_released[4096];
+static unsigned ps4_num_released;
+
+static void
+ps4_note_released(uint32_t handle, uint64_t va, uint64_t size, uint64_t seq)
+{
+   ps4_released[ps4_num_released++ % ARRAY_SIZE(ps4_released)] =
+      (struct ps4_released_range){va, size, seq, handle};
+}
+
+/* A released range holding va that no live buffer covers now (dev->lock held). */
+static const struct ps4_released_range *
+ps4_stale_at(ac_drm_device *dev, uint64_t va)
+{
+   if (va < 0x4000000000ull || va >= PS4_GPU_VA_LIMIT)
+      return NULL;
+   const struct ps4_released_range *hit = NULL;
+   const unsigned n = MIN2(ps4_num_released, ARRAY_SIZE(ps4_released));
+   for (unsigned i = 0; i < n && !hit; i++)
+      if (va >= ps4_released[i].va && va < ps4_released[i].va + ps4_released[i].size)
+         hit = &ps4_released[i];
+   if (!hit)
+      return NULL;
+   for (unsigned h = 1; h < dev->num_bos; h++) {
+      struct amdgpu_bo *b = dev->bos[h];
+      if (b && b->cpu && !b->cpu_owned && va >= b->last_va && va < b->last_va + b->size + PS4_TAIL)
+         return NULL;
+   }
+   return hit;
+}
+
+/* Does a compute dispatch's user data (or the descriptors it points to) hold the address of a
+ * released buffer? Cemu writes through stale descriptors: on PC the GPU drops such writes, on the
+ * PS4 they are a GPU page fault that ends the app (Donkey Kong Country: Tropical Freeze, 1.85: a
+ * compute copy into a 720p image freed 3 minutes earlier). Buffer descriptors carry the address in
+ * dwords 0-1 (48 bits), image descriptors as address >> 8 (40 bits). */
+static const struct ps4_released_range *
+ps4_dispatch_stale(ac_drm_device *dev, const uint32_t *ud, unsigned *where, uint64_t *addr)
+{
+   for (unsigned u = 0; u + 1 < 16; u++) {
+      const uint64_t ptr = ud[u] | ((uint64_t)(ud[u + 1] & 0xffff) << 32);
+      const struct ps4_released_range *r = ps4_stale_at(dev, ptr);
+      if (r) {
+         *where = u;
+         *addr = ptr;
+         return r;
+      }
+      struct amdgpu_bo *t = ptr >= 0x4000000000ull && ptr < PS4_GPU_VA_LIMIT ? ps4_bo_at(dev, ptr) : NULL;
+      if (!t || ptr % 4)
+         continue;
+      const uint64_t avail = t->last_va + t->size - ptr;
+      const unsigned n = (unsigned)MIN2(avail / 4, 64);
+      const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+      for (unsigned j = 0; j + 1 < n; j++) {
+         const uint64_t buffer = d[j] | ((uint64_t)(d[j + 1] & 0xffff) << 32);
+         const uint64_t image = (d[j] | ((uint64_t)(d[j + 1] & 0xff) << 32)) << 8;
+         if ((r = ps4_stale_at(dev, buffer)) || (r = ps4_stale_at(dev, image))) {
+            *where = 0x100 + u * 0x100 + j;
+            *addr = ps4_stale_at(dev, buffer) ? buffer : image;
+            return r;
+         }
+      }
+   }
+   return NULL;
+}
+
+/* The dispatches of a submission, checked with ps4_dispatch_stale (always on: only packet headers
+ * are walked, and nothing is read until a buffer has been released). dev->lock held. */
+static void
+ps4_scan_dispatches(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t seq, int depth)
+{
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      if (!ps4_mapped(ib, num_dw * 4ull))
+         return;
+      uint32_t *next = NULL;
+      unsigned next_dw = 0;
+      uint32_t compute_ud[16] = {0}; /* COMPUTE_USER_DATA_0..15 */
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2) {
+            i++;
+            continue;
+         }
+         if (h >> 30 != 3)
+            return;
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         if (i + 1 + body > num_dw)
+            return;
+         uint32_t *b = &ib[i + 1];
+         switch (op) {
+         case 0x76: /* SET_SH_REG: COMPUTE_USER_DATA_n is SH register 0x240 + n */
+            for (unsigned k = 1; k < body; k++) {
+               const unsigned reg = b[0] + k - 1;
+               if (reg >= 0x240 && reg < 0x250)
+                  compute_ud[reg - 0x240] = b[k];
+            }
+            break;
+         case 0x15: /* DISPATCH_DIRECT */
+         case 0x16: { /* DISPATCH_INDIRECT */
+            unsigned where = 0;
+            uint64_t addr = 0;
+            const struct ps4_released_range *r = ps4_dispatch_stale(dev, compute_ud, &where, &addr);
+            if (r) {
+               static unsigned logged;
+               if (logged++ < 40)
+                  ps4_log("radv/ps4: submission %llu: %p: dispatch uses %#llx (user data %#x) inside "
+                          "bo %u released at submission %llu (va %#llx, %#llx bytes) - skipped\n",
+                          (unsigned long long)seq, (void *)&ib[i], (unsigned long long)addr, where,
+                          r->handle, (unsigned long long)r->seq, (unsigned long long)r->va,
+                          (unsigned long long)r->size);
+               ps4_progress("stale dispatch: submission %llu addr %#llx bo %u\n",
+                            (unsigned long long)seq, (unsigned long long)addr, r->handle);
+               ib[i] = (h & ~0xff00u) | (0x10u << 8); /* NOP, same length */
+            }
+            break;
+         }
+         case 0x3f: { /* INDIRECT_BUFFER */
+            uint32_t *t = (uint32_t *)(uintptr_t)(b[0] | ((uint64_t)(b[1] & 0xffff) << 32));
+            if (body >= 3 && (b[2] & (1u << 20))) {
+               next = t;
+               next_dw = b[2] & 0xfffff;
+            } else if (body >= 3 && depth < 3) {
+               ps4_scan_dispatches(dev, t, b[2] & 0xfffff, seq, depth + 1);
+            }
+            break;
+         }
+         default:
+            break;
+         }
+         if (next)
+            break;
+         i += 1 + body;
+      }
+      if (!next)
+         return;
+      ib = next;
+      num_dw = next_dw;
+   }
 }
 
 /* Every command that writes memory (WRITE_DATA, EVENT_WRITE(_EOP), COPY_DATA, DMA_DATA,
@@ -2171,6 +2329,13 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       simple_mtx_lock(&dev->lock);
       for (unsigned i = 0; i < num_ibs; i++)
          ps4_scan_writes(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
+      simple_mtx_unlock(&dev->lock);
+   }
+   /* Dispatches through descriptors of released buffers: skipped (see ps4_dispatch_stale). */
+   if (num_ibs && ps4_num_released) {
+      simple_mtx_lock(&dev->lock);
+      for (unsigned i = 0; i < num_ibs; i++)
+         ps4_scan_dispatches(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
       simple_mtx_unlock(&dev->lock);
    }
 
