@@ -2055,6 +2055,17 @@ index b27aae0..eed31fa 100644
  	m_acquireIndex = (m_acquireIndex + 1) % m_swapchainImages.size();
  
  	return true;
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h
+index 7d2cb65..5ad301c 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h
+@@ -230,4 +230,5 @@ public:
+ 	~VKRObjectDescriptorSet() override;
+ 
+ 	VkDescriptorSet descriptorSet{ VK_NULL_HANDLE };
++	VkDescriptorPool pool{ VK_NULL_HANDLE }; // Crema: the pool it came from (VulkanRenderer::AllocateDescriptorSet)
+ };
+\ No newline at end of file
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
 index b7dc500..c9b170a 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
@@ -2218,7 +2229,7 @@ index 7179087..af4a1d9 100644
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..eb92485 100644
+index 599190a..1022927 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -2230,7 +2241,17 @@ index 599190a..eb92485 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1491,6 +1493,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+@@ -876,6 +878,9 @@ VulkanRenderer::~VulkanRenderer()
+ 	}
+ 
+ 	vkDestroyDescriptorPool(m_logicalDevice, m_descriptorPool, nullptr);
++	for (VkDescriptorPool extra : m_extraDescriptorPools)
++		vkDestroyDescriptorPool(m_logicalDevice, extra, nullptr);
++	m_extraDescriptorPools.clear();
+ 
+ 	for(auto& i : m_backbufferBlitPipelineCache)
+ 	{
+@@ -1491,6 +1496,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
  	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -2239,7 +2260,7 @@ index 599190a..eb92485 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1578,7 +1582,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+@@ -1578,7 +1585,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
  }
  #endif
  
@@ -2248,7 +2269,7 @@ index 599190a..eb92485 100644
  VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
  {
      VkXlibSurfaceCreateInfoKHR sci{};
-@@ -1642,6 +1646,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+@@ -1642,6 +1649,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
  {
  #if BOOST_OS_WINDOWS
  	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
@@ -2257,7 +2278,7 @@ index 599190a..eb92485 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -3038,7 +3044,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3038,7 +3047,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -2270,7 +2291,7 @@ index 599190a..eb92485 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3068,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3071,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -2279,8 +2300,79 @@ index 599190a..eb92485 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
+@@ -3282,6 +3296,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+ }
+ 
+ void VulkanRenderer::CreateDescriptorPool()
++{
++	m_descriptorPool = NewDescriptorPool();
++	if (m_descriptorPool == VK_NULL_HANDLE)
++		UnrecoverableError("Failed to create descriptor pool!");
++}
++
++// Crema: a descriptor set from the first pool with room, a new pool when all are full. One pool
++// holds 128K texture descriptors; Batman: Arkham Origins went past that and Cemu stopped
++// ("Failed to allocate descriptor sets").
++VkResult VulkanRenderer::AllocateDescriptorSet(VkDescriptorSetLayout layout, VkDescriptorSet* set, VkDescriptorPool* pool)
++{
++	VkDescriptorSetAllocateInfo allocInfo = {};
++	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++	allocInfo.descriptorSetCount = 1;
++	allocInfo.pSetLayouts = &layout;
++	allocInfo.descriptorPool = m_descriptorPool;
++	VkResult r = vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, set);
++	if (r == VK_SUCCESS)
++	{
++		*pool = m_descriptorPool;
++		return r;
++	}
++	for (auto it = m_extraDescriptorPools.rbegin(); it != m_extraDescriptorPools.rend(); ++it)
++	{
++		allocInfo.descriptorPool = *it;
++		if ((r = vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, set)) == VK_SUCCESS)
++		{
++			*pool = *it;
++			return r;
++		}
++	}
++	VkDescriptorPool extra = NewDescriptorPool();
++	if (extra == VK_NULL_HANDLE)
++		return r;
++	m_extraDescriptorPools.push_back(extra);
++	cemuLog_log(LogType::Force, "Vulkan: descriptor pool {} added (the others are full)", m_extraDescriptorPools.size() + 1);
++	allocInfo.descriptorPool = extra;
++	if ((r = vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, set)) == VK_SUCCESS)
++		*pool = extra;
++	return r;
++}
++
++VkDescriptorPool VulkanRenderer::NewDescriptorPool()
+ {
+ 	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
+ 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+@@ -3300,8 +3357,10 @@ void VulkanRenderer::CreateDescriptorPool()
+ 	poolInfo.maxSets = 1024 * 256;
+ 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+ 
+-	if (vkCreateDescriptorPool(m_logicalDevice, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS)
+-		UnrecoverableError("Failed to create descriptor pool!");
++	VkDescriptorPool pool = VK_NULL_HANDLE;
++	if (vkCreateDescriptorPool(m_logicalDevice, &poolInfo, nullptr, &pool) != VK_SUCCESS)
++		return VK_NULL_HANDLE;
++	return pool;
+ }
+ 
+ VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
+@@ -4379,6 +4438,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+ VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
+ {
+ 	auto vkr = VulkanRenderer::GetInstance();
+-	vkFreeDescriptorSets(vkr->GetLogicalDevice(), vkr->GetDescriptorPool(), 1, &descriptorSet);
++	vkFreeDescriptorSets(vkr->GetLogicalDevice(), pool != VK_NULL_HANDLE ? pool : vkr->GetDescriptorPool(), 1, &descriptorSet);
+ 	performanceMonitor.vk.numDescriptorSets.decrement();
+ }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index d975e11..9ed1d1e 100644
+index d975e11..d5a9239 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -212,7 +212,7 @@ public:
@@ -2292,6 +2384,62 @@ index d975e11..9ed1d1e 100644
  	static VkSurfaceKHR CreateXlibSurface(VkInstance instance, Display* dpy, Window window);
      static VkSurfaceKHR CreateXcbSurface(VkInstance instance, xcb_connection_t* connection, xcb_window_t window);
  	#ifdef HAS_WAYLAND
+@@ -273,6 +273,8 @@ public:
+ 
+ 	void DrawBackbufferQuad(LatteTextureView* texView, RendererOutputShader* shader, bool useLinearTexFilter, sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground) override;
+ 	void CreateDescriptorPool();
++	VkDescriptorPool NewDescriptorPool();
++	VkResult AllocateDescriptorSet(VkDescriptorSetLayout layout, VkDescriptorSet* set, VkDescriptorPool* pool);
+ 	VkDescriptorSet backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter);
+ 
+ 	robin_hood::unordered_flat_map<uint64, robin_hood::unordered_flat_map<uint64, PipelineInfo*> > m_pipeline_info_cache; // using robin_hood::unordered_flat_map is twice as fast (1-2% overall CPU time reduction)
+@@ -434,6 +436,7 @@ private:
+ 	VkRenderPass m_imguiRenderPass = VK_NULL_HANDLE;
+ 
+ 	VkDescriptorPool m_descriptorPool;
++	std::vector<VkDescriptorPool> m_extraDescriptorPools; // Crema: added when m_descriptorPool is full
+ 
+   public:
+ 	struct QueueFamilyIndices
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
+index 512ebee..a8b3a5a 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
+@@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
+ 	dsInfo->m_vkObjDescriptorSet = new VKRObjectDescriptorSet();
+ 	auto vkObjDS = dsInfo->m_vkObjDescriptorSet;
+ 
+-	VkDescriptorSetAllocateInfo allocInfo = {};
+-	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+-	allocInfo.descriptorPool = m_descriptorPool;
+-	allocInfo.descriptorSetCount = 1;
+-	allocInfo.pSetLayouts = &descriptor_set_layout;
+-
+ 	VkDescriptorSet result;
+-	if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &result) != VK_SUCCESS)
++	if (AllocateDescriptorSet(descriptor_set_layout, &result, &vkObjDS->pool) != VK_SUCCESS)
+ 	{
+ 		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
+ 			performanceMonitor.vk.numDescriptorSets.get(),
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
+index d102a89..dcd0ffe 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
+@@ -517,13 +517,7 @@ VKRObjectDescriptorSet* VulkanRenderer::surfaceCopy_getOrCreateDescriptorSet(VkC
+ 	VKRObjectDescriptorSet* vkObjDescriptorSet = new VKRObjectDescriptorSet();
+ 
+ 	// allocate new descriptor set
+-	VkDescriptorSetAllocateInfo allocInfo = {};
+-	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+-	allocInfo.descriptorPool = m_descriptorPool;
+-	allocInfo.descriptorSetCount = 1;
+-	allocInfo.pSetLayouts = &pipelineInfo->vkObjPipeline->m_pixelDSL;
+-
+-	if (vkAllocateDescriptorSets(m_logicalDevice, &allocInfo, &vkObjDescriptorSet->descriptorSet) != VK_SUCCESS)
++	if (AllocateDescriptorSet(pipelineInfo->vkObjPipeline->m_pixelDSL, &vkObjDescriptorSet->descriptorSet, &vkObjDescriptorSet->pool) != VK_SUCCESS)
+ 	{
+ 		UnrecoverableError("failed to allocate descriptor set for surface copy operation");
+ 	}
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit.cpp b/src/Cafe/OS/libs/coreinit/coreinit.cpp
 index 4d454e0..2b66546 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit.cpp
