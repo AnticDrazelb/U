@@ -849,6 +849,125 @@ ps4_record_ib(int fd, const uint32_t *ib, unsigned num_dw, uint64_t seq, unsigne
 }
 
 static void
+ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_ibs, uint64_t seq);
+
+/* The memory the submission's shader user data point to (descriptor sets, push constants, vertex
+ * buffer tables), and the 32-bit pointers inside that, one level more: mem-N.bin, records of
+ * 'DMEM' va length + bytes, to find offline what a draw reaches through descriptors (Donkey Kong
+ * Country: Tropical Freeze: a GPU write into a freed 720p image no command referred to). */
+struct ps4_mem_record {
+   uint32_t magic;
+   uint32_t length;
+   uint64_t va;
+};
+
+static void
+ps4_collect_user_data(uint32_t *ib, unsigned num_dw, uint32_t *values, unsigned *count, unsigned max,
+                      int depth)
+{
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      if (!ps4_mapped(ib, num_dw * 4ull))
+         return;
+      uint32_t *next = NULL;
+      unsigned next_dw = 0;
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2) {
+            i++;
+            continue;
+         }
+         if (h >> 30 != 3)
+            return;
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         if (i + 1 + body > num_dw)
+            return;
+         uint32_t *b = &ib[i + 1];
+         if (op == 0x76) { /* SET_SH_REG: values in pairs (a 64-bit address) and alone */
+            for (unsigned k = 1; k < body && *count + 2 <= max; k++) {
+               values[(*count)++] = b[k];
+               values[(*count)++] = k + 1 < body ? b[k + 1] : 0;
+            }
+         } else if (op == 0x3f && body >= 3) {
+            uint32_t *t = (uint32_t *)(uintptr_t)(b[0] | ((uint64_t)(b[1] & 0xffff) << 32));
+            if (b[2] & (1u << 20)) {
+               next = t;
+               next_dw = b[2] & 0xfffff;
+            } else if (depth < 3) {
+               ps4_collect_user_data(t, b[2] & 0xfffff, values, count, max, depth + 1);
+            }
+         }
+         if (next)
+            break;
+         i += 1 + body;
+      }
+      if (!next)
+         return;
+      ib = next;
+      num_dw = next_dw;
+   }
+}
+
+static ac_drm_device *ps4_last_device;
+static struct amdgpu_bo *ps4_bo_at(ac_drm_device *dev, uint64_t va);
+
+static void
+ps4_record_descriptors(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_ibs, uint64_t seq)
+{
+   ac_drm_device *dev = ps4_last_device;
+   if (!dev || ps4_progress_fd < 0)
+      return;
+   static uint32_t values[8192];
+   unsigned count = 0;
+   for (unsigned i = 0; i < num_ibs; i++)
+      ps4_collect_user_data(dcb[i], dcb_sizes[i] / 4, values, &count, ARRAY_SIZE(values), 0);
+   char path[64];
+   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/mem-%u.bin", (unsigned)(seq % 8));
+   const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   if (fd < 0)
+      return;
+   /* pointers to dump: 64-bit pairs and 32-bit window pointers; then 32-bit pointers inside */
+   static uint64_t done[2048];
+   unsigned num_done = 0;
+   static uint64_t queue[4096];
+   unsigned queued = 0;
+   for (unsigned i = 0; i + 1 < count && queued + 2 <= ARRAY_SIZE(queue); i += 2) {
+      queue[queued++] = values[i] | ((uint64_t)(values[i + 1] & 0xffff) << 32);
+      if (dev->va32_start)
+         queue[queued++] = dev->va32_start + values[i];
+   }
+   const unsigned first_level = queued;
+   simple_mtx_lock(&dev->lock);
+   for (unsigned q = 0; q < queued && num_done < ARRAY_SIZE(done); q++) {
+      const uint64_t ptr = queue[q] & ~3ull;
+      if (ptr < 0x4000000000ull || ptr >= PS4_GPU_VA_LIMIT)
+         continue;
+      bool seen = false;
+      for (unsigned d = 0; d < num_done && !seen; d++)
+         seen = done[d] == ptr;
+      if (seen)
+         continue;
+      struct amdgpu_bo *t = ps4_bo_at(dev, ptr);
+      if (!t)
+         continue;
+      done[num_done++] = ptr;
+      const uint32_t length = (uint32_t)MIN2(t->last_va + t->size - ptr, 1024);
+      const struct ps4_mem_record r = {0x4d454d44, length, ptr};
+      write(fd, &r, sizeof(r));
+      write(fd, (const void *)(uintptr_t)ptr, length);
+      /* one level more: 32-bit pointers inside (only from the first level) */
+      if (q < first_level && dev->va32_start) {
+         const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+         for (unsigned j = 0; j < length / 4 && queued < ARRAY_SIZE(queue); j++)
+            if (d[j] && d[j] % 4 == 0)
+               queue[queued++] = dev->va32_start + d[j];
+      }
+   }
+   simple_mtx_unlock(&dev->lock);
+   close(fd);
+}
+
+static void
 ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_ibs, uint64_t seq)
 {
    if (ps4_progress_fd < 0)
@@ -861,6 +980,7 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_record_ib(fd, dcb[i], dcb_sizes[i] / 4, seq, i, 0);
    close(fd);
+   ps4_record_descriptors(dcb, dcb_sizes, num_ibs, seq);
    ps4_progress("submit %llu -> ib-%u.bin\n", (unsigned long long)seq, (unsigned)(seq % 8));
 }
 
