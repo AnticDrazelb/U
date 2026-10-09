@@ -1864,52 +1864,101 @@ ps4_stale_at(ac_drm_device *dev, uint64_t va)
    return hit;
 }
 
-/* Does a compute dispatch's user data (or the descriptors it points to) hold the address of a
- * released buffer? Cemu writes through stale descriptors: on PC the GPU drops such writes, on the
- * PS4 they are a GPU page fault that ends the app (Donkey Kong Country: Tropical Freeze, 1.85: a
- * compute copy into a 720p image freed 3 minutes earlier). Buffer descriptors carry the address in
- * dwords 0-1 (48 bits), image descriptors as address >> 8 (40 bits). */
+/* Do a shader stage's user data (or the descriptors they point to) hold the address of a released
+ * buffer? Cemu uses resources through stale descriptors: on PC the GPU drops writes to freed
+ * memory, on the PS4 they are a GPU page fault that ends the app (Donkey Kong Country: Tropical
+ * Freeze, 1.86: a write into a 720p image released 5 submissions earlier, through a descriptor
+ * set). User data hold 64-bit addresses and 32-bit descriptor set pointers (into the 32-bit
+ * window); buffer descriptors carry an address in dwords 0-1 (48 bits), image descriptors as
+ * address >> 8 (40 bits). A descriptor set is read again only after a release or every 64
+ * submissions. dev->lock held. */
+static struct {
+   uint64_t ptr, epoch;
+} ps4_checked_sets[2048];
+
 static const struct ps4_released_range *
-ps4_dispatch_stale(ac_drm_device *dev, const uint32_t *ud, unsigned *where, uint64_t *addr)
+ps4_set_stale(ac_drm_device *dev, uint64_t ptr, uint64_t epoch, uint64_t *addr)
 {
-   for (unsigned u = 0; u + 1 < 16; u++) {
-      const uint64_t ptr = ud[u] | ((uint64_t)(ud[u + 1] & 0xffff) << 32);
-      const struct ps4_released_range *r = ps4_stale_at(dev, ptr);
-      if (r) {
-         *where = u;
-         *addr = ptr;
+   if (ptr % 4)
+      return NULL;
+   /* the buffer found last time first: a frame's descriptor sets mostly lie in one upload buffer */
+   static uint32_t last_handle;
+   struct amdgpu_bo *t = last_handle < dev->num_bos ? dev->bos[last_handle] : NULL;
+   if (!t || !t->cpu || t->cpu_owned || ptr < t->last_va || ptr >= t->last_va + t->size) {
+      t = ps4_bo_at(dev, ptr);
+      if (!t)
+         return NULL;
+      last_handle = t->handle;
+   }
+   const unsigned slot = (unsigned)((ptr >> 4) * 2654435761u) % ARRAY_SIZE(ps4_checked_sets);
+   if (ps4_checked_sets[slot].ptr == ptr && ps4_checked_sets[slot].epoch == epoch)
+      return NULL;
+   const uint64_t avail = t->last_va + t->size - ptr;
+   const unsigned n = (unsigned)MIN2(avail / 4, 256);
+   const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+   for (unsigned j = 0; j + 1 < n; j++) {
+      const uint64_t buffer = d[j] | ((uint64_t)(d[j + 1] & 0xffff) << 32);
+      const uint64_t image = (d[j] | ((uint64_t)(d[j + 1] & 0xff) << 32)) << 8;
+      const struct ps4_released_range *r;
+      if ((r = ps4_stale_at(dev, buffer))) {
+         *addr = buffer;
          return r;
       }
-      struct amdgpu_bo *t = ptr >= 0x4000000000ull && ptr < PS4_GPU_VA_LIMIT ? ps4_bo_at(dev, ptr) : NULL;
-      if (!t || ptr % 4)
+      if ((r = ps4_stale_at(dev, image))) {
+         *addr = image;
+         return r;
+      }
+   }
+   ps4_checked_sets[slot].ptr = ptr;
+   ps4_checked_sets[slot].epoch = epoch;
+   return NULL;
+}
+
+static const struct ps4_released_range *
+ps4_user_data_stale(ac_drm_device *dev, const uint32_t *ud, unsigned count, uint64_t seq,
+                    unsigned *where, uint64_t *addr)
+{
+   const uint64_t epoch = ps4_num_released + (seq >> 6) * 0x100000000ull;
+   for (unsigned u = 0; u < count; u++) {
+      if (!ud[u])
          continue;
-      const uint64_t avail = t->last_va + t->size - ptr;
-      const unsigned n = (unsigned)MIN2(avail / 4, 64);
-      const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
-      for (unsigned j = 0; j + 1 < n; j++) {
-         const uint64_t buffer = d[j] | ((uint64_t)(d[j + 1] & 0xffff) << 32);
-         const uint64_t image = (d[j] | ((uint64_t)(d[j + 1] & 0xff) << 32)) << 8;
-         if ((r = ps4_stale_at(dev, buffer)) || (r = ps4_stale_at(dev, image))) {
-            *where = 0x100 + u * 0x100 + j;
-            *addr = ps4_stale_at(dev, buffer) ? buffer : image;
+      const struct ps4_released_range *r;
+      if (u + 1 < count) {
+         const uint64_t ptr = ud[u] | ((uint64_t)(ud[u + 1] & 0xffff) << 32);
+         if ((r = ps4_stale_at(dev, ptr))) {
+            *where = u;
+            *addr = ptr;
             return r;
          }
+         if (ptr >= 0x4000000000ull && ptr < PS4_GPU_VA_LIMIT && (r = ps4_set_stale(dev, ptr, epoch, addr))) {
+            *where = 0x100 + u;
+            return r;
+         }
+      }
+      if (dev->va32_start && ud[u] < PS4_VA32_SIZE &&
+          (r = ps4_set_stale(dev, dev->va32_start + ud[u], epoch, addr))) {
+         *where = 0x200 + u;
+         return r;
       }
    }
    return NULL;
 }
 
-/* The dispatches of a submission, checked with ps4_dispatch_stale (always on: only packet headers
+/* The dispatches and draws of a submission, checked with ps4_user_data_stale (always on: only packet headers
  * are walked, and nothing is read until a buffer has been released). dev->lock held. */
 static void
 ps4_scan_dispatches(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t seq, int depth)
 {
+   /* user data: COMPUTE_USER_DATA_0..15, and SPI_SHADER_USER_DATA_{PS,VS,GS,ES,HS,LS}_0..15 */
+   static const unsigned stage_reg[6] = {0x0c, 0x4c, 0x8c, 0xcc, 0x10c, 0x14c};
+   static const char *const stage_name[6] = {"PS", "VS", "GS", "ES", "HS", "LS"};
+   uint32_t compute_ud[16] = {0};
+   uint32_t gfx_ud[6][16] = {{0}};
    for (unsigned link = 0; link < 256 && num_dw; link++) {
       if (!ps4_mapped(ib, num_dw * 4ull))
          return;
       uint32_t *next = NULL;
       unsigned next_dw = 0;
-      uint32_t compute_ud[16] = {0}; /* COMPUTE_USER_DATA_0..15 */
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
          if (h >> 30 == 2) {
@@ -1929,13 +1978,42 @@ ps4_scan_dispatches(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t 
                const unsigned reg = b[0] + k - 1;
                if (reg >= 0x240 && reg < 0x250)
                   compute_ud[reg - 0x240] = b[k];
+               for (unsigned s = 0; s < 6; s++)
+                  if (reg >= stage_reg[s] && reg < stage_reg[s] + 16)
+                     gfx_ud[s][reg - stage_reg[s]] = b[k];
+            }
+            break;
+         case 0x27: /* DRAW_INDEX_2 */
+         case 0x2d: /* DRAW_INDEX_AUTO */
+         case 0x35: /* DRAW_INDEX_OFFSET_2 */
+         case 0x24: /* DRAW_INDIRECT */
+         case 0x25: /* DRAW_INDEX_INDIRECT */
+         case 0x2c: /* DRAW_INDIRECT_MULTI */
+         case 0x38: /* DRAW_INDEX_INDIRECT_MULTI */
+            for (unsigned s = 0; s < 6; s++) {
+               unsigned where = 0;
+               uint64_t addr = 0;
+               const struct ps4_released_range *r = ps4_user_data_stale(dev, gfx_ud[s], 16, seq, &where, &addr);
+               if (!r)
+                  continue;
+               static unsigned logged;
+               if (logged++ < 40)
+                  ps4_log("radv/ps4: submission %llu: %p: draw (%s stage) uses %#llx (user data %#x) "
+                          "inside bo %u released at submission %llu (va %#llx, %#llx bytes) - skipped\n",
+                          (unsigned long long)seq, (void *)&ib[i], stage_name[s], (unsigned long long)addr,
+                          where, r->handle, (unsigned long long)r->seq, (unsigned long long)r->va,
+                          (unsigned long long)r->size);
+               ps4_progress("stale draw: submission %llu %s addr %#llx bo %u\n", (unsigned long long)seq,
+                            stage_name[s], (unsigned long long)addr, r->handle);
+               ib[i] = (h & ~0xff00u) | (0x10u << 8); /* NOP, same length */
+               break;
             }
             break;
          case 0x15: /* DISPATCH_DIRECT */
          case 0x16: { /* DISPATCH_INDIRECT */
             unsigned where = 0;
             uint64_t addr = 0;
-            const struct ps4_released_range *r = ps4_dispatch_stale(dev, compute_ud, &where, &addr);
+            const struct ps4_released_range *r = ps4_user_data_stale(dev, compute_ud, 16, seq, &where, &addr);
             if (r) {
                static unsigned logged;
                if (logged++ < 40)
@@ -2331,7 +2409,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
          ps4_scan_writes(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
       simple_mtx_unlock(&dev->lock);
    }
-   /* Dispatches through descriptors of released buffers: skipped (see ps4_dispatch_stale). */
+   /* Dispatches through descriptors of released buffers: skipped (see ps4_user_data_stale). */
    if (num_ibs && ps4_num_released) {
       simple_mtx_lock(&dev->lock);
       for (unsigned i = 0; i < num_ibs; i++)
