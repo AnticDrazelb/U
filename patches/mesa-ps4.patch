@@ -514,24 +514,30 @@ index 86db276..411bd7f 100644
        close(fd);
     if (master_fd != -1)
 diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
-index 564a8d8..671d481 100644
+index 564a8d8..7b22ab2 100644
 --- a/src/amd/vulkan/radv_queue.c
 +++ b/src/amd/vulkan/radv_queue.c
-@@ -34,6 +34,13 @@ radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj
+@@ -34,6 +34,19 @@ radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj
     return vk_to_radeon_priority(pObj->globalPriority);
  }
  
 +#ifdef __PS4__
 +void ac_ps4_trace(const char *fmt, ...);
 +#define PS4_FAIL(label) do { ac_ps4_trace("radv: %s:%d -> " #label "\n", __FILE__, __LINE__); goto label; } while (0)
++/* The legacy GS rings' memory, larger than the size programmed (VGT_*_RING_SIZE, the descriptors):
++ * on the PS4 the GS wrote at least 2 MiB into a 1.25 MiB GS->VS ring (Donkey Kong Country:
++ * Tropical Freeze, every crash at the ring's base + 0x200000) - on Linux such writes land in the
++ * next buffer or are dropped by the VM, on the PS4 a GPU page fault ends the app. */
++#define PS4_RING_ALLOC(size) MAX2((size) * 4, 4u << 20)
 +#else
 +#define PS4_FAIL(label) goto label
++#define PS4_RING_ALLOC(size) (size)
 +#endif
 +
  static VkResult
  radv_sparse_buffer_bind_memory(struct radv_device *device, const VkSparseBufferMemoryBindInfo *bind)
  {
-@@ -888,7 +895,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -888,7 +901,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        result = radv_bo_create(device, NULL, scratch_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &scratch_bo);
        if (result != VK_SUCCESS)
@@ -540,7 +546,7 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, scratch_bo, 0, 0, scratch_size);
     }
  
-@@ -899,7 +906,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -899,23 +912,23 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        result = radv_bo_create(device, NULL, compute_scratch_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &compute_scratch_bo);
        if (result != VK_SUCCESS)
@@ -549,8 +555,9 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, compute_scratch_bo, 0, 0, compute_scratch_size);
     }
  
-@@ -907,7 +914,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
-       result = radv_bo_create(device, NULL, needs->esgs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
+    if (needs->esgs_ring_size > queue->ring_info.esgs_ring_size) {
+-      result = radv_bo_create(device, NULL, needs->esgs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
++      result = radv_bo_create(device, NULL, PS4_RING_ALLOC(needs->esgs_ring_size), 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &esgs_ring_bo);
        if (result != VK_SUCCESS)
 -         goto fail;
@@ -558,8 +565,9 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, esgs_ring_bo, 0, 0, needs->esgs_ring_size);
     }
  
-@@ -915,7 +922,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
-       result = radv_bo_create(device, NULL, needs->gsvs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
+    if (needs->gsvs_ring_size > queue->ring_info.gsvs_ring_size) {
+-      result = radv_bo_create(device, NULL, needs->gsvs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
++      result = radv_bo_create(device, NULL, PS4_RING_ALLOC(needs->gsvs_ring_size), 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &gsvs_ring_bo);
        if (result != VK_SUCCESS)
 -         goto fail;
@@ -567,7 +575,7 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, gsvs_ring_bo, 0, 0, needs->gsvs_ring_size);
     }
  
-@@ -923,7 +930,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -923,7 +936,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        result = radv_bo_create(device, NULL, pdev->info.total_tess_ring_size, 256, RADEON_DOMAIN_VRAM, ring_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &tess_rings_bo);
        if (result != VK_SUCCESS)
@@ -576,7 +584,7 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, tess_rings_bo, 0, 0, pdev->info.total_tess_ring_size);
     }
  
-@@ -939,12 +946,12 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -939,12 +952,12 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        result = radv_bo_create(device, NULL, pdev->task_info.bo_size_bytes, 256, RADEON_DOMAIN_VRAM, task_rings_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &task_rings_bo);
        if (result != VK_SUCCESS)
@@ -591,7 +599,7 @@ index 564a8d8..671d481 100644
     }
  
     if (!queue->ring_info.mesh_scratch_ring && needs->mesh_scratch_ring) {
-@@ -954,7 +961,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -954,7 +967,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
                          RADEON_DOMAIN_VRAM, ring_bo_flags, RADV_BO_PRIORITY_SCRATCH, 0, true, &mesh_scratch_ring_bo);
  
        if (result != VK_SUCCESS)
@@ -600,7 +608,7 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, mesh_scratch_ring_bo, 0, 0,
                                              AC_MESH_SCRATCH_NUM_ENTRIES * AC_MESH_SCRATCH_ENTRY_BYTES);
     }
-@@ -965,7 +972,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -965,7 +978,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
                                RADEON_DOMAIN_VRAM, RADEON_FLAG_32BIT | RADEON_FLAG_DISCARDABLE | ring_bo_flags,
                                RADV_BO_PRIORITY_SCRATCH, 0, true, &ge_rings_bo);
        if (result != VK_SUCCESS)
@@ -609,7 +617,7 @@ index 564a8d8..671d481 100644
        radv_rmv_log_command_buffer_bo_create(device, ge_rings_bo, 0, 0, pdev->info.total_attribute_pos_prim_ring_size);
     }
  
-@@ -978,14 +985,14 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -978,14 +991,14 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        result = radv_bo_create(device, NULL, 256, 4, RADEON_DOMAIN_GDS, ring_bo_flags, RADV_BO_PRIORITY_SCRATCH, 0, true,
                                &gds_bo);
        if (result != VK_SUCCESS)
@@ -626,7 +634,7 @@ index 564a8d8..671d481 100644
     }
  
     if (!queue->ring_info.gds_oa && needs->gds_oa) {
-@@ -994,14 +1001,14 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -994,14 +1007,14 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        result = radv_bo_create(device, NULL, 1, 1, RADEON_DOMAIN_OA, ring_bo_flags, RADV_BO_PRIORITY_SCRATCH, 0, true,
                                &gds_oa_bo);
        if (result != VK_SUCCESS)
@@ -643,7 +651,7 @@ index 564a8d8..671d481 100644
     }
  
     /* Re-initialize the descriptor BO when any ring BOs changed.
-@@ -1021,14 +1028,14 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -1021,14 +1034,14 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
                                RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY,
                                RADV_BO_PRIORITY_DESCRIPTOR, 0, true, &descriptor_bo);
        if (result != VK_SUCCESS)
@@ -660,7 +668,7 @@ index 564a8d8..671d481 100644
        }
  
        radv_fill_shader_rings(device, map, scratch_bo, needs->esgs_ring_size, esgs_ring_bo, needs->gsvs_ring_size,
-@@ -1045,7 +1052,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -1045,7 +1058,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
  
        result = radv_create_cmd_stream(device, hw_ip, false, &cs);
        if (result != VK_SUCCESS)
@@ -669,7 +677,7 @@ index 564a8d8..671d481 100644
  
        radeon_check_space(ws, cs->b, 512);
        dest_cs[i] = cs;
-@@ -1113,7 +1120,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+@@ -1113,7 +1126,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
  
        result = radv_finalize_cmd_stream(device, cs);
        if (result != VK_SUCCESS)
@@ -678,7 +686,7 @@ index 564a8d8..671d481 100644
     }
  
     if (queue->initial_full_flush_preamble_cs)
-@@ -1388,19 +1395,19 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
+@@ -1388,19 +1401,19 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
  
     r = radv_create_cmd_stream(device, ip, false, &leader_pre_cs);
     if (r != VK_SUCCESS)
@@ -702,7 +710,7 @@ index 564a8d8..671d481 100644
  
     radeon_check_space(ws, leader_pre_cs->b, 256);
     radeon_check_space(ws, leader_post_cs->b, 256);
-@@ -1439,16 +1446,16 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
+@@ -1439,16 +1452,16 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
  
     r = radv_finalize_cmd_stream(device, leader_pre_cs);
     if (r != VK_SUCCESS)
@@ -723,7 +731,7 @@ index 564a8d8..671d481 100644
  
     queue->gang_sem_bo = gang_sem_bo;
     queue->state.gang_wait_preamble_cs = leader_pre_cs;
-@@ -1640,7 +1647,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
+@@ -1640,7 +1653,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
        struct vk_sync_wait *new_waits = malloc(sizeof(struct vk_sync_wait) * (wait_count + 1));
        if (!new_waits) {
           result = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -732,7 +740,7 @@ index 564a8d8..671d481 100644
        }
  
        memcpy(new_waits, submission->waits, sizeof(struct vk_sync_wait) * submission->wait_count);
-@@ -1679,7 +1686,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
+@@ -1679,7 +1692,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
  
           if (!perf_ctr_lock_cs || !perf_ctr_unlock_cs) {
              result = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -741,7 +749,7 @@ index 564a8d8..671d481 100644
           }
  
           initial_preambles[num_initial_preambles++] = perf_ctr_lock_cs->b;
-@@ -1779,7 +1786,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
+@@ -1779,7 +1792,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
                                       last_submit ? submission->signal_count : 0, submission->signals);
  
        if (result != VK_SUCCESS)
@@ -750,7 +758,7 @@ index 564a8d8..671d481 100644
  
        if (radv_device_fault_detection_enabled(device)) {
           result = radv_check_gpu_hangs(queue, &submit);
-@@ -1829,21 +1836,21 @@ radv_queue_sparse_submit(struct vk_queue *vqueue, struct vk_queue_submit *submis
+@@ -1829,21 +1842,21 @@ radv_queue_sparse_submit(struct vk_queue *vqueue, struct vk_queue_submit *submis
  
     result = radv_queue_submit_bind_sparse_memory(device, submission);
     if (result != VK_SUCCESS)
@@ -775,7 +783,7 @@ index 564a8d8..671d481 100644
     }
  
  fail:
-@@ -1869,7 +1876,7 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+@@ -1869,7 +1882,7 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
  
     VkResult result = radv_queue_submit_bind_sparse_memory(device, submission);
     if (result != VK_SUCCESS)
@@ -784,7 +792,7 @@ index 564a8d8..671d481 100644
  
     if (!submission->command_buffer_count && !submission->wait_count && !submission->signal_count)
        return VK_SUCCESS;
-@@ -1937,17 +1944,17 @@ radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
+@@ -1937,17 +1950,17 @@ radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
     if (queue->state.uses_shadow_regs) {
        result = radv_create_shadow_regs_preamble(device, &queue->state);
        if (result != VK_SUCCESS)
