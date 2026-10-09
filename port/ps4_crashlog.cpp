@@ -187,9 +187,26 @@ void setHandler(int sig, void (*handler)(int, siginfo_t*, void*), int flags) {
 
 void crashHandler(int sig, siginfo_t* info, void* context) {
     static volatile int s_depth = 0;
+    // First, before anything that could fault: one line in the boot trace with where it happened
+    // (static buffer, write() only). Minecraft (1.93) crashed, the report itself faulted before its
+    // first line, and the nested exit ended the app with nothing recorded.
+    {
+        const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
+        const uint64_t rip = regs[kRipIndex];
+        const uint64_t address = *reinterpret_cast<const uint64_t*>(reinterpret_cast<char*>(info) + 24);
+        static char early[200];
+        if (g_traceFd >= 0) {
+            const int n = snprintf(early, sizeof(early), "fatal signal %d (depth %d): rip 0x%llx%s elf 0x%llx, address 0x%llx\n",
+                                   sig, s_depth, static_cast<unsigned long long>(rip), isCode(rip) ? "" : " (not eboot code)",
+                                   static_cast<unsigned long long>(toElf(rip)), static_cast<unsigned long long>(address));
+            if (n > 0)
+                write(g_traceFd, early, static_cast<size_t>(n));
+        }
+    }
     // Crashed while reporting (typically the stack scan running off the end of a small thread
     // stack): end the process now. Returning re-ran the faulting read forever, leaving the crashed
-    // thread spinning and the app hanging on a black screen.
+    // thread spinning and the app hanging on a black screen. (The PS4 answers this _exit with
+    // SIGSYS: the system's crash report, error CE-34878-0.)
     if (s_depth++ > 0)
         _exit(128 + sig);
 
