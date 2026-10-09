@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <emmintrin.h>
 
 /* libkernel (declared here rather than through the OpenOrbis headers, which clash with Mesa's). */
 int sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t len, size_t align,
@@ -107,6 +108,7 @@ struct amdgpu_bo {
    bool tail_mapped;   /* the overflow tail is mapped after the buffer (see PS4_TAIL) */
    bool tail_reported;
    bool gpu_ro; /* mapped GPU read-only (command buffers) */
+   bool write_combined; /* garlic memory (VRAM); else CPU-cached onion */
 };
 
 struct amdgpu_va {
@@ -291,6 +293,22 @@ ps4_completed(ac_drm_device *dev)
 
 /* Waits until submission `seq` has finished; returns false on timeout. */
 static void ps4_progress(const char *fmt, ...);
+
+/* Writes a range's lines back from the CPU caches and drops them (clflush works through any
+ * mapping: the caches are physically tagged). Direct memory changes hands between CPU-cached
+ * buffers (onion: GTT, and the emulator's own memory) and write-combined ones (garlic: VRAM), and
+ * a dirty line left from the cached owner can be written back over what is written through the
+ * new write-combined mapping. Donkey Kong Country: Tropical Freeze (1.83): Mesa's new geometry
+ * ring table (VRAM) took the memory of the old one (GTT), got the old ring addresses back, and the
+ * GPU wrote to the freed ring - a GPU page fault that ends the app. */
+static void
+ps4_flush_cpu_cache(const void *addr, uint64_t size)
+{
+   _mm_mfence();
+   for (uintptr_t p = (uintptr_t)addr & ~(uintptr_t)63; p < (uintptr_t)addr + size; p += 64)
+      _mm_clflush((const void *)p);
+   _mm_mfence();
+}
 
 /* GPU addresses are CPU addresses: the IB parser can follow chained IBs directly. */
 static void
@@ -1108,6 +1126,7 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
                           (req->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
                        ? PS4_WC_GARLIC
                        : PS4_WB_ONION;
+   bo->write_combined = type == PS4_WC_GARLIC;
    const uint64_t align = MAX2(util_next_power_of_two64(MAX2(req->phys_alignment, 1)), PS4_PAGE);
    simple_mtx_lock(&dev->lock);
    ps4_run_deferred(dev);
@@ -1225,6 +1244,8 @@ ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo, void **cpu)
          ps4_log("radv/ps4: cpu map of bo %u failed\n", b->handle);
          return -ENOMEM;
       }
+      if (b->write_combined)
+         ps4_flush_cpu_cache(addr, b->size);
       b->cpu = addr;
       b->cpu_owned = true;
    }
@@ -1380,6 +1401,9 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
       int r = sceKernelMapDirectMemory(&a, map_size,
                                        PS4_PROT_CPU_RW | (gpu_ro ? PS4_PROT_GPU_READ : PS4_PROT_GPU_RW),
                                        PS4_MAP_FIXED, b->phys + offset, PS4_PAGE);
+      /* write-combined memory: no stale cached lines of an earlier owner (see ps4_flush_cpu_cache) */
+      if (!r && whole && a == (void *)(uintptr_t)addr && b->write_combined)
+         ps4_flush_cpu_cache(a, map_size);
       if (!r && whole && a == (void *)(uintptr_t)addr) {
          memset((uint8_t *)a + size, 0, PS4_TAIL);
          b->tail_mapped = true;
