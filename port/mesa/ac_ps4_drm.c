@@ -1511,6 +1511,8 @@ ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, ui
    return r;
 }
 
+static void ps4_va_release_held(unsigned w, uint64_t keep);
+
 int
 ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type, uint64_t size,
                       uint64_t va_base_alignment, uint64_t va_base_required,
@@ -1523,11 +1525,15 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
 
    simple_mtx_lock(&ps4_va_lock);
    uint64_t addr = 0;
-   if (va_base_required) {
-      if (util_vma_heap_alloc_addr(heap, va_base_required, size))
-         addr = va_base_required;
-   } else {
-      addr = util_vma_heap_alloc(heap, size, align);
+   for (int attempt = 0; attempt < 2 && !addr; attempt++) {
+      if (attempt) /* no room: the held-back ranges of this window go back first (ps4_do_va_free) */
+         ps4_va_release_held(heap == &dev->va32_heap ? 1 : 0, 0);
+      if (va_base_required) {
+         if (util_vma_heap_alloc_addr(heap, va_base_required, size))
+            addr = va_base_required;
+      } else {
+         addr = util_vma_heap_alloc(heap, size, align);
+      }
    }
    simple_mtx_unlock(&ps4_va_lock);
    if (!addr) {
@@ -1558,14 +1564,63 @@ ac_drm_va_range_free(amdgpu_va_handle va)
    return 0;
 }
 
+/* Released address ranges are held back before they are handed out again: up to PS4_VA_HOLD of
+ * the 16 GiB window and PS4_VA32_HOLD of the 32-bit one, oldest returned first (all of a window's
+ * when an allocation finds no room). Cemu uses resources through stale descriptors; when the
+ * range had already gone to a new buffer, a stale write landed in that buffer - Donkey Kong
+ * Country: Tropical Freeze (1.87) wrote into a command buffer (mapped GPU read-only: a fault that
+ * ends the app) at the address of a 720p image freed shortly before. Held back, the range stays a
+ * hole, which ps4_user_data_stale recognises (and the draw is skipped). */
+#define PS4_VA_HOLD (4ull << 30)
+#define PS4_VA32_HOLD (512ull << 20)
+static struct {
+   amdgpu_va_handle *items;
+   unsigned head, count, cap;
+   uint64_t bytes;
+} ps4_va_held[2]; /* 0: the 16 GiB window, 1: the 32-bit one */
+
+/* Returns the oldest held ranges of a window until at most `keep` bytes are held (ps4_va_lock held). */
+static void
+ps4_va_release_held(unsigned w, uint64_t keep)
+{
+   while (ps4_va_held[w].count && ps4_va_held[w].bytes > keep) {
+      amdgpu_va_handle va = ps4_va_held[w].items[ps4_va_held[w].head];
+      ps4_va_held[w].head = (ps4_va_held[w].head + 1) % ps4_va_held[w].cap;
+      ps4_va_held[w].count--;
+      ps4_va_held[w].bytes -= va->size;
+      util_vma_heap_free(va->heap, va->addr, va->size);
+      free(va);
+   }
+}
+
 /* A deferred address range free. */
 static void
 ps4_do_va_free(amdgpu_va_handle va)
 {
    simple_mtx_lock(&ps4_va_lock);
-   util_vma_heap_free(va->heap, va->addr, va->size);
+   const unsigned w = va->heap == &va->dev->va32_heap ? 1 : 0;
+   if (ps4_va_held[w].count == ps4_va_held[w].cap) {
+      /* grow the ring, keeping its order */
+      const unsigned cap = MAX2(ps4_va_held[w].cap * 2, 256);
+      amdgpu_va_handle *items = malloc(cap * sizeof(*items));
+      if (!items) {
+         util_vma_heap_free(va->heap, va->addr, va->size);
+         simple_mtx_unlock(&ps4_va_lock);
+         free(va);
+         return;
+      }
+      for (unsigned i = 0; i < ps4_va_held[w].count; i++)
+         items[i] = ps4_va_held[w].items[(ps4_va_held[w].head + i) % ps4_va_held[w].cap];
+      free(ps4_va_held[w].items);
+      ps4_va_held[w].items = items;
+      ps4_va_held[w].head = 0;
+      ps4_va_held[w].cap = cap;
+   }
+   ps4_va_held[w].items[(ps4_va_held[w].head + ps4_va_held[w].count) % ps4_va_held[w].cap] = va;
+   ps4_va_held[w].count++;
+   ps4_va_held[w].bytes += va->size;
+   ps4_va_release_held(w, w ? PS4_VA32_HOLD : PS4_VA_HOLD);
    simple_mtx_unlock(&ps4_va_lock);
-   free(va);
 }
 
 /* Runs the deferred operations whose submissions have completed, in order. dev->lock held. */
