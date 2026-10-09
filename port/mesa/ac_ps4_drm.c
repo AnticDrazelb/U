@@ -2451,7 +2451,13 @@ static uint32_t *
 ps4_emit_eop(uint32_t *cs, uint64_t addr, uint64_t value, bool interrupt)
 {
    *cs++ = 0xC0044700; /* PKT3(EVENT_WRITE_EOP, 4) */
-   *cs++ = 0x14 | (5 << 8) | (1 << 16) | (1 << 17); /* CACHE_FLUSH_AND_INV_TS_EVENT, TCL1, TC */
+   /* CACHE_FLUSH_AND_INV_TS_EVENT with TC_WB (bit 15), TCL1 and TC actions: Gnm's "write back and
+    * invalidate L1 and L2". Without the write-back bit the fence could signal while shader stores
+    * still sat dirty in the L2; the buffer was then released (unmapped) and the L2 wrote them back
+    * later - a GPU page fault that ends the app (Donkey Kong Country: Tropical Freeze, 1.82-1.89:
+    * a 720p image written through a storage buffer, released right after its submission
+    * "finished"). */
+   *cs++ = 0x14 | (5 << 8) | (1 << 15) | (1 << 16) | (1 << 17);
    *cs++ = (uint32_t)addr;
    /* DATA_SEL: 64-bit value; INT_SEL 2: interrupt once the write is confirmed. */
    *cs++ = ((addr >> 32) & 0xffff) | (2u << 29) | (interrupt ? 2u << 24 : 0);
@@ -2584,8 +2590,10 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
          ps4_scan_writes(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
       simple_mtx_unlock(&dev->lock);
    }
-   /* Dispatches through descriptors of released buffers: skipped (see ps4_user_data_stale). */
-   if (num_ibs && ps4_num_released) {
+   /* Draws and dispatches through descriptors of released buffers: skipped (see
+    * ps4_user_data_stale; RADV_PS4_SCAN=1 too: it never fired, the faults it hunted were the
+    * fence's missing L2 write-back, ps4_emit_eop). */
+   if (num_ibs && scan && ps4_num_released) {
       simple_mtx_lock(&dev->lock);
       for (unsigned i = 0; i < num_ibs; i++)
          ps4_scan_dispatches(dev, dcb[i], dcb_sizes[i] / 4, dev->last_seq + 1, 0);
