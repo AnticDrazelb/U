@@ -3651,10 +3651,10 @@ index d66e971..49e209f 100644
  endif()
 diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
 new file mode 100644
-index 0000000..fa9c78d
+index 0000000..653d29a
 --- /dev/null
 +++ b/src/gui/ps4/CMakeLists.txt
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,46 @@
 +add_library(CemuPS4Gui
 +	PS4WindowSystem.cpp
 +	CremaMii.cpp
@@ -3665,6 +3665,8 @@ index 0000000..fa9c78d
 +	PS4PauseMenu.h
 +	launcher/CremaCovers.cpp
 +	launcher/CremaCovers.h
++	launcher/CremaGraphicPacks.cpp
++	launcher/CremaGraphicPacks.h
 +	launcher/CremaSettings.cpp
 +	launcher/CremaSettings.h
 +	launcher/Launcher.cpp
@@ -3692,6 +3694,7 @@ index 0000000..fa9c78d
 +	Boost::headers
 +	PNG::PNG
 +	CURL::libcurl
++	libzip::zip
 +	imguiImpl
 +	# GameTDB's covers are JPEGs: libjpeg-turbo from the PacBrew sysroot (its usr/include stays off the
 +	# include path, so the header is a copy in the port's third_party folder)
@@ -6912,10 +6915,10 @@ index 0000000..c33e784
 +}
 diff --git a/src/gui/ps4/launcher/CremaCovers.cpp b/src/gui/ps4/launcher/CremaCovers.cpp
 new file mode 100644
-index 0000000..a41c48a
+index 0000000..3dbd2af
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaCovers.cpp
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,226 @@
 +#include "gui/ps4/launcher/CremaCovers.h"
 +
 +#include <cstdio>
@@ -6945,8 +6948,8 @@ index 0000000..a41c48a
 +	}
 +
 +	// The PS4's network: libSceNet and its resolver (the C library's getaddrinfo has no DNS
-+	// configuration on the PS4). Returns GameTDB's address as text, or empty.
-+	std::string ResolveHost(std::string* error)
++	// configuration on the PS4). Returns the host's address as text, or empty.
++	std::string ResolveHost(const char* HOST, std::string* error)
 +	{
 +		static bool s_net = false;
 +		static int s_pool = -1;
@@ -7049,6 +7052,11 @@ index 0000000..a41c48a
 +	}
 +} // namespace
 +
++std::string Resolve(const std::string& host, std::string* error)
++{
++	return ResolveHost(host.c_str(), error);
++}
++
 +Result Download(const std::vector<std::string>& ids, const std::string& coversDir, const std::string& caFile,
 +	const std::function<void(int, int, const std::string&)>& progress, const std::atomic<bool>& cancel)
 +{
@@ -7068,7 +7076,7 @@ index 0000000..a41c48a
 +	if (missing.empty())
 +		return result;
 +
-+	const std::string address = ResolveHost(&result.error);
++	const std::string address = ResolveHost(HOST, &result.error);
 +	if (address.empty())
 +	{
 +		result.failed = (int)missing.size();
@@ -7139,10 +7147,10 @@ index 0000000..a41c48a
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaCovers.h b/src/gui/ps4/launcher/CremaCovers.h
 new file mode 100644
-index 0000000..27140be
+index 0000000..3bacd01
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaCovers.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,30 @@
 +// Box art for the launcher (from DolphinPS4's PS4Covers), downloaded from GameTDB for the games
 +// the user has, into /data/Crema/covers/<ID>.jpg. IDs are GameTDB's Wii U ones: the product code
 +// from meta.xml and the company code (ARDE01 = Super Mario 3D World, USA). A <ID>.png the user puts
@@ -7165,16 +7173,549 @@ index 0000000..27140be
 +	std::string error; // why the last download failed (network, ...)
 +};
 +
++// A host's IPv4 address as text through the PS4's resolver (for CURLOPT_RESOLVE), or empty with
++// the reason in error.
++std::string Resolve(const std::string& host, std::string* error);
++
 +// Downloads the missing covers. progress(done, total, id) is called before each game.
 +Result Download(const std::vector<std::string>& ids, const std::string& coversDir, const std::string& caFile,
 +	const std::function<void(int, int, const std::string&)>& progress, const std::atomic<bool>& cancel);
 +} // namespace CremaCovers
+diff --git a/src/gui/ps4/launcher/CremaGraphicPacks.cpp b/src/gui/ps4/launcher/CremaGraphicPacks.cpp
+new file mode 100644
+index 0000000..6470048
+--- /dev/null
++++ b/src/gui/ps4/launcher/CremaGraphicPacks.cpp
+@@ -0,0 +1,470 @@
++#include "gui/ps4/launcher/CremaGraphicPacks.h"
++#include "gui/ps4/launcher/CremaCovers.h"
++
++#include "Cafe/GraphicPack/GraphicPack2.h"
++#include "config/CemuConfig.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <set>
++
++#include <curl/curl.h>
++#include <rapidjson/document.h>
++#include <zip.h>
++
++extern "C" void ps4_boot_trace(const char* line); // port/ps4_crashlog.cpp
++
++namespace CremaGraphicPacks
++{
++namespace
++{
++	constexpr const char* RELEASE_URL = "https://api.github.com/repos/cemu-project/cemu_graphic_packs/releases/latest";
++
++	void Log(const std::string& text)
++	{
++		ps4_boot_trace(("graphic packs: " + text).c_str());
++	}
++
++	size_t Append(char* data, size_t size, size_t count, void* user)
++	{
++		static_cast<std::string*>(user)->append(data, size * count);
++		return size * count;
++	}
++
++	struct Progress
++	{
++		const std::function<void(const std::string&)>* status;
++		const std::atomic<bool>* cancel;
++		curl_off_t shown = -1;
++	};
++
++	int OnProgress(void* user, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t)
++	{
++		auto* p = static_cast<Progress*>(user);
++		if (*p->cancel)
++			return 1;
++		// the zip only (the release information is a few KiB), every 256 KiB
++		if (now > 1024 * 1024 && now / (256 * 1024) != p->shown)
++		{
++			p->shown = now / (256 * 1024);
++			(*p->status)(total > 0 ? fmt::format("Downloading: {:.1f} of {:.1f} MB", now / 1048576.0, total / 1048576.0) :
++				fmt::format("Downloading: {:.1f} MB", now / 1048576.0));
++		}
++		return 0;
++	}
++
++	// HTTPS through the PS4's resolver: each host is looked up before its first request (and
++	// redirects are followed here, since the PS4's C library can't resolve them), certificates
++	// checked against Crema's CA list. The packs hold code patches: no download without the check.
++	class Http
++	{
++	public:
++		Http(const std::string& caFile, Progress* progress)
++		{
++			m_curl = curl_easy_init();
++			curl_easy_setopt(m_curl, CURLOPT_CAINFO, caFile.c_str());
++			curl_easy_setopt(m_curl, CURLOPT_USERAGENT, "Crema-PS4");
++			curl_easy_setopt(m_curl, CURLOPT_WRITEFUNCTION, Append);
++			curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1L);
++			curl_easy_setopt(m_curl, CURLOPT_CONNECTTIMEOUT, 15L);
++			curl_easy_setopt(m_curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // gives up after 30 s without data
++			curl_easy_setopt(m_curl, CURLOPT_LOW_SPEED_TIME, 30L);
++			curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION, OnProgress);
++			curl_easy_setopt(m_curl, CURLOPT_XFERINFODATA, progress);
++			curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L);
++		}
++
++		~Http()
++		{
++			curl_easy_cleanup(m_curl);
++			curl_slist_free_all(m_resolves);
++		}
++
++		// GET url (following up to 8 redirects) into body; false with the reason in error
++		bool Get(std::string url, std::string* body, std::string* error)
++		{
++			for (int hop = 0; hop < 8; hop++)
++			{
++				if (!AddHost(url, error))
++					return false;
++				body->clear();
++				char detail[CURL_ERROR_SIZE] = {};
++				curl_easy_setopt(m_curl, CURLOPT_ERRORBUFFER, detail);
++				curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
++				curl_easy_setopt(m_curl, CURLOPT_WRITEDATA, body);
++				const CURLcode code = curl_easy_perform(m_curl);
++				if (code != CURLE_OK)
++				{
++					*error = std::string(curl_easy_strerror(code)) + (detail[0] ? std::string(": ") + detail : "");
++					return false;
++				}
++				long status = 0;
++				curl_easy_getinfo(m_curl, CURLINFO_RESPONSE_CODE, &status);
++				if (status >= 300 && status < 400)
++				{
++					char* next = nullptr;
++					curl_easy_getinfo(m_curl, CURLINFO_REDIRECT_URL, &next);
++					if (!next)
++					{
++						*error = fmt::format("redirect without an address (HTTP {})", status);
++						return false;
++					}
++					url = next;
++					continue;
++				}
++				if (status != 200)
++				{
++					*error = fmt::format("HTTP {} from {}", status, url.substr(0, url.find('?')));
++					return false;
++				}
++				return true;
++			}
++			*error = "too many redirects";
++			return false;
++		}
++
++	private:
++		bool AddHost(const std::string& url, std::string* error)
++		{
++			const size_t start = url.find("://");
++			if (start == std::string::npos || url.compare(0, start, "https") != 0)
++			{
++				*error = "not an https address: " + url;
++				return false;
++			}
++			const size_t end = url.find_first_of("/:?", start + 3);
++			const std::string host = url.substr(start + 3, end == std::string::npos ? std::string::npos : end - start - 3);
++			if (m_hosts.count(host))
++				return true;
++			const std::string address = CremaCovers::Resolve(host, error);
++			if (address.empty())
++				return false;
++			m_hosts.insert(host);
++			m_resolves = curl_slist_append(m_resolves, (host + ":443:" + address).c_str());
++			curl_easy_setopt(m_curl, CURLOPT_RESOLVE, m_resolves);
++			return true;
++		}
++
++		CURL* m_curl = nullptr;
++		curl_slist* m_resolves = nullptr;
++		std::set<std::string> m_hosts;
++	};
++
++	// Replaces folder's contents with the zip's files; returns how many were written.
++	int Extract(const std::string& data, const std::string& folder, std::string* error)
++	{
++		zip_error_t zerror;
++		zip_error_init(&zerror);
++		zip_source_t* source = zip_source_buffer_create(data.data(), data.size(), 0, &zerror);
++		zip_t* zip = source ? zip_open_from_source(source, ZIP_RDONLY, &zerror) : nullptr;
++		if (!zip)
++		{
++			*error = std::string("not a zip file: ") + zip_error_strerror(&zerror);
++			if (source)
++				zip_source_free(source);
++			zip_error_fini(&zerror);
++			return -1;
++		}
++		std::error_code ec;
++		fs::create_directories(_utf8ToPath(folder), ec);
++		for (const auto& entry : fs::directory_iterator(_utf8ToPath(folder), ec))
++			fs::remove_all(entry.path(), ec);
++		int files = 0;
++		std::vector<char> buffer;
++		const zip_int64_t count = zip_get_num_entries(zip, 0);
++		for (zip_int64_t i = 0; i < count; i++)
++		{
++			zip_stat_t stat;
++			zip_stat_init(&stat);
++			if (zip_stat_index(zip, i, 0, &stat) != 0 || !stat.name || !stat.name[0])
++				continue;
++			const std::string name = stat.name;
++			if (name[0] == '/' || name.find("..") != std::string::npos || name.find('\\') != std::string::npos)
++				continue; // outside the folder
++			const fs::path path = _utf8ToPath(folder + "/" + name);
++			if (name.back() == '/')
++			{
++				fs::create_directories(path, ec);
++				continue;
++			}
++			if (stat.size > 64 * 1024 * 1024)
++				continue;
++			fs::create_directories(path.parent_path(), ec);
++			zip_file_t* file = zip_fopen_index(zip, i, 0);
++			if (!file)
++				continue;
++			buffer.resize((size_t)stat.size);
++			const bool read = zip_fread(file, buffer.data(), stat.size) == (zip_int64_t)stat.size;
++			zip_fclose(file);
++			if (!read)
++				continue;
++			if (FILE* out = fopen(_pathToUtf8(path).c_str(), "wb"))
++			{
++				fwrite(buffer.data(), 1, buffer.size(), out);
++				fclose(out);
++				files++;
++			}
++		}
++		zip_discard(zip);
++		zip_error_fini(&zerror);
++		return files;
++	}
++
++	bool ForTitle(const GraphicPack2& pack, uint64 titleId)
++	{
++		const auto& ids = pack.GetTitleIds();
++		return std::find(ids.begin(), ids.end(), titleId) != ids.end();
++	}
++
++	std::vector<std::shared_ptr<GraphicPack2>> PacksOf(const std::string& titleId)
++	{
++		std::vector<std::shared_ptr<GraphicPack2>> packs;
++		uint64 id = 0;
++		if (titleId.size() != 16 || sscanf(titleId.c_str(), "%llx", (unsigned long long*)&id) != 1)
++			return packs;
++		for (const auto& pack : GraphicPack2::GetGraphicPacks())
++		{
++			if (ForTitle(*pack, id))
++				packs.push_back(pack);
++		}
++		std::sort(packs.begin(), packs.end(), [](const auto& a, const auto& b) { return a->GetVirtualPath() < b->GetVirtualPath(); });
++		return packs;
++	}
++
++	std::shared_ptr<GraphicPack2> PackAt(const std::string& index)
++	{
++		const auto& packs = GraphicPack2::GetGraphicPacks();
++		const size_t i = (size_t)std::strtoul(index.c_str(), nullptr, 10);
++		return i < packs.size() ? packs[i] : nullptr;
++	}
++
++	size_t IndexOf(const std::shared_ptr<GraphicPack2>& pack)
++	{
++		const auto& packs = GraphicPack2::GetGraphicPacks();
++		return (size_t)(std::find(packs.begin(), packs.end(), pack) - packs.begin());
++	}
++
++	std::string OneLine(std::string text)
++	{
++		for (char& c : text)
++		{
++			if (c == '\n' || c == '\r' || c == '\t')
++				c = ' ';
++		}
++		return text;
++	}
++
++	// Cemu's GraphicPacksWindow2::SaveStateToConfig
++	void Save()
++	{
++		auto& data = GetConfigHandle().data();
++		data.graphic_pack_entries.clear();
++		for (const auto& pack : GraphicPack2::GetGraphicPacks())
++		{
++			const fs::path name = _utf8ToPath(pack->GetNormalizedPathString());
++			if (pack->IsEnabled())
++			{
++				auto& entry = data.graphic_pack_entries[name];
++				for (const auto& preset : pack->GetActivePresets())
++					entry.try_emplace(preset->category, preset->name);
++			}
++			else if (pack->IsDefaultEnabled())
++			{
++				data.graphic_pack_entries[name].try_emplace("_disabled", "false");
++			}
++		}
++		GetConfigHandle().Save();
++	}
++} // namespace
++
++std::string InstalledVersion(const std::string& folder)
++{
++	std::string version;
++	if (FILE* file = fopen((folder + "/version.txt").c_str(), "rb"))
++	{
++		char line[128] = {};
++		if (fgets(line, sizeof(line), file))
++			version = line;
++		fclose(file);
++	}
++	while (!version.empty() && (version.back() == '\n' || version.back() == '\r' || version.back() == ' '))
++		version.pop_back();
++	return version;
++}
++
++DownloadResult Download(const std::string& folder, const std::string& caFile,
++	const std::function<void(const std::string&)>& status, const std::atomic<bool>& cancel)
++{
++	DownloadResult result;
++	curl_global_init(CURL_GLOBAL_DEFAULT);
++	Progress progress{&status, &cancel};
++	Http http(caFile, &progress);
++	status("Asking GitHub for the latest release...");
++	std::string body;
++	if (!http.Get(RELEASE_URL, &body, &result.error))
++	{
++		Log("release information: " + result.error);
++		return result;
++	}
++	rapidjson::Document json;
++	json.Parse(body.data(), body.size());
++	const char* url = nullptr;
++	if (!json.HasParseError() && json.IsObject() && json.HasMember("name") && json["name"].IsString() &&
++		json.HasMember("assets") && json["assets"].IsArray() && json["assets"].Size() > 0)
++	{
++		result.version = json["name"].GetString();
++		const auto& asset = json["assets"][0];
++		if (asset.IsObject() && asset.HasMember("browser_download_url") && asset["browser_download_url"].IsString())
++			url = asset["browser_download_url"].GetString();
++	}
++	if (!url || result.version.empty())
++	{
++		result.error = "GitHub's answer has no release";
++		Log(result.error);
++		return result;
++	}
++	if (InstalledVersion(folder) == result.version)
++	{
++		result.upToDate = true;
++		Log(result.version + " is installed already");
++		return result;
++	}
++	const std::string zipUrl = url;
++	status("Downloading " + result.version + "...");
++	std::string data;
++	if (!http.Get(zipUrl, &data, &result.error))
++	{
++		if (cancel)
++			result.error = "cancelled";
++		Log("download: " + result.error);
++		return result;
++	}
++	status(fmt::format("Extracting {:.1f} MB...", data.size() / 1048576.0));
++	result.files = Extract(data, folder, &result.error);
++	if (result.files <= 0)
++	{
++		if (result.error.empty())
++			result.error = "the zip file had no files";
++		Log("extract: " + result.error);
++		return result;
++	}
++	if (FILE* file = fopen((folder + "/version.txt").c_str(), "wb"))
++	{
++		fputs(result.version.c_str(), file);
++		fclose(file);
++	}
++	result.installed = true;
++	Log(fmt::format("{} installed: {} files, {:.1f} MB", result.version, result.files, data.size() / 1048576.0));
++	return result;
++}
++
++void Reload()
++{
++	GraphicPack2::ClearGraphicPacks();
++	GraphicPack2::LoadAll();
++}
++
++int PackCount(const std::string& titleId)
++{
++	return (int)PacksOf(titleId).size();
++}
++
++std::vector<Row> Rows(const std::string& titleId)
++{
++	std::vector<Row> rows;
++	std::string group = "\x01";
++	for (const auto& pack : PacksOf(titleId))
++	{
++		// grouped by the folders of the pack's place in Cemu's tree (Graphics, Mods, Enhancements, ...)
++		const std::string& path = pack->GetVirtualPath();
++		const size_t slash = path.rfind('/');
++		const std::string folder = slash == std::string::npos ? std::string() : path.substr(0, slash);
++		if (folder != group)
++		{
++			group = folder;
++			Row header;
++			header.label = folder.empty() ? "Graphic Packs" : folder;
++			header.header = true;
++			rows.push_back(header);
++		}
++		const std::string index = std::to_string(IndexOf(pack));
++		Row row;
++		row.label = slash == std::string::npos ? path : path.substr(slash + 1);
++		row.value = pack->IsEnabled() ? "On" : "Off";
++		row.key = "pack:" + index;
++		row.help = OneLine(pack->GetDescription());
++		if (row.help.empty())
++			row.help = "Cross: on or off. Takes effect at the next game start.";
++		rows.push_back(row);
++		if (!pack->IsEnabled())
++			continue;
++		std::vector<std::string> order;
++		const auto categories = pack->GetCategorizedPresets(order);
++		for (const std::string& category : order)
++		{
++			const auto it = categories.find(category);
++			if (it == categories.end())
++				continue;
++			const bool visible = std::any_of(it->second.begin(), it->second.end(), [](const auto& p) { return p->visible; });
++			if (!visible)
++				continue;
++			Row preset;
++			preset.label = "      " + (category.empty() ? std::string("Preset") : category);
++			preset.value = pack->GetActivePreset(category);
++			preset.key = "preset:" + index + ":" + category;
++			preset.help = "Left / Right: " + (category.empty() ? std::string("the preset") : category) + " of " + row.label + ". Takes effect at the next game start.";
++			rows.push_back(preset);
++		}
++	}
++	return rows;
++}
++
++void Change(const std::string& key, int direction)
++{
++	if (key.rfind("pack:", 0) == 0)
++	{
++		const auto pack = PackAt(key.substr(5));
++		if (!pack)
++			return;
++		pack->SetEnabled(!pack->IsEnabled());
++		if (pack->IsEnabled())
++		{
++			pack->UpdatePresetVisibility();
++			pack->ValidatePresetSelections();
++		}
++		Log(fmt::format("{}: {}", pack->GetVirtualPath(), pack->IsEnabled() ? "on" : "off"));
++		Save();
++		return;
++	}
++	if (key.rfind("preset:", 0) == 0)
++	{
++		const size_t colon = key.find(':', 7);
++		if (colon == std::string::npos)
++			return;
++		const auto pack = PackAt(key.substr(7, colon - 7));
++		const std::string category = key.substr(colon + 1);
++		if (!pack)
++			return;
++		std::vector<GraphicPack2::PresetPtr> presets;
++		for (const auto& preset : pack->GetPresets())
++		{
++			if (preset->category == category && preset->visible)
++				presets.push_back(preset);
++		}
++		if (presets.empty())
++			return;
++		const std::string active = pack->GetActivePreset(category);
++		int at = 0;
++		for (size_t i = 0; i < presets.size(); i++)
++		{
++			if (presets[i]->name == active)
++				at = (int)i;
++		}
++		const int count = (int)presets.size();
++		at = ((at + (direction < 0 ? -1 : 1)) % count + count) % count;
++		pack->SetActivePreset(category, presets[at]->name);
++		Log(fmt::format("{}: {} = {}", pack->GetVirtualPath(), category.empty() ? "preset" : category, presets[at]->name));
++		Save();
++	}
++}
++} // namespace CremaGraphicPacks
+diff --git a/src/gui/ps4/launcher/CremaGraphicPacks.h b/src/gui/ps4/launcher/CremaGraphicPacks.h
+new file mode 100644
+index 0000000..b972bf8
+--- /dev/null
++++ b/src/gui/ps4/launcher/CremaGraphicPacks.h
+@@ -0,0 +1,47 @@
++// Cemu's community graphic packs (github.com/cemu-project/cemu_graphic_packs) for the launcher:
++// the latest release downloaded into Cemu's graphicPacks/downloadedGraphicPacks folder (as Cemu's
++// "Download latest community graphic packs"), and each game's packs turned on and off with their
++// presets (resolution, frame rate, ...). The choices go to Cemu's settings.xml, as Cemu's Graphic
++// Packs window saves them, and apply at the next game start.
++#pragma once
++
++#include <atomic>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace CremaGraphicPacks
++{
++struct DownloadResult
++{
++	bool installed = false; // a new release was extracted
++	bool upToDate = false;  // the installed release is the latest
++	std::string version;    // the release's name (Github...)
++	int files = 0;
++	std::string error;
++};
++
++// The installed release's name, or empty.
++std::string InstalledVersion(const std::string& folder);
++
++// Downloads and extracts the latest release into folder (its old contents are replaced) unless it
++// is installed already. status(text) reports the progress.
++DownloadResult Download(const std::string& folder, const std::string& caFile,
++	const std::function<void(const std::string&)>& status, const std::atomic<bool>& cancel);
++
++// Loads the graphic packs again (after a download).
++void Reload();
++
++// A game's packs as settings rows: a header per group, a row per pack (On / Off) and, for a pack
++// that is on, a row per preset category. Keys go back to Change.
++struct Row
++{
++	std::string label, value, key, help;
++	bool header = false;
++};
++std::vector<Row> Rows(const std::string& titleId);
++int PackCount(const std::string& titleId);
++
++// Left (-1) / Right or Cross (+1) on a row: a pack on or off, or the next preset; saved at once.
++void Change(const std::string& key, int direction);
++} // namespace CremaGraphicPacks
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..dfe5b7c
+index 0000000..0836d8b
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,396 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -7211,6 +7752,8 @@ index 0000000..dfe5b7c
 +			"A pointer where your finger is on the touchpad, so you can see where a touch lands."},
 +		{"show_fps", "FPS Counter", "Display", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Frames per second in the top left corner."},
++		{"vsync", "VSync", "Display", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: each new picture waits for the TV's next refresh, so it never tears (a line where two pictures meet), but a frame can wait up to 16 ms. Off: pictures show at once (Cemu's VSync off)."},
 +		{"scaling", "Picture Size", "Display", {{"keep", "Keep Aspect Ratio"}, {"stretch", "Stretch"}},
 +			"keep", false, "Stretch fills the whole TV even when the game's picture has another shape."},
 +		{"upscale_filter", "Upscaling Filter", "Display",
@@ -7519,6 +8062,7 @@ index 0000000..dfe5b7c
 +			get("tv_shows") == "gamepad");
 +	}
 +	config.async_compile = get("shader_compile") != "sync";
++	config.vsync = get("vsync") == "on" ? 1 : 0; // Cemu's VSync: FIFO, else Immediate (SwapchainInfoVk.h)
 +	// Cemu's "Full sync at GX2DrawDone" and "Accurate barriers"
 +	const bool accurate = get("gpu_accuracy") != "fast";
 +	config.gx2drawdone_sync = accurate;
@@ -7637,10 +8181,10 @@ index 0000000..2743734
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..09171e0
+index 0000000..06b1136
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3287 @@
+@@ -0,0 +1,3426 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -7649,6 +8193,8 @@ index 0000000..09171e0
 +#include "gui/ps4/launcher/Launcher.h"
 +
 +#include "gui/ps4/launcher/CremaCovers.h"
++#include "gui/ps4/launcher/CremaGraphicPacks.h"
++#include "config/ActiveSettings.h"
 +#include "gui/ps4/CremaOnline.h"
 +#include "gui/ps4/launcher/CremaSettings.h"
 +#include "gui/ps4/launcher/LauncherDisplay.h"
@@ -8395,6 +8941,8 @@ index 0000000..09171e0
 +		SET_STYLE,     // Menu Style: Library or XMB
 +		SET_LANGUAGE,  // Language: a list of all of them
 +		SET_COVERS,    // Download Covers: GameTDB box art, with its progress
++		SET_PACKS,     // Download Graphic Packs: Cemu's community packs, with the progress
++		SET_GAME_PACKS, // a game's Graphic Packs (settings rows: packs and presets)
 +		SET_GROUP = 100, // + index into CremaSettings::Categories(): a settings list
 +	};
 +
@@ -8442,6 +8990,10 @@ index 0000000..09171e0
 +		void LoadBoxArt(Game& game);
 +		void StartCoverDownload();
 +		void UpdateCoverDownload();
++		void StartPackDownload();
++		void UpdatePackDownload();
++		void OpenGamePacks(const std::string& gameId, const std::string& title);
++		std::string PacksFolder() const { return _pathToUtf8(ActiveSettings::GetUserDataPath("graphicPacks/downloadedGraphicPacks")); }
 +		void LoadAssets();
 +		void BuildItems();
 +		const Theme& CurrentTheme() const;
@@ -8532,6 +9084,12 @@ index 0000000..09171e0
 +		std::mutex m_coverMutex;
 +		std::string m_coverStatus;
 +		CremaCovers::Result m_coverResult;
++		// Graphic pack download (background thread).
++		std::thread m_packThread;
++		std::atomic<bool> m_packCancel{false}, m_packDone{false};
++		std::mutex m_packMutex;
++		std::string m_packStatus;
++		CremaGraphicPacks::DownloadResult m_packResult;
 +		bool m_firstLanguage = false; // the first start: the language list before anything else
 +		bool m_firstStyle = false;    // the first start: Library or XMB
 +		float m_time = 0.0f;
@@ -8672,6 +9230,96 @@ index 0000000..09171e0
 +			m_panel.lines.push_back("Your own pictures: " + m_dataDir + "/covers/<ID>.png");
 +			Play(result.failed > 0 ? "error" : "confirm");
 +		}
++	}
++
++	void Menu::StartPackDownload()
++	{
++		if (m_packThread.joinable())
++			return; // already running
++		m_packCancel = false;
++		m_packDone = false;
++		{
++			std::lock_guard lock(m_packMutex);
++			m_packStatus = "Connecting to GitHub...";
++		}
++		m_packThread = std::thread([this] {
++			const CremaGraphicPacks::DownloadResult result = CremaGraphicPacks::Download(PacksFolder(),
++				m_assetsDir + "/xmb/cacert.pem",
++				[this](const std::string& status) {
++					std::lock_guard lock(m_packMutex);
++					m_packStatus = status;
++				},
++				m_packCancel);
++			std::lock_guard lock(m_packMutex);
++			m_packResult = result;
++			m_packDone = true;
++		});
++	}
++
++	// Shows the download's progress in its panel; at the end, loads the new packs.
++	void Menu::UpdatePackDownload()
++	{
++		if (!m_packThread.joinable())
++			return;
++		std::string status;
++		{
++			std::lock_guard lock(m_packMutex);
++			status = m_packStatus;
++		}
++		const bool shown = m_panel.open && m_panel.setting == SET_PACKS;
++		if (!m_packDone)
++		{
++			if (shown)
++				m_panel.lines = {"", status, "", "Circle closes this; the download goes on."};
++			return;
++		}
++		m_packThread.join();
++		const CremaGraphicPacks::DownloadResult result = m_packResult;
++		if (result.installed)
++		{
++			CremaGraphicPacks::Reload();
++			BuildItems(); // Settings: the installed release
++		}
++		if (!shown)
++			return;
++		if (result.installed)
++			m_panel.lines = {"", "Installed: " + result.version, std::to_string(result.files) + " files", "",
++				"Turn them on per game: Triangle on a game,", "then Graphic Packs."};
++		else if (result.upToDate)
++			m_panel.lines = {"", "Up to date: " + result.version, "", "Turn them on per game: Triangle on a game,",
++				"then Graphic Packs."};
++		else
++			m_panel.lines = {"", "The download failed:", result.error};
++		Play(result.installed || result.upToDate ? "confirm" : "error");
++	}
++
++	// A game's graphic packs: settings rows (CremaGraphicPacks::Rows), changed with Left / Right / Cross.
++	void Menu::OpenGamePacks(const std::string& gameId, const std::string& title)
++	{
++		m_panel = {};
++		m_panel.open = true;
++		m_panel.setting = SET_GAME_PACKS;
++		m_panel.gameId = gameId;
++		m_panel.title = "Graphic Packs";
++		for (const CremaGraphicPacks::Row& pack : CremaGraphicPacks::Rows(gameId))
++		{
++			SettingRow row{pack.label, pack.value, pack.key, pack.header};
++			row.help = pack.help;
++			row.note = pack.value == "On";
++			m_panel.rows.push_back(row);
++		}
++		if (m_panel.rows.empty())
++		{
++			const std::string installed = CremaGraphicPacks::InstalledVersion(PacksFolder());
++			m_panel.lines = {"", title, ""};
++			if (installed.empty())
++				m_panel.lines.insert(m_panel.lines.end(), {"No graphic packs are installed.", "",
++					"Settings > Download Graphic Packs", "gets Cemu's community packs."});
++			else
++				m_panel.lines.insert(m_panel.lines.end(), {"No graphic packs for this game", "in " + installed + "."});
++			return;
++		}
++		MoveSettingRow(0);
 +	}
 +
 +	void Menu::LoadAssets()
@@ -9022,6 +9670,11 @@ index 0000000..09171e0
 +		settings.push_back({"Clock", m_prefs.clock ? "On" : "Off", -1, -1, SET_CLOCK});
 +		settings.push_back({"Game Folder", GamesFolder(), -1, -1, SET_GAMES_DIR});
 +		settings.push_back({"Download Covers", "Box art from GameTDB for your games", -1, -1, SET_COVERS});
++		{
++			const std::string packs = CremaGraphicPacks::InstalledVersion(PacksFolder());
++			settings.push_back({"Download Graphic Packs", packs.empty() ? "Cemu's community packs: resolution, frame rate and more" :
++				"Installed: " + packs, -1, -1, SET_PACKS});
++		}
 +		settings.push_back({"Reset All Settings", "Every setting back to the defaults", -1, -1, SET_RESET_ALL});
 +		settings.push_back({"About", "", -1, -1, SET_ABOUT});
 +
@@ -9122,6 +9775,11 @@ index 0000000..09171e0
 +				StartCoverDownload();
 +			}
 +			m_panel.lines = {"", "Connecting to GameTDB..."};
++			break;
++		case SET_PACKS:
++			m_panel.title = "Download Graphic Packs";
++			StartPackDownload();
++			m_panel.lines = {"", "Connecting to GitHub..."};
 +			break;
 +		case SET_RESET_ALL:
 +			m_panel.title = "Reset All Settings";
@@ -9302,6 +9960,19 @@ index 0000000..09171e0
 +			return;
 +		const SettingRow& row = m_panel.rows[m_panel.selected];
 +		const std::string& game = m_panel.gameId;
++		if (m_panel.setting == SET_GAME_PACKS)
++		{
++			const std::string key = row.key;
++			const int selected = m_panel.selected;
++			const std::string title = m_panel.title;
++			CremaGraphicPacks::Change(key, direction);
++			const float scroll = m_panel.scroll, slide = m_panel.slide;
++			OpenGamePacks(game, title);
++			m_panel.selected = std::min(selected, (int)m_panel.rows.size() - 1);
++			m_panel.scroll = scroll;
++			m_panel.slide = slide;
++			return;
++		}
 +		if (m_panel.setting == SET_GAMES_DIR)
 +		{
 +			if (direction <= 0)
@@ -9550,6 +10221,12 @@ index 0000000..09171e0
 +						Play("confirm");
 +						return;
 +					}
++					if (choice == "Graphic Packs")
++					{
++						OpenGamePacks(game.id, game.title);
++						Play("confirm");
++						return;
++					}
 +					if (choice == "Information")
 +					{
 +						m_panel.title = "Information";
@@ -9691,6 +10368,8 @@ index 0000000..09171e0
 +				m_panel.options = {"Start"};
 +				if (!game.homebrew)
 +					m_panel.options.push_back("Game Settings");
++				if (!game.homebrew)
++					m_panel.options.push_back("Graphic Packs");
 +				m_panel.options.push_back("Information");
 +				m_panel.options.push_back(m_prefs.defaultGame == game.path ? "Remove Default Game" : "Set as Default Game");
 +				m_panel.options.push_back("Delete");
@@ -10889,6 +11568,7 @@ index 0000000..09171e0
 +				HandleInput(m_input.Poll(dt));
 +			}
 +			UpdateCoverDownload();
++			UpdatePackDownload();
 +
 +			m_display.BeginFrame();
 +			ImGui::NewFrame();
@@ -10905,6 +11585,9 @@ index 0000000..09171e0
 +		m_coverCancel = true;
 +		if (m_coverThread.joinable())
 +			m_coverThread.join();
++		m_packCancel = true;
++		if (m_packThread.joinable())
++			m_packThread.join();
 +		m_audio.Stop();
 +		m_display.Shutdown();
 +		ImGui::DestroyContext(context);
