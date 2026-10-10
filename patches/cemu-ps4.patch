@@ -2794,7 +2794,7 @@ index bb31077..1403d8d 100644
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..b151988 100644
+index 9fe4bea..101b2dc 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2902,7 +2902,24 @@ index 9fe4bea..b151988 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1391,6 +1461,11 @@ namespace coreinit
+@@ -1233,6 +1303,16 @@ namespace coreinit
+ 
+ 	void __OSCheckSystemEvents()
+ 	{
++#if defined(__ORBIS__)
++		// Crema: at most every 0.1 ms (only the main core calls this, at each of its thread switches
++		// and while it idles): audio waits 1.7-3 ms between updates, alarms are checked to 0.1 ms
++		static uint64 s_nextCheck = 0;
++		static const uint64 s_interval = _rdtscFrequency / 10000;
++		const uint64 now = __rdtsc();
++		if (now < s_nextCheck)
++			return;
++		s_nextCheck = now + s_interval;
++#endif
+ 		// AX update
+ 		snd_core::AXOut_update();
+ 		// alarm update
+@@ -1391,6 +1471,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -2914,7 +2931,7 @@ index 9fe4bea..b151988 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1722,135 @@ namespace coreinit
+@@ -1647,3 +1732,135 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
@@ -3098,6 +3115,29 @@ index 821fe8a..f24e24f 100644
  			while(!m_threadShouldExit)
  			{
  				m_decodeSem.decrementWithWait();
+diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
+index 6cb1599..3b5a3cc 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
+@@ -482,6 +482,18 @@ namespace snd_core
+ 		constexpr static auto kWaitDurationFast = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(2900));
+ 		constexpr static auto kWaitDurationMinimum = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(1700));
+ 
++#if defined(__ORBIS__)
++		// Crema: nothing to do before the shorter of the two waits: return before taking the audio
++		// locks (this runs every time the main core switches threads, ~12,000 times a second in
++		// Breath of the Wild, and the locks were shared with the audio output thread)
++		{
++			static auto s_cremaNext = now_cached();
++			const auto t = now_cached();
++			if (t < s_cremaNext)
++				return;
++			s_cremaNext = t + std::chrono::microseconds(250); // well under the 1.7 ms minimum
++		}
++#endif
+ 		// if we haven't buffered any blocks, we will wait less time than usual
+ 		bool additional_blocks_required = false;
+ 		{
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 index 7afbf19..bee0598 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
