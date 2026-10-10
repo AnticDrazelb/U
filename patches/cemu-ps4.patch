@@ -2808,7 +2808,7 @@ index bb31077..1403d8d 100644
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..101b2dc 100644
+index 9fe4bea..b8cd8f2 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2945,7 +2945,7 @@ index 9fe4bea..101b2dc 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1732,135 @@ namespace coreinit
+@@ -1647,3 +1732,159 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
@@ -2965,12 +2965,14 @@ index 9fe4bea..101b2dc 100644
 +	struct CensusThread
 +	{
 +		char name[48]{};
++		uint8 affinity = 0; // OSThread_t::ATTR_AFFINITY_CORE0..2 bits
 +		uint32 samples = 0;
 +		uint32 kinds[kKinds]{};
 +		std::unordered_map<uint64, uint32> waitSites; // kind << 32 | LR
 +	};
 +	std::mutex s_censusMutex;
 +	std::unordered_map<MPTR, CensusThread> s_census;
++	uint32 s_censusCoreSamples = 0, s_censusCoreIdle[Espresso::CORE_COUNT]{};
 +
 +	void CremaThreadCensusSample()
 +	{
@@ -2978,6 +2980,16 @@ index 9fe4bea..101b2dc 100644
 +		for (sint32 i = 0; i < Espresso::CORE_COUNT; i++)
 +			current[i] = __currentCoreThread[i];
 +		std::unique_lock _l(s_censusMutex);
++		// a core is idle when no thread runs on it (the pointer can still name a thread that blocked)
++		s_censusCoreSamples++;
++		for (sint32 i = 0; i < Espresso::CORE_COUNT; i++)
++		{
++			if (!current[i] || current[i]->state.value() != OSThread_t::THREAD_STATE::STATE_RUNNING)
++			{
++				s_censusCoreIdle[i]++;
++				current[i] = nullptr;
++			}
++		}
 +		srwlock_activeThreadList.LockRead();
 +		for (sint32 i = 0; i < activeThreadCount; i++)
 +		{
@@ -2998,6 +3010,7 @@ index 9fe4bea..101b2dc 100644
 +					snprintf(c.name, sizeof(c.name), "thread %08x", ptr);
 +			}
 +			c.samples++;
++			c.affinity = t->attr & 7;
 +			CensusKind kind;
 +			if (t == current[0] || t == current[1] || t == current[2])
 +				kind = kRunning;
@@ -3043,9 +3056,17 @@ index 9fe4bea..101b2dc 100644
 +	{
 +		static const char* kNames[kKinds] = {"run", "ready", "mutex", "fastmutex", "queue", "suspended", "other"};
 +		std::unordered_map<MPTR, CensusThread> census;
++		uint32 coreSamples, coreIdle[Espresso::CORE_COUNT];
 +		{
 +			std::unique_lock _l(s_censusMutex);
 +			census.swap(s_census);
++			coreSamples = std::max<uint32>(s_censusCoreSamples, 1);
++			for (sint32 i = 0; i < Espresso::CORE_COUNT; i++)
++			{
++				coreIdle[i] = s_censusCoreIdle[i];
++				s_censusCoreIdle[i] = 0;
++			}
++			s_censusCoreSamples = 0;
 +		}
 +		std::vector<const CensusThread*> threads;
 +		for (auto& it : census)
@@ -3054,11 +3075,14 @@ index 9fe4bea..101b2dc 100644
 +			return a->kinds[kRunning] + a->kinds[kReady] > b->kinds[kRunning] + b->kinds[kReady];
 +		});
 +		std::vector<std::string> lines;
++		lines.push_back(fmt::format("wiiu cores idle: core0 {}%, core1 {}%, core2 {}%", coreIdle[0] * 100 / coreSamples,
++			coreIdle[1] * 100 / coreSamples, coreIdle[2] * 100 / coreSamples));
 +		for (const CensusThread* c : threads)
 +		{
-+			if (lines.size() == 16)
++			if (lines.size() == 20)
 +				break;
-+			std::string line = fmt::format("wiiu thread {}:", c->name);
++			std::string line = fmt::format("wiiu thread {} [core {}{}{}]:", c->name, (c->affinity & 1) ? "0" : "",
++				(c->affinity & 2) ? "1" : "", (c->affinity & 4) ? "2" : "");
 +			for (uint32 k = 0; k < kKinds; k++)
 +			{
 +				if (c->kinds[k] * 100 >= c->samples)
