@@ -1399,10 +1399,26 @@ index 89e805d..58a4f31 100644
  		PPCRecompiler_pushBackIMLInstructions(seg, 0, 1);
  		seg->imlList[0].type = PPCREC_IML_TYPE_MACRO;
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
-index de67772..03ba035 100644
+index de67772..24b109b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
-@@ -1458,12 +1458,18 @@ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx)
+@@ -633,6 +633,7 @@ LatteCMDPtr LatteCP_itMemSemaphore(LatteCMDPtr cmd, uint32 nWords)
+ 	{
+ 		// wait
+ 		LatteCP_signalEnterWait();
++		performanceMonitor.gpuTime_semaphoreTime.beginMeasuring();
+ 		size_t loopCount = 0;
+ 		while (true)
+ 		{
+@@ -647,6 +648,7 @@ LatteCMDPtr LatteCP_itMemSemaphore(LatteCMDPtr cmd, uint32 nWords)
+ 			if (semaphoreData->compare_exchange_strong(oldVal, oldVal - 1))
+ 				break;
+ 		}
++		performanceMonitor.gpuTime_semaphoreTime.endMeasuring();
+ 	}
+ 	else
+ 	{
+@@ -1458,12 +1460,18 @@ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx)
  	}
  }
  
@@ -1421,6 +1437,83 @@ index de67772..03ba035 100644
  		uint32 itHeader = LatteCP_readU32Deprc();
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
+diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
+index a3bcb63..e628db6 100644
+--- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
++++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
+@@ -4,6 +4,30 @@
+ 
+ performanceMonitor_t performanceMonitor{};
+ 
++#if defined(__ORBIS__)
++// Crema's performance log: where the GPU thread (LatteThread) waited since the last call, in % of
++// the time: for commands from the game (idle), on a game's fence (WAIT_REG_MEM) or semaphore, for
++// the PS4 GPU (GX2DrawDone's full sync, readbacks) and compiling shaders.
++std::string LattePerformanceMonitor_cremaWaits()
++{
++	static uint64 s_last[6]{}, s_lastTsc = 0;
++	const uint64 now = PPCTimer_getRawTsc();
++	const uint64 totals[6] = {performanceMonitor.gpuTime_idleTime.getTotal(), performanceMonitor.gpuTime_fenceTime.getTotal(),
++		performanceMonitor.gpuTime_semaphoreTime.getTotal(), performanceMonitor.gpuTime_waitForAsync.getTotal(),
++		performanceMonitor.gpuTime_shaderCreate.getTotal(), performanceMonitor.gpuTime_frameTime.getTotal()};
++	const uint64 span = s_lastTsc ? now - s_lastTsc : 0;
++	uint64 pct[6]{};
++	for (int i = 0; i < 6; i++)
++	{
++		pct[i] = span ? (totals[i] - s_last[i]) * 100 / span : 0;
++		s_last[i] = totals[i];
++	}
++	s_lastTsc = now;
++	return fmt::format("latte waits: idle {}%, game fence {}%, semaphore {}%, gpu sync {}%, shaders {}%", pct[0], pct[1], pct[2],
++		pct[3], pct[4]);
++}
++#endif
++
+ void LattePerformanceMonitor_frameEnd()
+ {
+ 	// per-frame stats
+diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
+index dbc3cff..eea3451 100644
+--- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
++++ b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.h
+@@ -18,8 +18,11 @@ public:
+ 	{
+ 		uint64 dif = PPCTimer_getRawTsc() - timerStart;
+ 		currentSum += dif;
++		total += dif;
+ 	}
+ 
++	uint64 getTotal() const { return total; } // since the start (Crema's performance log)
++
+ 	void frameFinished()
+ 	{
+ 		previousFrame = currentSum;
+@@ -35,6 +38,7 @@ private:
+ 	uint64 currentSum{};
+ 	uint64 previousFrame{};
+ 	uint64 timerStart{};
++	uint64 total{};
+ };
+ 
+ class LattePerfStatCounter
+@@ -99,6 +103,7 @@ typedef struct
+ 	LattePerfStatTimer gpuTime_shaderCreate;
+ 	LattePerfStatTimer gpuTime_idleTime; // time spent waiting for new commands from CPU
+ 	LattePerfStatTimer gpuTime_fenceTime; // time spent waiting for fence condition
++	LattePerfStatTimer gpuTime_semaphoreTime; // Crema: waiting in IT_MEM_SEMAPHORE for the CPU's signal
+ 
+ 	LattePerfStatTimer gpuTime_dcStageTextures; // drawcall texture/mrt setup
+ 	LattePerfStatTimer gpuTime_dcStageVertexMgr; // drawcall vertex setup and upload
+@@ -143,6 +148,9 @@ typedef struct
+ extern performanceMonitor_t performanceMonitor;
+ 
+ void LattePerformanceMonitor_frameEnd();
++#if defined(__ORBIS__)
++std::string LattePerformanceMonitor_cremaWaits();
++#endif
+ void LattePerformanceMonitor_frameBegin();
+ 
+ #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 index f1556f8..1cc9d33 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
@@ -6062,10 +6155,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..c33e784
+index 0000000..0258c97
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,867 @@
+@@ -0,0 +1,869 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -6080,6 +6173,7 @@ index 0000000..c33e784
 +#include "Cafe/CafeSystem.h"
 +#include "Cafe/HW/Latte/Core/Latte.h"
 +#include "Cafe/HW/Latte/Core/LatteOverlay.h"
++#include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 +#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 +#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 +#include "Cafe/TitleList/TitleInfo.h"
@@ -6180,6 +6274,7 @@ index 0000000..c33e784
 +		const int totalFds = files + sockets + pipes + devices + others;
 +		Trace(fmt::format("perf: gpu {}% | {} | fds {} (files {}, sockets {}, pipes {}, devices {}, other {})",
 +			spanDelta ? busyDelta * 100 / spanDelta : 0, threads, totalFds, files, sockets, pipes, devices, others));
++		Trace(LattePerformanceMonitor_cremaWaits());
 +		// what they are: once the game runs (at 30 s), then at 220 and every 15 more (the PS4
 +		// refuses new files at ~250)
 +		static int sReportedAt = 0;
