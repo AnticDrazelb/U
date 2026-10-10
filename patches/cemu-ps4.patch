@@ -105,15 +105,18 @@ index 06c2a13..33bea8f 100644
  	uint64_t m_title_id = 0;
  	bool m_is_loaded = false;
 diff --git a/src/Cafe/HW/Espresso/PPCTimer.cpp b/src/Cafe/HW/Espresso/PPCTimer.cpp
-index 257973a..96fafc6 100644
+index 257973a..2d7d62b 100644
 --- a/src/Cafe/HW/Espresso/PPCTimer.cpp
 +++ b/src/Cafe/HW/Espresso/PPCTimer.cpp
-@@ -75,10 +75,20 @@ int PPCTimer_initThread()
+@@ -75,19 +75,54 @@ int PPCTimer_initThread()
  	return 0;
  }
  
 +#ifdef __ORBIS__
 +extern "C" uint64_t sceKernelGetTscFrequency();
++#endif
++#ifdef __ORBIS__
++static void s_cremaTscBaseInit(uint64 tsc);
 +#endif
 +
  void PPCTimer_init()
@@ -127,9 +130,55 @@ index 257973a..96fafc6 100644
  	t.detach();
 +#endif
  	_rdtscLastMeasure = __rdtsc();
++#if defined(__ORBIS__)
++	s_cremaTscBaseInit(_rdtscLastMeasure);
++#endif
  }
  
-@@ -150,7 +160,18 @@ uint64 PPCTimer_getFromRDTSC()
+ uint64 _tickSummary = 0;
+ 
++#if defined(__ORBIS__)
++// (statics declared above PPCTimer_init)
++// Crema: the PS4's TSC is invariant and the same on every core, so the Wii U's time is one multiply
++// away from it: no lock, fence or 128-bit division. Cemu's version took a spinlock shared by the
++// three emulated cores on every mftb / OSGetTime, which Breath of the Wild calls constantly (~10%
++// of its main core). The CORE_CLOCK ticks per TSC tick as 32.32 fixed point (exact to 1 in 3e9).
++static uint64 s_cremaTscBase = 0;
++static uint64 s_cremaTicksPerTsc = 0;
++static void s_cremaTscBaseInit(uint64 tsc)
++{
++	s_cremaTscBase = tsc;
++	if (_rdtscFrequency)
++		s_cremaTicksPerTsc = (uint64)(((unsigned __int128)Espresso::CORE_CLOCK << 32) / _rdtscFrequency);
++}
++#endif
++
+ void PPCTimer_start()
+ {
+ 	_rdtscLastMeasure = __rdtsc();
+ 	_tickSummary = 0;
++#if defined(__ORBIS__)
++	s_cremaTscBase = _rdtscLastMeasure;
++#endif
+ }
+ 
+ uint64 PPCTimer_getRawTsc()
+@@ -126,6 +161,14 @@ FSpinlock sTimerSpinlock;
+ // thread safe
+ uint64 PPCTimer_getFromRDTSC()
+ {
++#if defined(__ORBIS__)
++	// the normal speed (timer shift 3: *8 >> 3); other speeds take Cemu's way below
++	if (s_cremaTicksPerTsc && ActiveSettings::GetTimerShiftFactor() == 3)
++	{
++		const uint64 elapsed = __rdtsc() - s_cremaTscBase;
++		return (uint64)(((unsigned __int128)elapsed * s_cremaTicksPerTsc) >> 32);
++	}
++#endif
+ 	sTimerSpinlock.lock();
+ 	_mm_mfence();
+ 	uint64 rdtscCurrentMeasure = __rdtsc();
+@@ -150,7 +193,18 @@ uint64 PPCTimer_getFromRDTSC()
  	#endif
  
  	uint64 remainder;

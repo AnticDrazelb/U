@@ -2678,7 +2678,12 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       return -EINVAL;
    }
 
-   if (seq % 256 == 0)
+   /* Only with the flight recorder (Crema: GPU Fault Recorder): the tails are in write-combined
+    * memory, slow to read, and every live buffer's took ~2% of Breath of the Wild's GPU thread. */
+   static int trace_tails = -1;
+   if (trace_tails < 0)
+      trace_tails = getenv("RADV_PS4_TRACE") != NULL;
+   if (trace_tails && seq % 256 == 0)
       ps4_scan_tails(dev);
    ps4_run_deferred(dev);
 
