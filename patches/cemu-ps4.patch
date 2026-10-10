@@ -2807,8 +2807,33 @@ index bb31077..1403d8d 100644
  #else
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp
+index 4f85537..1971d3c 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp
+@@ -185,10 +185,20 @@ namespace coreinit
+ 		__OSUnlockScheduler();
+ 	}
+ 
++#if defined(__ORBIS__)
++	uint32 CremaHomeCore(); // coreinit_Thread.cpp: Core Balancing
++#endif
++
+ 	bool OSWaitRendezvous(OSRendezvous* rendezvous, uint32 coreMask)
+ 	{
+ 		__OSLockScheduler();
++#if defined(__ORBIS__)
++		// the thread's own core, also when Core Balancing runs it on another (2.08: Breath of the
++		// Wild's start waited forever - a core 2 thread arrived as core 1)
++		rendezvous->coreHit[CremaHomeCore()] = 1;
++#else
+ 		rendezvous->coreHit[OSGetCoreId()] = 1;
++#endif
+ 		OSSignalEventAllInternal(g_rendezvousEvent.GetPtr());
+ 		while (true)
+ 		{
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..4d6c0e1 100644
+index 9fe4bea..46ee5cd 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2842,7 +2867,7 @@ index 9fe4bea..4d6c0e1 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1202,120 @@ namespace coreinit
+@@ -1192,6 +1202,134 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -2915,6 +2940,20 @@ index 9fe4bea..4d6c0e1 100644
 +	std::unordered_set<OSThread_t*> s_cremaGX2Threads; // under the scheduler lock
 +	uint64 s_cremaSteals = 0;
 +
++	// the core a thread pinned to one core belongs to, else the one it runs on
++	uint32 CremaHomeCore()
++	{
++		OSThread_t* t = OSGetCurrentThread();
++		const uint32 affinity = t ? (t->attr & 7) : 0;
++		if (affinity == 1)
++			return 0;
++		if (affinity == 2)
++			return 1;
++		if (affinity == 4)
++			return 2;
++		return OSGetCoreId();
++	}
++
 +	void CremaMarkGX2Thread(OSThread_t* thread)
 +	{
 +		if (!thread)
@@ -2963,7 +3002,7 @@ index 9fe4bea..4d6c0e1 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1334,9 @@ namespace coreinit
+@@ -1210,6 +1348,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -2973,7 +3012,7 @@ index 9fe4bea..4d6c0e1 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1360,16 @@ namespace coreinit
+@@ -1233,6 +1374,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -2990,7 +3029,7 @@ index 9fe4bea..4d6c0e1 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1263,6 +1400,27 @@ namespace coreinit
+@@ -1263,6 +1414,28 @@ namespace coreinit
  				}
  				__OSUnlockScheduler();
  			}
@@ -3000,7 +3039,8 @@ index 9fe4bea..4d6c0e1 100644
 +			else if (isMainCore && g_isMulticoreMode && g_crema_core_balancing.load(std::memory_order_relaxed) &&
 +				(!g_coreRunQueueThreadCount[0].isZero() || !g_coreRunQueueThreadCount[2].isZero()))
 +			{
-+				static uint64 s_nextSteal = 0;
++				// not in the game's first 30 s, where it sets up its cores
++				static uint64 s_nextSteal = __rdtsc() + _rdtscFrequency * 30;
 +				const uint64 now = __rdtsc();
 +				if (now >= s_nextSteal)
 +				{
@@ -3018,7 +3058,7 @@ index 9fe4bea..4d6c0e1 100644
  			if (isMainCore)
  			{
  				__OSCheckSystemEvents();
-@@ -1391,6 +1549,11 @@ namespace coreinit
+@@ -1391,6 +1564,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -3030,7 +3070,7 @@ index 9fe4bea..4d6c0e1 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1810,159 @@ namespace coreinit
+@@ -1647,3 +1825,159 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
