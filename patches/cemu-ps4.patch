@@ -78,18 +78,23 @@ index b509e72..22777eb 100644
  	target_sources(CemuCafe PRIVATE
  	    HW/Latte/Renderer/MetalView.mm
 diff --git a/src/Cafe/GameProfile/GameProfile.h b/src/Cafe/GameProfile/GameProfile.h
-index 06c2a13..8cee1b0 100644
+index 06c2a13..33bea8f 100644
 --- a/src/Cafe/GameProfile/GameProfile.h
 +++ b/src/Cafe/GameProfile/GameProfile.h
-@@ -43,6 +43,17 @@ public:
+@@ -43,6 +43,22 @@ public:
  
  	[[nodiscard]] const std::array< std::optional<std::string>, 8>& GetControllerProfile() const { return m_controllerProfile; }
  
 +#if defined(__ORBIS__)
 +	// Crema's settings (gui/ps4/launcher/CremaSettings.cpp) over the profile's, after it is loaded
-+	void SetCremaOverrides(CPUMode cpuMode, std::optional<uint32> threadQuantum, bool startWithPadView)
++	// cpuMode empty: the profile's own (Cemu's game profiles make some games single-core), else
++	// multi-core
++	void SetCremaOverrides(std::optional<CPUMode> cpuMode, std::optional<uint32> threadQuantum, bool startWithPadView)
 +	{
-+		m_cpuMode = cpuMode;
++		if (cpuMode)
++			m_cpuMode = *cpuMode;
++		else if (!m_cpuMode)
++			m_cpuMode = CPUMode::MulticoreRecompiler;
 +		if (threadQuantum)
 +			m_threadQuantum = *threadQuantum;
 +		m_startWithPadView = startWithPadView;
@@ -2470,7 +2475,7 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..c18344b 100644
+index 9fe4bea..eb1a82a 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2514,7 +2519,7 @@ index 9fe4bea..c18344b 100644
 +	// during a fight's loading) then keeps the lower ones from ever running, and the game stops.
 +	// When a lower priority ready thread has waited kStarveTicks, the core gives the waiting ones
 +	// kRescueTicks of turns (oldest first, round robin), then back to priorities.
-+	std::atomic<bool> g_crema_thread_fairness{true};
++	std::atomic<bool> g_crema_thread_fairness{false};
 +	uint64 s_starveSince[PPC_CORE_COUNT]{};
 +	uint64 s_rescueUntil[PPC_CORE_COUNT]{};
 +	uint64 s_fairnessRescues = 0;
@@ -7008,10 +7013,10 @@ index 0000000..27140be
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..d03cb38
+index 0000000..dfe5b7c
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,393 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -7055,8 +7060,8 @@ index 0000000..d03cb38
 +			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest."},
 +		// Emulation
 +		{"cpu_mode", "CPU Mode", "Emulation",
-+			{{"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}}, "multi", false,
-+			"Multi-core runs the Wii U's three CPU cores on three PS4 cores (fastest). Single-core is for games that misbehave with it."},
++			{{"auto", "Auto"}, {"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}}, "auto", false,
++			"Auto: what Cemu's profile for the game says (some games need single-core: Xenoblade Chronicles X, Batman: Arkham Origins), else multi-core. Multi-core runs the Wii U's three CPU cores on three PS4 cores (fastest). Single-core is for games that misbehave with it."},
 +		{"thread_quantum", "Thread Quantum", "Emulation",
 +			{{"default", "Default"}, {"20000", "20000"}, {"45000", "45000"}, {"60000", "60000"}, {"80000", "80000"}, {"100000", "100000"}},
 +			"default", false, "How long an emulated thread runs before the next one. Only change it for a game that needs it."},
@@ -7076,8 +7081,8 @@ index 0000000..d03cb38
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
 +		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
-+		{"thread_fairness", "Thread Fairness", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
-+			"When a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get turns (10 ms after waiting 10 ms). Fixes games that stop while loading (Tekken Tag Tournament 2's fights); sound may stutter there. Off: the Wii U's strict priorities."},
++		{"thread_fairness", "Thread Fairness", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: when a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get turns (10 ms after waiting 10 ms). Fixes games that stop while loading (Tekken Tag Tournament 2's fights). Off: the Wii U's strict priorities, which some games rely on (Minecraft crashed within minutes with it on)."},
 +		// Audio
 +		{"game_volume", "Game Volume", "Audio",
 +			{{"100", "100"}, {"90", "90"}, {"80", "80"}, {"70", "70"}, {"60", "60"}, {"50", "50"},
@@ -7350,7 +7355,8 @@ index 0000000..d03cb38
 +		const std::string cpu = get("cpu_mode");
 +		const std::string quantum = get("thread_quantum");
 +		g_current_game_profile->SetCremaOverrides(
-+			cpu == "single" ? CPUMode::SinglecoreRecompiler : CPUMode::MulticoreRecompiler,
++			cpu == "single" ? std::optional<CPUMode>(CPUMode::SinglecoreRecompiler) :
++			cpu == "multi" ? std::optional<CPUMode>(CPUMode::MulticoreRecompiler) : std::optional<CPUMode>(),
 +			quantum == "default" ? std::optional<uint32>() : std::optional<uint32>((uint32)std::stoul(quantum)),
 +			get("tv_shows") == "gamepad");
 +	}
