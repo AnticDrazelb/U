@@ -2808,7 +2808,7 @@ index bb31077..1403d8d 100644
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..b8cd8f2 100644
+index 9fe4bea..4d6c0e1 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2842,7 +2842,7 @@ index 9fe4bea..b8cd8f2 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1202,63 @@ namespace coreinit
+@@ -1192,6 +1202,120 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -2903,10 +2903,67 @@ index 9fe4bea..b8cd8f2 100644
 +	}
 +#endif
 +
++#if defined(__ORBIS__)
++	// Crema: Core Balancing (Settings > Emulation, per game; off by default). A Wii U game pins its
++	// threads to cores, and on the PS4 the cores' loads differ from the Wii U's: in Breath of the
++	// Wild core 1 (the main thread) idled ~40% while threads pinned to cores 0 and 2 waited for
++	// them most of the time. When the main core has nothing to run, it takes a thread waiting in
++	// another core's run queue while that core is busy. The thread runs as core 1 (OSGetCoreId,
++	// per-core data stay consistent). Never a thread that records GX2 display lists: GX2 keeps a
++	// command buffer per core, and its commands would land in the main core's.
++	std::atomic<bool> g_crema_core_balancing{false};
++	std::unordered_set<OSThread_t*> s_cremaGX2Threads; // under the scheduler lock
++	uint64 s_cremaSteals = 0;
++
++	void CremaMarkGX2Thread(OSThread_t* thread)
++	{
++		if (!thread)
++			return;
++		__OSLockScheduler();
++		s_cremaGX2Threads.insert(thread);
++		__OSUnlockScheduler();
++	}
++
++	OSThread_t* __OSCremaStealThread(uint32 coreIndex)
++	{
++		cemu_assert_debug(__OSHasSchedulerLock());
++		OSThread_t* best = nullptr;
++		for (uint32 c = 0; c < Espresso::CORE_COUNT; c++)
++		{
++			if (c == coreIndex)
++				continue;
++			OSThread_t* running = __currentCoreThread[c];
++			if (!running || running->state != OSThread_t::THREAD_STATE::STATE_RUNNING)
++				continue; // that core picks its own threads soon
++			for (OSThread_t* t = g_coreRunQueue.GetPtr()[c].head.GetPtr(); t; t = t->linkRun[c].next.GetPtr())
++			{
++				if (t->state != OSThread_t::THREAD_STATE::STATE_READY || t->suspendCounter != 0)
++					continue;
++				if (s_cremaGX2Threads.count(t))
++					continue;
++				if (!best || t->effectivePriority < best->effectivePriority)
++					best = t;
++			}
++		}
++		if (!best)
++			return nullptr;
++		__OSRemoveThreadFromRunQueues(best);
++		best->state = OSThread_t::THREAD_STATE::STATE_RUNNING;
++		if ((s_cremaSteals++ & 0xFFFF) == 0)
++		{
++			char line[128];
++			snprintf(line, sizeof(line), "core balancing: core %u runs waiting threads of the other cores (%llu so far)", coreIndex,
++				(unsigned long long)s_cremaSteals);
++			ps4_boot_trace(line);
++		}
++		return best;
++	}
++#endif
++
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1277,9 @@ namespace coreinit
+@@ -1210,6 +1334,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -2916,7 +2973,7 @@ index 9fe4bea..b8cd8f2 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1303,16 @@ namespace coreinit
+@@ -1233,6 +1360,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -2933,7 +2990,35 @@ index 9fe4bea..b8cd8f2 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1391,6 +1471,11 @@ namespace coreinit
+@@ -1263,6 +1400,27 @@ namespace coreinit
+ 				}
+ 				__OSUnlockScheduler();
+ 			}
++#if defined(__ORBIS__)
++			// Core Balancing: nothing of its own to run - another core's waiting thread (at most
++			// every 20 us, so the scheduler lock isn't hammered)
++			else if (isMainCore && g_isMulticoreMode && g_crema_core_balancing.load(std::memory_order_relaxed) &&
++				(!g_coreRunQueueThreadCount[0].isZero() || !g_coreRunQueueThreadCount[2].isZero()))
++			{
++				static uint64 s_nextSteal = 0;
++				const uint64 now = __rdtsc();
++				if (now >= s_nextSteal)
++				{
++					s_nextSteal = now + _rdtscFrequency / 50000;
++					__OSLockScheduler();
++					if (g_coreRunQueueThreadCount[coreIndex].isZero())
++					{
++						if (OSThread_t* stolen = __OSCremaStealThread(coreIndex))
++							__OSSwitchToThreadFiber(stolen, coreIndex);
++					}
++					__OSUnlockScheduler();
++				}
++			}
++#endif
+ 			if (isMainCore)
+ 			{
+ 				__OSCheckSystemEvents();
+@@ -1391,6 +1549,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -2945,7 +3030,7 @@ index 9fe4bea..b8cd8f2 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1732,159 @@ namespace coreinit
+@@ -1647,3 +1810,159 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
@@ -3105,6 +3190,41 @@ index 9fe4bea..b8cd8f2 100644
 +	}
 +}
 +#endif
+diff --git a/src/Cafe/OS/libs/gx2/GX2_Command.cpp b/src/Cafe/OS/libs/gx2/GX2_Command.cpp
+index d12bf21..bbac978 100644
+--- a/src/Cafe/OS/libs/gx2/GX2_Command.cpp
++++ b/src/Cafe/OS/libs/gx2/GX2_Command.cpp
+@@ -12,6 +12,10 @@
+ #include "GX2_Misc.h"
+ #include "OS/libs/coreinit/coreinit_MEM.h"
+ 
++#if defined(__ORBIS__)
++namespace coreinit { void CremaMarkGX2Thread(OSThread_t* thread); } // coreinit_Thread.cpp: Core Balancing
++#endif
++
+ namespace GX2
+ {
+ 	GX2PerCoreCBState s_perCoreCBState[Espresso::CORE_COUNT];
+@@ -341,6 +345,19 @@ namespace GX2
+ 
+ 	void GX2WriteGather_beginDisplayList(PPCInterpreter_t* hCPU, MPTR buffer, uint32 maxSize)
+ 	{
++#if defined(__ORBIS__)
++		// Core Balancing: a thread recording display lists is never moved to another core; one
++		// that runs away from its own core now goes back first (GX2 keeps a command buffer per core)
++		if (OSThread_t* self = coreinit::OSGetCurrentThread())
++		{
++			coreinit::CremaMarkGX2Thread(self);
++			if (!self->context.hasCoreAffinitySet(coreinit::OSGetCoreId()))
++			{
++				coreinit::OSYieldThread();
++				hCPU = PPCInterpreter_getCurrentInstance();
++			}
++		}
++#endif
+ 		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
+ 		if (coreIndex == sGX2MainCoreIndex)
+ 		{
 diff --git a/src/Cafe/OS/libs/gx2/GX2_Event.cpp b/src/Cafe/OS/libs/gx2/GX2_Event.cpp
 index 338b7d7..544c556 100644
 --- a/src/Cafe/OS/libs/gx2/GX2_Event.cpp
@@ -8133,10 +8253,10 @@ index 0000000..b972bf8
 +} // namespace CremaGraphicPacks
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..0836d8b
+index 0000000..e89bb50
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,396 @@
+@@ -0,0 +1,400 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -8150,6 +8270,7 @@ index 0000000..0836d8b
 +extern bool g_crema_fast_cycles; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Cycle Counting
 +extern bool g_crema_fast_compares; // Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp: Compare Results
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
++namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
 +
 +#include <atomic>
 +#include <fstream>
@@ -8203,6 +8324,8 @@ index 0000000..0836d8b
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
 +		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
++		{"core_balancing", "Core Balancing (Experimental)", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: when the Wii U's core 1 has nothing to run, it runs threads waiting for the busy cores 0 and 2 (Wii U games pin their threads to cores, and the PS4 runs them at different speeds). Faster in Breath of the Wild. A game that relies on its threads' cores may crash or misbehave: then Off."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: when a busy game thread keeps the others on its core from running (the PS4's cores are slower than a PC's), they still get turns (10 ms after waiting 10 ms). Fixes games that stop while loading (Tekken Tag Tournament 2's fights). Off: the Wii U's strict priorities, which some games rely on (Minecraft crashed within minutes with it on)."},
 +		// Audio
@@ -8491,6 +8614,7 @@ index 0000000..0836d8b
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
 +	g_crema_fast_compares = get("compare_results") != "exact";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
++	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
 +	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
