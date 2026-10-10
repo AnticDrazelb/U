@@ -8181,10 +8181,10 @@ index 0000000..2743734
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..06b1136
+index 0000000..4e18b23
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3426 @@
+@@ -0,0 +1,3450 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -8941,7 +8941,6 @@ index 0000000..06b1136
 +		SET_STYLE,     // Menu Style: Library or XMB
 +		SET_LANGUAGE,  // Language: a list of all of them
 +		SET_COVERS,    // Download Covers: GameTDB box art, with its progress
-+		SET_PACKS,     // Download Graphic Packs: Cemu's community packs, with the progress
 +		SET_GAME_PACKS, // a game's Graphic Packs (settings rows: packs and presets)
 +		SET_GROUP = 100, // + index into CremaSettings::Categories(): a settings list
 +	};
@@ -8992,7 +8991,7 @@ index 0000000..06b1136
 +		void UpdateCoverDownload();
 +		void StartPackDownload();
 +		void UpdatePackDownload();
-+		void OpenGamePacks(const std::string& gameId, const std::string& title);
++		void OpenGamePacks(std::string gameId, std::string title); // copies: callers pass m_panel's
 +		std::string PacksFolder() const { return _pathToUtf8(ActiveSettings::GetUserDataPath("graphicPacks/downloadedGraphicPacks")); }
 +		void LoadAssets();
 +		void BuildItems();
@@ -9090,6 +9089,8 @@ index 0000000..06b1136
 +		std::mutex m_packMutex;
 +		std::string m_packStatus;
 +		CremaGraphicPacks::DownloadResult m_packResult;
++		std::string m_packNote;  // the last download's outcome (the game's Graphic Packs list)
++		std::string m_packTitle; // the game whose Graphic Packs list is open
 +		bool m_firstLanguage = false; // the first start: the language list before anything else
 +		bool m_firstStyle = false;    // the first start: Library or XMB
 +		float m_time = 0.0f;
@@ -9266,11 +9267,13 @@ index 0000000..06b1136
 +			std::lock_guard lock(m_packMutex);
 +			status = m_packStatus;
 +		}
-+		const bool shown = m_panel.open && m_panel.setting == SET_PACKS;
++		// a game's Graphic Packs list waiting for the download
++		const bool shown = m_panel.open && m_panel.setting == SET_GAME_PACKS && m_panel.rows.empty();
 +		if (!m_packDone)
 +		{
 +			if (shown)
-+				m_panel.lines = {"", status, "", "Circle closes this; the download goes on."};
++				m_panel.lines = {"", m_packTitle, "", "Getting Cemu's community graphic packs...", status, "",
++					"Circle closes this; the download goes on."};
 +			return;
 +		}
 +		m_packThread.join();
@@ -9278,29 +9281,35 @@ index 0000000..06b1136
 +		if (result.installed)
 +		{
 +			CremaGraphicPacks::Reload();
-+			BuildItems(); // Settings: the installed release
++			m_packNote = "Updated to " + result.version + ".";
 +		}
++		else if (result.upToDate)
++			m_packNote = "Up to date: " + result.version + ".";
++		else
++			m_packNote = "The download failed: " + result.error;
 +		if (!shown)
 +			return;
-+		if (result.installed)
-+			m_panel.lines = {"", "Installed: " + result.version, std::to_string(result.files) + " files", "",
-+				"Turn them on per game: Triangle on a game,", "then Graphic Packs."};
-+		else if (result.upToDate)
-+			m_panel.lines = {"", "Up to date: " + result.version, "", "Turn them on per game: Triangle on a game,",
-+				"then Graphic Packs."};
-+		else
-+			m_panel.lines = {"", "The download failed:", result.error};
++		OpenGamePacks(m_panel.gameId, m_packTitle);
 +		Play(result.installed || result.upToDate ? "confirm" : "error");
 +	}
 +
 +	// A game's graphic packs: settings rows (CremaGraphicPacks::Rows), changed with Left / Right / Cross.
-+	void Menu::OpenGamePacks(const std::string& gameId, const std::string& title)
++	void Menu::OpenGamePacks(std::string gameId, std::string title)
 +	{
 +		m_panel = {};
 +		m_panel.open = true;
 +		m_panel.setting = SET_GAME_PACKS;
 +		m_panel.gameId = gameId;
 +		m_panel.title = "Graphic Packs";
++		m_packTitle = title;
++		const std::string installed = CremaGraphicPacks::InstalledVersion(PacksFolder());
++		if (installed.empty() || m_packThread.joinable())
++		{
++			// not here yet (the first time): downloaded now, then the list (UpdatePackDownload)
++			StartPackDownload();
++			m_panel.lines = {"", title, "", "Getting Cemu's community graphic packs..."};
++			return;
++		}
 +		for (const CremaGraphicPacks::Row& pack : CremaGraphicPacks::Rows(gameId))
 +		{
 +			SettingRow row{pack.label, pack.value, pack.key, pack.header};
@@ -9309,16 +9318,12 @@ index 0000000..06b1136
 +			m_panel.rows.push_back(row);
 +		}
 +		if (m_panel.rows.empty())
-+		{
-+			const std::string installed = CremaGraphicPacks::InstalledVersion(PacksFolder());
-+			m_panel.lines = {"", title, ""};
-+			if (installed.empty())
-+				m_panel.lines.insert(m_panel.lines.end(), {"No graphic packs are installed.", "",
-+					"Settings > Download Graphic Packs", "gets Cemu's community packs."});
-+			else
-+				m_panel.lines.insert(m_panel.lines.end(), {"No graphic packs for this game", "in " + installed + "."});
-+			return;
-+		}
++			m_panel.rows.push_back({"No graphic packs for this game in " + installed, "", "", true});
++		m_panel.rows.push_back({"", "", "", true});
++		SettingRow update{"Check for Updates", installed, "__packs_update__"};
++		update.help = (m_packNote.empty() ? std::string() : m_packNote + " ") +
++			"Cross: download the newest community graphic packs (github.com/cemu-project/cemu_graphic_packs).";
++		m_panel.rows.push_back(update);
 +		MoveSettingRow(0);
 +	}
 +
@@ -9670,11 +9675,6 @@ index 0000000..06b1136
 +		settings.push_back({"Clock", m_prefs.clock ? "On" : "Off", -1, -1, SET_CLOCK});
 +		settings.push_back({"Game Folder", GamesFolder(), -1, -1, SET_GAMES_DIR});
 +		settings.push_back({"Download Covers", "Box art from GameTDB for your games", -1, -1, SET_COVERS});
-+		{
-+			const std::string packs = CremaGraphicPacks::InstalledVersion(PacksFolder());
-+			settings.push_back({"Download Graphic Packs", packs.empty() ? "Cemu's community packs: resolution, frame rate and more" :
-+				"Installed: " + packs, -1, -1, SET_PACKS});
-+		}
 +		settings.push_back({"Reset All Settings", "Every setting back to the defaults", -1, -1, SET_RESET_ALL});
 +		settings.push_back({"About", "", -1, -1, SET_ABOUT});
 +
@@ -9775,11 +9775,6 @@ index 0000000..06b1136
 +				StartCoverDownload();
 +			}
 +			m_panel.lines = {"", "Connecting to GameTDB..."};
-+			break;
-+		case SET_PACKS:
-+			m_panel.title = "Download Graphic Packs";
-+			StartPackDownload();
-+			m_panel.lines = {"", "Connecting to GitHub..."};
 +			break;
 +		case SET_RESET_ALL:
 +			m_panel.title = "Reset All Settings";
@@ -9962,12 +9957,20 @@ index 0000000..06b1136
 +		const std::string& game = m_panel.gameId;
 +		if (m_panel.setting == SET_GAME_PACKS)
 +		{
++			if (row.key == "__packs_update__")
++			{
++				if (direction <= 0)
++					return; // Cross only
++				m_panel.rows.clear();
++				m_panel.lines = {"", m_packTitle, "", "Asking GitHub for the latest release..."};
++				StartPackDownload();
++				return;
++			}
 +			const std::string key = row.key;
 +			const int selected = m_panel.selected;
-+			const std::string title = m_panel.title;
 +			CremaGraphicPacks::Change(key, direction);
 +			const float scroll = m_panel.scroll, slide = m_panel.slide;
-+			OpenGamePacks(game, title);
++			OpenGamePacks(game, m_packTitle);
 +			m_panel.selected = std::min(selected, (int)m_panel.rows.size() - 1);
 +			m_panel.scroll = scroll;
 +			m_panel.slide = slide;
@@ -10764,8 +10767,23 @@ index 0000000..06b1136
 +				const bool sel = (int)i == m_panel.selected;
 +				if (sel)
 +					dl->AddRectFilled(ImVec2(x0 + 30, ry - 4), ImVec2(W - 30, ry + 50), Rgba(theme.wave, 0.30f * m_panel.slide), 10.0f);
-+				Text(dl, sel ? m_bold : m_font, sel ? 32.0f : 30.0f, ImVec2(x0 + 60, ry + 4), text, row.label);
++				// long names (graphic packs and their presets) end in ... before the value
 +				const float tw = TextWidth(m_font, 28, row.value);
++				ImFont* labelFont = sel ? m_bold : m_font;
++				const float labelSize = sel ? 32.0f : 30.0f;
++				const float room = W - 70 - tw - 30 - (x0 + 60);
++				std::string label = row.label;
++				if (TextWidth(labelFont, labelSize, label) > room)
++				{
++					while (!label.empty() && TextWidth(labelFont, labelSize, label + "...") > room)
++					{
++						label.pop_back();
++						while (!label.empty() && ((unsigned char)label.back() & 0xC0) == 0x80)
++							label.pop_back(); // a whole UTF-8 character
++					}
++					label += "...";
++				}
++				Text(dl, labelFont, labelSize, ImVec2(x0 + 60, ry + 4), text, label);
 +				const ImU32 colour = row.note ? Rgba(0xFFC870, m_panel.slide) : text;
 +				Text(dl, m_font, 28, ImVec2(W - 70 - tw, ry + 7), colour, row.value);
 +			}
@@ -11530,6 +11548,12 @@ index 0000000..06b1136
 +			}
 +		}
 +		Log("menu: " + std::to_string(m_games.size()) + " games, " + std::to_string(m_wallpapers.size()) + " wallpapers");
++		// Cemu's community graphic packs, the first time (then the games' Check for Updates).
++		if (CremaGraphicPacks::InstalledVersion(PacksFolder()).empty())
++		{
++			Log("graphic packs: none installed, downloading them in the background");
++			StartPackDownload();
++		}
 +		// Covers missing for any game are fetched in the background every time the launcher opens.
 +		for (const Game& game : m_games)
 +		{
