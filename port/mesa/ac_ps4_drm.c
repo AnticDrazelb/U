@@ -2505,6 +2505,108 @@ ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks)
    simple_mtx_unlock(&dev->lock);
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * Submission thread. sceGnmSubmitCommandBuffers is a kernel call of ~0.4 ms, and the GPU thread
+ * of an emulator submits ~230 times a second (Breath of the Wild: ~9% of Cemu's GPU thread). The
+ * submitting thread now only queues the job - the sequence number is taken and the fence written
+ * into the IB as before - and this thread makes the calls, in queue order (jobs are queued under
+ * dev->lock, in sequence order; the thread never takes dev->lock). Flips go through the same
+ * queue, so a flip can't overtake the work queued before it. A failed submission writes its
+ * fence from the CPU, so nothing waits for it forever.
+ */
+#define PS4_JOB_RING 128
+struct ps4_job {
+   ac_drm_device *dev;
+   bool flip;
+   unsigned num_ibs;
+   void *dcb[68];
+   uint32_t dcb_sizes[68];
+   uint64_t seq;
+   int video;
+   unsigned buffer, mode;
+   int64_t arg;
+};
+static struct ps4_job ps4_jobs[PS4_JOB_RING];
+static unsigned ps4_job_head, ps4_job_tail; /* next to run, next to fill */
+static pthread_mutex_t ps4_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ps4_job_ready = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t ps4_job_space = PTHREAD_COND_INITIALIZER;
+static bool ps4_job_thread_started;
+void ps4_boost_thread(void); /* port/ps4_runtime.cpp: above the default priority */
+
+static void
+ps4_fence_at_least(ac_drm_device *dev, uint64_t seq)
+{
+   volatile uint64_t *f = (volatile uint64_t *)dev->fence;
+   uint64_t cur = *f;
+   while (cur < seq && !__atomic_compare_exchange_n(f, &cur, seq, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+      ;
+}
+
+static void *
+ps4_submit_thread(void *arg)
+{
+   (void)arg;
+   ps4_boost_thread();
+   int64_t last_done = 0;
+   for (;;) {
+      pthread_mutex_lock(&ps4_job_lock);
+      while (ps4_job_head == ps4_job_tail)
+         pthread_cond_wait(&ps4_job_ready, &ps4_job_lock);
+      struct ps4_job *job = &ps4_jobs[ps4_job_head % PS4_JOB_RING];
+      pthread_mutex_unlock(&ps4_job_lock);
+
+      ac_drm_device *dev = job->dev;
+      void *ccb[68] = {0};
+      uint32_t ccb_sizes[68] = {0};
+      int r;
+      if (job->flip)
+         r = dev->submit_and_flip(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes, job->video,
+                                  job->buffer, job->mode, job->arg);
+      else
+         r = dev->submit(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes);
+      /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
+       * frame): after every flip, else at most every 4 ms */
+      const int64_t now = os_time_get_nano();
+      if (job->flip || now - last_done >= 4000000) {
+         dev->submit_done();
+         last_done = now;
+      }
+      if (r) {
+         static unsigned logged;
+         if (logged++ < 8)
+            ps4_log("radv/ps4: %s of submission %llu = %#x (its fence written by the CPU)\n",
+                    job->flip ? "sceGnmSubmitAndFlipCommandBuffers" : "sceGnmSubmitCommandBuffers",
+                    (unsigned long long)job->seq, r);
+         ps4_fence_at_least(dev, job->seq);
+      }
+
+      pthread_mutex_lock(&ps4_job_lock);
+      ps4_job_head++;
+      pthread_cond_signal(&ps4_job_space);
+      pthread_mutex_unlock(&ps4_job_lock);
+   }
+   return NULL;
+}
+
+/* Queues a submission (called with dev->lock held, in sequence order). */
+static void
+ps4_queue_job(const struct ps4_job *job)
+{
+   pthread_mutex_lock(&ps4_job_lock);
+   if (!ps4_job_thread_started) {
+      pthread_t thread;
+      pthread_create(&thread, NULL, ps4_submit_thread, NULL);
+      ps4_job_thread_started = true;
+   }
+   while (ps4_job_tail - ps4_job_head >= PS4_JOB_RING)
+      pthread_cond_wait(&ps4_job_space, &ps4_job_lock);
+   ps4_jobs[ps4_job_tail % PS4_JOB_RING] = *job;
+   ps4_job_tail++;
+   pthread_cond_signal(&ps4_job_ready);
+   pthread_mutex_unlock(&ps4_job_lock);
+}
+
 int
 ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle,
                       int num_chunks, struct drm_amdgpu_cs_chunk *chunks, uint64_t *seq_no)
@@ -2664,16 +2766,18 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       dcb_sizes[0] = (uint32_t)(t - ts_ib) * 4;
       submit_ibs++;
    }
-   int r = dev->submit(submit_ibs, dcb, dcb_sizes, ccb, ccb_sizes);
-   /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
-    * frame; flips always send it): at most every 4 ms here. After every submission it was a
-    * second kernel call each time, part of the ~7% of Breath of the Wild's GPU thread in ioctl. */
-   static int64_t last_done = 0;
-   const int64_t now_done = os_time_get_nano();
-   if (now_done - last_done >= 4000000) {
-      dev->submit_done();
-      last_done = now_done;
-   }
+   /* the submission thread makes the calls (ps4_queue_job) */
+   struct ps4_job job;
+   job.dev = dev;
+   job.flip = false;
+   job.num_ibs = submit_ibs;
+   memcpy(job.dcb, dcb, sizeof(dcb[0]) * submit_ibs);
+   memcpy(job.dcb_sizes, dcb_sizes, sizeof(dcb_sizes[0]) * submit_ibs);
+   job.seq = seq;
+   ps4_queue_job(&job);
+   (void)ccb;
+   (void)ccb_sizes;
+   const int r = 0;
    if (seq <= 40 || seq % 1000 == 0)
       ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu, "
               "%llu memory writes checked, %u disabled\n",
@@ -2751,8 +2855,22 @@ ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg)
    uint32_t dcb_size[1] = {(uint32_t)(cs - ib) * 4};
    void *ccb[1] = {NULL};
    uint32_t ccb_size[1] = {0};
-   const int r = dev->submit_and_flip(1, dcb, dcb_size, ccb, ccb_size, video, buffer, mode, arg);
-   dev->submit_done();
+   /* behind the queued submissions (ps4_queue_job) */
+   struct ps4_job job;
+   job.dev = dev;
+   job.flip = true;
+   job.num_ibs = 1;
+   job.dcb[0] = dcb[0];
+   job.dcb_sizes[0] = dcb_size[0];
+   job.seq = seq;
+   job.video = video;
+   job.buffer = buffer;
+   job.mode = mode;
+   job.arg = arg;
+   ps4_queue_job(&job);
+   (void)ccb;
+   (void)ccb_size;
+   const int r = 0;
    if (r) {
       dev->last_seq--;
       static unsigned logged;
