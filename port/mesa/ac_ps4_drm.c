@@ -2665,7 +2665,15 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
       submit_ibs++;
    }
    int r = dev->submit(submit_ibs, dcb, dcb_sizes, ccb, ccb_sizes);
-   dev->submit_done();
+   /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
+    * frame; flips always send it): at most every 4 ms here. After every submission it was a
+    * second kernel call each time, part of the ~7% of Breath of the Wild's GPU thread in ioctl. */
+   static int64_t last_done = 0;
+   const int64_t now_done = os_time_get_nano();
+   if (now_done - last_done >= 4000000) {
+      dev->submit_done();
+      last_done = now_done;
+   }
    if (seq <= 40 || seq % 1000 == 0)
       ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu, "
               "%llu memory writes checked, %u disabled\n",

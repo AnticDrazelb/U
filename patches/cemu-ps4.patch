@@ -2464,7 +2464,7 @@ index 7179087..af4a1d9 100644
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..1022927 100644
+index 599190a..fd9df44 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -2513,7 +2513,21 @@ index 599190a..1022927 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -3038,7 +3047,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -2280,7 +2289,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+ 	occlusionQuery_notifyBeginCommandBuffer();
+ 
+ 	m_recordedDrawcalls = 0;
++#if defined(__ORBIS__)
++	// Crema: a submission is two kernel calls on the PS4 (~7% of Breath of the Wild's GPU thread
++	// at 300 draws each); the PS4 GPU is mostly idle, so starting its work later costs nothing
++	m_submitThreshold = 800;
++#else
+ 	m_submitThreshold = 300;
++#endif
+ 	m_submitOnIdle = false;
+ }
+ 
+@@ -3038,7 +3053,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -2526,7 +2540,7 @@ index 599190a..1022927 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3071,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3077,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -2535,7 +2549,7 @@ index 599190a..1022927 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3282,6 +3296,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3282,6 +3302,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -2585,7 +2599,7 @@ index 599190a..1022927 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3357,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3363,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -2598,7 +2612,7 @@ index 599190a..1022927 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -4379,6 +4438,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4444,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
