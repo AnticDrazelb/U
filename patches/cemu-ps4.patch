@@ -2697,6 +2697,102 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "OSPanic!");
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
+index bb31077..1403d8d 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Scheduler.cpp
+@@ -11,10 +11,73 @@ CRITICAL_SECTION s_csSchedulerLock;
+ pthread_mutex_t s_ptmSchedulerLock;
+ #endif
+ 
++#if defined(__ORBIS__)
++// Crema: the scheduler lock without the kernel. Every guest thread switch, event, message and
++// mutex takes it, from all three emulated cores and the GPU thread; as a recursive pthread mutex
++// on the PS4 it cost Breath of the Wild's main core ~13% in lock/unlock and ~13% asleep in the
++// kernel waiting for it. The sections it guards are short: spin, then yield, then sleep briefly (a
++// holder preempted by a higher priority thread on its core still gets to finish). Recursive like
++// the mutex was (per host thread; fibers lock and unlock on the same host thread).
++#include <immintrin.h>
++extern "C" int sceKernelUsleep(unsigned int microseconds);
++static std::atomic<uint32> s_cremaSchedLocked{0};
++static std::atomic<const void*> s_cremaSchedOwner{nullptr};
++static uint32 s_cremaSchedDepth = 0;
++thread_local char t_cremaSchedId;
++
++static void CremaSchedLock()
++{
++	const void* self = &t_cremaSchedId;
++	if (s_cremaSchedOwner.load(std::memory_order_relaxed) == self)
++	{
++		s_cremaSchedDepth++;
++		return;
++	}
++	for (uint32 n = 0;; n++)
++	{
++		if (s_cremaSchedLocked.load(std::memory_order_relaxed) == 0 && s_cremaSchedLocked.exchange(1, std::memory_order_acquire) == 0)
++			break;
++		if (n < 4000)
++			_mm_pause();
++		else if (n < 4064)
++			sched_yield();
++		else
++			sceKernelUsleep(20);
++	}
++	s_cremaSchedOwner.store(self, std::memory_order_relaxed);
++	s_cremaSchedDepth = 1;
++}
++
++static bool CremaSchedTryLock()
++{
++	const void* self = &t_cremaSchedId;
++	if (s_cremaSchedOwner.load(std::memory_order_relaxed) == self)
++	{
++		s_cremaSchedDepth++;
++		return true;
++	}
++	if (s_cremaSchedLocked.load(std::memory_order_relaxed) != 0 || s_cremaSchedLocked.exchange(1, std::memory_order_acquire) != 0)
++		return false;
++	s_cremaSchedOwner.store(self, std::memory_order_relaxed);
++	s_cremaSchedDepth = 1;
++	return true;
++}
++
++static void CremaSchedUnlock()
++{
++	if (--s_cremaSchedDepth != 0)
++		return;
++	s_cremaSchedOwner.store(nullptr, std::memory_order_relaxed);
++	s_cremaSchedLocked.store(0, std::memory_order_release);
++}
++#endif
++
+ void __OSLockScheduler(void* obj)
+ {
+ #if BOOST_OS_WINDOWS
+ 	EnterCriticalSection(&s_csSchedulerLock);
++#elif defined(__ORBIS__)
++	CremaSchedLock();
+ #else
+ 	pthread_mutex_lock(&s_ptmSchedulerLock);
+ #endif
+@@ -32,6 +95,8 @@ bool __OSTryLockScheduler(void* obj)
+ 	bool r;
+ #if BOOST_OS_WINDOWS
+ 	r = TryEnterCriticalSection(&s_csSchedulerLock);
++#elif defined(__ORBIS__)
++	r = CremaSchedTryLock();
+ #else
+ 	r = pthread_mutex_trylock(&s_ptmSchedulerLock) == 0;
+ #endif
+@@ -49,6 +114,8 @@ void __OSUnlockScheduler(void* obj)
+ 	cemu_assert_debug(s_schedulerLockCount >= 0);
+ #if BOOST_OS_WINDOWS
+ 	LeaveCriticalSection(&s_csSchedulerLock);
++#elif defined(__ORBIS__)
++	CremaSchedUnlock();
+ #else
+ 	pthread_mutex_unlock(&s_ptmSchedulerLock);
+ #endif
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 index 9fe4bea..b151988 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
