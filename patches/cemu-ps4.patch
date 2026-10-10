@@ -492,7 +492,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..1901b14 100644
+index c9758f3..8c40ccb 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -839,7 +839,7 @@ index c9758f3..1901b14 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +633,139 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +633,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -848,8 +848,8 @@ index c9758f3..1901b14 100644
 +// register at the end of its range, so each compare stored its CR bits (and copied XER.SO) even
 +// when the next compare overwrote them: ~15% of the recompiled instructions in Tekken Tag
 +// Tournament 2. Liveness of the 32 CR bits is solved over the function's segments; where control
-+// leaves the function every bit is live, except that a call or a return (bl, bctrl, blr, an HLE
-+// call) leaves cr0, cr1 and cr5-cr7 dead: the PowerPC EABI makes those fields volatile.
++// leaves the function every bit is live, except that a call (bl, bctrl, an HLE call) leaves cr0,
++// cr1 and cr5-cr7 dead: the PowerPC EABI makes those fields volatile.
 +bool g_crema_fast_compares = true;
 +
 +static void PPCRecompiler_RemoveDeadCRWrites(ppcImlGenContext_t& ctx)
@@ -886,10 +886,13 @@ index c9758f3..1901b14 100644
 +		case PPCREC_IML_MACRO_HLE:
 +			return kNonVolatile | kVarargsFloatBit;
 +		case PPCREC_IML_MACRO_B_TO_REG:
-+			// 2: a call (bctrl/blrl), 1: a return (blr), 0: another computed branch
++			// 2: a call (bctrl/blrl), 1: a return (blr), 0: another computed branch. A return keeps
++			// every bit: hand-written code can return a result in cr0 (2.00: Breath of the Wild's FPS++
++			// pack compares and returns to a blt, and lost the compare; the game waited for vsync
++			// forever).
 +			if (last->op_macro.paramU16 == 2)
 +				return kNonVolatile | kVarargsFloatBit;
-+			return last->op_macro.paramU16 == 1 ? kNonVolatile : kAll;
++			return kAll;
 +		default:
 +			return kAll; // B_FAR, LEAVE (back to the interpreter at this function's code), ...
 +		}
@@ -979,7 +982,7 @@ index c9758f3..1901b14 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +777,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +780,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -1002,7 +1005,7 @@ index c9758f3..1901b14 100644
  
  	return true;
  }
-@@ -377,6 +814,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +817,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -1011,7 +1014,7 @@ index c9758f3..1901b14 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +827,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +830,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1028,7 +1031,7 @@ index c9758f3..1901b14 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +866,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +869,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1038,7 +1041,7 @@ index c9758f3..1901b14 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +893,112 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +896,112 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1155,7 +1158,7 @@ index c9758f3..1901b14 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1031,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1034,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1239,7 +1242,7 @@ index c9758f3..1901b14 100644
  	}
  }
  
-@@ -504,6 +1120,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1123,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1281,7 +1284,7 @@ index c9758f3..1901b14 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1260,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1263,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1289,7 +1292,7 @@ index c9758f3..1901b14 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1354,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1357,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1302,7 +1305,7 @@ index c9758f3..1901b14 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1367,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1370,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
