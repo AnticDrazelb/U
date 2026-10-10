@@ -2475,7 +2475,7 @@ index 4d454e0..2b66546 100644
  		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
  		cemuLog_log(LogType::Force, "Msg: {}", msg);
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..eb1a82a 100644
+index 9fe4bea..b151988 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2595,6 +2595,142 @@ index 9fe4bea..eb1a82a 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
+@@ -1647,3 +1722,135 @@ namespace coreinit
+ 		__OSInitTerminatorThreads();
+ 	}
+ }
++
++#if defined(__ORBIS__)
++#include "Cafe/OS/RPL/rpl_symbol_storage.h"
++
++// Crema: the Profiler, Wii U side. What each game thread does, sampled about 500 times a second
++// (CremaThreadCensusSample, from the profiler) and reported every 30 s (CremaThreadCensusReport):
++// running on its core, ready but waiting for the core, or waiting on an OSMutex, an OSFastMutex or
++// a thread queue (events, semaphores, messages, sleeps, joins), with the calls it waits in most
++// (the function the bl before the saved LR goes to). The PS4 side (samples.log) shows only where
++// the host threads are; this shows why a game is slow when no host thread is busy.
++namespace coreinit
++{
++	enum CensusKind : uint32 { kRunning, kReady, kMutex, kFastMutex, kQueue, kSuspended, kOther, kKinds };
++	struct CensusThread
++	{
++		char name[48]{};
++		uint32 samples = 0;
++		uint32 kinds[kKinds]{};
++		std::unordered_map<uint64, uint32> waitSites; // kind << 32 | LR
++	};
++	std::mutex s_censusMutex;
++	std::unordered_map<MPTR, CensusThread> s_census;
++
++	void CremaThreadCensusSample()
++	{
++		OSThread_t* current[Espresso::CORE_COUNT];
++		for (sint32 i = 0; i < Espresso::CORE_COUNT; i++)
++			current[i] = __currentCoreThread[i];
++		std::unique_lock _l(s_censusMutex);
++		srwlock_activeThreadList.LockRead();
++		for (sint32 i = 0; i < activeThreadCount; i++)
++		{
++			const MPTR ptr = activeThread[i];
++			OSThread_t* t = MEMPTR<OSThread_t>(ptr).GetPtr();
++			if (!t)
++				continue;
++			const auto state = t->state.value();
++			if (state != OSThread_t::THREAD_STATE::STATE_RUNNING && state != OSThread_t::THREAD_STATE::STATE_WAITING &&
++				state != OSThread_t::THREAD_STATE::STATE_READY)
++				continue;
++			CensusThread& c = s_census[ptr];
++			if (c.name[0] == 0)
++			{
++				const char* name = t->threadName.GetPtr();
++				snprintf(c.name, sizeof(c.name), "%s", name ? name : "?");
++				if (c.name[0] == 0)
++					snprintf(c.name, sizeof(c.name), "thread %08x", ptr);
++			}
++			c.samples++;
++			CensusKind kind;
++			if (t == current[0] || t == current[1] || t == current[2])
++				kind = kRunning;
++			else if (state != OSThread_t::THREAD_STATE::STATE_WAITING)
++				kind = t->suspendCounter.value() > 0 ? kSuspended : kReady; // READY: created, not resumed yet
++			else if (t->waitingForMutex)
++				kind = kMutex;
++			else if (t->waitingForFastMutex)
++				kind = kFastMutex;
++			else if (t->currentWaitQueue)
++				kind = kQueue;
++			else if (t->suspendCounter.value() > 0)
++				kind = kSuspended;
++			else
++				kind = kOther;
++			c.kinds[kind]++;
++			if (kind >= kMutex)
++				c.waitSites[(uint64)kind << 32 | _swapEndianU32(t->context.lr)]++;
++		}
++		srwlock_activeThreadList.UnlockRead();
++	}
++
++	// the call a return address comes back from: "name" of the bl target, else its address
++	static std::string CensusCallName(uint32 lr)
++	{
++		if (lr < 0x01000004 || !memory_isAddressRangeAccessible(lr - 4, 4))
++			return fmt::format("? (lr {:08x})", lr);
++		const uint32 instr = memory_readU32(lr - 4);
++		if ((instr >> 26) != 18 || (instr & 1) == 0)
++			return fmt::format("indirect call (lr {:08x})", lr);
++		sint32 offset = (sint32)(instr & 0x03FFFFFC);
++		if (offset & 0x02000000)
++			offset -= 0x04000000;
++		const uint32 target = (instr & 2) ? (uint32)offset : lr - 4 + offset;
++		RPLStoredSymbol* symbol = rplSymbolStorage_getByAddress(target);
++		if (symbol && symbol->symbolName)
++			return fmt::format("{} (lr {:08x})", (const char*)symbol->symbolName, lr);
++		return fmt::format("{:08x} (lr {:08x})", target, lr);
++	}
++
++	// one line per thread that ran or waited, busiest first, then the counters start over
++	std::vector<std::string> CremaThreadCensusReport()
++	{
++		static const char* kNames[kKinds] = {"run", "ready", "mutex", "fastmutex", "queue", "suspended", "other"};
++		std::unordered_map<MPTR, CensusThread> census;
++		{
++			std::unique_lock _l(s_censusMutex);
++			census.swap(s_census);
++		}
++		std::vector<const CensusThread*> threads;
++		for (auto& it : census)
++			threads.push_back(&it.second);
++		std::sort(threads.begin(), threads.end(), [](const CensusThread* a, const CensusThread* b) {
++			return a->kinds[kRunning] + a->kinds[kReady] > b->kinds[kRunning] + b->kinds[kReady];
++		});
++		std::vector<std::string> lines;
++		for (const CensusThread* c : threads)
++		{
++			if (lines.size() == 16)
++				break;
++			std::string line = fmt::format("wiiu thread {}:", c->name);
++			for (uint32 k = 0; k < kKinds; k++)
++			{
++				if (c->kinds[k] * 100 >= c->samples)
++					line += fmt::format(" {} {}%", kNames[k], c->kinds[k] * 100 / c->samples);
++			}
++			std::vector<std::pair<uint32, uint64>> sites;
++			for (auto& it : c->waitSites)
++				sites.emplace_back(it.second, it.first);
++			std::sort(sites.begin(), sites.end(), std::greater<>());
++			for (size_t i = 0; i < sites.size() && i < 3; i++)
++			{
++				if (sites[i].first * 100 < c->samples * 3)
++					break;
++				line += fmt::format(" | {} {}% in {}", kNames[sites[i].second >> 32], sites[i].first * 100 / c->samples,
++					CensusCallName((uint32)sites[i].second));
++			}
++			lines.push_back(std::move(line));
++		}
++		return lines;
++	}
++}
++#endif
 diff --git a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp b/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
 index 821fe8a..f24e24f 100644
 --- a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
@@ -5903,10 +6039,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..92f8cfd
+index 0000000..c33e784
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,867 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -5957,6 +6093,11 @@ index 0000000..92f8cfd
 +
 +extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
 +extern "C" void ps4_sampler_start(); // port/ps4_sampler.cpp: the profiler (samples.log)
++namespace coreinit
++{
++	void CremaThreadCensusSample(); // coreinit_Thread.cpp: the profiler, Wii U side
++	std::vector<std::string> CremaThreadCensusReport();
++}
 +extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason); // port/ps4_sampler.cpp
 +extern "C" void ps4_thread_busy_report(char* out, size_t size, int min_percent); // port/ps4_sampler.cpp
 +extern "C" void ac_ps4_get_gpu_busy(uint64_t* busy_ticks, uint64_t* span_ticks); // port/mesa/ac_ps4_drm.c
@@ -6583,7 +6724,24 @@ index 0000000..92f8cfd
 +		// RADV's per-draw trace markers and the PS4 winsys's flight recorder (port/mesa/ac_ps4_drm.c:
 +		// /data/DolphinPS4/flight), read when the device is created (after this)
 +		if (CremaSettings::On("profiler", gameId))
++		{
 +			ps4_sampler_start();
++			// what each Wii U thread does (running, waiting for its core or on what), every 30 s
++			std::thread([] {
++				SetThreadName("census");
++				auto next = std::chrono::steady_clock::now() + std::chrono::seconds(30);
++				for (;;)
++				{
++					std::this_thread::sleep_for(std::chrono::milliseconds(2));
++					coreinit::CremaThreadCensusSample();
++					if (std::chrono::steady_clock::now() < next)
++						continue;
++					next += std::chrono::seconds(30);
++					for (const std::string& line : coreinit::CremaThreadCensusReport())
++						Trace(line);
++				}
++			}).detach();
++		}
 +		if (CremaSettings::On("gpu_trace", gameId))
 +		{
 +			setenv("RADV_PS4_TRACE", "1", 1);
