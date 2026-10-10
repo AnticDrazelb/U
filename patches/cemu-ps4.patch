@@ -2731,6 +2731,26 @@ index 9fe4bea..b151988 100644
 +	}
 +}
 +#endif
+diff --git a/src/Cafe/OS/libs/gx2/GX2_Event.cpp b/src/Cafe/OS/libs/gx2/GX2_Event.cpp
+index 338b7d7..544c556 100644
+--- a/src/Cafe/OS/libs/gx2/GX2_Event.cpp
++++ b/src/Cafe/OS/libs/gx2/GX2_Event.cpp
+@@ -218,8 +218,15 @@ namespace GX2
+ 	{
+ 		// optional force full sync (texture readback and occlusion queries)
+ 		bool forceFullSync = false;
++#if !defined(__ORBIS__)
+ 		if (g_renderer && g_renderer->GetType() == RendererAPI::Vulkan)
+ 			forceFullSync = true;
++#endif
++		// Crema: only with Graphics Accuracy: Accurate (Cemu forces it on Vulkan). The full sync
++		// makes the game wait for the PS4 GPU to finish everything (occlusion queries, texture
++		// readbacks): Breath of the Wild calls GX2DrawDone every frame and its main thread spent
++		// 25-30% of each frame waiting there. Fast: query results and readbacks arrive when the GPU
++		// is done, a frame or so later (some games may flicker).
+ 		if (forceFullSync || ActiveSettings::WaitForGX2DrawDoneEnabled())
+ 		{
+ 			GX2ReserveCmdSpace(2);
 diff --git a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp b/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
 index 821fe8a..f24e24f 100644
 --- a/src/Cafe/OS/libs/h264_avc/H264DecBackendAVC.cpp
