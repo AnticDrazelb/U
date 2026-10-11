@@ -104,6 +104,25 @@ index 06c2a13..33bea8f 100644
  private:
  	uint64_t m_title_id = 0;
  	bool m_is_loaded = false;
+diff --git a/src/Cafe/GraphicPack/GraphicPack2.cpp b/src/Cafe/GraphicPack/GraphicPack2.cpp
+index 850fb6b..a8d2384 100644
+--- a/src/Cafe/GraphicPack/GraphicPack2.cpp
++++ b/src/Cafe/GraphicPack/GraphicPack2.cpp
+@@ -904,7 +904,14 @@ void GraphicPack2::_iterateReplacedFiles(const fs::path& currentPath, bool isAOC
+ 	{
+ 		if (fs::is_regular_file(it))
+ 		{
++#if defined(__ORBIS__)
++			// Crema: by the names only - fs::relative resolves paths (weakly_canonical -> realpath),
++			// which the PS4 doesn't have: it threw, and a pack with a content folder (NSMBU's NSKBU)
++			// ended the app
++			fs::path virtualMountPath = it.path().lexically_relative(currentPath);
++#else
+ 			fs::path virtualMountPath = fs::relative(it.path(), currentPath);
++#endif
+ 			if (isAOC)
+ 			{
+ 				virtualMountPath = fs::path(fmt::format("/vol/aoc{:016x}/", aocTitleId)) / virtualMountPath;
 diff --git a/src/Cafe/HW/Espresso/PPCTimer.cpp b/src/Cafe/HW/Espresso/PPCTimer.cpp
 index 257973a..2d7d62b 100644
 --- a/src/Cafe/HW/Espresso/PPCTimer.cpp
@@ -5320,7 +5339,7 @@ index 0000000..59a3de1
 +} // namespace CremaMii
 diff --git a/src/gui/ps4/CremaOnline.cpp b/src/gui/ps4/CremaOnline.cpp
 new file mode 100644
-index 0000000..62925e8
+index 0000000..fda02d9
 --- /dev/null
 +++ b/src/gui/ps4/CremaOnline.cpp
 @@ -0,0 +1,352 @@
@@ -5455,7 +5474,7 @@ index 0000000..62925e8
 +		for (auto it = stdfs::recursive_directory_iterator(from, ec); !ec && it != stdfs::recursive_directory_iterator(); it.increment(ec))
 +		{
 +			if (it->is_regular_file(ec))
-+				CopyFile(it->path(), to / stdfs::relative(it->path(), from, ec));
++				CopyFile(it->path(), to / it->path().lexically_relative(from)); // (stdfs::relative needs realpath)
 +		}
 +	}
 +
@@ -5496,7 +5515,7 @@ index 0000000..62925e8
 +			const std::string name = it->path().filename().string();
 +			if (!it->is_regular_file(ec) || (name.size() > 10 && name.compare(name.size() - 10, 10, ".crema-new") == 0))
 +				continue;
-+			entries.push_back("mlc:" + stdfs::relative(it->path(), mlc, ec).generic_string());
++			entries.push_back("mlc:" + it->path().lexically_relative(mlc).generic_string());
 +		}
 +		std::sort(entries.begin(), entries.end());
 +		return entries;
@@ -15136,7 +15155,7 @@ index 3994299..d361bba 100644
  
  	bool try_lock() const
 diff --git a/src/util/helpers/helpers.cpp b/src/util/helpers/helpers.cpp
-index d13a31a..dd0bcf6 100644
+index d13a31a..68b2360 100644
 --- a/src/util/helpers/helpers.cpp
 +++ b/src/util/helpers/helpers.cpp
 @@ -113,8 +113,15 @@ typedef struct tagTHREADNAME_INFO
@@ -15155,6 +15174,20 @@ index d13a31a..dd0bcf6 100644
  #if BOOST_OS_WINDOWS
  	using SetThreadDescription_t = HRESULT (*)(HANDLE hThread, PCWSTR lpThreadDescription);
  	static SetThreadDescription_t pSetThreadDescription = nullptr;
+@@ -303,7 +310,13 @@ fs::path MakeRelativePath(const fs::path& base, const fs::path& path)
+ {
+ 	try
+ 	{
++#if defined(__ORBIS__)
++		// Crema: by the names only (fs::relative needs realpath, which the PS4 doesn't have)
++		fs::path relative = path.lexically_normal().lexically_relative(base.lexically_normal());
++		return relative.empty() ? path : relative;
++#else
+ 		return fs::relative(path, base);
++#endif
+ 	}
+ 	catch (const std::exception&)
+ 	{
 diff --git a/src/util/highresolutiontimer/HighResolutionTimer.cpp b/src/util/highresolutiontimer/HighResolutionTimer.cpp
 index 6bb96a8..8c7108e 100644
 --- a/src/util/highresolutiontimer/HighResolutionTimer.cpp
