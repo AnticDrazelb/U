@@ -90,7 +90,7 @@ def kind(mnemonic):
     return "integer"
 
 
-order = sorted(funcs, key=lambda f: -(totals.get(f["ppc"], 0) or f["samples"]))
+order = sorted(funcs, key=lambda f: -(totals.get(f["ppc"], 0) if totals else f["samples"]))
 print("%-10s %8s %7s %7s %6s  %s" % ("function", "samples", "ppc B", "x86 B", "x86/ppc", "PowerPC mix"))
 for f in order:
     insns = ppc_disasm(f["ppc"], f["code"])

@@ -165,7 +165,7 @@ void report(int fd, ThreadSamples& t, double window_start) {
     }
 }
 
-// The busiest recompiled game functions since the last dump (hotfuncs.bin).
+// The busiest recompiled game functions of the session (hotfuncs.bin, rewritten every minute).
 constexpr int kMaxHotFunctions = 512;
 struct HotFunction { uint32_t ppc; uint64_t x86; int count; };
 HotFunction g_hot_functions[kMaxHotFunctions];
@@ -189,11 +189,12 @@ void dumpHotFunctions() {
               [](const HotFunction& a, const HotFunction& b) { return a.count > b.count; });
     const int fd = open("/data/Crema/hotfuncs.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd >= 0) {
-        for (int i = 0; i < std::min(g_hot_function_count, 40); i++)
+        for (int i = 0; i < std::min(g_hot_function_count, 60); i++)
             ps4_jit_dump_function(fd, g_hot_functions[i].ppc, g_hot_functions[i].x86, (uint32_t)g_hot_functions[i].count);
         close(fd);
     }
-    g_hot_function_count = 0;
+    // the counts keep growing over the session (a minute in the menu at the end doesn't replace
+    // the gameplay)
 }
 
 // 64 KiB chunks of JIT code sampled since the last dump (dumpJitCode).
