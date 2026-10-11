@@ -27,11 +27,18 @@ echo "$VERSION" > "$STAGE/version.txt"
 # PkgTool's pkg_build crashes ("Sequence contains no elements") on empty folders.
 find "$STAGE" -type d -empty -delete
 # Vulkan (RADV on GNM) runs under the plain homebrew identity (4.5 GiB of direct memory).
-PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 "$HERE/make-pkg.sh" "$STAGE" CREM00001 "Crema" "$VERSION" CREMA "$PS4_BUILD_ROOT/out" | tail -1)"
+# CEMU_PS4_LAB=1: the experimental line as its own app, "Crema Lab" (CREM00002), installed next to
+# Crema (the stable line) - both use /data/Crema
+if [ -n "${CEMU_PS4_LAB:-}" ]; then
+    APP_ID=CREM00002; APP_NAME="Crema Lab"; APP_LABEL=CREMALAB; APP_FILE=Crema-Lab
+else
+    APP_ID=CREM00001; APP_NAME="Crema"; APP_LABEL=CREMA; APP_FILE=Crema
+fi
+PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 "$HERE/make-pkg.sh" "$STAGE" "$APP_ID" "$APP_NAME" "$VERSION" "$APP_LABEL" "$PS4_BUILD_ROOT/out" | tail -1)"
 ls -la "$PKG"
 # a copy next to the repo (E:\PS4 Projects\CEMUPS4\out), easy to find from Windows; *.pkg is ignored by git
 mkdir -p "$HERE/../out"
-cp "$PKG" "$HERE/../out/Crema-v$VERSION.pkg"
+cp "$PKG" "$HERE/../out/$APP_FILE-v$VERSION.pkg"
 # Keep the symbols of every packaged build: crash logs must be symbolized against the exact binary.
 mkdir -p "$PS4_BUILD_ROOT/oelf"
 cp "$BUILD/src/CemuBin_eboot/CemuBin.oelf" "$PS4_BUILD_ROOT/oelf/v$VERSION.oelf"

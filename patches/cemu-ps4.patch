@@ -198,7 +198,7 @@ index 257973a..2d7d62b 100644
  	_rdtscAcc.low = remainder;
  	_rdtscAcc.high = 0;
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
-index e466deb..1316a67 100644
+index e466deb..3d19609 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp
 @@ -9,6 +9,9 @@
@@ -256,6 +256,114 @@ index e466deb..1316a67 100644
  		{
  			// swap operand 2 with RCX
  			x64Gen_xchg_reg64_reg64(x64GenContext, X86_REG_RCX, rRegOperand2);
+@@ -1533,7 +1564,30 @@ bool PPCRecompiler_generateX64Code(PPCRecFunction_t* PPCRecFunction, ppcImlGenCo
+ 			}
+ 			else if (imlInstruction->type == PPCREC_IML_TYPE_FPR_COMPARE)
+ 			{
+-				PPCRecompilerX64Gen_imlInstruction_fpr_compare(PPCRecFunction, ppcImlGenContext, &x64GenContext, imlInstruction);
++				// Crema: the following compares of the same two registers into other registers
++				// share one UCOMISD (BackendX64FPU.cpp)
++				size_t group = 1;
++				while (i + group < segIt->imlList.size() && group < 4)
++				{
++					const IMLInstruction& next = segIt->imlList[i + group];
++					if (next.type != PPCREC_IML_TYPE_FPR_COMPARE ||
++						_regF64(next.op_fpr_compare.regA) != _regF64(imlInstruction->op_fpr_compare.regA) ||
++						_regF64(next.op_fpr_compare.regB) != _regF64(imlInstruction->op_fpr_compare.regB))
++						break;
++					bool sameTarget = false;
++					for (size_t k = 0; k < group; k++)
++						sameTarget |= _reg8(segIt->imlList[i + k].op_fpr_compare.regR) == _reg8(next.op_fpr_compare.regR);
++					if (sameTarget)
++						break;
++					group++;
++				}
++				if (group > 1)
++				{
++					PPCRecompilerX64Gen_imlInstruction_fpr_compare_group(PPCRecFunction, ppcImlGenContext, &x64GenContext, imlInstruction, group);
++					i += group - 1;
++				}
++				else
++					PPCRecompilerX64Gen_imlInstruction_fpr_compare(PPCRecFunction, ppcImlGenContext, &x64GenContext, imlInstruction);
+ 			}
+ 			else
+ 			{
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h
+index 8f58d2f..efa07fa 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.h
+@@ -91,6 +91,7 @@ void PPCRecompilerX64Gen_imlInstruction_fpr_r_r_r_r(PPCRecFunction_t* PPCRecFunc
+ void PPCRecompilerX64Gen_imlInstruction_fpr_r(PPCRecFunction_t* PPCRecFunction, ppcImlGenContext_t* ppcImlGenContext, x64GenContext_t* x64GenContext, IMLInstruction* imlInstruction);
+ 
+ void PPCRecompilerX64Gen_imlInstruction_fpr_compare(PPCRecFunction_t* PPCRecFunction, ppcImlGenContext_t* ppcImlGenContext, x64GenContext_t* x64GenContext, IMLInstruction* imlInstruction);
++void PPCRecompilerX64Gen_imlInstruction_fpr_compare_group(PPCRecFunction_t* PPCRecFunction, ppcImlGenContext_t* ppcImlGenContext, x64GenContext_t* x64GenContext, IMLInstruction* first, size_t count);
+ 
+ // ASM gen
+ void x64Gen_writeU8(x64GenContext_t* x64GenContext, uint8 v);
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp
+index 8751a04..6f0005d 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64FPU.cpp
+@@ -476,6 +476,59 @@ void PPCRecompilerX64Gen_imlInstruction_fpr_r(PPCRecFunction_t* PPCRecFunction,
+ 	}
+ }
+ 
++// Crema: consecutive compares of the same two values (an fcmpu sets LT, GT, EQ and SO, each a
++// compare in IML) share one UCOMISD: every result register is cleared first, the condition
++// bits are all set from the one comparison's flags, then LT and EQ are masked with "ordered".
++// Before, each bit had its own XOR, UCOMISD and SETcc (four UCOMISD per fcmpu).
++void PPCRecompilerX64Gen_imlInstruction_fpr_compare_group(PPCRecFunction_t* PPCRecFunction, ppcImlGenContext_t* ppcImlGenContext, x64GenContext_t* x64GenContext, IMLInstruction* first, size_t count)
++{
++	auto regA = _regF64(first->op_fpr_compare.regA);
++	auto regB = _regF64(first->op_fpr_compare.regB);
++	bool needOrdered = false;
++	for (size_t k = 0; k < count; k++)
++	{
++		auto regR = _reg8(first[k].op_fpr_compare.regR);
++		x64GenContext->emitter->XOR_dd(_reg32_from_reg8(regR), _reg32_from_reg8(regR));
++		const IMLCondition cond = first[k].op_fpr_compare.cond;
++		if (cond == IMLCondition::UNORDERED_LT || cond == IMLCondition::UNORDERED_EQ)
++			needOrdered = true;
++	}
++	x64Gen_ucomisd_xmmReg_xmmReg(x64GenContext, regA, regB);
++	auto regTmp = _reg32_from_reg8(_reg32(REG_RESV_TEMP));
++	if (needOrdered)
++		x64GenContext->emitter->SETcc_b(X86Cond::X86_CONDITION_PO, regTmp);
++	for (size_t k = 0; k < count; k++)
++	{
++		auto regR = _reg8(first[k].op_fpr_compare.regR);
++		switch (first[k].op_fpr_compare.cond)
++		{
++		case IMLCondition::UNORDERED_GT:
++			x64GenContext->emitter->SETcc_b(X86Cond::X86_CONDITION_NBE, regR);
++			break;
++		case IMLCondition::UNORDERED_U:
++			x64GenContext->emitter->SETcc_b(X86Cond::X86_CONDITION_PE, regR);
++			break;
++		case IMLCondition::UNORDERED_LT:
++			x64GenContext->emitter->SETcc_b(X86Cond::X86_CONDITION_B, regR);
++			break;
++		case IMLCondition::UNORDERED_EQ:
++			x64GenContext->emitter->SETcc_b(X86Cond::X86_CONDITION_Z, regR);
++			break;
++		default:
++			cemu_assert_unimplemented();
++		}
++	}
++	for (size_t k = 0; k < count; k++)
++	{
++		const IMLCondition cond = first[k].op_fpr_compare.cond;
++		if (cond == IMLCondition::UNORDERED_LT || cond == IMLCondition::UNORDERED_EQ)
++		{
++			auto regR = _reg8(first[k].op_fpr_compare.regR);
++			x64GenContext->emitter->AND_bb(_reg8_from_reg32(regR), _reg8_from_reg32(regTmp));
++		}
++	}
++}
++
+ void PPCRecompilerX64Gen_imlInstruction_fpr_compare(PPCRecFunction_t* PPCRecFunction, ppcImlGenContext_t* ppcImlGenContext, x64GenContext_t* x64GenContext, IMLInstruction* imlInstruction)
+ {
+ 	auto regR = _reg8(imlInstruction->op_fpr_compare.regR);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
 index d4b41b9..b111c13 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64Gen.cpp
@@ -1783,10 +1891,10 @@ index 743ab67..b1fc494 100644
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..4978912
+index 0000000..d2b623e
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,524 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -2304,6 +2412,12 @@ index 0000000..4978912
 +VkSurfaceKHR PS4CreateVulkanSurface()
 +{
 +	return (VkSurfaceKHR)new PS4Surface();
++}
++
++// Crema: frames presented so far (Core Balancing starts once the game shows its frames)
++uint64 CremaFramesPresented()
++{
++	return sFlipsSubmitted;
 +}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp
 index b27aae0..eed31fa 100644
@@ -2879,7 +2993,7 @@ index 4f85537..1971d3c 100644
  		while (true)
  		{
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..da6faf7 100644
+index 9fe4bea..4f0b6c1 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2928,7 +3042,7 @@ index 9fe4bea..da6faf7 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1208,134 @@ namespace coreinit
+@@ -1192,6 +1208,154 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -2998,6 +3112,10 @@ index 9fe4bea..da6faf7 100644
 +	// per-core data stay consistent). Never a thread that records GX2 display lists: GX2 keeps a
 +	// command buffer per core, and its commands would land in the main core's.
 +	std::atomic<bool> g_crema_core_balancing{false};
++}
++uint64 CremaFramesPresented(); // PS4WSI.cpp
++namespace coreinit
++{
 +	std::unordered_set<OSThread_t*> s_cremaGX2Threads; // under the scheduler lock
 +	uint64 s_cremaSteals = 0;
 +
@@ -3024,6 +3142,22 @@ index 9fe4bea..da6faf7 100644
 +		__OSUnlockScheduler();
 +	}
 +
++	// 2.14 (Crema Lab): only the game's world threads seen waiting longest for their busy cores in
++	// Breath of the Wild (2.08 moved any waiting thread and Breath of the Wild's start hung)
++	bool CremaMayMove(OSThread_t* t)
++	{
++		static const char* const kAllowed[] = {"RadarMgr", "PlacementMgr", "AutoPlacementMgr"};
++		const char* name = t->threadName.GetPtr();
++		if (!name)
++			return false;
++		for (const char* allowed : kAllowed)
++		{
++			if (strcmp(name, allowed) == 0)
++				return true;
++		}
++		return false;
++	}
++
 +	OSThread_t* __OSCremaStealThread(uint32 coreIndex)
 +	{
 +		cemu_assert_debug(__OSHasSchedulerLock());
@@ -3039,7 +3173,7 @@ index 9fe4bea..da6faf7 100644
 +			{
 +				if (t->state != OSThread_t::THREAD_STATE::STATE_READY || t->suspendCounter != 0)
 +					continue;
-+				if (s_cremaGX2Threads.count(t))
++				if (s_cremaGX2Threads.count(t) || !CremaMayMove(t))
 +					continue;
 +				if (!best || t->effectivePriority < best->effectivePriority)
 +					best = t;
@@ -3063,7 +3197,7 @@ index 9fe4bea..da6faf7 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1354,9 @@ namespace coreinit
+@@ -1210,6 +1374,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -3073,7 +3207,7 @@ index 9fe4bea..da6faf7 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1380,16 @@ namespace coreinit
+@@ -1233,6 +1400,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -3090,7 +3224,7 @@ index 9fe4bea..da6faf7 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1263,6 +1420,28 @@ namespace coreinit
+@@ -1263,6 +1440,29 @@ namespace coreinit
  				}
  				__OSUnlockScheduler();
  			}
@@ -3100,10 +3234,11 @@ index 9fe4bea..da6faf7 100644
 +			else if (isMainCore && g_isMulticoreMode && g_crema_core_balancing.load(std::memory_order_relaxed) &&
 +				(!g_coreRunQueueThreadCount[0].isZero() || !g_coreRunQueueThreadCount[2].isZero()))
 +			{
-+				// not in the game's first 30 s, where it sets up its cores
-+				static uint64 s_nextSteal = __rdtsc() + _rdtscFrequency * 30;
++				// only once the game has shown 3000 frames (it sets up its cores at the start; 2.09's
++				// 30 s by the TSC still moved a thread at 0.8 s)
++				static uint64 s_nextSteal = 0;
 +				const uint64 now = __rdtsc();
-+				if (now >= s_nextSteal)
++				if (now >= s_nextSteal && CremaFramesPresented() >= 3000)
 +				{
 +					s_nextSteal = now + _rdtscFrequency / 50000;
 +					__OSLockScheduler();
@@ -3119,7 +3254,7 @@ index 9fe4bea..da6faf7 100644
  			if (isMainCore)
  			{
  				__OSCheckSystemEvents();
-@@ -1391,6 +1570,11 @@ namespace coreinit
+@@ -1391,6 +1591,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -3131,7 +3266,7 @@ index 9fe4bea..da6faf7 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1831,159 @@ namespace coreinit
+@@ -1647,3 +1852,159 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
