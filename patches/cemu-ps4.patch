@@ -13265,10 +13265,10 @@ index 0000000..5157e21
 +}  // namespace PS4Glyphs
 diff --git a/src/gui/ps4/launcher/PS4Lang.cpp b/src/gui/ps4/launcher/PS4Lang.cpp
 new file mode 100644
-index 0000000..5546b53
+index 0000000..0884d4a
 --- /dev/null
 +++ b/src/gui/ps4/launcher/PS4Lang.cpp
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,620 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -13607,6 +13607,13 @@ index 0000000..5546b53
 +  {
 +    const char32_t c = text[i];
 +    if (dir[i] == N && dir[i - 1] == L && dir[i + 1] == L && (c == '.' || c == ',' || c == ':' || c == '/' || c == '-' || c == '_'))
++      dir[i] = L;
++  }
++  // a path's leading / (or a .file's dot) after a space stays with it: "/data/Crema"
++  for (size_t i = 0; i + 1 < n; i++)
++  {
++    const char32_t c = text[i];
++    if (dir[i] == N && (c == '/' || c == '.' || c == '\\') && dir[i + 1] == L && (i == 0 || text[i - 1] == ' '))
 +      dir[i] = L;
 +  }
 +  // bracket pairs take the direction of what they hold: left to right around Latin text and
