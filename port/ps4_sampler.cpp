@@ -89,6 +89,10 @@ void writeLine(int fd, const char* text) {
 }
 
 void noteHotJit(uint64_t address, int count);
+// Crema's recompiler (PPCRecompiler.cpp): which game function JIT code belongs to, and its dump
+extern "C" __attribute__((weak)) int ps4_jit_owner(uint64_t rip, uint32_t* ppcStart, uint64_t* x86Start);
+extern "C" __attribute__((weak)) void ps4_jit_dump_function(int fd, uint32_t ppcStart, uint64_t x86Start, uint32_t samples);
+void noteHotFunction(uint32_t ppcStart, uint64_t x86Start, int count);
 
 // Aggregates one thread's window: sorts the samples in place and prints the top entries.
 void report(int fd, ThreadSamples& t, double window_start) {
@@ -136,8 +140,18 @@ void report(int fd, ThreadSamples& t, double window_start) {
     for (int i = 0; i < unique && i < 1500 && entries[i].count >= 2; i++) {
         if (entries[i].key >> 63) {
             const uint64_t address = entries[i].key & ~(1ULL << 63);
-            snprintf(line, sizeof(line), "  %5.1f%% jit 0x%llx\n", 100.0 * entries[i].count / n,
-                     static_cast<unsigned long long>(address));
+            uint32_t ppc = 0;
+            uint64_t x86 = 0;
+            if (ps4_jit_owner && ps4_jit_owner(address, &ppc, &x86)) {
+                // the game function it was recompiled from, and the offset in its x86 code
+                snprintf(line, sizeof(line), "  %5.1f%% jit 0x%llx ppc %08x +%llx\n", 100.0 * entries[i].count / n,
+                         static_cast<unsigned long long>(address), ppc,
+                         static_cast<unsigned long long>(address - x86));
+                noteHotFunction(ppc, x86, entries[i].count);
+            } else {
+                snprintf(line, sizeof(line), "  %5.1f%% jit 0x%llx\n", 100.0 * entries[i].count / n,
+                         static_cast<unsigned long long>(address));
+            }
             noteHotJit(address, entries[i].count);
         }
         else if (entries[i].key & kCallerTag)
@@ -149,6 +163,37 @@ void report(int fd, ThreadSamples& t, double window_start) {
                      static_cast<unsigned long long>(entries[i].key));
         writeLine(fd, line);
     }
+}
+
+// The busiest recompiled game functions since the last dump (hotfuncs.bin).
+constexpr int kMaxHotFunctions = 512;
+struct HotFunction { uint32_t ppc; uint64_t x86; int count; };
+HotFunction g_hot_functions[kMaxHotFunctions];
+int g_hot_function_count = 0;
+
+void noteHotFunction(uint32_t ppcStart, uint64_t x86Start, int count) {
+    for (int i = 0; i < g_hot_function_count; i++) {
+        if (g_hot_functions[i].x86 == x86Start) {
+            g_hot_functions[i].count += count;
+            return;
+        }
+    }
+    if (g_hot_function_count < kMaxHotFunctions)
+        g_hot_functions[g_hot_function_count++] = {ppcStart, x86Start, count};
+}
+
+void dumpHotFunctions() {
+    if (!ps4_jit_dump_function || g_hot_function_count == 0)
+        return;
+    std::sort(g_hot_functions, g_hot_functions + g_hot_function_count,
+              [](const HotFunction& a, const HotFunction& b) { return a.count > b.count; });
+    const int fd = open("/data/Crema/hotfuncs.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        for (int i = 0; i < std::min(g_hot_function_count, 40); i++)
+            ps4_jit_dump_function(fd, g_hot_functions[i].ppc, g_hot_functions[i].x86, (uint32_t)g_hot_functions[i].count);
+        close(fd);
+    }
+    g_hot_function_count = 0;
 }
 
 // 64 KiB chunks of JIT code sampled since the last dump (dumpJitCode).
@@ -330,6 +375,7 @@ void* samplerThread(void*) {
             window_start = now();
             if (window_start - last_dump >= 60.0) {
                 dumpJitCode();
+                dumpHotFunctions();
                 last_dump = window_start = now();
                 writeLine(fd, "(jitcode.bin and mem1.bin updated)\n");
             }

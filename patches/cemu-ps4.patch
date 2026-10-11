@@ -541,7 +541,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..b9a8b9c 100644
+index c9758f3..fcbae8b 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -590,7 +590,7 @@ index c9758f3..b9a8b9c 100644
  	std::atomic_int_fast32_t recompilerEnableCount{0};
  	// recompiler thread
  	std::thread workerThread;
-@@ -59,6 +80,260 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +80,306 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -829,6 +829,52 @@ index c9758f3..b9a8b9c 100644
 +		out(snprintf(line, sizeof(line), "jit: host 0x%llx is not in a recompiled function (%u recorded)\n", (unsigned long long)rip, count));
 +}
 +
++// The profiler (port/ps4_sampler.cpp): the recompiled game function a host address is in
++// (its game address and where its x86 code starts), and hotfuncs.bin records of the busiest:
++// 'HFNC', game address, game size, x86 size, samples, x86 address, then the game's code
++// (big-endian words) and the x86 code - disassembled offline (scripts/hotfuncs.py).
++extern "C" int ps4_jit_owner(uint64 rip, uint32* ppcStart, uint64* x86Start)
++{
++	const uint32 count = s_cremaJitNext.load(std::memory_order_acquire);
++	const uint32 total = std::min(count, kCremaJitRanges);
++	for (uint32 i = 0; i < total; i++)
++	{
++		const CremaJitRange& r = s_cremaJitRanges[(count - 1 - i) % kCremaJitRanges];
++		const uintptr_t start = r.x86Start.load(std::memory_order_acquire);
++		const uint32 size = r.x86Size.load(std::memory_order_relaxed);
++		if (start == 0 || rip < start || rip >= start + size)
++			continue;
++		*ppcStart = r.ppcStart.load(std::memory_order_relaxed);
++		*x86Start = start;
++		return 1;
++	}
++	return 0;
++}
++
++extern "C" void ps4_jit_dump_function(int fd, uint32 ppcStart, uint64 x86Start, uint32 samples)
++{
++	const uint32 count = s_cremaJitNext.load(std::memory_order_acquire);
++	const uint32 total = std::min(count, kCremaJitRanges);
++	for (uint32 i = 0; i < total; i++)
++	{
++		const CremaJitRange& r = s_cremaJitRanges[(count - 1 - i) % kCremaJitRanges];
++		if (r.x86Start.load(std::memory_order_acquire) != x86Start || r.ppcStart.load(std::memory_order_relaxed) != ppcStart)
++			continue;
++		const uint32 ppcSize = std::min<uint32>(r.ppcSize.load(std::memory_order_relaxed), 0x10000);
++		const uint32 x86Size = std::min<uint32>(r.x86Size.load(std::memory_order_relaxed), 0x40000);
++		if (!memory_isAddressRangeAccessible(ppcStart, ppcSize))
++			return;
++		const uint32 header[5] = {0x434e4648, ppcStart, ppcSize, x86Size, samples}; // "HFNC"
++		write(fd, header, sizeof(header));
++		write(fd, &x86Start, sizeof(x86Start));
++		write(fd, memory_base + ppcStart, ppcSize);
++		static uint8 copy[0x40000];
++		memcpy(copy, (const void*)x86Start, x86Size);
++		write(fd, copy, x86Size);
++		return;
++	}
++}
++
 +// hang.log: what the recompiler thread is doing (one thread compiles everything: while it is busy
 +// with one function, newly reached game code runs in the much slower interpreter)
 +extern "C" void ps4_recompiler_status(int fd)
@@ -851,7 +897,7 @@ index c9758f3..b9a8b9c 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -174,6 +449,48 @@ void PPCRecompiler_attemptEnter(PPCInterpreter_t* hCPU, uint32 enterAddress)
+@@ -174,6 +495,48 @@ void PPCRecompiler_attemptEnter(PPCInterpreter_t* hCPU, uint32 enterAddress)
  }
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext);
  
@@ -900,7 +946,7 @@ index c9758f3..b9a8b9c 100644
  PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PPCRange_t range, std::set<uint32>& entryAddresses, std::vector<std::pair<MPTR, uint32>>& entryPointsOut, PPCFunctionBoundaryTracker& boundaryTracker)
  {
  	if (range.startAddress >= PPC_REC_CODE_AREA_END)
-@@ -207,9 +524,21 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+@@ -207,9 +570,21 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
  	// generate intermediate code
  	ppcImlGenContext_t ppcImlGenContext = { 0 };
  	ppcImlGenContext.debug_entryPPCAddress = range.startAddress;
@@ -922,7 +968,7 @@ index c9758f3..b9a8b9c 100644
  		delete ppcRecFunc;
  		return nullptr;
  	}
-@@ -232,10 +561,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+@@ -232,10 +607,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
  		delete ppcRecFunc;
  		return nullptr;
  	}
@@ -942,7 +988,7 @@ index c9758f3..b9a8b9c 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +678,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +724,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -1085,7 +1131,7 @@ index c9758f3..b9a8b9c 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +825,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +871,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -1108,7 +1154,7 @@ index c9758f3..b9a8b9c 100644
  
  	return true;
  }
-@@ -377,6 +862,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +908,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -1117,7 +1163,7 @@ index c9758f3..b9a8b9c 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +875,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +921,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1134,7 +1180,7 @@ index c9758f3..b9a8b9c 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +914,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +960,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1144,7 +1190,7 @@ index c9758f3..b9a8b9c 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +941,115 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +987,115 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1264,7 +1310,7 @@ index c9758f3..b9a8b9c 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1082,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1128,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1348,7 +1394,7 @@ index c9758f3..b9a8b9c 100644
  	}
  }
  
-@@ -504,6 +1171,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1217,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1390,7 +1436,7 @@ index c9758f3..b9a8b9c 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1311,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1357,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1398,7 +1444,7 @@ index c9758f3..b9a8b9c 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1405,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1451,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1411,7 +1457,7 @@ index c9758f3..b9a8b9c 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1418,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1464,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
