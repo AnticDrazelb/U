@@ -946,7 +946,10 @@ void tscProbeCore(int core, double ticksPerUs, char* out, size_t size) {
         }
     });
     a.join();
-    b.join();
+    if (shared->abandon.load())
+        b.detach(); // it may never get to run on that core
+    else
+        b.join();
     if (shared->abandon.load()) {
         snprintf(out, size, " core%d no answer", core);
         return;
