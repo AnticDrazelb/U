@@ -8491,7 +8491,7 @@ index 0000000..b972bf8
 +} // namespace CremaGraphicPacks
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..e89bb50
+index 0000000..d12bc28
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
 @@ -0,0 +1,400 @@
@@ -8555,7 +8555,7 @@ index 0000000..e89bb50
 +		{"language", "Language", "Emulation",
 +			{{"en", "English"}, {"es", "Español"}, {"fr", "Français"}, {"de", "Deutsch"}, {"it", "Italiano"},
 +				{"pt", "Português"}, {"nl", "Nederlands"}, {"pl", "Polski"}, {"tr", "Türkçe"}, {"ru", "Русский"},
-+				{"ja", "日本語"}, {"zh", "中文 (简体)"}, {"ko", "한국어"}},
++				{"ja", "日本語"}, {"zh", "中文 (简体)"}, {"ko", "한국어"}, {"ar", "العربية"}},
 +			"en", false, "The menus' language, and the Wii U's system language where it has it."},
 +		{"mii_data", "Mii Data When Missing", "Emulation",
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
@@ -8964,10 +8964,10 @@ index 0000000..2743734
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..4e18b23
+index 0000000..e5d42b3
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3450 @@
+@@ -0,0 +1,3492 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -10131,6 +10131,8 @@ index 0000000..4e18b23
 +				cjk.AddText(ReadFile(m_assetsDir + "/xmb/lang/" + code + ".ini").c_str());
 +			for (const auto& language : PS4Lang::All())
 +				cjk.AddText(language.name);
++			static const ImWchar arabic[] = {0x0600, 0x06FF, 0xFB50, 0xFDFF, 0xFE70, 0xFEFF, 0};
++			cjk.AddRanges(arabic);
 +			cjk.BuildRanges(&s_cjkRanges);
 +		}
 +		auto addFont = [&](const char* file, bool bold) {
@@ -11265,6 +11267,46 @@ index 0000000..4e18b23
 +	// line has no space (Japanese and Chinese are written without them).
 +	std::string Menu::WrapText(ImFont* font, float size, const std::string& text, float width)
 +	{
++		// Arabic comes in visual order (PS4Lang::T): each paragraph's words from the right end,
++		// where it starts, each line keeping the words' order on screen
++		if (PS4Lang::RightToLeft(text))
++		{
++			auto widthOf = [&](const std::string& t) { return font->CalcTextSizeA(size, FLT_MAX, 0.0f, t.c_str()).x; };
++			std::string out;
++			size_t start = 0;
++			while (true)
++			{
++				const size_t end = text.find('\n', start);
++				const std::string paragraph = text.substr(start, end == std::string::npos ? end : end - start);
++				std::vector<std::string> words;
++				for (size_t at = 0;;)
++				{
++					const size_t space = paragraph.find(' ', at);
++					words.push_back(paragraph.substr(at, space == std::string::npos ? space : space - at));
++					if (space == std::string::npos)
++						break;
++					at = space + 1;
++				}
++				std::string line;
++				for (auto it = words.rbegin(); it != words.rend(); ++it)
++				{
++					const std::string candidate = line.empty() ? *it : *it + " " + line;
++					if (!line.empty() && widthOf(candidate) > width)
++					{
++						out += line + "\n";
++						line = *it;
++					}
++					else
++						line = candidate;
++				}
++				out += line;
++				if (end == std::string::npos)
++					break;
++				out += "\n";
++				start = end + 1;
++			}
++			return out;
++		}
 +		std::string out;
 +		std::string line;
 +		size_t lastSpace = std::string::npos;
@@ -13223,10 +13265,10 @@ index 0000000..5157e21
 +}  // namespace PS4Glyphs
 diff --git a/src/gui/ps4/launcher/PS4Lang.cpp b/src/gui/ps4/launcher/PS4Lang.cpp
 new file mode 100644
-index 0000000..c37babe
+index 0000000..5546b53
 --- /dev/null
 +++ b/src/gui/ps4/launcher/PS4Lang.cpp
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,613 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -13253,7 +13295,7 @@ index 0000000..c37babe
 +    {"de", "Deutsch", 1, 2},       {"it", "Italiano", 4, 5},  {"pt", "Português", 0, 1},
 +    {"nl", "Nederlands", 5, 6},    {"pl", "Polski", 0, 1},    {"tr", "Türkçe", 0, 1},
 +    {"ru", "Русский", 0, 1},       {"ja", "日本語", 0, 0},     {"zh", "中文 (简体)", 0, 7},
-+    {"ko", "한국어", 0, 9},
++    {"ko", "한국어", 0, 9},       {"ar", "العربية", 0, 1},
 +};
 +
 +struct Pattern
@@ -13347,6 +13389,319 @@ index 0000000..c37babe
 +  }
 +  return out;
 +}
++
++// Arabic (Crema): ImGui draws glyphs left to right, one per code point, so Arabic text is turned
++// into what to draw: each letter in its joined form (Arabic Presentation Forms-B, with the lam-alef
++// ligatures; vowel marks don't break the joining) and the line in visual order - right to left,
++// with runs of Latin letters and numbers (and the separators inside numbers) kept left to right
++// and brackets mirrored. A simple form of the Unicode bidi algorithm: one level, neutrals between
++// two runs of the same direction take it, others the paragraph's (right to left).
++bool IsArabic(char32_t c)
++{
++  return (c >= 0x0600 && c <= 0x06FF) || (c >= 0x0750 && c <= 0x077F) || (c >= 0xFB50 && c <= 0xFDFF) ||
++         (c >= 0xFE70 && c <= 0xFEFF);
++}
++
++bool IsTransparent(char32_t c)
++{
++  return (c >= 0x064B && c <= 0x065F) || c == 0x0670 || (c >= 0x06D6 && c <= 0x06ED);
++}
++
++// isolated, final, initial, medial forms of U+0621..U+064A (0: none; right-joining letters have
++// no initial or medial form)
++struct ArabicForms
++{
++  char16_t isolated, final, initial, medial;
++};
++const ArabicForms kForms[] = {
++    {0xFE80, 0, 0, 0},                {0xFE81, 0xFE82, 0, 0},           {0xFE83, 0xFE84, 0, 0},
++    {0xFE85, 0xFE86, 0, 0},           {0xFE87, 0xFE88, 0, 0},           {0xFE89, 0xFE8A, 0xFE8B, 0xFE8C},
++    {0xFE8D, 0xFE8E, 0, 0},           {0xFE8F, 0xFE90, 0xFE91, 0xFE92}, {0xFE93, 0xFE94, 0, 0},
++    {0xFE95, 0xFE96, 0xFE97, 0xFE98}, {0xFE99, 0xFE9A, 0xFE9B, 0xFE9C}, {0xFE9D, 0xFE9E, 0xFE9F, 0xFEA0},
++    {0xFEA1, 0xFEA2, 0xFEA3, 0xFEA4}, {0xFEA5, 0xFEA6, 0xFEA7, 0xFEA8}, {0xFEA9, 0xFEAA, 0, 0},
++    {0xFEAB, 0xFEAC, 0, 0},           {0xFEAD, 0xFEAE, 0, 0},           {0xFEAF, 0xFEB0, 0, 0},
++    {0xFEB1, 0xFEB2, 0xFEB3, 0xFEB4}, {0xFEB5, 0xFEB6, 0xFEB7, 0xFEB8}, {0xFEB9, 0xFEBA, 0xFEBB, 0xFEBC},
++    {0xFEBD, 0xFEBE, 0xFEBF, 0xFEC0}, {0xFEC1, 0xFEC2, 0xFEC3, 0xFEC4}, {0xFEC5, 0xFEC6, 0xFEC7, 0xFEC8},
++    {0xFEC9, 0xFECA, 0xFECB, 0xFECC}, {0xFECD, 0xFECE, 0xFECF, 0xFED0}, {0, 0, 0, 0},
++    {0, 0, 0, 0},                     {0, 0, 0, 0},                     {0, 0, 0, 0},
++    {0, 0, 0, 0},                     {0, 0, 0, 0}, // U+063B..U+0640 (0640: tatweel, below)
++    {0xFED1, 0xFED2, 0xFED3, 0xFED4}, {0xFED5, 0xFED6, 0xFED7, 0xFED8}, {0xFED9, 0xFEDA, 0xFEDB, 0xFEDC},
++    {0xFEDD, 0xFEDE, 0xFEDF, 0xFEE0}, {0xFEE1, 0xFEE2, 0xFEE3, 0xFEE4}, {0xFEE5, 0xFEE6, 0xFEE7, 0xFEE8},
++    {0xFEE9, 0xFEEA, 0xFEEB, 0xFEEC}, {0xFEED, 0xFEEE, 0, 0},           {0xFEEF, 0xFEF0, 0, 0},
++    {0xFEF1, 0xFEF2, 0xFEF3, 0xFEF4},
++};
++
++const ArabicForms* FormsOf(char32_t c)
++{
++  if (c < 0x0621 || c > 0x064A || c == 0x0640)
++    return nullptr;
++  const ArabicForms* forms = &kForms[c - 0x0621];
++  return forms->isolated ? forms : nullptr;
++}
++
++bool JoinsNext(char32_t c)  // can connect to the letter after it (dual-joining, or tatweel)
++{
++  if (c == 0x0640)
++    return true;
++  const ArabicForms* forms = FormsOf(c);
++  return forms && forms->initial;
++}
++
++bool JoinsPrevious(char32_t c)  // can connect to the letter before it
++{
++  if (c == 0x0640)
++    return true;
++  const ArabicForms* forms = FormsOf(c);
++  return forms && forms->final;
++}
++
++std::u32string Decode(const std::string& text)
++{
++  std::u32string out;
++  for (size_t i = 0; i < text.size();)
++  {
++    const unsigned char b = (unsigned char)text[i];
++    char32_t c;
++    size_t n;
++    if (b < 0x80) { c = b; n = 1; }
++    else if ((b >> 5) == 6) { c = b & 0x1F; n = 2; }
++    else if ((b >> 4) == 14) { c = b & 0x0F; n = 3; }
++    else { c = b & 0x07; n = 4; }
++    for (size_t k = 1; k < n && i + k < text.size(); k++)
++      c = (c << 6) | ((unsigned char)text[i + k] & 0x3F);
++    out.push_back(c);
++    i += n;
++  }
++  return out;
++}
++
++std::string Encode(const std::u32string& text)
++{
++  std::string out;
++  for (char32_t c : text)
++  {
++    if (c < 0x80)
++      out += (char)c;
++    else if (c < 0x800)
++    {
++      out += (char)(0xC0 | (c >> 6));
++      out += (char)(0x80 | (c & 0x3F));
++    }
++    else if (c < 0x10000)
++    {
++      out += (char)(0xE0 | (c >> 12));
++      out += (char)(0x80 | ((c >> 6) & 0x3F));
++      out += (char)(0x80 | (c & 0x3F));
++    }
++    else
++    {
++      out += (char)(0xF0 | (c >> 18));
++      out += (char)(0x80 | ((c >> 12) & 0x3F));
++      out += (char)(0x80 | ((c >> 6) & 0x3F));
++      out += (char)(0x80 | (c & 0x3F));
++    }
++  }
++  return out;
++}
++
++std::u32string Shape(const std::u32string& in)
++{
++  std::u32string out;
++  auto neighbour = [&](size_t from, int step) -> char32_t {
++    for (long i = (long)from + step; i >= 0 && i < (long)in.size(); i += step)
++    {
++      if (!IsTransparent(in[i]))
++        return in[i];
++    }
++    return 0;
++  };
++  for (size_t i = 0; i < in.size(); i++)
++  {
++    const char32_t c = in[i];
++    const ArabicForms* forms = FormsOf(c);
++    if (!forms)
++    {
++      out.push_back(c);
++      continue;
++    }
++    const bool fromPrevious = JoinsNext(neighbour(i, -1)) && forms->final;
++    // lam + alef: one ligature
++    if (c == 0x0644)
++    {
++      size_t next = i + 1;
++      while (next < in.size() && IsTransparent(in[next]))
++        next++;
++      if (next < in.size())
++      {
++        char16_t ligature = 0;
++        switch (in[next])
++        {
++        case 0x0622: ligature = 0xFEF5; break;
++        case 0x0623: ligature = 0xFEF7; break;
++        case 0x0625: ligature = 0xFEF9; break;
++        case 0x0627: ligature = 0xFEFB; break;
++        }
++        if (ligature)
++        {
++          out.push_back(fromPrevious ? ligature + 1 : ligature);
++          for (size_t k = i + 1; k < next; k++)
++            out.push_back(in[k]);  // vowel marks between them
++          i = next;
++          continue;
++        }
++      }
++    }
++    const char32_t after = neighbour(i, 1);
++    const bool toNext = forms->initial && after && JoinsPrevious(after);
++    if (fromPrevious && toNext)
++      out.push_back(forms->medial);
++    else if (fromPrevious)
++      out.push_back(forms->final);
++    else if (toNext)
++      out.push_back(forms->initial);
++    else
++      out.push_back(forms->isolated);
++  }
++  return out;
++}
++
++char32_t Mirrored(char32_t c)
++{
++  switch (c)
++  {
++  case '(': return ')';
++  case ')': return '(';
++  case '[': return ']';
++  case ']': return '[';
++  case '{': return '}';
++  case '}': return '{';
++  case '<': return '>';
++  case '>': return '<';
++  case 0x00AB: return 0x00BB;
++  case 0x00BB: return 0x00AB;
++  }
++  return c;
++}
++
++// One line: shaped and in visual order.
++std::u32string VisualLine(const std::u32string& logical)
++{
++  const std::u32string text = Shape(logical);
++  const size_t n = text.size();
++  enum Dir : char { L, R, N };
++  std::vector<Dir> dir(n);
++  auto isDigit = [](char32_t c) { return (c >= '0' && c <= '9') || (c >= 0x0660 && c <= 0x0669); };
++  for (size_t i = 0; i < n; i++)
++  {
++    const char32_t c = text[i];
++    if (IsArabic(c))
++      dir[i] = R;
++    else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || isDigit(c) ||
++             (c >= 0xC0 && c < 0x2000) || (c >= 0x2E80 && c < 0xFB00))
++      dir[i] = L;
++    else
++      dir[i] = N;
++  }
++  // separators inside numbers and words (1.95, 192.168.0.10, a/b, file.txt) stay with them
++  for (size_t i = 1; i + 1 < n; i++)
++  {
++    const char32_t c = text[i];
++    if (dir[i] == N && dir[i - 1] == L && dir[i + 1] == L && (c == '.' || c == ',' || c == ':' || c == '/' || c == '-' || c == '_'))
++      dir[i] = L;
++  }
++  // bracket pairs take the direction of what they hold: left to right around Latin text and
++  // numbers only, else right to left ("(Crema)" stays as written in an Arabic line)
++  {
++    std::vector<size_t> open;
++    for (size_t i = 0; i < n; i++)
++    {
++      const char32_t c = text[i];
++      if (c == '(' || c == '[' || c == '{')
++        open.push_back(i);
++      else if ((c == ')' || c == ']' || c == '}') && !open.empty())
++      {
++        const size_t from = open.back();
++        open.pop_back();
++        bool hasL = false, hasR = false;
++        for (size_t k = from + 1; k < i; k++)
++        {
++          hasL |= dir[k] == L;
++          hasR |= dir[k] == R;
++        }
++        if (hasL || hasR)
++          dir[from] = dir[i] = hasR ? R : L;
++      }
++    }
++  }
++  // neutral runs: the direction on both sides if it is the same, else right to left
++  for (size_t i = 0; i < n;)
++  {
++    if (dir[i] != N)
++    {
++      i++;
++      continue;
++    }
++    size_t end = i;
++    while (end < n && dir[end] == N)
++      end++;
++    const Dir before = i > 0 ? dir[i - 1] : R;
++    const Dir after = end < n ? dir[end] : R;
++    const Dir resolved = before == after ? before : R;
++    for (size_t k = i; k < end; k++)
++      dir[k] = resolved;
++    i = end;
++  }
++  // right to left as a whole, the left-to-right runs back in their order
++  std::u32string visual(text.rbegin(), text.rend());
++  std::vector<Dir> visualDir(dir.rbegin(), dir.rend());
++  for (size_t i = 0; i < n;)
++  {
++    if (visualDir[i] != L)
++    {
++      visual[i] = Mirrored(visual[i]);
++      i++;
++      continue;
++    }
++    size_t end = i;
++    while (end < n && visualDir[end] == L)
++      end++;
++    std::reverse(visual.begin() + i, visual.begin() + end);
++    i = end;
++  }
++  return visual;
++}
++
++bool HasArabic(const std::string& text)
++{
++  // UTF-8 lead bytes of U+0600..U+07FF (D8..DF) or U+FB50..U+FEFF (EF AD..EF BB)
++  for (size_t i = 0; i < text.size(); i++)
++  {
++    const unsigned char b = (unsigned char)text[i];
++    if (b >= 0xD8 && b <= 0xDD)
++      return true;
++    if (b == 0xEF && i + 1 < text.size() && (unsigned char)text[i + 1] >= 0xAD && (unsigned char)text[i + 1] <= 0xBB)
++      return true;
++  }
++  return false;
++}
++
++std::string Visual(const std::string& logical)
++{
++  std::string out;
++  size_t start = 0;
++  while (true)
++  {
++    const size_t end = logical.find('\n', start);
++    out += Encode(VisualLine(Decode(logical.substr(start, end == std::string::npos ? end : end - start))));
++    if (end == std::string::npos)
++      break;
++    out += '\n';
++    start = end + 1;
++  }
++  return out;
++}
++
++std::unordered_map<std::string, std::string> s_visual;  // Arabic texts as drawn
 +}  // namespace
 +
 +const std::vector<Language>& All()
@@ -13372,6 +13727,7 @@ index 0000000..c37babe
 +  s_patterns.clear();
 +  s_cache.clear();
 +  s_untranslated.clear();
++  s_visual.clear();
 +  if (std::string(s_current->code) == "en")
 +    return;
 +  const std::string path = assets_dir + "/xmb/lang/" + s_current->code + ".ini";
@@ -13408,7 +13764,8 @@ index 0000000..c37babe
 +  ps4_boot_trace(text);
 +}
 +
-+const std::string& T(const std::string& english)
++// The translation in reading order (Arabic not shaped yet).
++const std::string& Translate(const std::string& english)
 +{
 +  std::lock_guard lock(s_mutex);
 +  if (s_exact.empty() && s_patterns.empty())
@@ -13434,7 +13791,7 @@ index 0000000..c37babe
 +      const size_t at = english.find(separator, start);
 +      const std::string piece = english.substr(start, at == std::string::npos ? at : at - start);
 +      s_mutex.unlock();
-+      const std::string translated = T(piece);
++      const std::string translated = Translate(piece);
 +      s_mutex.lock();
 +      changed = changed || translated != piece;
 +      joined += translated;
@@ -13468,13 +13825,31 @@ index 0000000..c37babe
 +  return english;
 +}
 +
++bool RightToLeft(const std::string& text)
++{
++  return HasArabic(text);
++}
++
++const std::string& T(const std::string& english)
++{
++  const std::string& translated = Translate(english);
++  if (!HasArabic(translated))
++    return translated;
++  std::lock_guard lock(s_mutex);
++  if (const auto it = s_visual.find(translated); it != s_visual.end())
++    return it->second;
++  if (s_visual.size() > 20000)
++    s_visual.clear();
++  return s_visual.emplace(translated, Visual(translated)).first->second;
++}
++
 +const char* T(const char* english)
 +{
 +  if (!english)
 +    return english;
 +  {
 +    std::lock_guard lock(s_mutex);
-+    if (s_exact.empty() && s_patterns.empty())
++    if (s_exact.empty() && s_patterns.empty() && !HasArabic(english))
 +      return english;
 +  }
 +  const std::string text(english);
@@ -13500,15 +13875,19 @@ index 0000000..c37babe
 +    if (std::ifstream(path).good())
 +      fonts.push_back(path);
 +  }
++  // Arabic (Crema): always, for its name in the language list
++  const std::string arabic = assets_dir + "/xmb/fonts/NotoSansArabic" + (bold ? "-Bold" : "-Regular") + ".ttf";
++  if (std::ifstream(arabic).good())
++    fonts.push_back(arabic);
 +  return fonts;
 +}
 +}  // namespace PS4Lang
 diff --git a/src/gui/ps4/launcher/PS4Lang.h b/src/gui/ps4/launcher/PS4Lang.h
 new file mode 100644
-index 0000000..627595f
+index 0000000..3adb16a
 --- /dev/null
 +++ b/src/gui/ps4/launcher/PS4Lang.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,44 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -13542,8 +13921,12 @@ index 0000000..627595f
 +void Load(const std::string& assets_dir, const std::string& code);
 +
 +// The text in the current language (cached). The result stays valid until the next Load.
++// Arabic comes back as drawn: letters joined, the line right to left.
 +const std::string& T(const std::string& english);
 +const char* T(const char* english);
++
++// Arabic text (as T returns it: in visual order) - wrapped from the right.
++bool RightToLeft(const std::string& text);
 +
 +// Font files with the glyphs the menus need beyond Nunito's (Japanese, Chinese, Korean - only
 +// the characters the translations use), the current language's first. regular or bold.
