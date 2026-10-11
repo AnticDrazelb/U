@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <thread>
+#include <memory>
 #include <immintrin.h>
 #include <sys/types.h>
 
@@ -881,65 +882,92 @@ void* startOnAppCores(void* raw) {
 // Do the cores' time stamp counters agree? Cemu's Wii U clock (PPCTimer.cpp) and parts of Crema
 // read the TSC on whatever core a thread runs on, and threads move between the app's cores. A
 // thread pinned to core 0 and one pinned to core N pass a counter value back and forth; the
-// smallest differences each way give the offset (core N minus core 0) and the round trip.
-extern "C" void ps4_tsc_probe() {
-    struct Shared {
-        std::atomic<uint64_t> value{0};
-        std::atomic<int> turn{0};
-    };
-    char line[400];
-    int len = snprintf(line, sizeof(line), "tsc: offsets from core 0 (us):");
-    const double ticksPerUs = (double)sceKernelGetTscFrequency_ps4() / 1e6;
-    for (int core = 1; core < 7; core++) {
-        Shared shared;
-        uint64_t minAB = ~0ull, minBA = ~0ull;
-        constexpr int kRounds = 200;
-        auto pinned = [](int c) {
-            reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 1ull << c);
-            sched_yield();
-        };
-        std::thread a([&] {
-            pinned(0);
-            for (int k = 0; k < kRounds; k++) {
-                // A -> B: A writes its counter, B reads its own
-                shared.value.store(__builtin_ia32_rdtsc(), std::memory_order_release);
-                shared.turn.store(4 * k + 1, std::memory_order_release);
-                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 2)
-                    _mm_pause();
-                // B -> A
-                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 3)
-                    _mm_pause();
-                const uint64_t now = __builtin_ia32_rdtsc();
-                const uint64_t d = now - shared.value.load(std::memory_order_acquire);
-                if ((int64_t)d < (int64_t)minBA || minBA == ~0ull)
-                    minBA = d;
-                shared.turn.store(4 * k + 4, std::memory_order_release);
-            }
-        });
-        std::thread b([&] {
-            pinned(core);
-            for (int k = 0; k < kRounds; k++) {
-                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 1)
-                    _mm_pause();
-                const uint64_t now = __builtin_ia32_rdtsc();
-                const uint64_t d = now - shared.value.load(std::memory_order_acquire);
-                if ((int64_t)d < (int64_t)minAB || minAB == ~0ull)
-                    minAB = d;
-                shared.turn.store(4 * k + 2, std::memory_order_release);
-                shared.value.store(__builtin_ia32_rdtsc(), std::memory_order_release);
-                shared.turn.store(4 * k + 3, std::memory_order_release);
-                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 4)
-                    _mm_pause();
-            }
-        });
-        a.join();
-        b.join();
-        // minAB = offset + latency, minBA = -offset + latency
-        const double offset = ((double)(int64_t)minAB - (double)(int64_t)minBA) / 2.0 / ticksPerUs;
-        const double latency = ((double)(int64_t)minAB + (double)(int64_t)minBA) / 2.0 / ticksPerUs;
-        len += snprintf(line + len, sizeof(line) - len, " core%d %+.2f (trip %.2f)", core, offset, latency);
+// smallest differences each way give the offset (core N minus core 0) and the round trip. In a
+// detached thread, every wait limited to 0.2 s: a core the app can't run on (2.10 waited forever
+// for one, and the game never started) is reported as "no answer".
+namespace {
+struct TscShared {
+    std::atomic<uint64_t> value{0};
+    std::atomic<int> turn{0};
+    std::atomic<bool> abandon{false};
+    uint64_t limit = 0;  // TSC ticks a wait may take
+};
+
+bool tscWait(TscShared& s, int turn) {
+    const uint64_t start = __builtin_ia32_rdtsc();
+    while (s.turn.load(std::memory_order_acquire) != turn) {
+        if (s.abandon.load(std::memory_order_relaxed))
+            return false;
+        // the start was read on this core: the limit doesn't depend on other cores' counters
+        if (__builtin_ia32_rdtsc() - start > s.limit) {
+            s.abandon.store(true);
+            return false;
+        }
+        _mm_pause();
     }
-    ps4_boot_trace(line);
+    return true;
+}
+
+void tscProbeCore(int core, double ticksPerUs, char* out, size_t size) {
+    auto* shared = new TscShared;  // leaked if a side never ends (it would still read it)
+    shared->limit = (uint64_t)(ticksPerUs * 200000);
+    auto minAB = std::make_shared<std::atomic<uint64_t>>(~0ull);
+    auto minBA = std::make_shared<std::atomic<uint64_t>>(~0ull);
+    constexpr int kRounds = 200;
+    auto pin = [](int c) {
+        reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 1ull << c);
+        sched_yield();
+    };
+    std::thread a([shared, minBA, pin] {
+        pin(0);
+        for (int k = 0; k < kRounds; k++) {
+            shared->value.store(__builtin_ia32_rdtsc(), std::memory_order_release);
+            shared->turn.store(4 * k + 1, std::memory_order_release);
+            if (!tscWait(*shared, 4 * k + 3))
+                return;
+            const uint64_t d = __builtin_ia32_rdtsc() - shared->value.load(std::memory_order_acquire);
+            if ((int64_t)d < (int64_t)minBA->load() || minBA->load() == ~0ull)
+                minBA->store(d);
+            shared->turn.store(4 * k + 4, std::memory_order_release);
+        }
+    });
+    std::thread b([shared, minAB, core, pin] {
+        pin(core);
+        for (int k = 0; k < kRounds; k++) {
+            if (!tscWait(*shared, 4 * k + 1))
+                return;
+            const uint64_t d = __builtin_ia32_rdtsc() - shared->value.load(std::memory_order_acquire);
+            if ((int64_t)d < (int64_t)minAB->load() || minAB->load() == ~0ull)
+                minAB->store(d);
+            shared->value.store(__builtin_ia32_rdtsc(), std::memory_order_release);
+            shared->turn.store(4 * k + 3, std::memory_order_release);
+            if (!tscWait(*shared, 4 * k + 4))
+                return;
+        }
+    });
+    a.join();
+    b.join();
+    if (shared->abandon.load()) {
+        snprintf(out, size, " core%d no answer", core);
+        return;
+    }
+    const double ab = (double)(int64_t)minAB->load(), ba = (double)(int64_t)minBA->load();
+    snprintf(out, size, " core%d %+.2f (trip %.2f)", core, (ab - ba) / 2.0 / ticksPerUs, (ab + ba) / 2.0 / ticksPerUs);
+}
+}  // namespace
+
+extern "C" void ps4_tsc_probe() {
+    std::thread([] {
+        char line[400];
+        int len = snprintf(line, sizeof(line), "tsc: offsets from core 0 (us):");
+        const double ticksPerUs = (double)sceKernelGetTscFrequency_ps4() / 1e6;
+        for (int core = 1; core < 7 && len < (int)sizeof(line) - 40; core++) {
+            char part[64];
+            tscProbeCore(core, ticksPerUs, part, sizeof(part));
+            len += snprintf(line + len, sizeof(line) - len, "%s", part);
+        }
+        ps4_boot_trace(line);
+    }).detach();
 }
 
 // The emulation's busiest threads (the emulated CPU cores, the GPU thread) above the default
