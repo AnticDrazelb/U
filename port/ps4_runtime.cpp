@@ -25,6 +25,8 @@
 #include <time.h>
 
 #include <atomic>
+#include <thread>
+#include <immintrin.h>
 #include <sys/types.h>
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes.
@@ -875,6 +877,70 @@ void* startOnAppCores(void* raw) {
     return start.start(start.arg);
 }
 }  // namespace
+
+// Do the cores' time stamp counters agree? Cemu's Wii U clock (PPCTimer.cpp) and parts of Crema
+// read the TSC on whatever core a thread runs on, and threads move between the app's cores. A
+// thread pinned to core 0 and one pinned to core N pass a counter value back and forth; the
+// smallest differences each way give the offset (core N minus core 0) and the round trip.
+extern "C" void ps4_tsc_probe() {
+    struct Shared {
+        std::atomic<uint64_t> value{0};
+        std::atomic<int> turn{0};
+    };
+    char line[400];
+    int len = snprintf(line, sizeof(line), "tsc: offsets from core 0 (us):");
+    const double ticksPerUs = (double)sceKernelGetTscFrequency_ps4() / 1e6;
+    for (int core = 1; core < 7; core++) {
+        Shared shared;
+        uint64_t minAB = ~0ull, minBA = ~0ull;
+        constexpr int kRounds = 200;
+        auto pinned = [](int c) {
+            reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 1ull << c);
+            sched_yield();
+        };
+        std::thread a([&] {
+            pinned(0);
+            for (int k = 0; k < kRounds; k++) {
+                // A -> B: A writes its counter, B reads its own
+                shared.value.store(__builtin_ia32_rdtsc(), std::memory_order_release);
+                shared.turn.store(4 * k + 1, std::memory_order_release);
+                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 2)
+                    _mm_pause();
+                // B -> A
+                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 3)
+                    _mm_pause();
+                const uint64_t now = __builtin_ia32_rdtsc();
+                const uint64_t d = now - shared.value.load(std::memory_order_acquire);
+                if ((int64_t)d < (int64_t)minBA || minBA == ~0ull)
+                    minBA = d;
+                shared.turn.store(4 * k + 4, std::memory_order_release);
+            }
+        });
+        std::thread b([&] {
+            pinned(core);
+            for (int k = 0; k < kRounds; k++) {
+                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 1)
+                    _mm_pause();
+                const uint64_t now = __builtin_ia32_rdtsc();
+                const uint64_t d = now - shared.value.load(std::memory_order_acquire);
+                if ((int64_t)d < (int64_t)minAB || minAB == ~0ull)
+                    minAB = d;
+                shared.turn.store(4 * k + 2, std::memory_order_release);
+                shared.value.store(__builtin_ia32_rdtsc(), std::memory_order_release);
+                shared.turn.store(4 * k + 3, std::memory_order_release);
+                while (shared.turn.load(std::memory_order_acquire) != 4 * k + 4)
+                    _mm_pause();
+            }
+        });
+        a.join();
+        b.join();
+        // minAB = offset + latency, minBA = -offset + latency
+        const double offset = ((double)(int64_t)minAB - (double)(int64_t)minBA) / 2.0 / ticksPerUs;
+        const double latency = ((double)(int64_t)minAB + (double)(int64_t)minBA) / 2.0 / ticksPerUs;
+        len += snprintf(line + len, sizeof(line) - len, " core%d %+.2f (trip %.2f)", core, offset, latency);
+    }
+    ps4_boot_trace(line);
+}
 
 // The emulation's busiest threads (the emulated CPU cores, the GPU thread) above the default
 // priority (256 highest .. 767 lowest, 700 default): logging, loading and shader compiling never

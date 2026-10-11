@@ -2833,7 +2833,7 @@ index 4f85537..1971d3c 100644
  		while (true)
  		{
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..46ee5cd 100644
+index 9fe4bea..da6faf7 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,6 +23,8 @@
@@ -2857,7 +2857,22 @@ index 9fe4bea..46ee5cd 100644
  namespace coreinit
  {
  #ifdef __arm64__
-@@ -1180,6 +1187,9 @@ namespace coreinit
+@@ -91,7 +98,13 @@ namespace coreinit
+ 		uint32 selectedCore;
+ 	};
+ 
+-	std::unordered_map<OSThread_t*, OSHostThread*> s_threadToFiber;
++	// Crema: a plain hash (libc++ hashes pointers with murmur2: ~3% of a busy emulated core in
++	// Breath of the Wild, looked up at every thread switch). OSThread_t is 8-byte aligned.
++	struct OSThreadPtrHash
++	{
++		size_t operator()(const OSThread_t* t) const { return (size_t)((uintptr_t)t >> 3); }
++	};
++	std::unordered_map<OSThread_t*, OSHostThread*, OSThreadPtrHash> s_threadToFiber;
+ 
+ 	bool __CemuIsMulticoreMode()
+ 	{
+@@ -1180,6 +1193,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -2867,7 +2882,7 @@ index 9fe4bea..46ee5cd 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1202,134 @@ namespace coreinit
+@@ -1192,6 +1208,134 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -3002,7 +3017,7 @@ index 9fe4bea..46ee5cd 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1348,9 @@ namespace coreinit
+@@ -1210,6 +1354,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -3012,7 +3027,7 @@ index 9fe4bea..46ee5cd 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1374,16 @@ namespace coreinit
+@@ -1233,6 +1380,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -3029,7 +3044,7 @@ index 9fe4bea..46ee5cd 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1263,6 +1414,28 @@ namespace coreinit
+@@ -1263,6 +1420,28 @@ namespace coreinit
  				}
  				__OSUnlockScheduler();
  			}
@@ -3058,7 +3073,7 @@ index 9fe4bea..46ee5cd 100644
  			if (isMainCore)
  			{
  				__OSCheckSystemEvents();
-@@ -1391,6 +1564,11 @@ namespace coreinit
+@@ -1391,6 +1570,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -3070,7 +3085,7 @@ index 9fe4bea..46ee5cd 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1825,159 @@ namespace coreinit
+@@ -1647,3 +1831,159 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
@@ -6619,10 +6634,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..c03daf3
+index 0000000..56dca4f
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,873 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -6674,6 +6689,7 @@ index 0000000..c03daf3
 +
 +extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
 +extern "C" void ps4_sampler_start(); // port/ps4_sampler.cpp: the profiler (samples.log)
++extern "C" void ps4_tsc_probe(); // port/ps4_runtime.cpp: do the cores' time stamp counters agree
 +std::string CremaRecompilerStats(); // PPCRecompiler.cpp: compiled / failed functions, queue
 +namespace coreinit
 +{
@@ -7309,6 +7325,7 @@ index 0000000..c03daf3
 +		// /data/DolphinPS4/flight), read when the device is created (after this)
 +		if (CremaSettings::On("profiler", gameId))
 +		{
++			ps4_tsc_probe();
 +			ps4_sampler_start();
 +			// what each Wii U thread does (running, waiting for its core or on what), every 30 s
 +			std::thread([] {
