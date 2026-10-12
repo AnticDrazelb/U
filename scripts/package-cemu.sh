@@ -49,7 +49,14 @@ cp "$BUILD/src/CemuBin_eboot/CemuBin.oelf" "$PS4_BUILD_ROOT/oelf/v$VERSION.oelf"
 cp "$SRC/bin/Cemu_release" "$PS4_BUILD_ROOT/oelf/v$VERSION.elf"
 if [ "${1:-}" = upload ]; then
     curl -sS -T "$PKG" "$HOST/data/pkg/"
-    echo "uploaded $(basename "$PKG")"
+    # the console's listing must show the new size: an upload from WSL has reported success
+    # while the old package stayed (2026-10-12)
+    REMOTE_SIZE="$(curl -s --max-time 30 "$HOST/data/pkg/" | awk -v f="$(basename "$PKG")" '$NF == f {print $5}')"
+    if [ "$REMOTE_SIZE" != "$(stat -c %s "$PKG")" ]; then
+        echo "UPLOAD FAILED: /data/pkg/$(basename "$PKG") is ${REMOTE_SIZE:-missing} bytes, not $(stat -c %s "$PKG")" >&2
+        exit 1
+    fi
+    echo "uploaded $(basename "$PKG") ($REMOTE_SIZE bytes, checked)"
     # the package from before the rename (CEMU00001), superseded: /data/pkg stays clean
     curl -sS -Q "DELE /data/pkg/IV0000-CEMU00001_00-CEMUPS4000000000.pkg" "$HOST/" -o /dev/null 2>/dev/null &&
         echo "removed the old IV0000-CEMU00001_00-CEMUPS4000000000.pkg from /data/pkg" || true

@@ -1603,8 +1603,21 @@ index c9758f3..fcbae8b 100644
      // clean up queues
      while(!s_ppcRecompilerState.targetQueue.empty())
          s_ppcRecompilerState.targetQueue.pop();
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
+index bfb2aed..5e6059c 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerIml.h
+@@ -55,6 +55,8 @@ bool PPCRecompilerImlGen_FRSQRTE(ppcImlGenContext_t* ppcImlGenContext, uint32 op
+ bool PPCRecompilerImlGen_FCTIWZ(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PSQ_L(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool withUpdate);
+ bool PPCRecompilerImlGen_PSQ_ST(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool withUpdate);
++bool PPCRecompilerImlGen_PSQ_LX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
++bool PPCRecompilerImlGen_PSQ_STX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
+ bool PPCRecompilerImlGen_PS_MULSX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool isVariant1);
+ bool PPCRecompilerImlGen_PS_MADDSX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool isVariant1);
+ bool PPCRecompilerImlGen_PS_ADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..1735093 100644
+index 89e805d..9c064ce 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -1643,7 +1656,24 @@ index 89e805d..1735093 100644
  	}
  	return true;
  }
-@@ -2968,6 +2973,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
+@@ -1977,6 +1982,16 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+ 				break;
+ 			}
+ 			break;
++		case 6: // PSQ_LX (with bit 25: PSQ_LUX, left to the interpreter)
++			if (PPC_getBits(opcode, 25, 1) != 0 || !PPCRecompilerImlGen_PSQ_LX(ppcImlGenContext, opcode))
++				unsupportedInstructionFound = true;
++			ppcImlGenContext->hasFPUInstruction = true;
++			break;
++		case 7: // PSQ_STX (with bit 25: PSQ_STUX, left to the interpreter)
++			if (PPC_getBits(opcode, 25, 1) != 0 || !PPCRecompilerImlGen_PSQ_STX(ppcImlGenContext, opcode))
++				unsupportedInstructionFound = true;
++			ppcImlGenContext->hasFPUInstruction = true;
++			break;
+ 		case 8: //Sub category - move/negate
+ 			switch (PPC_getBits(opcode, 25, 5))
+ 			{
+@@ -2968,6 +2983,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
  	return basicBlockList;
  }
  
@@ -1654,7 +1684,7 @@ index 89e805d..1735093 100644
  bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBlockInfo& basicBlockInfo)
  {
  	ppcImlGenContext.currentOutputSegment = basicBlockInfo.GetSegmentForInstructionAppend();
-@@ -2984,6 +2993,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
+@@ -2984,6 +3003,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
  		if (PPCRecompiler_decodePPCInstruction(&ppcImlGenContext))
  		{
  			cemuLog_logDebug(LogType::Force, "PPCRecompiler: Unsupported instruction at 0x{:08x}", addressOfCurrentInstruction);
@@ -1664,7 +1694,7 @@ index 89e805d..1735093 100644
  			ppcImlGenContext.currentOutputSegment = nullptr;
  			return false;
  		}
-@@ -3115,6 +3127,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -3115,6 +3137,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  	}
  }
  
@@ -1673,7 +1703,7 @@ index 89e805d..1735093 100644
  bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
  {
  	std::vector<PPCBasicBlockInfo> basicBlockList = PPCRecompiler_DetermineBasicBlockRange(boundaryTracker, entryAddresses);
-@@ -3164,6 +3178,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3164,6 +3188,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  	// generate cycle counters
  	// in theory we could generate these as part of FillBasicBlock() but in the future we might use more complex logic to emit fewer operations
@@ -1687,7 +1717,7 @@ index 89e805d..1735093 100644
  	for (size_t i = 0; i < basicBlockList.size(); i++)
  	{
  		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
-@@ -3171,6 +3192,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3171,6 +3202,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
  		cemu_assert_debug(ppcInstructionCount > 0);
@@ -1703,6 +1733,109 @@ index 89e805d..1735093 100644
  
  		PPCRecompiler_pushBackIMLInstructions(seg, 0, 1);
  		seg->imlList[0].type = PPCREC_IML_TYPE_MACRO;
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp
+index f9c811b..a54e976 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGenFPU.cpp
+@@ -811,6 +811,9 @@ void PPCRecompilerImlGen_EmitPSQLoadCase(ppcImlGenContext_t* ppcImlGenContext, s
+ 	}
+ }
+ 
++bool PPCRecompilerImlGen_PSQ_LoadAt(ppcImlGenContext_t* ppcImlGenContext, sint32 frD, sint32 gqrIndex, bool readPS1, IMLReg gprA, uint32 imm);
++bool PPCRecompilerImlGen_PSQ_StoreAt(ppcImlGenContext_t* ppcImlGenContext, sint32 frD, sint32 gqrIndex, bool storePS1, IMLReg gprA, uint32 imm);
++
+ // PSQ_L and PSQ_LU
+ bool PPCRecompilerImlGen_PSQ_L(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool withUpdate)
+ {
+@@ -824,6 +827,53 @@ bool PPCRecompilerImlGen_PSQ_L(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 	bool readPS1 = (opcode & 0x8000) == false;
+ 
+ 	IMLReg gprA = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0+rA);
++	if (withUpdate)
++	{
++		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_ADD, gprA, gprA, (sint32)imm);
++		imm = 0;
++	}
++	return PPCRecompilerImlGen_PSQ_LoadAt(ppcImlGenContext, frD, gqrIndex, readPS1, gprA, imm);
++}
++
++// Crema: the address of PSQ_LX / PSQ_STX, (rA|0) + rB (in a temporary unless rA is 0)
++static IMLReg PPCRecompilerImlGen_PSQ_IndexedAddress(ppcImlGenContext_t* ppcImlGenContext, sint32 rA, sint32 rB)
++{
++	IMLReg gprB = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0 + rB);
++	if (rA == 0)
++		return gprB;
++	IMLReg gprA = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0 + rA);
++	IMLReg gprEA = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_TEMPORARY + 1);
++	ppcImlGenContext->emitInst().make_r_r_r(PPCREC_IML_OP_ADD, gprEA, gprA, gprB);
++	return gprEA;
++}
++
++// Crema: PSQ_LX and PSQ_STX, the indexed forms (W in bit 21, the GQR in bits 22-24), as the
++// interpreter decodes them. Upstream left them to the interpreter, so a function with one ran
++// interpreted (Ninja Gaiden 3: Razor's Edge, 8 functions). The update forms (PSQ_LUX, PSQ_STUX)
++// still go there: the interpreter treats them as these, without updating rA.
++bool PPCRecompilerImlGen_PSQ_LX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
++{
++	sint32 frD, rA, rB;
++	PPC_OPC_TEMPL_X(opcode, frD, rA, rB);
++	const sint32 gqrIndex = (opcode >> 7) & 7;
++	const bool readPS1 = (opcode & (1 << 10)) == 0;
++	IMLReg gprEA = PPCRecompilerImlGen_PSQ_IndexedAddress(ppcImlGenContext, rA, rB);
++	return PPCRecompilerImlGen_PSQ_LoadAt(ppcImlGenContext, frD, gqrIndex, readPS1, gprEA, 0);
++}
++
++bool PPCRecompilerImlGen_PSQ_STX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
++{
++	sint32 frD, rA, rB;
++	PPC_OPC_TEMPL_X(opcode, frD, rA, rB);
++	const sint32 gqrIndex = (opcode >> 7) & 7;
++	const bool storePS1 = (opcode & (1 << 10)) == 0;
++	IMLReg gprEA = PPCRecompilerImlGen_PSQ_IndexedAddress(ppcImlGenContext, rA, rB);
++	return PPCRecompilerImlGen_PSQ_StoreAt(ppcImlGenContext, frD, gqrIndex, storePS1, gprEA, 0);
++}
++
++// a paired-single load from gprA + imm (PSQ_L, PSQ_LU, PSQ_LX)
++bool PPCRecompilerImlGen_PSQ_LoadAt(ppcImlGenContext_t* ppcImlGenContext, sint32 frD, sint32 gqrIndex, bool readPS1, IMLReg gprA, uint32 imm)
++{
+ 	DefinePS0(fprDPS0, frD);
+ 	DefinePS1(fprDPS1, frD);
+ 	if (!readPS1)
+@@ -831,11 +881,6 @@ bool PPCRecompilerImlGen_PSQ_L(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+ 		// if PS1 is not explicitly read then set it to 1.0
+ 		ppcImlGenContext->emitInst().make_fpr_r(PPCREC_IML_OP_FPR_LOAD_ONE, fprDPS1);
+ 	}
+-	if (withUpdate)
+-	{
+-		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_ADD, gprA, gprA, (sint32)imm);
+-		imm = 0;
+-	}
+ 	uint32 knownGQRValue = 0;
+ 	if ( !PPCRecompiler_isUGQRValueKnown(ppcImlGenContext, gqrIndex, knownGQRValue) )
+ 	{
+@@ -959,14 +1004,19 @@ bool PPCRecompilerImlGen_PSQ_ST(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+ 	bool storePS1 = (opcode & 0x8000) == false;
+ 
+ 	IMLReg gprA = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_R0+rA);
+-	DefinePS0(fprDPS0, frD);
+-	IMLReg fprDPS1 = storePS1 ? _GetFPRRegPS1(ppcImlGenContext, frD) : IMLREG_INVALID;
+-
+ 	if (withUpdate)
+ 	{
+ 		ppcImlGenContext->emitInst().make_r_r_s32(PPCREC_IML_OP_ADD, gprA, gprA, (sint32)imm);
+ 		imm = 0;
+ 	}
++	return PPCRecompilerImlGen_PSQ_StoreAt(ppcImlGenContext, frD, gqrIndex, storePS1, gprA, imm);
++}
++
++// a paired-single store to gprA + imm (PSQ_ST, PSQ_STU, PSQ_STX)
++bool PPCRecompilerImlGen_PSQ_StoreAt(ppcImlGenContext_t* ppcImlGenContext, sint32 frD, sint32 gqrIndex, bool storePS1, IMLReg gprA, uint32 imm)
++{
++	DefinePS0(fprDPS0, frD);
++	IMLReg fprDPS1 = storePS1 ? _GetFPRRegPS1(ppcImlGenContext, frD) : IMLREG_INVALID;
+ 
+ 	uint32 gqrValue = 0;
+ 	if ( !PPCRecompiler_isUGQRValueKnown(ppcImlGenContext, gqrIndex, gqrValue) )
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..24b109b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
