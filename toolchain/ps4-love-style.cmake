@@ -12,6 +12,7 @@ set(PS4_RUNTIME_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_crashlog.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_sampler.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_net.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_netfs.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_string.c
     ${CMAKE_CURRENT_LIST_DIR}/../port/ps4_random.c)
 
@@ -100,6 +101,12 @@ string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=clock_gettime")
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=pthread_create")
 # Host names through the PS4's resolver: the C library has no DNS on the PS4 (port/ps4_net.cpp).
 string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=getaddrinfo --wrap=gethostbyname")
+# The network game library: SMB / NFS shares read under /net (port/ps4_netfs.cpp; open and close
+# are its too, through the wraps above). _read and _readv are the C library's stdio reads.
+# (not lstat / fstatat: the PS4 has no fstatat, and nothing here calls them)
+foreach (fn read _read readv _readv pread lseek fstat stat getdents)
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " --wrap=${fn}")
+endforeach ()
 
 # Program authority ID: the system Piglet (OpenGL ES) only gives a display to processes with a
 # system authority ID. This is RetroArch for PS4's value, as used by love-ps4.

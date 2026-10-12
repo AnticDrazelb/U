@@ -179,7 +179,24 @@ build_curl() {
         -DCURL_CA_BUNDLE=none -DCURL_CA_PATH=none -DCURL_CA_FALLBACK=OFF "${MUSL_LINUX_ONLY[@]}"
 }
 
-ALL=(zlib libpng zstd libzip pugixml fmt glm rapidjson glslang boost openssl curl)
+# Network game library (SMB and NFS shares), both by Ronnie Sahlberg, LGPL-2.1.
+build_libsmb2() {
+    fetch libsmb2 https://github.com/sahlberg/libsmb2/archive/refs/tags/v6.0.0.tar.gz
+    # its PS4 branch replaces CMAKE_C_FLAGS (our sysroot and target flags) with -funwind-tables
+    sed -i '/elseif(PS4)/,/elseif(EE)/{/CMAKE_C_FLAGS\|CMAKE_CXX_FLAGS\|add_compile_options/d}' "$SRC/libsmb2/CMakeLists.txt"
+    # OpenOrbis' endian.h has __bswapNN as functions (not macros): don't rename them to __bswap_NN
+    sed -i 's/^#ifndef __bswap\(16\|32\|64\)$/#if !defined(__bswap\1) \&\& !defined(PS4_PLATFORM)/' \
+        "$SRC/libsmb2/include/portable-endian.h"
+    cmake_build libsmb2 "$SRC/libsmb2" -DENABLE_EXAMPLES=OFF "${MUSL_LINUX_ONLY[@]}"
+}
+
+build_libnfs() {
+    fetch libnfs https://github.com/sahlberg/libnfs/archive/refs/tags/libnfs-8.0.0.tar.gz
+    cmake_build libnfs "$SRC/libnfs" -DENABLE_TESTS=OFF -DENABLE_DOCUMENTATION=OFF -DENABLE_UTILS=OFF \
+        -DENABLE_EXAMPLES=OFF -DENABLE_MULTITHREADING=OFF -DENABLE_TLS=OFF "${MUSL_LINUX_ONLY[@]}"
+}
+
+ALL=(zlib libpng zstd libzip pugixml fmt glm rapidjson glslang boost openssl curl libsmb2 libnfs)
 targets=("$@")
 [ ${#targets[@]} -gt 0 ] || targets=("${ALL[@]}")
 for t in "${targets[@]}"; do

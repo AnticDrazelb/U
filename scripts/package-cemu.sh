@@ -31,12 +31,16 @@ find "$STAGE" -type d -empty -delete
 # Crema (the stable line) - both use /data/Crema
 if [ -n "${CEMU_PS4_LAB:-}" ]; then
     APP_ID=CREM00002; APP_NAME="Crema Lab"; APP_LABEL=CREMALAB; APP_FILE=Crema-Lab
+    # version.txt's second line: the updater (CremaUpdater.h) looks for Crema-Lab-v<version>.pkg
+    echo lab >> "$STAGE/version.txt"
 else
     APP_ID=CREM00001; APP_NAME="Crema"; APP_LABEL=CREMA; APP_FILE=Crema
 fi
 PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 "$HERE/make-pkg.sh" "$STAGE" "$APP_ID" "$APP_NAME" "$VERSION" "$APP_LABEL" "$PS4_BUILD_ROOT/out" | tail -1)"
 ls -la "$PKG"
-# a copy next to the repo (E:\PS4 Projects\CEMUPS4\out), easy to find from Windows; *.pkg is ignored by git
+# a copy next to the repo (E:\PS4 Projects\CEMUPS4\out), easy to find from Windows; *.pkg is ignored by git.
+# Its name is what a GitHub release needs for the in-app updater: Crema-v<version>.pkg /
+# Crema-Lab-v<version>.pkg (CremaUpdater.h).
 mkdir -p "$HERE/../out"
 cp "$PKG" "$HERE/../out/$APP_FILE-v$VERSION.pkg"
 # Keep the symbols of every packaged build: crash logs must be symbolized against the exact binary.

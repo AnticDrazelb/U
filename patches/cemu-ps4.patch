@@ -29,7 +29,7 @@ index 644032c..9457f9a 100644
  if (MSVC)
  	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT CemuBin)
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index d8378c3..a27c3df 100644
+index d8378c3..09c21a8 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -12,6 +12,11 @@ endif()
@@ -44,7 +44,7 @@ index d8378c3..a27c3df 100644
  elseif(UNIX)
  	if(APPLE)
  		if (ENABLE_VULKAN)
-@@ -229,3 +234,17 @@ endif()
+@@ -229,3 +234,19 @@ endif()
  if (BSD)
  	target_link_libraries(CemuBin PRIVATE execinfo SPIRV-Tools SPIRV-Tools-opt)
  endif()
@@ -59,7 +59,9 @@ index d8378c3..a27c3df 100644
 +	endif()
 +	target_link_libraries(CemuBin PRIVATE
 +		CemuResource SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet
-+		SceCommonDialog SceImeDialog)
++		SceCommonDialog SceImeDialog
++		# the network game library (port/ps4_netfs.cpp): SMB and NFS, scripts/build-deps.sh
++		"$ENV{HOME}/cemups4-build/sysroot/lib/libsmb2.a" "$ENV{HOME}/cemups4-build/sysroot/lib/libnfs.a")
 +	ps4_add_eboot(CemuBin)
 +endif()
 diff --git a/src/Cafe/CMakeLists.txt b/src/Cafe/CMakeLists.txt
@@ -4443,10 +4445,10 @@ index d66e971..49e209f 100644
  endif()
 diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
 new file mode 100644
-index 0000000..653d29a
+index 0000000..d190456
 --- /dev/null
 +++ b/src/gui/ps4/CMakeLists.txt
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,49 @@
 +add_library(CemuPS4Gui
 +	PS4WindowSystem.cpp
 +	CremaMii.cpp
@@ -4459,6 +4461,9 @@ index 0000000..653d29a
 +	launcher/CremaCovers.h
 +	launcher/CremaGraphicPacks.cpp
 +	launcher/CremaGraphicPacks.h
++	launcher/CremaHttp.h
++	launcher/CremaUpdater.cpp
++	launcher/CremaUpdater.h
 +	launcher/CremaSettings.cpp
 +	launcher/CremaSettings.h
 +	launcher/Launcher.cpp
@@ -6834,10 +6839,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..56dca4f
+index 0000000..d6123dc
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,873 @@
+@@ -0,0 +1,875 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -7432,6 +7437,7 @@ index 0000000..56dca4f
 +		// the online world's console files and account in place before Cemu reads them
 +		// (CremaOnline.h): Pretendo's, the private server's, or the offline ones
 +		CremaSettings::Load(_pathToUtf8(kDataRoot));
++		CremaSettings::MountNetworkLibrary();
 +		CremaOnline::CreateFolders(_pathToUtf8(kDataRoot), _pathToUtf8(ActiveSettings::GetMlcPath()));
 +		Trace(CremaOnline::Stage(_pathToUtf8(kDataRoot), _pathToUtf8(ActiveSettings::GetMlcPath()), CremaSettings::Get("online")));
 +		if (!CreateDefaultMLCFiles(ActiveSettings::GetMlcPath()))
@@ -7463,6 +7469,7 @@ index 0000000..56dca4f
 +		}
 +		PS4PauseMenu::SetupPlayers(); // players 2-4 (local multiplayer)
 +		CremaSettings::Load(_pathToUtf8(kDataRoot));
++		CremaSettings::MountNetworkLibrary();
 +		// the private server: Cemu's online requests go through its proxy (pretendo-docker's
 +		// mitmproxy sends Pretendo's names to the server); Cemu's config was loaded again above
 +		const std::string onlineWorld = CremaSettings::Get("online");
@@ -7981,12 +7988,13 @@ index 0000000..3bacd01
 +} // namespace CremaCovers
 diff --git a/src/gui/ps4/launcher/CremaGraphicPacks.cpp b/src/gui/ps4/launcher/CremaGraphicPacks.cpp
 new file mode 100644
-index 0000000..6470048
+index 0000000..328deb2
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaGraphicPacks.cpp
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,367 @@
 +#include "gui/ps4/launcher/CremaGraphicPacks.h"
 +#include "gui/ps4/launcher/CremaCovers.h"
++#include "gui/ps4/launcher/CremaHttp.h"
 +
 +#include "Cafe/GraphicPack/GraphicPack2.h"
 +#include "config/CemuConfig.h"
@@ -8012,129 +8020,25 @@ index 0000000..6470048
 +		ps4_boot_trace(("graphic packs: " + text).c_str());
 +	}
 +
-+	size_t Append(char* data, size_t size, size_t count, void* user)
-+	{
-+		static_cast<std::string*>(user)->append(data, size * count);
-+		return size * count;
-+	}
-+
++	// "Downloading: 1.5 of 9.0 MB" every 256 KiB of the zip (the release information is a few KiB)
 +	struct Progress
 +	{
 +		const std::function<void(const std::string&)>* status;
 +		const std::atomic<bool>* cancel;
-+		curl_off_t shown = -1;
-+	};
++		uint64_t shown = ~0ull;
 +
-+	int OnProgress(void* user, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t)
-+	{
-+		auto* p = static_cast<Progress*>(user);
-+		if (*p->cancel)
-+			return 1;
-+		// the zip only (the release information is a few KiB), every 256 KiB
-+		if (now > 1024 * 1024 && now / (256 * 1024) != p->shown)
++		bool operator()(uint64_t now, uint64_t total)
 +		{
-+			p->shown = now / (256 * 1024);
-+			(*p->status)(total > 0 ? fmt::format("Downloading: {:.1f} of {:.1f} MB", now / 1048576.0, total / 1048576.0) :
-+				fmt::format("Downloading: {:.1f} MB", now / 1048576.0));
-+		}
-+		return 0;
-+	}
-+
-+	// HTTPS through the PS4's resolver: each host is looked up before its first request (and
-+	// redirects are followed here, since the PS4's C library can't resolve them), certificates
-+	// checked against Crema's CA list. The packs hold code patches: no download without the check.
-+	class Http
-+	{
-+	public:
-+		Http(const std::string& caFile, Progress* progress)
-+		{
-+			m_curl = curl_easy_init();
-+			curl_easy_setopt(m_curl, CURLOPT_CAINFO, caFile.c_str());
-+			curl_easy_setopt(m_curl, CURLOPT_USERAGENT, "Crema-PS4");
-+			curl_easy_setopt(m_curl, CURLOPT_WRITEFUNCTION, Append);
-+			curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1L);
-+			curl_easy_setopt(m_curl, CURLOPT_CONNECTTIMEOUT, 15L);
-+			curl_easy_setopt(m_curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // gives up after 30 s without data
-+			curl_easy_setopt(m_curl, CURLOPT_LOW_SPEED_TIME, 30L);
-+			curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION, OnProgress);
-+			curl_easy_setopt(m_curl, CURLOPT_XFERINFODATA, progress);
-+			curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L);
-+		}
-+
-+		~Http()
-+		{
-+			curl_easy_cleanup(m_curl);
-+			curl_slist_free_all(m_resolves);
-+		}
-+
-+		// GET url (following up to 8 redirects) into body; false with the reason in error
-+		bool Get(std::string url, std::string* body, std::string* error)
-+		{
-+			for (int hop = 0; hop < 8; hop++)
-+			{
-+				if (!AddHost(url, error))
-+					return false;
-+				body->clear();
-+				char detail[CURL_ERROR_SIZE] = {};
-+				curl_easy_setopt(m_curl, CURLOPT_ERRORBUFFER, detail);
-+				curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
-+				curl_easy_setopt(m_curl, CURLOPT_WRITEDATA, body);
-+				const CURLcode code = curl_easy_perform(m_curl);
-+				if (code != CURLE_OK)
-+				{
-+					*error = std::string(curl_easy_strerror(code)) + (detail[0] ? std::string(": ") + detail : "");
-+					return false;
-+				}
-+				long status = 0;
-+				curl_easy_getinfo(m_curl, CURLINFO_RESPONSE_CODE, &status);
-+				if (status >= 300 && status < 400)
-+				{
-+					char* next = nullptr;
-+					curl_easy_getinfo(m_curl, CURLINFO_REDIRECT_URL, &next);
-+					if (!next)
-+					{
-+						*error = fmt::format("redirect without an address (HTTP {})", status);
-+						return false;
-+					}
-+					url = next;
-+					continue;
-+				}
-+				if (status != 200)
-+				{
-+					*error = fmt::format("HTTP {} from {}", status, url.substr(0, url.find('?')));
-+					return false;
-+				}
-+				return true;
-+			}
-+			*error = "too many redirects";
-+			return false;
-+		}
-+
-+	private:
-+		bool AddHost(const std::string& url, std::string* error)
-+		{
-+			const size_t start = url.find("://");
-+			if (start == std::string::npos || url.compare(0, start, "https") != 0)
-+			{
-+				*error = "not an https address: " + url;
++			if (*cancel)
 +				return false;
++			if (now > 1024 * 1024 && now / (256 * 1024) != shown)
++			{
++				shown = now / (256 * 1024);
++				(*status)(total > 0 ? fmt::format("Downloading: {:.1f} of {:.1f} MB", now / 1048576.0, total / 1048576.0) :
++					fmt::format("Downloading: {:.1f} MB", now / 1048576.0));
 +			}
-+			const size_t end = url.find_first_of("/:?", start + 3);
-+			const std::string host = url.substr(start + 3, end == std::string::npos ? std::string::npos : end - start - 3);
-+			if (m_hosts.count(host))
-+				return true;
-+			const std::string address = CremaCovers::Resolve(host, error);
-+			if (address.empty())
-+				return false;
-+			m_hosts.insert(host);
-+			m_resolves = curl_slist_append(m_resolves, (host + ":443:" + address).c_str());
-+			curl_easy_setopt(m_curl, CURLOPT_RESOLVE, m_resolves);
 +			return true;
 +		}
-+
-+		CURL* m_curl = nullptr;
-+		curl_slist* m_resolves = nullptr;
-+		std::set<std::string> m_hosts;
 +	};
 +
 +	// Replaces folder's contents with the zip's files; returns how many were written.
@@ -8285,7 +8189,7 @@ index 0000000..6470048
 +	DownloadResult result;
 +	curl_global_init(CURL_GLOBAL_DEFAULT);
 +	Progress progress{&status, &cancel};
-+	Http http(caFile, &progress);
++	CremaHttp http(caFile, progress);
 +	status("Asking GitHub for the latest release...");
 +	std::string body;
 +	if (!http.Get(RELEASE_URL, &body, &result.error))
@@ -8508,12 +8412,189 @@ index 0000000..b972bf8
 +// Left (-1) / Right or Cross (+1) on a row: a pack on or off, or the next preset; saved at once.
 +void Change(const std::string& key, int direction);
 +} // namespace CremaGraphicPacks
+diff --git a/src/gui/ps4/launcher/CremaHttp.h b/src/gui/ps4/launcher/CremaHttp.h
+new file mode 100644
+index 0000000..a6d4cc6
+--- /dev/null
++++ b/src/gui/ps4/launcher/CremaHttp.h
+@@ -0,0 +1,171 @@
++// HTTPS for the launcher (graphic packs, updates) through the PS4's resolver: each host is looked
++// up before its first request (and redirects are followed here, since the PS4's C library can't
++// resolve them), certificates checked against Crema's CA list. Nothing is downloaded without it.
++#pragma once
++
++#include "gui/ps4/launcher/CremaCovers.h"
++
++#include <cstdint>
++#include <functional>
++#include <set>
++#include <string>
++#include <vector>
++
++#include <curl/curl.h>
++
++class CremaHttp
++{
++public:
++	// a piece of the body; false stops the download
++	using Sink = std::function<bool(const char* data, size_t size)>;
++	// bytes so far and in all (0: not known yet); false stops the download
++	using Progress = std::function<bool(uint64_t done, uint64_t total)>;
++
++	explicit CremaHttp(const std::string& caFile, Progress progress = {}) : m_progress(std::move(progress))
++	{
++		m_curl = curl_easy_init();
++		curl_easy_setopt(m_curl, CURLOPT_CAINFO, caFile.c_str());
++		curl_easy_setopt(m_curl, CURLOPT_USERAGENT, "Crema-PS4");
++		curl_easy_setopt(m_curl, CURLOPT_WRITEFUNCTION, OnData);
++		curl_easy_setopt(m_curl, CURLOPT_WRITEDATA, this);
++		curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1L);
++		curl_easy_setopt(m_curl, CURLOPT_CONNECTTIMEOUT, 15L);
++		curl_easy_setopt(m_curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // gives up after 30 s without data
++		curl_easy_setopt(m_curl, CURLOPT_LOW_SPEED_TIME, 30L);
++		curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION, OnProgress);
++		curl_easy_setopt(m_curl, CURLOPT_XFERINFODATA, this);
++		curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L);
++	}
++
++	~CremaHttp()
++	{
++		curl_easy_cleanup(m_curl);
++		curl_slist_free_all(m_resolves);
++		curl_slist_free_all(m_headers);
++	}
++
++	CremaHttp(const CremaHttp&) = delete;
++	CremaHttp& operator=(const CremaHttp&) = delete;
++
++	// Header lines sent with every request ("Accept: application/vnd.github+json").
++	void SetHeaders(const std::vector<std::string>& headers)
++	{
++		curl_slist_free_all(m_headers);
++		m_headers = nullptr;
++		for (const std::string& header : headers)
++			m_headers = curl_slist_append(m_headers, header.c_str());
++		curl_easy_setopt(m_curl, CURLOPT_HTTPHEADER, m_headers);
++	}
++
++	// GET url (following up to 8 redirects), the body to sink; false with the reason in error
++	bool Get(std::string url, const Sink& sink, std::string* error)
++	{
++		for (int hop = 0; hop < 8; hop++)
++		{
++			if (!AddHost(url, error))
++				return false;
++			char detail[CURL_ERROR_SIZE] = {};
++			m_sink = &sink;
++			m_stopped = false;
++			curl_easy_setopt(m_curl, CURLOPT_ERRORBUFFER, detail);
++			curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
++			const CURLcode code = curl_easy_perform(m_curl);
++			m_sink = nullptr;
++			if (code != CURLE_OK)
++			{
++				*error = m_stopped ? "stopped" : std::string(curl_easy_strerror(code)) + (detail[0] ? std::string(": ") + detail : "");
++				return false;
++			}
++			long status = 0;
++			curl_easy_getinfo(m_curl, CURLINFO_RESPONSE_CODE, &status);
++			if (status >= 300 && status < 400)
++			{
++				char* next = nullptr;
++				curl_easy_getinfo(m_curl, CURLINFO_REDIRECT_URL, &next);
++				if (!next)
++				{
++					*error = "redirect without an address (HTTP " + std::to_string(status) + ")";
++					return false;
++				}
++				url = next;
++				continue;
++			}
++			if (status != 200)
++			{
++				*error = "HTTP " + std::to_string(status) + " from " + url.substr(0, url.find('?'));
++				return false;
++			}
++			return true;
++		}
++		*error = "too many redirects";
++		return false;
++	}
++
++	// GET url into body (up to limit bytes)
++	bool Get(const std::string& url, std::string* body, std::string* error, size_t limit = 256u * 1024 * 1024)
++	{
++		const Sink sink = [body, limit](const char* data, size_t size) {
++			body->append(data, size);
++			return body->size() <= limit;
++		};
++		body->clear();
++		return Get(url, sink, error);
++	}
++
++private:
++	// a redirect's own body is skipped
++	static size_t OnData(char* data, size_t size, size_t count, void* user)
++	{
++		auto* self = static_cast<CremaHttp*>(user);
++		long status = 0;
++		curl_easy_getinfo(self->m_curl, CURLINFO_RESPONSE_CODE, &status);
++		if (status != 200)
++			return size * count;
++		if (self->m_sink && !(*self->m_sink)(data, size * count))
++		{
++			self->m_stopped = true;
++			return 0;
++		}
++		return size * count;
++	}
++
++	static int OnProgress(void* user, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t)
++	{
++		auto* self = static_cast<CremaHttp*>(user);
++		if (self->m_progress && !self->m_progress((uint64_t)now, (uint64_t)total))
++		{
++			self->m_stopped = true;
++			return 1;
++		}
++		return 0;
++	}
++
++	bool AddHost(const std::string& url, std::string* error)
++	{
++		const size_t start = url.find("://");
++		if (start == std::string::npos || url.compare(0, start, "https") != 0)
++		{
++			*error = "not an https address: " + url;
++			return false;
++		}
++		const size_t end = url.find_first_of("/:?", start + 3);
++		const std::string host = url.substr(start + 3, end == std::string::npos ? std::string::npos : end - start - 3);
++		if (m_hosts.count(host))
++			return true;
++		const std::string address = CremaCovers::Resolve(host, error);
++		if (address.empty())
++			return false;
++		m_hosts.insert(host);
++		m_resolves = curl_slist_append(m_resolves, (host + ":443:" + address).c_str());
++		curl_easy_setopt(m_curl, CURLOPT_RESOLVE, m_resolves);
++		return true;
++	}
++
++	CURL* m_curl = nullptr;
++	curl_slist* m_resolves = nullptr;
++	curl_slist* m_headers = nullptr;
++	std::set<std::string> m_hosts;
++	Progress m_progress;
++	const Sink* m_sink = nullptr;
++	bool m_stopped = false;
++};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..d12bc28
+index 0000000..15c2b67
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,430 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -8529,7 +8610,9 @@ index 0000000..d12bc28
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
 +
++#include <algorithm>
 +#include <atomic>
++#include <cstring>
 +#include <fstream>
 +#include <map>
 +#include <mutex>
@@ -8604,6 +8687,8 @@ index 0000000..d12bc28
 +		// Online
 +		{"online", "Online", "Online", {{"off", "Off"}, {"pretendo", "Pretendo"}, {"private", "Private Server"}}, "off", false,
 +			"Pretendo: Pretendo Network's public servers, with your own Wii U's files (Dumpling) in /data/Crema/online/pretendo. Private Server: your own Pretendo server (pretendo-docker) at the Server Address, with its files in /data/Crema/online/private. Off: your offline files come back. For all consoles and games."},
++		{"net_library", "Network Library", "Online", {{"off", "Off"}, {"smb", "SMB (Shared Folder)"}, {"nfs", "NFS"}}, "off", false,
++			"Games in a computer's shared folder, listed with your games and played from there: .wua, .wud, .wux, .wuhb and unpacked games. SMB: a Windows shared folder (or Samba). NFS: an NFS export (WinNFSd, Linux). Updates and DLC still go in mlc01. A wired connection is best."},
 +		// Diagnostics
 +		{"perf_log", "Performance Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Every 5 s, the GPU's and each thread's load in log.txt (what limits the frame rate)."},
@@ -8847,6 +8932,32 @@ index 0000000..d12bc28
 +	return setting.choices[index].value;
 +}
 +
++extern "C" void ps4_netfs_mount(const char* name, const char* url, const char* user, const char* password);
++
++void MountNetworkLibrary()
++{
++	const std::string type = Get("net_library");
++	// "\\PC\Games", "smb://PC/Games" and "PC/Games": the same
++	std::string address = Get("net_address");
++	std::replace(address.begin(), address.end(), '\\', '/');
++	for (const char* scheme : {"smb://", "nfs://"})
++		if (address.rfind(scheme, 0) == 0)
++			address.erase(0, strlen(scheme));
++	while (!address.empty() && address.front() == '/')
++		address.erase(0, 1);
++	while (!address.empty() && address.back() == '/')
++		address.pop_back();
++	const bool on = (type == "smb" || type == "nfs") && !address.empty();
++	const std::string url = on ? type + "://" + address : "";
++	ps4_netfs_mount("library", url.c_str(), Get("net_user").c_str(), Get("net_password").c_str());
++}
++
++std::string NetworkLibraryFolder()
++{
++	const std::string type = Get("net_library");
++	return (type == "smb" || type == "nfs") && !Get("net_address").empty() ? "/net/library" : "";
++}
++
 +void Apply(const std::string& gameId)
 +{
 +	auto get = [&](const char* key) { return Get(key, gameId); };
@@ -8916,10 +9027,10 @@ index 0000000..d12bc28
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/CremaSettings.h b/src/gui/ps4/launcher/CremaSettings.h
 new file mode 100644
-index 0000000..2743734
+index 0000000..5947a7f
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,67 @@
 +// Crema settings (from DolphinPS4's PS4Settings), shared by the launcher and the game process.
 +// The user's choices are kept in /data/Crema/crema.ini: a [global] section and one section per
 +// title ID (16 hex digits) for games set to their own settings ("custom=on"). A setting never
@@ -8977,16 +9088,319 @@ index 0000000..2743734
 +std::string LabelOf(const Setting& setting, const std::string& value);
 +std::string Step(const Setting& setting, const std::string& value, int direction);
 +
++// The network library (Settings > Online): its share at /net/library (port/ps4_netfs.cpp), or
++// none when it's off. Called after Load and when its settings change.
++void MountNetworkLibrary();
++// "/net/library" when the network library is on, else empty.
++std::string NetworkLibraryFolder();
++
 +// Game process: applies the settings of the game being started (title ID as 16 hex digits)
 +// to Cemu's config and game profile, in memory.
 +void Apply(const std::string& game_id);
 +} // namespace CremaSettings
+diff --git a/src/gui/ps4/launcher/CremaUpdater.cpp b/src/gui/ps4/launcher/CremaUpdater.cpp
+new file mode 100644
+index 0000000..f4b0838
+--- /dev/null
++++ b/src/gui/ps4/launcher/CremaUpdater.cpp
+@@ -0,0 +1,236 @@
++#include "gui/ps4/launcher/CremaUpdater.h"
++#include "gui/ps4/launcher/CremaHttp.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <vector>
++
++#include <dirent.h>
++#include <unistd.h>
++
++#include <openssl/evp.h>
++#include <rapidjson/document.h>
++
++extern "C" void ps4_boot_trace(const char* line); // port/ps4_crashlog.cpp
++
++namespace CremaUpdater
++{
++namespace
++{
++	void Log(const std::string& text)
++	{
++		ps4_boot_trace(("update: " + text).c_str());
++	}
++
++	std::string Lower(std::string text)
++	{
++		for (char& c : text)
++			c = (char)std::tolower((unsigned char)c);
++		return text;
++	}
++
++	std::string Text(const rapidjson::Value& object, const char* key)
++	{
++		const auto it = object.FindMember(key);
++		return it != object.MemberEnd() && it->value.IsString() ? std::string(it->value.GetString(), it->value.GetStringLength()) :
++			std::string();
++	}
++
++	// "<prefix>-v02.17.pkg" -> "02.17", else empty
++	std::string VersionOf(const std::string& name, const std::string& prefix)
++	{
++		const std::string start = prefix + "-v", end = ".pkg";
++		if (name.size() <= start.size() + end.size() || name.compare(0, start.size(), start) != 0 ||
++			Lower(name.substr(name.size() - end.size())) != end)
++			return {};
++		const std::string version = name.substr(start.size(), name.size() - start.size() - end.size());
++		return std::all_of(version.begin(), version.end(), [](char c) { return std::isdigit((unsigned char)c) || c == '.'; }) ? version :
++			std::string();
++	}
++} // namespace
++
++std::string PackagePrefix(const std::string& assetsDir)
++{
++	std::ifstream file(assetsDir + "/version.txt");
++	std::string line;
++	std::getline(file, line); // the version
++	std::getline(file, line); // "lab" for Crema Lab
++	return line.rfind("lab", 0) == 0 ? "Crema-Lab" : "Crema";
++}
++
++Release CheckLatest(const std::string& caFile, const std::string& prefix)
++{
++	Release release;
++	CremaHttp http(caFile);
++	http.SetHeaders({"Accept: application/vnd.github+json", "X-GitHub-Api-Version: 2022-11-28"});
++	std::string body, error;
++	const std::string url = std::string("https://api.github.com/repos/") + REPOSITORY + "/releases?per_page=30";
++	if (!http.Get(url, &body, &error, 4 * 1024 * 1024))
++	{
++		release.error = error.find("HTTP 404") == 0 ? "no releases on GitHub yet" : error;
++		Log("check failed: " + release.error);
++		return release;
++	}
++	rapidjson::Document json;
++	json.Parse(body.data(), body.size());
++	if (json.HasParseError() || !json.IsArray())
++	{
++		release.error = "unexpected answer from GitHub";
++		Log("check failed: " + release.error);
++		return release;
++	}
++	// the newest version that has this app's package (drafts aside)
++	for (const auto& entry : json.GetArray())
++	{
++		if (!entry.IsObject())
++			continue;
++		const auto draft = entry.FindMember("draft");
++		if (draft != entry.MemberEnd() && draft->value.IsBool() && draft->value.GetBool())
++			continue;
++		const auto assets = entry.FindMember("assets");
++		if (assets == entry.MemberEnd() || !assets->value.IsArray())
++			continue;
++		for (const auto& asset : assets->value.GetArray())
++		{
++			if (!asset.IsObject())
++				continue;
++			const std::string name = Text(asset, "name");
++			const std::string version = VersionOf(name, prefix);
++			if (version.empty() || (!release.version.empty() && CompareVersions(version, release.version) <= 0))
++				continue;
++			const auto size = asset.FindMember("size");
++			const std::string digest = Text(asset, "digest");
++			release.version = version;
++			release.title = Text(entry, "name");
++			release.package = name;
++			release.url = Text(asset, "browser_download_url");
++			release.size = size != asset.MemberEnd() && size->value.IsNumber() ? (uint64_t)size->value.GetDouble() : 0;
++			release.sha256 = digest.compare(0, 7, "sha256:") == 0 ? Lower(digest.substr(7)) : "";
++		}
++	}
++	if (release.version.empty() || release.url.empty())
++		release.error = "no " + prefix + " package on GitHub yet";
++	else if (release.sha256.size() != 64)
++		release.error = "the latest package has no checksum"; // it couldn't be checked: not offered
++	else
++		release.ok = true;
++	Log("latest " + prefix + " release " + (release.version.empty() ? "-" : release.version) + " (" + release.package + ", " +
++		std::to_string(release.size) + " bytes)" + (release.ok ? "" : ": " + release.error));
++	return release;
++}
++
++int CompareVersions(const std::string& a, const std::string& b)
++{
++	auto parts = [](const std::string& text) {
++		std::vector<long> numbers;
++		size_t i = 0;
++		while (i < text.size())
++		{
++			if (std::isdigit((unsigned char)text[i]))
++			{
++				char* end = nullptr;
++				numbers.push_back(std::strtol(text.c_str() + i, &end, 10));
++				i = (size_t)(end - text.c_str());
++			}
++			else
++			{
++				i++;
++			}
++		}
++		return numbers;
++	};
++	const std::vector<long> x = parts(a), y = parts(b);
++	for (size_t i = 0; i < std::max(x.size(), y.size()); i++)
++	{
++		const long p = i < x.size() ? x[i] : 0, q = i < y.size() ? y[i] : 0;
++		if (p != q)
++			return p < q ? -1 : 1;
++	}
++	return 0;
++}
++
++bool Download(const Release& release, const std::string& path, const std::string& caFile,
++	const std::function<bool(uint64_t, uint64_t)>& progress, std::string* error)
++{
++	const std::string part = path + ".part";
++	FILE* file = fopen(part.c_str(), "wb");
++	if (!file)
++	{
++		*error = "can't write " + part;
++		return false;
++	}
++	EVP_MD_CTX* sha = EVP_MD_CTX_new();
++	EVP_DigestInit_ex(sha, EVP_sha256(), nullptr);
++	uint64_t written = 0;
++	bool writeFailed = false;
++	CremaHttp http(caFile, [&](uint64_t done, uint64_t total) { return progress(done, total ? total : release.size); });
++	const bool got = http.Get(release.url, [&](const char* data, size_t size) {
++		if (fwrite(data, 1, size, file) != size)
++		{
++			writeFailed = true;
++			return false;
++		}
++		EVP_DigestUpdate(sha, data, size);
++		written += size;
++		return true;
++	}, error);
++	fclose(file);
++	unsigned char digest[EVP_MAX_MD_SIZE];
++	unsigned int length = 0;
++	EVP_DigestFinal_ex(sha, digest, &length);
++	EVP_MD_CTX_free(sha);
++	std::string hex;
++	for (unsigned int i = 0; i < length; i++)
++	{
++		static const char digits[] = "0123456789abcdef";
++		hex += digits[digest[i] >> 4];
++		hex += digits[digest[i] & 15];
++	}
++	if (writeFailed)
++		*error = "couldn't write the package (is the PS4's storage full?)";
++	else if (got && written != release.size)
++		*error = "the download is incomplete";
++	else if (got && hex != release.sha256)
++		*error = "the download doesn't match GitHub's checksum";
++	if (!got || writeFailed || hex != release.sha256 || written != release.size)
++	{
++		std::remove(part.c_str());
++		Log("download failed: " + *error);
++		return false;
++	}
++	std::remove(path.c_str());
++	if (std::rename(part.c_str(), path.c_str()) != 0)
++	{
++		*error = "can't rename " + part;
++		std::remove(part.c_str());
++		return false;
++	}
++	Log("downloaded " + path + " (" + std::to_string(written) + " bytes, checksum OK)");
++	return true;
++}
++
++void RemoveOld(const std::string& prefix, const std::string& running)
++{
++	DIR* dir = opendir("/data/pkg");
++	if (!dir)
++		return;
++	std::vector<std::string> remove;
++	while (dirent* entry = readdir(dir))
++	{
++		std::string name = entry->d_name;
++		const bool partial = name.size() > 5 && name.compare(name.size() - 5, 5, ".part") == 0;
++		const std::string version = VersionOf(partial ? name.substr(0, name.size() - 5) : name, prefix);
++		if (!version.empty() && (partial || CompareVersions(version, running) <= 0))
++			remove.push_back(name);
++	}
++	closedir(dir);
++	for (const std::string& name : remove)
++	{
++		unlink(("/data/pkg/" + name).c_str());
++		Log("removed /data/pkg/" + name);
++	}
++}
++} // namespace CremaUpdater
+diff --git a/src/gui/ps4/launcher/CremaUpdater.h b/src/gui/ps4/launcher/CremaUpdater.h
+new file mode 100644
+index 0000000..132ae41
+--- /dev/null
++++ b/src/gui/ps4/launcher/CremaUpdater.h
+@@ -0,0 +1,49 @@
++// Updates from Crema's GitHub releases (as DolphinPS4's PS4Updater): the newest release with a
++// package for this app (Crema-v<version>.pkg, or Crema-Lab-v<version>.pkg for Crema Lab) is
++// compared with the running version, and its package downloaded - the connection's certificate
++// checked, the file checked against the SHA-256 GitHub publishes for it - into /data/pkg, for the
++// PS4's package installer. The running app can't install over itself (DolphinPS4: the system's
++// overwrite call uninstalls the running app, and a downloaded program started from /data didn't
++// start on 13.52), so the user installs it with Crema closed.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <string>
++
++namespace CremaUpdater
++{
++// The GitHub repository the releases come from.
++constexpr const char* REPOSITORY = "iHaiDeeZ/Crema";
++
++struct Release
++{
++	bool ok = false;
++	std::string error;
++	std::string version; // "02.17" (the tag without its "v")
++	std::string title;   // the release's name
++	std::string package; // file name of the .pkg asset
++	std::string url;     // its download address
++	uint64_t size = 0;
++	std::string sha256;  // lower-case hex
++};
++
++// "Crema" or "Crema-Lab": the packages' names (/app0/version.txt's second line says "lab").
++std::string PackagePrefix(const std::string& assetsDir);
++
++// The newest release that has a package for this app.
++Release CheckLatest(const std::string& caFile, const std::string& prefix);
++
++// <0 if a is older than b, 0 if equal, >0 if newer ("02.99" < "03.00" < "03.10").
++int CompareVersions(const std::string& a, const std::string& b);
++
++// Downloads the release's package to path (through path + ".part"), checking its size and
++// SHA-256. progress(done, total) may return false to cancel. False with *error set.
++bool Download(const Release& release, const std::string& path, const std::string& caFile,
++	const std::function<bool(uint64_t, uint64_t)>& progress, std::string* error);
++
++// Packages this updater left in /data/pkg (<prefix>-v<version>.pkg, and unfinished .part files)
++// for the running version or older: installed, no longer needed. Newer ones stay.
++void RemoveOld(const std::string& prefix, const std::string& running);
++} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..e5d42b3
+index 0000000..01be75f
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3492 @@
+@@ -0,0 +1,3886 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -8999,6 +9413,7 @@ index 0000000..e5d42b3
 +#include "config/ActiveSettings.h"
 +#include "gui/ps4/CremaOnline.h"
 +#include "gui/ps4/launcher/CremaSettings.h"
++#include "gui/ps4/launcher/CremaUpdater.h"
 +#include "gui/ps4/launcher/LauncherDisplay.h"
 +#include "gui/ps4/launcher/PS4Glyphs.h"
 +#include "gui/ps4/launcher/PS4Lang.h"
@@ -9036,6 +9451,9 @@ index 0000000..e5d42b3
 +
 +extern "C" void ps4_boot_trace(const char* line); // port/ps4_crashlog.cpp
 +extern "C" int g_crema_pad_handle;                // input/api/PS4/PS4PadController.cpp
++// the network library's shares (port/ps4_netfs.cpp)
++extern "C" int ps4_netfs_check(const char* name, char* message, size_t size);
++extern "C" void ps4_netfs_forget();
 +
 +namespace CremaLauncher
 +{
@@ -9531,6 +9949,7 @@ index 0000000..e5d42b3
 +		std::string style;           // "library" (covers) or "xmb"; empty: not chosen yet (asked)
 +		std::string sort = "title";  // "title", "recent" (last played first)
 +		std::string defaultGame;     // starts by itself when the app opens
++		bool autoUpdate = true;      // look for a new version on GitHub when the launcher opens
 +
 +		void Load(const std::string& path)
 +		{
@@ -9564,6 +9983,8 @@ index 0000000..e5d42b3
 +					sort = value;
 +				else if (key == "default_game")
 +					defaultGame = value;
++				else if (key == "auto_update")
++					autoUpdate = value != "off";
 +			}
 +		}
 +		void Save(const std::string& path) const
@@ -9573,7 +9994,7 @@ index 0000000..e5d42b3
 +			file << "theme=" << theme << "\nwallpaper=" << wallpaper << "\nsounds=" << (sounds ? "on" : "off")
 +				 << "\nvolume=" << volume << "\nclock=" << (clock ? "on" : "off") << "\ngames_dir=" << gamesDir
 +				 << "\nlast_game=" << lastGame << "\nstyle=" << style << "\nsort=" << sort
-+				 << "\ndefault_game=" << defaultGame << "\n";
++				 << "\ndefault_game=" << defaultGame << "\nauto_update=" << (autoUpdate ? "on" : "off") << "\n";
 +		}
 +	};
 +
@@ -9629,8 +10050,18 @@ index 0000000..e5d42b3
 +		std::vector<LibraryEntry> library;
 +		std::vector<fs::path> candidates;
 +		std::error_code ec;
++		const bool network = gamesDir.rfind("/net/", 0) == 0;
 +		for (auto it = fs::recursive_directory_iterator(gamesDir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
 +		{
++			if (network && it->is_directory(ec))
++			{
++				// over the network every folder costs a round trip: a game's content and meta
++				// folders hold thousands of files and nothing to find
++				const std::string folder = Lower(it->path().filename().string());
++				if (folder == "content" || folder == "meta")
++					it.disable_recursion_pending();
++				continue;
++			}
 +			if (!it->is_regular_file(ec))
 +				continue;
 +			const fs::path path = it->path();
@@ -9744,6 +10175,9 @@ index 0000000..e5d42b3
 +		SET_LANGUAGE,  // Language: a list of all of them
 +		SET_COVERS,    // Download Covers: GameTDB box art, with its progress
 +		SET_GAME_PACKS, // a game's Graphic Packs (settings rows: packs and presets)
++		SET_UPDATE_CHECK, // Check for Updates
++		SET_AUTO_UPDATE,  // Automatic Updates: On / Off
++		SET_UPDATE,       // the update panel: checking, the prompt, the download, the result
 +		SET_GROUP = 100, // + index into CremaSettings::Categories(): a settings list
 +	};
 +
@@ -9805,7 +10239,16 @@ index 0000000..e5d42b3
 +		void ApplySettingOption(int setting, int option);
 +		void OpenSettingsList(const std::string& category, const std::string& gameId);
 +		void AddOnlineRows(std::vector<SettingRow>& rows);
-+		void OpenKeyboard(const std::string& title, const std::string& text);
++		void AddNetworkRows(std::vector<SettingRow>& rows);
++		void StartNetworkCheck();
++		void UpdateNetworkCheck();
++		void StartUpdateCheck(bool manual);
++		void StartUpdateDownload();
++		void ShowUpdatePanel();
++		void UpdateUpdater();
++		void ChooseUpdateOption();
++		std::vector<LibraryEntry> ScanAllGames();
++		void OpenKeyboard(const std::string& title, const std::string& text, const std::string& key = "online_server");
 +		void UpdateKeyboard();
 +		std::string GamesFolder() const { return m_prefs.gamesDir.empty() ? m_dataDir + "/games" : m_prefs.gamesDir; }
 +		void RefreshGames();
@@ -9857,6 +10300,35 @@ index 0000000..e5d42b3
 +		int m_user = 0;                          // the user who started Crema (the keyboard's owner)
 +		bool m_keyboard = false;                 // the PS4 keyboard is open (Server Address)
 +		std::u16string m_keyboardText;           // its text (UTF-16)
++		std::string m_keyboardKey;               // the setting it fills
++		// Updates from GitHub (CremaUpdater): checked in the background when the launcher opens.
++		enum class UpdateState
++		{
++			Idle,
++			Checking,
++			UpToDate,
++			Available,
++			Downloading,
++			Finished, // downloaded, checked and in /data/pkg (m_updateReady)
++			Failed,
++		};
++		std::thread m_updateThread;
++		std::atomic<UpdateState> m_updateState{UpdateState::Idle};
++		std::atomic<bool> m_updateCancel{false};
++		std::atomic<uint64_t> m_updateDone{0}, m_updateTotal{0};
++		std::mutex m_updateMutex;
++		CremaUpdater::Release m_updateRelease;
++		std::string m_updateError;
++		std::string m_updatePrefix;        // "Crema" or "Crema-Lab"
++		bool m_updateManual = false;       // asked for in Settings: "up to date" and errors shown too
++		bool m_updatePrompted = false;     // "Update Available" was shown
++		bool m_updateReadyShown = false;
++		std::string m_updateReady;         // the downloaded package
++		// Settings > Online > Network Library: the connection test (a thread: a server may be slow)
++		std::thread m_netCheck;
++		std::atomic<bool> m_netCheckDone{false};
++		std::string m_netStatus;                 // shown on the Connection row
++		std::string m_netStatusThread;
 +		Preferences m_prefs;
 +		std::vector<Game> m_games;
 +		std::vector<std::string> m_wallpapers;
@@ -10342,7 +10814,8 @@ index 0000000..e5d42b3
 +				m_display.DestroyTexture(game.icon);
 +		}
 +		m_games.clear();
-+		BuildGames(ScanLibrary(GamesFolder()));
++		ps4_netfs_forget(); // the share is looked at again too
++		BuildGames(ScanAllGames());
 +		BuildItems();
 +		m_selected[gamesIndex] = 0;
 +		m_itemPos[gamesIndex] = 0.0f;
@@ -10469,7 +10942,8 @@ index 0000000..e5d42b3
 +		auto& settings = m_items[(int)Category::Settings];
 +		const auto& categories = CremaSettings::Categories();
 +		constexpr const char* GROUP_HELP[] = {"TV picture, touch pointer, FPS counter", "CPU mode, shaders, language",
-+			"Volume, GamePad speaker, buffer", "Touchpad, motion controls", "Logs and freeze reports - on or off"};
++			"Volume, GamePad speaker, buffer", "Touchpad, motion controls", "Pretendo, private server, network library",
++			"Logs and freeze reports - on or off"};
 +		for (size_t i = 0; i < categories.size(); i++)
 +			settings.push_back({categories[i], i < std::size(GROUP_HELP) ? GROUP_HELP[i] : "", -1, -1, SET_GROUP + (int)i});
 +		settings.push_back({"Language", PS4Lang::Current().name, -1, -1, SET_LANGUAGE});
@@ -10479,6 +10953,8 @@ index 0000000..e5d42b3
 +		settings.push_back({"Clock", m_prefs.clock ? "On" : "Off", -1, -1, SET_CLOCK});
 +		settings.push_back({"Game Folder", GamesFolder(), -1, -1, SET_GAMES_DIR});
 +		settings.push_back({"Download Covers", "Box art from GameTDB for your games", -1, -1, SET_COVERS});
++		settings.push_back({"Check for Updates", "Version " + m_version, -1, -1, SET_UPDATE_CHECK});
++		settings.push_back({"Automatic Updates", m_prefs.autoUpdate ? "On" : "Off", -1, -1, SET_AUTO_UPDATE});
 +		settings.push_back({"Reset All Settings", "Every setting back to the defaults", -1, -1, SET_RESET_ALL});
 +		settings.push_back({"About", "", -1, -1, SET_ABOUT});
 +
@@ -10580,6 +11056,16 @@ index 0000000..e5d42b3
 +			}
 +			m_panel.lines = {"", "Connecting to GameTDB..."};
 +			break;
++		case SET_UPDATE_CHECK:
++			StartUpdateCheck(true);
++			ShowUpdatePanel();
++			return;
++		case SET_AUTO_UPDATE:
++			m_panel.title = "Automatic Updates";
++			m_panel.options = {"On", "Off"};
++			m_panel.selected = m_prefs.autoUpdate ? 0 : 1;
++			m_panel.lines = {"", "On: when Crema opens, it looks", "for a new version on GitHub", "and asks before downloading it."};
++			break;
 +		case SET_RESET_ALL:
 +			m_panel.title = "Reset All Settings";
 +			m_panel.options = {"Cancel", "Reset everything"};
@@ -10590,6 +11076,7 @@ index 0000000..e5d42b3
 +			m_panel.lines = {"Crema",
 +				"Wii U emulator for PS4, based on Cemu",
 +				"Ported to PS4 by ShiroKlein",
++				"GitHub: github.com/iHaiDeeZ",
 +				"Version " + m_version,
 +				"",
 +				"Games: " + GamesFolder(),
@@ -10642,12 +11129,15 @@ index 0000000..e5d42b3
 +				if (std::string(setting.category) != category)
 +					continue;
 +				// the menus' language and the online world are per console, not per game
-+				if (!game.empty() && (std::string(setting.key) == "language" || std::string(setting.key) == "online"))
++				if (!game.empty() && (std::string(setting.key) == "language" || std::string(setting.key) == "online" ||
++										 std::string(setting.key) == "net_library"))
 +					continue;
 +				rows.push_back({setting.label, CremaSettings::LabelOf(setting, CremaSettings::Get(setting.key, game)),
 +					setting.key, false, false, !setting.live});
 +				if (game.empty() && std::string(setting.key) == "online")
 +					AddOnlineRows(rows);
++				if (game.empty() && std::string(setting.key) == "net_library")
++					AddNetworkRows(rows);
 +			}
 +		}
 +		rows.push_back({"", "", "", true});
@@ -10678,9 +11168,277 @@ index 0000000..e5d42b3
 +		}
 +	}
 +
-+	// The PS4's keyboard over the menu; UpdateKeyboard (every frame) takes its text when it closes.
-+	void Menu::OpenKeyboard(const std::string& title, const std::string& text)
++	// Settings > Online, under "Network Library": where the share is, who to sign in as (SMB), and
++	// a connection test. The share is read at /net/library (port/ps4_netfs.cpp).
++	void Menu::AddNetworkRows(std::vector<SettingRow>& rows)
 +	{
++		const std::string type = CremaSettings::Get("net_library");
++		if (type != "smb" && type != "nfs")
++			return;
++		const std::string address = CremaSettings::Get("net_address");
++		SettingRow where{"Share Address", address.empty() ? "Not Set" : address, "__net_address__"};
++		where.help = type == "smb" ?
++			"The computer and its shared folder, for example 192.168.0.10/Games (a folder in it: 192.168.0.10/Games/WiiU). Cross: type it." :
++			"The computer and the exported folder, for example 192.168.0.10/c/Games (WinNFSd: the drive letter, then the folder). Cross: type it.";
++		where.note = address.empty();
++		rows.push_back(where);
++		if (type == "smb")
++		{
++			const std::string user = CremaSettings::Get("net_user");
++			SettingRow name{"User Name", user.empty() ? "Guest" : user, "__net_user__"};
++			name.help = "The computer's user name (a Microsoft account: its e-mail address). Empty: guest. Cross: type it.";
++			rows.push_back(name);
++			SettingRow password{"Password", CremaSettings::Get("net_password").empty() ? "Not Set" : "********", "__net_password__"};
++			password.help = "That user's password, kept in /data/Crema/crema.ini. Cross: type it.";
++			rows.push_back(password);
++		}
++		SettingRow check{"Connection", m_netCheck.joinable() ? "Connecting..." : m_netStatus.empty() ? "Test" : m_netStatus, "__net_check__"};
++		check.help = "Cross: connect and look at the folder. Then press Square on your games to list the share's games.";
++		rows.push_back(check);
++	}
++
++	void Menu::StartNetworkCheck()
++	{
++		if (m_netCheck.joinable())
++			return;
++		CremaSettings::MountNetworkLibrary();
++		m_netCheckDone = false;
++		m_netCheck = std::thread([this] {
++			char message[256] = {};
++			ps4_netfs_check("library", message, sizeof(message));
++			m_netStatusThread = message;
++			m_netCheckDone = true;
++		});
++		Log("network library: connecting");
++	}
++
++	// every frame: the test's answer, when it has one
++	void Menu::UpdateNetworkCheck()
++	{
++		if (!m_netCheck.joinable() || !m_netCheckDone)
++			return;
++		m_netCheck.join();
++		m_netStatus = m_netStatusThread;
++		Log("network library: " + m_netStatus);
++		if (m_panel.open && m_panel.category == "Online")
++		{
++			const int selected = m_panel.selected;
++			BuildSettingRows();
++			m_panel.selected = std::min(selected, (int)m_panel.rows.size() - 1);
++		}
++	}
++
++	// The games folder's games, then the network library's (Settings > Online)
++	std::vector<LibraryEntry> Menu::ScanAllGames()
++	{
++		std::vector<LibraryEntry> library = ScanLibrary(GamesFolder());
++		const std::string network = CremaSettings::NetworkLibraryFolder();
++		if (!network.empty())
++		{
++			std::vector<LibraryEntry> shared = ScanLibrary(network);
++			Log("network library: " + std::to_string(shared.size()) + " games");
++			for (LibraryEntry& entry : shared)
++				library.push_back(std::move(entry));
++		}
++		return library;
++	}
++
++	void Menu::StartUpdateCheck(bool manual)
++	{
++		m_updateManual = m_updateManual || manual;
++		const UpdateState state = m_updateState;
++		if (m_updateThread.joinable() || state == UpdateState::Downloading || state == UpdateState::Finished)
++			return;
++		m_updateState = UpdateState::Checking;
++		m_updateThread = std::thread([this] {
++			const CremaUpdater::Release release = CremaUpdater::CheckLatest(m_assetsDir + "/xmb/cacert.pem", m_updatePrefix);
++			std::lock_guard lock(m_updateMutex);
++			m_updateRelease = release;
++			m_updateError = release.error;
++			if (!release.ok)
++				m_updateState = UpdateState::Failed;
++			else if (CremaUpdater::CompareVersions(release.version, m_version) > 0)
++				m_updateState = UpdateState::Available;
++			else
++				m_updateState = UpdateState::UpToDate;
++		});
++	}
++
++	void Menu::StartUpdateDownload()
++	{
++		if (m_updateThread.joinable())
++			m_updateThread.join();
++		m_updateCancel = false;
++		m_updateDone = 0;
++		m_updateTotal = m_updateRelease.size;
++		m_updateState = UpdateState::Downloading;
++		m_updateThread = std::thread([this] {
++			CremaUpdater::Release release;
++			{
++				std::lock_guard lock(m_updateMutex);
++				release = m_updateRelease;
++			}
++			// where the PS4's package installers look; the app can't install over itself
++			mkdir("/data/pkg", 0777);
++			const std::string path = "/data/pkg/" + m_updatePrefix + "-v" + release.version + ".pkg";
++			std::string error;
++			const bool ok = CremaUpdater::Download(release, path, m_assetsDir + "/xmb/cacert.pem",
++				[this](uint64_t done, uint64_t total) {
++					m_updateDone = done;
++					if (total)
++						m_updateTotal = total;
++					return !m_updateCancel;
++				},
++				&error);
++			std::lock_guard lock(m_updateMutex);
++			if (!ok)
++			{
++				m_updateError = m_updateCancel ? "" : error;
++				m_updateState = m_updateCancel ? UpdateState::Available : UpdateState::Failed;
++				Log("update: " + (m_updateCancel ? std::string("cancelled") : error));
++				return;
++			}
++			Log("update: " + path + " ready for the package installer");
++			m_updateReady = path;
++			m_updateState = UpdateState::Finished;
++		});
++	}
++
++	// The update panel shows the state: checking, the prompt, the download, the result.
++	void Menu::ShowUpdatePanel()
++	{
++		CremaUpdater::Release release;
++		std::string error, ready;
++		{
++			std::lock_guard lock(m_updateMutex);
++			release = m_updateRelease;
++			error = m_updateError;
++			ready = m_updateReady;
++		}
++		const std::string app = m_updatePrefix == "Crema-Lab" ? "Crema Lab" : "Crema";
++		const std::string latest = app + " v" + release.version;
++		std::vector<std::string> lines, options;
++		std::string title = "Updates";
++		switch (m_updateState.load())
++		{
++		case UpdateState::Idle:
++		case UpdateState::Checking:
++			lines = {"", "Looking for a new version on GitHub..."};
++			break;
++		case UpdateState::UpToDate:
++			lines = {"", "You have the latest version.", "", "Installed: v" + m_version};
++			break;
++		case UpdateState::Available:
++			title = "Update Available";
++			lines = {"", latest + " is available.", "You have v" + m_version + ".", "",
++				fmt::format("Download it ({:.0f} MB)?", release.size / 1048576.0)};
++			options = {"Yes", "No"};
++			break;
++		case UpdateState::Downloading:
++		{
++			title = "Downloading Update";
++			const uint64_t done = m_updateDone, total = std::max<uint64_t>(m_updateTotal, 1);
++			lines = {"", latest, fmt::format("{}%   {:.0f} of {:.0f} MB", (int)(done * 100 / total), done / 1048576.0, total / 1048576.0), "",
++				"Keep the app open until it's done."};
++			options = {"Cancel"};
++			break;
++		}
++		case UpdateState::Finished:
++			title = "Update Ready";
++			lines = {"", latest + " is downloaded and checked.", "",
++				"To install it, close " + app + ", then open",
++				"GoldHEN's Package Installer (or Debug Settings >",
++				"Game > Package Installer) and pick it.", "",
++				"Saved as " + ready,
++				"Games, saves and settings are kept."};
++			options = {"OK"};
++			break;
++		case UpdateState::Failed:
++			title = "Updates";
++			lines = {"", m_updatePrompted ? "The update didn't work:" : "Couldn't check for updates:", error};
++			options = {"OK"};
++			break;
++		}
++		const bool sameOptions = m_panel.open && m_panel.setting == SET_UPDATE && m_panel.options == options;
++		if (!(m_panel.open && m_panel.setting == SET_UPDATE))
++			m_panel = {};
++		m_panel.open = true;
++		m_panel.setting = SET_UPDATE;
++		m_panel.title = title;
++		m_panel.lines = lines;
++		m_panel.rows.clear();
++		if (!sameOptions)
++		{
++			m_panel.options = options;
++			m_panel.selected = 0;
++		}
++	}
++
++	void Menu::ChooseUpdateOption()
++	{
++		if (m_panel.selected < 0 || m_panel.selected >= (int)m_panel.options.size())
++			return;
++		const std::string choice = m_panel.options[m_panel.selected];
++		if (choice == "Yes")
++		{
++			StartUpdateDownload();
++			Play("confirm");
++		}
++		else if (choice == "Cancel")
++		{
++			m_updateCancel = true;
++			Play("back");
++		}
++		else
++		{
++			m_panel.open = false;
++			Play("back");
++		}
++	}
++
++	// every frame: the background check's and the download's news
++	void Menu::UpdateUpdater()
++	{
++		const UpdateState state = m_updateState;
++		const bool settled = state == UpdateState::UpToDate || state == UpdateState::Available ||
++			state == UpdateState::Failed || state == UpdateState::Finished;
++		if (settled && m_updateThread.joinable())
++			m_updateThread.join();
++		const bool shown = m_panel.open && m_panel.setting == SET_UPDATE;
++		// a new version found in the background: asked once, when nothing else is on screen
++		if (state == UpdateState::Available && !m_updatePrompted && !m_intro && m_launch < 0 && !m_firstLanguage &&
++			!m_firstStyle && !m_keyboard && (!m_panel.open || shown))
++		{
++			m_updatePrompted = true;
++			ShowUpdatePanel();
++			Play("menu");
++			return;
++		}
++		if (!shown)
++		{
++			// background results nobody asked to see stay in the log; a finished download is shown once
++			if (state == UpdateState::Finished && !m_updateReadyShown && !m_panel.open && m_launch < 0)
++			{
++				m_updateReadyShown = true;
++				ShowUpdatePanel();
++				Play("confirm");
++			}
++			return;
++		}
++		if (state == UpdateState::Available)
++			m_updatePrompted = true;
++		if (state == UpdateState::Finished && !m_updateReadyShown)
++		{
++			m_updateReadyShown = true;
++			Play("confirm");
++		}
++		ShowUpdatePanel();
++	}
++
++	// The PS4's keyboard over the menu; UpdateKeyboard (every frame) takes its text when it closes.
++	void Menu::OpenKeyboard(const std::string& title, const std::string& text, const std::string& key)
++	{
++		m_keyboardKey = key;
 +		static bool s_loaded = false;
 +		if (!s_loaded)
 +		{
@@ -10699,7 +11457,7 @@ index 0000000..e5d42b3
 +		s_title[i] = u'\0';
 +		OrbisImeDialogSetting setting = {};
 +		setting.userId = (uint32_t)m_user;
-+		setting.type = ORBIS_TYPE_TYPE_URL;
++		setting.type = key == "net_user" || key == "net_password" ? ORBIS_TYPE_BASIC_LATIN : ORBIS_TYPE_TYPE_URL;
 +		setting.enterLabel = ORBIS_BUTTON_LABEL_DEFAULT;
 +		setting.maxTextLength = 120;
 +		setting.inputTextBuffer = reinterpret_cast<wchar_t*>(m_keyboardText.data());
@@ -10727,16 +11485,24 @@ index 0000000..e5d42b3
 +		m_keyboard = false;
 +		if (status != ORBIS_DIALOG_STATUS_STOPPED || result.endstatus != ORBIS_DIALOG_OK)
 +			return;
-+		// the address is ASCII
++		// ASCII (a shared folder or a password may have spaces in it; an address doesn't)
++		const bool network = m_keyboardKey.rfind("net_", 0) == 0;
 +		std::string text;
 +		for (char16_t c : m_keyboardText)
 +		{
 +			if (c == u'\0')
 +				break;
-+			if (c > u' ' && c < 0x7F)
++			if ((c > u' ' || (network && c == u' ')) && c < 0x7F)
 +				text += (char)c;
 +		}
-+		CremaSettings::Set("online_server", text);
++		if (m_keyboardKey != "net_password")
++			boost::algorithm::trim(text);
++		CremaSettings::Set(m_keyboardKey.empty() ? "online_server" : m_keyboardKey, text);
++		if (network)
++		{
++			CremaSettings::MountNetworkLibrary();
++			m_netStatus.clear();
++		}
 +		BuildSettingRows();
 +		Play("confirm");
 +	}
@@ -10804,6 +11570,22 @@ index 0000000..e5d42b3
 +				OpenKeyboard("Server Address", CremaSettings::Get("online_server"));
 +			return;
 +		}
++		if (row.key == "__net_address__" || row.key == "__net_user__" || row.key == "__net_password__")
++		{
++			const std::string key = row.key == "__net_address__" ? "net_address" : row.key == "__net_user__" ? "net_user" : "net_password";
++			if (direction > 0)
++				OpenKeyboard(row.label, key == "net_password" ? "" : CremaSettings::Get(key), key);
++			return;
++		}
++		if (row.key == "__net_check__")
++		{
++			if (direction > 0)
++			{
++				StartNetworkCheck();
++				BuildSettingRows();
++			}
++			return;
++		}
 +		if (row.key.rfind("__files__", 0) == 0)
 +		{
 +			BuildSettingRows(); // looks at the folders again
@@ -10843,6 +11625,11 @@ index 0000000..e5d42b3
 +			CremaSettings::Set(row.key, CremaSettings::Step(*setting, CremaSettings::Get(row.key, game), direction), game);
 +			if (row.key == "language")
 +				SetLanguage(CremaSettings::Get("language"));
++			if (row.key == "net_library")
++			{
++				CremaSettings::MountNetworkLibrary();
++				m_netStatus.clear();
++			}
 +		}
 +		BuildSettingRows();
 +	}
@@ -10859,6 +11646,9 @@ index 0000000..e5d42b3
 +			break;
 +		case SET_CLOCK:
 +			m_prefs.clock = option == 0;
++			break;
++		case SET_AUTO_UPDATE:
++			m_prefs.autoUpdate = option == 0;
 +			break;
 +		case SET_LANGUAGE:
 +			if (option >= 0 && option < (int)PS4Lang::All().size())
@@ -10957,6 +11747,11 @@ index 0000000..e5d42b3
 +			}
 +			if (pressed & BTN_CROSS)
 +			{
++				if (m_panel.setting == SET_UPDATE)
++				{
++					ChooseUpdateOption();
++					return;
++				}
 +				if (m_panel.setting >= 0)
 +				{
 +					const int setting = m_panel.setting;
@@ -12337,7 +13132,7 @@ index 0000000..e5d42b3
 +		m_audio.Start();
 +		m_input.Open(user);
 +		LoadAssets();
-+		BuildGames(ScanLibrary(GamesFolder()));
++		BuildGames(ScanAllGames());
 +		LoadPlayed();
 +		ApplyPreferences();
 +		BuildItems();
@@ -12392,6 +13187,12 @@ index 0000000..e5d42b3
 +			}
 +		}
 +		Log("menu: " + std::to_string(m_games.size()) + " games, " + std::to_string(m_wallpapers.size()) + " wallpapers");
++		// Updates: packages already installed go from /data/pkg; then GitHub is asked (Settings >
++		// Automatic Updates).
++		m_updatePrefix = CremaUpdater::PackagePrefix(m_assetsDir);
++		CremaUpdater::RemoveOld(m_updatePrefix, m_version);
++		if (m_prefs.autoUpdate)
++			StartUpdateCheck(false);
 +		// Cemu's community graphic packs, the first time (then the games' Check for Updates).
 +		if (CremaGraphicPacks::InstalledVersion(PacksFolder()).empty())
 +		{
@@ -12436,6 +13237,8 @@ index 0000000..e5d42b3
 +				HandleInput(m_input.Poll(dt));
 +			}
 +			UpdateCoverDownload();
++			UpdateNetworkCheck();
++			UpdateUpdater();
 +			UpdatePackDownload();
 +
 +			m_display.BeginFrame();
@@ -12456,6 +13259,11 @@ index 0000000..e5d42b3
 +		m_packCancel = true;
 +		if (m_packThread.joinable())
 +			m_packThread.join();
++		if (m_netCheck.joinable())
++			m_netCheck.join();
++		m_updateCancel = true;
++		if (m_updateThread.joinable())
++			m_updateThread.join();
 +		m_audio.Stop();
 +		m_display.Shutdown();
 +		ImGui::DestroyContext(context);
