@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -747,6 +748,10 @@ int64_t readvFd(NetFile& file, const struct iovec* iov, int count) {
 // Mounts url (smb://host/share[/folder] or nfs://host/export[/folder]) at /net/<name>; an empty url
 // takes it away. Connects on first use.
 extern "C" void ps4_netfs_mount(const char* name, const char* url, const char* user, const char* password) {
+    // a server that goes away mid-read raises SIGPIPE on the next write, which would end the app
+    // (DolphinPS4 Lab's network shares hit it): a failed write is an error instead
+    static std::once_flag s_sigpipe;
+    std::call_once(s_sigpipe, [] { signal(SIGPIPE, SIG_IGN); });
     std::shared_ptr<Mount> mount;
     const std::string address = url ? url : "";
     if (!address.empty()) {
