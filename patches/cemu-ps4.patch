@@ -7235,10 +7235,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..1a8bd94
+index 0000000..35143a7
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,878 @@
+@@ -0,0 +1,897 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -7701,12 +7701,31 @@ index 0000000..1a8bd94
 +	}
 +
 +	// MainWindow::FileLoad without the dialogs
++	// the update and DLC the launcher found next to this game (data_dir/title-extras.txt: "<game>\t<title>"),
++	// added to Cemu's title list so they mount as if installed
++	void AddTitleExtras(const fs::path& launchPath)
++	{
++		std::ifstream file(kDataRoot / "title-extras.txt");
++		const std::string game = _pathToUtf8(launchPath);
++		std::string line;
++		while (std::getline(file, line))
++		{
++			const size_t tab = line.find('\t');
++			if (tab == std::string::npos || line.compare(0, tab, game) != 0 || tab != game.size())
++				continue;
++			const std::string extra = line.substr(tab + 1);
++			Trace("title: with " + extra);
++			CafeTitleList::AddTitleFromPath(_utf8ToPath(extra));
++		}
++	}
++
 +	bool PrepareTitle(const fs::path& launchPath)
 +	{
 +		TitleInfo launchTitle{launchPath};
 +		if (launchTitle.IsValid())
 +		{
 +			CafeTitleList::AddTitleFromPath(launchPath);
++			AddTitleExtras(launchPath);
 +			TitleId baseTitleId;
 +			if (!CafeTitleList::FindBaseTitleId(launchTitle.GetAppTitleId(), baseTitleId))
 +			{
@@ -9796,10 +9815,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..01be75f
+index 0000000..936e773
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3886 @@
+@@ -0,0 +1,4070 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -9819,6 +9838,7 @@ index 0000000..01be75f
 +
 +#include "Cafe/Filesystem/fsc.h"
 +#include "Cafe/TitleList/TitleInfo.h"
++#include "Cafe/TitleList/TitleId.h"
 +
 +#include <imgui.h>
 +#include <imgui_internal.h>
@@ -10411,6 +10431,8 @@ index 0000000..01be75f
 +		std::string format;   // "NUS", "Folder", "WUA", "WUD", "WUHB", "Homebrew"
 +		std::vector<uint8> icon; // RGBA
 +		uint32_t iconWidth = 0, iconHeight = 0;
++		uint64 appId = 0;     // the title ID: 00050000 a game, 0005000E its update, 0005000C its DLC
++		int kind = 0;         // 0 a game (or homebrew), 1 an update, 2 DLC
 +	};
 +
 +	std::string Lower(std::string text)
@@ -10486,6 +10508,10 @@ index 0000000..01be75f
 +				if (info.IsSystemDataTitle())
 +					continue;
 +				entry.titleId = fmt::format("{:016x}", info.GetAppTitleId());
++				entry.appId = info.GetAppTitleId();
++				// updates and DLC go with their game (BuildGames), not in the list
++				const auto type = TitleIdParser(entry.appId).GetType();
++				entry.kind = type == TitleIdParser::TITLE_TYPE::BASE_TITLE_UPDATE ? 1 : type == TitleIdParser::TITLE_TYPE::AOC ? 2 : 0;
 +				entry.title = info.GetMetaTitleName();
 +				entry.version = info.GetAppTitleVersion();
 +				entry.region = RegionName(info.GetMetaRegion());
@@ -10504,7 +10530,8 @@ index 0000000..01be75f
 +					format == TitleInfo::TitleDataFormat::WIIU_ARCHIVE ? "WUA" :
 +					format == TitleInfo::TitleDataFormat::WUD ? "WUD" :
 +					format == TitleInfo::TitleDataFormat::WUHB ? "WUHB" : "NUS";
-+				LoadIcon(info, entry);
++				if (entry.kind == 0)
++					LoadIcon(info, entry); // (an update's or DLC's icon isn't shown: not read, over the network either)
 +			}
 +			else
 +			{
@@ -10537,6 +10564,14 @@ index 0000000..01be75f
 +		ImTextureID icon{};   // the title's own icon (meta/iconTex.tga)
 +		float iconAspect = 1.0f;
 +		bool boxArt = false;  // cover is box art (data_dir/covers/<ID>.png or .jpg)
++		// updates and DLC found for it (the games folder, the network library), newest first;
++		// used as Triangle > Update & DLC says (title-sources.ini), else the newest
++		struct Source
++		{
++			std::string path;
++			uint16 version = 0;
++		};
++		std::vector<Source> updates, dlcs;
 +	};
 +
 +	enum class Category
@@ -10621,6 +10656,15 @@ index 0000000..01be75f
 +
 +	private:
 +		void BuildGames(std::vector<LibraryEntry> library);
++		// Update & DLC: the choice per game ("auto", "off" or a path), kept in title-sources.ini
++		std::map<std::string, std::string> m_sources;
++		void LoadSources();
++		void SaveSources();
++		std::string SourceChoice(const Game& game, const char* what) const;
++		const Game::Source* ChosenSource(const Game& game, const char* what) const;
++		void WriteTitleExtras();
++		void ShowUpdateDlc(const Game& game);
++		std::string SourceLabel(const Game& game, const char* what) const;
 +		void LoadBoxArt(Game& game);
 +		void StartCoverDownload();
 +		void UpdateCoverDownload();
@@ -10782,9 +10826,39 @@ index 0000000..01be75f
 +
 +	void Menu::BuildGames(std::vector<LibraryEntry> library)
 +	{
++		// updates and DLC by the low half of their title ID (the game's is the same)
++		std::map<uint32, std::vector<Game::Source>> updates, dlcs;
++		for (const LibraryEntry& entry : library)
++		{
++			if (entry.kind == 1)
++				updates[(uint32)entry.appId].push_back({entry.path, entry.version});
++			else if (entry.kind == 2)
++				dlcs[(uint32)entry.appId].push_back({entry.path, entry.version});
++		}
++		size_t attached = 0;
 +		for (LibraryEntry& entry : library)
 +		{
++			if (entry.kind != 0)
++				continue;
 +			Game game;
++			if (entry.appId)
++			{
++				auto u = updates.find((uint32)entry.appId);
++				if (u != updates.end())
++				{
++					game.updates = u->second;
++					attached += u->second.size();
++				}
++				auto d = dlcs.find((uint32)entry.appId);
++				if (d != dlcs.end())
++				{
++					game.dlcs = d->second;
++					attached += d->second.size();
++				}
++				auto newest = [](const Game::Source& a, const Game::Source& b) { return a.version > b.version; };
++				std::stable_sort(game.updates.begin(), game.updates.end(), newest);
++				std::stable_sort(game.dlcs.begin(), game.dlcs.end(), newest);
++			}
 +			game.path = entry.path;
 +			game.id = entry.titleId;
 +			game.title = entry.title;
@@ -10804,6 +10878,89 @@ index 0000000..01be75f
 +			m_games.push_back(std::move(game));
 +		}
 +		std::sort(m_games.begin(), m_games.end(), [](const Game& a, const Game& b) { return Lower(a.title) < Lower(b.title); });
++		Log(fmt::format("games: {} updates and DLC found next to their games", attached));
++		WriteTitleExtras();
++	}
++
++	// title-sources.ini: "<title ID>.update=auto|off|<path>" and ".dlc=..." (Triangle > Update & DLC)
++	void Menu::LoadSources()
++	{
++		m_sources.clear();
++		std::ifstream file(m_dataDir + "/title-sources.ini");
++		std::string line;
++		while (std::getline(file, line))
++		{
++			while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
++				line.pop_back();
++			const size_t eq = line.find('=');
++			if (eq != std::string::npos && line[0] != '#')
++				m_sources[line.substr(0, eq)] = line.substr(eq + 1);
++		}
++	}
++
++	void Menu::SaveSources()
++	{
++		std::ofstream file(m_dataDir + "/title-sources.ini", std::ios::trunc);
++		file << "# Crema: which update and DLC each game uses (Triangle > Update & DLC); auto = the newest found\n";
++		for (const auto& [key, value] : m_sources)
++			if (value != "auto")
++				file << key << "=" << value << "\n";
++	}
++
++	std::string Menu::SourceChoice(const Game& game, const char* what) const
++	{
++		auto it = m_sources.find(game.id + "." + what);
++		return it == m_sources.end() ? "auto" : it->second;
++	}
++
++	// the update / DLC a game starts with: the chosen one, else the newest found; none when off
++	const Game::Source* Menu::ChosenSource(const Game& game, const char* what) const
++	{
++		const auto& list = std::string(what) == "update" ? game.updates : game.dlcs;
++		const std::string choice = SourceChoice(game, what);
++		if (choice == "off" || list.empty())
++			return nullptr;
++		for (const Game::Source& source : list)
++			if (source.path == choice)
++				return &source;
++		return &list.front();
++	}
++
++	// title-extras.txt: "<game's path>\t<its update or DLC>" for the game process
++	// (PS4WindowSystem.cpp PrepareTitle adds them to Cemu's title list, so they mount as installed)
++	void Menu::WriteTitleExtras()
++	{
++		std::ofstream file(m_dataDir + "/title-extras.txt", std::ios::trunc);
++		for (const Game& game : m_games)
++		{
++			for (const char* what : {"update", "dlc"})
++				if (const Game::Source* source = ChosenSource(game, what))
++					file << game.path << "\t" << source->path << "\n";
++		}
++	}
++
++	// "v208, network library" / "Off" / "None found" (an update installed in mlc01 is used too)
++	std::string Menu::SourceLabel(const Game& game, const char* what) const
++	{
++		const auto& list = std::string(what) == "update" ? game.updates : game.dlcs;
++		if (list.empty())
++			return "None found";
++		const std::string choice = SourceChoice(game, what);
++		if (choice == "off")
++			return "Off";
++		const Game::Source* source = ChosenSource(game, what);
++		const std::string where = source->path.rfind("/net/", 0) == 0 ? "network library" : "games folder";
++		return fmt::format("{}v{}, {}", choice == "auto" ? "Auto: " : "", source->version, where);
++	}
++
++	// Triangle > Update & DLC: Cross on a line takes the next choice (Auto, each one found, Off)
++	void Menu::ShowUpdateDlc(const Game& game)
++	{
++		m_panel.title = "Update & DLC";
++		m_panel.options = {"Update: " + SourceLabel(game, "update"), "DLC: " + SourceLabel(game, "dlc"), "Done"};
++		m_panel.lines = {game.title, "", "Found next to the game, in the games folder",
++			"or the network library. Auto: the newest.", "Cross: the next choice.",
++			"(An update installed in mlc01 is used too.)"};
 +	}
 +
 +	// Box art: data_dir/covers/<ID>.png (the user's own) or <ID>.jpg (downloaded from GameTDB), by
@@ -12180,11 +12337,51 @@ index 0000000..01be75f
 +					Play("confirm");
 +					return;
 +				}
++				else if (m_panel.title == "Update & DLC")
++				{
++					const Item& item = m_items[m_category][m_selected[m_category]];
++					if (item.game < 0 || m_panel.selected >= 2)
++					{
++						m_panel.open = false;
++						Play("back");
++						return;
++					}
++					const Game& game = m_games[item.game];
++					const char* what = m_panel.selected == 0 ? "update" : "dlc";
++					const auto& list = m_panel.selected == 0 ? game.updates : game.dlcs;
++					if (!list.empty())
++					{
++						// Auto, then each one found, then Off
++						std::vector<std::string> choices = {"auto"};
++						for (const Game::Source& source : list)
++							choices.push_back(source.path);
++						choices.push_back("off");
++						const std::string current = SourceChoice(game, what);
++						size_t at = std::find(choices.begin(), choices.end(), current) - choices.begin();
++						const std::string next = choices[(at + 1) % choices.size()];
++						m_sources[game.id + "." + what] = next;
++						SaveSources();
++						WriteTitleExtras();
++						Log(fmt::format("{} {}: {}", game.id, what, next));
++					}
++					const int selected = m_panel.selected;
++					ShowUpdateDlc(game);
++					m_panel.selected = selected;
++					Play("confirm");
++					return;
++				}
 +				else if (m_panel.title == "Game")
 +				{
 +					const Item& item = m_items[m_category][m_selected[m_category]];
 +					const Game& game = m_games[item.game];
 +					const std::string& choice = m_panel.options[m_panel.selected];
++					if (choice == "Update & DLC")
++					{
++						ShowUpdateDlc(game);
++						m_panel.selected = 0;
++						Play("confirm");
++						return;
++					}
 +					if (choice == "Start")
 +					{
 +						m_panel.open = false;
@@ -12249,8 +12446,11 @@ index 0000000..01be75f
 +							std::error_code ec;
 +							const std::string titles = m_dataDir + "/mlc01/usr/title/";
 +							const std::string low = game.id.substr(8);
-+							m_panel.lines.push_back(std::string("Update: ") + (fs::exists(titles + "0005000e/" + low, ec) ? "installed" : "not installed"));
-+							m_panel.lines.push_back(std::string("DLC: ") + (fs::exists(titles + "0005000c/" + low, ec) ? "installed" : "not installed"));
++							const bool updateInMlc = fs::exists(titles + "0005000e/" + low, ec), dlcInMlc = fs::exists(titles + "0005000c/" + low, ec);
++							m_panel.lines.push_back("Update: " + (game.updates.empty() ? std::string(updateInMlc ? "installed (mlc01)" : "not found") :
++								SourceLabel(game, "update") + (updateInMlc ? " (+ mlc01)" : "")));
++							m_panel.lines.push_back("DLC: " + (game.dlcs.empty() ? std::string(dlcInMlc ? "installed (mlc01)" : "not found") :
++								SourceLabel(game, "dlc") + (dlcInMlc ? " (+ mlc01)" : "")));
 +						}
 +						Play("confirm");
 +						return;
@@ -12371,6 +12571,8 @@ index 0000000..01be75f
 +					m_panel.options.push_back("Game Settings");
 +				if (!game.homebrew)
 +					m_panel.options.push_back("Graphic Packs");
++				if (!game.homebrew)
++					m_panel.options.push_back("Update & DLC");
 +				m_panel.options.push_back("Information");
 +				m_panel.options.push_back(m_prefs.defaultGame == game.path ? "Remove Default Game" : "Set as Default Game");
 +				m_panel.options.push_back("Delete");
@@ -13531,6 +13733,7 @@ index 0000000..01be75f
 +		m_audio.Start();
 +		m_input.Open(user);
 +		LoadAssets();
++		LoadSources();
 +		BuildGames(ScanAllGames());
 +		LoadPlayed();
 +		ApplyPreferences();
