@@ -187,6 +187,14 @@ build_libsmb2() {
     # OpenOrbis' endian.h has __bswapNN as functions (not macros): don't rename them to __bswap_NN
     sed -i 's/^#ifndef __bswap\(16\|32\|64\)$/#if !defined(__bswap\1) \&\& !defined(PS4_PLATFORM)/' \
         "$SRC/libsmb2/include/portable-endian.h"
+    # its AES functions get their own names: Cemu's AES128_ECB_encrypt is a function pointer
+    # variable (util/crypto/aes128.h), and libsmb2's signing called into it - a jump into data
+    # right after a successful login (SMB3 signing, required by Windows 11)
+    grep -q smb2_AES128_ECB_encrypt "$SRC/libsmb2/lib/aes.h" || sed -i '1i\
+#define AES128_ECB_encrypt smb2_AES128_ECB_encrypt\
+#define AES128_ECB_decrypt smb2_AES128_ECB_decrypt\
+#define AES128_CBC_encrypt_buffer smb2_AES128_CBC_encrypt_buffer\
+#define AES128_CBC_decrypt_buffer smb2_AES128_CBC_decrypt_buffer' "$SRC/libsmb2/lib/aes.h"
     cmake_build libsmb2 "$SRC/libsmb2" -DENABLE_EXAMPLES=OFF "${MUSL_LINUX_ONLY[@]}"
 }
 
