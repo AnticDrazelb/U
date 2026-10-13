@@ -9815,10 +9815,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..936e773
+index 0000000..f450d80
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4070 @@
+@@ -0,0 +1,4132 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -9852,6 +9852,7 @@ index 0000000..936e773
 +#include <ctime>
 +#include <fstream>
 +#include <map>
++#include <set>
 +#include <thread>
 +
 +#include <dirent.h>
@@ -10572,6 +10573,10 @@ index 0000000..936e773
 +			uint16 version = 0;
 +		};
 +		std::vector<Source> updates, dlcs;
++		// the same game found more than once (the games folder, the network library): one entry,
++		// the copy chosen in Triangle > Update & DLC, else the console's own
++		std::vector<std::string> copies;
++		uint64 appId = 0;
 +	};
 +
 +	enum class Category
@@ -10660,7 +10665,8 @@ index 0000000..936e773
 +		std::map<std::string, std::string> m_sources;
 +		void LoadSources();
 +		void SaveSources();
-+		std::string SourceChoice(const Game& game, const char* what) const;
++		std::string SourceChoice(const Game& game, const char* what) const { return SourceChoice(game.id, what); }
++		std::string SourceChoice(const std::string& titleId, const char* what) const;
 +		const Game::Source* ChosenSource(const Game& game, const char* what) const;
 +		void WriteTitleExtras();
 +		void ShowUpdateDlc(const Game& game);
@@ -10836,11 +10842,39 @@ index 0000000..936e773
 +				dlcs[(uint32)entry.appId].push_back({entry.path, entry.version});
 +		}
 +		size_t attached = 0;
++		// the same game more than once: the console's copy first (faster than the network), then
++		// the network library's in scan order
++		std::stable_sort(library.begin(), library.end(), [](const LibraryEntry& a, const LibraryEntry& b) {
++			return (a.path.rfind("/net/", 0) != 0) > (b.path.rfind("/net/", 0) != 0);
++		});
++		std::map<uint64, std::vector<std::string>> copies;
++		for (const LibraryEntry& entry : library)
++			if (entry.kind == 0 && entry.appId)
++				copies[entry.appId].push_back(entry.path);
++		std::set<uint64> shown;
++		size_t duplicates = 0;
 +		for (LibraryEntry& entry : library)
 +		{
 +			if (entry.kind != 0)
 +				continue;
++			if (entry.appId)
++			{
++				const std::vector<std::string>& all = copies[entry.appId];
++				const std::string chosen = SourceChoice(fmt::format("{:016x}", entry.appId), "game");
++				const bool hasChoice = std::find(all.begin(), all.end(), chosen) != all.end();
++				// the chosen copy, else the first; the others are only in its list
++				if (hasChoice ? entry.path != chosen : entry.path != all.front())
++				{
++					duplicates++;
++					continue;
++				}
++				if (!shown.insert(entry.appId).second)
++					continue;
++			}
 +			Game game;
++			game.appId = entry.appId;
++			if (entry.appId)
++				game.copies = copies[entry.appId];
 +			if (entry.appId)
 +			{
 +				auto u = updates.find((uint32)entry.appId);
@@ -10878,7 +10912,7 @@ index 0000000..936e773
 +			m_games.push_back(std::move(game));
 +		}
 +		std::sort(m_games.begin(), m_games.end(), [](const Game& a, const Game& b) { return Lower(a.title) < Lower(b.title); });
-+		Log(fmt::format("games: {} updates and DLC found next to their games", attached));
++		Log(fmt::format("games: {} updates and DLC found next to their games, {} more copies of listed games", attached, duplicates));
 +		WriteTitleExtras();
 +	}
 +
@@ -10907,9 +10941,9 @@ index 0000000..936e773
 +				file << key << "=" << value << "\n";
 +	}
 +
-+	std::string Menu::SourceChoice(const Game& game, const char* what) const
++	std::string Menu::SourceChoice(const std::string& titleId, const char* what) const
 +	{
-+		auto it = m_sources.find(game.id + "." + what);
++		auto it = m_sources.find(titleId + "." + what);
 +		return it == m_sources.end() ? "auto" : it->second;
 +	}
 +
@@ -10957,10 +10991,16 @@ index 0000000..936e773
 +	void Menu::ShowUpdateDlc(const Game& game)
 +	{
 +		m_panel.title = "Update & DLC";
-+		m_panel.options = {"Update: " + SourceLabel(game, "update"), "DLC: " + SourceLabel(game, "dlc"), "Done"};
++		m_panel.options = {"Update: " + SourceLabel(game, "update"), "DLC: " + SourceLabel(game, "dlc")};
++		if (game.copies.size() > 1)
++			m_panel.options.push_back(std::string("Game: ") + (game.path.rfind("/net/", 0) == 0 ? "network library" : "console") +
++				fmt::format(" ({} of {})", std::find(game.copies.begin(), game.copies.end(), game.path) - game.copies.begin() + 1, game.copies.size()));
++		m_panel.options.push_back("Done");
 +		m_panel.lines = {game.title, "", "Found next to the game, in the games folder",
 +			"or the network library. Auto: the newest.", "Cross: the next choice.",
 +			"(An update installed in mlc01 is used too.)"};
++		if (game.copies.size() > 1)
++			m_panel.lines.push_back(fmt::format("This game is there {} times: Game picks the copy.", game.copies.size()));
 +	}
 +
 +	// Box art: data_dir/covers/<ID>.png (the user's own) or <ID>.jpg (downloaded from GameTDB), by
@@ -12340,13 +12380,35 @@ index 0000000..936e773
 +				else if (m_panel.title == "Update & DLC")
 +				{
 +					const Item& item = m_items[m_category][m_selected[m_category]];
-+					if (item.game < 0 || m_panel.selected >= 2)
++					if (item.game < 0 || m_panel.options[m_panel.selected] == "Done")
 +					{
 +						m_panel.open = false;
 +						Play("back");
 +						return;
 +					}
 +					const Game& game = m_games[item.game];
++					if (m_panel.selected == 2)
++					{
++						// the next copy of the game; the list is built again with it
++						const auto at = std::find(game.copies.begin(), game.copies.end(), game.path) - game.copies.begin();
++						const std::string next = game.copies[(at + 1) % game.copies.size()];
++						const std::string id = game.id;
++						m_sources[id + ".game"] = next;
++						SaveSources();
++						Log(fmt::format("{} game: {}", id, next));
++						RefreshGames();
++						for (const Item& listed : m_items[(int)Category::Games])
++							if (listed.game >= 0 && m_games[listed.game].id == id)
++							{
++								ShowUpdateDlc(m_games[listed.game]);
++								m_panel.open = true;
++								m_panel.title = "Update & DLC";
++								m_panel.selected = 2;
++								break;
++							}
++						Play("confirm");
++						return;
++					}
 +					const char* what = m_panel.selected == 0 ? "update" : "dlc";
 +					const auto& list = m_panel.selected == 0 ? game.updates : game.dlcs;
 +					if (!list.empty())
