@@ -6112,10 +6112,10 @@ index 0000000..e00d2d5
 +} // namespace CremaOnline
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 0000000..d45f6c5
+index 0000000..d03208a
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,1059 @@
+@@ -0,0 +1,1092 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -6410,6 +6410,7 @@ index 0000000..d45f6c5
 +	{
 +		CTL_PLAYER,
 +		CTL_KIND,
++		CTL_ORIENT, // a Wii Remote alone: sideways or upright
 +		CTL_SCOPE,
 +		CTL_BINDING,
 +		CTL_BLOW, // the GamePad's microphone (player 1)
@@ -6483,6 +6484,8 @@ index 0000000..d45f6c5
 +	std::vector<ControlRow> ControlRows()
 +	{
 +		std::vector<ControlRow> rows = {{CTL_PLAYER, 0}, {CTL_KIND, 0}};
++		if (KindOf(PlayerController(sPlayer)) == KIND_WIIMOTE)
++			rows.push_back({CTL_ORIENT, 0});
 +		if (!sGameId.empty())
 +			rows.push_back({CTL_SCOPE, 0});
 +		const int count = (int)BindingsOf(KindOf(PlayerController(sPlayer))).size();
@@ -6566,12 +6569,35 @@ index 0000000..d45f6c5
 +		if (!controller)
 +			return;
 +		if (kind == KIND_WIIMOTE || kind == KIND_NUNCHUK)
-+			std::static_pointer_cast<WiimoteController>(controller)->set_device_type(kind == KIND_NUNCHUK ? kWAPDevFreestyle : kWAPDevCore);
++		{
++			auto wiimote = std::static_pointer_cast<WiimoteController>(controller);
++			wiimote->set_device_type(kind == KIND_NUNCHUK ? kWAPDevFreestyle : kWAPDevCore);
++			wiimote->set_sideways(kind == KIND_WIIMOTE); // alone: sideways first (Orientation changes it)
++		}
 +		controller->clear_mappings();
 +		controller->set_default_mapping(pad);
 +		ApplyPointerMode(player);
 +		SaveLayout(player);
 +		ps4_boot_trace(fmt::format("in-game menu: player {} uses a {}", player + 1, kKindNames[kind]).c_str());
++	}
++
++	// Orientation (a Wii Remote alone): sideways or upright, with that orientation's default layout
++	void ToggleOrientation(int player)
++	{
++		auto controller = PlayerController(player);
++		if (!controller || KindOf(controller) != KIND_WIIMOTE)
++			return;
++		auto wiimote = std::static_pointer_cast<WiimoteController>(controller);
++		std::shared_ptr<ControllerBase> pad = Pad(controller);
++		wiimote->set_sideways(!wiimote->is_sideways());
++		if (pad)
++		{
++			controller->clear_mappings();
++			controller->set_default_mapping(pad);
++		}
++		SaveLayout(player);
++		ps4_boot_trace(fmt::format("in-game menu: player {} holds the Wii Remote {}", player + 1,
++			wiimote->is_sideways() ? "sideways" : "upright").c_str());
 +	}
 +
 +	// Left/Right: the next controller type (the GamePad for player 1 only: Cemu has two at most,
@@ -6869,6 +6895,8 @@ index 0000000..d45f6c5
 +				sPlayer = ((sPlayer + direction) % kPlayers + kPlayers) % kPlayers;
 +			else if (row.kind == CTL_KIND)
 +				StepKind(sPlayer, direction);
++			else if (row.kind == CTL_ORIENT)
++				ToggleOrientation(sPlayer);
 +			else if (row.kind == CTL_SCOPE)
 +				ToggleScope(sPlayer);
 +			else if (stick)
@@ -6932,7 +6960,8 @@ index 0000000..d45f6c5
 +			const bool sel = i == sControlsSelected;
 +			if (sel)
 +				dl->AddRectFilled(ImVec2(x0 + 30, y - 4), ImVec2(W - 30, y + 46), Rgba(ACCENT, 0.30f * a), 10.0f);
-+			const char* label = row.kind == CTL_PLAYER ? "Player" : row.kind == CTL_KIND ? "Controller" : row.kind == CTL_SCOPE ? "Apply To" :
++			const char* label = row.kind == CTL_PLAYER ? "Player" : row.kind == CTL_KIND ? "Controller" :
++				row.kind == CTL_ORIENT ? "Orientation" : row.kind == CTL_SCOPE ? "Apply To" :
 +				row.kind == CTL_RESET ? "Reset to Default" : row.kind == CTL_BLOW ? "Blow (Mic)" : bindings[row.binding].label;
 +			dl->AddText(font, 30.0f, ImVec2(x0 + 60, y + 4), Rgba(TEXT, a), label);
 +			std::string glyph, value;
@@ -6945,6 +6974,8 @@ index 0000000..d45f6c5
 +			}
 +			else if (row.kind == CTL_KIND)
 +				value = kKindNames[kind];
++			else if (row.kind == CTL_ORIENT)
++				value = controller && std::static_pointer_cast<WiimoteController>(controller)->is_sideways() ? "Sideways" : "Upright";
 +			else if (row.kind == CTL_SCOPE)
 +				value = HasGameLayout(sPlayer) ? "This Game" : "All Games";
 +			else if (row.kind == CTL_BINDING && sCapture && !sCaptureBlow && row.binding == sCaptureBinding)
@@ -7006,9 +7037,11 @@ index 0000000..d45f6c5
 +		else if (row.kind == CTL_PLAYER)
 +			help = "Left/Right: the player to set up. Players 2-4: a second PS4 user signs in with their DualShock 4.";
 +		else if (row.kind == CTL_KIND)
-+			help = kind == KIND_WIIMOTE ? "Left/Right: the controller. A Wii Remote alone is held sideways; touchpad: pointer." :
++			help = kind == KIND_WIIMOTE ? "Left/Right: the controller. Orientation (below): sideways or upright; touchpad: pointer." :
 +				kind == KIND_NUNCHUK ? "Left/Right: the controller. Held upright: left stick = Nunchuk; touchpad: pointer." :
 +				"Left/Right: the controller the game sees for this player.";
++		else if (row.kind == CTL_ORIENT)
++			help = "Sideways: D-pad on the left, 1 and 2 on Square and Cross (NES-style games). Upright: pointing at the TV. Buttons and tilt follow.";
 +		else if (row.kind == CTL_SCOPE)
 +			help = "This Game: a layout for this game only. All Games: the normal layout.";
 +		else if (row.kind == CTL_RESET)
@@ -15833,11 +15866,43 @@ index a791c5f..8b92f4e 100644
  #endif
  	case InputAPI::XInput:
  	{
+diff --git a/src/input/emulated/WPADController.cpp b/src/input/emulated/WPADController.cpp
+index 2eae0f8..c0e5778 100644
+--- a/src/input/emulated/WPADController.cpp
++++ b/src/input/emulated/WPADController.cpp
+@@ -262,6 +262,12 @@ void WPADController::KPADRead(KPADStatus_t& status, const BtnRepeat& repeat)
+ 
+ 		glm::vec3 acc;
+ 		motion_sample.getAccelerometer(&acc[0]);
++#ifdef __ORBIS__
++		// Crema: a Wii Remote held sideways is the DualShock 4 turned a quarter around the axis
++		// through its face (y: ~1 g with the controller held normally), so the two other axes swap
++		if (is_sideways())
++			acc = glm::vec3(acc.z, acc.y, -acc.x);
++#endif
+ 		status.acc.x = acc.x;
+ 		status.acc.y = acc.y;
+ 		status.acc.z = acc.z;
+diff --git a/src/input/emulated/WPADController.h b/src/input/emulated/WPADController.h
+index 39df509..e2ddf7d 100644
+--- a/src/input/emulated/WPADController.h
++++ b/src/input/emulated/WPADController.h
+@@ -121,6 +121,10 @@ public:
+ 
+ 	void KPADRead(KPADStatus_t& status, const BtnRepeat& repeat);
+ 	virtual bool is_mpls_attached() { return false; }
++#ifdef __ORBIS__
++	// Crema: a Wii Remote held sideways (WiimoteController): its tilt is turned a quarter
++	virtual bool is_sideways() const { return false; }
++#endif
+ 
+ 	enum class ConnectCallbackStatus
+ 	{
 diff --git a/src/input/emulated/WiimoteController.cpp b/src/input/emulated/WiimoteController.cpp
-index 46921f8..268badf 100644
+index 46921f8..7a8f0bf 100644
 --- a/src/input/emulated/WiimoteController.cpp
 +++ b/src/input/emulated/WiimoteController.cpp
-@@ -56,7 +56,58 @@ bool WiimoteController::set_default_mapping(const std::shared_ptr<ControllerBase
+@@ -56,7 +56,59 @@ bool WiimoteController::set_default_mapping(const std::shared_ptr<ControllerBase
  			{kButtonId_Nunchuck_Left, kAxisXN},
  			{kButtonId_Nunchuck_Right, kAxisXP},
  		};
@@ -15847,9 +15912,10 @@ index 46921f8..268badf 100644
 +	case InputAPI::PS4Pad:
 +	{
 +		// the DualShock 4 (PS4PadController.h: SDL gamepad indices)
-+		if (m_device_type == kWAPDevFreestyle)
++		if (!is_sideways())
 +		{
-+			// upright with the Nunchuk: its stick on the left stick, Z and C on L2 and L1
++			// upright (with the Nunchuk, or alone pointing at the TV): the Nunchuk's stick on the
++			// left stick, Z and C on L2 and L1
 +			mapping =
 +			{
 +				{kButtonId_A, kButton0},
@@ -15896,6 +15962,53 @@ index 46921f8..268badf 100644
  	}
  
  	bool mapping_updated = false;
+@@ -102,6 +154,11 @@ void WiimoteController::load(const pugi::xml_node& node)
+ 
+ 	if (const auto value = node.child("device_type"))
+ 		m_device_type = ConvertString<WPADDeviceType>(value.child_value());
++#ifdef __ORBIS__
++	// layouts saved before the setting: alone was sideways
++	const auto sideways = node.child("sideways");
++	m_sideways = sideways ? std::string(sideways.child_value()) != "0" : true;
++#endif
+ }
+ 
+ void WiimoteController::save(pugi::xml_node& node)
+@@ -109,6 +166,9 @@ void WiimoteController::save(pugi::xml_node& node)
+ 	base_type::save(node);
+ 
+ 	node.append_child("device_type").append_child(pugi::node_pcdata).set_value(fmt::format("{}", (int)m_device_type).c_str());
++#ifdef __ORBIS__
++	node.append_child("sideways").append_child(pugi::node_pcdata).set_value(m_sideways ? "1" : "0");
++#endif
+ }
+ 
+ uint32 WiimoteController::s_get_emulated_button_flag(uint32 id)
+diff --git a/src/input/emulated/WiimoteController.h b/src/input/emulated/WiimoteController.h
+index dc9896f..70a26b7 100644
+--- a/src/input/emulated/WiimoteController.h
++++ b/src/input/emulated/WiimoteController.h
+@@ -43,6 +43,12 @@ public:
+ 	Type type() const override { return Type::Wiimote; }
+ 	WPADDeviceType get_device_type() const override { return m_device_type; }
+ 	void set_device_type(WPADDeviceType device_type);
++#ifdef __ORBIS__
++	// Crema: held sideways (the D-pad on the left, like an NES pad) or upright (pointing at the TV);
++	// the default layout and the tilt follow. A Nunchuk is always upright.
++	bool is_sideways() const override { return m_sideways && m_device_type != kWAPDevFreestyle; }
++	void set_sideways(bool sideways) { m_sideways = sideways; }
++#endif
+ 
+ 	bool is_mpls_attached() override;
+ 
+@@ -74,4 +80,7 @@ public:
+ 
+ private:
+ 	WPADDeviceType m_device_type = kWAPDevCore;
++#ifdef __ORBIS__
++	bool m_sideways = true;
++#endif
+ };
 diff --git a/src/main.cpp b/src/main.cpp
 index ab91559..e04e1d3 100644
 --- a/src/main.cpp
