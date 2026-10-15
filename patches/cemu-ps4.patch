@@ -2111,7 +2111,7 @@ index dbc3cff..eea3451 100644
  
  #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-index f1556f8..1cc9d33 100644
+index f1556f8..1ac44c1 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 @@ -17,6 +17,10 @@
@@ -2125,7 +2125,27 @@ index f1556f8..1cc9d33 100644
  
  uint32 prevScissorX = 0;
  uint32 prevScissorY = 0;
-@@ -864,6 +868,34 @@ void LatteRenderTarget_getScreenImageArea(sint32* x, sint32* y, sint32* width, s
+@@ -265,6 +269,19 @@ LatteTextureView* LatteMRT::GetColorAttachmentTexture(uint32 index, bool createN
+ 	pitchHeight <<= 6;
+ 	uint32 colorBufferHeight = pitchHeight / colorBufferPitch;
+ 	uint32 colorBufferWidth = colorBufferPitch;
++#if defined(__ORBIS__)
++	// Crema: a render target this tall comes from the slice size (the Wii U has no height register)
++	if (colorBufferHeight >= 4096)
++	{
++		static std::unordered_set<uint64> s_logged;
++		const uint64 key = ((uint64)colorBufferPhysMem << 20) ^ colorBufferHeight;
++		if (s_logged.insert(key).second)
++			cemuLog_log(LogType::Force, "big color buffer: {:08x} pitch {} slice size {:#x} -> height {} (scissor {}x{}, fmt {:04x}, tilemode {})",
++				colorBufferPhysMem, colorBufferPitch, pitchHeight, colorBufferHeight,
++				LatteGPUState.contextNew.PA_SC_GENERIC_SCISSOR_BR.get_BR_X(), LatteGPUState.contextNew.PA_SC_GENERIC_SCISSOR_BR.get_BR_Y(),
++				(uint32)colorBufferFormat, (uint32)colorBufferTileMode);
++	}
++#endif
+ 
+ 	// colorbuffer width/height has to be padded to 8/32 alignment but the actual resolution might be smaller
+ 	// use the scissor box as a clue to figure out the original resolution if possible
+@@ -864,6 +881,34 @@ void LatteRenderTarget_getScreenImageArea(sint32* x, sint32* y, sint32* width, s
  		*fullHeight = h;
  }
  
@@ -2160,7 +2180,7 @@ index f1556f8..1cc9d33 100644
  void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPadView)
  {
  	// make sure texture is updated to latest data in cache
-@@ -970,6 +1002,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -970,6 +1015,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  	swkbd_render(!isPadView);
  	nn::erreula::render(!isPadView);
  	LatteOverlay_render(isPadView);
@@ -2201,6 +2221,28 @@ index 743ab67..b1fc494 100644
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
  
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
+index 86b4d75..312180c 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
+@@ -141,4 +141,17 @@ void LatteTextureVk::AllocateOnHost()
+ {
+ 	auto allocationInfo = VulkanRenderer::GetInstance()->GetMemoryManager()->imageMemoryAllocate(GetImageObj()->m_image);
+ 	vkObjTex->m_allocation = allocationInfo;
++#if defined(__ORBIS__)
++	// Crema: large textures with the driver's memory requirement next to them (a Virtual Console
++	// game's GPU read ~240 MB past a 1920x16384 texture placed in a 16 MB block)
++	if (width >= 4096 || height >= 4096 || (uint64)width * height >= 4096ull * 2048)
++	{
++		VkMemoryRequirements req{};
++		vkGetImageMemoryRequirements(m_vkr->GetLogicalDevice(), GetImageObj()->m_image, &req);
++		const uint64 bytesNeeded = (uint64)width * height * (uint64)std::max<sint32>(1, (sint32)depth) * 4;
++		cemuLog_log(LogType::Force, "big texture: {:08x} {}x{}x{} mips {} pitch {} fmt {:04x} tilemode {} dim {} -> vk format {} memory {:#x} (align {:#x}, ~{:#x} for 4 bytes a pixel){}",
++			physAddress, width, height, depth, mipLevels, pitch, (uint32)format, (uint32)tileMode, (uint32)dim, (uint32)vkObjTex->m_format,
++			(uint64)req.size, (uint64)req.alignment, bytesNeeded, req.size < bytesNeeded / 2 ? "  <- SMALLER THAN THE TEXTURE" : "");
++	}
++#endif
+ }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
 index 0000000..d2b623e
