@@ -2111,7 +2111,7 @@ index dbc3cff..eea3451 100644
  
  #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-index f1556f8..1ac44c1 100644
+index f1556f8..7f41344 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 @@ -17,6 +17,10 @@
@@ -2145,7 +2145,29 @@ index f1556f8..1ac44c1 100644
  
  	// colorbuffer width/height has to be padded to 8/32 alignment but the actual resolution might be smaller
  	// use the scissor box as a clue to figure out the original resolution if possible
-@@ -864,6 +881,34 @@ void LatteRenderTarget_getScreenImageArea(sint32* x, sint32* y, sint32* width, s
+@@ -277,6 +294,21 @@ LatteTextureView* LatteMRT::GetColorAttachmentTexture(uint32 index, bool createN
+ 		if (((colorBufferHeight + 31) & ~31) == colorBufferHeight)
+ 			colorBufferHeight = scissorBoxHeight;
+ 	}
++#if defined(__ORBIS__)
++	// Crema: a slice size smaller than one row of the pitch (and no scissor) leaves no height; the
++	// texture is made 1 high at least (LatteTexture.cpp), so the lookup asks for that as well
++	if (colorBufferHeight == 0 || colorBufferWidth == 0)
++	{
++		static std::atomic<uint32> s_logged{0};
++		if (s_logged.fetch_add(1) < 8)
++			cemuLog_log(LogType::Force, "empty color buffer: {:08x} {}x{} pitch {} slice size {:#x} (scissor {}x{}, fmt {:04x}, tilemode {})",
++				colorBufferPhysMem, colorBufferWidth, colorBufferHeight, colorBufferPitch, pitchHeight,
++				LatteGPUState.contextNew.PA_SC_GENERIC_SCISSOR_BR.get_BR_X(), LatteGPUState.contextNew.PA_SC_GENERIC_SCISSOR_BR.get_BR_Y(),
++				(uint32)colorBufferFormat, (uint32)colorBufferTileMode);
++		colorBufferWidth = std::max<uint32>(colorBufferWidth, 1);
++		colorBufferHeight = std::max<uint32>(colorBufferHeight, 1);
++	}
++#endif
+ 
+ 	// log resolution changes if the above heuristic takes effect
+ 	// this is useful to find resolutions which need to be updated in gfx pack texture rules
+@@ -864,6 +896,34 @@ void LatteRenderTarget_getScreenImageArea(sint32* x, sint32* y, sint32* width, s
  		*fullHeight = h;
  }
  
@@ -2180,7 +2202,7 @@ index f1556f8..1ac44c1 100644
  void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPadView)
  {
  	// make sure texture is updated to latest data in cache
-@@ -970,6 +1015,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -970,6 +1030,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  	swkbd_render(!isPadView);
  	nn::erreula::render(!isPadView);
  	LatteOverlay_render(isPadView);
@@ -2195,6 +2217,32 @@ index f1556f8..1ac44c1 100644
  	g_renderer->ImguiEnd();
  }
  
+diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
+index 43b116f..d0b6c82 100644
+--- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
+@@ -1233,6 +1233,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+ 	_AddTextureToGlobalList(this);
+ 	if (depth < 1)
+ 		depth = 1;
++#if defined(__ORBIS__)
++	// Crema: a surface with no height (a colour buffer whose slice size is smaller than one row of its
++	// pitch, as in the SNES Virtual Console) made a Vulkan image 0 rows high: the driver gave it a few
++	// bytes and the GPU, reading it as 16384 rows, faulted past the memory block (fatal on the PS4)
++	if (width < 1 || height < 1 || mipLevels < 1)
++	{
++		static std::atomic<uint32> s_logged{0};
++		if (s_logged.fetch_add(1) < 8)
++			cemuLog_log(LogType::Force, "empty texture: {:08x} {}x{}x{} mips {} pitch {} fmt {:04x} tilemode {} - made 1 at least",
++				physAddress, width, height, depth, mipLevels, pitch, (uint32)format, (uint32)tileMode);
++		width = std::max<uint32>(width, 1);
++		height = std::max<uint32>(height, 1);
++		mipLevels = std::max<uint32>(mipLevels, 1);
++	}
++#endif
+ 	// setup texture object
+ 	this->physAddress = physAddress;
+ 	this->dim = dim;
 diff --git a/src/Cafe/HW/Latte/Core/LatteThread.cpp b/src/Cafe/HW/Latte/Core/LatteThread.cpp
 index 743ab67..b1fc494 100644
 --- a/src/Cafe/HW/Latte/Core/LatteThread.cpp
@@ -2222,10 +2270,27 @@ index 743ab67..b1fc494 100644
  	WindowSystem::GetWindowPhysSize(w,h);
  
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
-index 86b4d75..312180c 100644
+index 86b4d75..1ccc4b9 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
-@@ -141,4 +141,17 @@ void LatteTextureVk::AllocateOnHost()
+@@ -22,10 +22,15 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
+ 		effectiveBaseDepth = overwriteInfo.depth;
+ 	}
+ 	effectiveBaseDepth = std::max(1, effectiveBaseDepth);
++#if defined(__ORBIS__)
++	// Crema: never a Vulkan image without rows or columns (LatteTexture.cpp; the members are already 1 at least)
++	effectiveBaseWidth = std::max(1, effectiveBaseWidth);
++	effectiveBaseHeight = std::max(1, effectiveBaseHeight);
++#endif
+ 
+ 	imageInfo.extent.width = effectiveBaseWidth;
+ 	imageInfo.extent.height = effectiveBaseHeight;
+-	imageInfo.mipLevels = mipLevels;
++	imageInfo.mipLevels = std::max<uint32>(1, this->mipLevels);
+ 	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+ 	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+@@ -141,4 +146,17 @@ void LatteTextureVk::AllocateOnHost()
  {
  	auto allocationInfo = VulkanRenderer::GetInstance()->GetMemoryManager()->imageMemoryAllocate(GetImageObj()->m_image);
  	vkObjTex->m_allocation = allocationInfo;
