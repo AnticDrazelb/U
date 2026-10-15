@@ -10439,10 +10439,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..6e89c7c
+index 0000000..47f4bda
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4256 @@
+@@ -0,0 +1,4322 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -10886,6 +10886,7 @@ index 0000000..6e89c7c
 +	public:
 +		void Open(int user)
 +		{
++			m_user = user;
 +			// Cemu's DualShock 4 provider has the user's pad open already (it opens once).
 +			m_pad = g_crema_pad_handle;
 +			if (m_pad < 0)
@@ -10893,19 +10894,43 @@ index 0000000..6e89c7c
 +				scePadInit();
 +				m_pad = scePadOpen(user, 0, 0, nullptr);
 +			}
-+			if (m_pad < 0)
-+				Log("no pad");
++			Log(m_pad < 0 ? fmt::format("pad: none for user {:#x} ({:#x})", (uint32_t)user, (uint32_t)m_pad) :
++				fmt::format("pad: handle {} for user {:#x}", m_pad, (uint32_t)user));
++		}
++		// Reads that fail (or say the pad isn't connected) for 2 seconds: the pad is opened again
++		// (a handle can go stale; the menu then took no input at all).
++		void Reopen()
++		{
++			int pad = scePadGetHandle(m_user, 0, 0);
++			if (pad < 0)
++				pad = scePadOpen(m_user, 0, 0, nullptr);
++			Log(fmt::format("pad: reads failing ({:#x}, connected {}) for 2 s, handle {} -> {}", (uint32_t)m_lastRead,
++				m_lastConnected, m_pad, pad));
++			if (pad >= 0)
++				m_pad = pad;
++			m_failTime = 0.0f;
++		}
++		// for the launcher's heartbeat: the last read's result, presses seen
++		std::string Status() const
++		{
++			return fmt::format("pad {} read {:#x} connected {} buttons {:#x}, {} presses", m_pad, (uint32_t)m_lastRead,
++				m_lastConnected, m_lastButtons, m_presses);
 +		}
 +		// Buttons that went down this frame (directions repeat while held).
 +		uint32_t Poll(float dt)
 +		{
 +			uint32_t held = 0;
++			bool read = false;
 +			if (m_pad >= 0)
 +			{
 +				OrbisPadData data = {};
-+				if (scePadReadState(m_pad, &data) == 0 && data.connected)
++				m_lastRead = scePadReadState(m_pad, &data);
++				m_lastConnected = m_lastRead == 0 && data.connected;
++				if (m_lastRead == 0 && data.connected)
 +				{
++					read = true;
 +					const uint32_t b = data.buttons;
++					m_lastButtons = b;
 +					if ((b & ORBIS_PAD_BUTTON_UP) || data.leftStick.y < 50)
 +						held |= BTN_UP;
 +					if ((b & ORBIS_PAD_BUTTON_DOWN) || data.leftStick.y > 205)
@@ -10946,11 +10971,21 @@ index 0000000..6e89c7c
 +				m_repeat = 0.35f;
 +			}
 +			m_held = held;
++			m_presses += pressed != 0;
++			m_failTime = read ? 0.0f : m_failTime + dt;
++			if (m_failTime >= 2.0f && m_user >= 0)
++				Reopen();
 +			return pressed;
 +		}
 +
 +	private:
 +		int m_pad = -1;
++		int m_user = -1;
++		int32_t m_lastRead = 0;
++		bool m_lastConnected = false;
++		uint32_t m_lastButtons = 0;
++		uint32_t m_presses = 0;
++		float m_failTime = 0.0f;
 +		uint32_t m_held = 0;
 +		float m_repeat = 0.35f;
 +	};
@@ -14624,9 +14659,13 @@ index 0000000..6e89c7c
 +
 +		auto last = Clock::now();
 +		std::string result;
++		// heartbeat: every 5 s for the first minute, then every 30 s (frames drawn, the pad's state)
++		float beatTime = 0.0f, nextBeat = 5.0f;
++		uint32_t beatFrames = 0;
 +		for (;;)
 +		{
-+			const auto now = Clock::now();
++			const auto frameStart = Clock::now();
++			const auto now = frameStart;
 +			const float dt = std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.1f);
 +			last = now;
 +			m_time += dt;
@@ -14648,16 +14687,43 @@ index 0000000..6e89c7c
 +			{
 +				HandleInput(m_input.Poll(dt));
 +			}
++			auto mark = Clock::now();
++			float steps[6] = {};
++			auto step = [&](int i) {
++				const auto t = Clock::now();
++				steps[i] = std::chrono::duration<float>(t - mark).count();
++				mark = t;
++			};
++			step(0);
 +			UpdateCoverDownload();
++			step(1);
 +			UpdateNetworkCheck();
++			step(2);
 +			UpdateUpdater();
 +			UpdatePackDownload();
++			step(3);
 +
 +			m_display.BeginFrame();
 +			ImGui::NewFrame();
 +			Draw(dt);
 +			ImGui::Render();
++			step(4);
 +			m_display.EndFrame();
++			step(5);
++
++			const float frame = std::chrono::duration<float>(Clock::now() - frameStart).count();
++			if (frame >= 1.0f)
++				Log(fmt::format("slow frame: {:.1f} s (input {:.1f}, covers {:.1f}, network {:.1f}, updates {:.1f}, draw {:.1f}, present {:.1f})",
++					frame, steps[0], steps[1], steps[2], steps[3], steps[4], steps[5]));
++			beatFrames++;
++			beatTime += frame;
++			if (beatTime >= nextBeat)
++			{
++				Log(fmt::format("alive at {:.0f} s: {} frames since the last line, {}{}{}", beatTime, beatFrames, m_input.Status(),
++					m_panel.open ? ", panel " + m_panel.title : std::string(), m_keyboard ? ", keyboard open" : ""));
++				nextBeat = beatTime < 60.0f ? beatTime + 5.0f : beatTime + 30.0f;
++				beatFrames = 0;
++			}
 +
 +			if (m_launch >= 0 && m_launchTime >= 0.75f)
 +			{
