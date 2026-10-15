@@ -4808,12 +4808,14 @@ index d66e971..49e209f 100644
  endif()
 diff --git a/src/gui/ps4/CMakeLists.txt b/src/gui/ps4/CMakeLists.txt
 new file mode 100644
-index 0000000..d190456
+index 0000000..2a9d22b
 --- /dev/null
 +++ b/src/gui/ps4/CMakeLists.txt
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,51 @@
 +add_library(CemuPS4Gui
 +	PS4WindowSystem.cpp
++	CremaCheats.cpp
++	CremaCheats.h
 +	CremaMii.cpp
 +	CremaMii.h
 +	CremaOnline.cpp
@@ -4861,6 +4863,518 @@ index 0000000..d190456
 +	/opt/pacbrew/ps4/openorbis/usr/lib/libturbojpeg.a
 +)
 +target_include_directories(CemuPS4Gui PRIVATE "$ENV{HOME}/cemups4/port/third_party/turbojpeg")
+diff --git a/src/gui/ps4/CremaCheats.cpp b/src/gui/ps4/CremaCheats.cpp
+new file mode 100644
+index 0000000..cecb9b2
+--- /dev/null
++++ b/src/gui/ps4/CremaCheats.cpp
+@@ -0,0 +1,464 @@
++#include "gui/ps4/CremaCheats.h"
++
++#include "Cafe/HW/MMU/MMU.h"
++#include "Cafe/HW/Espresso/Recompiler/PPCRecompiler.h"
++
++#include <atomic>
++#include <cctype>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <thread>
++
++#include <sys/stat.h>
++
++extern "C" void ps4_boot_trace(const char* line); // port/ps4_crashlog.cpp
++
++namespace CremaCheats
++{
++namespace
++{
++	void Log(const std::string& text)
++	{
++		ps4_boot_trace(("cheats: " + text).c_str());
++	}
++
++	std::string Trim(std::string text)
++	{
++		while (!text.empty() && (text.back() == '\r' || text.back() == ' ' || text.back() == '\t'))
++			text.pop_back();
++		size_t start = 0;
++		while (start < text.size() && (text[start] == ' ' || text[start] == '\t'))
++			start++;
++		return text.substr(start);
++	}
++
++	// --- the code handler (Cafe code types, CosmoCortney's documentation) ----------------------
++	//
++	// A line is two words, AAAAAAAA BBBBBBBB, with A = CC P S xxxx: CC the code type, P 1 when it
++	// works on the loaded pointer, S the size (0: 8 bits, 1: 16, 2: 32).
++
++	constexpr uint32 kTerminator = 0xD0000000, kTerminatorB = 0xDEADCAFE; // end of a condition / pointer code
++	constexpr uint32 kTimerEnd = 0xD2000000, kTimerEndB = 0xCAFEBABE;     // end of a time-dependent code
++
++	struct Machine
++	{
++		uint32 pointer = 0;
++		bool pointerValid = false;
++		uint32 ints[8]{};
++		float floats[8]{};
++		uint64 timer = 0; // executions (the Wii U's handler: ~120 a second)
++		bool warnedAsm = false;
++	};
++
++	bool Accessible(uint32 address, uint32 size)
++	{
++		return size && address + size > address && memory_isAddressRangeAccessible(address, size);
++	}
++
++	bool Read(uint32 address, int size, uint32& value)
++	{
++		const uint32 bytes = size == 0 ? 1 : size == 1 ? 2 : 4;
++		if (!Accessible(address, bytes))
++			return false;
++		value = size == 0 ? memory_readU8(address) : size == 1 ? memory_readU16(address) : memory_readU32(address);
++		return true;
++	}
++
++	// a write to game code (below 0x10000000) throws its recompiled copy away, so the change runs
++	void Write(uint32 address, int size, uint32 value)
++	{
++		const uint32 bytes = size == 0 ? 1 : size == 1 ? 2 : 4;
++		if (!Accessible(address, bytes))
++			return;
++		uint32 old = 0;
++		Read(address, size, old);
++		if (old == (size == 0 ? (value & 0xFF) : size == 1 ? (value & 0xFFFF) : value))
++			return;
++		if (size == 0)
++			memory_writeU8(address, (uint8)value);
++		else if (size == 1)
++			memory_writeU16(address, (uint16)value);
++		else
++			memory_writeU32(address, value);
++		if (address < 0x10000000)
++			PPCRecompiler_invalidateRange(address & ~3u, (address + bytes + 3) & ~3u);
++	}
++
++	size_t SkipTo(const std::vector<uint32>& w, size_t i, uint32 a, uint32 b)
++	{
++		for (size_t j = i; j + 1 < w.size(); j += 2)
++			if (w[j] == a && w[j + 1] == b)
++				return j + 2;
++		return w.size();
++	}
++
++	bool Compare(uint32 type, uint32 value, uint32 v, uint32 v2)
++	{
++		switch (type)
++		{
++		case 0x03: return value == v;
++		case 0x04: return value != v;
++		case 0x05: return value > v;
++		case 0x06: return value < v;
++		case 0x07: return value >= v;
++		case 0x08: return value <= v;
++		case 0x09: return (value & v) == v; // has all of v's bits
++		case 0x0A: return (value & v) != 0; // has one of v's bits
++		case 0x0B: return value > v && value < v2;
++		}
++		return false;
++	}
++
++	void Run(const std::vector<uint32>& w, Machine& m, bool& corruptorDone)
++	{
++		m.pointerValid = false;
++		size_t i = 0;
++		while (i + 1 < w.size())
++		{
++			const uint32 a = w[i], b = w[i + 1];
++			const uint32 type = a >> 24, viaPointer = (a >> 20) & 0xF;
++			const int size = std::min<int>((a >> 16) & 0xF, 2);
++			// a pointer code whose pointer is out of its range: skipped to its terminator
++			if (viaPointer && !m.pointerValid && type != 0x30 && type != 0xD0)
++			{
++				i = SkipTo(w, i, kTerminator, kTerminatorB);
++				continue;
++			}
++			auto address = [&](uint32 offset, bool signedOffset) {
++				return viaPointer ? m.pointer + (signedOffset ? (uint32)(sint32)offset : offset) : offset;
++			};
++			switch (type)
++			{
++			case 0x00: // RAM write: "00000000 LLLLLLLL / VVVVVVVV 00000000", or "001SKKKK VVVVVVVV"
++				if (viaPointer)
++				{
++					Write(m.pointer + (a & 0xFFFF), size, b);
++					i += 2;
++				}
++				else
++				{
++					if (i + 2 < w.size())
++						Write(b, size, w[i + 2]);
++					i += 4;
++				}
++				break;
++			case 0x01: // string write: "01P0NNNN LLLLLLLL", then the bytes, the last line ending in FF
++			{
++				const uint32 count = a & 0xFFFF;
++				const size_t lines = count / 8 + 1;
++				uint32 to = address(b, true);
++				const uint8* bytes = nullptr;
++				std::vector<uint8> data;
++				for (size_t k = 0; k < lines * 2 && i + 2 + k < w.size(); k++)
++					for (int s = 24; s >= 0; s -= 8)
++						data.push_back((uint8)(w[i + 2 + k] >> s));
++				bytes = data.data();
++				if (data.size() >= count && Accessible(to, count))
++				{
++					bool changed = false;
++					for (uint32 k = 0; k < count; k++)
++						changed |= memory_readU8(to + k) != bytes[k];
++					if (changed)
++					{
++						for (uint32 k = 0; k < count; k++)
++							memory_writeU8(to + k, bytes[k]);
++						if (to < 0x10000000)
++							PPCRecompiler_invalidateRange(to & ~3u, (to + count + 3) & ~3u);
++					}
++				}
++				i += 2 + lines * 2;
++				break;
++			}
++			case 0x02: // skip write: "02PSNNNN LLLLLLLL / V YYYYYYYY / I 00000000"
++			{
++				if (i + 5 >= w.size())
++					return;
++				const uint32 count = a & 0xFFFF;
++				uint32 to = address(b, true), value = w[i + 2];
++				const sint32 step = (sint32)w[i + 3], increment = (sint32)w[i + 4];
++				for (uint32 k = 0; k < count && k < 0x10000; k++)
++				{
++					Write(to, size, value);
++					to += step;
++					value += increment;
++				}
++				i += 6;
++				break;
++			}
++			case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0B:
++			{
++				// "TTPS0000 LLLLLLLL / V [W]": the codes up to the next terminator run only if true
++				if (i + 3 >= w.size())
++					return;
++				uint32 value = 0;
++				const bool ok = Read(address(b, true), size, value) && Compare(type, value, w[i + 2], w[i + 3]);
++				i = ok ? i + 4 : SkipTo(w, i + 4, kTerminator, kTerminatorB);
++				break;
++			}
++			case 0x0C: // "0C000000 NNNNNNNN": up to D2000000 CAFEBABE only while the timer is below N
++				i = m.timer < b ? i + 2 : SkipTo(w, i + 2, kTimerEnd, kTimerEndB);
++				break;
++			case 0x0D: // "0D00VVVV LLLLLLLL": the timer back to 0 when the 16 bits at L equal V
++			{
++				uint32 value = 0;
++				if (Read(b, 1, value) && value == (a & 0xFFFF))
++					m.timer = 0;
++				i += 2;
++				break;
++			}
++			case 0x10: case 0x11: // load / store integer: "1xPS000R LLLLLLLL"
++			{
++				const int r = a & 7;
++				const uint32 at = address(b, true);
++				if (type == 0x10)
++					Read(at, size, m.ints[r]);
++				else
++					Write(at, size, m.ints[r]);
++				i += 2;
++				break;
++			}
++			case 0x12: case 0x13: // load / store float: "1xP0000R LLLLLLLL"
++			{
++				const int r = a & 7;
++				const uint32 at = address(b, true);
++				if (Accessible(at, 4))
++				{
++					if (type == 0x12)
++						m.floats[r] = memory_readFloat(at);
++					else
++					{
++						uint32 bits;
++						std::memcpy(&bits, &m.floats[r], 4);
++						Write(at, 2, bits);
++					}
++				}
++				i += 2;
++				break;
++			}
++			case 0x14: // integer operations: "140T0R0Q 00000000" (registers) / "140T0R00 VVVVVVVV" (a value)
++			case 0x15: // float operations, the same; T 8: float R to integer register Q
++			{
++				const uint32 op = (a >> 16) & 0xF;
++				const int r = (a >> 8) & 7, q = a & 7;
++				if (type == 0x14)
++				{
++					uint32& x = m.ints[r];
++					const uint32 y = op < 4 ? m.ints[q] : b;
++					switch (op & 3)
++					{
++					case 0: x += y; break;
++					case 1: x -= y; break;
++					case 2: x *= y; break; // (the documentation's labels for 6 and 7 are swapped; its formulas are followed)
++					case 3: if (y) x /= y; break;
++					}
++				}
++				else if (op == 8)
++				{
++					m.ints[q] = (uint32)(sint32)m.floats[r];
++				}
++				else
++				{
++					float& x = m.floats[r];
++					float y = m.floats[q];
++					if (op >= 4)
++						std::memcpy(&y, &b, 4);
++					switch (op & 3)
++					{
++					case 0: x += y; break;
++					case 1: x -= y; break;
++					case 2: x *= y; break;
++					case 3: if (y != 0.0f) x /= y; break;
++					}
++				}
++				i += 2;
++				break;
++			}
++			case 0x20: // fill: "20P00000 VVVVVVVV / LLLLLLLL MMMMMMMM" (32-bit writes from L to L + M)
++			{
++				if (i + 3 >= w.size())
++					return;
++				const uint32 from = address(w[i + 2], true), span = std::min<uint32>(w[i + 3], 0x100000);
++				for (uint32 k = 0; k <= span; k += 4)
++					Write(from + k, 2, b);
++				i += 4;
++				break;
++			}
++			case 0x30: // load pointer: "30P00000 LLLLLLLL / RANGE_ST RANGE_EN" (P: the pointer's own target)
++			{
++				if (i + 3 >= w.size())
++					return;
++				uint32 target = 0;
++				const uint32 from = viaPointer ? m.pointer : b;
++				const bool ok = (!viaPointer || m.pointerValid) && Read(from, 2, target) && target >= w[i + 2] && target < w[i + 3];
++				m.pointer = target;
++				m.pointerValid = ok;
++				i = ok ? i + 4 : SkipTo(w, i + 4, kTerminator, kTerminatorB);
++				break;
++			}
++			case 0x31: // "31000000 QQQQQQQQ": a signed offset added to the pointer
++				m.pointer += b;
++				i += 2;
++				break;
++			case 0xC0: // execute PowerPC code: not possible from here (it'd have to run on a Wii U core)
++				if (!m.warnedAsm)
++				{
++					Log("a C0 code (PowerPC code) is skipped: not supported");
++					m.warnedAsm = true;
++				}
++				i += 2 + (a & 0xFFFF) * 2;
++				break;
++			case 0xC1: // Cafe OS syscall: not supported
++				i += 2;
++				break;
++			case 0xF0: // corruptor: "F0000000 LLLLLLLL / MMMMMMMM VVVVVVVV / WWWWWWWW 00000000" (once)
++			{
++				if (i + 5 >= w.size())
++					return;
++				if (!corruptorDone)
++				{
++					const uint32 from = b & ~3u, to = std::min<uint32>(w[i + 2], from + 0x8000000);
++					size_t replaced = 0;
++					for (uint32 at = from; at + 4 <= to; at += 4)
++						if (Accessible(at, 4) && memory_readU32(at) == w[i + 3])
++						{
++							Write(at, 2, w[i + 4]);
++							replaced++;
++						}
++					corruptorDone = true;
++					Log(fmt::format("corruptor: {} values replaced", replaced));
++				}
++				i += 6;
++				break;
++			}
++			default: // D0 / D1 / D2 markers, or an unknown line
++				i += 2;
++				break;
++			}
++		}
++	}
++
++	std::atomic<bool> s_running{false};
++} // namespace
++
++std::string FilePath(const std::string& dataDir, const std::string& titleId)
++{
++	return dataDir + "/cheats/" + titleId + ".txt";
++}
++
++std::vector<Cheat> Load(const std::string& dataDir, const std::string& titleId)
++{
++	std::vector<Cheat> cheats;
++	std::ifstream file(FilePath(dataDir, titleId));
++	std::string line;
++	while (std::getline(file, line))
++	{
++		line = Trim(line);
++		if (line.empty() || line[0] == '#')
++			continue;
++		if (line[0] == '+' || line[0] == '-')
++		{
++			cheats.push_back({Trim(line.substr(1)), line[0] == '+', {}});
++			continue;
++		}
++		if (cheats.empty())
++			continue;
++		std::string error;
++		const std::vector<uint32> words = ParseCode(line, &error);
++		cheats.back().words.insert(cheats.back().words.end(), words.begin(), words.end());
++	}
++	return cheats;
++}
++
++bool Save(const std::string& dataDir, const std::string& titleId, const std::vector<Cheat>& cheats)
++{
++	mkdir((dataDir + "/cheats").c_str(), 0777);
++	const std::string path = FilePath(dataDir, titleId);
++	std::ofstream file(path + ".part", std::ios::trunc);
++	if (!file)
++		return false;
++	file << "# Crema cheats (Cafe codes). \"+Name\" starts a cheat that is on, \"-Name\" one that is off;\n"
++		 << "# its code follows, two groups of 8 hex digits per line.\n";
++	for (const Cheat& cheat : cheats)
++	{
++		file << (cheat.on ? "+" : "-") << cheat.name << "\n";
++		for (size_t k = 0; k + 1 < cheat.words.size(); k += 2)
++			file << fmt::format("{:08X} {:08X}\n", cheat.words[k], cheat.words[k + 1]);
++	}
++	file.close();
++	return std::rename((path + ".part").c_str(), path.c_str()) == 0;
++}
++
++std::vector<uint32> ParseCode(const std::string& text, std::string* error)
++{
++	std::string digits;
++	for (char c : text)
++	{
++		if (std::isxdigit((unsigned char)c))
++			digits += (char)std::toupper((unsigned char)c);
++		else if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '-' && c != ':')
++		{
++			if (error)
++				*error = std::string("not a hex digit: ") + c;
++			return {};
++		}
++	}
++	if (digits.empty() || digits.size() % 16 != 0)
++	{
++		if (error)
++			*error = fmt::format("{} hex digits: a code is whole lines of 16 (two groups of 8)", digits.size());
++		return {};
++	}
++	std::vector<uint32> words;
++	for (size_t k = 0; k < digits.size(); k += 8)
++		words.push_back((uint32)std::stoul(digits.substr(k, 8), nullptr, 16));
++	return words;
++}
++
++void Start(const std::string& dataDir, const std::string& titleId)
++{
++	if (s_running.exchange(true))
++		return;
++	std::thread([dataDir, titleId] {
++		const std::string path = FilePath(dataDir, titleId);
++		std::vector<Cheat> cheats;
++		std::vector<bool> corruptorDone;
++		Machine machine;
++		time_t loadedTime = -1;
++		auto nextCheck = std::chrono::steady_clock::now();
++		for (;;)
++		{
++			const auto now = std::chrono::steady_clock::now();
++			if (now >= nextCheck)
++			{
++				// the file again when it changed (the launcher, or FTP)
++				nextCheck = now + std::chrono::seconds(1);
++				struct stat info;
++				const time_t modified = stat(path.c_str(), &info) == 0 ? info.st_mtime : 0;
++				if (modified != loadedTime)
++				{
++					loadedTime = modified;
++					cheats = Load(dataDir, titleId);
++					corruptorDone.assign(cheats.size(), false);
++					size_t on = 0;
++					for (const Cheat& cheat : cheats)
++						on += cheat.on;
++					Log(fmt::format("{} cheats for {}, {} on", cheats.size(), titleId, on));
++				}
++			}
++			for (size_t k = 0; k < cheats.size(); k++)
++			{
++				if (!cheats[k].on)
++					continue;
++				bool done = corruptorDone[k];
++				Run(cheats[k].words, machine, done);
++				corruptorDone[k] = done;
++			}
++			machine.timer++;
++			std::this_thread::sleep_for(std::chrono::microseconds(8333)); // ~120 a second
++		}
++	}).detach();
++}
++} // namespace CremaCheats
+diff --git a/src/gui/ps4/CremaCheats.h b/src/gui/ps4/CremaCheats.h
+new file mode 100644
+index 0000000..c07a72d
+--- /dev/null
++++ b/src/gui/ps4/CremaCheats.h
+@@ -0,0 +1,36 @@
++// Cheats: Cafe codes, the Wii U's Gecko codes (CosmoCortney's code types, as TCPGecko / JGecko U and
++// GameHacking.org use them), per game in data_dir/cheats/<title ID>.txt. Typed in the launcher
++// (Triangle > Cheats), or the file copied there by FTP:
++//
++//   # comment
++//   +Infinite Hearts        a cheat that is on ("-" for off)
++//   00000000 15073BC3       its code: two groups of 8 hex digits per line
++//   00000050 00000000
++//
++// The game process runs the cheats that are on 120 times a second, as the Wii U's code handler does,
++// and reads the file again when it changes.
++#pragma once
++
++#include <string>
++#include <vector>
++
++namespace CremaCheats
++{
++struct Cheat
++{
++	std::string name;
++	bool on = false;
++	std::vector<uint32> words; // the code, two words per line
++};
++
++std::string FilePath(const std::string& dataDir, const std::string& titleId);
++std::vector<Cheat> Load(const std::string& dataDir, const std::string& titleId);
++bool Save(const std::string& dataDir, const std::string& titleId, const std::vector<Cheat>& cheats);
++
++// "00000000 15073BC3 00000050 00000000" (any spacing, line breaks, dashes) -> the code; empty, with
++// the reason in error, unless it is whole lines of two 8-digit hex groups
++std::vector<uint32> ParseCode(const std::string& text, std::string* error);
++
++// Game process: runs the game's cheats that are on (titleId: 16 hex digits).
++void Start(const std::string& dataDir, const std::string& titleId);
++} // namespace CremaCheats
 diff --git a/src/gui/ps4/CremaMii.cpp b/src/gui/ps4/CremaMii.cpp
 new file mode 100644
 index 0000000..5081720
@@ -7235,10 +7749,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..35143a7
+index 0000000..d6bea45
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,897 @@
+@@ -0,0 +1,900 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -7266,6 +7780,7 @@ index 0000000..35143a7
 +#include "input/InputManager.h"
 +#include "util/helpers/helpers.h"
 +
++#include "gui/ps4/CremaCheats.h"
 +#include "gui/ps4/CremaMii.h"
 +#include "gui/ps4/CremaOnline.h"
 +#include "gui/ps4/PS4PauseMenu.h"
@@ -7997,6 +8512,8 @@ index 0000000..35143a7
 +		CafeSystem::SetImplementation(&sSystemImplementation);
 +		CafeSystem::LaunchForegroundTitle();
 +		Trace("launched");
++		// the game's cheats that are on (data_dir/cheats/<title ID>.txt; Triangle > Cheats)
++		CremaCheats::Start(_pathToUtf8(kDataRoot), fmt::format("{:016x}", CafeSystem::GetForegroundTitleId()));
 +
 +		// The emulator runs on its own threads; the main thread reports progress and, per Crema's
 +		// Diagnostics settings, the load (perf log), freezes (hang.log) and TV screenshots (5, 15
@@ -9815,10 +10332,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..f450d80
+index 0000000..6e89c7c
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4132 @@
+@@ -0,0 +1,4256 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -9829,6 +10346,7 @@ index 0000000..f450d80
 +#include "gui/ps4/launcher/CremaCovers.h"
 +#include "gui/ps4/launcher/CremaGraphicPacks.h"
 +#include "config/ActiveSettings.h"
++#include "gui/ps4/CremaCheats.h"
 +#include "gui/ps4/CremaOnline.h"
 +#include "gui/ps4/launcher/CremaSettings.h"
 +#include "gui/ps4/launcher/CremaUpdater.h"
@@ -10670,6 +11188,12 @@ index 0000000..f450d80
 +		const Game::Source* ChosenSource(const Game& game, const char* what) const;
 +		void WriteTitleExtras();
 +		void ShowUpdateDlc(const Game& game);
++		// Triangle > Cheats: the game's Cafe codes (CremaCheats.h), typed with the PS4 keyboard
++		void ShowCheats(const Game& game);
++		std::vector<CremaCheats::Cheat> m_cheats;
++		std::string m_cheatsGame, m_cheatsTitle; // title ID, name
++		std::string m_cheatName;                 // while the code is typed
++		bool m_cheatsRemove = false;             // the next cheat chosen is removed
 +		std::string SourceLabel(const Game& game, const char* what) const;
 +		void LoadBoxArt(Game& game);
 +		void StartCoverDownload();
@@ -10985,6 +11509,35 @@ index 0000000..f450d80
 +		const Game::Source* source = ChosenSource(game, what);
 +		const std::string where = source->path.rfind("/net/", 0) == 0 ? "network library" : "games folder";
 +		return fmt::format("{}v{}, {}", choice == "auto" ? "Auto: " : "", source->version, where);
++	}
++
++	// Triangle > Cheats: each cheat On / Off (Cross), Add a Cheat (its name, then its code), Remove
++	void Menu::ShowCheats(const Game& game)
++	{
++		if (m_cheatsGame != game.id)
++		{
++			m_cheats = CremaCheats::Load(m_dataDir, game.id);
++			m_cheatsGame = game.id;
++			m_cheatsRemove = false;
++		}
++		m_cheatsTitle = game.title;
++		m_panel.open = true;
++		m_panel.title = "Cheats";
++		m_panel.options.clear();
++		size_t on = 0;
++		for (const CremaCheats::Cheat& cheat : m_cheats)
++		{
++			m_panel.options.push_back((cheat.on ? "ON   " : "OFF  ") + cheat.name);
++			on += cheat.on;
++		}
++		m_panel.options.push_back("Add a Cheat");
++		if (!m_cheats.empty())
++			m_panel.options.push_back(m_cheatsRemove ? "Cancel Remove" : "Remove a Cheat");
++		m_panel.options.push_back("Done");
++		m_panel.lines = {game.title, "", m_cheatsRemove ? "Cross on a cheat removes it." :
++			fmt::format("{} cheats, {} on. Cross: on / off.", m_cheats.size(), on),
++			"Cafe codes (TCPGecko, GameHacking.org):", "they apply while the game runs.",
++			"File: cheats/" + game.id + ".txt"};
 +	}
 +
 +	// Triangle > Update & DLC: Cross on a line takes the next choice (Auto, each one found, Off)
@@ -12045,17 +12598,20 @@ index 0000000..f450d80
 +		}
 +		// the dialog works in UTF-16 (the PS4's wchar_t); the text buffer must outlive it
 +		static char16_t s_title[64];
++		// a cheat's code: many lines of hex (16 digits each, with spaces)
++		const size_t maxLength = key == "cheat_code" ? 1800 : 120;
 +		m_keyboardText.assign(text.begin(), text.end());
-+		m_keyboardText.resize(128, u'\0');
++		m_keyboardText.resize(maxLength + 8, u'\0');
 +		size_t i = 0;
 +		for (; i + 1 < std::size(s_title) && i < title.size(); i++)
 +			s_title[i] = (char16_t)(unsigned char)title[i];
 +		s_title[i] = u'\0';
 +		OrbisImeDialogSetting setting = {};
 +		setting.userId = (uint32_t)m_user;
-+		setting.type = key == "net_user" || key == "net_password" ? ORBIS_TYPE_BASIC_LATIN : ORBIS_TYPE_TYPE_URL;
++		setting.type = key == "net_user" || key == "net_password" || key.rfind("cheat_", 0) == 0 ? ORBIS_TYPE_BASIC_LATIN :
++			ORBIS_TYPE_TYPE_URL;
 +		setting.enterLabel = ORBIS_BUTTON_LABEL_DEFAULT;
-+		setting.maxTextLength = 120;
++		setting.maxTextLength = (uint32_t)maxLength;
 +		setting.inputTextBuffer = reinterpret_cast<wchar_t*>(m_keyboardText.data());
 +		setting.posx = 1920.0f / 2;
 +		setting.posy = 1080.0f / 2;
@@ -12079,10 +12635,15 @@ index 0000000..f450d80
 +			sceImeDialogGetResult(&result);
 +		sceImeDialogTerm();
 +		m_keyboard = false;
++		const bool cheat = m_keyboardKey.rfind("cheat_", 0) == 0;
 +		if (status != ORBIS_DIALOG_STATUS_STOPPED || result.endstatus != ORBIS_DIALOG_OK)
++		{
++			if (cheat && m_panel.open && m_panel.title == "Cheats")
++				Play("back"); // the cheats list stays
 +			return;
-+		// ASCII (a shared folder or a password may have spaces in it; an address doesn't)
-+		const bool network = m_keyboardKey.rfind("net_", 0) == 0;
++		}
++		// ASCII (a shared folder, a password or a cheat may have spaces in it; an address doesn't)
++		const bool network = m_keyboardKey.rfind("net_", 0) == 0 || cheat;
 +		std::string text;
 +		for (char16_t c : m_keyboardText)
 +		{
@@ -12093,6 +12654,39 @@ index 0000000..f450d80
 +		}
 +		if (m_keyboardKey != "net_password")
 +			boost::algorithm::trim(text);
++		if (m_keyboardKey == "cheat_name")
++		{
++			// then its code
++			m_cheatName = text.empty() ? fmt::format("Cheat {}", m_cheats.size() + 1) : text;
++			OpenKeyboard("Code: " + m_cheatName, "", "cheat_code");
++			return;
++		}
++		if (m_keyboardKey == "cheat_code")
++		{
++			std::string error;
++			const std::vector<uint32> words = CremaCheats::ParseCode(text, &error);
++			for (const Game& game : m_games)
++			{
++				if (game.id != m_cheatsGame)
++					continue;
++				if (words.empty())
++				{
++					ShowCheats(game);
++					m_panel.lines = {game.title, "", "That code wasn't added:", error, "",
++						"Type it as in the cheat lists, for example", "00000000 15073BC3 00000050 00000000"};
++					Play("error");
++					return;
++				}
++				m_cheats.push_back({m_cheatName, true, words});
++				CremaCheats::Save(m_dataDir, game.id, m_cheats);
++				Log(fmt::format("cheats: added {} ({} lines) for {}", m_cheatName, words.size() / 2, game.id));
++				ShowCheats(game);
++				m_panel.selected = (int)m_cheats.size() - 1;
++				Play("confirm");
++				return;
++			}
++			return;
++		}
 +		CremaSettings::Set(m_keyboardKey.empty() ? "online_server" : m_keyboardKey, text);
 +		if (network)
 +		{
@@ -12377,6 +12971,43 @@ index 0000000..f450d80
 +					Play("confirm");
 +					return;
 +				}
++				else if (m_panel.title == "Cheats")
++				{
++					const Item& item = m_items[m_category][m_selected[m_category]];
++					const std::string choice = m_panel.options[m_panel.selected];
++					if (item.game < 0 || choice == "Done")
++					{
++						m_panel.open = false;
++						Play("back");
++						return;
++					}
++					const Game& game = m_games[item.game];
++					if (choice == "Add a Cheat")
++					{
++						m_cheatsRemove = false;
++						OpenKeyboard("Cheat Name", "", "cheat_name");
++						return;
++					}
++					if (choice == "Remove a Cheat" || choice == "Cancel Remove")
++						m_cheatsRemove = !m_cheatsRemove;
++					else if (m_panel.selected < (int)m_cheats.size())
++					{
++						if (m_cheatsRemove)
++						{
++							Log("cheats: removed " + m_cheats[m_panel.selected].name);
++							m_cheats.erase(m_cheats.begin() + m_panel.selected);
++							m_cheatsRemove = false;
++						}
++						else
++							m_cheats[m_panel.selected].on = !m_cheats[m_panel.selected].on;
++						CremaCheats::Save(m_dataDir, game.id, m_cheats);
++					}
++					const int selected = m_panel.selected;
++					ShowCheats(game);
++					m_panel.selected = std::min(selected, (int)m_panel.options.size() - 1);
++					Play("confirm");
++					return;
++				}
 +				else if (m_panel.title == "Update & DLC")
 +				{
 +					const Item& item = m_items[m_category][m_selected[m_category]];
@@ -12437,6 +13068,14 @@ index 0000000..f450d80
 +					const Item& item = m_items[m_category][m_selected[m_category]];
 +					const Game& game = m_games[item.game];
 +					const std::string& choice = m_panel.options[m_panel.selected];
++					if (choice == "Cheats")
++					{
++						m_cheatsGame.clear(); // read the file again (it may have changed by FTP)
++						ShowCheats(game);
++						m_panel.selected = 0;
++						Play("confirm");
++						return;
++					}
 +					if (choice == "Update & DLC")
 +					{
 +						ShowUpdateDlc(game);
@@ -12635,6 +13274,8 @@ index 0000000..f450d80
 +					m_panel.options.push_back("Graphic Packs");
 +				if (!game.homebrew)
 +					m_panel.options.push_back("Update & DLC");
++				if (!game.homebrew)
++					m_panel.options.push_back("Cheats");
 +				m_panel.options.push_back("Information");
 +				m_panel.options.push_back(m_prefs.defaultGame == game.path ? "Remove Default Game" : "Set as Default Game");
 +				m_panel.options.push_back("Delete");
