@@ -16122,10 +16122,10 @@ index 0000000..75abc8b
 +} // namespace CremaLauncher
 diff --git a/src/gui/ps4/launcher/LauncherDisplay.cpp b/src/gui/ps4/launcher/LauncherDisplay.cpp
 new file mode 100644
-index 0000000..c6dbc99
+index 0000000..20b0ba4
 --- /dev/null
 +++ b/src/gui/ps4/launcher/LauncherDisplay.cpp
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,471 @@
 +#include "gui/ps4/launcher/LauncherDisplay.h"
 +
 +#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
@@ -16242,6 +16242,13 @@ index 0000000..c6dbc99
 +		VkDeviceCreateInfo deviceInfo = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
 +		deviceInfo.queueCreateInfoCount = 1;
 +		deviceInfo.pQueueCreateInfos = &queueInfo;
++		// the GPU self-test vertex shaders store their outputs (gpu_selftest_vertex.h)
++		VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++		if (vkGetPhysicalDeviceFeatures2)
++			vkGetPhysicalDeviceFeatures2(s_gpu, &supported);
++		VkPhysicalDeviceFeatures features{};
++		features.vertexPipelineStoresAndAtomics = supported.features.vertexPipelineStoresAndAtomics;
++		deviceInfo.pEnabledFeatures = &features;
 +		if (!Check(vkCreateDevice(s_gpu, &deviceInfo, nullptr, &s_device), "vkCreateDevice"))
 +			return false;
 +		InitializeDeviceVulkan(s_device);
@@ -16397,6 +16404,7 @@ index 0000000..c6dbc99
 +} // namespace
 +
 +#include "gui/ps4/launcher/gpu_selftest_core.h"
++#include "gui/ps4/launcher/gpu_selftest_vertex.h"
 +
 +std::string Display::RunGpuSelfTest(const std::string& dir)
 +{
@@ -16405,6 +16413,26 @@ index 0000000..c6dbc99
 +		return {};
 +	fclose(marker);
 +	remove((dir + "/run").c_str());
++	// vertex fetch test (make_vtest.py): every case in dir/vtest/list.txt through a real graphics pipeline
++	if (FILE* list = fopen((dir + "/vtest/list.txt").c_str(), "rb"))
++	{
++		std::string summary = "GPU vertex test:";
++		char name[64];
++		int cases = 0, failed = 0;
++		while (fscanf(list, "%63s", name) == 1)
++		{
++			char msg[128] = "";
++			const std::string caseDir = dir + "/vtest/" + name;
++			cases++;
++			if (!selftest_vertex_case(s_gpu, s_device, s_queueFamily, s_queue, caseDir.c_str(), "out-ps4.bin", msg, sizeof(msg)))
++			{
++				failed++;
++				summary += std::string(" ") + name + " " + msg + ";";
++			}
++		}
++		fclose(list);
++		return summary + " " + std::to_string(cases) + " cases, " + std::to_string(failed) + " failed";
++	}
 +	auto readAll = [&](const char* name, std::vector<uint8_t>& data) {
 +		FILE* f = fopen((dir + "/" + name).c_str(), "rb");
 +		if (!f)
@@ -17849,6 +17877,368 @@ index 0000000..abf6da9
 +	selftest_free(dev, &ub);
 +	return ok;
 +#undef SELFTEST_STEP
++}
+diff --git a/src/gui/ps4/launcher/gpu_selftest_vertex.h b/src/gui/ps4/launcher/gpu_selftest_vertex.h
+new file mode 100755
+index 0000000..6857288
+--- /dev/null
++++ b/src/gui/ps4/launcher/gpu_selftest_vertex.h
+@@ -0,0 +1,356 @@
++// GPU self-test, vertex fetch: draws a captured vertex buffer through a real graphics pipeline (the
++// game's vertex shader with its vertex inputs, make_vtest.py) as points with rasterizer discard; the
++// shader stores its outputs by gl_VertexIndex, so two GPUs' vertex fetch + shader can be compared.
++// Needs gpu_selftest_core.h first and the vertexPipelineStoresAndAtomics feature.
++//   binding 0: uniform buffer (256 ivec4), 2: outputs (storage); vertex binding 0: the vertex buffer
++#pragma once
++#include <stdlib.h>
++
++typedef struct
++{
++	uint32_t location, format, offset;
++} SelftestAttribute;
++
++static int selftest_run_vertex(VkPhysicalDevice gpu, VkDevice dev, uint32_t queueFamily, VkQueue queue, const uint32_t* spv, size_t spvSize,
++	const void* uniforms, size_t uniformSize, const void* vertexData, size_t vertexSize, uint32_t stride,
++	const SelftestAttribute* attributes, uint32_t attributeCount, uint32_t vertexCount, void* out, size_t outSize, char* err, size_t errSize)
++{
++	int ok = 0;
++	SelftestBuffer ub, vb, outb;
++	VkShaderModule module = VK_NULL_HANDLE;
++	VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++	VkRenderPass renderPass = VK_NULL_HANDLE;
++	VkFramebuffer framebuffer = VK_NULL_HANDLE;
++	VkPipeline pipeline = VK_NULL_HANDLE;
++	VkDescriptorPool pool = VK_NULL_HANDLE;
++	VkCommandPool cmdPool = VK_NULL_HANDLE;
++	VkFence fence = VK_NULL_HANDLE;
++	VkVertexInputAttributeDescription attrs[32];
++	memset(&ub, 0, sizeof(ub));
++	memset(&vb, 0, sizeof(vb));
++	memset(&outb, 0, sizeof(outb));
++#define SELFTEST_STEP(cond, what) if (!(cond)) { snprintf(err, errSize, "%s", what); goto done; }
++
++	SELFTEST_STEP(attributeCount <= 32, "too many attributes");
++	SELFTEST_STEP(selftest_buffer(gpu, dev, uniformSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &ub), "uniform buffer");
++	SELFTEST_STEP(selftest_buffer(gpu, dev, vertexSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &vb), "vertex buffer");
++	SELFTEST_STEP(selftest_buffer(gpu, dev, outSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &outb), "output buffer");
++	memcpy(ub.ptr, uniforms, uniformSize);
++	memcpy(vb.ptr, vertexData, vertexSize);
++	memset(outb.ptr, 0xCD, outSize);
++
++	{
++		VkShaderModuleCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++		info.codeSize = spvSize;
++		info.pCode = spv;
++		SELFTEST_STEP(vkCreateShaderModule(dev, &info, NULL, &module) == VK_SUCCESS, "shader module");
++	}
++	{
++		VkDescriptorSetLayoutBinding b[2];
++		memset(b, 0, sizeof(b));
++		b[0].binding = 0;
++		b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++		b[0].descriptorCount = 1;
++		b[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++		b[1].binding = 2;
++		b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++		b[1].descriptorCount = 1;
++		b[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++		VkDescriptorSetLayoutCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++		info.bindingCount = 2;
++		info.pBindings = b;
++		SELFTEST_STEP(vkCreateDescriptorSetLayout(dev, &info, NULL, &setLayout) == VK_SUCCESS, "set layout");
++		VkPipelineLayoutCreateInfo pl;
++		memset(&pl, 0, sizeof(pl));
++		pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++		pl.setLayoutCount = 1;
++		pl.pSetLayouts = &setLayout;
++		SELFTEST_STEP(vkCreatePipelineLayout(dev, &pl, NULL, &pipelineLayout) == VK_SUCCESS, "pipeline layout");
++	}
++	{
++		VkSubpassDescription subpass;
++		memset(&subpass, 0, sizeof(subpass));
++		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++		VkRenderPassCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++		info.subpassCount = 1;
++		info.pSubpasses = &subpass;
++		SELFTEST_STEP(vkCreateRenderPass(dev, &info, NULL, &renderPass) == VK_SUCCESS, "render pass");
++		VkFramebufferCreateInfo fb;
++		memset(&fb, 0, sizeof(fb));
++		fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
++		fb.renderPass = renderPass;
++		fb.width = 1;
++		fb.height = 1;
++		fb.layers = 1;
++		SELFTEST_STEP(vkCreateFramebuffer(dev, &fb, NULL, &framebuffer) == VK_SUCCESS, "framebuffer");
++	}
++	{
++		VkPipelineShaderStageCreateInfo stage;
++		memset(&stage, 0, sizeof(stage));
++		stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++		stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
++		stage.module = module;
++		stage.pName = "main";
++		VkVertexInputBindingDescription binding;
++		binding.binding = 0;
++		binding.stride = stride;
++		binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++		for (uint32_t i = 0; i < attributeCount; i++)
++		{
++			attrs[i].location = attributes[i].location;
++			attrs[i].binding = 0;
++			attrs[i].format = (VkFormat)attributes[i].format;
++			attrs[i].offset = attributes[i].offset;
++		}
++		VkPipelineVertexInputStateCreateInfo vi;
++		memset(&vi, 0, sizeof(vi));
++		vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++		vi.vertexBindingDescriptionCount = 1;
++		vi.pVertexBindingDescriptions = &binding;
++		vi.vertexAttributeDescriptionCount = attributeCount;
++		vi.pVertexAttributeDescriptions = attrs;
++		VkPipelineInputAssemblyStateCreateInfo ia;
++		memset(&ia, 0, sizeof(ia));
++		ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++		ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++		VkViewport viewport = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
++		VkRect2D scissor = {{0, 0}, {1, 1}};
++		VkPipelineViewportStateCreateInfo vp;
++		memset(&vp, 0, sizeof(vp));
++		vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++		vp.viewportCount = 1;
++		vp.pViewports = &viewport;
++		vp.scissorCount = 1;
++		vp.pScissors = &scissor;
++		VkPipelineRasterizationStateCreateInfo rs;
++		memset(&rs, 0, sizeof(rs));
++		rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++		rs.rasterizerDiscardEnable = VK_TRUE;
++		rs.polygonMode = VK_POLYGON_MODE_FILL;
++		rs.lineWidth = 1.0f;
++		VkPipelineMultisampleStateCreateInfo ms;
++		memset(&ms, 0, sizeof(ms));
++		ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++		ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++		VkGraphicsPipelineCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++		info.stageCount = 1;
++		info.pStages = &stage;
++		info.pVertexInputState = &vi;
++		info.pInputAssemblyState = &ia;
++		info.pViewportState = &vp;
++		info.pRasterizationState = &rs;
++		info.pMultisampleState = &ms;
++		info.layout = pipelineLayout;
++		info.renderPass = renderPass;
++		SELFTEST_STEP(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS, "graphics pipeline");
++	}
++	VkDescriptorSet set;
++	{
++		VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
++		VkDescriptorPoolCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++		info.maxSets = 1;
++		info.poolSizeCount = 2;
++		info.pPoolSizes = sizes;
++		SELFTEST_STEP(vkCreateDescriptorPool(dev, &info, NULL, &pool) == VK_SUCCESS, "descriptor pool");
++		VkDescriptorSetAllocateInfo a;
++		memset(&a, 0, sizeof(a));
++		a.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++		a.descriptorPool = pool;
++		a.descriptorSetCount = 1;
++		a.pSetLayouts = &setLayout;
++		SELFTEST_STEP(vkAllocateDescriptorSets(dev, &a, &set) == VK_SUCCESS, "descriptor set");
++		VkDescriptorBufferInfo bi[2] = {{ub.buffer, 0, uniformSize}, {outb.buffer, 0, outSize}};
++		VkWriteDescriptorSet w[2];
++		memset(w, 0, sizeof(w));
++		for (uint32_t i = 0; i < 2; i++)
++		{
++			w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++			w[i].dstSet = set;
++			w[i].dstBinding = i == 0 ? 0 : 2;
++			w[i].descriptorCount = 1;
++			w[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++			w[i].pBufferInfo = &bi[i];
++		}
++		vkUpdateDescriptorSets(dev, 2, w, 0, NULL);
++	}
++	{
++		VkCommandPoolCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++		info.queueFamilyIndex = queueFamily;
++		SELFTEST_STEP(vkCreateCommandPool(dev, &info, NULL, &cmdPool) == VK_SUCCESS, "command pool");
++		VkCommandBufferAllocateInfo a;
++		memset(&a, 0, sizeof(a));
++		a.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++		a.commandPool = cmdPool;
++		a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++		a.commandBufferCount = 1;
++		VkCommandBuffer cmd;
++		SELFTEST_STEP(vkAllocateCommandBuffers(dev, &a, &cmd) == VK_SUCCESS, "command buffer");
++		VkCommandBufferBeginInfo begin;
++		memset(&begin, 0, sizeof(begin));
++		begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++		vkBeginCommandBuffer(cmd, &begin);
++		VkRenderPassBeginInfo rp;
++		memset(&rp, 0, sizeof(rp));
++		rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
++		rp.renderPass = renderPass;
++		rp.framebuffer = framebuffer;
++		rp.renderArea.extent.width = 1;
++		rp.renderArea.extent.height = 1;
++		vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
++		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &set, 0, NULL);
++		VkDeviceSize zero = 0;
++		vkCmdBindVertexBuffers(cmd, 0, 1, &vb.buffer, &zero);
++		vkCmdDraw(cmd, vertexCount, 1, 0, 0);
++		vkCmdEndRenderPass(cmd);
++		VkMemoryBarrier mb;
++		memset(&mb, 0, sizeof(mb));
++		mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++		mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++		mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++		SELFTEST_STEP(vkEndCommandBuffer(cmd) == VK_SUCCESS, "end command buffer");
++		VkFenceCreateInfo fi;
++		memset(&fi, 0, sizeof(fi));
++		fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++		SELFTEST_STEP(vkCreateFence(dev, &fi, NULL, &fence) == VK_SUCCESS, "fence");
++		VkSubmitInfo submit;
++		memset(&submit, 0, sizeof(submit));
++		submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++		submit.commandBufferCount = 1;
++		submit.pCommandBuffers = &cmd;
++		SELFTEST_STEP(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS, "submit");
++		SELFTEST_STEP(vkWaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS, "wait (10 s)");
++	}
++	memcpy(out, outb.ptr, outSize);
++	ok = 1;
++done:
++	if (fence)
++		vkDestroyFence(dev, fence, NULL);
++	if (cmdPool)
++		vkDestroyCommandPool(dev, cmdPool, NULL);
++	if (pool)
++		vkDestroyDescriptorPool(dev, pool, NULL);
++	if (pipeline)
++		vkDestroyPipeline(dev, pipeline, NULL);
++	if (framebuffer)
++		vkDestroyFramebuffer(dev, framebuffer, NULL);
++	if (renderPass)
++		vkDestroyRenderPass(dev, renderPass, NULL);
++	if (pipelineLayout)
++		vkDestroyPipelineLayout(dev, pipelineLayout, NULL);
++	if (setLayout)
++		vkDestroyDescriptorSetLayout(dev, setLayout, NULL);
++	if (module)
++		vkDestroyShaderModule(dev, module, NULL);
++	selftest_free(dev, &outb);
++	selftest_free(dev, &vb);
++	selftest_free(dev, &ub);
++	return ok;
++#undef SELFTEST_STEP
++}
++
++static void* selftest_read_file(const char* dir, const char* name, size_t* size)
++{
++	char path[512];
++	snprintf(path, sizeof(path), "%s/%s", dir, name);
++	FILE* f = fopen(path, "rb");
++	if (!f)
++		return NULL;
++	fseek(f, 0, SEEK_END);
++	*size = (size_t)ftell(f);
++	fseek(f, 0, SEEK_SET);
++	void* data = malloc(*size + 1);
++	if (data && fread(data, 1, *size, f) != *size)
++	{
++		free(data);
++		data = NULL;
++	}
++	if (data)
++		((char*)data)[*size] = 0;
++	fclose(f);
++	return data;
++}
++
++// One make_vtest.py case directory: vtest.spv, vb.bin, uniforms.bin, layout.txt -> outName. Returns 1 on success.
++static int selftest_vertex_case(VkPhysicalDevice gpu, VkDevice dev, uint32_t queueFamily, VkQueue queue, const char* dir, const char* outName,
++	char* msg, size_t msgSize)
++{
++	size_t spvSize = 0, vbSize = 0, uniSize = 0, layoutSize = 0;
++	void* spv = selftest_read_file(dir, "vtest.spv", &spvSize);
++	void* vbData = selftest_read_file(dir, "vb.bin", &vbSize);
++	void* uni = selftest_read_file(dir, "uniforms.bin", &uniSize);
++	char* layout = (char*)selftest_read_file(dir, "layout.txt", &layoutSize);
++	void* out = NULL;
++	int ok = 0;
++	unsigned stride = 0, verts = 0, outs = 0, count = 0;
++	SelftestAttribute attributes[32];
++	if (!spv || !vbData || !uni || !layout)
++	{
++		snprintf(msg, msgSize, "input files missing");
++		goto done;
++	}
++	{
++		int used = 0;
++		if (sscanf(layout, "stride %u verts %u outs %u attrs %u%n", &stride, &verts, &outs, &count, &used) != 4 || count > 32)
++		{
++			snprintf(msg, msgSize, "bad layout.txt");
++			goto done;
++		}
++		const char* p = layout + used;
++		for (unsigned i = 0; i < count; i++)
++		{
++			int n = 0;
++			if (sscanf(p, "%u %u %u%n", &attributes[i].location, &attributes[i].format, &attributes[i].offset, &n) != 3)
++			{
++				snprintf(msg, msgSize, "bad layout.txt attribute");
++				goto done;
++			}
++			p += n;
++		}
++	}
++	{
++		const size_t outSize = (size_t)verts * outs * 16;
++		out = malloc(outSize);
++		char err[96] = "";
++		if (!out || !selftest_run_vertex(gpu, dev, queueFamily, queue, (const uint32_t*)spv, spvSize, uni, uniSize, vbData, vbSize, stride,
++				attributes, count, verts, out, outSize, err, sizeof(err)))
++		{
++			snprintf(msg, msgSize, "failed at %s", err);
++			goto done;
++		}
++		char path[512];
++		snprintf(path, sizeof(path), "%s/%s", dir, outName);
++		FILE* f = fopen(path, "wb");
++		if (!f)
++		{
++			snprintf(msg, msgSize, "can't write %s", outName);
++			goto done;
++		}
++		fwrite(out, 1, outSize, f);
++		fclose(f);
++		snprintf(msg, msgSize, "%u vertices", verts);
++		ok = 1;
++	}
++done:
++	free(spv);
++	free(vbData);
++	free(uni);
++	free(layout);
++	free(out);
++	return ok;
 +}
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
 index 4978ef0..62be7be 100644
