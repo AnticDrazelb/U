@@ -2304,6 +2304,27 @@ index f1556f8..7f41344 100644
  	g_renderer->ImguiEnd();
  }
  
+diff --git a/src/Cafe/HW/Latte/Core/LatteShader.cpp b/src/Cafe/HW/Latte/Core/LatteShader.cpp
+index a25e771..8fabdc5 100644
+--- a/src/Cafe/HW/Latte/Core/LatteShader.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteShader.cpp
+@@ -796,11 +796,16 @@ void LatteShader_GetDecompilerOptions(LatteDecompilerOptions& options, LatteCons
+ {
+ 	options.usesGeometryShader = geometryShaderEnabled;
+ 	options.spirvInstrinsics.hasRoundingModeRTEFloat32 = false;
++	options.spirvInstrinsics.hasDenormPreserveFloat32 = false;
+ 	options.useTFViaSSBO = g_renderer->UseTFViaSSBO();
+ #ifdef ENABLE_VULKAN
+ 	if (g_renderer->GetType() == RendererAPI::Vulkan)
+ 	{
+ 		options.spirvInstrinsics.hasRoundingModeRTEFloat32 = VulkanRenderer::GetInstance()->HasSPRIVRoundingModeRTE32();
++#ifdef __ORBIS__
++		extern bool g_crema_denorm_preserve; // gui/ps4/launcher/CremaSettings.cpp
++		options.spirvInstrinsics.hasDenormPreserveFloat32 = g_crema_denorm_preserve && VulkanRenderer::GetInstance()->HasSPIRVDenormPreserve32();
++#endif
+ 	}
+ #endif
+ 	options.strictMul = g_current_game_profile->GetAccurateShaderMul() != AccurateShaderMulOption::False;
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 index 43b116f..d0b6c82 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
@@ -2356,6 +2377,18 @@ index 743ab67..b1fc494 100644
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
  
+diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h
+index 208ef2d..3c84732 100644
+--- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h
++++ b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h
+@@ -264,6 +264,7 @@ struct LatteDecompilerOptions
+ 	struct
+ 	{
+ 		bool hasRoundingModeRTEFloat32{ false };
++		bool hasDenormPreserveFloat32{ false }; // Crema: GCN (RADV/ACO) flushes fp32 denormals unless asked
+ 	}spirvInstrinsics;
+ };
+ 
 diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
 index ba58081..a53eda2 100644
 --- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
@@ -2391,6 +2424,43 @@ index ba58081..a53eda2 100644
  		// set AR
  		if( aluInstruction->destElem == 0 )
  			src->add("ARi.x = tempResulti;" _CRLF);
+diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSLHeader.hpp b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSLHeader.hpp
+index 9d6a438..75833f4 100644
+--- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSLHeader.hpp
++++ b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSLHeader.hpp
+@@ -312,6 +312,16 @@ namespace LatteDecompiler
+ 			src->add("spirv_execution_mode(capabilities = [4467], extensions = [\"SPV_KHR_float_controls\"], 4462, 32);" _CRLF);
+ 			src->add("spirv_execution_mode(capabilities = [4467], extensions = [\"SPV_KHR_float_controls\"], 4462, 64);" _CRLF);
+ 		}
++		if (decompilerContext->options->spirvInstrinsics.hasDenormPreserveFloat32)
++		{
++			// Crema: keep 32-bit denormals (DenormPreserve, 4459; capability 4464). The Wii U's registers are
++			// untyped and small integers kept in float registers are denormal floats; GCN's shader compiler
++			// (ACO) flushes them to zero in float operations unless asked (NVIDIA keeps them): Sonic Lost
++			// World's legs were pulled out of shape and some scenery was missing on the PS4
++			if (!decompilerContext->options->spirvInstrinsics.hasRoundingModeRTEFloat32)
++				src->add("#extension GL_EXT_spirv_intrinsics: enable" _CRLF);
++			src->add("spirv_execution_mode(capabilities = [4464], extensions = [\"SPV_KHR_float_controls\"], 4459, 32);" _CRLF);
++		}
+ 		src->add("#else" _CRLF);
+ 		// OpenGL defines
+ 		src->add("#define ATTR_LAYOUT(__location) layout(location = __location)" _CRLF);
+diff --git a/src/Cafe/HW/Latte/Renderer/RendererShader.cpp b/src/Cafe/HW/Latte/Renderer/RendererShader.cpp
+index 293d959..27edce6 100644
+--- a/src/Cafe/HW/Latte/Renderer/RendererShader.cpp
++++ b/src/Cafe/HW/Latte/Renderer/RendererShader.cpp
+@@ -20,6 +20,11 @@ uint32 RendererShader::GeneratePrecompiledCacheId()
+ 	v += (uint32)g_current_game_profile->GetAccurateShaderMul() * 133;
+ 
+ 	v += 0x820a5291; // change this value for manual invalidation
++#ifdef __ORBIS__
++	extern bool g_crema_denorm_preserve; // gui/ps4/launcher/CremaSettings.cpp: shaders differ with it
++	if (g_crema_denorm_preserve)
++		v ^= 0x5a17d3e9;
++#endif
+ 
+ 	return v;
+ }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
 index 86b4d75..1ccc4b9 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
@@ -3235,7 +3305,7 @@ index 7179087..9a38051 100644
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..fd9df44 100644
+index 599190a..1cdb1d5 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -3247,7 +3317,19 @@ index 599190a..fd9df44 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -876,6 +878,9 @@ VulkanRenderer::~VulkanRenderer()
+@@ -318,6 +320,11 @@ void VulkanRenderer::GetDeviceFeatures()
+ 	m_featureControl.deviceExtensions.pipeline_creation_cache_control = pcc.pipelineCreationCacheControl;
+ 	m_featureControl.deviceExtensions.custom_border_color_without_format = m_featureControl.deviceExtensions.custom_border_color && bcf.customBorderColorWithoutFormat;
+ 	m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32 = m_featureControl.deviceExtensions.shader_float_controls && pfcp.shaderRoundingModeRTEFloat32;
++	m_featureControl.shaderFloatControls.shaderDenormPreserveFloat32 = m_featureControl.deviceExtensions.shader_float_controls && pfcp.shaderDenormPreserveFloat32;
++#ifdef __ORBIS__
++	cemuLog_log(LogType::Force, "Vulkan: 32-bit float denormals {} (shaders keep the Wii U's integers stored in float registers)",
++		m_featureControl.shaderFloatControls.shaderDenormPreserveFloat32 ? "preserved" : "NOT preservable");
++#endif
+ 	if(!m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32)
+ 		cemuLog_log(LogType::Force, "Shader round mode control not available on this device or driver. Some rendering issues might occur.");
+ 
+@@ -876,6 +883,9 @@ VulkanRenderer::~VulkanRenderer()
  	}
  
  	vkDestroyDescriptorPool(m_logicalDevice, m_descriptorPool, nullptr);
@@ -3257,7 +3339,7 @@ index 599190a..fd9df44 100644
  
  	for(auto& i : m_backbufferBlitPipelineCache)
  	{
-@@ -1491,6 +1496,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+@@ -1491,6 +1501,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
  	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -3266,7 +3348,7 @@ index 599190a..fd9df44 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1578,7 +1585,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+@@ -1578,7 +1590,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
  }
  #endif
  
@@ -3275,7 +3357,7 @@ index 599190a..fd9df44 100644
  VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
  {
      VkXlibSurfaceCreateInfoKHR sci{};
-@@ -1642,6 +1649,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+@@ -1642,6 +1654,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
  {
  #if BOOST_OS_WINDOWS
  	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
@@ -3284,7 +3366,7 @@ index 599190a..fd9df44 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -2280,7 +2289,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+@@ -2280,7 +2294,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
  	occlusionQuery_notifyBeginCommandBuffer();
  
  	m_recordedDrawcalls = 0;
@@ -3298,7 +3380,7 @@ index 599190a..fd9df44 100644
  	m_submitOnIdle = false;
  }
  
-@@ -3038,7 +3053,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3038,7 +3058,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -3311,7 +3393,7 @@ index 599190a..fd9df44 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3077,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3082,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -3320,7 +3402,7 @@ index 599190a..fd9df44 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3282,6 +3302,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3282,6 +3307,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -3370,7 +3452,7 @@ index 599190a..fd9df44 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3363,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3368,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -3383,7 +3465,7 @@ index 599190a..fd9df44 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -4379,6 +4444,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4449,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -3392,7 +3474,7 @@ index 599190a..fd9df44 100644
  	performanceMonitor.vk.numDescriptorSets.decrement();
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index d975e11..d5a9239 100644
+index d975e11..e449af9 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -212,7 +212,7 @@ public:
@@ -3421,6 +3503,22 @@ index d975e11..d5a9239 100644
  
    public:
  	struct QueueFamilyIndices
+@@ -475,6 +478,7 @@ private:
+ 		struct
+ 		{
+ 			bool shaderRoundingModeRTEFloat32{ false };
++			bool shaderDenormPreserveFloat32{ false };
+ 		}shaderFloatControls; // from VK_KHR_shader_float_controls
+ 
+ 		struct
+@@ -955,6 +959,7 @@ private:
+ public:
+ 	bool GetDisableMultithreadedCompilation() const { return m_featureControl.disableMultithreadedCompilation; }
+ 	bool HasSPRIVRoundingModeRTE32() const { return m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32; }
++	bool HasSPIRVDenormPreserve32() const { return m_featureControl.shaderFloatControls.shaderDenormPreserveFloat32; }
+ 	bool IsDebugMarkersEnabled() const { return m_featureControl.usingDebugMarkerTool; }
+ 	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
+ 	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 index 512ebee..a8b3a5a 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
@@ -9838,10 +9936,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..e9853c7
+index 0000000..2e8b55a
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,651 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9860,6 +9958,8 @@ index 0000000..e9853c7
 +extern bool g_crema_native_rects; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Rectangle Draws
 +extern bool g_crema_native_quads; // the same file: Quad Draws
 +extern bool g_crema_shader_compat_26; // Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
++// shaders keep 32-bit float denormals (Core/LatteShader.cpp, LatteDecompilerEmitGLSLHeader.hpp)
++bool g_crema_denorm_preserve = true;
 +
 +#include <algorithm>
 +#include <atomic>
@@ -9966,6 +10066,8 @@ index 0000000..e9853c7
 +			"On: the Wii U's variable shifts in one PS4 instruction, slightly faster, but some games break (Tekken Tag Tournament 2 crashes). Off: Cemu's original code."},
 +		{"profiler", "Profiler", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
++		{"denormals", "Keep Float Denormals", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
++			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off: they become zero, as before 2.42 (Sonic Lost World's legs broke and some scenery went missing). Only for comparison."},
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
 +			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"sync", "Synchronized"}, {"all", "All"}}, "off", false,
 +			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Synchronized: the GPU waits and flushes its caches after every draw, and copies avoid compute shaders. Slower; for one test each."},
@@ -10418,6 +10520,7 @@ index 0000000..e9853c7
 +	g_crema_native_rects = get("rect_draws") != "cemu";
 +	g_crema_native_quads = get("quad_draws") == "native";
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
++	g_crema_denorm_preserve = get("denormals") != "off";
 +	// the GPU driver's own debug switches (read when the Vulkan instance and shader compiler start,
 +	// after this); its pipeline cache is off with them, or cached shaders would come back
 +	{
