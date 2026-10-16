@@ -828,7 +828,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..fcbae8b 100644
+index c9758f3..320973c 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1477,10 +1477,51 @@ index c9758f3..fcbae8b 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +987,115 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +987,156 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
++#ifdef __ORBIS__
++	// Crema: a range entered at many places (a switch's cases reached through bctr, functions
++	// joined by tail calls) was compiled whole again for every new entry: Sonic Lost World compiled
++	// one of 538 segments 129 times in 95 s (~1 s each on the PS4: hitches, and that code running
++	// interpreted meanwhile). The entries already known go in too: the addresses waiting to be
++	// compiled and the ones earlier compiles made; from the range's second compile on, every
++	// block start after an unconditional branch and every branch target in it as well.
++	{
++		const uint32 rangeEnd = range.startAddress + range.length;
++		for (uint32 v = range.startAddress; v < rangeEnd; v += 4)
++		{
++			if (v != address && ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[v / 4] != PPCRecompiler_leaveRecompilerCode_unvisited)
++				entryAddresses.emplace(v);
++		}
++		static std::unordered_map<uint32, uint32> s_rangeCompiles;
++		const uint32 times = ++s_rangeCompiles[range.startAddress];
++		if (times >= 2)
++		{
++			for (uint32 target : funcBoundaries.GetBranchTargets())
++			{
++				if (target >= range.startAddress && target < rangeEnd && (target & 3) == 0)
++					entryAddresses.emplace(target);
++			}
++			for (uint32 v = range.startAddress; v + 4 < rangeEnd; v += 4)
++			{
++				const uint32 op = memory_readU32(v);
++				const bool branch = (op >> 26) == 18 && (op & 1) == 0;              // b (not bl)
++				const bool blr = op == 0x4E800020, bctr = op == 0x4E800420;
++				if ((branch || blr || bctr) && memory_readU32(v + 4) != 0 && (memory_readU32(v + 4) >> 26) != 0)
++					entryAddresses.emplace(v + 4);
++			}
++		}
++		if (times == 2 || times == 8 || times == 64)
++		{
++			char line[160];
++			snprintf(line, sizeof(line), "recompiler: the range at %08x (%u bytes) compiled %u times, %zu entry points now",
++				range.startAddress, range.length, times, entryAddresses.size());
++			ps4_boot_trace(line);
++		}
++	}
++#endif
 +	// Crema: another worker compiling the same code already: this address goes back to
 +	// unvisited, so it is queued again if it runs before that function covers it
 +	if (t_recompilerWorker >= 0)
@@ -1597,7 +1638,7 @@ index c9758f3..fcbae8b 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1128,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1169,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1681,7 +1722,7 @@ index c9758f3..fcbae8b 100644
  	}
  }
  
-@@ -504,6 +1217,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1258,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1723,7 +1764,7 @@ index c9758f3..fcbae8b 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1357,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1398,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1731,7 +1772,7 @@ index c9758f3..fcbae8b 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1451,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1492,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1744,7 +1785,7 @@ index c9758f3..fcbae8b 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1464,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1505,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -1775,7 +1816,7 @@ index bfb2aed..5e6059c 100644
  bool PPCRecompilerImlGen_PS_MADDSX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool isVariant1);
  bool PPCRecompilerImlGen_PS_ADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..9c064ce 100644
+index 89e805d..483c6ca 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -1814,7 +1855,30 @@ index 89e805d..9c064ce 100644
  	}
  	return true;
  }
-@@ -1977,6 +1982,16 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+@@ -946,6 +951,22 @@ bool PPCRecompilerImlGen_SUBFZE(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+ 	return true;
+ }
+ 
++bool PPCRecompilerImlGen_SUBFME(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
++{
++	// d = ~a + 0xFFFFFFFF + ca;
++	sint32 rD, rA, rB;
++	PPC_OPC_TEMPL_XO(opcode, rD, rA, rB);
++	IMLReg regA = _GetRegGPR(ppcImlGenContext, rA);
++	IMLReg regD = _GetRegGPR(ppcImlGenContext, rD);
++	IMLReg regTmp = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_TEMPORARY + 0);
++	IMLReg regCa = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_XER_CA);
++	ppcImlGenContext->emitInst().make_r_r(PPCREC_IML_OP_NOT, regTmp, regA);
++	ppcImlGenContext->emitInst().make_r_r_s32_carry(PPCREC_IML_OP_ADD_WITH_CARRY, regD, regTmp, -1, regCa);
++	if (opcode & PPC_OPC_RC)
++		PPCImlGen_UpdateCR0(ppcImlGenContext, regD);
++	return true;
++}
++
+ bool PPCRecompilerImlGen_SUBFC(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
+ {
+ 	// d = ~a + b + 1;
+@@ -1977,6 +1998,16 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
  				break;
  			}
  			break;
@@ -1831,7 +1895,18 @@ index 89e805d..9c064ce 100644
  		case 8: //Sub category - move/negate
  			switch (PPC_getBits(opcode, 25, 5))
  			{
-@@ -2968,6 +2983,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
+@@ -2362,6 +2393,10 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+ 			if (!PPCRecompilerImlGen_STORE_INDEXED(ppcImlGenContext, opcode, 8, true, false))
+ 				unsupportedInstructionFound = true;
+ 			break;
++		case 232: // SUBFME
++			if (PPCRecompilerImlGen_SUBFME(ppcImlGenContext, opcode) == false)
++				unsupportedInstructionFound = true;
++			break;
+ 		case 234:
+ 			if (PPCRecompilerImlGen_ADDME(ppcImlGenContext, opcode) == false)
+ 				unsupportedInstructionFound = true;
+@@ -2968,6 +3003,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
  	return basicBlockList;
  }
  
@@ -1842,7 +1917,7 @@ index 89e805d..9c064ce 100644
  bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBlockInfo& basicBlockInfo)
  {
  	ppcImlGenContext.currentOutputSegment = basicBlockInfo.GetSegmentForInstructionAppend();
-@@ -2984,6 +3003,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
+@@ -2984,6 +3023,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
  		if (PPCRecompiler_decodePPCInstruction(&ppcImlGenContext))
  		{
  			cemuLog_logDebug(LogType::Force, "PPCRecompiler: Unsupported instruction at 0x{:08x}", addressOfCurrentInstruction);
@@ -1852,7 +1927,7 @@ index 89e805d..9c064ce 100644
  			ppcImlGenContext.currentOutputSegment = nullptr;
  			return false;
  		}
-@@ -3115,6 +3137,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -3115,6 +3157,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  	}
  }
  
@@ -1861,7 +1936,7 @@ index 89e805d..9c064ce 100644
  bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
  {
  	std::vector<PPCBasicBlockInfo> basicBlockList = PPCRecompiler_DetermineBasicBlockRange(boundaryTracker, entryAddresses);
-@@ -3164,6 +3188,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3164,6 +3208,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  	// generate cycle counters
  	// in theory we could generate these as part of FillBasicBlock() but in the future we might use more complex logic to emit fewer operations
@@ -1875,7 +1950,7 @@ index 89e805d..9c064ce 100644
  	for (size_t i = 0; i < basicBlockList.size(); i++)
  	{
  		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
-@@ -3171,6 +3202,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3171,6 +3222,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
  		cemu_assert_debug(ppcInstructionCount > 0);
