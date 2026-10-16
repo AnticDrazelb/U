@@ -4283,10 +4283,10 @@ index 4f85537..1971d3c 100644
  		while (true)
  		{
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..36a964e 100644
+index 9fe4bea..ad69172 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-@@ -23,6 +23,8 @@
+@@ -23,9 +23,21 @@
  #endif
  #endif
  
@@ -4294,8 +4294,22 @@ index 9fe4bea..36a964e 100644
 +
  static void ConfigureHostFloatingPointEnvironment()
  {
- #if defined(ARCH_X86_64)
-@@ -47,6 +49,11 @@ sint32 activeThreadCount = 0;
+-#if defined(ARCH_X86_64)
++#if defined(ARCH_X86_64) && defined(__ORBIS__)
++	// Crema: flush-to-zero like Cemu, and denormals-are-zero (DAZ, 0x40) cleared. The PS4 starts its
++	// threads with DAZ set; then any float operation read a tiny value as zero, and the Wii U games
++	// keep integers in float registers (struct copies, bone indices): Sonic Lost World lost bones
++	// and pointers on the PS4 only, in the interpreter too
++	const uint32 mxcsrBefore = _mm_getcsr();
++	_mm_setcsr((mxcsrBefore | 0x8000) & ~0x0040u);
++	static std::atomic<bool> s_mxcsrLogged{false};
++	if (!s_mxcsrLogged.exchange(true))
++		cemuLog_log(LogType::Force, "CPU float mode (MXCSR): {:#06x} found, {:#06x} used", mxcsrBefore, _mm_getcsr());
++#elif defined(ARCH_X86_64)
+ 	_mm_setcsr(_mm_getcsr() | 0x8000);
+ #elif defined(__arm64__)
+ 	// enable flush-to-zero and preserve NaN signs and payloads (FZ=1, DN=0)
+@@ -47,6 +59,11 @@ sint32 activeThreadCount = 0;
  
  void nnNfp_update();
  
@@ -4307,7 +4321,7 @@ index 9fe4bea..36a964e 100644
  namespace coreinit
  {
  #ifdef __arm64__
-@@ -91,7 +98,13 @@ namespace coreinit
+@@ -91,7 +108,13 @@ namespace coreinit
  		uint32 selectedCore;
  	};
  
@@ -4322,7 +4336,7 @@ index 9fe4bea..36a964e 100644
  
  	bool __CemuIsMulticoreMode()
  	{
-@@ -1058,9 +1071,23 @@ namespace coreinit
+@@ -1058,9 +1081,23 @@ namespace coreinit
  		__OSUnlockScheduler();
  	}
  
@@ -4346,7 +4360,7 @@ index 9fe4bea..36a964e 100644
  		cemu_assert_debug(s_threadToFiber.find(thread) != s_threadToFiber.end());
  
  		OSHostThread* hostThread = s_threadToFiber.find(thread)->second;
-@@ -1180,6 +1207,9 @@ namespace coreinit
+@@ -1180,6 +1217,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -4356,7 +4370,7 @@ index 9fe4bea..36a964e 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1222,154 @@ namespace coreinit
+@@ -1192,6 +1232,154 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -4511,7 +4525,7 @@ index 9fe4bea..36a964e 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1388,9 @@ namespace coreinit
+@@ -1210,6 +1398,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -4521,7 +4535,7 @@ index 9fe4bea..36a964e 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1414,16 @@ namespace coreinit
+@@ -1233,6 +1424,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -4538,7 +4552,7 @@ index 9fe4bea..36a964e 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1250,6 +1441,9 @@ namespace coreinit
+@@ -1250,6 +1451,9 @@ namespace coreinit
  		bool isMainCore = g_isMulticoreMode == false || t_assignedCoreIndex == 1;
  		sint32 coreIndex = t_assignedCoreIndex;
  		__OSUnlockScheduler();
@@ -4548,7 +4562,7 @@ index 9fe4bea..36a964e 100644
  		while (true)
  		{
  			if (!g_coreRunQueueThreadCount[coreIndex].isZero()) // avoid hammering the lock on the main core if there is no runable thread
-@@ -1259,10 +1453,44 @@ namespace coreinit
+@@ -1259,10 +1463,44 @@ namespace coreinit
  				if (nextThread)
  				{
  					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
@@ -4593,7 +4607,7 @@ index 9fe4bea..36a964e 100644
  			if (isMainCore)
  			{
  				__OSCheckSystemEvents();
-@@ -1391,6 +1619,11 @@ namespace coreinit
+@@ -1391,6 +1629,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -4605,7 +4619,7 @@ index 9fe4bea..36a964e 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1880,182 @@ namespace coreinit
+@@ -1647,3 +1890,182 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
