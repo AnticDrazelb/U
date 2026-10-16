@@ -14,6 +14,8 @@ VERSION="${CEMU_PS4_VERSION:-01.00}"
 HOST="ftp://${PS4_HOST:-192.168.0.90}:${PS4_FTP_PORT:-2121}"
 
 [ -f "$EBOOT" ] || { echo "missing $EBOOT: build first" >&2; exit 1; }
+# an eboot older than the linked program means create-fself failed: never package it
+[ "$EBOOT" -nt "$SRC/bin/Cemu_release" ] || { echo "$EBOOT is older than $SRC/bin/Cemu_release: the last build did not make an eboot" >&2; exit 1; }
 [[ "$VERSION" =~ ^[0-9][0-9]\.[0-9][0-9]$ ]] || { echo "version must look like 01.00" >&2; exit 1; }
 STAGE="$PS4_BUILD_ROOT/build/cemu-stage"
 rm -rf "$STAGE"

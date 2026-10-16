@@ -591,10 +591,10 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..e1c078a 100644
+index 935e61a..176d8cc 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -14,10 +14,26 @@
+@@ -14,10 +14,29 @@
  #include <boost/container/small_vector.hpp>
  
  #include "Common/cpu_features.h"
@@ -604,7 +604,10 @@ index 935e61a..e1c078a 100644
  #define DEBUG_RA_INSTRUCTION_GEN 0
  
 +// the merge budget of the compile running on this thread (PPCRecompiler.cpp: less for recompiles)
-+thread_local uint64 g_cremaRaMergeBudget = 200000;
++static thread_local uint64 g_cremaRaMergeBudget = 200000;
++// set by PPCRecompiler.cpp before each compile (a function: the PS4 toolchain cannot link a
++// thread_local variable used from another file, _ZTH wrapper)
++void CremaSetRaMergeBudget(uint64 budget) { g_cremaRaMergeBudget = budget; }
 +
 +namespace
 +{
@@ -621,7 +624,7 @@ index 935e61a..e1c078a 100644
  struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per register and segment
  {
  	IMLRARegAbstractLiveness(IMLRegFormat regBaseFormat, sint32 usageStart, sint32 usageEnd)
-@@ -35,6 +51,8 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
+@@ -35,6 +54,8 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
  	IMLRegFormat regBaseFormat;
  };
  
@@ -630,7 +633,7 @@ index 935e61a..e1c078a 100644
  struct IMLRegisterAllocatorContext
  {
  	IMLRegisterAllocatorParameters* raParam;
-@@ -42,10 +60,10 @@ struct IMLRegisterAllocatorContext
+@@ -42,10 +63,10 @@ struct IMLRegisterAllocatorContext
  
  	std::unordered_map<IMLRegID, IMLRegFormat> regIdToBaseFormat;
  	// first pass
@@ -643,7 +646,7 @@ index 935e61a..e1c078a 100644
  	{
  		return perSegmentAbstractRanges[imlSegment->momentaryIndex];
  	}
-@@ -196,9 +214,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+@@ -196,9 +217,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
  
  uint32 IMLRA_GetNextIterationIndex()
  {
@@ -655,7 +658,7 @@ index 935e61a..e1c078a 100644
  }
  
  bool _detectLoop(IMLSegment* currentSegment, sint32 depth, uint32 iterationIndex, IMLSegment* imlSegmentLoopBase)
-@@ -1569,6 +1586,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
+@@ -1569,6 +1589,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
  
  void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regId, IMLSegment** route, sint32 routeDepth)
  {
@@ -663,7 +666,7 @@ index 935e61a..e1c078a 100644
  #ifdef CEMU_DEBUG_ASSERT
  	if (routeDepth < 2)
  		assert_dbg();
-@@ -1585,42 +1603,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
+@@ -1585,42 +1606,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
  	IMLRA_extendAbstractRangeToBeginningOfSegment(ctx, route[routeDepth - 1], regId);
  }
  
@@ -769,7 +772,7 @@ index 935e61a..e1c078a 100644
  	}
  }
  
-@@ -1638,6 +1706,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+@@ -1638,6 +1709,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
  	if (remainingScanDist <= 0)
  		return; // can't reach end
  
@@ -787,7 +790,7 @@ index 935e61a..e1c078a 100644
  	IMLSegment* route[64];
  	route[0] = currentSegment;
  	if (currentSegment->nextSegmentBranchNotTaken)
-@@ -1698,8 +1777,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
+@@ -1698,8 +1780,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
  	}
  }
  
@@ -831,7 +834,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..caabf17 100644
+index c9758f3..3cd5fc7 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -891,7 +894,7 @@ index c9758f3..caabf17 100644
 +#include "Cafe/CafeSystem.h"
 +#include <unordered_map>
 +extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
-+extern thread_local uint64 g_cremaRaMergeBudget; // IML/IMLRegisterAllocator.cpp
++void CremaSetRaMergeBudget(uint64 budget); // IML/IMLRegisterAllocator.cpp
 +extern "C" size_t ps4rt_heap_size(void); // port/ps4_runtime.cpp
 +extern "C" size_t ps4rt_heap_footprint(void);
 +// Crema: the newest recompiled functions' host code ranges, so a crash in recompiled code can be
@@ -1494,7 +1497,7 @@ index c9758f3..caabf17 100644
 +	{
 +		static std::unordered_map<uint32, uint32> s_rangeCompiles;
 +		const uint32 times = ++s_rangeCompiles[range.startAddress];
-+		g_cremaRaMergeBudget = times >= 2 ? 20000 : 200000;
++		CremaSetRaMergeBudget(times >= 2 ? 20000 : 200000);
 +		if (times == 2 || times == 8 || times == 64)
 +		{
 +			char line[160];

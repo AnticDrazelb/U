@@ -7,4 +7,6 @@ bash "$HERE/logrun.sh" configure bash "$HERE/configure-cemu.sh" || { tail -20 "$
 bash "$HERE/logrun.sh" build bash "$HERE/build-cemu.sh" -k 0
 L="$HOME/cemups4-build/logs/build.log"
 tail -1 "$L"; echo "errors: $(grep -c 'error:' "$L")"
+# the PS4 executable (create-fself) can fail after everything compiled: say so
+grep -E "^FAILED|Failed to build FSELF" "$L" && echo "errors: eboot.bin NOT built"
 grep "error:" "$L" | sed 's/.*src\/Cemu\///' | sort | uniq -c | sort -rn | head -${TOP:-80}
