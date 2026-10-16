@@ -186,9 +186,12 @@ packs: they crash on the PS4.
 
 ### Recommended settings
 
-The best settings found for each tested game, with notes on what they fix, are in
-[`game-settings.ini`](game-settings.ini). Most games run best on the defaults with every
-Diagnostics switch off. The [compatibility table](#game-compatibility) lists what a game needs.
+Every game we've tested has its best settings in [`game-settings.ini`](game-settings.ini), with notes
+on what they fix. Crema carries that file and downloads the newest copy from GitHub each time it
+opens, so new findings reach you without an update. With **Settings → Emulation → Recommended
+Settings** on (the default), a tested game starts with its recommended settings, unless you've given
+it its own settings. **Triangle on a game → Information** shows how it was tested and what it uses.
+The [compatibility table](#game-compatibility) lists the same games.
 
 ## Your files
 
@@ -218,19 +221,24 @@ Everything the app creates sits in **`/data/Crema/`**:
 | ![Nothing](https://img.shields.io/badge/Nothing-455556?style=flat-square) | Doesn't start, or closes right away |
 
 **Tested by us** on a launch-model PS4, frames per second while playing, with every Diagnostics
-switch off unless noted:
+switch off unless noted. The settings named here are applied for you (see
+[Recommended settings](#recommended-settings)):
 
 | Status | Game | FPS |
 |---|---|---|
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | The Legend of Zelda: Breath of the Wild | 20–24 (its normal rate is 30) with *Graphics Accuracy: Fast*, *Thread Quantum: 100000* and the **FPS++** and **Draw Distance** graphic packs. The first 2–3 minutes after loading are slow while its code is compiled. |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Donkey Kong Country: Tropical Freeze | Menus ~20, cutscenes ~45 (measured with diagnostics on); smooth with them off. *Thread Quantum: 100000*. |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Mario Kart 8 | Races 45–52, menus 60 |
-| ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Minecraft: Wii U Edition | ~37 with its update, 15+ minutes without a problem |
+| ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Minecraft: Wii U Edition | ~37 with its update, 15+ minutes without a problem. *Thread Fairness: Off*. |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Nintendo Land | ~60 |
+| ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Paper Mario: Color Splash | ~28 (its normal rate is 30), 21 in busy towns. *Graphics Accuracy: Fast* gives ~29.5, but parts of the map may show black: being looked into. |
+| ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Batman: Arkham Origins | Not measured. Needs *CPU Mode: Auto* (single-core); the first start takes about a minute. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | New Super Mario Bros. U | ~30 (its normal rate is 60) |
+| ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Ninja Gaiden 3: Razor's Edge | 17–30 (60 on a PC). Needs *Thread Fairness: On* for its cutscenes; *Graphics Accuracy: Fast*. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Super Mario 3D World | ~30 (its normal rate is 60) |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Tekken Tag Tournament 2 | Fights 33–38, menus 60 (the game slows down with its frame rate). Needs *Thread Fairness: On*. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Xenoblade Chronicles X | ~30 in the intro. Needs its update and *CPU Mode: Auto*. |
+| ![Nothing](https://img.shields.io/badge/Nothing-455556?style=flat-square) | Donkey Kong Country (Virtual Console) | Closed at start (a GPU fault); fixed in Crema Lab v02.27, waiting for a test. |
 
 A range means the frame rate depends on what's on screen. Tested a game that isn't listed?
 [Open an issue](https://github.com/iHaiDeeZ/Crema/issues) with the game, its region, your console
