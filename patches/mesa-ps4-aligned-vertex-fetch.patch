@@ -1,0 +1,35 @@
+From a2527757729ebd489c2820127ae25d6e8c052853 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Sat, 17 Oct 2026 02:48:05 +0300
+Subject: [PATCH] PS4: typed vertex fetches aligned to their element size, as
+ on gfx6 (Liverpool read an 8_8 fetch at an odd address wrong)
+
+---
+ src/amd/common/ac_shader_util.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/ac_shader_util.c b/src/amd/common/ac_shader_util.c
+index 7ac9733..322449a 100644
+--- a/src/amd/common/ac_shader_util.c
++++ b/src/amd/common/ac_shader_util.c
+@@ -514,7 +514,16 @@ is_fetch_size_safe(const enum amd_gfx_level gfx_level, const struct ac_vtx_forma
+       return false;
+ 
+    unsigned vertex_byte_size = vtx_info->chan_byte_size * channels;
+-   return (gfx_level >= GFX7 && gfx_level <= GFX9) ||
++#if defined(__PS4__) || defined(AC_PS4_ALIGNED_VERTEX_FETCH)
++   /* PS4: Liverpool (gfx7) needs typed vertex fetches aligned to their element size, like gfx6.
++    * An 8_8 fetch at an odd address (an R8G8B8A8 attribute whose first channel is unused) read
++    * wrong data: the bone weights of every skinned model in Sonic Lost World, whose legs shattered.
++    */
++   const bool unaligned_ok = false;
++#else
++   const bool unaligned_ok = gfx_level >= GFX7 && gfx_level <= GFX9;
++#endif
++   return unaligned_ok ||
+           (offset % vertex_byte_size == 0 && MAX2(alignment, 1) % vertex_byte_size == 0);
+ }
+ 
+-- 
+2.53.0
+
