@@ -3896,7 +3896,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..ee04459 100644
+index 512ebee..ba2d01e 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -3915,10 +3915,13 @@ index 512ebee..ee04459 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
-@@ -1297,8 +1291,126 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1297,8 +1291,129 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
++// Crema: draws done since launch, for the hang watchdog (gui/ps4/PS4WindowSystem.cpp)
++std::atomic<uint64> g_crema_draws_total{0};
++
 +// Crema: draws Cemu drops without a log line, counted by reason and logged every 10 s together with
 +// the shaders of the dropped draws (an object missing on the PS4 only)
 +namespace
@@ -4042,7 +4045,7 @@ index 512ebee..ee04459 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1420,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1423,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -4050,7 +4053,7 @@ index 512ebee..ee04459 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1434,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1437,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -4058,7 +4061,7 @@ index 512ebee..ee04459 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1442,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1445,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -4066,7 +4069,7 @@ index 512ebee..ee04459 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1467,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1470,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -4084,7 +4087,7 @@ index 512ebee..ee04459 100644
  		return;
  	}
  
-@@ -1451,8 +1570,11 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1573,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -4092,11 +4095,12 @@ index 512ebee..ee04459 100644
  		return;
  	}
 +	s_cremaDrawn++;
++	g_crema_draws_total.fetch_add(1, std::memory_order_relaxed);
 +	CremaCaptureDraw(pipeline_info->vertexShader, baseVertex, count, indexDataMPTR, (uint32)indexType, indexMax);
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1526,6 +1648,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1526,6 +1652,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -4104,7 +4108,7 @@ index 512ebee..ee04459 100644
  		return;
  	}
  
-@@ -1640,8 +1763,10 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1767,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
@@ -4112,6 +4116,7 @@ index 512ebee..ee04459 100644
  		return;
  	}
 +	s_cremaDrawn++;
++	g_crema_draws_total.fetch_add(1, std::memory_order_relaxed);
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
@@ -8747,10 +8752,10 @@ index 0000000..7c96bca
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 0000000..d6bea45
+index 0000000..8c32a6d
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,919 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -8806,6 +8811,8 @@ index 0000000..d6bea45
 +extern "C" void ps4_tsc_probe(); // port/ps4_runtime.cpp: do the cores' time stamp counters agree
 +std::string CremaRecompilerStats(); // PPCRecompiler.cpp: compiled / failed functions, queue
 +extern std::atomic<bool> g_crema_hle_timing; // PPCInterpreterHLE.cpp
++extern std::atomic<uint64> g_crema_draws_total; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
++
 +namespace coreinit
 +{
 +	void CremaThreadCensusSample(); // coreinit_Thread.cpp: the profiler, Wii U side
@@ -8900,7 +8907,9 @@ index 0000000..d6bea45
 +			// report (it sleeps almost always)
 +			scePthreadSetprio(scePthreadSelf(), 450);
 +			uint64 lastBeat = sHeartbeat.load(), lastFrame = LatteGPUState.frameCounter;
-+			int beatStall = 0, frameStall = 0, dumps = 0, sinceDump = 60;
++			uint64 lastDraws = g_crema_draws_total.load();
++			int beatStall = 0, frameStall = 0, drawStall = 0, dumps = 0, sinceDump = 60;
++			const std::string dumpNow = _pathToUtf8(kDataRoot / "dump-now");
 +			char reason[160], line[200];
 +			for (uint64 seconds = 1;; seconds++)
 +			{
@@ -8910,18 +8919,33 @@ index 0000000..d6bea45
 +				beatStall = beat == lastBeat ? beatStall + 1 : 0;
 +				// after the first frame, or (still none) 30 s after launch: a hang while the caches load
 +				frameStall = frame == lastFrame && (frame != 0 || seconds > 30) ? frameStall + 1 : 0;
++				// draws stop too when the game freezes but still counts frames (Sonic Lost World, 2.54)
++				const uint64 draws = g_crema_draws_total.load();
++				drawStall = draws == lastDraws && draws != 0 ? drawStall + 1 : 0;
++				lastDraws = draws;
 +				lastBeat = beat;
 +				lastFrame = frame;
 +				sinceDump++;
-+				if (std::max(beatStall, frameStall) < 15)
++				// data_dir/dump-now (put there over FTP): the stacks right now, whatever the counters say
++				if (FILE* f = fopen(dumpNow.c_str(), "rb"))
++				{
++					fclose(f);
++					remove(dumpNow.c_str());
++					snprintf(reason, sizeof(reason), "stacks on request at %llu s: no heartbeat for %d s, no TV frame for %d s, no draw for %d s (frame %llu)",
++						(unsigned long long)seconds, beatStall, frameStall, drawStall, (unsigned long long)frame);
++					ps4_boot_trace(reason);
++					ps4_dump_thread_stacks(path.c_str(), reason);
++					continue;
++				}
++				if (std::max({beatStall, frameStall, drawStall}) < 15)
 +				{
 +					sinceDump = 60; // a new hang dumps at once
 +					continue;
 +				}
 +				if (dumps >= 3 || sinceDump < 60)
 +					continue;
-+				snprintf(reason, sizeof(reason), "hang at %llu s: no heartbeat for %d s, no TV frame for %d s (frame %llu)",
-+					(unsigned long long)seconds, beatStall, frameStall, (unsigned long long)frame);
++				snprintf(reason, sizeof(reason), "hang at %llu s: no heartbeat for %d s, no TV frame for %d s, no draw for %d s (frame %llu)",
++					(unsigned long long)seconds, beatStall, frameStall, drawStall, (unsigned long long)frame);
 +				snprintf(line, sizeof(line), "%s, stacks in hang.log", reason);
 +				ps4_boot_trace(line);
 +				ps4_dump_thread_stacks(path.c_str(), reason);
