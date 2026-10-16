@@ -3189,7 +3189,7 @@ index b7dc500..c9b170a 100644
  
  void* dlopen_vulkan_loader()
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
-index f503c10..715421f 100644
+index f503c10..d5bb8fa 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
 @@ -11,6 +11,11 @@ bool InitializeGlobalVulkan();
@@ -3221,7 +3221,12 @@ index f503c10..715421f 100644
  
  // pipeline
  VKFUNC_DEVICE(vkCreatePipelineCache);
-@@ -130,7 +138,7 @@ VKFUNC_DEVICE(vkDestroyPipeline);
+@@ -126,11 +134,12 @@ VKFUNC_DEVICE(vkDestroyPipelineCache);
+ VKFUNC_DEVICE(vkCreatePipelineLayout);
+ VKFUNC_DEVICE(vkDestroyPipelineLayout);
+ VKFUNC_DEVICE(vkCreateGraphicsPipelines);
++VKFUNC_DEVICE(vkCreateComputePipelines);
+ VKFUNC_DEVICE(vkDestroyPipeline);
  VKFUNC_DEVICE(vkCmdBindPipeline);
  
  // swapchain
@@ -3230,7 +3235,15 @@ index f503c10..715421f 100644
  VKFUNC_INSTANCE(vkCreateXlibSurfaceKHR);
  VKFUNC_INSTANCE(vkCreateXcbSurfaceKHR);
  #ifdef HAS_WAYLAND
-@@ -202,6 +210,7 @@ VKFUNC_DEVICE(vkCmdResetQueryPool);
+@@ -162,6 +171,7 @@ VKFUNC_DEVICE(vkDestroyFence);
+ 
+ // cmd
+ VKFUNC_DEVICE(vkCmdDraw);
++VKFUNC_DEVICE(vkCmdDispatch);
+ VKFUNC_DEVICE(vkCmdCopyBufferToImage);
+ VKFUNC_DEVICE(vkCmdCopyImageToBuffer);
+ VKFUNC_DEVICE(vkCmdClearColorImage);
+@@ -202,6 +212,7 @@ VKFUNC_DEVICE(vkCmdResetQueryPool);
  VKFUNC_DEVICE(vkCmdBeginQuery);
  VKFUNC_DEVICE(vkCmdEndQuery);
  VKFUNC_DEVICE(vkCmdCopyQueryPoolResults);
@@ -3238,7 +3251,7 @@ index f503c10..715421f 100644
  
  // event
  VKFUNC_DEVICE(vkCreateEvent);
-@@ -226,6 +235,7 @@ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
+@@ -226,6 +237,7 @@ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
  VKFUNC_DEVICE(vkCreateImage);
  VKFUNC_DEVICE(vkDestroyImage);
  VKFUNC_DEVICE(vkGetImageMemoryRequirements);
@@ -11149,10 +11162,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..a5f4a00
+index 0000000..a6f7127
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4358 @@
+@@ -0,0 +1,4364 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -15288,6 +15301,12 @@ index 0000000..a5f4a00
 +			ImGui::DestroyContext(context);
 +			return {};
 +		}
++		// a GPU self-test waiting in data_dir/selftest (gpu_selftest_core.h)
++		{
++			const std::string selftest = m_display.RunGpuSelfTest(m_dataDir + "/selftest");
++			if (!selftest.empty())
++				Log(selftest);
++		}
 +		// The menus' language (CremaSettings "language"), before the fonts (their characters).
 +		bool languageChosen = false;
 +		for (const auto& [key, value] : CremaSettings::GlobalValues())
@@ -15538,10 +15557,10 @@ index 0000000..75abc8b
 +} // namespace CremaLauncher
 diff --git a/src/gui/ps4/launcher/LauncherDisplay.cpp b/src/gui/ps4/launcher/LauncherDisplay.cpp
 new file mode 100644
-index 0000000..987c5e8
+index 0000000..c6dbc99
 --- /dev/null
 +++ b/src/gui/ps4/launcher/LauncherDisplay.cpp
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,443 @@
 +#include "gui/ps4/launcher/LauncherDisplay.h"
 +
 +#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
@@ -15812,6 +15831,45 @@ index 0000000..987c5e8
 +	}
 +} // namespace
 +
++#include "gui/ps4/launcher/gpu_selftest_core.h"
++
++std::string Display::RunGpuSelfTest(const std::string& dir)
++{
++	FILE* marker = fopen((dir + "/run").c_str(), "rb");
++	if (!marker)
++		return {};
++	fclose(marker);
++	remove((dir + "/run").c_str());
++	auto readAll = [&](const char* name, std::vector<uint8_t>& data) {
++		FILE* f = fopen((dir + "/" + name).c_str(), "rb");
++		if (!f)
++			return false;
++		fseek(f, 0, SEEK_END);
++		data.resize((size_t)ftell(f));
++		fseek(f, 0, SEEK_SET);
++		const bool ok = fread(data.data(), 1, data.size(), f) == data.size();
++		fclose(f);
++		return ok;
++	};
++	std::vector<uint8_t> spv, uniforms, attrs, info;
++	if (!readAll("test.spv", spv) || !readAll("uniforms.bin", uniforms) || !readAll("attrs.bin", attrs) || !readAll("info.txt", info))
++		return "GPU self-test: input files missing in " + dir;
++	info.push_back(0);
++	unsigned vertices = 0, attributes = 0, outputs = 0;
++	sscanf((const char*)info.data(), "%u %u %u", &vertices, &attributes, &outputs);
++	std::vector<uint8_t> out((size_t)vertices * outputs * 16);
++	char err[128] = "";
++	if (!selftest_run(s_gpu, s_device, s_queueFamily, s_queue, (const uint32_t*)spv.data(), spv.size(), uniforms.data(), uniforms.size(),
++			attrs.data(), attrs.size(), out.data(), out.size(), vertices, err, sizeof(err)))
++		return std::string("GPU self-test failed at: ") + err;
++	FILE* f = fopen((dir + "/out-ps4.bin").c_str(), "wb");
++	if (!f)
++		return "GPU self-test: can't write out-ps4.bin";
++	fwrite(out.data(), 1, out.size(), f);
++	fclose(f);
++	return "GPU self-test: " + std::to_string(vertices) + " invocations, out-ps4.bin written";
++}
++
 +bool Display::Initialize()
 +{
 +	if (!CreateDevice() || !CreateRenderPass() || !CreateFrames())
@@ -15948,10 +16006,10 @@ index 0000000..987c5e8
 +} // namespace CremaLauncher
 diff --git a/src/gui/ps4/launcher/LauncherDisplay.h b/src/gui/ps4/launcher/LauncherDisplay.h
 new file mode 100644
-index 0000000..6894c5f
+index 0000000..f52427b
 --- /dev/null
 +++ b/src/gui/ps4/launcher/LauncherDisplay.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +// Crema launcher display (from DolphinPS4's PS4XMBDisplay): a minimal Vulkan renderer on the
 +// linked-in RADV that draws Dear ImGui into three 1920x1080 linear images registered with
 +// VideoOut, flipped behind the GPU work (ac_ps4_submit_flip) like the game's swapchain (PS4WSI.cpp).
@@ -15983,6 +16041,10 @@ index 0000000..6894c5f
 +
 +	// An RGBA8 texture for ImDrawList::AddImage (nullptr on failure).
 +	ImTextureID CreateTexture(const void* rgba, uint32_t width, uint32_t height);
++	// GPU self-test (gpu_selftest_core.h): with dir/run present, runs dir/test.spv over
++	// dir/uniforms.bin and dir/attrs.bin on the PS4's GPU, writes dir/out-ps4.bin, removes dir/run.
++	// Returns a line for the log ("" when there was nothing to run).
++	std::string RunGpuSelfTest(const std::string& dir);
 +	void DestroyTexture(ImTextureID texture);
 +};
 +} // namespace CremaLauncher
@@ -16990,6 +17052,239 @@ index 0000000..3adb16a
 +// the characters the translations use), the current language's first. regular or bold.
 +std::vector<std::string> ExtraFonts(const std::string& assets_dir, bool bold);
 +}  // namespace PS4Lang
+diff --git a/src/gui/ps4/launcher/gpu_selftest_core.h b/src/gui/ps4/launcher/gpu_selftest_core.h
+new file mode 100755
+index 0000000..abf6da9
+--- /dev/null
++++ b/src/gui/ps4/launcher/gpu_selftest_core.h
+@@ -0,0 +1,227 @@
++// GPU self-test: runs one compute shader (a game's vertex shader turned into compute, make_test.py)
++// over fixed inputs on a Vulkan device and returns its outputs, so two GPUs can be compared.
++// Needs the vk* entry points visible (Crema: Cemu's VulkanAPI.h; the PC runner: loaded pointers).
++//   binding 0: uniform buffer (256 ivec4), 1: input attributes (storage), 2: outputs (storage)
++#pragma once
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++typedef struct
++{
++	VkBuffer buffer;
++	VkDeviceMemory memory;
++	void* ptr;
++} SelftestBuffer;
++
++static int selftest_memtype(VkPhysicalDevice gpu, uint32_t bits, VkMemoryPropertyFlags want)
++{
++	VkPhysicalDeviceMemoryProperties props;
++	vkGetPhysicalDeviceMemoryProperties(gpu, &props);
++	for (uint32_t i = 0; i < props.memoryTypeCount; i++)
++		if ((bits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
++			return (int)i;
++	return -1;
++}
++
++static int selftest_buffer(VkPhysicalDevice gpu, VkDevice dev, VkDeviceSize size, VkBufferUsageFlags usage, SelftestBuffer* b)
++{
++	memset(b, 0, sizeof(*b));
++	VkBufferCreateInfo info;
++	memset(&info, 0, sizeof(info));
++	info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++	info.size = size;
++	info.usage = usage;
++	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++	if (vkCreateBuffer(dev, &info, NULL, &b->buffer) != VK_SUCCESS)
++		return 0;
++	VkMemoryRequirements req;
++	vkGetBufferMemoryRequirements(dev, b->buffer, &req);
++	int type = selftest_memtype(gpu, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++	if (type < 0)
++		return 0;
++	VkMemoryAllocateInfo alloc;
++	memset(&alloc, 0, sizeof(alloc));
++	alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++	alloc.allocationSize = req.size;
++	alloc.memoryTypeIndex = (uint32_t)type;
++	if (vkAllocateMemory(dev, &alloc, NULL, &b->memory) != VK_SUCCESS)
++		return 0;
++	if (vkBindBufferMemory(dev, b->buffer, b->memory, 0) != VK_SUCCESS)
++		return 0;
++	return vkMapMemory(dev, b->memory, 0, VK_WHOLE_SIZE, 0, &b->ptr) == VK_SUCCESS;
++}
++
++static void selftest_free(VkDevice dev, SelftestBuffer* b)
++{
++	if (b->ptr)
++		vkUnmapMemory(dev, b->memory);
++	if (b->buffer)
++		vkDestroyBuffer(dev, b->buffer, NULL);
++	if (b->memory)
++		vkFreeMemory(dev, b->memory, NULL);
++}
++
++// Returns 1 on success; err gets the failing step otherwise.
++static int selftest_run(VkPhysicalDevice gpu, VkDevice dev, uint32_t queueFamily, VkQueue queue, const uint32_t* spv, size_t spvSize,
++	const void* uniforms, size_t uniformSize, const void* attrs, size_t attrSize, void* out, size_t outSize, uint32_t invocations,
++	char* err, size_t errSize)
++{
++	int ok = 0;
++	SelftestBuffer ub, inb, outb;
++	VkShaderModule module = VK_NULL_HANDLE;
++	VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++	VkPipeline pipeline = VK_NULL_HANDLE;
++	VkDescriptorPool pool = VK_NULL_HANDLE;
++	VkCommandPool cmdPool = VK_NULL_HANDLE;
++	VkFence fence = VK_NULL_HANDLE;
++	memset(&ub, 0, sizeof(ub));
++	memset(&inb, 0, sizeof(inb));
++	memset(&outb, 0, sizeof(outb));
++#define SELFTEST_STEP(cond, what) if (!(cond)) { snprintf(err, errSize, "%s", what); goto done; }
++
++	SELFTEST_STEP(selftest_buffer(gpu, dev, uniformSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &ub), "uniform buffer");
++	SELFTEST_STEP(selftest_buffer(gpu, dev, attrSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &inb), "input buffer");
++	SELFTEST_STEP(selftest_buffer(gpu, dev, outSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &outb), "output buffer");
++	memcpy(ub.ptr, uniforms, uniformSize);
++	memcpy(inb.ptr, attrs, attrSize);
++	memset(outb.ptr, 0xCD, outSize);
++
++	{
++		VkShaderModuleCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++		info.codeSize = spvSize;
++		info.pCode = spv;
++		SELFTEST_STEP(vkCreateShaderModule(dev, &info, NULL, &module) == VK_SUCCESS, "shader module");
++	}
++	{
++		VkDescriptorSetLayoutBinding b[3];
++		memset(b, 0, sizeof(b));
++		for (uint32_t i = 0; i < 3; i++)
++		{
++			b[i].binding = i;
++			b[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++			b[i].descriptorCount = 1;
++			b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++		}
++		VkDescriptorSetLayoutCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++		info.bindingCount = 3;
++		info.pBindings = b;
++		SELFTEST_STEP(vkCreateDescriptorSetLayout(dev, &info, NULL, &setLayout) == VK_SUCCESS, "set layout");
++		VkPipelineLayoutCreateInfo pl;
++		memset(&pl, 0, sizeof(pl));
++		pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++		pl.setLayoutCount = 1;
++		pl.pSetLayouts = &setLayout;
++		SELFTEST_STEP(vkCreatePipelineLayout(dev, &pl, NULL, &pipelineLayout) == VK_SUCCESS, "pipeline layout");
++	}
++	{
++		VkComputePipelineCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
++		info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++		info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++		info.stage.module = module;
++		info.stage.pName = "main";
++		info.layout = pipelineLayout;
++		SELFTEST_STEP(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS, "compute pipeline");
++	}
++	VkDescriptorSet set;
++	{
++		VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
++		VkDescriptorPoolCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++		info.maxSets = 1;
++		info.poolSizeCount = 2;
++		info.pPoolSizes = sizes;
++		SELFTEST_STEP(vkCreateDescriptorPool(dev, &info, NULL, &pool) == VK_SUCCESS, "descriptor pool");
++		VkDescriptorSetAllocateInfo a;
++		memset(&a, 0, sizeof(a));
++		a.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++		a.descriptorPool = pool;
++		a.descriptorSetCount = 1;
++		a.pSetLayouts = &setLayout;
++		SELFTEST_STEP(vkAllocateDescriptorSets(dev, &a, &set) == VK_SUCCESS, "descriptor set");
++		VkDescriptorBufferInfo bi[3] = {{ub.buffer, 0, uniformSize}, {inb.buffer, 0, attrSize}, {outb.buffer, 0, outSize}};
++		VkWriteDescriptorSet w[3];
++		memset(w, 0, sizeof(w));
++		for (uint32_t i = 0; i < 3; i++)
++		{
++			w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++			w[i].dstSet = set;
++			w[i].dstBinding = i;
++			w[i].descriptorCount = 1;
++			w[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++			w[i].pBufferInfo = &bi[i];
++		}
++		vkUpdateDescriptorSets(dev, 3, w, 0, NULL);
++	}
++	{
++		VkCommandPoolCreateInfo info;
++		memset(&info, 0, sizeof(info));
++		info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++		info.queueFamilyIndex = queueFamily;
++		SELFTEST_STEP(vkCreateCommandPool(dev, &info, NULL, &cmdPool) == VK_SUCCESS, "command pool");
++		VkCommandBufferAllocateInfo a;
++		memset(&a, 0, sizeof(a));
++		a.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++		a.commandPool = cmdPool;
++		a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++		a.commandBufferCount = 1;
++		VkCommandBuffer cmd;
++		SELFTEST_STEP(vkAllocateCommandBuffers(dev, &a, &cmd) == VK_SUCCESS, "command buffer");
++		VkCommandBufferBeginInfo begin;
++		memset(&begin, 0, sizeof(begin));
++		begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++		vkBeginCommandBuffer(cmd, &begin);
++		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
++		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, NULL);
++		vkCmdDispatch(cmd, (invocations + 63) / 64, 1, 1);
++		VkMemoryBarrier mb;
++		memset(&mb, 0, sizeof(mb));
++		mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++		mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++		mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
++		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++		SELFTEST_STEP(vkEndCommandBuffer(cmd) == VK_SUCCESS, "end command buffer");
++		VkFenceCreateInfo fi;
++		memset(&fi, 0, sizeof(fi));
++		fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++		SELFTEST_STEP(vkCreateFence(dev, &fi, NULL, &fence) == VK_SUCCESS, "fence");
++		VkSubmitInfo submit;
++		memset(&submit, 0, sizeof(submit));
++		submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++		submit.commandBufferCount = 1;
++		submit.pCommandBuffers = &cmd;
++		SELFTEST_STEP(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS, "submit");
++		SELFTEST_STEP(vkWaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS, "wait (10 s)");
++	}
++	memcpy(out, outb.ptr, outSize);
++	ok = 1;
++done:
++	if (fence)
++		vkDestroyFence(dev, fence, NULL);
++	if (cmdPool)
++		vkDestroyCommandPool(dev, cmdPool, NULL);
++	if (pool)
++		vkDestroyDescriptorPool(dev, pool, NULL);
++	if (pipeline)
++		vkDestroyPipeline(dev, pipeline, NULL);
++	if (pipelineLayout)
++		vkDestroyPipelineLayout(dev, pipelineLayout, NULL);
++	if (setLayout)
++		vkDestroyDescriptorSetLayout(dev, setLayout, NULL);
++	if (module)
++		vkDestroyShaderModule(dev, module, NULL);
++	selftest_free(dev, &outb);
++	selftest_free(dev, &inb);
++	selftest_free(dev, &ub);
++	return ok;
++#undef SELFTEST_STEP
++}
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
 index 4978ef0..62be7be 100644
 --- a/src/input/CMakeLists.txt
