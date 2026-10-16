@@ -3896,7 +3896,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..eb512ee 100644
+index 512ebee..dfbfb4b 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -3915,7 +3915,7 @@ index 512ebee..eb512ee 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
-@@ -1297,8 +1291,71 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1297,8 +1291,123 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
@@ -3953,6 +3953,57 @@ index 512ebee..eb512ee 100644
 +		entry.gs = CremaShaderHash(gs);
 +	}
 +
++	// GPU self-test, real data: with /data/Crema/selftest/capture present (holding a vertex shader hash in
++	// hex, or nothing for Sonic Lost World's 09315128e257f08e) the next 4 draws with that vertex shader
++	// write their vertex uniform registers, vertex buffer 0 and index data to selftest/cap<N>-*
++	uint64 s_cremaCaptureHash = 0;
++	int s_cremaCaptureLeft = 0;
++
++	void CremaCaptureArm()
++	{
++		FILE* f = fopen("/data/Crema/selftest/capture", "rb");
++		if (!f)
++			return;
++		char text[64] = {};
++		fread(text, 1, sizeof(text) - 1, f);
++		fclose(f);
++		remove("/data/Crema/selftest/capture");
++		s_cremaCaptureHash = strtoull(text, nullptr, 16);
++		if (s_cremaCaptureHash == 0)
++			s_cremaCaptureHash = 0x09315128e257f08eull;
++		s_cremaCaptureLeft = 4;
++		cemuLog_log(LogType::Force, "draw capture armed for vertex shader {:016x}", s_cremaCaptureHash);
++	}
++
++	void CremaCaptureDraw(const LatteDecompilerShader* vs, uint32 baseVertex, uint32 count, MPTR indexData, uint32 indexType, uint32 indexMax)
++	{
++		if (s_cremaCaptureLeft <= 0 || !vs || vs->baseHash != s_cremaCaptureHash)
++			return;
++		const int n = 4 - s_cremaCaptureLeft--;
++		const std::string base = fmt::format("/data/Crema/selftest/cap{}-", n);
++		auto write = [&](const char* name, const void* data, size_t size) {
++			FILE* out = fopen((base + name).c_str(), "wb");
++			if (!out)
++				return;
++			fwrite(data, 1, size, out);
++			fclose(out);
++		};
++		write("uniforms.bin", LatteGPUState.contextRegister + mmSQ_ALU_CONSTANT0_0 + 0x400, 256 * 16);
++		const uint32* regs = LatteGPUState.contextRegister + mmSQ_VTX_ATTRIBUTE_BLOCK_START;
++		const MPTR vbAddr = regs[0];
++		const uint32 stride = (regs[2] >> 11) & 0xFFFF;
++		const uint32 vbSize = std::min<uint32>(stride * (indexMax + baseVertex + 1) + 64, 4u << 20);
++		if (vbAddr != MPTR_NULL)
++			write("vb.bin", memory_getPointerFromPhysicalOffset(vbAddr), vbSize);
++		const uint32 indexSize = (indexType == 1 || indexType == 9) ? 4 : 2;
++		if (indexData != MPTR_NULL)
++			write("idx.bin", memory_getPointerFromVirtualOffset(indexData), std::min<uint32>(count * indexSize, 4u << 20));
++		const std::string info = fmt::format("count {} baseVertex {} indexType {} indexMax {} stride {} vbAddr {:08x} vbSize {} vsAux {:016x}\n",
++			count, baseVertex, indexType, indexMax, stride, vbAddr, vbSize, vs->auxHash);
++		write("info.txt", info.data(), info.size());
++		cemuLog_log(LogType::Force, "draw capture {}: {}", n, info);
++	}
++
 +	void CremaDrawStats()
 +	{
 +		const auto now = std::chrono::steady_clock::now();
@@ -3961,6 +4012,7 @@ index 512ebee..eb512ee 100644
 +		if (now - s_cremaStatsTime < std::chrono::seconds(10))
 +			return;
 +		s_cremaStatsTime = now;
++		CremaCaptureArm();
 +		cemuLog_log(LogType::Force, "draws in 10 s: {} drawn; skipped: {} shader error, {} no render target, {} no color/depth buffer, {} rasterizer off, {} pipeline not ready",
 +			s_cremaDrawn, s_cremaSkipped[kCremaSkipShaderError], s_cremaSkipped[kCremaSkipNoTarget], s_cremaSkipped[kCremaSkipNoBuffer],
 +			s_cremaSkipped[kCremaSkipRasterKill], s_cremaSkipped[kCremaSkipNoPipeline]);
@@ -3987,7 +4039,7 @@ index 512ebee..eb512ee 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1365,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1417,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -3995,7 +4047,7 @@ index 512ebee..eb512ee 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1379,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1431,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -4003,7 +4055,7 @@ index 512ebee..eb512ee 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1387,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1439,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -4011,7 +4063,7 @@ index 512ebee..eb512ee 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1412,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1464,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -4029,7 +4081,7 @@ index 512ebee..eb512ee 100644
  		return;
  	}
  
-@@ -1451,8 +1515,10 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1567,11 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -4037,10 +4089,11 @@ index 512ebee..eb512ee 100644
  		return;
  	}
 +	s_cremaDrawn++;
++	CremaCaptureDraw(pipeline_info->vertexShader, baseVertex, count, indexDataMPTR, (uint32)indexType, indexMax);
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1526,6 +1592,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1526,6 +1645,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -4048,7 +4101,7 @@ index 512ebee..eb512ee 100644
  		return;
  	}
  
-@@ -1640,8 +1707,10 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1760,10 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
