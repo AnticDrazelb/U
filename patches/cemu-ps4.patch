@@ -3896,7 +3896,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..7c6e0f5 100644
+index 512ebee..ee04459 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -3915,7 +3915,7 @@ index 512ebee..7c6e0f5 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
-@@ -1297,8 +1291,123 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1297,8 +1291,126 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
@@ -3967,7 +3967,10 @@ index 512ebee..7c6e0f5 100644
 +		char text[64] = {};
 +		fread(text, 1, sizeof(text) - 1, f);
 +		fclose(f);
-+		remove("/data/Crema/selftest/capture");
++		static bool s_armed = false; // once per run; the file stays until the captures are fetched
++		if (s_armed)
++			return;
++		s_armed = true;
 +		s_cremaCaptured.clear();
 +		s_cremaCaptureLeft = 64;
 +		cemuLog_log(LogType::Force, "draw capture armed for skinned vertex shaders");
@@ -4039,7 +4042,7 @@ index 512ebee..7c6e0f5 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1417,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1420,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -4047,7 +4050,7 @@ index 512ebee..7c6e0f5 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1431,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1434,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -4055,7 +4058,7 @@ index 512ebee..7c6e0f5 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1439,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1442,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -4063,7 +4066,7 @@ index 512ebee..7c6e0f5 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1464,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1467,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -4081,7 +4084,7 @@ index 512ebee..7c6e0f5 100644
  		return;
  	}
  
-@@ -1451,8 +1567,11 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1570,11 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -4093,7 +4096,7 @@ index 512ebee..7c6e0f5 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1526,6 +1645,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1526,6 +1648,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -4101,7 +4104,7 @@ index 512ebee..7c6e0f5 100644
  		return;
  	}
  
-@@ -1640,8 +1760,10 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1763,10 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
