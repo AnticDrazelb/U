@@ -828,7 +828,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..320973c 100644
+index c9758f3..b7163da 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1477,7 +1477,7 @@ index c9758f3..320973c 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +987,156 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +987,157 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1486,8 +1486,7 @@ index c9758f3..320973c 100644
 +	// joined by tail calls) was compiled whole again for every new entry: Sonic Lost World compiled
 +	// one of 538 segments 129 times in 95 s (~1 s each on the PS4: hitches, and that code running
 +	// interpreted meanwhile). The entries already known go in too: the addresses waiting to be
-+	// compiled and the ones earlier compiles made; from the range's second compile on, every
-+	// block start after an unconditional branch and every branch target in it as well.
++	// compiled and the ones earlier compiles made.
 +	{
 +		const uint32 rangeEnd = range.startAddress + range.length;
 +		for (uint32 v = range.startAddress; v < rangeEnd; v += 4)
@@ -1497,7 +1496,9 @@ index c9758f3..320973c 100644
 +		}
 +		static std::unordered_map<uint32, uint32> s_rangeCompiles;
 +		const uint32 times = ++s_rangeCompiles[range.startAddress];
-+		if (times >= 2)
++		// v02.30 also guessed entries here (block starts after unconditional branches, branch targets):
++		// Sonic Lost World then hung in a loop and jumped into bad code (v02.31), so only real entries now
++		if (false && times >= 2)
 +		{
 +			for (uint32 target : funcBoundaries.GetBranchTargets())
 +			{
@@ -1638,7 +1639,7 @@ index c9758f3..320973c 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1169,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1170,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1722,7 +1723,7 @@ index c9758f3..320973c 100644
  	}
  }
  
-@@ -504,6 +1258,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1259,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1764,7 +1765,7 @@ index c9758f3..320973c 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1398,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1399,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1772,7 +1773,7 @@ index c9758f3..320973c 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1492,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1493,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1785,7 +1786,7 @@ index c9758f3..320973c 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1505,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1506,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
