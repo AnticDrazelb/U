@@ -9936,10 +9936,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..2e8b55a
+index 0000000..432fe40
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,651 @@
+@@ -0,0 +1,654 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9959,7 +9959,7 @@ index 0000000..2e8b55a
 +extern bool g_crema_native_quads; // the same file: Quad Draws
 +extern bool g_crema_shader_compat_26; // Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
 +// shaders keep 32-bit float denormals (Core/LatteShader.cpp, LatteDecompilerEmitGLSLHeader.hpp)
-+bool g_crema_denorm_preserve = true;
++bool g_crema_denorm_preserve = false;
 +
 +#include <algorithm>
 +#include <atomic>
@@ -10066,8 +10066,10 @@ index 0000000..2e8b55a
 +			"On: the Wii U's variable shifts in one PS4 instruction, slightly faster, but some games break (Tekken Tag Tournament 2 crashes). Off: Cemu's original code."},
 +		{"profiler", "Profiler", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
-+		{"denormals", "Keep Float Denormals", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
-+			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off: they become zero, as before 2.42 (Sonic Lost World's legs broke and some scenery went missing). Only for comparison."},
++		{"denormals", "Keep Float Denormals", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off (default): they become zero in float math, as on the Wii U. On made Sonic Lost World's world geometry blow up (2.42); for tests only."},
++		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"Writes every shader the game uses, translated, to dump/shaders (for finding rendering bugs). Slower loading."},
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
 +			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"sync", "Synchronized"}, {"all", "All"}}, "off", false,
 +			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Synchronized: the GPU waits and flushes its caches after every draw, and copies avoid compute shaders. Slower; for one test each."},
@@ -10520,7 +10522,8 @@ index 0000000..2e8b55a
 +	g_crema_native_rects = get("rect_draws") != "cemu";
 +	g_crema_native_quads = get("quad_draws") == "native";
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
-+	g_crema_denorm_preserve = get("denormals") != "off";
++	g_crema_denorm_preserve = get("denormals") == "on";
++	ActiveSettings::EnableDumpShaders(get("dump_shaders") == "on");
 +	// the GPU driver's own debug switches (read when the Vulkan instance and shader compiler start,
 +	// after this); its pipeline cache is off with them, or cached shaders would come back
 +	{
