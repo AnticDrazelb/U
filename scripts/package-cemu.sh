@@ -23,6 +23,8 @@ cp "$HERE/../sce_sys/icon0.png" "$STAGE/sce_sys/"
 cp -r "$SRC/bin/resources" "$SRC/bin/gameProfiles" "$STAGE/"
 # the launcher's fonts, sounds, languages (xmb/, from DolphinPS4) and artwork (launcher/)
 cp -r "$HERE/../launcher-assets/xmb" "$HERE/../launcher-assets/launcher" "$STAGE/"
+# the recommended settings for tested games (CremaSettings.h; the newest comes from GitHub)
+cp "$HERE/../game-settings.ini" "$STAGE/"
 echo "$VERSION" > "$STAGE/version.txt"
 # PkgTool's pkg_build crashes ("Sequence contains no elements") on empty folders.
 find "$STAGE" -type d -empty -delete

@@ -9633,10 +9633,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..15c2b67
+index 0000000..b475aa5
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,602 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9654,7 +9654,9 @@ index 0000000..15c2b67
 +
 +#include <algorithm>
 +#include <atomic>
++#include <cstdlib>
 +#include <cstring>
++#include <iterator>
 +#include <fstream>
 +#include <map>
 +#include <mutex>
@@ -9696,6 +9698,8 @@ index 0000000..15c2b67
 +		{"gpu_accuracy", "Graphics Accuracy", "Emulation",
 +			{{"accurate", "Accurate"}, {"fast", "Fast"}}, "accurate", false,
 +			"Fast: the CPU doesn't wait for the GPU when a game asks it to, and fewer GPU barriers. Faster in busy games (Minecraft), but some games may flicker or show glitches."},
++		{"recommended", "Recommended Settings", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
++			"On: each game tested on the PS4 starts with the settings found best for it (game-settings.ini, updated from GitHub when Crema opens; Triangle > Information shows them). A game set to its own settings keeps those. Off: every game uses your settings for all games."},
 +		{"language", "Language", "Emulation",
 +			{{"en", "English"}, {"es", "Español"}, {"fr", "Français"}, {"de", "Deutsch"}, {"it", "Italiano"},
 +				{"pt", "Português"}, {"nl", "Nederlands"}, {"pl", "Polski"}, {"tr", "Türkçe"}, {"ru", "Русский"},
@@ -9753,6 +9757,10 @@ index 0000000..15c2b67
 +	std::mutex s_mutex;
 +	std::string s_path;
 +	std::map<std::string, std::map<std::string, std::string>> s_sections;
++	// game-settings.ini (see the header)
++	std::string s_recommendedPath; // data_dir/game-settings.ini
++	uint64_t s_recommendedRevision = 0;
++	std::map<std::string, Recommendation> s_recommended;
 +
 +	std::string Trim(std::string text)
 +	{
@@ -9785,6 +9793,18 @@ index 0000000..15c2b67
 +				if (value != game->second.end())
 +					return value->second;
 +			}
++			// the game's recommended settings (Recommended Settings on: global, else its default)
++			std::string id = gameId;
++			std::transform(id.begin(), id.end(), id.begin(), [](unsigned char c) { return (char)std::tolower(c); });
++			auto recommended = s_recommended.find(id);
++			if (recommended != s_recommended.end() && GetLocked("recommended", {}) != "off")
++			{
++				for (const auto& [name, value] : recommended->second.values)
++				{
++					if (name == key)
++						return value;
++				}
++			}
 +		}
 +		auto global = s_sections.find("global");
 +		if (global != s_sections.end())
@@ -9794,6 +9814,92 @@ index 0000000..15c2b67
 +				return value->second;
 +		}
 +		return Fallback(key);
++	}
++	// Settings a recommendation may hold: not the console's own choices (language, online, the
++	// network library) and not Diagnostics (the player turns those on to report a problem).
++	bool Recommendable(const Setting& setting)
++	{
++		const std::string key = setting.key, category = setting.category;
++		return category != "Diagnostics" && category != "Online" && key != "language" && key != "recommended";
++	}
++
++	// game-settings.ini: [crema] revision=, and [title ID] sections (16 hex digits, lower case) with
++	// name / status / fps / note and crema.ini keys. Unknown keys and values are skipped.
++	uint64_t ParseRecommended(const std::string& text, std::map<std::string, Recommendation>* games)
++	{
++		uint64_t revision = 0;
++		std::string section;
++		size_t start = 0;
++		while (start < text.size())
++		{
++			size_t end = text.find('\n', start);
++			if (end == std::string::npos)
++				end = text.size();
++			const std::string line = Trim(text.substr(start, end - start));
++			start = end + 1;
++			if (line.empty() || line[0] == '#' || line[0] == ';')
++				continue;
++			if (line.front() == '[' && line.back() == ']')
++			{
++				section = line.substr(1, line.size() - 2);
++				std::transform(section.begin(), section.end(), section.begin(), [](unsigned char c) { return (char)std::tolower(c); });
++				continue;
++			}
++			const size_t eq = line.find('=');
++			if (eq == std::string::npos)
++				continue;
++			const std::string key = Trim(line.substr(0, eq)), value = Trim(line.substr(eq + 1));
++			if (section == "crema")
++			{
++				if (key == "revision")
++					revision = std::strtoull(value.c_str(), nullptr, 10);
++				continue;
++			}
++			if (section.size() != 16 || section.find_first_not_of("0123456789abcdef") != std::string::npos)
++				continue;
++			Recommendation& game = (*games)[section];
++			if (key == "name")
++				game.name = value;
++			else if (key == "status")
++				game.status = value;
++			else if (key == "fps")
++				game.fps = value;
++			else if (key == "note")
++				game.note = value;
++			else if (const Setting* setting = Find(key); setting && Recommendable(*setting))
++			{
++				for (const Choice& choice : setting->choices)
++				{
++					if (value == choice.value)
++						game.values.emplace_back(key, value);
++				}
++			}
++		}
++		return revision;
++	}
++
++	std::string ReadAll(const std::string& path)
++	{
++		std::ifstream file(path, std::ios::binary);
++		return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++	}
++
++	// The packaged copy and the downloaded one: the higher revision wins.
++	void LoadRecommendedLocked(const std::string& dataDir)
++	{
++		s_recommendedPath = dataDir + "/game-settings.ini";
++		s_recommended.clear();
++		s_recommendedRevision = 0;
++		for (const std::string& path : {std::string("/app0/game-settings.ini"), s_recommendedPath})
++		{
++			std::map<std::string, Recommendation> games;
++			const uint64_t revision = ParseRecommended(ReadAll(path), &games);
++			if (!games.empty() && revision >= s_recommendedRevision)
++			{
++				s_recommended = std::move(games);
++				s_recommendedRevision = revision;
++			}
++		}
 +	}
 +} // namespace
 +
@@ -9838,6 +9944,7 @@ index 0000000..15c2b67
 +		if (eq != std::string::npos)
 +			s_sections[section][Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
 +	}
++	LoadRecommendedLocked(dataDir);
 +}
 +
 +void Save()
@@ -9913,9 +10020,9 @@ index 0000000..15c2b67
 +		auto& section = s_sections[gameId];
 +		if (custom && section.size() <= 1)
 +		{
-+			// First time: start from what the game uses now.
++			// First time: start from what the game uses now (its recommended settings included).
 +			for (const Setting& setting : SETTINGS)
-+				section[setting.key] = GetLocked(setting.key, {});
++				section[setting.key] = GetLocked(setting.key, gameId);
 +		}
 +		section["custom"] = custom ? "on" : "off";
 +	}
@@ -9949,6 +10056,67 @@ index 0000000..15c2b67
 +		s_sections.clear();
 +	}
 +	Save();
++}
++
++bool GetRecommendation(const std::string& gameId, Recommendation* recommendation)
++{
++	std::string id = gameId;
++	std::transform(id.begin(), id.end(), id.begin(), [](unsigned char c) { return (char)std::tolower(c); });
++	std::lock_guard lock(s_mutex);
++	auto it = s_recommended.find(id);
++	if (it == s_recommended.end())
++		return false;
++	*recommendation = it->second;
++	return true;
++}
++
++uint64_t RecommendedRevision()
++{
++	std::lock_guard lock(s_mutex);
++	return s_recommendedRevision;
++}
++
++const char* RecommendedUrl()
++{
++	return "https://raw.githubusercontent.com/iHaiDeeZ/Crema/main/game-settings.ini";
++}
++
++bool InstallRecommended(const std::string& text, std::string* message)
++{
++	std::map<std::string, Recommendation> games;
++	const uint64_t revision = ParseRecommended(text, &games);
++	std::lock_guard lock(s_mutex);
++	if (games.empty() || revision == 0)
++	{
++		*message = "not a game-settings.ini (no games or no revision)";
++		return false;
++	}
++	if (revision <= s_recommendedRevision)
++	{
++		*message = "revision " + std::to_string(revision) + ", already in use";
++		return true;
++	}
++	if (s_recommendedPath.empty())
++	{
++		*message = "settings not loaded";
++		return false;
++	}
++	const std::string temp = s_recommendedPath + ".new";
++	{
++		std::ofstream file(temp, std::ios::binary | std::ios::trunc);
++		file << text;
++		if (!file)
++		{
++			*message = "can't write " + temp;
++			return false;
++		}
++	}
++	std::rename(temp.c_str(), s_recommendedPath.c_str());
++	*message = "revision " + std::to_string(revision) + " (was " + std::to_string(s_recommendedRevision) + "), " +
++		std::to_string(games.size()) + " games";
++	s_recommended = std::move(games);
++	s_recommendedRevision = revision;
++	return true;
 +}
 +
 +std::string LabelOf(const Setting& setting, const std::string& value)
@@ -10062,17 +10230,21 @@ index 0000000..15c2b67
 +
 +	g_crema_touchpad_buttons = get("touchpad") == "buttons" ? 1 : 0;
 +	g_crema_touch_pointer = get("touch_pointer") == "on" ? 1 : 0;
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, TV shows {}, touchpad {}, motion {}",
++	Recommendation recommendation;
++	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
++		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("tv_shows"), get("touchpad"), get("motion"));
++		get("gpu_accuracy"), get("tv_shows"), get("touchpad"), get("motion"),
++		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/CremaSettings.h b/src/gui/ps4/launcher/CremaSettings.h
 new file mode 100644
-index 0000000..5947a7f
+index 0000000..8556ac7
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,93 @@
 +// Crema settings (from DolphinPS4's PS4Settings), shared by the launcher and the game process.
 +// The user's choices are kept in /data/Crema/crema.ini: a [global] section and one section per
 +// title ID (16 hex digits) for games set to their own settings ("custom=on"). A setting never
@@ -10080,8 +10252,15 @@ index 0000000..5947a7f
 +//
 +// When a game starts (PS4WindowSystem.cpp), the effective values are applied in memory to Cemu's
 +// config and the game's profile (Apply), so crema.ini always wins over settings.xml.
++//
++// Recommended settings: game-settings.ini (the repository's, carried in the package as
++// /app0/game-settings.ini, and the newest copy from GitHub in data_dir/game-settings.ini - the one
++// with the higher revision is used) holds the settings found best for each tested game. With
++// Recommended Settings on, a game that isn't set to its own settings uses them over the global
++// values: the default < global < the game's recommended < the game's own (custom) settings.
 +#pragma once
 +
++#include <cstdint>
 +#include <string>
 +#include <vector>
 +
@@ -10139,6 +10318,25 @@ index 0000000..5947a7f
 +// Game process: applies the settings of the game being started (title ID as 16 hex digits)
 +// to Cemu's config and game profile, in memory.
 +void Apply(const std::string& game_id);
++
++// A tested game in game-settings.ini: how it runs and the settings it starts with.
++struct Recommendation
++{
++	std::string name;   // the game's name
++	std::string status; // Playable, Ingame, Intro, Loadable, Nothing (the README's compatibility list)
++	std::string fps;    // e.g. "29-30 (a 30 FPS game)"
++	std::string note;   // one line on what it needs
++	std::vector<std::pair<std::string, std::string>> values; // crema.ini keys, valid values only
++};
++// The game's entry (title ID as 16 hex digits); false when it has none.
++bool GetRecommendation(const std::string& game_id, Recommendation* recommendation);
++// The revision of the game-settings.ini in use (its [crema] revision=), 0 when there's none.
++uint64_t RecommendedRevision();
++// The repository's game-settings.ini on GitHub (raw).
++const char* RecommendedUrl();
++// A downloaded game-settings.ini: saved as data_dir/game-settings.ini and used at once when its
++// revision is higher than the one in use. message: what happened, for the log.
++bool InstallRecommended(const std::string& text, std::string* message);
 +} // namespace CremaSettings
 diff --git a/src/gui/ps4/launcher/CremaUpdater.cpp b/src/gui/ps4/launcher/CremaUpdater.cpp
 new file mode 100644
@@ -10439,10 +10637,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..47f4bda
+index 0000000..a5f4a00
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4322 @@
+@@ -0,0 +1,4358 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -10452,6 +10650,7 @@ index 0000000..47f4bda
 +
 +#include "gui/ps4/launcher/CremaCovers.h"
 +#include "gui/ps4/launcher/CremaGraphicPacks.h"
++#include "gui/ps4/launcher/CremaHttp.h"
 +#include "config/ActiveSettings.h"
 +#include "gui/ps4/CremaCheats.h"
 +#include "gui/ps4/CremaOnline.h"
@@ -11332,6 +11531,7 @@ index 0000000..47f4bda
 +		void ShowUpdateDlc(const Game& game);
 +		// Triangle > Cheats: the game's Cafe codes (CremaCheats.h), typed with the PS4 keyboard
 +		void ShowCheats(const Game& game);
++		std::thread m_recommendedThread; // game-settings.ini from GitHub
 +		std::vector<CremaCheats::Cheat> m_cheats;
 +		std::string m_cheatsGame, m_cheatsTitle; // title ID, name
 +		std::string m_cheatName;                 // while the code is typed
@@ -12421,7 +12621,7 @@ index 0000000..47f4bda
 +					continue;
 +				// the menus' language and the online world are per console, not per game
 +				if (!game.empty() && (std::string(setting.key) == "language" || std::string(setting.key) == "online" ||
-+										 std::string(setting.key) == "net_library"))
++										 std::string(setting.key) == "net_library" || std::string(setting.key) == "recommended"))
 +					continue;
 +				rows.push_back({setting.label, CremaSettings::LabelOf(setting, CremaSettings::Get(setting.key, game)),
 +					setting.key, false, false, !setting.live});
@@ -13294,6 +13494,25 @@ index 0000000..47f4bda
 +								SourceLabel(game, "update") + (updateInMlc ? " (+ mlc01)" : "")));
 +							m_panel.lines.push_back("DLC: " + (game.dlcs.empty() ? std::string(dlcInMlc ? "installed (mlc01)" : "not found") :
 +								SourceLabel(game, "dlc") + (dlcInMlc ? " (+ mlc01)" : "")));
++							// game-settings.ini: tested on the PS4
++							CremaSettings::Recommendation tested;
++							if (CremaSettings::GetRecommendation(game.id, &tested))
++							{
++								m_panel.lines.push_back("");
++								m_panel.lines.push_back("Tested: " + (tested.status.empty() ? std::string("yes") : tested.status) +
++									(tested.fps.empty() ? std::string() : ", " + tested.fps + " FPS"));
++								if (!tested.note.empty())
++									m_panel.lines.push_back(tested.note);
++								std::string values;
++								for (const auto& [key, value] : tested.values)
++								{
++									if (const CremaSettings::Setting* setting = CremaSettings::Find(key))
++										values += (values.empty() ? "" : ", ") + std::string(setting->label) + " " + CremaSettings::LabelOf(*setting, value);
++								}
++								if (!values.empty())
++									m_panel.lines.push_back(std::string(CremaSettings::IsCustom(game.id) ? "Recommended (not used: own settings): " :
++										CremaSettings::Get("recommended") == "off" ? "Recommended (off): " : "Recommended: ") + values);
++							}
 +						}
 +						Play("confirm");
 +						return;
@@ -14640,6 +14859,19 @@ index 0000000..47f4bda
 +		CremaUpdater::RemoveOld(m_updatePrefix, m_version);
 +		if (m_prefs.autoUpdate)
 +			StartUpdateCheck(false);
++		// the newest recommended settings (game-settings.ini) from GitHub
++		m_recommendedThread = std::thread([this] {
++			CremaHttp http(m_assetsDir + "/xmb/cacert.pem");
++			std::string text, error;
++			if (!http.Get(CremaSettings::RecommendedUrl(), &text, &error, 1024 * 1024))
++			{
++				Log("recommended settings: not downloaded (" + error + "), revision " + std::to_string(CremaSettings::RecommendedRevision()) + " in use");
++				return;
++			}
++			std::string message;
++			CremaSettings::InstallRecommended(text, &message);
++			Log("recommended settings: " + message);
++		});
 +		// Cemu's community graphic packs, the first time (then the games' Check for Updates).
 +		if (CremaGraphicPacks::InstalledVersion(PacksFolder()).empty())
 +		{
@@ -14742,6 +14974,8 @@ index 0000000..47f4bda
 +		m_updateCancel = true;
 +		if (m_updateThread.joinable())
 +			m_updateThread.join();
++		if (m_recommendedThread.joinable())
++			m_recommendedThread.join();
 +		m_audio.Stop();
 +		m_display.Shutdown();
 +		ImGui::DestroyContext(context);
