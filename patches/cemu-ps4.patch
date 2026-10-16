@@ -2131,15 +2131,48 @@ index de67772..24b109b 100644
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
 diff --git a/src/Cafe/HW/Latte/Core/LatteIndices.cpp b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-index a237644..bcdb02c 100644
+index a237644..4668b2b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteIndices.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-@@ -644,8 +644,17 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
+@@ -644,8 +644,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
  	}
  }
  
 +#ifdef __ORBIS__
 +extern bool g_crema_native_quads; // Renderer/Vulkan/VulkanPipelineCompiler.cpp: the GPU draws quads itself
++extern bool g_crema_strip_lists; // Renderer/Vulkan/VulkanPipelineCompiler.cpp: triangle strips drawn as lists
++
++// Crema: a triangle strip (restart index ends a strip) as a triangle list with the strip's winding
++template<typename T>
++static void CremaUnpackTriangleStrip(const void* indexDataInput, void* indexDataOutput, uint32 count, uint32 restartIndex, bool autoIndices, uint32& indexMax, uint32& outputCount)
++{
++	const betype<T>* src = (const betype<T>*)indexDataInput;
++	T* dst = (T*)indexDataOutput;
++	const T restart = (T)restartIndex;
++	uint32 n = 0, run = 0;
++	T a = 0, b = 0;
++	for (uint32 i = 0; i < count; i++)
++	{
++		const T v = autoIndices ? (T)i : (T)src[i];
++		if (!autoIndices && v == restart)
++		{
++			run = 0;
++			continue;
++		}
++		if (run >= 2)
++		{
++			// triangle k of the strip: (v[k], v[k+1], v[k+2]), odd k as (v[k+1], v[k], v[k+2])
++			dst[n++] = (run & 1) == 0 ? a : b;
++			dst[n++] = (run & 1) == 0 ? b : a;
++			dst[n++] = v;
++		}
++		indexMax = std::max(indexMax, (uint32)v);
++		a = b;
++		b = v;
++		run++;
++	}
++	outputCount = n;
++}
 +#endif
 +
  void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32 count, LattePrimitiveMode primitiveMode, uint32& indexMax, Renderer::INDEX_TYPE& renderIndexType, uint32& outputCount, Renderer::IndexAllocation& indexAllocation)
@@ -2152,6 +2185,50 @@ index a237644..bcdb02c 100644
  	// what this should do:
  	// [x] use fast SIMD-based index decoding
  	// [x] unpack QUAD indices to triangle indices
+@@ -682,6 +724,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+ 
+ 	// calculate index output size
+ 	uint32 indexOutputSize = LatteIndices_calculateIndexOutputSize(primitiveMode, indexType, count);
++#ifdef __ORBIS__
++	const bool cremaStripLists = g_crema_strip_lists && primitiveMode == LattePrimitiveMode::TRIANGLE_STRIP &&
++		(indexType == LatteIndexType::AUTO || indexType == LatteIndexType::U16_BE || indexType == LatteIndexType::U32_BE);
++	if (cremaStripLists)
++	{
++		if (indexType == LatteIndexType::AUTO)
++			renderIndexType = count <= 0xFFFF ? Renderer::INDEX_TYPE::U16 : Renderer::INDEX_TYPE::U32;
++		indexOutputSize = std::max<uint32>(count, 3) * 3 * (renderIndexType == Renderer::INDEX_TYPE::U16 ? 2 : 4);
++	}
++#else
++	const bool cremaStripLists = false;
++#endif
+ 	if (indexOutputSize == 0)
+ 	{
+ 		outputCount = count;
+@@ -696,7 +750,14 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+ 
+ 	// decode indices
+ 	indexMax = std::numeric_limits<uint32>::min();
+-	if (primitiveMode == LattePrimitiveMode::QUADS)
++	if (cremaStripLists)
++	{
++		if (renderIndexType == Renderer::INDEX_TYPE::U16)
++			CremaUnpackTriangleStrip<uint16>(indexData, indexOutputPtr, count, primitiveRestartIndex, indexType == LatteIndexType::AUTO, indexMax, outputCount);
++		else
++			CremaUnpackTriangleStrip<uint32>(indexData, indexOutputPtr, count, primitiveRestartIndex, indexType == LatteIndexType::AUTO, indexMax, outputCount);
++	}
++	else if (primitiveMode == LattePrimitiveMode::QUADS)
+ 	{
+ 		// unpack quads into triangles
+ 		if (indexType == LatteIndexType::AUTO)
+@@ -838,7 +899,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+ 	}
+ 	// the above algorithms use a fast approach to get indexMax which does not filter out indices matching primitiveRestartIndex
+ 	// here we use a fallback in case the determined index equals the primitive restart index
+-	if (primitiveRestartIndex == indexMax)
++	if (primitiveRestartIndex == indexMax && !cremaStripLists)
+ 	{
+ 		// recalculate index range but filter out primitive restart index
+ 		LatteIndices_alternativeCalculateIndexMax(indexData, indexType, count, indexMax);
 diff --git a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp b/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
 index a3bcb63..e628db6 100644
 --- a/src/Cafe/HW/Latte/Core/LattePerformanceMonitor.cpp
@@ -3475,10 +3552,10 @@ index f503c10..d5bb8fa 100644
  
  VKFUNC_DEVICE(vkCreateSampler);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 7179087..5fc9f30 100644
+index 7179087..7979b9e 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-@@ -10,6 +10,18 @@
+@@ -10,6 +10,21 @@
  #include "util/helpers/Serializer.h"
  #include "Cafe/HW/Latte/Common/RegisterSerializer.h"
  #include "HW/Latte/Renderer/RendererCore.h"
@@ -3493,11 +3570,14 @@ index 7179087..5fc9f30 100644
 +// Crema setting quad_draws: the GPU's own quad lists (the PS4 driver's topology 12, DI_PT_QUADLIST)
 +// instead of Cemu turning every quad into two triangles on the CPU (LatteIndices.cpp)
 +bool g_crema_native_quads = false;
++// Crema setting strip_draws: triangle strips unpacked into triangle lists on the CPU (Core/LatteIndices.cpp)
++// instead of strips with restart indices for the GPU
++bool g_crema_strip_lists = false;
 +#endif
  
  RendererShaderVk* rectsEmulationGS_generate(LatteDecompilerShader* vertexShader, const LatteContextRegister& latteRegister)
  {
-@@ -423,6 +435,35 @@ void PipelineCompiler::InitVertexInputState(const LatteContextRegister& latteReg
+@@ -423,6 +438,35 @@ void PipelineCompiler::InitVertexInputState(const LatteContextRegister& latteReg
  		vertexInputBindingDescription.emplace_back(entry);
  	}
  
@@ -3533,8 +3613,17 @@ index 7179087..5fc9f30 100644
  	vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
  	vertexInputInfo.vertexBindingDescriptionCount = vertexInputBindingDescription.size();
  	vertexInputInfo.pVertexBindingDescriptions = vertexInputBindingDescription.data();
-@@ -464,6 +505,14 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
+@@ -462,8 +506,23 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
+ 		break;
+ 	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLE_STRIP:
  		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
++#ifdef __ORBIS__
++		if (g_crema_strip_lists)
++		{
++			inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++			inputAssembly.primitiveRestartEnable = VK_FALSE;
++		}
++#endif
  		break;
  	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::QUADS:
 +#ifdef __ORBIS__
@@ -3548,7 +3637,7 @@ index 7179087..5fc9f30 100644
  		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // quads are emulated as 2 triangles
  		inputAssembly.primitiveRestartEnable = false;
  		break;
-@@ -472,7 +521,16 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
+@@ -472,7 +531,16 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::RECTS:
@@ -3565,7 +3654,7 @@ index 7179087..5fc9f30 100644
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	default:
-@@ -843,7 +901,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
+@@ -843,7 +911,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
  	m_requestRobustBufferAccess = requireRobustBufferAccess;
  
  	// if required generate RECT emulation geometry shader
@@ -3579,7 +3668,7 @@ index 7179087..5fc9f30 100644
  	{
  		cemu_assert(m_vkGeometryShader == nullptr); // todo - handle cases where the game already provides a GS
  		m_rectEmulationGS = rectsEmulationGS_generate(pipelineInfo->vertexShader, latteRegister);
-@@ -1050,8 +1113,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
+@@ -1050,8 +1123,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
  // this can happen when:
  // - Streamout is used with too small of a buffer (probably? Could also be some issue with how the streamout array index is calculated -> We can maybe fix this in the future)
  // - The shader uses dynamic indices for uniform access. This will trigger the uniform mode to be FULL_CBANK
@@ -3592,7 +3681,7 @@ index 7179087..5fc9f30 100644
  	bool requiresRobustBufferAcces = false;
  	if (vertexShader)
  	{
-@@ -1085,6 +1152,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1085,6 +1162,11 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -3604,7 +3693,7 @@ index 7179087..5fc9f30 100644
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
-@@ -1109,6 +1181,9 @@ void PipelineCompiler::CompileThreadPool_Start()
+@@ -1109,6 +1191,9 @@ void PipelineCompiler::CompileThreadPool_Start()
  		numCompileThreads = 2 + (cpuCoreCount - 3); // 2 plus one additionally for every extra core above 3
  
  	numCompileThreads = std::min(numCompileThreads, 8u); // cap at 8
@@ -10562,10 +10651,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..a3ab69f
+index 0000000..1d7846e
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,670 @@
+@@ -0,0 +1,674 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10583,6 +10672,7 @@ index 0000000..a3ab69f
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
 +extern bool g_crema_native_rects; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Rectangle Draws
 +extern bool g_crema_native_quads; // the same file: Quad Draws
++extern bool g_crema_strip_lists; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Strip Draws
 +extern bool g_crema_shader_compat_26; // Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
 +// shaders keep 32-bit float denormals (Core/LatteShader.cpp, LatteDecompilerEmitGLSLHeader.hpp)
 +bool g_crema_denorm_preserve = false;
@@ -10639,6 +10729,8 @@ index 0000000..a3ab69f
 +			"Fast: the CPU doesn't wait for the GPU when a game asks it to, and fewer GPU barriers. Faster in busy games (Minecraft), but some games may flicker or show glitches."},
 +		{"rect_draws", "Rectangle Draws", "Emulation", {{"native", "Native"}, {"cemu", "Cemu"}}, "native", false,
 +			"How the Wii U's rectangle draws (full-screen effects, copies) are drawn. Native: the PS4 GPU's own rectangles (fast). Cemu: Cemu's geometry shader, as Cemu on a PC. Try Cemu if a game's picture is partly black, blurred or wrongly lit."},
++		{"strip_draws", "Strip Draws", "Diagnostics", {{"native", "Native"}, {"lists", "Triangle Lists"}}, "native", false,
++			"Native: triangle strips go to the GPU as they are, with restart markers between them. Triangle Lists: the CPU unpacks them into separate triangles first (a little slower). Try it if a model is shattered into loose triangles on the PS4 only."},
 +		{"quad_draws", "Quad Draws", "Emulation", {{"cemu", "Cemu"}, {"native", "Native (Experimental)"}}, "cemu", false,
 +			"How the Wii U's quads (four-cornered shapes) are drawn. Cemu: each one becomes two triangles on the CPU, every draw. Native: the PS4 GPU draws quads itself, less work for the GPU thread (Sonic Lost World spends ~6% of it on quads). If a game's shapes look torn or missing, set Cemu."},
 +		{"shader_compat", "Shader Compatibility", "Emulation", {{"current", "Current"}, {"cemu26", "Cemu 2.6"}}, "current", false,
@@ -11157,6 +11249,7 @@ index 0000000..a3ab69f
 +	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
 +	g_crema_native_rects = get("rect_draws") != "cemu";
 +	g_crema_native_quads = get("quad_draws") == "native";
++	g_crema_strip_lists = get("strip_draws") == "lists";
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
