@@ -3052,20 +3052,26 @@ index f503c10..fd4754d 100644
  
  VKFUNC_DEVICE(vkCreateSampler);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 7179087..af4a1d9 100644
+index 7179087..838dfb3 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-@@ -10,6 +10,9 @@
+@@ -10,6 +10,15 @@
  #include "util/helpers/Serializer.h"
  #include "Cafe/HW/Latte/Common/RegisterSerializer.h"
  #include "HW/Latte/Renderer/RendererCore.h"
 +#ifdef __ORBIS__
 +#include <orbis/libkernel.h>
 +#endif
++
++#ifdef __ORBIS__
++// Crema setting rect_draws (CremaSettings.cpp): the GPU's own rect lists (true), or Cemu's
++// emulation geometry shader, as Cemu on a PC draws them
++bool g_crema_native_rects = true;
++#endif
  
  RendererShaderVk* rectsEmulationGS_generate(LatteDecompilerShader* vertexShader, const LatteContextRegister& latteRegister)
  {
-@@ -472,7 +475,15 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
+@@ -472,7 +481,16 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::RECTS:
@@ -3074,20 +3080,21 @@ index 7179087..af4a1d9 100644
 +		// RADV's internal topology (vk_internal_exts.h) - instead of the emulation geometry shader:
 +		// geometry shaders overrun RADV's ES->GS ring on the PS4 and the system kills the app
 +		// (Minecraft: Wii U Edition, CE-34878-0)
-+		inputAssembly.topology = (VkPrimitiveTopology)11; // VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA
++		inputAssembly.topology = g_crema_native_rects ? (VkPrimitiveTopology)11 : // VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA
++			VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // rects are emulated as 2 triangles (geometry shader)
 +#else
  		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // rects are emulated as 2 triangles
 +#endif
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	default:
-@@ -843,7 +854,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
+@@ -843,7 +861,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
  	m_requestRobustBufferAccess = requireRobustBufferAccess;
  
  	// if required generate RECT emulation geometry shader
 -	if (!vkRenderer->m_featureControl.deviceExtensions.nv_fill_rectangle && isPrimitiveRect)
 +#ifdef __ORBIS__
-+	constexpr bool nativeRects = true; // InitInputAssemblyState
++	const bool nativeRects = g_crema_native_rects; // InitInputAssemblyState
 +#else
 +	constexpr bool nativeRects = false;
 +#endif
@@ -3095,7 +3102,7 @@ index 7179087..af4a1d9 100644
  	{
  		cemu_assert(m_vkGeometryShader == nullptr); // todo - handle cases where the game already provides a GS
  		m_rectEmulationGS = rectsEmulationGS_generate(pipelineInfo->vertexShader, latteRegister);
-@@ -1085,6 +1101,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1085,6 +1108,11 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -3107,7 +3114,7 @@ index 7179087..af4a1d9 100644
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
-@@ -1109,6 +1130,9 @@ void PipelineCompiler::CompileThreadPool_Start()
+@@ -1109,6 +1137,9 @@ void PipelineCompiler::CompileThreadPool_Start()
  		numCompileThreads = 2 + (cpuCoreCount - 3); // 2 plus one additionally for every extra core above 3
  
  	numCompileThreads = std::min(numCompileThreads, 8u); // cap at 8
@@ -9708,10 +9715,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..b475aa5
+index 0000000..b3afeb9
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,602 @@
+@@ -0,0 +1,606 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9726,6 +9733,7 @@ index 0000000..b475aa5
 +extern bool g_crema_fast_compares; // Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp: Compare Results
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
++extern bool g_crema_native_rects; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Rectangle Draws
 +
 +#include <algorithm>
 +#include <atomic>
@@ -9773,6 +9781,8 @@ index 0000000..b475aa5
 +		{"gpu_accuracy", "Graphics Accuracy", "Emulation",
 +			{{"accurate", "Accurate"}, {"fast", "Fast"}}, "accurate", false,
 +			"Fast: the CPU doesn't wait for the GPU when a game asks it to, and fewer GPU barriers. Faster in busy games (Minecraft), but some games may flicker or show glitches."},
++		{"rect_draws", "Rectangle Draws", "Emulation", {{"native", "Native"}, {"cemu", "Cemu"}}, "native", false,
++			"How the Wii U's rectangle draws (full-screen effects, copies) are drawn. Native: the PS4 GPU's own rectangles (fast). Cemu: Cemu's geometry shader, as Cemu on a PC. Try Cemu if a game's picture is partly black, blurred or wrongly lit."},
 +		{"recommended", "Recommended Settings", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"On: each game tested on the PS4 starts with the settings found best for it (game-settings.ini, updated from GitHub when Crema opens; Triangle > Information shows them). A game set to its own settings keeps those. Off: every game uses your settings for all games."},
 +		{"language", "Language", "Emulation",
@@ -10268,6 +10278,7 @@ index 0000000..b475aa5
 +	g_crema_fast_compares = get("compare_results") != "exact";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
++	g_crema_native_rects = get("rect_draws") != "cemu";
 +	// the online service of the account in use (Cemu: per account): Pretendo (its servers, or a
 +	// private one through the proxy: PS4WindowSystem.cpp), or none. One world for every game.
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
@@ -10308,9 +10319,9 @@ index 0000000..b475aa5
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings
