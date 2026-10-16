@@ -155,7 +155,7 @@ index f5b0837..45768c3 100644
  
     if (pred_offset) {
 diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
-index 405023b..46373c4 100644
+index 405023b..ce2e9f5 100644
 --- a/src/amd/vulkan/radv_cmd_buffer.c
 +++ b/src/amd/vulkan/radv_cmd_buffer.c
 @@ -1707,7 +1707,7 @@ radv_cmd_buffer_after_draw(struct radv_cmd_buffer *cmd_buffer, enum radv_cmd_flu
@@ -167,7 +167,15 @@ index 405023b..46373c4 100644
        radv_cmd_buffer_trace_emit(cmd_buffer);
  }
  
-@@ -7774,7 +7774,7 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
+@@ -6899,6 +6899,7 @@ static const struct radv_prim_vertex_count prim_size_table[] = {
+    [V_008958_DI_PT_TRISTRIP] = {3, 1},      [V_008958_DI_PT_LINELIST_ADJ] = {4, 4},
+    [V_008958_DI_PT_LINESTRIP_ADJ] = {4, 1}, [V_008958_DI_PT_TRILIST_ADJ] = {6, 6},
+    [V_008958_DI_PT_TRISTRIP_ADJ] = {6, 2},  [V_008958_DI_PT_RECTLIST] = {3, 3},
++   [V_008958_DI_PT_QUADLIST] = {4, 4},
+    [V_008958_DI_PT_LINELOOP] = {2, 1},      [V_008958_DI_PT_POLYGON] = {3, 1},
+    [V_008958_DI_PT_2D_TRI_STRIP] = {0, 0},
+ };
+@@ -7774,7 +7775,7 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
           cmd_buffer->state.dirty |= RADV_CMD_DIRTY_OCCLUSION_QUERY;
     }
  
@@ -176,7 +184,7 @@ index 405023b..46373c4 100644
        radv_cmd_buffer_trace_emit(cmd_buffer);
  
     if (radv_spm_trace_enabled(pdev) && (cmd_buffer->qf == RADV_QUEUE_GENERAL || cmd_buffer->qf == RADV_QUEUE_COMPUTE)) {
-@@ -14612,7 +14612,7 @@ radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer)
+@@ -14612,7 +14613,7 @@ radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer)
                              cmd_buffer->gfx9_fence_va, cmd_buffer->state.flush_bits, &cmd_buffer->state.sqtt_flush_bits,
                              cmd_buffer->gfx9_eop_bug_va);
  
@@ -185,7 +193,7 @@ index 405023b..46373c4 100644
        radv_cmd_buffer_trace_emit(cmd_buffer);
  
     if (cmd_buffer->state.flush_bits & RADV_CMD_FLAG_INV_L2)
-@@ -14927,6 +14927,16 @@ radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_vi
+@@ -14927,6 +14928,16 @@ radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_vi
     struct radv_cmd_stream *cs = cmd_buffer->cs;
     uint32_t op = 0;
  
@@ -513,6 +521,28 @@ index 86db276..411bd7f 100644
     if (fd != -1)
        close(fd);
     if (master_fd != -1)
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.h b/src/amd/vulkan/radv_pipeline_graphics.h
+index c4dfd25..04a7206 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.h
++++ b/src/amd/vulkan/radv_pipeline_graphics.h
+@@ -228,6 +228,8 @@ radv_conv_prim_to_gs_out(uint32_t topology, bool is_ngg)
+       return V_028A6C_TRISTRIP;
+    case V_008958_DI_PT_RECTLIST:
+       return is_ngg ? V_028A6C_RECTLIST : V_028A6C_TRISTRIP;
++   case V_008958_DI_PT_QUADLIST:
++      return V_028A6C_TRISTRIP;
+    default:
+       assert(0);
+       return 0;
+@@ -299,6 +301,8 @@ radv_translate_prim(unsigned topology)
+       return V_008958_DI_PT_PATCH;
+    case VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA:
+       return V_008958_DI_PT_RECTLIST;
++   case VK_PRIMITIVE_TOPOLOGY_META_QUAD_LIST_PS4:
++      return V_008958_DI_PT_QUADLIST;
+    default:
+       UNREACHABLE("unhandled primitive type");
+    }
 diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
 index 564a8d8..7b22ab2 100644
 --- a/src/amd/vulkan/radv_queue.c
@@ -1270,3 +1300,28 @@ index 3b830a7..58b1fac 100644
  endif
  
  if with_platform_android
+diff --git a/src/vulkan/util/vk_internal_exts.h b/src/vulkan/util/vk_internal_exts.h
+index 497d28b..d912d66 100644
+--- a/src/vulkan/util/vk_internal_exts.h
++++ b/src/vulkan/util/vk_internal_exts.h
+@@ -24,6 +24,8 @@ extern "C" {
+ #endif
+ 
+ #define VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA (VkPrimitiveTopology)11
++/* PS4 (Crema): the GPU's own quad lists (DI_PT_QUADLIST), as the Wii U's GPU draws quads */
++#define VK_PRIMITIVE_TOPOLOGY_META_QUAD_LIST_PS4 (VkPrimitiveTopology)12
+ #define VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA \
+    (VkImageViewCreateFlagBits)0x80000000
+ 
+diff --git a/src/vulkan/util/vk_util.c b/src/vulkan/util/vk_util.c
+index 289b8ac..9402eed 100644
+--- a/src/vulkan/util/vk_util.c
++++ b/src/vulkan/util/vk_util.c
+@@ -157,6 +157,7 @@ vk_topology_to_mesa(VkPrimitiveTopology topology)
+ PRAGMA_DIAGNOSTIC_PUSH
+ PRAGMA_DIAGNOSTIC_IGNORED(-Wswitch)
+    case VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA:
++   case VK_PRIMITIVE_TOPOLOGY_META_QUAD_LIST_PS4:
+ PRAGMA_DIAGNOSTIC_POP
+       return MESA_PRIM_TRIANGLES;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
