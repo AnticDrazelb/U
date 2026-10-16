@@ -15,6 +15,12 @@ HOST="ftp://${PS4_HOST:-192.168.0.90}:${PS4_FTP_PORT:-2121}"
 
 [ -f "$EBOOT" ] || { echo "missing $EBOOT: build first" >&2; exit 1; }
 # an eboot older than the linked program means create-fself failed: never package it
+# the last build must have no compile errors and a fresh eboot (a failed compile leaves the old program
+# and eboot in place, which the age check below can't see)
+BUILD_LOG="$PS4_BUILD_ROOT/logs/build.log"
+if [ -f "$BUILD_LOG" ] && grep -qE "error:|^FAILED|Failed to build FSELF" "$BUILD_LOG"; then
+    echo "the last build failed ($BUILD_LOG): not packaging" >&2; exit 1
+fi
 [ "$EBOOT" -nt "$SRC/bin/Cemu_release" ] || { echo "$EBOOT is older than $SRC/bin/Cemu_release: the last build did not make an eboot" >&2; exit 1; }
 [[ "$VERSION" =~ ^[0-9][0-9]\.[0-9][0-9]$ ]] || { echo "version must look like 01.00" >&2; exit 1; }
 STAGE="$PS4_BUILD_ROOT/build/cemu-stage"

@@ -3189,7 +3189,7 @@ index b7dc500..c9b170a 100644
  
  void* dlopen_vulkan_loader()
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
-index f503c10..fd4754d 100644
+index f503c10..715421f 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
 @@ -11,6 +11,11 @@ bool InitializeGlobalVulkan();
@@ -3230,7 +3230,15 @@ index f503c10..fd4754d 100644
  VKFUNC_INSTANCE(vkCreateXlibSurfaceKHR);
  VKFUNC_INSTANCE(vkCreateXcbSurfaceKHR);
  #ifdef HAS_WAYLAND
-@@ -226,6 +234,7 @@ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
+@@ -202,6 +210,7 @@ VKFUNC_DEVICE(vkCmdResetQueryPool);
+ VKFUNC_DEVICE(vkCmdBeginQuery);
+ VKFUNC_DEVICE(vkCmdEndQuery);
+ VKFUNC_DEVICE(vkCmdCopyQueryPoolResults);
++VKFUNC_DEVICE(vkGetQueryPoolResults);
+ 
+ // event
+ VKFUNC_DEVICE(vkCreateEvent);
+@@ -226,6 +235,7 @@ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
  VKFUNC_DEVICE(vkCreateImage);
  VKFUNC_DEVICE(vkDestroyImage);
  VKFUNC_DEVICE(vkGetImageMemoryRequirements);
