@@ -3896,7 +3896,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..a8b3a5a 100644
+index 512ebee..eb512ee 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -3915,6 +3915,150 @@ index 512ebee..a8b3a5a 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
+@@ -1297,8 +1291,71 @@ void VulkanRenderer::draw_handleSpecialState5()
+ 		vpWidth, vpHeight);
+ }
+ 
++// Crema: draws Cemu drops without a log line, counted by reason and logged every 10 s together with
++// the shaders of the dropped draws (an object missing on the PS4 only)
++namespace
++{
++	enum CremaSkip { kCremaSkipShaderError, kCremaSkipNoTarget, kCremaSkipNoBuffer, kCremaSkipRasterKill, kCremaSkipNoPipeline, kCremaSkipCount };
++	struct CremaSkippedShaders
++	{
++		uint32 count;
++		uint64 vs, ps, gs;
++	};
++	uint64 s_cremaDrawn = 0;
++	uint64 s_cremaSkipped[kCremaSkipCount] = {};
++	int s_cremaSequenceSkip = kCremaSkipShaderError;
++	std::unordered_map<uint64, CremaSkippedShaders> s_cremaSkippedShaders[kCremaSkipCount];
++	std::chrono::steady_clock::time_point s_cremaStatsTime{};
++
++	uint64 CremaShaderHash(const LatteDecompilerShader* shader)
++	{
++		return shader ? shader->baseHash : 0;
++	}
++
++	void CremaNoteSkip(int reason, const LatteDecompilerShader* vs, const LatteDecompilerShader* ps, const LatteDecompilerShader* gs)
++	{
++		s_cremaSkipped[reason]++;
++		if (reason == kCremaSkipRasterKill || reason == kCremaSkipNoBuffer)
++			return; // drawing nothing is what the game asked for
++		const uint64 key = CremaShaderHash(vs) * 31 + CremaShaderHash(ps) * 7 + CremaShaderHash(gs);
++		auto& entry = s_cremaSkippedShaders[reason][key];
++		entry.count++;
++		entry.vs = CremaShaderHash(vs);
++		entry.ps = CremaShaderHash(ps);
++		entry.gs = CremaShaderHash(gs);
++	}
++
++	void CremaDrawStats()
++	{
++		const auto now = std::chrono::steady_clock::now();
++		if (s_cremaStatsTime.time_since_epoch().count() == 0)
++			s_cremaStatsTime = now;
++		if (now - s_cremaStatsTime < std::chrono::seconds(10))
++			return;
++		s_cremaStatsTime = now;
++		cemuLog_log(LogType::Force, "draws in 10 s: {} drawn; skipped: {} shader error, {} no render target, {} no color/depth buffer, {} rasterizer off, {} pipeline not ready",
++			s_cremaDrawn, s_cremaSkipped[kCremaSkipShaderError], s_cremaSkipped[kCremaSkipNoTarget], s_cremaSkipped[kCremaSkipNoBuffer],
++			s_cremaSkipped[kCremaSkipRasterKill], s_cremaSkipped[kCremaSkipNoPipeline]);
++		static const char* const reasonName[kCremaSkipCount] = { "shader error", "no render target", "no buffer", "rasterizer off", "pipeline not ready" };
++		for (int reason = 0; reason < kCremaSkipCount; reason++)
++		{
++			std::vector<CremaSkippedShaders> list;
++			for (auto& it : s_cremaSkippedShaders[reason])
++				list.emplace_back(it.second);
++			std::sort(list.begin(), list.end(), [](const CremaSkippedShaders& a, const CremaSkippedShaders& b) { return a.count > b.count; });
++			for (size_t i = 0; i < list.size() && i < 8; i++)
++				cemuLog_log(LogType::Force, "  skipped ({}) {}x: vs {:016x} ps {:016x} gs {:016x}", reasonName[reason], list[i].count, list[i].vs, list[i].ps, list[i].gs);
++			s_cremaSkippedShaders[reason].clear();
++		}
++		s_cremaDrawn = 0;
++		for (auto& count : s_cremaSkipped)
++			count = 0;
++	}
++}
++
+ void VulkanRenderer::draw_beginSequence()
+ {
++	CremaDrawStats();
+ 	m_state.drawSequenceSkip = false;
+ 
+ 	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
+@@ -1308,6 +1365,7 @@ void VulkanRenderer::draw_beginSequence()
+ 	if (LatteGPUState.activeShaderHasError)
+ 	{
+ 		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
++		s_cremaSequenceSkip = kCremaSkipShaderError;
+ 		m_state.drawSequenceSkip = true;
+ 		cemu_assert_debug(false);
+ 		return;
+@@ -1321,6 +1379,7 @@ void VulkanRenderer::draw_beginSequence()
+ 		if (!LatteMRT::UpdateCurrentFBO())
+ 		{
+ 			debug_printf("Rendertarget invalid\n");
++			s_cremaSequenceSkip = kCremaSkipNoTarget;
+ 			m_state.drawSequenceSkip = true;
+ 			return; // no render target
+ 		}
+@@ -1328,6 +1387,7 @@ void VulkanRenderer::draw_beginSequence()
+ 		if (!hasValidFramebufferAttached && !streamoutEnable)
+ 		{
+ 			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
++			s_cremaSequenceSkip = kCremaSkipNoBuffer;
+ 			m_state.drawSequenceSkip = true;
+ 			return; // no render target
+ 		}
+@@ -1352,13 +1412,17 @@ void VulkanRenderer::draw_beginSequence()
+ 		rasterizerEnable = true;
+ 
+ 	if (rasterizerEnable == false && streamoutEnable == false)
++	{
++		s_cremaSequenceSkip = kCremaSkipRasterKill;
+ 		m_state.drawSequenceSkip = true;
++	}
+ }
+ 
+ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, uint32 instanceCount, uint32 count, MPTR indexDataMPTR, Latte::LATTE_VGT_DMA_INDEX_TYPE::E_INDEX_TYPE indexType, const LatteDrawcallContext& drawcallContext)
+ {
+ 	if (m_state.drawSequenceSkip)
+ 	{
++		CremaNoteSkip(s_cremaSequenceSkip, LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), LatteSHRC_GetActiveGeometryShader());
+ 		return;
+ 	}
+ 
+@@ -1451,8 +1515,10 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+ 	{
+ 		// invalid/uninitialized pipeline
+ 		m_state.activeVertexDS = nullptr;
++		CremaNoteSkip(kCremaSkipNoPipeline, pipeline_info->vertexShader, pipeline_info->pixelShader, pipeline_info->geometryShader);
+ 		return;
+ 	}
++	s_cremaDrawn++;
+ 
+ 	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
+ 	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
+@@ -1526,6 +1592,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+ {
+ 	if (m_state.drawSequenceSkip)
+ 	{
++		CremaNoteSkip(s_cremaSequenceSkip, LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), LatteSHRC_GetActiveGeometryShader());
+ 		return;
+ 	}
+ 
+@@ -1640,8 +1707,10 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+ 	{
+ 		// invalid/uninitialized pipeline
+ 		//m_state.activeVertexDS = nullptr;
++		CremaNoteSkip(kCremaSkipNoPipeline, pipeline_info->vertexShader, pipeline_info->pixelShader, pipeline_info->geometryShader);
+ 		return;
+ 	}
++	s_cremaDrawn++;
+ 
+ 	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
+ 	if (m_state.activeVertexDS)
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
 index d102a89..dcd0ffe 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
