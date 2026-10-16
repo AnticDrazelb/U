@@ -1801,10 +1801,15 @@ index bfb2aed..5e6059c 100644
  bool PPCRecompilerImlGen_PS_MADDSX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool isVariant1);
  bool PPCRecompilerImlGen_PS_ADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..3825b86 100644
+index 89e805d..cd0669d 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-@@ -8,6 +8,8 @@
+@@ -1,3 +1,4 @@
++extern bool g_crema_psq_indexed;
+ #include "Cafe/HW/Espresso/Interpreter/PPCInterpreterInternal.h"
+ #include "Cafe/HW/Espresso/Interpreter/PPCInterpreterHelper.h"
+ #include "Cafe/HW/Espresso/EspressoISA.h"
+@@ -8,6 +9,8 @@
  #include "PPCFunctionBoundaryTracker.h"
  #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
  
@@ -1813,7 +1818,7 @@ index 89e805d..3825b86 100644
  bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext);
  
  struct PPCBasicBlockInfo
-@@ -729,6 +731,9 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+@@ -729,6 +732,9 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
  		regCRBit = _GetRegCR(ppcImlGenContext, crRegister, crBit);
  
  	IMLReg branchDestReg = PPCRecompilerImlGen_loadRegister(ppcImlGenContext, PPCREC_NAME_SPR0 + sprReg);
@@ -1823,7 +1828,7 @@ index 89e805d..3825b86 100644
  	if (LK)
  	{
  		if (sprReg == SPR_LR)
-@@ -756,14 +761,14 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
+@@ -756,14 +762,14 @@ bool PPCRecompilerImlGen_BCSPR(ppcImlGenContext_t* ppcImlGenContext, uint32 opco
  		PPCBasicBlockInfo* currentBasicBlock = ppcImlGenContext->currentBasicBlock;
  		IMLSegment* bctrSeg = PPCIMLGen_CreateNewSegmentAsBranchTarget(*ppcImlGenContext, *currentBasicBlock);
  		ppcImlGenContext->emitInst().make_conditional_jump(regCRBit, !BO.conditionInverted());
@@ -1840,7 +1845,7 @@ index 89e805d..3825b86 100644
  	}
  	return true;
  }
-@@ -946,6 +951,22 @@ bool PPCRecompilerImlGen_SUBFZE(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
+@@ -946,6 +952,22 @@ bool PPCRecompilerImlGen_SUBFZE(ppcImlGenContext_t* ppcImlGenContext, uint32 opc
  	return true;
  }
  
@@ -1863,24 +1868,24 @@ index 89e805d..3825b86 100644
  bool PPCRecompilerImlGen_SUBFC(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode)
  {
  	// d = ~a + b + 1;
-@@ -1977,6 +1998,16 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+@@ -1977,6 +1999,16 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
  				break;
  			}
  			break;
 +		case 6: // PSQ_LX (with bit 25: PSQ_LUX, left to the interpreter)
-+			if (PPC_getBits(opcode, 25, 1) != 0 || !PPCRecompilerImlGen_PSQ_LX(ppcImlGenContext, opcode))
++			if (!g_crema_psq_indexed || PPC_getBits(opcode, 25, 1) != 0 || !PPCRecompilerImlGen_PSQ_LX(ppcImlGenContext, opcode))
 +				unsupportedInstructionFound = true;
 +			ppcImlGenContext->hasFPUInstruction = true;
 +			break;
 +		case 7: // PSQ_STX (with bit 25: PSQ_STUX, left to the interpreter)
-+			if (PPC_getBits(opcode, 25, 1) != 0 || !PPCRecompilerImlGen_PSQ_STX(ppcImlGenContext, opcode))
++			if (!g_crema_psq_indexed || PPC_getBits(opcode, 25, 1) != 0 || !PPCRecompilerImlGen_PSQ_STX(ppcImlGenContext, opcode))
 +				unsupportedInstructionFound = true;
 +			ppcImlGenContext->hasFPUInstruction = true;
 +			break;
  		case 8: //Sub category - move/negate
  			switch (PPC_getBits(opcode, 25, 5))
  			{
-@@ -2362,6 +2393,8 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+@@ -2362,6 +2394,8 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
  			if (!PPCRecompilerImlGen_STORE_INDEXED(ppcImlGenContext, opcode, 8, true, false))
  				unsupportedInstructionFound = true;
  			break;
@@ -1889,7 +1894,7 @@ index 89e805d..3825b86 100644
  		case 234:
  			if (PPCRecompilerImlGen_ADDME(ppcImlGenContext, opcode) == false)
  				unsupportedInstructionFound = true;
-@@ -2968,6 +3001,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
+@@ -2968,6 +3002,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
  	return basicBlockList;
  }
  
@@ -1900,7 +1905,7 @@ index 89e805d..3825b86 100644
  bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBlockInfo& basicBlockInfo)
  {
  	ppcImlGenContext.currentOutputSegment = basicBlockInfo.GetSegmentForInstructionAppend();
-@@ -2984,6 +3021,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
+@@ -2984,6 +3022,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
  		if (PPCRecompiler_decodePPCInstruction(&ppcImlGenContext))
  		{
  			cemuLog_logDebug(LogType::Force, "PPCRecompiler: Unsupported instruction at 0x{:08x}", addressOfCurrentInstruction);
@@ -1910,16 +1915,18 @@ index 89e805d..3825b86 100644
  			ppcImlGenContext.currentOutputSegment = nullptr;
  			return false;
  		}
-@@ -3115,6 +3155,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -3115,6 +3156,10 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  	}
  }
  
++// Crema setting psq_indexed: PSQ_LX / PSQ_STX recompiled (v02.18), else interpreted as upstream
++bool g_crema_psq_indexed = true;
 +bool g_crema_fast_cycles = false; // Crema: off - Fast froze and crashed Tekken Tag Tournament 2 (1.63-1.65), the setting was removed
 +
  bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
  {
  	std::vector<PPCBasicBlockInfo> basicBlockList = PPCRecompiler_DetermineBasicBlockRange(boundaryTracker, entryAddresses);
-@@ -3164,6 +3206,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3164,6 +3209,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  	// generate cycle counters
  	// in theory we could generate these as part of FillBasicBlock() but in the future we might use more complex logic to emit fewer operations
@@ -1933,7 +1940,7 @@ index 89e805d..3825b86 100644
  	for (size_t i = 0; i < basicBlockList.size(); i++)
  	{
  		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
-@@ -3171,6 +3220,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3171,6 +3223,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
  		cemu_assert_debug(ppcInstructionCount > 0);
@@ -9738,10 +9745,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..69b79f1
+index 0000000..6aa70bb
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,639 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9754,6 +9761,7 @@ index 0000000..69b79f1
 +extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
 +extern bool g_crema_fast_cycles; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Cycle Counting
 +extern bool g_crema_fast_compares; // Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp: Compare Results
++extern bool g_crema_psq_indexed; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Indexed Paired Singles
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
 +extern bool g_crema_native_rects; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Rectangle Draws
@@ -9821,6 +9829,8 @@ index 0000000..69b79f1
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
 +		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
++		{"psq_indexed", "Indexed Paired Singles", "Emulation", {{"on", "Recompiled"}, {"off", "Interpreted"}}, "on", false,
++			"Recompiled: the indexed quantized loads and stores (psq_lx, psq_stx) run as PS4 code, faster (Ninja Gaiden 3). Interpreted: as Cemu on a PC does. Try Interpreted if a game's models or animations come out wrong."},
 +		{"core_balancing", "Core Balancing (Experimental)", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: when the Wii U's core 1 has nothing to run, it runs threads waiting for the busy cores 0 and 2 (Wii U games pin their threads to cores, and the PS4 runs them at different speeds). Faster in Breath of the Wild. A game that relies on its threads' cores may crash or misbehave: then Off."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -10305,6 +10315,7 @@ index 0000000..69b79f1
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
 +	g_crema_fast_compares = get("compare_results") != "exact";
++	g_crema_psq_indexed = get("psq_indexed") != "off";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
 +	g_crema_native_rects = get("rect_draws") != "cemu";
@@ -10371,9 +10382,9 @@ index 0000000..69b79f1
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings
