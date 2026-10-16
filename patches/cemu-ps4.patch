@@ -2356,6 +2356,41 @@ index 743ab67..b1fc494 100644
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
  
+diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
+index ba58081..a53eda2 100644
+--- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
++++ b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
+@@ -1,4 +1,6 @@
+ #include "Cafe/HW/Latte/Core/LatteConst.h"
++// Crema setting shader_compat (CremaSettings.cpp): Cemu 2.6's MOVA clamp and robust buffer access for every pipeline
++bool g_crema_shader_compat_26 = false;
+ #include "Cafe/HW/Latte/Core/LatteShaderAssembly.h"
+ #include "Cafe/HW/Latte/ISA/RegDefines.h"
+ #include "Cafe/OS/libs/gx2/GX2.h" // todo - remove dependency
+@@ -1084,7 +1086,10 @@ void _emitALUOP2InstructionCode(LatteDecompilerShaderContext* shaderContext, Lat
+ 		_emitOperandInputCode(shaderContext, aluInstruction, 0, LATTE_DECOMPILER_DTYPE_FLOAT);
+ 		src->add(";" _CRLF);
+ 		src->add("tempResultf = floor(tempResultf);" _CRLF);
+-		src->add("tempResultf = (tempResultf >= -256.0 && tempResultf <= 255.0) ? tempResultf : -256.0;" _CRLF);
++		if (g_crema_shader_compat_26) // Cemu 2.6: out-of-range MOVA clamps (upstream e33db57: -256)
++			src->add("tempResultf = clamp(tempResultf, -256.0, 255.0);" _CRLF);
++		else
++			src->add("tempResultf = (tempResultf >= -256.0 && tempResultf <= 255.0) ? tempResultf : -256.0;" _CRLF);
+ 		// set AR
+ 		if( aluInstruction->destElem == 0 )
+ 			src->add("ARi.x = int(tempResultf);" _CRLF);
+@@ -1109,7 +1114,10 @@ void _emitALUOP2InstructionCode(LatteDecompilerShaderContext* shaderContext, Lat
+ 		src->add("tempResulti = ");
+ 		_emitOperandInputCode(shaderContext, aluInstruction, 0, LATTE_DECOMPILER_DTYPE_SIGNED_INT);
+ 		src->add(";" _CRLF);
+-		src->add("tempResulti = (tempResulti >= -256 && tempResulti <= 255) ? tempResulti : -256;" _CRLF);
++		if (g_crema_shader_compat_26)
++			src->add("tempResulti = clamp(tempResulti, -256, 255);" _CRLF);
++		else
++			src->add("tempResulti = (tempResulti >= -256 && tempResulti <= 255) ? tempResulti : -256;" _CRLF);
+ 		// set AR
+ 		if( aluInstruction->destElem == 0 )
+ 			src->add("ARi.x = tempResulti;" _CRLF);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
 index 86b4d75..1ccc4b9 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
@@ -2925,6 +2960,38 @@ index 0000000..d2b623e
 +{
 +	return sFlipsSubmitted;
 +}
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
+index 15fd66e..eec27ad 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp
+@@ -11,6 +11,9 @@
+ #include "util/helpers/helpers.h"
+ 
+ bool s_isLoadingShadersVk{ false };
++// Crema: with Shader Compatibility Cemu 2.6 the SPIR-V cache (keyed by the game's shader, not the
++// translation) is neither read nor written, so every shader is translated with the older behaviors
++extern bool g_crema_shader_compat_26;
+ class FileCache* s_spirvCache{nullptr};
+ 
+ extern std::atomic_int g_compiled_shaders_total;
+@@ -269,7 +272,7 @@ void RendererShaderVk::CompileInternal(bool isRenderThread)
+ 	const bool compileWithDebugInfo = ((VulkanRenderer*)g_renderer.get())->IsTracingToolEnabled();
+ 
+ 	// try to retrieve SPIR-V module from cache
+-	if (s_isLoadingShadersVk && (m_isGameShader && !m_isGfxPackShader) && s_spirvCache && !compileWithDebugInfo)
++	if (s_isLoadingShadersVk && (m_isGameShader && !m_isGfxPackShader) && s_spirvCache && !compileWithDebugInfo && !g_crema_shader_compat_26)
+ 	{
+ 		cemu_assert_debug(m_baseHash != 0);
+ 		uint64 h1, h2;
+@@ -374,7 +377,7 @@ void RendererShaderVk::CompileInternal(bool isRenderThread)
+ 	//forceLogRemoveMe_printf("Shader GLSL-to-SPIRV compilation took %lfms Size %08x", timeDur, spirvBuffer.size()*4);
+ 
+ 	// store in cache, unless it got compiled with debug info or is a modified shader from a gfx pack
+-	if (s_spirvCache && m_isGameShader && m_isGfxPackShader == false && !compileWithDebugInfo)
++	if (s_spirvCache && m_isGameShader && m_isGfxPackShader == false && !compileWithDebugInfo && !g_crema_shader_compat_26)
+ 	{
+ 		uint64 h1, h2;
+ 		GenerateShaderPrecompiledCacheFilename(m_type, m_baseHash, m_auxHash, h1, h2);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp
 index b27aae0..eed31fa 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/SwapchainInfoVk.cpp
@@ -3064,7 +3131,7 @@ index f503c10..fd4754d 100644
  
  VKFUNC_DEVICE(vkCreateSampler);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 7179087..902bc2a 100644
+index 7179087..9a38051 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 @@ -10,6 +10,18 @@
@@ -3132,7 +3199,20 @@ index 7179087..902bc2a 100644
  	{
  		cemu_assert(m_vkGeometryShader == nullptr); // todo - handle cases where the game already provides a GS
  		m_rectEmulationGS = rectsEmulationGS_generate(pipelineInfo->vertexShader, latteRegister);
-@@ -1085,6 +1119,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1050,8 +1084,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
+ // this can happen when:
+ // - Streamout is used with too small of a buffer (probably? Could also be some issue with how the streamout array index is calculated -> We can maybe fix this in the future)
+ // - The shader uses dynamic indices for uniform access. This will trigger the uniform mode to be FULL_CBANK
++extern bool g_crema_shader_compat_26; // LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
++
+ bool PipelineCompiler::CalcRobustBufferAccessRequirement(LatteDecompilerShader* vertexShader, LatteDecompilerShader* pixelShader, LatteDecompilerShader* geometryShader)
+ {
++	if (g_crema_shader_compat_26)
++		return true; // Cemu 2.6: robust buffer access for every pipeline (upstream 6148459 narrowed it)
+ 	bool requiresRobustBufferAcces = false;
+ 	if (vertexShader)
+ 	{
+@@ -1085,6 +1123,11 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -3144,7 +3224,7 @@ index 7179087..902bc2a 100644
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
-@@ -1109,6 +1148,9 @@ void PipelineCompiler::CompileThreadPool_Start()
+@@ -1109,6 +1152,9 @@ void PipelineCompiler::CompileThreadPool_Start()
  		numCompileThreads = 2 + (cpuCoreCount - 3); // 2 plus one additionally for every extra core above 3
  
  	numCompileThreads = std::min(numCompileThreads, 8u); // cap at 8
@@ -4136,10 +4216,10 @@ index 6cb1599..3b5a3cc 100644
  		bool additional_blocks_required = false;
  		{
 diff --git a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-index 7afbf19..bee0598 100644
+index 7afbf19..fb4b373 100644
 --- a/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
 +++ b/src/Common/ExceptionHandler/ExceptionHandler_posix.cpp
-@@ -1,3 +1,147 @@
+@@ -1,3 +1,160 @@
 +#ifdef __ORBIS__
 +// PS4: fatal signals are handled by the port's crash log (port/ps4_crashlog.cpp: registers and a
 +// stack scan with ELF-relative addresses in /data/Crema/crash.log); there is no execinfo.
@@ -4152,6 +4232,13 @@ index 7afbf19..bee0598 100644
 +#include "Cafe/HW/MMU/MMU.h"
 +#include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
 +#include <unistd.h>
++
++// Crema: a value found on a game's stack can point anywhere; only mapped guest memory is read
++// (the freeze report crashed Sonic Lost World following a frame pointer to 80000000, v02.40)
++static bool GuestReadable(uint32 address, uint32 size)
++{
++	return address >= 0x01000000 && address < 0xF0000000 && memory_isAddressRangeAccessible(address, size);
++}
 +
 +// Called by the port's crash handler while it writes crash.log (fd): the crashed thread's PPC
 +// registers and the return addresses on its guest stack. No locks and no allocation: the full
@@ -4179,8 +4266,10 @@ index 7afbf19..bee0598 100644
 +	uint32 sp = hCPU->gpr[1];
 +	for (int i = 0; i < 16 && sp >= 0x01000000 && sp < 0xF0000000 && (sp & 3) == 0 && n < 180; i++)
 +	{
++		if (!GuestReadable(sp, 4))
++			break;
 +		const uint32 next = memory_readU32(sp);
-+		if (next <= sp || next >= 0xF0000000)
++		if (next <= sp || next >= 0xF0000000 || !GuestReadable(next, 8))
 +			break;
 +		n += snprintf(line + n, sizeof(line) - n, " %08x", memory_readU32(next + 4));
 +		sp = next;
@@ -4194,15 +4283,17 @@ index 7afbf19..bee0598 100644
 +	sp = hCPU->gpr[1];
 +	for (int i = 1; i < 4 && sp >= 0x01000000 && sp < 0xF0000000 && (sp & 3) == 0; i++)
 +	{
++		if (!GuestReadable(sp, 4))
++			break;
 +		const uint32 next = memory_readU32(sp);
-+		if (next <= sp || next >= 0xF0000000)
++		if (next <= sp || next >= 0xF0000000 || !GuestReadable(next, 8))
 +			break;
 +		addresses[i] = memory_readU32(next + 4);
 +		sp = next;
 +	}
 +	for (uint32 address : addresses)
 +	{
-+		if (address < 0x01000000 || address >= 0x10000000 || (address & 3))
++		if (address < 0x01000000 || address >= 0x10000000 || (address & 3) || !GuestReadable(address - 0x40, 0x100))
 +			continue;
 +		const uint32 start = address - 0x40;
 +		for (uint32 at = start; at < address + 0xC0; at += 0x20)
@@ -4227,7 +4318,7 @@ index 7afbf19..bee0598 100644
 +	for (sint32 i = 0; i < count; i++)
 +	{
 +		const MPTR threadPtr = activeThread[i];
-+		if (threadPtr < 0x01000000 || threadPtr >= 0xF0000000)
++		if (!GuestReadable(threadPtr, sizeof(OSThread_t)))
 +			continue;
 +		OSThread_t* thread = (OSThread_t*)memory_getPointerFromVirtualOffset(threadPtr);
 +		const char* state = "?";
@@ -4245,7 +4336,7 @@ index 7afbf19..bee0598 100644
 +			state = "NONE";
 +		char name[48] = "?";
 +		const MPTR namePtr = thread->threadName.GetMPTR();
-+		if (namePtr >= 0x01000000 && namePtr < 0xF0000000)
++		if (GuestReadable(namePtr, 1))
 +		{
 +			const char* text = (const char*)memory_getPointerFromVirtualOffset(namePtr);
 +			size_t n = 0;
@@ -4262,8 +4353,10 @@ index 7afbf19..bee0598 100644
 +		uint32 sp = _swapEndianU32(thread->context.gpr[1]);
 +		for (int f = 0; f < 12 && sp >= 0x01000000 && sp < 0xF0000000 && (sp & 3) == 0 && n < 230; f++)
 +		{
++			if (!GuestReadable(sp, 4))
++				break;
 +			const uint32 next = memory_readU32(sp);
-+			if (next <= sp || next >= 0xF0000000)
++			if (next <= sp || next >= 0xF0000000 || !GuestReadable(next, 8))
 +				break;
 +			n += snprintf(line + n, sizeof(line) - n, " %08x", memory_readU32(next + 4));
 +			sp = next;
@@ -4287,7 +4380,7 @@ index 7afbf19..bee0598 100644
  #include <signal.h>
  #include <execinfo.h>
  #include <string.h>
-@@ -170,3 +314,4 @@ void ExceptionHandler_Init()
+@@ -170,3 +327,4 @@ void ExceptionHandler_Init()
  	sigaction(SIGSYS, &action, nullptr);
  	sigaction(SIGTRAP, &action, nullptr);
  }
@@ -9745,10 +9838,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..eeb10eb
+index 0000000..e9853c7
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,646 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9766,6 +9859,7 @@ index 0000000..eeb10eb
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
 +extern bool g_crema_native_rects; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Rectangle Draws
 +extern bool g_crema_native_quads; // the same file: Quad Draws
++extern bool g_crema_shader_compat_26; // Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
 +
 +#include <algorithm>
 +#include <atomic>
@@ -9817,6 +9911,8 @@ index 0000000..eeb10eb
 +			"How the Wii U's rectangle draws (full-screen effects, copies) are drawn. Native: the PS4 GPU's own rectangles (fast). Cemu: Cemu's geometry shader, as Cemu on a PC. Try Cemu if a game's picture is partly black, blurred or wrongly lit."},
 +		{"quad_draws", "Quad Draws", "Emulation", {{"cemu", "Cemu"}, {"native", "Native (Experimental)"}}, "cemu", false,
 +			"How the Wii U's quads (four-cornered shapes) are drawn. Cemu: each one becomes two triangles on the CPU, every draw. Native: the PS4 GPU draws quads itself, less work for the GPU thread (Sonic Lost World spends ~6% of it on quads). If a game's shapes look torn or missing, set Cemu."},
++		{"shader_compat", "Shader Compatibility", "Emulation", {{"current", "Current"}, {"cemu26", "Cemu 2.6"}}, "current", false,
++			"Current: Cemu's newest shader translation. Cemu 2.6: two older behaviors back (an out-of-range index register clamps, and every shader's buffer reads are bounds-checked), for a game that looks wrong here but right in Cemu 2.6 on a PC."},
 +		{"recommended", "Recommended Settings", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"On: each game tested on the PS4 starts with the settings found best for it (game-settings.ini, updated from GitHub when Crema opens; Triangle > Information shows them). A game set to its own settings keeps those. Off: every game uses your settings for all games."},
 +		{"language", "Language", "Emulation",
@@ -10321,6 +10417,7 @@ index 0000000..eeb10eb
 +	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
 +	g_crema_native_rects = get("rect_draws") != "cemu";
 +	g_crema_native_quads = get("quad_draws") == "native";
++	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
 +	// the GPU driver's own debug switches (read when the Vulkan instance and shader compiler start,
 +	// after this); its pipeline cache is off with them, or cached shaders would come back
 +	{
@@ -10385,9 +10482,9 @@ index 0000000..eeb10eb
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings
