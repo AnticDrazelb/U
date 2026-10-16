@@ -9745,10 +9745,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..6aa70bb
+index 0000000..b94997e
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,639 @@
+@@ -0,0 +1,640 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9802,8 +9802,8 @@ index 0000000..6aa70bb
 +			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest."},
 +		// Emulation
 +		{"cpu_mode", "CPU Mode", "Emulation",
-+			{{"auto", "Auto"}, {"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}}, "auto", false,
-+			"Auto: what Cemu's profile for the game says (some games need single-core: Xenoblade Chronicles X, Batman: Arkham Origins), else multi-core. Multi-core runs the Wii U's three CPU cores on three PS4 cores (fastest). Single-core is for games that misbehave with it."},
++			{{"auto", "Auto"}, {"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}, {"interpreter", "Interpreter (Debug)"}}, "auto", false,
++			"Auto: what Cemu's profile for the game says (some games need single-core: Xenoblade Chronicles X, Batman: Arkham Origins), else multi-core. Multi-core runs the Wii U's three CPU cores on three PS4 cores (fastest). Single-core is for games that misbehave with it. Interpreter: no recompiler at all, very slow - only to check whether a wrong-looking game is the recompiler's doing."},
 +		{"thread_quantum", "Thread Quantum", "Emulation",
 +			{{"default", "Default"}, {"20000", "20000"}, {"45000", "45000"}, {"60000", "60000"}, {"80000", "80000"}, {"100000", "100000"}},
 +			"default", false, "How long an emulated thread runs before the next one. Only change it for a game that needs it."},
@@ -10303,6 +10303,7 @@ index 0000000..6aa70bb
 +		const std::string quantum = get("thread_quantum");
 +		g_current_game_profile->SetCremaOverrides(
 +			cpu == "single" ? std::optional<CPUMode>(CPUMode::SinglecoreRecompiler) :
++			cpu == "interpreter" ? std::optional<CPUMode>(CPUMode::SinglecoreInterpreter) :
 +			cpu == "multi" ? std::optional<CPUMode>(CPUMode::MulticoreRecompiler) : std::optional<CPUMode>(),
 +			quantum == "default" ? std::optional<uint32>() : std::optional<uint32>((uint32)std::stoul(quantum)),
 +			get("tv_shows") == "gamepad");
