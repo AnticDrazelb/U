@@ -3896,7 +3896,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..dfbfb4b 100644
+index 512ebee..7c6e0f5 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -3953,11 +3953,11 @@ index 512ebee..dfbfb4b 100644
 +		entry.gs = CremaShaderHash(gs);
 +	}
 +
-+	// GPU self-test, real data: with /data/Crema/selftest/capture present (holding a vertex shader hash in
-+	// hex, or nothing for Sonic Lost World's 09315128e257f08e) the next 4 draws with that vertex shader
-+	// write their vertex uniform registers, vertex buffer 0 and index data to selftest/cap<N>-*
-+	uint64 s_cremaCaptureHash = 0;
++	// GPU self-test, real data: with /data/Crema/selftest/capture present the first draw of each vertex
++	// shader that indexes the uniform registers (skinned models, up to 64) writes its vertex uniform
++	// registers, vertex buffer 0 and index data to selftest/cap-<shader hash>-*
 +	int s_cremaCaptureLeft = 0;
++	std::unordered_set<uint64> s_cremaCaptured;
 +
 +	void CremaCaptureArm()
 +	{
@@ -3968,19 +3968,19 @@ index 512ebee..dfbfb4b 100644
 +		fread(text, 1, sizeof(text) - 1, f);
 +		fclose(f);
 +		remove("/data/Crema/selftest/capture");
-+		s_cremaCaptureHash = strtoull(text, nullptr, 16);
-+		if (s_cremaCaptureHash == 0)
-+			s_cremaCaptureHash = 0x09315128e257f08eull;
-+		s_cremaCaptureLeft = 4;
-+		cemuLog_log(LogType::Force, "draw capture armed for vertex shader {:016x}", s_cremaCaptureHash);
++		s_cremaCaptured.clear();
++		s_cremaCaptureLeft = 64;
++		cemuLog_log(LogType::Force, "draw capture armed for skinned vertex shaders");
 +	}
 +
 +	void CremaCaptureDraw(const LatteDecompilerShader* vs, uint32 baseVertex, uint32 count, MPTR indexData, uint32 indexType, uint32 indexMax)
 +	{
-+		if (s_cremaCaptureLeft <= 0 || !vs || vs->baseHash != s_cremaCaptureHash)
++		if (s_cremaCaptureLeft <= 0 || !vs || vs->uniformMode != LATTE_DECOMPILER_UNIFORM_MODE_FULL_CFILE)
 +			return;
-+		const int n = 4 - s_cremaCaptureLeft--;
-+		const std::string base = fmt::format("/data/Crema/selftest/cap{}-", n);
++		if (!s_cremaCaptured.insert(vs->baseHash).second)
++			return;
++		const int n = 64 - s_cremaCaptureLeft--;
++		const std::string base = fmt::format("/data/Crema/selftest/cap-{:016x}-", vs->baseHash);
 +		auto write = [&](const char* name, const void* data, size_t size) {
 +			FILE* out = fopen((base + name).c_str(), "wb");
 +			if (!out)
@@ -4001,7 +4001,7 @@ index 512ebee..dfbfb4b 100644
 +		const std::string info = fmt::format("count {} baseVertex {} indexType {} indexMax {} stride {} vbAddr {:08x} vbSize {} vsAux {:016x}\n",
 +			count, baseVertex, indexType, indexMax, stride, vbAddr, vbSize, vs->auxHash);
 +		write("info.txt", info.data(), info.size());
-+		cemuLog_log(LogType::Force, "draw capture {}: {}", n, info);
++		cemuLog_log(LogType::Force, "draw capture {} ({:016x}): {}", n, vs->baseHash, info);
 +	}
 +
 +	void CremaDrawStats()
