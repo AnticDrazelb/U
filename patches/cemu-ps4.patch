@@ -3379,7 +3379,7 @@ index 7179087..5fc9f30 100644
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
-index f9788c9..9098afb 100644
+index f9788c9..112dd94 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 @@ -92,6 +92,13 @@ void LatteQueryObjectVk::endFragment()
@@ -3396,13 +3396,25 @@ index f9788c9..9098afb 100644
  void LatteQueryObjectVk::handleFinishedFragments()
  {
  	// remove finished fragments and add to m_acccumulatedSum
-@@ -103,6 +110,17 @@ void LatteQueryObjectVk::handleFinishedFragments()
+@@ -102,7 +109,29 @@ void LatteQueryObjectVk::handleFinishedFragments()
+ 			break;
  		if (!m_rendererVk->HasCommandBufferFinished(it.m_finishCommandBuffer))
  			break;
++#ifndef __ORBIS__
  		m_acccumulatedSum += m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
++#endif
 +#ifdef __ORBIS__
 +		{
-+			const uint64 result = m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
++			// Crema: on the PS4 every copied result came back 0 (Sonic Lost World hid its scenery): the
++			// pool is also read directly from the CPU, and that value is used when it has samples
++			uint64 direct = 0;
++			const VkResult directResult = vkGetQueryPoolResults(m_rendererVk->GetLogicalDevice(), m_rendererVk->m_occlusionQueries.queryPool, it.queryIndex, 1,
++				sizeof(direct), &direct, sizeof(direct), VK_QUERY_RESULT_64_BIT);
++			const uint64 copied = m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
++			if (s_cremaQueryResults < 20 || (copied == 0 && direct != 0 && s_cremaQueryResults < 200))
++				cemuLog_log(LogType::Force, "occlusion query {}: copied {} direct {} (vkGetQueryPoolResults {})", it.queryIndex, copied, direct, (sint32)directResult);
++			const uint64 result = (directResult == VK_SUCCESS && direct != 0) ? direct : copied;
++			m_acccumulatedSum += result;
 +			s_cremaQueryResults++;
 +			s_cremaQueryZero += result == 0;
 +			if (s_cremaQueryResults == 50 || s_cremaQueryResults == 1000 || (s_cremaQueryResults % 20000) == 0)
