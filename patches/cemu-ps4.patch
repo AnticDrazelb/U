@@ -591,10 +591,10 @@ index d4b41b9..b111c13 100644
  		x64Gen_writeU8(x64GenContext, 0x40);
  	x64Gen_writeU8(x64GenContext, 0x0F);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-index 935e61a..612f403 100644
+index 935e61a..e1c078a 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/IML/IMLRegisterAllocator.cpp
-@@ -14,10 +14,23 @@
+@@ -14,10 +14,26 @@
  #include <boost/container/small_vector.hpp>
  
  #include "Common/cpu_features.h"
@@ -603,6 +603,9 @@ index 935e61a..612f403 100644
  #define DEBUG_RA_EXTRA_VALIDATION 0	// if set to non-zero, additional expensive validation checks will be performed
  #define DEBUG_RA_INSTRUCTION_GEN 0
  
++// the merge budget of the compile running on this thread (PPCRecompiler.cpp: less for recompiles)
++thread_local uint64 g_cremaRaMergeBudget = 200000;
++
 +namespace
 +{
 +	// Crema: merging close ranges is only an optimization (values stay in registers between
@@ -612,13 +615,13 @@ index 935e61a..612f403 100644
 +	constexpr uint64 kRaMergeBudget = 200000; // (1M: 27 s for the largest functions on the PS4)
 +	thread_local uint64 t_raMergeSteps = 0;
 +	thread_local uint64 t_raMergeCapped = 0;
-+	inline bool RaMergeBudgetLeft() { return t_raMergeSteps < kRaMergeBudget; }
++	inline bool RaMergeBudgetLeft() { return t_raMergeSteps < g_cremaRaMergeBudget; }
 +}
 +
  struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per register and segment
  {
  	IMLRARegAbstractLiveness(IMLRegFormat regBaseFormat, sint32 usageStart, sint32 usageEnd)
-@@ -35,6 +48,8 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
+@@ -35,6 +51,8 @@ struct IMLRARegAbstractLiveness // preliminary liveness info. One entry per regi
  	IMLRegFormat regBaseFormat;
  };
  
@@ -627,7 +630,7 @@ index 935e61a..612f403 100644
  struct IMLRegisterAllocatorContext
  {
  	IMLRegisterAllocatorParameters* raParam;
-@@ -42,10 +57,10 @@ struct IMLRegisterAllocatorContext
+@@ -42,10 +60,10 @@ struct IMLRegisterAllocatorContext
  
  	std::unordered_map<IMLRegID, IMLRegFormat> regIdToBaseFormat;
  	// first pass
@@ -640,7 +643,7 @@ index 935e61a..612f403 100644
  	{
  		return perSegmentAbstractRanges[imlSegment->momentaryIndex];
  	}
-@@ -196,9 +211,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
+@@ -196,9 +214,8 @@ static void GetInstructionFixedRegisters(IMLInstruction* instruction, IMLFixedRe
  
  uint32 IMLRA_GetNextIterationIndex()
  {
@@ -652,7 +655,7 @@ index 935e61a..612f403 100644
  }
  
  bool _detectLoop(IMLSegment* currentSegment, sint32 depth, uint32 iterationIndex, IMLSegment* imlSegmentLoopBase)
-@@ -1569,6 +1583,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
+@@ -1569,6 +1586,7 @@ void IMLRA_extendAbstractRangeToBeginningOfSegment(IMLRegisterAllocatorContext&
  
  void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regId, IMLSegment** route, sint32 routeDepth)
  {
@@ -660,7 +663,7 @@ index 935e61a..612f403 100644
  #ifdef CEMU_DEBUG_ASSERT
  	if (routeDepth < 2)
  		assert_dbg();
-@@ -1585,42 +1600,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
+@@ -1585,42 +1603,92 @@ void IMLRA_connectAbstractRanges(IMLRegisterAllocatorContext& ctx, IMLRegID regI
  	IMLRA_extendAbstractRangeToBeginningOfSegment(ctx, route[routeDepth - 1], regId);
  }
  
@@ -766,7 +769,7 @@ index 935e61a..612f403 100644
  	}
  }
  
-@@ -1638,6 +1703,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
+@@ -1638,6 +1706,17 @@ void PPCRecRA_checkAndTryExtendRange(IMLRegisterAllocatorContext& ctx, IMLSegmen
  	if (remainingScanDist <= 0)
  		return; // can't reach end
  
@@ -784,7 +787,7 @@ index 935e61a..612f403 100644
  	IMLSegment* route[64];
  	route[0] = currentSegment;
  	if (currentSegment->nextSegmentBranchNotTaken)
-@@ -1698,8 +1774,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
+@@ -1698,8 +1777,27 @@ void PPCRecRA_followFlowAndExtendRanges(IMLRegisterAllocatorContext& ctx, IMLSeg
  	}
  }
  
@@ -828,7 +831,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..89f8157 100644
+index c9758f3..caabf17 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -877,7 +880,7 @@ index c9758f3..89f8157 100644
  	std::atomic_int_fast32_t recompilerEnableCount{0};
  	// recompiler thread
  	std::thread workerThread;
-@@ -59,6 +80,306 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
+@@ -59,6 +80,307 @@ void ATTR_MS_ABI (*PPCRecompiler_leaveRecompilerCode_unvisited)();
  
  PPCRecompilerInstanceData_t* ppcRecompilerInstanceData;
  
@@ -888,6 +891,7 @@ index c9758f3..89f8157 100644
 +#include "Cafe/CafeSystem.h"
 +#include <unordered_map>
 +extern "C" void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
++extern thread_local uint64 g_cremaRaMergeBudget; // IML/IMLRegisterAllocator.cpp
 +extern "C" size_t ps4rt_heap_size(void); // port/ps4_runtime.cpp
 +extern "C" size_t ps4rt_heap_footprint(void);
 +// Crema: the newest recompiled functions' host code ranges, so a crash in recompiled code can be
@@ -1184,7 +1188,7 @@ index c9758f3..89f8157 100644
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  static std::mutex s_singleRecompilationMutex;
  #endif
-@@ -174,6 +495,48 @@ void PPCRecompiler_attemptEnter(PPCInterpreter_t* hCPU, uint32 enterAddress)
+@@ -174,6 +496,48 @@ void PPCRecompiler_attemptEnter(PPCInterpreter_t* hCPU, uint32 enterAddress)
  }
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext);
  
@@ -1233,7 +1237,7 @@ index c9758f3..89f8157 100644
  PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PPCRange_t range, std::set<uint32>& entryAddresses, std::vector<std::pair<MPTR, uint32>>& entryPointsOut, PPCFunctionBoundaryTracker& boundaryTracker)
  {
  	if (range.startAddress >= PPC_REC_CODE_AREA_END)
-@@ -207,9 +570,21 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+@@ -207,9 +571,21 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
  	// generate intermediate code
  	ppcImlGenContext_t ppcImlGenContext = { 0 };
  	ppcImlGenContext.debug_entryPPCAddress = range.startAddress;
@@ -1255,7 +1259,7 @@ index c9758f3..89f8157 100644
  		delete ppcRecFunc;
  		return nullptr;
  	}
-@@ -232,10 +607,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+@@ -232,10 +608,19 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
  		delete ppcRecFunc;
  		return nullptr;
  	}
@@ -1275,7 +1279,7 @@ index c9758f3..89f8157 100644
  	if (x64GenerationSuccess == false)
  	{
  		return nullptr;
-@@ -340,6 +724,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
+@@ -340,6 +725,142 @@ void PPCRecompiler_NativeRegisterAllocatorPass(ppcImlGenContext_t& ppcImlGenCont
  	IMLRegisterAllocator_AllocateRegisters(&ppcImlGenContext, raParam);
  }
  
@@ -1418,7 +1422,7 @@ index c9758f3..89f8157 100644
  bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  {
  	// isolate entry points from function flow (enterable segments must not be the target of any other segment)
-@@ -351,11 +871,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
+@@ -351,11 +872,22 @@ bool PPCRecompiler_ApplyIMLPasses(ppcImlGenContext_t& ppcImlGenContext)
  	// delay byte swapping for certain load+store patterns
  	IMLOptimizer_OptimizeDirectIntegerCopies(&ppcImlGenContext);
  
@@ -1441,7 +1445,7 @@ index c9758f3..89f8157 100644
  
  	return true;
  }
-@@ -377,6 +908,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -377,6 +909,8 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	bool isInvalidated = false;
  	for (auto& invRange : s_ppcRecompilerState.invalidationRanges)
  	{
@@ -1450,7 +1454,7 @@ index c9758f3..89f8157 100644
  		MPTR rStartAddr = invRange.startAddress;
  		MPTR rEndAddr = rStartAddr + invRange.size;
  		for (auto& recFuncRange : ppcRecFunc->list_ranges)
-@@ -388,7 +921,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -388,7 +922,15 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  			}
  		}
  	}
@@ -1467,7 +1471,7 @@ index c9758f3..89f8157 100644
  	if (isInvalidated)
  	{
  		s_ppcRecompilerState.recompilerSpinlock.unlock();
-@@ -419,6 +960,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
+@@ -419,6 +961,9 @@ bool PPCRecompiler_makeRecompiledFunctionActive(uint32 initialEntryPoint, PPCFun
  	{
  		r.storedRange = s_ppcRecompilerState.functionStorage.storeRange(ppcRecFunc, r.ppcAddress, r.ppcAddress + r.ppcSize);
  	}
@@ -1477,58 +1481,25 @@ index c9758f3..89f8157 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +987,167 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +988,134 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
 +#ifdef __ORBIS__
-+	// Crema: a range entered at many places (a switch's cases reached through bctr, functions
-+	// joined by tail calls) was compiled whole again for every new entry: Sonic Lost World compiled
-+	// one of 538 segments 129 times in 95 s (~1 s each on the PS4: hitches, and that code running
-+	// interpreted meanwhile). The entries already known go in too: the addresses waiting to be
-+	// compiled, the ones earlier compiles made, and (second compile on) the functions in it.
++	// Crema: a range is compiled whole again for every new entry the game reaches (Cemu: one entry
++	// a compile) - Sonic Lost World compiled one of 538 segments 129 times in 95 s, ~1 s each on the
++	// PS4. Adding entries (v02.30-v02.33: the known ones, guessed labels, jump table slots) made
++	// Sonic hang or crash, so the entries stay Cemu's; a range's later compiles are made cheap
++	// instead: register range merging (optimization only) gets a tenth of its budget.
 +	{
-+		const uint32 rangeEnd = range.startAddress + range.length;
-+		for (uint32 v = range.startAddress; v < rangeEnd; v += 4)
-+		{
-+			if (v != address && ppcRecompilerInstanceData->ppcRecompilerDirectJumpTable[v / 4] != PPCRecompiler_leaveRecompilerCode_unvisited)
-+				entryAddresses.emplace(v);
-+		}
 +		static std::unordered_map<uint32, uint32> s_rangeCompiles;
 +		const uint32 times = ++s_rangeCompiles[range.startAddress];
-+		// from the range's second compile on, its jump tables' slots as well (a run of b after a bctr:
-+		// a switch's cases, each reached through the bctr - Sonic Lost World's 02d97eec has 184).
-+		// v02.30 guessed every block start after an unconditional branch: Sonic Lost World then hung
-+		// in a loop entered at such a label (03749c44) and crashed (v02.31)
-+		if (times >= 2)
-+		{
-+			for (uint32 v = range.startAddress; v + 4 < rangeEnd; v += 4)
-+			{
-+				if (memory_readU32(v) != 0x4E800420) // bctr
-+					continue;
-+				for (uint32 slot = v + 4; slot < rangeEnd; slot += 4)
-+				{
-+					const uint32 op = memory_readU32(slot);
-+					if ((op >> 26) != 18 || (op & 3) != 0) // b (not ba / bl)
-+						break;
-+					entryAddresses.emplace(slot);
-+				}
-+			}
-+		}
++		g_cremaRaMergeBudget = times >= 2 ? 20000 : 200000;
 +		if (times == 2 || times == 8 || times == 64)
 +		{
-+			// what made it compile again: the entry asked for, and the instruction before it
-+			// (a call: a return point; a branch: a label; else mid-block)
-+			const uint32 before = address > range.startAddress ? memory_readU32(address - 4) : 0;
-+			const char* kind = address == range.startAddress ? "its start" :
-+				(before >> 26) == 18 && (before & 1) ? "after a call (bl)" :
-+				before == 0x4E800421 ? "after a call (bctrl)" :
-+				(before >> 26) == 18 ? "after a branch (b)" :
-+				before == 0x4E800020 ? "after blr" : before == 0x4E800420 ? "after bctr" :
-+				(before >> 26) == 16 ? "after a conditional branch" : "mid-block";
-+			char line[220];
-+			snprintf(line, sizeof(line), "recompiler: the range at %08x (%u bytes) compiled %u times, %zu entry points now; this time for %08x, %s",
-+				range.startAddress, range.length, times, entryAddresses.size(), address, kind);
++			char line[160];
++			snprintf(line, sizeof(line), "recompiler: the range at %08x (%u bytes) compiled %u times (later compiles quick)",
++				range.startAddress, range.length, times);
 +			ps4_boot_trace(line);
 +		}
 +	}
@@ -1649,7 +1620,7 @@ index c9758f3..89f8157 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1180,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1148,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1733,7 +1704,7 @@ index c9758f3..89f8157 100644
  	}
  }
  
-@@ -504,6 +1269,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1237,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1775,7 +1746,7 @@ index c9758f3..89f8157 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1409,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1377,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1783,7 +1754,7 @@ index c9758f3..89f8157 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1503,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1471,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1796,7 +1767,7 @@ index c9758f3..89f8157 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1516,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1484,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
