@@ -3104,6 +3104,44 @@ index 7d2cb65..5ad301c 100644
 +	VkDescriptorPool pool{ VK_NULL_HANDLE }; // Crema: the pool it came from (VulkanRenderer::AllocateDescriptorSet)
  };
 \ No newline at end of file
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VKRMemoryManager.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VKRMemoryManager.cpp
+index 54ca20c..e50f754 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VKRMemoryManager.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VKRMemoryManager.cpp
+@@ -31,6 +31,17 @@ void VKRSynchronizedRingAllocator::allocateAdditionalUploadBuffer(uint32 sizeReq
+ 	AllocatorBuffer_t newBuffer{};
+ 	newBuffer.writeIndex = 0;
+ 	newBuffer.basePtr = nullptr;
++#ifdef __ORBIS__
++	// Crema setting uniform_memory = uncached: the upload rings (staging, index, vertex stride) in
++	// write-combined device memory (the PS4 GPU's garlic path) as well, not CPU-cached onion memory
++	extern bool g_crema_uniforms_uncached; // gui/ps4/launcher/CremaSettings.cpp
++	const VkBufferUsageFlags ps4Usage = m_bufferType == VKR_BUFFER_TYPE::STAGING ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT :
++		m_bufferType == VKR_BUFFER_TYPE::INDEX ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
++	if (g_crema_uniforms_uncached && m_vkrMemMgr->CreateBuffer(bufferAllocSize, ps4Usage,
++			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, newBuffer.vk_buffer, newBuffer.vk_mem))
++		;
++	else
++#endif
+ 	if (m_bufferType == VKR_BUFFER_TYPE::STAGING)
+ 		m_vkrMemMgr->CreateBuffer(bufferAllocSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, newBuffer.vk_buffer, newBuffer.vk_mem);
+ 	else if (m_bufferType == VKR_BUFFER_TYPE::INDEX)
+@@ -368,7 +379,15 @@ VkBufferChunkedHeap::~VkBufferChunkedHeap()
+ uint32 VkBufferChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumAllocationSize)
+ {
+ 	size_t allocationSize = std::max<size_t>(m_minimumBufferAllocationSize, minimumAllocationSize);
++#ifdef __ORBIS__
++	extern bool g_crema_uniforms_uncached; // gui/ps4/launcher/CremaSettings.cpp: Upload Memory Uncached
++	VKRBuffer* buffer = g_crema_uniforms_uncached ? VKRBuffer::Create(m_bufferType, allocationSize,
++		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) : nullptr;
++	if (!buffer)
++		buffer = VKRBuffer::Create(m_bufferType, allocationSize, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++#else
+ 	VKRBuffer* buffer = VKRBuffer::Create(m_bufferType, allocationSize, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++#endif
+ 	if(!buffer)
+ 		buffer = VKRBuffer::Create(m_bufferType, allocationSize, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+ 	if(!buffer)
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
 index b7dc500..c9b170a 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.cpp
@@ -9990,7 +10028,7 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..751bfcc
+index 0000000..2db1b97
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
 @@ -0,0 +1,659 @@
@@ -10124,8 +10162,8 @@ index 0000000..751bfcc
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"denormals", "Keep Float Denormals", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off (default): they become zero in float math, as on the Wii U. On made Sonic Lost World's world geometry blow up (2.42); for tests only."},
-+		{"uniform_memory", "Uniform Buffer Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
-+			"Where each draw's shader constants (an animated model's bone matrices) are put for the GPU. Cached: CPU-cached memory (Cemu's choice). Uncached: write-combined memory the GPU reads directly. Try Uncached if models are torn or missing on the PS4 only."},
++		{"uniform_memory", "Upload Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
++			"Where the data uploaded for each draw (shader constants, indices, vertex data, copies) is put for the GPU. Cached: CPU-cached memory (Cemu's choice). Uncached: write-combined memory the GPU reads directly. Try Uncached if models are torn or missing on the PS4 only."},
 +		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Writes every shader the game uses, translated, to dump/shaders (for finding rendering bugs). Slower loading."},
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
