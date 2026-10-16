@@ -3378,6 +3378,42 @@ index 7179087..5fc9f30 100644
  
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
+index f9788c9..9098afb 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
+@@ -92,6 +92,13 @@ void LatteQueryObjectVk::endFragment()
+ 	m_hasActiveFragment = false;
+ }
+ 
++#ifdef __ORBIS__
++// Crema setting occlusion_queries: every query visible (the game draws everything it tests), and
++// how many results come back zero (objects the game then hides)
++bool g_crema_queries_visible = false;
++static uint64 s_cremaQueryResults = 0, s_cremaQueryZero = 0;
++#endif
++
+ void LatteQueryObjectVk::handleFinishedFragments()
+ {
+ 	// remove finished fragments and add to m_acccumulatedSum
+@@ -103,6 +110,17 @@ void LatteQueryObjectVk::handleFinishedFragments()
+ 		if (!m_rendererVk->HasCommandBufferFinished(it.m_finishCommandBuffer))
+ 			break;
+ 		m_acccumulatedSum += m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
++#ifdef __ORBIS__
++		{
++			const uint64 result = m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
++			s_cremaQueryResults++;
++			s_cremaQueryZero += result == 0;
++			if (s_cremaQueryResults == 50 || s_cremaQueryResults == 1000 || (s_cremaQueryResults % 20000) == 0)
++				cemuLog_log(LogType::Force, "occlusion queries: {} results, {} of them zero (last {})", s_cremaQueryResults, s_cremaQueryZero, result);
++			if (g_crema_queries_visible)
++				m_acccumulatedSum += 0x10000; // reported visible
++		}
++#endif
+ 		releaseQueryIndex(it.queryIndex);
+ 		list_queryFragments.erase(list_queryFragments.begin());
+ 	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 index 599190a..7af3858 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
@@ -10028,10 +10064,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..2db1b97
+index 0000000..c5aa9ac
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,659 @@
+@@ -0,0 +1,663 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10054,6 +10090,7 @@ index 0000000..2db1b97
 +bool g_crema_denorm_preserve = false;
 +// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
 +bool g_crema_uniforms_uncached = false;
++extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 +
 +#include <algorithm>
 +#include <atomic>
@@ -10162,6 +10199,8 @@ index 0000000..2db1b97
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"denormals", "Keep Float Denormals", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off (default): they become zero in float math, as on the Wii U. On made Sonic Lost World's world geometry blow up (2.42); for tests only."},
++		{"occlusion_queries", "Occlusion Queries", "Diagnostics", {{"real", "Real"}, {"visible", "Always Visible"}}, "real", false,
++			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"uniform_memory", "Upload Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
 +			"Where the data uploaded for each draw (shader constants, indices, vertex data, copies) is put for the GPU. Cached: CPU-cached memory (Cemu's choice). Uncached: write-combined memory the GPU reads directly. Try Uncached if models are torn or missing on the PS4 only."},
 +		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -10620,6 +10659,7 @@ index 0000000..2db1b97
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
++	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	ActiveSettings::EnableDumpShaders(get("dump_shaders") == "on");
 +	// the GPU driver's own debug switches (read when the Vulkan instance and shader compiler start,
 +	// after this); its pipeline cache is off with them, or cached shaders would come back
