@@ -1801,7 +1801,7 @@ index bfb2aed..5e6059c 100644
  bool PPCRecompilerImlGen_PS_MADDSX(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode, bool isVariant1);
  bool PPCRecompilerImlGen_PS_ADD(ppcImlGenContext_t* ppcImlGenContext, uint32 opcode);
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
-index 89e805d..483c6ca 100644
+index 89e805d..3825b86 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp
 @@ -8,6 +8,8 @@
@@ -1880,18 +1880,16 @@ index 89e805d..483c6ca 100644
  		case 8: //Sub category - move/negate
  			switch (PPC_getBits(opcode, 25, 5))
  			{
-@@ -2362,6 +2393,10 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
+@@ -2362,6 +2393,8 @@ bool PPCRecompiler_decodePPCInstruction(ppcImlGenContext_t* ppcImlGenContext)
  			if (!PPCRecompilerImlGen_STORE_INDEXED(ppcImlGenContext, opcode, 8, true, false))
  				unsupportedInstructionFound = true;
  			break;
-+		case 232: // SUBFME
-+			if (PPCRecompilerImlGen_SUBFME(ppcImlGenContext, opcode) == false)
-+				unsupportedInstructionFound = true;
-+			break;
++		// case 232 (SUBFME) stays unsupported: compiled (v02.30-v02.36), Sonic Lost World's 64-bit
++		// tick difference at 02d43f08 (subfic/subfme/addc/adde/addze) deadlocked its threads; interpreted, fine
  		case 234:
  			if (PPCRecompilerImlGen_ADDME(ppcImlGenContext, opcode) == false)
  				unsupportedInstructionFound = true;
-@@ -2968,6 +3003,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
+@@ -2968,6 +3001,10 @@ std::vector<PPCBasicBlockInfo> PPCRecompiler_DetermineBasicBlockRange(PPCFunctio
  	return basicBlockList;
  }
  
@@ -1902,7 +1900,7 @@ index 89e805d..483c6ca 100644
  bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBlockInfo& basicBlockInfo)
  {
  	ppcImlGenContext.currentOutputSegment = basicBlockInfo.GetSegmentForInstructionAppend();
-@@ -2984,6 +3023,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
+@@ -2984,6 +3021,9 @@ bool PPCIMLGen_FillBasicBlock(ppcImlGenContext_t& ppcImlGenContext, PPCBasicBloc
  		if (PPCRecompiler_decodePPCInstruction(&ppcImlGenContext))
  		{
  			cemuLog_logDebug(LogType::Force, "PPCRecompiler: Unsupported instruction at 0x{:08x}", addressOfCurrentInstruction);
@@ -1912,7 +1910,7 @@ index 89e805d..483c6ca 100644
  			ppcImlGenContext.currentOutputSegment = nullptr;
  			return false;
  		}
-@@ -3115,6 +3157,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
+@@ -3115,6 +3155,8 @@ void PPCRecompiler_SetSegmentsUncertainFlow(ppcImlGenContext_t& ppcImlGenContext
  	}
  }
  
@@ -1921,7 +1919,7 @@ index 89e805d..483c6ca 100644
  bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunctionBoundaryTracker& boundaryTracker, std::set<uint32>& entryAddresses)
  {
  	std::vector<PPCBasicBlockInfo> basicBlockList = PPCRecompiler_DetermineBasicBlockRange(boundaryTracker, entryAddresses);
-@@ -3164,6 +3208,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3164,6 +3206,13 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  	// generate cycle counters
  	// in theory we could generate these as part of FillBasicBlock() but in the future we might use more complex logic to emit fewer operations
@@ -1935,7 +1933,7 @@ index 89e805d..483c6ca 100644
  	for (size_t i = 0; i < basicBlockList.size(); i++)
  	{
  		PPCBasicBlockInfo& basicBlockInfo = basicBlockList[i];
-@@ -3171,6 +3222,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
+@@ -3171,6 +3220,15 @@ bool PPCRecompiler_GenerateIML(ppcImlGenContext_t& ppcImlGenContext, PPCFunction
  
  		uint32 ppcInstructionCount = (basicBlockInfo.lastAddress - basicBlockInfo.startAddress + 4) / 4;
  		cemu_assert_debug(ppcInstructionCount > 0);
