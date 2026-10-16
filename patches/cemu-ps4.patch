@@ -9745,10 +9745,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..b94997e
+index 0000000..eeb10eb
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,642 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9871,8 +9871,8 @@ index 0000000..b94997e
 +		{"profiler", "Profiler", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
-+			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"all", "All"}}, "off", false,
-+			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Slower; for one test each."},
++			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"sync", "Synchronized"}, {"all", "All"}}, "off", false,
++			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Synchronized: the GPU waits and flushes its caches after every draw, and copies avoid compute shaders. Slower; for one test each."},
 +		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"When the PS4 closes a game with error CE-34878-0 (a GPU fault), the GPU's last commands are kept for the logs. Slightly slower."},
 +	};
@@ -10332,6 +10332,8 @@ index 0000000..b94997e
 +			radv += "zerovram,";
 +		if (checks == "shaders" || checks == "all")
 +			aco = "noopt,nosched";
++		if (checks == "sync" || checks == "all")
++			radv += "syncshaders,nocompute,";
 +		if (checks != "off" && !checks.empty())
 +			radv += "nocache";
 +		if (radv.empty())
