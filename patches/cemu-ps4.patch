@@ -2059,6 +2059,38 @@ index f9c811b..a54e976 100644
  
  	uint32 gqrValue = 0;
  	if ( !PPCRecompiler_isUGQRValueKnown(ppcImlGenContext, gqrIndex, gqrValue) )
+diff --git a/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp b/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp
+index a561a20..61f945d 100644
+--- a/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp
+@@ -7,6 +7,9 @@
+ #define CACHE_PAGE_SIZE_M1	(CACHE_PAGE_SIZE-1)
+ 
+ uint32 g_currentCacheChronon = 0;
++// Crema: 0 vertex/uniform buffer data is re-checked only after the game flushes its CPU cache (Cemu),
++// 1 also at every new frame, 2 at every draw that uses it (gui/ps4/launcher/CremaSettings.cpp)
++int g_crema_vertex_resync = 0;
+ 
+ template<typename TRangeType, typename TNodeObject>
+ class IntervalTree
+@@ -1565,6 +1568,8 @@ uint32 LatteBufferCache_retrieveDataInCache(MPTR physAddress, uint32 size)
+ 	range->flagInUse();
+ 
+ 	range->checkAndSyncModificationsIfChrononChanged(physAddress, size);
++	if (g_crema_vertex_resync == 2 && size != 0)
++		range->checkAndSyncModifications(physAddress & ~CACHE_PAGE_SIZE_M1, (physAddress + size + CACHE_PAGE_SIZE_M1) & ~CACHE_PAGE_SIZE_M1, true);
+ 
+ 	return range->getBufferOffset(physAddress);
+ }
+@@ -1726,7 +1731,7 @@ void LatteBufferCache_notifyDrawDone()
+ 
+ void LatteBufferCache_notifySwapTVScanBuffer()
+ {
+-	if( ActiveSettings::FlushGPUCacheOnSwap() )
++	if( ActiveSettings::FlushGPUCacheOnSwap() || g_crema_vertex_resync != 0 )
+ 		g_currentCacheChronon++;
+ }
+ 
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..24b109b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -2198,7 +2230,7 @@ index dbc3cff..eea3451 100644
  
  #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-index f1556f8..7f41344 100644
+index f1556f8..6164421 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 @@ -17,6 +17,10 @@
@@ -2289,7 +2321,28 @@ index f1556f8..7f41344 100644
  void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPadView)
  {
  	// make sure texture is updated to latest data in cache
-@@ -970,6 +1030,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -961,6 +1021,20 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+ 
+ 			filter = LatteTextureView::MagFilter::kNearestNeighbor;
+ 		}
++		else if (scaling_filter == kFsrFilter && RendererOutputShader::s_fsr_shader)
++		{
++			if (renderUpsideDown)
++				shader = RendererOutputShader::s_fsr_shader_ud;
++			else
++				shader = RendererOutputShader::s_fsr_shader;
++
++			filter = LatteTextureView::MagFilter::kNearestNeighbor; // the shader fetches texels itself
++		}
++		else
++		{
++			shader = renderUpsideDown ? RendererOutputShader::s_bicubic_shader_ud : RendererOutputShader::s_bicubic_shader;
++			filter = LatteTextureView::MagFilter::kLinear;
++		}
+ 	}
+ 	cemu_assert(shader);
+ 	g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
+@@ -970,6 +1044,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  	swkbd_render(!isPadView);
  	nn::erreula::render(!isPadView);
  	LatteOverlay_render(isPadView);
@@ -2445,6 +2498,168 @@ index 9d6a438..75833f4 100644
  		src->add("#else" _CRLF);
  		// OpenGL defines
  		src->add("#define ATTR_LAYOUT(__location) layout(location = __location)" _CRLF);
+diff --git a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp
+index a43b7ee..8fb05b8 100644
+--- a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp
++++ b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp
+@@ -244,6 +244,97 @@ fragment float4 main0(VertexOut in [[stage_in]], texture2d<float> textureSrc [[t
+ }
+ )";
+ 
++const std::string RendererOutputShader::s_fsr_shader_source =
++R"(
++// AMD FidelityFX Super Resolution 1.0, EASU (edge adaptive spatial upsampling) in one pass:
++// a 12-tap Lanczos-like filter stretched along the local edge direction, clamped to the
++// 4 nearest texels so edges get sharp without ringing
++float fsrLuma(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
++
++vec3 fsrTap(ivec2 p)
++{
++	return texelFetch(textureSrc, clamp(p, ivec2(0), ivec2(textureSrcResolution) - 1), 0).rgb;
++}
++
++void fsrSet(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE)
++{
++	float lenX = max(abs(lD - lC), abs(lC - lB));
++	lenX = lenX > 0.0 ? 1.0 / lenX : 0.0;
++	float dirX = lD - lB;
++	lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
++	lenX *= lenX;
++	float lenY = max(abs(lE - lC), abs(lC - lA));
++	lenY = lenY > 0.0 ? 1.0 / lenY : 0.0;
++	float dirY = lE - lA;
++	lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
++	lenY *= lenY;
++	dir += vec2(dirX, dirY) * w;
++	len += (lenX + lenY) * w;
++}
++
++void fsrTapW(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len2, float lob, float clp, vec3 c)
++{
++	vec2 v = vec2(dot(off, dir), dot(off, vec2(-dir.y, dir.x))) * len2;
++	float d2 = min(dot(v, v), clp);
++	float wB = 0.4 * d2 - 1.0;
++	float wA = lob * d2 - 1.0;
++	wB *= wB;
++	wA *= wA;
++	wB = 1.5625 * wB - 0.5625;
++	float w = wB * wA;
++	aC += c * w;
++	aW += w;
++}
++
++void outputShader()
++{
++	vec2 pp = passUV * textureSrcResolution - 0.5;
++	vec2 fp = floor(pp);
++	pp -= fp;
++	ivec2 p = ivec2(fp);
++	vec3 b = fsrTap(p + ivec2(0, -1)), c = fsrTap(p + ivec2(1, -1));
++	vec3 e = fsrTap(p + ivec2(-1, 0)), f = fsrTap(p), g = fsrTap(p + ivec2(1, 0)), h = fsrTap(p + ivec2(2, 0));
++	vec3 i = fsrTap(p + ivec2(-1, 1)), j = fsrTap(p + ivec2(0, 1)), k = fsrTap(p + ivec2(1, 1)), l = fsrTap(p + ivec2(2, 1));
++	vec3 n = fsrTap(p + ivec2(0, 2)), o = fsrTap(p + ivec2(1, 2));
++	float bL = fsrLuma(b), cL = fsrLuma(c), eL = fsrLuma(e), fL = fsrLuma(f), gL = fsrLuma(g), hL = fsrLuma(h);
++	float iL = fsrLuma(i), jL = fsrLuma(j), kL = fsrLuma(k), lL = fsrLuma(l), nL = fsrLuma(n), oL = fsrLuma(o);
++	vec2 dir = vec2(0.0);
++	float len = 0.0;
++	fsrSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
++	fsrSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
++	fsrSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
++	fsrSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
++	float dirR = dot(dir, dir);
++	bool zro = dirR < 1.0 / 32768.0;
++	dirR = zro ? 1.0 : inversesqrt(dirR);
++	dir.x = zro ? 1.0 : dir.x;
++	dir *= dirR;
++	len *= 0.5;
++	len *= len;
++	float stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y));
++	vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
++	float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
++	float clp = 1.0 / lob;
++	vec3 aC = vec3(0.0);
++	float aW = 0.0;
++	fsrTapW(aC, aW, vec2( 0.0, -1.0) - pp, dir, len2, lob, clp, b);
++	fsrTapW(aC, aW, vec2( 1.0, -1.0) - pp, dir, len2, lob, clp, c);
++	fsrTapW(aC, aW, vec2(-1.0,  1.0) - pp, dir, len2, lob, clp, i);
++	fsrTapW(aC, aW, vec2( 0.0,  1.0) - pp, dir, len2, lob, clp, j);
++	fsrTapW(aC, aW, vec2( 0.0,  0.0) - pp, dir, len2, lob, clp, f);
++	fsrTapW(aC, aW, vec2(-1.0,  0.0) - pp, dir, len2, lob, clp, e);
++	fsrTapW(aC, aW, vec2( 1.0,  1.0) - pp, dir, len2, lob, clp, k);
++	fsrTapW(aC, aW, vec2( 2.0,  1.0) - pp, dir, len2, lob, clp, l);
++	fsrTapW(aC, aW, vec2( 2.0,  0.0) - pp, dir, len2, lob, clp, h);
++	fsrTapW(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, g);
++	fsrTapW(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, o);
++	fsrTapW(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, n);
++	vec3 mn = min(min(f, g), min(j, k));
++	vec3 mx = max(max(f, g), max(j, k));
++	colorOut0 = vec4(clamp(aC / aW, mn, mx), 1.0);
++}
++)";
++
+ RendererOutputShader::RendererOutputShader(const std::string& vertex_source, const std::string& fragment_source)
+ {
+     std::string finalFragmentSrc;
+@@ -300,6 +391,9 @@ RendererOutputShader* RendererOutputShader::s_bicubic_shader_ud;
+ RendererOutputShader* RendererOutputShader::s_hermit_shader;
+ RendererOutputShader* RendererOutputShader::s_hermit_shader_ud;
+ 
++RendererOutputShader* RendererOutputShader::s_fsr_shader;
++RendererOutputShader* RendererOutputShader::s_fsr_shader_ud;
++
+ std::string RendererOutputShader::GetOpenGlVertexSource(bool render_upside_down)
+ {
+ 	// vertex shader
+@@ -527,6 +621,9 @@ void RendererOutputShader::InitializeStatic()
+ 
+     	s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
+     	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
++
++    	s_fsr_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source);
++    	s_fsr_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source);
+ 		break;
+     }
+ #endif
+@@ -546,6 +643,9 @@ void RendererOutputShader::InitializeStatic()
+ 
+     	s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
+     	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
++
++    	s_fsr_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source);
++    	s_fsr_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source);
+ 		break;
+     }
+ #endif
+@@ -562,4 +662,7 @@ void RendererOutputShader::ShutdownStatic()
+ 
+ 	delete s_hermit_shader;
+ 	delete s_hermit_shader_ud;
++
++	delete s_fsr_shader;
++	delete s_fsr_shader_ud;
+ }
+diff --git a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h
+index 433a330..b72c18f 100644
+--- a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h
++++ b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h
+@@ -50,6 +50,9 @@ public:
+ 	static RendererOutputShader* s_hermit_shader;
+ 	static RendererOutputShader* s_hermit_shader_ud;
+ 
++	static RendererOutputShader* s_fsr_shader;
++	static RendererOutputShader* s_fsr_shader_ud;
++
+ 	static std::string GetOpenGlVertexSource(bool render_upside_down);
+ 	static std::string GetVulkanVertexSource(bool render_upside_down);
+ 	static std::string GetMetalVertexSource(bool render_upside_down);
+@@ -65,6 +68,7 @@ private:
+ 	static const std::string s_copy_shader_source;
+ 	static const std::string s_bicubic_shader_source;
+ 	static const std::string s_hermite_shader_source;
++	static const std::string s_fsr_shader_source;
+ 
+ 	static const std::string s_bicubic_shader_source_vk;
+ 	static const std::string s_hermite_shader_source_vk;
 diff --git a/src/Cafe/HW/Latte/Renderer/RendererShader.cpp b/src/Cafe/HW/Latte/Renderer/RendererShader.cpp
 index 293d959..27edce6 100644
 --- a/src/Cafe/HW/Latte/Renderer/RendererShader.cpp
@@ -5365,6 +5580,18 @@ index 0000000..0a576df
 +	std::vector<sint16> m_ring;
 +	size_t m_readPos = 0, m_count = 0;
 +};
+diff --git a/src/config/CemuConfig.h b/src/config/CemuConfig.h
+index 48c396f..5e5c5b6 100644
+--- a/src/config/CemuConfig.h
++++ b/src/config/CemuConfig.h
+@@ -94,6 +94,7 @@ enum UpscalingFilter
+ 	kBicubicFilter,
+ 	kBicubicHermiteFilter,
+ 	kNearestNeighborFilter,
++	kFsrFilter, // AMD FSR 1 EASU (RendererOuputShader.cpp), Vulkan/OpenGL
+ };
+ 
+ enum FullscreenScaling
 diff --git a/src/gui/CMakeLists.txt b/src/gui/CMakeLists.txt
 index d66e971..49e209f 100644
 --- a/src/gui/CMakeLists.txt
@@ -10097,10 +10324,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..c5aa9ac
+index 0000000..a3ab69f
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,663 @@
+@@ -0,0 +1,670 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10124,6 +10351,7 @@ index 0000000..c5aa9ac
 +// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
 +bool g_crema_uniforms_uncached = false;
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
++extern int g_crema_vertex_resync; // Cafe/HW/Latte/Core/LatteBufferCache.cpp
 +
 +#include <algorithm>
 +#include <atomic>
@@ -10156,8 +10384,8 @@ index 0000000..c5aa9ac
 +		{"scaling", "Picture Size", "Display", {{"keep", "Keep Aspect Ratio"}, {"stretch", "Stretch"}},
 +			"keep", false, "Stretch fills the whole TV even when the game's picture has another shape."},
 +		{"upscale_filter", "Upscaling Filter", "Display",
-+			{{"bicubic", "Bicubic"}, {"linear", "Bilinear"}, {"hermite", "Hermite"}, {"nearest", "Nearest"}},
-+			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest."},
++			{{"bicubic", "Bicubic"}, {"linear", "Bilinear"}, {"hermite", "Hermite"}, {"nearest", "Nearest"}, {"fsr", "FSR 1"}},
++			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest. FSR 1 (AMD FidelityFX Super Resolution) keeps edges sharp without jaggies; it makes the picture look better, not the game faster."},
 +		// Emulation
 +		{"cpu_mode", "CPU Mode", "Emulation",
 +			{{"auto", "Auto"}, {"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}, {"interpreter", "Interpreter (Debug)"}}, "auto", false,
@@ -10232,6 +10460,8 @@ index 0000000..c5aa9ac
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"denormals", "Keep Float Denormals", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off (default): they become zero in float math, as on the Wii U. On made Sonic Lost World's world geometry blow up (2.42); for tests only."},
++		{"vertex_resync", "Vertex Data Re-check", "Diagnostics", {{"off", "Off"}, {"frame", "Every Frame"}, {"draw", "Every Draw"}}, "off", false,
++			"Crema copies the game's models to the GPU and re-copies them when the game says they changed. Every Frame / Every Draw: also compare them with the game's memory that often (slower). Try it if a model is pulled out of shape or missing on the PS4 only."},
 +		{"occlusion_queries", "Occlusion Queries", "Diagnostics", {{"real", "Real"}, {"visible", "Always Visible"}}, "real", false,
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"uniform_memory", "Upload Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
@@ -10693,6 +10923,10 @@ index 0000000..c5aa9ac
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
++	{
++		const std::string resync = get("vertex_resync");
++		g_crema_vertex_resync = resync == "draw" ? 2 : resync == "frame" ? 1 : 0;
++	}
 +	ActiveSettings::EnableDumpShaders(get("dump_shaders") == "on");
 +	// the GPU driver's own debug switches (read when the Vulkan instance and shader compiler start,
 +	// after this); its pipeline cache is off with them, or cached shaders would come back
@@ -10723,7 +10957,7 @@ index 0000000..c5aa9ac
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
 +	const std::string upscale = get("upscale_filter");
 +	config.upscale_filter = upscale == "linear" ? kLinearFilter : upscale == "hermite" ? kBicubicHermiteFilter :
-+		upscale == "nearest" ? kNearestNeighborFilter : kBicubicFilter;
++		upscale == "nearest" ? kNearestNeighborFilter : upscale == "fsr" ? kFsrFilter : kBicubicFilter;
 +	config.fullscreen_scaling = get("scaling") == "stretch" ? kStretch : kKeepAspectRatio;
 +	config.overlay.position = get("show_fps") == "on" ? ScreenPosition::kTopLeft : ScreenPosition::kDisabled;
 +	config.overlay.fps = true;
