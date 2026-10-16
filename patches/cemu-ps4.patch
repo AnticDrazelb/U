@@ -828,7 +828,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..b7163da 100644
+index c9758f3..89f8157 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1477,7 +1477,7 @@ index c9758f3..b7163da 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +987,157 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +987,167 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1486,7 +1486,7 @@ index c9758f3..b7163da 100644
 +	// joined by tail calls) was compiled whole again for every new entry: Sonic Lost World compiled
 +	// one of 538 segments 129 times in 95 s (~1 s each on the PS4: hitches, and that code running
 +	// interpreted meanwhile). The entries already known go in too: the addresses waiting to be
-+	// compiled and the ones earlier compiles made.
++	// compiled, the ones earlier compiles made, and (second compile on) the functions in it.
 +	{
 +		const uint32 rangeEnd = range.startAddress + range.length;
 +		for (uint32 v = range.startAddress; v < rangeEnd; v += 4)
@@ -1496,29 +1496,39 @@ index c9758f3..b7163da 100644
 +		}
 +		static std::unordered_map<uint32, uint32> s_rangeCompiles;
 +		const uint32 times = ++s_rangeCompiles[range.startAddress];
-+		// v02.30 also guessed entries here (block starts after unconditional branches, branch targets):
-+		// Sonic Lost World then hung in a loop and jumped into bad code (v02.31), so only real entries now
-+		if (false && times >= 2)
++		// from the range's second compile on, its jump tables' slots as well (a run of b after a bctr:
++		// a switch's cases, each reached through the bctr - Sonic Lost World's 02d97eec has 184).
++		// v02.30 guessed every block start after an unconditional branch: Sonic Lost World then hung
++		// in a loop entered at such a label (03749c44) and crashed (v02.31)
++		if (times >= 2)
 +		{
-+			for (uint32 target : funcBoundaries.GetBranchTargets())
-+			{
-+				if (target >= range.startAddress && target < rangeEnd && (target & 3) == 0)
-+					entryAddresses.emplace(target);
-+			}
 +			for (uint32 v = range.startAddress; v + 4 < rangeEnd; v += 4)
 +			{
-+				const uint32 op = memory_readU32(v);
-+				const bool branch = (op >> 26) == 18 && (op & 1) == 0;              // b (not bl)
-+				const bool blr = op == 0x4E800020, bctr = op == 0x4E800420;
-+				if ((branch || blr || bctr) && memory_readU32(v + 4) != 0 && (memory_readU32(v + 4) >> 26) != 0)
-+					entryAddresses.emplace(v + 4);
++				if (memory_readU32(v) != 0x4E800420) // bctr
++					continue;
++				for (uint32 slot = v + 4; slot < rangeEnd; slot += 4)
++				{
++					const uint32 op = memory_readU32(slot);
++					if ((op >> 26) != 18 || (op & 3) != 0) // b (not ba / bl)
++						break;
++					entryAddresses.emplace(slot);
++				}
 +			}
 +		}
 +		if (times == 2 || times == 8 || times == 64)
 +		{
-+			char line[160];
-+			snprintf(line, sizeof(line), "recompiler: the range at %08x (%u bytes) compiled %u times, %zu entry points now",
-+				range.startAddress, range.length, times, entryAddresses.size());
++			// what made it compile again: the entry asked for, and the instruction before it
++			// (a call: a return point; a branch: a label; else mid-block)
++			const uint32 before = address > range.startAddress ? memory_readU32(address - 4) : 0;
++			const char* kind = address == range.startAddress ? "its start" :
++				(before >> 26) == 18 && (before & 1) ? "after a call (bl)" :
++				before == 0x4E800421 ? "after a call (bctrl)" :
++				(before >> 26) == 18 ? "after a branch (b)" :
++				before == 0x4E800020 ? "after blr" : before == 0x4E800420 ? "after bctr" :
++				(before >> 26) == 16 ? "after a conditional branch" : "mid-block";
++			char line[220];
++			snprintf(line, sizeof(line), "recompiler: the range at %08x (%u bytes) compiled %u times, %zu entry points now; this time for %08x, %s",
++				range.startAddress, range.length, times, entryAddresses.size(), address, kind);
 +			ps4_boot_trace(line);
 +		}
 +	}
@@ -1639,7 +1649,7 @@ index c9758f3..b7163da 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1170,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1180,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1723,7 +1733,7 @@ index c9758f3..b7163da 100644
  	}
  }
  
-@@ -504,6 +1259,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1269,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1765,7 +1775,7 @@ index c9758f3..b7163da 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1399,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1409,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1773,7 +1783,7 @@ index c9758f3..b7163da 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1493,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1503,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1786,7 +1796,7 @@ index c9758f3..b7163da 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1506,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1516,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
