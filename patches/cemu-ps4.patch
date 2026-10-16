@@ -3341,7 +3341,7 @@ index 7179087..5fc9f30 100644
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..1cdb1d5 100644
+index 599190a..7af3858 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -3365,7 +3365,25 @@ index 599190a..1cdb1d5 100644
  	if(!m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32)
  		cemuLog_log(LogType::Force, "Shader round mode control not available on this device or driver. Some rendering issues might occur.");
  
-@@ -876,6 +883,9 @@ VulkanRenderer::~VulkanRenderer()
+@@ -804,6 +811,17 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+ 	void* bufferPtr;
+ 	// init ringbuffer for uniform vars
+ 	m_uniformVarBufferMemoryIsCoherent = false;
++#ifdef __ORBIS__
++	// Crema setting uniform_memory: the per-draw uniform ring (bone matrices of animated models) in
++	// write-combined, uncached memory (the PS4 GPU's garlic path) instead of CPU-cached onion memory
++	extern bool g_crema_uniforms_uncached; // gui/ps4/launcher/CremaSettings.cpp
++	if (g_crema_uniforms_uncached && memoryManager->CreateBuffer(UNIFORMVAR_RINGBUFFER_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_uniformVarBuffer, m_uniformVarBufferMemory))
++	{
++		m_uniformVarBufferMemoryIsCoherent = true;
++		cemuLog_log(LogType::Force, "Vulkan: uniform ring buffer in uncached (write-combined) device memory");
++	}
++	else
++#endif
+ 	if (memoryManager->CreateBuffer(UNIFORMVAR_RINGBUFFER_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_uniformVarBuffer, m_uniformVarBufferMemory))
+ 		m_uniformVarBufferMemoryIsCoherent = true;
+ 	else if (memoryManager->CreateBuffer(UNIFORMVAR_RINGBUFFER_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_uniformVarBuffer, m_uniformVarBufferMemory))
+@@ -876,6 +894,9 @@ VulkanRenderer::~VulkanRenderer()
  	}
  
  	vkDestroyDescriptorPool(m_logicalDevice, m_descriptorPool, nullptr);
@@ -3375,7 +3393,7 @@ index 599190a..1cdb1d5 100644
  
  	for(auto& i : m_backbufferBlitPipelineCache)
  	{
-@@ -1491,6 +1501,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+@@ -1491,6 +1512,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
  	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -3384,7 +3402,7 @@ index 599190a..1cdb1d5 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1578,7 +1590,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+@@ -1578,7 +1601,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
  }
  #endif
  
@@ -3393,7 +3411,7 @@ index 599190a..1cdb1d5 100644
  VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
  {
      VkXlibSurfaceCreateInfoKHR sci{};
-@@ -1642,6 +1654,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+@@ -1642,6 +1665,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
  {
  #if BOOST_OS_WINDOWS
  	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
@@ -3402,7 +3420,7 @@ index 599190a..1cdb1d5 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -2280,7 +2294,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+@@ -2280,7 +2305,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
  	occlusionQuery_notifyBeginCommandBuffer();
  
  	m_recordedDrawcalls = 0;
@@ -3416,7 +3434,7 @@ index 599190a..1cdb1d5 100644
  	m_submitOnIdle = false;
  }
  
-@@ -3038,7 +3058,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3038,7 +3069,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -3429,7 +3447,7 @@ index 599190a..1cdb1d5 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3082,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3093,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -3438,7 +3456,7 @@ index 599190a..1cdb1d5 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3282,6 +3307,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3282,6 +3318,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -3488,7 +3506,7 @@ index 599190a..1cdb1d5 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3368,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3379,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -3501,7 +3519,7 @@ index 599190a..1cdb1d5 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -4379,6 +4449,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4460,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -9972,10 +9990,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..432fe40
+index 0000000..751bfcc
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,659 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -9996,6 +10014,8 @@ index 0000000..432fe40
 +extern bool g_crema_shader_compat_26; // Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerEmitGLSL.cpp
 +// shaders keep 32-bit float denormals (Core/LatteShader.cpp, LatteDecompilerEmitGLSLHeader.hpp)
 +bool g_crema_denorm_preserve = false;
++// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
++bool g_crema_uniforms_uncached = false;
 +
 +#include <algorithm>
 +#include <atomic>
@@ -10104,6 +10124,8 @@ index 0000000..432fe40
 +			"Where the emulation spends its time: samples the emulated CPU cores and the GPU thread 1000 times a second (samples.log). Slightly slower."},
 +		{"denormals", "Keep Float Denormals", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: the PS4 GPU keeps tiny float values, which the Wii U's shaders use to carry whole numbers (bone numbers in animated models). Off (default): they become zero in float math, as on the Wii U. On made Sonic Lost World's world geometry blow up (2.42); for tests only."},
++		{"uniform_memory", "Uniform Buffer Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
++			"Where each draw's shader constants (an animated model's bone matrices) are put for the GPU. Cached: CPU-cached memory (Cemu's choice). Uncached: write-combined memory the GPU reads directly. Try Uncached if models are torn or missing on the PS4 only."},
 +		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Writes every shader the game uses, translated, to dump/shaders (for finding rendering bugs). Slower loading."},
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
@@ -10559,6 +10581,7 @@ index 0000000..432fe40
 +	g_crema_native_quads = get("quad_draws") == "native";
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
 +	g_crema_denorm_preserve = get("denormals") == "on";
++	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
 +	ActiveSettings::EnableDumpShaders(get("dump_shaders") == "on");
 +	// the GPU driver's own debug switches (read when the Vulkan instance and shader compiler start,
 +	// after this); its pipeline cache is off with them, or cached shaders would come back
