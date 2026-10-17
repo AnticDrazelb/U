@@ -2515,10 +2515,45 @@ index a25e771..8fabdc5 100644
  #endif
  	options.strictMul = g_current_game_profile->GetAccurateShaderMul() != AccurateShaderMulOption::False;
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 43b116f..d0b6c82 100644
+index 43b116f..ff9e427 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-@@ -1233,6 +1233,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1168,10 +1168,34 @@ LatteTextureView* LatteTC_GetTextureSliceViewOrTryCreate(MPTR srcImagePtr, MPTR
+ void LatteTexture_UpdateDataToLatest(LatteTexture* texture)
+ {
+ 	if (LatteTC_HasTextureChanged(texture))
++	{
++#if defined(__ORBIS__)
++		// Crema (Diagnostic Log): a texture the GPU drew into, loaded again from the game's memory
++		// (whose copy of it can be older) because that memory changed
++		extern bool g_crema_diag_log; // gui/ps4/launcher/CremaSettings.cpp
++		if (g_crema_diag_log && texture->isUpdatedOnGPU)
++		{
++			static std::atomic<uint32> s_logged{0};
++			if (s_logged.fetch_add(1) < 64)
++				cemuLog_log(LogType::Force, "GPU-drawn texture reloaded from memory: {:08x} {}x{}x{} fmt {:04x} tilemode {} frame {}",
++					texture->physAddress, texture->width, texture->height, texture->depth, (uint32)texture->format, (uint32)texture->tileMode, LatteGPUState.frameCounter);
++		}
++#endif
+ 		LatteTexture_ReloadData(texture);
++	}
+ 
+ 	if (texture->reloadFromDynamicTextures)
+ 	{
++#if defined(__ORBIS__)
++		extern bool g_crema_diag_log;
++		if (g_crema_diag_log)
++		{
++			static std::atomic<uint32> s_logged{0};
++			if (s_logged.fetch_add(1) < 64)
++				cemuLog_log(LogType::Force, "texture refreshed from overlapping drawn textures: {:08x} {}x{} fmt {:04x} frame {}",
++					texture->physAddress, texture->width, texture->height, (uint32)texture->format, LatteGPUState.frameCounter);
++		}
++#endif
+ 		LatteTexture_UpdateCacheFromDynamicTextures(texture);
+ 		texture->reloadFromDynamicTextures = false;
+ 	}
+@@ -1233,6 +1257,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  	_AddTextureToGlobalList(this);
  	if (depth < 1)
  		depth = 1;
@@ -4140,7 +4175,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..c7b4b98 100644
+index 512ebee..cf3cc36 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4367,7 +4402,7 @@ index 512ebee..c7b4b98 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,92 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,95 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4431,6 +4466,9 @@ index 512ebee..c7b4b98 100644
 +	for (uint32 r = 0; r < 6; r++)
 +		put32(LatteGPUState.contextRegister[0xA10F + r]); // PA_CL_VPORT_XSCALE..ZOFFSET
 +	put32(LatteGPUState.contextRegister[0xA206]); // PA_CL_VTE_CNTL
++	put32(LatteGPUState.contextRegister[mmCB_COLOR0_BASE]); // render target 0 (address >> 8)
++	for (uint32 t = 0; t < 4; t++)
++		put32(LatteGPUState.contextRegister[mmSQ_TEX_RESOURCE_WORD0 + t * 7 + 2]); // pixel shader textures 0-3 (address >> 8)
 +	const uint32 uniformSize = vs ? std::min<uint32>(vs->uniform.uniformRangeSize, 2048) : 0;
 +	put32(uniformSize);
 +	put(s_vkUniformDataVS, uniformSize);
