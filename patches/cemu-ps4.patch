@@ -4473,7 +4473,7 @@ index 4f85537..1971d3c 100644
  		while (true)
  		{
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..d6c0183 100644
+index 9fe4bea..48bd94c 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,9 +23,22 @@
@@ -4598,7 +4598,7 @@ index 9fe4bea..d6c0183 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1263,154 @@ namespace coreinit
+@@ -1192,6 +1263,155 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -4609,6 +4609,7 @@ index 9fe4bea..d6c0183 100644
 +	// When a lower priority ready thread has waited kStarveTicks, the core gives the waiting ones
 +	// kRescueTicks of turns (oldest first, round robin), then back to priorities.
 +	std::atomic<bool> g_crema_thread_fairness{false};
++	std::atomic<bool> g_crema_core_wake_fast{true}; // Crema setting core_wake (__OSThreadCoreIdle)
 +	uint64 s_starveSince[PPC_CORE_COUNT]{};
 +	uint64 s_rescueUntil[PPC_CORE_COUNT]{};
 +	uint64 s_fairnessRescues = 0;
@@ -4753,7 +4754,7 @@ index 9fe4bea..d6c0183 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1429,9 @@ namespace coreinit
+@@ -1210,6 +1430,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -4763,7 +4764,7 @@ index 9fe4bea..d6c0183 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1455,16 @@ namespace coreinit
+@@ -1233,6 +1456,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -4780,7 +4781,7 @@ index 9fe4bea..d6c0183 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1250,6 +1482,9 @@ namespace coreinit
+@@ -1250,6 +1483,9 @@ namespace coreinit
  		bool isMainCore = g_isMulticoreMode == false || t_assignedCoreIndex == 1;
  		sint32 coreIndex = t_assignedCoreIndex;
  		__OSUnlockScheduler();
@@ -4790,7 +4791,7 @@ index 9fe4bea..d6c0183 100644
  		while (true)
  		{
  			if (!g_coreRunQueueThreadCount[coreIndex].isZero()) // avoid hammering the lock on the main core if there is no runable thread
-@@ -1259,10 +1494,44 @@ namespace coreinit
+@@ -1259,10 +1495,44 @@ namespace coreinit
  				if (nextThread)
  				{
  					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
@@ -4835,7 +4836,44 @@ index 9fe4bea..d6c0183 100644
  			if (isMainCore)
  			{
  				__OSCheckSystemEvents();
-@@ -1391,6 +1660,11 @@ namespace coreinit
+@@ -1271,6 +1541,36 @@ namespace coreinit
+ 			}
+ 			else
+ 			{
++#if defined(__ORBIS__)
++				// Crema setting core_wake (Fast): watch the run queue for ~0.1 ms before sleeping. A
++				// thread handed to this core within it starts at once instead of after the kernel wakes
++				// this host thread - the games hand jobs to cores 0 and 2 over a thousand times a second
++				// (Breath of the Wild's workers slept 37-65% of the time, each wake-up on the chain)
++				extern std::atomic<bool> g_crema_core_wake_fast;
++				if (g_crema_core_wake_fast.load(std::memory_order_relaxed))
++				{
++					static const uint64 s_spinTicks = _rdtscFrequency / 10000;
++					const uint64 until = __rdtsc() + s_spinTicks;
++					bool work = false;
++					while (__rdtsc() < until)
++					{
++						asm volatile("" ::: "memory"); // read the count again each time
++						if (!g_coreRunQueueThreadCount[t_assignedCoreIndex].isZero() || !sSchedulerActive.load(std::memory_order::relaxed))
++						{
++							work = true;
++							break;
++						}
++						_mm_pause();
++						_mm_pause();
++					}
++					if (work)
++					{
++						if (!sSchedulerActive.load(std::memory_order::relaxed))
++							Fiber::Switch(*t_schedulerFiber);
++						continue;
++					}
++				}
++#endif
+ 				// wait for semaphore (only in multicore mode)
+ 				g_coreRunQueueThreadCount[t_assignedCoreIndex].waitUntilNonZero();
+ 				if (!sSchedulerActive.load(std::memory_order::relaxed))
+@@ -1391,6 +1691,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -4847,7 +4885,7 @@ index 9fe4bea..d6c0183 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1921,182 @@ namespace coreinit
+@@ -1647,3 +1952,182 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
@@ -10920,10 +10958,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..c75ede9
+index 0000000..231eaf3
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,699 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10942,6 +10980,7 @@ index 0000000..c75ede9
 +extern bool g_crema_psq_indexed; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Indexed Paired Singles
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
++namespace coreinit { extern std::atomic<bool> g_crema_core_wake_fast; } // coreinit_Thread.cpp: Core Wake-Up
 +extern bool g_crema_native_rects; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Rectangle Draws
 +extern bool g_crema_native_quads; // the same file: Quad Draws
 +extern bool g_crema_strip_lists; // Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp: Strip Draws
@@ -11023,6 +11062,8 @@ index 0000000..c75ede9
 +		{"mii_data", "Mii Data When Missing", "Emulation",
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
++		{"core_wake", "Core Wake-Up", "Emulation", {{"fast", "Fast"}, {"sleep", "Sleep"}}, "fast", true,
++			"Fast: an emulated core with nothing to run watches for new work a moment (0.1 ms) before sleeping, so work handed to it starts at once (games hand work between their cores very often). Sleep: it sleeps right away, as in Cemu (the PS4 then takes a while to wake it)."},
 +		{"return_entries", "Return Entries", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"On: when a game function is compiled, every place a call inside it returns to is ready at once. Off: as in Cemu, each one makes the whole function compile again (about a second each on the PS4) and run in the slow interpreter meanwhile. Turn it off if a game hangs or crashes where it didn't before."},
 +		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
@@ -11533,6 +11574,7 @@ index 0000000..c75ede9
 +	g_crema_return_entries = get("return_entries") != "off";
 +	g_crema_psq_indexed = get("psq_indexed") != "off";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
++	coreinit::g_crema_core_wake_fast = get("core_wake") != "sleep";
 +	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
 +	g_crema_native_rects = get("rect_draws") != "cemu";
 +	g_crema_native_quads = get("quad_draws") == "native";
