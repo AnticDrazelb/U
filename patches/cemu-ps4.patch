@@ -4175,7 +4175,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..cf3cc36 100644
+index 512ebee..f429d50 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4402,7 +4402,7 @@ index 512ebee..cf3cc36 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,95 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,137 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4414,6 +4414,29 @@ index 512ebee..cf3cc36 100644
 +uint32 g_crema_trace_frames_left = 0; // TV frames still to record (VulkanRenderer::SwapBuffers)
 +static std::vector<uint8> s_cremaTrace;
 +uint32 g_crema_trace_frame = 0;
++static std::mutex s_cremaTraceShotsMutex;
++static std::vector<uint8> s_cremaTraceShots; // per shot: frame, width, height, 160x90 RGB
++
++static void CremaTraceRequestShot()
++{
++	const uint32 frame = g_crema_trace_frame;
++	g_renderer->RequestScreenshot([frame](const std::vector<uint8>& rgb, int width, int height, bool) -> std::optional<std::string> {
++		const uint32 w = 160, h = 90;
++		std::vector<uint8> small(w * h * 3);
++		for (uint32 y = 0; y < h; y++)
++			for (uint32 x = 0; x < w; x++)
++			{
++				const size_t sx = (size_t)x * width / w, sy = (size_t)y * height / h;
++				for (int c = 0; c < 3; c++)
++					small[(y * w + x) * 3 + c] = rgb[(sy * width + sx) * 3 + c];
++			}
++		std::lock_guard lock(s_cremaTraceShotsMutex);
++		const uint32 head[3] = {frame, (uint32)width, (uint32)height};
++		s_cremaTraceShots.insert(s_cremaTraceShots.end(), (const uint8*)head, (const uint8*)head + sizeof(head));
++		s_cremaTraceShots.insert(s_cremaTraceShots.end(), small.begin(), small.end());
++		return std::nullopt;
++	});
++}
 +
 +void CremaTraceFrameDone()
 +{
@@ -4431,12 +4454,29 @@ index 512ebee..cf3cc36 100644
 +		s_cremaTrace.reserve(32u << 20);
 +		g_crema_trace_frames_left = 30;
 +		g_crema_trace_frame = 0;
++		{
++			std::lock_guard lock(s_cremaTraceShotsMutex);
++			s_cremaTraceShots.clear();
++		}
++		CremaTraceRequestShot();
 +		cemuLog_log(LogType::Force, "frame trace: recording 30 frames");
 +		return;
 +	}
 +	g_crema_trace_frame++;
++	if (g_crema_trace_frames_left > 1)
++		CremaTraceRequestShot();
 +	if (--g_crema_trace_frames_left == 0)
 +	{
++		{
++			std::this_thread::sleep_for(std::chrono::milliseconds(200)); // the last shot's thread
++			std::lock_guard lock(s_cremaTraceShotsMutex);
++			FILE* shots = fopen("/data/Crema/selftest/trace-shots.bin", "wb");
++			if (shots)
++			{
++				fwrite(s_cremaTraceShots.data(), 1, s_cremaTraceShots.size(), shots);
++				fclose(shots);
++			}
++		}
 +		FILE* out = fopen("/data/Crema/selftest/trace.bin", "wb");
 +		if (out)
 +		{
@@ -4448,7 +4488,7 @@ index 512ebee..cf3cc36 100644
 +	}
 +}
 +
-+static void CremaTraceDraw(LatteDecompilerShader* vs, LatteDecompilerShader* ps, uint32 baseVertex, uint32 instanceCount, uint32 count, uint32 indexType, bool first)
++static void CremaTraceDraw(LatteDecompilerShader* vs, LatteDecompilerShader* ps, uint32 baseVertex, uint32 instanceCount, uint32 count, uint32 indexType, bool first, uint32 vsUniformOffset)
 +{
 +	auto put = [](const void* p, size_t n) { s_cremaTrace.insert(s_cremaTrace.end(), (const uint8*)p, (const uint8*)p + n); };
 +	auto put32 = [&](uint32 v) { put(&v, 4); };
@@ -4466,6 +4506,7 @@ index 512ebee..cf3cc36 100644
 +	for (uint32 r = 0; r < 6; r++)
 +		put32(LatteGPUState.contextRegister[0xA10F + r]); // PA_CL_VPORT_XSCALE..ZOFFSET
 +	put32(LatteGPUState.contextRegister[0xA206]); // PA_CL_VTE_CNTL
++	put32(vsUniformOffset); // where in the uniform ring the vertex shader's data is
 +	put32(LatteGPUState.contextRegister[mmCB_COLOR0_BASE]); // render target 0 (address >> 8)
 +	for (uint32 t = 0; t < 4; t++)
 +		put32(LatteGPUState.contextRegister[mmSQ_TEX_RESOURCE_WORD0 + t * 7 + 2]); // pixel shader textures 0-3 (address >> 8)
@@ -4493,7 +4534,8 @@ index 512ebee..cf3cc36 100644
  		draw_execute_continued(baseVertex, baseInstance, instanceCount, count, indexDataMPTR, indexType, drawcallContext);
 +#ifdef __ORBIS__
 +	if (g_crema_trace_frames_left)
-+		CremaTraceDraw(LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), baseVertex, instanceCount, count, (uint32)indexType, drawcallContext.isFirst);
++		CremaTraceDraw(LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), baseVertex, instanceCount, count, (uint32)indexType, drawcallContext.isFirst,
++			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX]);
 +#endif
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
