@@ -11131,10 +11131,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..efe4a04
+index 0000000..4bd3495
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,705 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -11163,6 +11163,7 @@ index 0000000..efe4a04
 +// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
 +bool g_crema_uniforms_uncached = false;
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
++extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
 +// occlusion query readback, draw capture) - off: none of it runs
@@ -11298,8 +11299,8 @@ index 0000000..efe4a04
 +		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"Writes every shader the game uses, translated, to dump/shaders (for finding rendering bugs). Slower loading."},
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
-+			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"sync", "Synchronized"}, {"all", "All"}}, "off", false,
-+			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Synchronized: the GPU waits and flushes its caches after every draw, and copies avoid compute shaders. Slower; for one test each."},
++			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"sync", "Synchronized"}, {"flush", "Flush Caches"}, {"all", "All"}}, "off", false,
++			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Synchronized: the GPU waits after every draw, and copies avoid compute shaders. Flush Caches: after every draw the GPU also writes back and clears all its caches. Slower; for one test each."},
 +		{"float_inputs", "Float Inputs", "Diagnostics", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the CPU reads tiny float values (denormals) as zero, as the PS4 sets it up. Exact: it keeps them, as on a PC, but each one is very slow on the PS4 (Breath of the Wild dropped to a third of its speed). Only for comparison."},
 +		{"diag_log", "Diagnostic Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -11780,6 +11781,7 @@ index 0000000..efe4a04
 +			aco = "noopt,nosched";
 +		if (checks == "sync" || checks == "all")
 +			radv += "syncshaders,nocompute,";
++		ac_ps4_flush_all_draws = checks == "flush" || checks == "all" ? 1 : 0;
 +		if (checks != "off" && !checks.empty())
 +			radv += "nocache";
 +		if (radv.empty())
