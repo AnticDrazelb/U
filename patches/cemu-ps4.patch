@@ -19243,7 +19243,7 @@ index bb584c1..74ea432 100644
  	case InputAPI::XInput:
  	{
 diff --git a/src/input/emulated/VPADController.cpp b/src/input/emulated/VPADController.cpp
-index a791c5f..8b92f4e 100644
+index a791c5f..3e90fd2 100644
 --- a/src/input/emulated/VPADController.cpp
 +++ b/src/input/emulated/VPADController.cpp
 @@ -8,6 +8,16 @@
@@ -19317,7 +19317,26 @@ index a791c5f..8b92f4e 100644
  			const uint32 value = get_emulated_button_flag(i);
  			if (value == 0)
  			{
-@@ -637,6 +687,47 @@ bool VPADController::set_default_mapping(const std::shared_ptr<ControllerBase>&
+@@ -234,6 +284,18 @@ void VPADController::update_touch(VPADStatus_t& status)
+ 
+ 	status.tpProcessed1 = status.tpData;
+ 	status.tpProcessed2 = status.tpData;
++#ifdef __ORBIS__
++	// Crema (Diagnostic Log): each touch the game is given - its start and end, with the position
++	{
++		extern bool g_crema_diag_log; // gui/ps4/launcher/CremaSettings.cpp
++		const bool touched = status.tpData.touch == kTpTouchOn;
++		if (g_crema_diag_log && touched != m_cremaTouchLogged)
++		{
++			m_cremaTouchLogged = touched;
++			cemuLog_log(LogType::Force, "GamePad touch {}: raw x {} y {}", touched ? "on" : "off", (uint32)status.tpData.x, (uint32)status.tpData.y);
++		}
++	}
++#endif
+ }
+ 
+ void VPADController::update_motion(VPADStatus_t& status)
+@@ -637,6 +699,47 @@ bool VPADController::set_default_mapping(const std::shared_ptr<ControllerBase>&
  		}
  		break;
  	}
@@ -19364,6 +19383,20 @@ index a791c5f..8b92f4e 100644
 +	}
  #endif
  	case InputAPI::XInput:
+ 	{
+diff --git a/src/input/emulated/VPADController.h b/src/input/emulated/VPADController.h
+index 937062d..a22acc3 100644
+--- a/src/input/emulated/VPADController.h
++++ b/src/input/emulated/VPADController.h
+@@ -6,6 +6,9 @@
+ 
+ class VPADController : public EmulatedController
+ {
++#ifdef __ORBIS__
++	bool m_cremaTouchLogged = false; // Diagnostic Log: the last touch state logged
++#endif
+ public:
+ 	enum ButtonId
  	{
 diff --git a/src/input/emulated/WPADController.cpp b/src/input/emulated/WPADController.cpp
 index 2eae0f8..c0e5778 100644
