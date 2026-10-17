@@ -3927,7 +3927,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..e219a66 100644
+index 599190a..2c02ee2 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4077,7 +4077,7 @@ index 599190a..e219a66 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3113,9 +3161,17 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
+@@ -3113,9 +3161,21 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
  
  void VulkanBenchmarkPrintResults();
  
@@ -4085,17 +4085,21 @@ index 599190a..e219a66 100644
 +void CremaTraceFrameDone(); // VulkanRendererCore.cpp: frame trace
 +#endif
 +
++bool g_crema_frame_wait = false; // Crema setting frame_wait (diagnostics): the CPU waits for the GPU every frame
++
  void VulkanRenderer::SwapBuffers(bool swapTV, bool swapDRC)
  {
  	SubmitCommandBuffer();
 +#ifdef __ORBIS__
 +	if (swapTV)
 +		CremaTraceFrameDone();
++	if (g_crema_frame_wait && swapTV)
++		vkQueueWaitIdle(m_graphicsQueue);
 +#endif
  
  	if (swapTV && IsSwapchainInfoValid(true))
  		SwapBuffer(true);
-@@ -3282,6 +3338,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3282,6 +3342,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -4145,7 +4149,7 @@ index 599190a..e219a66 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3399,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3403,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4158,7 +4162,7 @@ index 599190a..e219a66 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,6 +3901,14 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,6 +3905,14 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -4173,7 +4177,28 @@ index 599190a..e219a66 100644
  		vkCmdBindVertexBuffers(m_state.currentCommandBuffer, binding.index, 1, &buffer, &bindOffset);
  	}
  }
-@@ -4379,6 +4488,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -3875,6 +3988,10 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+ 		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
+ }
+ 
++#ifdef __ORBIS__
++void CremaTraceUpload(uint32 bufferOffset, uint32 size, uint32 stagingIndex, uint32 stagingOffset, const uint8* data); // VulkanRendererCore.cpp
++#endif
++
+ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
+ {
+ 	draw_endRenderPass();
+@@ -3883,6 +4000,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+ 
+ 	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
+ 	memcpy(uploadResv.memPtr, buffer, size);
++#ifdef __ORBIS__
++	CremaTraceUpload(bufferOffset, (uint32)size, uploadResv.bufferIndex, uploadResv.bufferOffset, buffer);
++#endif
+ 
+ 	vkMemAllocator.FlushReservation(uploadResv);
+ 
+@@ -4379,6 +4499,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -4228,7 +4253,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..82bb03c 100644
+index 512ebee..e48b43d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4455,7 +4480,7 @@ index 512ebee..82bb03c 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,148 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,162 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4552,7 +4577,20 @@ index 512ebee..82bb03c 100644
 +	}
 +}
 +
-+static void CremaTraceDraw(LatteDecompilerShader* vs, LatteDecompilerShader* ps, uint32 baseVertex, uint32 instanceCount, uint32 count, uint32 indexType, bool first, uint32 vsUniformOffset)
++void CremaTraceUpload(uint32 bufferOffset, uint32 size, uint32 stagingIndex, uint32 stagingOffset, const uint8* data)
++{
++	if (!g_crema_trace_frames_left || s_cremaTrace.size() > (120u << 20))
++		return;
++	auto put = [](const void* p, size_t n) { s_cremaTrace.insert(s_cremaTrace.end(), (const uint8*)p, (const uint8*)p + n); };
++	const uint32 rec[6] = {0x444C5055 /* "UPLD" */, g_crema_trace_frame, bufferOffset, size, stagingIndex, stagingOffset};
++	put(rec, sizeof(rec));
++	uint64 h = 1469598103934665603ull;
++	for (uint32 i = 0; i < size; i++)
++		h = (h ^ data[i]) * 1099511628211ull;
++	put(&h, 8);
++}
++
++static void CremaTraceDraw(LatteDecompilerShader* vs, LatteDecompilerShader* ps, uint32 baseVertex, uint32 instanceCount, uint32 count, uint32 indexType, bool first, uint32 vsUniformOffset, uint32 vbBindOffset)
 +{
 +	auto put = [](const void* p, size_t n) { s_cremaTrace.insert(s_cremaTrace.end(), (const uint8*)p, (const uint8*)p + n); };
 +	auto put32 = [&](uint32 v) { put(&v, 4); };
@@ -4584,6 +4622,7 @@ index 512ebee..82bb03c 100644
 +	const uint32 vbBytes = vbAddr ? std::min<uint32>(vbSize, 16384) : 0;
 +	put32(vbAddr);
 +	put32(stride);
++	put32(vbBindOffset); // where the GPU reads it in the buffer cache
 +	put32(vbBytes);
 +	if (vbBytes)
 +		put(memory_getPointerFromPhysicalOffset(vbAddr), vbBytes);
@@ -4599,7 +4638,7 @@ index 512ebee..82bb03c 100644
 +#ifdef __ORBIS__
 +	if (g_crema_trace_frames_left)
 +		CremaTraceDraw(LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), baseVertex, instanceCount, count, (uint32)indexType, drawcallContext.isFirst,
-+			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX]);
++			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX], (uint32)m_state.currentVertexBinding[0].offset);
 +#endif
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
@@ -11275,10 +11314,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..4bd3495
+index 0000000..6004c25
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,709 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -11307,6 +11346,7 @@ index 0000000..4bd3495
 +// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
 +bool g_crema_uniforms_uncached = false;
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
++extern bool g_crema_frame_wait; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp: Wait for GPU Each Frame
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
@@ -11438,6 +11478,8 @@ index 0000000..4bd3495
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
 +			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
++		{"frame_wait", "Wait for GPU Each Frame", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: at the end of every frame the CPU waits until the GPU has finished all its work (slower). For finding a picture that goes wrong only when the CPU runs ahead of the GPU."},
 +		{"uniform_memory", "Upload Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
 +			"Where the data uploaded for each draw (shader constants, indices, vertex data, copies) is put for the GPU. Cached: CPU-cached memory (Cemu's choice). Uncached: write-combined memory the GPU reads directly. Try Uncached if models are torn or missing on the PS4 only."},
 +		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -11903,6 +11945,7 @@ index 0000000..4bd3495
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
++	g_crema_frame_wait = get("frame_wait") == "on";
 +	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	g_crema_diag_log = get("diag_log") == "on";
