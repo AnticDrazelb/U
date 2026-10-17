@@ -3839,7 +3839,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..7af3858 100644
+index 599190a..a82c423 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -3932,7 +3932,42 @@ index 599190a..7af3858 100644
  	m_submitOnIdle = false;
  }
  
-@@ -3038,7 +3069,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -2314,6 +2345,10 @@ void VulkanRenderer::WaitCommandBufferFinished(uint64 commandBufferId)
+ 		WaitForNextFinishedCommandBuffer();
+ }
+ 
++#ifdef __ORBIS__
++extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa ac_shader_util.c (Crema setting vertex_fetch): other shader code, other pipeline cache file
++#endif
++
+ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
+ {
+ 	SetThreadName("vkDriverPlCache");
+@@ -2331,7 +2366,11 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
+ 		}
+ 	}
+ 
++#ifdef __ORBIS__
++	const auto filename = dir / fmt::format(L"{:016x}{}.bin", CafeSystem::GetForegroundTitleId(), ac_ps4_unaligned_vertex_fetch ? L"_ua" : L"");
++#else
+ 	const auto filename = dir / fmt::format(L"{:016x}.bin", CafeSystem::GetForegroundTitleId());
++#endif
+ 
+ 	while (true)
+ 	{
+@@ -2397,7 +2436,11 @@ void VulkanRenderer::CreatePipelineCache()
+ 	const auto dir = ActiveSettings::GetCachePath("shaderCache/driver/vk");
+ 	if (fs::exists(dir))
+ 	{
++#ifdef __ORBIS__
++		const auto filename = dir / fmt::format("{:016x}{}.bin", CafeSystem::GetForegroundTitleId(), ac_ps4_unaligned_vertex_fetch ? "_ua" : "");
++#else
+ 		const auto filename = dir / fmt::format("{:016x}.bin", CafeSystem::GetForegroundTitleId());
++#endif
+ 		auto file = std::ifstream(filename, std::ios::in | std::ios::binary | std::ios::ate);
+ 		if (file.is_open())
+ 		{
+@@ -3038,7 +3081,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -3945,7 +3980,7 @@ index 599190a..7af3858 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3093,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3105,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -3954,7 +3989,7 @@ index 599190a..7af3858 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3282,6 +3318,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3282,6 +3330,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -4004,7 +4039,7 @@ index 599190a..7af3858 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3379,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3391,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4017,7 +4052,22 @@ index 599190a..7af3858 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -4379,6 +4460,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -3800,6 +3893,14 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+ 			continue;
+ 		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
+ 		VkDeviceSize bindOffset = binding.bindOffset;
++#ifdef __ORBIS__
++		{
++			extern bool g_crema_diag_log; // gui/ps4/launcher/CremaSettings.cpp
++			static std::atomic<uint32> s_misaligned{0};
++			if (g_crema_diag_log && (bindOffset & 3) && s_misaligned.fetch_add(1) < 24)
++				cemuLog_log(LogType::Force, "vertex buffer {} bound at offset {:#x} (not 4-byte aligned)", binding.index, (uint64)bindOffset);
++		}
++#endif
+ 		vkCmdBindVertexBuffers(m_state.currentCommandBuffer, binding.index, 1, &buffer, &bindOffset);
+ 	}
+ }
+@@ -4379,6 +4480,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -10970,10 +11020,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..231eaf3
+index 0000000..efe4a04
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,699 @@
+@@ -0,0 +1,703 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -11002,6 +11052,7 @@ index 0000000..231eaf3
 +// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
 +bool g_crema_uniforms_uncached = false;
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
++extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
 +// occlusion query readback, draw capture) - off: none of it runs
 +bool g_crema_diag_log = false;
@@ -11129,6 +11180,8 @@ index 0000000..231eaf3
 +			"Crema copies the game's models to the GPU and re-copies them when the game says they changed. Every Frame / Every Draw: also compare them with the game's memory that often (slower). Try it if a model is pulled out of shape or missing on the PS4 only."},
 +		{"occlusion_queries", "Occlusion Queries", "Diagnostics", {{"real", "Real"}, {"visible", "Always Visible"}}, "real", false,
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
++		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
++			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
 +		{"uniform_memory", "Upload Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
 +			"Where the data uploaded for each draw (shader constants, indices, vertex data, copies) is put for the GPU. Cached: CPU-cached memory (Cemu's choice). Uncached: write-combined memory the GPU reads directly. Try Uncached if models are torn or missing on the PS4 only."},
 +		{"dump_shaders", "Dump Shaders", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -11594,6 +11647,7 @@ index 0000000..231eaf3
 +	g_crema_shader_compat_26 = get("shader_compat") == "cemu26";
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
++	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	g_crema_diag_log = get("diag_log") == "on";
 +	g_crema_exact_float_inputs = get("float_inputs") == "exact";
