@@ -232,6 +232,7 @@ switch off unless noted. The settings named here are applied for you (see
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Minecraft: Wii U Edition | ~37 with its update, 15+ minutes without a problem. *Thread Fairness: Off*. |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Nintendo Land | ~60 |
 | ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Paper Mario: Color Splash | ~28 (its normal rate is 30), 21 in busy towns. *Graphics Accuracy: Fast* gives ~29.5, but parts of the map may show black: being looked into. |
+| ![Playable](https://img.shields.io/badge/Playable-1ebc61?style=flat-square) | Tokyo Mirage Sessions #FE | 30, locked (its normal rate). Needs Crema Lab v02.66 or newer. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Batman: Arkham Origins | Not measured. Needs *CPU Mode: Auto* (single-core); the first start takes about a minute. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | New Super Mario Bros. U | ~30 (its normal rate is 60) |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Ninja Gaiden 3: Razor's Edge | 17–30 (60 on a PC). Needs *Thread Fairness: On* for its cutscenes; *Graphics Accuracy: Fast*. |
