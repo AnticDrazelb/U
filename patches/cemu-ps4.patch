@@ -4473,7 +4473,7 @@ index 4f85537..1971d3c 100644
  		while (true)
  		{
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bea..38be356 100644
+index 9fe4bea..d6c0183 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -23,9 +23,22 @@
@@ -4527,7 +4527,44 @@ index 9fe4bea..38be356 100644
  
  	bool __CemuIsMulticoreMode()
  	{
-@@ -1058,9 +1082,23 @@ namespace coreinit
+@@ -667,6 +691,36 @@ namespace coreinit
+ 
+ 	void OSYieldThread()
+ 	{
++#if defined(__ORBIS__)
++		// Crema: a yield whose scheduler pass would pick the yielding thread again (no other ready
++		// thread of the same or a higher priority on this core) returns at once. The pass stores the
++		// thread, takes it back from the run queue and switches its fiber to itself - several us on
++		// the PS4, and Breath of the Wild's spin loops yield ~150000 times a second (two thirds of a
++		// core). Not on core 1 (its switches visit the idle loop for the system events), not with
++		// Thread Fairness (it may pick another), not with a suspend/cancel request pending.
++		extern std::atomic<bool> g_crema_thread_fairness;
++		if (g_isMulticoreMode && t_assignedCoreIndex != 1 && t_assignedCoreIndex < 3 && !g_crema_thread_fairness.load(std::memory_order_relaxed) &&
++			sSchedulerActive.load(std::memory_order_relaxed))
++		{
++			OSThread_t* currentThread = OSGetCurrentThread();
++			if (currentThread && currentThread->requestFlags == 0)
++			{
++				__OSLockScheduler();
++				bool other = false;
++				for (OSThread_t* t = g_coreRunQueue.GetPtr()[t_assignedCoreIndex].head.GetPtr(); t; t = t->linkRun[t_assignedCoreIndex].next.GetPtr())
++				{
++					if (t != currentThread && t->effectivePriority <= currentThread->effectivePriority)
++					{
++						other = true;
++						break;
++					}
++				}
++				__OSUnlockScheduler();
++				if (!other)
++					return;
++			}
++		}
++#endif
+ 		PPCCore_switchToScheduler();
+ 	}
+ 
+@@ -1058,9 +1112,23 @@ namespace coreinit
  		__OSUnlockScheduler();
  	}
  
@@ -4551,7 +4588,7 @@ index 9fe4bea..38be356 100644
  		cemu_assert_debug(s_threadToFiber.find(thread) != s_threadToFiber.end());
  
  		OSHostThread* hostThread = s_threadToFiber.find(thread)->second;
-@@ -1180,6 +1218,9 @@ namespace coreinit
+@@ -1180,6 +1248,9 @@ namespace coreinit
  
  	void __OSThreadStartTimeslice(OSThread_t* thread, PPCInterpreter_t* hCPU)
  	{
@@ -4561,7 +4598,7 @@ index 9fe4bea..38be356 100644
  		uint32 coreIndex = PPCInterpreter_getCoreIndex(hCPU);
  		// run one timeslice
  		hCPU->remainingCycles = ppcThreadQuantum;
-@@ -1192,6 +1233,154 @@ namespace coreinit
+@@ -1192,6 +1263,154 @@ namespace coreinit
  		s_lehmer_lcg[coreIndex] = (uint32)((uint64)s_lehmer_lcg[coreIndex] * 279470273ull % 0xfffffffbull);
  	}
  
@@ -4716,7 +4753,7 @@ index 9fe4bea..38be356 100644
  	OSThread_t* __OSGetNextRunableThread(uint32 coreIndex)
  	{
  		cemu_assert_debug(__OSHasSchedulerLock());
-@@ -1210,6 +1399,9 @@ namespace coreinit
+@@ -1210,6 +1429,9 @@ namespace coreinit
  				selectedThread = threadItr;
  			threadItr = threadItr->linkRun[coreIndex].next.GetPtr();
  		}
@@ -4726,7 +4763,7 @@ index 9fe4bea..38be356 100644
  
  		cemu_assert_debug(selectedThread->state == OSThread_t::THREAD_STATE::STATE_READY);
  
-@@ -1233,6 +1425,16 @@ namespace coreinit
+@@ -1233,6 +1455,16 @@ namespace coreinit
  
  	void __OSCheckSystemEvents()
  	{
@@ -4743,7 +4780,7 @@ index 9fe4bea..38be356 100644
  		// AX update
  		snd_core::AXOut_update();
  		// alarm update
-@@ -1250,6 +1452,9 @@ namespace coreinit
+@@ -1250,6 +1482,9 @@ namespace coreinit
  		bool isMainCore = g_isMulticoreMode == false || t_assignedCoreIndex == 1;
  		sint32 coreIndex = t_assignedCoreIndex;
  		__OSUnlockScheduler();
@@ -4753,7 +4790,7 @@ index 9fe4bea..38be356 100644
  		while (true)
  		{
  			if (!g_coreRunQueueThreadCount[coreIndex].isZero()) // avoid hammering the lock on the main core if there is no runable thread
-@@ -1259,10 +1464,44 @@ namespace coreinit
+@@ -1259,10 +1494,44 @@ namespace coreinit
  				if (nextThread)
  				{
  					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
@@ -4798,7 +4835,7 @@ index 9fe4bea..38be356 100644
  			if (isMainCore)
  			{
  				__OSCheckSystemEvents();
-@@ -1391,6 +1630,11 @@ namespace coreinit
+@@ -1391,6 +1660,11 @@ namespace coreinit
  	{
  		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
  		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -4810,7 +4847,7 @@ index 9fe4bea..38be356 100644
  
  		ConfigureHostFloatingPointEnvironment();
  
-@@ -1647,3 +1891,182 @@ namespace coreinit
+@@ -1647,3 +1921,182 @@ namespace coreinit
  		__OSInitTerminatorThreads();
  	}
  }
