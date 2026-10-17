@@ -4228,7 +4228,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..3cb704d 100644
+index 512ebee..82bb03c 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4557,7 +4557,7 @@ index 512ebee..3cb704d 100644
 +	auto put = [](const void* p, size_t n) { s_cremaTrace.insert(s_cremaTrace.end(), (const uint8*)p, (const uint8*)p + n); };
 +	auto put32 = [&](uint32 v) { put(&v, 4); };
 +	auto put64 = [&](uint64 v) { put(&v, 8); };
-+	if (s_cremaTrace.size() > (48u << 20))
++	if (s_cremaTrace.size() > (120u << 20))
 +		return;
 +	put32(0x57415244); // "DRAW"
 +	put32(g_crema_trace_frame);
@@ -4581,7 +4581,7 @@ index 512ebee..3cb704d 100644
 +	const MPTR vbAddr = regs[0];
 +	const uint32 vbSize = regs[1] + 1;
 +	const uint32 stride = (regs[2] >> 11) & 0xFFFF;
-+	const uint32 vbBytes = vbAddr ? std::min<uint32>(vbSize, 256) : 0;
++	const uint32 vbBytes = vbAddr ? std::min<uint32>(vbSize, 16384) : 0;
 +	put32(vbAddr);
 +	put32(stride);
 +	put32(vbBytes);
