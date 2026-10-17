@@ -2907,10 +2907,10 @@ index 86b4d75..1ccc4b9 100644
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
 new file mode 100644
-index 0000000..d2b623e
+index 0000000..99b6109
 --- /dev/null
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/PS4WSI.cpp
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,577 @@
 +// PS4 window system integration for Vulkan.
 +//
 +// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file provides
@@ -2928,6 +2928,7 @@ index 0000000..d2b623e
 +extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char* name);
 +// port/mesa/ac_ps4_drm.c: queues a VideoOut flip behind the submitted GPU work (GPU-side flip).
 +extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
++extern uint32 g_crema_trace_frames_left; // VulkanRendererCore.cpp: frame trace
 +
 +namespace
 +{
@@ -2950,6 +2951,8 @@ index 0000000..d2b623e
 +		int firstBuffer = 0;
 +		uint32 nextImage = 0;
 +		uint32 flipMode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
++		uint8* addresses[kMaxImages]{}; // CPU view of each image (frame trace)
++		uint32 pitch = kWidth;
 +	};
 +
 +	VkInstance sInstance = VK_NULL_HANDLE;
@@ -3222,6 +3225,9 @@ index 0000000..d2b623e
 +			return VK_ERROR_INITIALIZATION_FAILED;
 +		}
 +		cemuLog_log(LogType::Force, "PS4WSI: swapchain of {} images {}x{} pitch {}, buffers {}+", sc->imageCount, kWidth, kHeight, pitch, sc->firstBuffer);
++		for (uint32 i = 0; i < sc->imageCount; i++)
++			sc->addresses[i] = (uint8*)addresses[i];
++		sc->pitch = pitch;
 +		*swapchain = (VkSwapchainKHR)sc;
 +		return VK_SUCCESS;
 +	}
@@ -3311,10 +3317,57 @@ index 0000000..d2b623e
 +		return queue;
 +	}
 +
++	// Crema frame trace (VulkanRendererCore.cpp): small pictures of what was actually on screen - the
++	// image of the flip before the last one, finished and shown once WaitImageOffScreen returns - read
++	// from the CPU without making anything wait, for 60 presents, to selftest/trace-display.bin
++	std::vector<uint8> sTraceDisplay;
++	uint32 sTraceDisplayLeft = 0;
++	bool sTraceDisplayArmed = false;
++
++	void TraceDisplay(PS4Swapchain* sc)
++	{
++		if (g_crema_trace_frames_left && !sTraceDisplayArmed)
++		{
++			sTraceDisplayArmed = true;
++			sTraceDisplayLeft = 60;
++			sTraceDisplay.clear();
++		}
++		if (!g_crema_trace_frames_left && sTraceDisplayLeft == 0)
++			sTraceDisplayArmed = false;
++		if (sTraceDisplayLeft == 0 || sFlipsSubmitted < sc->imageCount)
++			return;
++		const uint32 image = (sc->nextImage + sc->imageCount - 2) % sc->imageCount;
++		const uint8* base = sc->addresses[image];
++		if (!base)
++			return;
++		const uint32 head[3] = {(uint32)sFlipsSubmitted - 1, image, 0};
++		sTraceDisplay.insert(sTraceDisplay.end(), (const uint8*)head, (const uint8*)head + sizeof(head));
++		for (uint32 y = 0; y < 90; y++)
++			for (uint32 x = 0; x < 160; x++)
++			{
++				const uint8* px = base + ((size_t)(y * kHeight / 90) * sc->pitch + (x * kWidth / 160)) * 4;
++				sTraceDisplay.push_back(px[0]);
++				sTraceDisplay.push_back(px[1]);
++				sTraceDisplay.push_back(px[2]);
++			}
++		if (--sTraceDisplayLeft == 0)
++		{
++			FILE* out = fopen("/data/Crema/selftest/trace-display.bin", "wb");
++			if (out)
++			{
++				fwrite(sTraceDisplay.data(), 1, sTraceDisplay.size(), out);
++				fclose(out);
++			}
++			cemuLog_log(LogType::Force, "frame trace: {} screen pictures written to selftest/trace-display.bin", sTraceDisplay.size() / (12 + 160 * 90 * 3));
++			sTraceDisplay = {};
++		}
++	}
++
 +	VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64, VkSemaphore semaphore, VkFence fence, uint32* index)
 +	{
 +		auto sc = (PS4Swapchain*)swapchain;
 +		WaitImageOffScreen(sc->imageCount);
++		TraceDisplay(sc);
 +		*index = sc->nextImage;
 +		sc->nextImage = (sc->nextImage + 1) % sc->imageCount;
 +		if (semaphore || fence)
@@ -4175,7 +4228,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..f429d50 100644
+index 512ebee..3cb704d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4402,7 +4455,7 @@ index 512ebee..f429d50 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,137 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,148 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4417,8 +4470,12 @@ index 512ebee..f429d50 100644
 +static std::mutex s_cremaTraceShotsMutex;
 +static std::vector<uint8> s_cremaTraceShots; // per shot: frame, width, height, 160x90 RGB
 +
++static bool s_cremaTraceShotsOn = false; // selftest/trace-shots present when the trace starts: they make the GPU wait each frame
++
 +static void CremaTraceRequestShot()
 +{
++	if (!s_cremaTraceShotsOn)
++		return;
 +	const uint32 frame = g_crema_trace_frame;
 +	g_renderer->RequestScreenshot([frame](const std::vector<uint8>& rgb, int width, int height, bool) -> std::optional<std::string> {
 +		const uint32 w = 160, h = 90;
@@ -4450,6 +4507,13 @@ index 512ebee..f429d50 100644
 +			return;
 +		fclose(f);
 +		remove("/data/Crema/selftest/trace");
++		if (FILE* shotsFlag = fopen("/data/Crema/selftest/trace-shots", "rb"))
++		{
++			fclose(shotsFlag);
++			s_cremaTraceShotsOn = true;
++		}
++		else
++			s_cremaTraceShotsOn = false;
 +		s_cremaTrace.clear();
 +		s_cremaTrace.reserve(32u << 20);
 +		g_crema_trace_frames_left = 30;
