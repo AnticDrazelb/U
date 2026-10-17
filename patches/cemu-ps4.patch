@@ -2131,10 +2131,24 @@ index de67772..24b109b 100644
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
 diff --git a/src/Cafe/HW/Latte/Core/LatteIndices.cpp b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-index a237644..4668b2b 100644
+index a237644..61c8893 100644
 --- a/src/Cafe/HW/Latte/Core/LatteIndices.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-@@ -644,8 +644,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
+@@ -26,7 +26,13 @@ struct
+ 		uint32 outputCount;
+ 		Renderer::IndexAllocation indexAllocation;
+ 	};
++#ifdef __ORBIS__
++	// Crema: 64 instead of 8 - Sonic Lost World draws more index buffers than 8 between two GPU waits
++	// (the cache is emptied at every wait), so most draws decoded their indices again
++	std::array<CacheEntry, 64> entry;
++#else
+ 	std::array<CacheEntry, 8> entry;
++#endif
+ 	uint64 currentUsageCounter{0};
+ }LatteIndexCache{};
+ 
+@@ -644,8 +650,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
  	}
  }
  
@@ -2185,7 +2199,7 @@ index a237644..4668b2b 100644
  	// what this should do:
  	// [x] use fast SIMD-based index decoding
  	// [x] unpack QUAD indices to triangle indices
-@@ -682,6 +724,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -682,6 +730,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  
  	// calculate index output size
  	uint32 indexOutputSize = LatteIndices_calculateIndexOutputSize(primitiveMode, indexType, count);
@@ -2204,7 +2218,7 @@ index a237644..4668b2b 100644
  	if (indexOutputSize == 0)
  	{
  		outputCount = count;
-@@ -696,7 +750,14 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -696,7 +756,14 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  
  	// decode indices
  	indexMax = std::numeric_limits<uint32>::min();
@@ -2220,7 +2234,7 @@ index a237644..4668b2b 100644
  	{
  		// unpack quads into triangles
  		if (indexType == LatteIndexType::AUTO)
-@@ -838,7 +899,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -838,7 +905,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  	}
  	// the above algorithms use a fast approach to get indexMax which does not filter out indices matching primitiveRestartIndex
  	// here we use a fallback in case the determined index equals the primitive restart index
@@ -4358,6 +4372,29 @@ index bb31077..1403d8d 100644
  #else
  	pthread_mutex_unlock(&s_ptmSchedulerLock);
  #endif
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Spinlock.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Spinlock.cpp
+index 3d23510..ce8e307 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Spinlock.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Spinlock.cpp
+@@ -50,6 +50,18 @@ namespace coreinit
+ 			// loop until lock acquired
+ 			while (!spinlock->ownerThread.atomic_compare_exchange(nullptr, currentThread))
+ 			{
++#ifdef __ORBIS__
++				// Crema: a holder running on another core usually lets go within a microsecond; wait that
++				// long before yielding (each yield takes the scheduler lock: Sonic Lost World spent 15% of a
++				// core in this loop)
++				if (coreinit::__CemuIsMulticoreMode())
++				{
++					for (sint32 i = 0; i < 256 && spinlock->ownerThread != nullptr; i++)
++						_mm_pause();
++					if (spinlock->ownerThread == nullptr)
++						continue;
++				}
++#endif
+ 				OSYieldThread();
+ 			}
+ 		}
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp
 index 4f85537..1971d3c 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Synchronization.cpp
