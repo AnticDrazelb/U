@@ -235,6 +235,7 @@ switch off unless noted. The settings named here are applied for you (see
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Batman: Arkham Origins | Not measured. Needs *CPU Mode: Auto* (single-core); the first start takes about a minute. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | New Super Mario Bros. U | ~30 (its normal rate is 60) |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Ninja Gaiden 3: Razor's Edge | 17–30 (60 on a PC). Needs *Thread Fairness: On* for its cutscenes; *Graphics Accuracy: Fast*. |
+| ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Sonic Lost World | 20–32 (its normal rate is 60). Needs Crema Lab v02.60 or newer, *Graphics Accuracy: Fast*, *Thread Quantum: 100000* and the **Graphic Options** pack at TV 854x480, GamePad 320x180. Crashes now and then. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Super Mario 3D World | ~30 (its normal rate is 60) |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Tekken Tag Tournament 2 | Fights 33–38, menus 60 (the game slows down with its frame rate). Needs *Thread Fairness: On*. |
 | ![Ingame](https://img.shields.io/badge/Ingame-f9b32f?style=flat-square) | Xenoblade Chronicles X | ~30 in the intro. Needs its update and *CPU Mode: Auto*. |
