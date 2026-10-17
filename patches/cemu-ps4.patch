@@ -3552,7 +3552,7 @@ index f503c10..d5bb8fa 100644
  
  VKFUNC_DEVICE(vkCreateSampler);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 7179087..7979b9e 100644
+index 7179087..28d148e 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 @@ -10,6 +10,21 @@
@@ -3577,14 +3577,15 @@ index 7179087..7979b9e 100644
  
  RendererShaderVk* rectsEmulationGS_generate(LatteDecompilerShader* vertexShader, const LatteContextRegister& latteRegister)
  {
-@@ -423,6 +438,35 @@ void PipelineCompiler::InitVertexInputState(const LatteContextRegister& latteReg
+@@ -423,6 +438,36 @@ void PipelineCompiler::InitVertexInputState(const LatteContextRegister& latteReg
  		vertexInputBindingDescription.emplace_back(entry);
  	}
  
 +#ifdef __ORBIS__
 +	// Crema: the vertex layout of skinned models (shaders indexing the uniform registers), once per
 +	// shader and layout - Sonic Lost World's legs and some scenery come out wrong on the PS4 only
-+	if (vertexShader->uniformMode == LATTE_DECOMPILER_UNIFORM_MODE_FULL_CFILE)
++	extern bool g_crema_diag_log; // gui/ps4/launcher/CremaSettings.cpp
++	if (g_crema_diag_log && vertexShader->uniformMode == LATTE_DECOMPILER_UNIFORM_MODE_FULL_CFILE)
 +	{
 +		static std::mutex s_logMutex;
 +		static std::unordered_set<uint64> s_logged;
@@ -3613,7 +3614,7 @@ index 7179087..7979b9e 100644
  	vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
  	vertexInputInfo.vertexBindingDescriptionCount = vertexInputBindingDescription.size();
  	vertexInputInfo.pVertexBindingDescriptions = vertexInputBindingDescription.data();
-@@ -462,8 +506,23 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
+@@ -462,8 +507,23 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
  		break;
  	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLE_STRIP:
  		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
@@ -3637,7 +3638,7 @@ index 7179087..7979b9e 100644
  		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // quads are emulated as 2 triangles
  		inputAssembly.primitiveRestartEnable = false;
  		break;
-@@ -472,7 +531,16 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
+@@ -472,7 +532,16 @@ void PipelineCompiler::InitInputAssemblyState(const Latte::LATTE_VGT_PRIMITIVE_T
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	case Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::RECTS:
@@ -3654,7 +3655,7 @@ index 7179087..7979b9e 100644
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	default:
-@@ -843,7 +911,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
+@@ -843,7 +912,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
  	m_requestRobustBufferAccess = requireRobustBufferAccess;
  
  	// if required generate RECT emulation geometry shader
@@ -3668,7 +3669,7 @@ index 7179087..7979b9e 100644
  	{
  		cemu_assert(m_vkGeometryShader == nullptr); // todo - handle cases where the game already provides a GS
  		m_rectEmulationGS = rectsEmulationGS_generate(pipelineInfo->vertexShader, latteRegister);
-@@ -1050,8 +1123,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
+@@ -1050,8 +1124,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
  // this can happen when:
  // - Streamout is used with too small of a buffer (probably? Could also be some issue with how the streamout array index is calculated -> We can maybe fix this in the future)
  // - The shader uses dynamic indices for uniform access. This will trigger the uniform mode to be FULL_CBANK
@@ -3681,7 +3682,7 @@ index 7179087..7979b9e 100644
  	bool requiresRobustBufferAcces = false;
  	if (vertexShader)
  	{
-@@ -1085,6 +1162,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1085,6 +1163,11 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -3693,7 +3694,7 @@ index 7179087..7979b9e 100644
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
-@@ -1109,6 +1191,9 @@ void PipelineCompiler::CompileThreadPool_Start()
+@@ -1109,6 +1192,9 @@ void PipelineCompiler::CompileThreadPool_Start()
  		numCompileThreads = 2 + (cpuCoreCount - 3); // 2 plus one additionally for every extra core above 3
  
  	numCompileThreads = std::min(numCompileThreads, 8u); // cap at 8
@@ -3704,7 +3705,7 @@ index 7179087..7979b9e 100644
  	for (uint32_t i = 0; i < numCompileThreads; i++)
  	{
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
-index f9788c9..112dd94 100644
+index f9788c9..85a3446 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 @@ -92,6 +92,13 @@ void LatteQueryObjectVk::endFragment()
@@ -3721,7 +3722,7 @@ index f9788c9..112dd94 100644
  void LatteQueryObjectVk::handleFinishedFragments()
  {
  	// remove finished fragments and add to m_acccumulatedSum
-@@ -102,7 +109,29 @@ void LatteQueryObjectVk::handleFinishedFragments()
+@@ -102,7 +109,37 @@ void LatteQueryObjectVk::handleFinishedFragments()
  			break;
  		if (!m_rendererVk->HasCommandBufferFinished(it.m_finishCommandBuffer))
  			break;
@@ -3729,9 +3730,17 @@ index f9788c9..112dd94 100644
  		m_acccumulatedSum += m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
 +#endif
 +#ifdef __ORBIS__
++		extern bool g_crema_diag_log; // gui/ps4/launcher/CremaSettings.cpp
++		if (!g_crema_diag_log)
 +		{
-+			// Crema: on the PS4 every copied result came back 0 (Sonic Lost World hid its scenery): the
-+			// pool is also read directly from the CPU, and that value is used when it has samples
++			m_acccumulatedSum += m_rendererVk->m_occlusionQueries.ptrQueryResults[it.queryIndex];
++			if (g_crema_queries_visible)
++				m_acccumulatedSum += 0x10000; // reported visible
++		}
++		else
++		{
++			// Crema diagnostic: the pool also read directly from the CPU (on the PS4 the early copied
++			// results were all 0), used when it has samples, and both values logged
 +			uint64 direct = 0;
 +			const VkResult directResult = vkGetQueryPoolResults(m_rendererVk->GetLogicalDevice(), m_rendererVk->m_occlusionQueries.queryPool, it.queryIndex, 1,
 +				sizeof(direct), &direct, sizeof(direct), VK_QUERY_RESULT_64_BIT);
@@ -3985,7 +3994,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..ba2d01e 100644
+index 512ebee..e64649d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4004,12 +4013,13 @@ index 512ebee..ba2d01e 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
-@@ -1297,8 +1291,129 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1297,8 +1291,132 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
 +// Crema: draws done since launch, for the hang watchdog (gui/ps4/PS4WindowSystem.cpp)
 +std::atomic<uint64> g_crema_draws_total{0};
++extern bool g_crema_diag_log; // gui/ps4/launcher/CremaSettings.cpp: the counts below are logged and the capture armed
 +
 +// Crema: draws Cemu drops without a log line, counted by reason and logged every 10 s together with
 +// the shaders of the dropped draws (an object missing on the PS4 only)
@@ -4035,7 +4045,7 @@ index 512ebee..ba2d01e 100644
 +	void CremaNoteSkip(int reason, const LatteDecompilerShader* vs, const LatteDecompilerShader* ps, const LatteDecompilerShader* gs)
 +	{
 +		s_cremaSkipped[reason]++;
-+		if (reason == kCremaSkipRasterKill || reason == kCremaSkipNoBuffer)
++		if (!g_crema_diag_log || reason == kCremaSkipRasterKill || reason == kCremaSkipNoBuffer)
 +			return; // drawing nothing is what the game asked for
 +		const uint64 key = CremaShaderHash(vs) * 31 + CremaShaderHash(ps) * 7 + CremaShaderHash(gs);
 +		auto& entry = s_cremaSkippedShaders[reason][key];
@@ -4101,6 +4111,8 @@ index 512ebee..ba2d01e 100644
 +
 +	void CremaDrawStats()
 +	{
++		if (!g_crema_diag_log)
++			return;
 +		const auto now = std::chrono::steady_clock::now();
 +		if (s_cremaStatsTime.time_since_epoch().count() == 0)
 +			s_cremaStatsTime = now;
@@ -4134,7 +4146,7 @@ index 512ebee..ba2d01e 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1423,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1426,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -4142,7 +4154,7 @@ index 512ebee..ba2d01e 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1437,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1440,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -4150,7 +4162,7 @@ index 512ebee..ba2d01e 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1445,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1448,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -4158,7 +4170,7 @@ index 512ebee..ba2d01e 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1470,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1473,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -4176,7 +4188,7 @@ index 512ebee..ba2d01e 100644
  		return;
  	}
  
-@@ -1451,8 +1573,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1576,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -4189,7 +4201,7 @@ index 512ebee..ba2d01e 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1526,6 +1652,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1526,6 +1655,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -4197,7 +4209,7 @@ index 512ebee..ba2d01e 100644
  		return;
  	}
  
-@@ -1640,8 +1767,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1770,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
@@ -10651,10 +10663,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..1d7846e
+index 0000000..3f8760b
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,680 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10679,6 +10691,9 @@ index 0000000..1d7846e
 +// the uniform ring buffer in uncached memory (Renderer/Vulkan/VulkanRenderer.cpp)
 +bool g_crema_uniforms_uncached = false;
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
++// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
++// occlusion query readback, draw capture) - off: none of it runs
++bool g_crema_diag_log = false;
 +extern int g_crema_vertex_resync; // Cafe/HW/Latte/Core/LatteBufferCache.cpp
 +
 +#include <algorithm>
@@ -10801,6 +10816,8 @@ index 0000000..1d7846e
 +		{"driver_debug", "GPU Driver Checks", "Diagnostics",
 +			{{"off", "Off"}, {"compression", "No Compression"}, {"memory", "Zeroed Memory"}, {"shaders", "Unoptimized Shaders"}, {"sync", "Synchronized"}, {"all", "All"}}, "off", false,
 +			"For a game drawn wrong on the PS4 but right in Cemu on a PC: turns parts of the PS4's GPU driver off to find which one breaks it. No Compression: no depth compression or fast clears. Zeroed Memory: new GPU memory starts at zero. Unoptimized Shaders: the shader compiler's optimizations off. Synchronized: the GPU waits and flushes its caches after every draw, and copies avoid compute shaders. Slower; for one test each."},
++		{"diag_log", "Diagnostic Log", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
++			"On: extra lines in log.txt for finding graphics bugs (draws dropped and drawn every 10 s, the vertex layout of animated models, occlusion query results read back from the GPU) and the draw capture for the GPU self-test. Slightly slower."},
 +		{"gpu_trace", "GPU Fault Recorder", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"When the PS4 closes a game with error CE-34878-0 (a GPU fault), the GPU's last commands are kept for the logs. Slightly slower."},
 +	};
@@ -11254,6 +11271,7 @@ index 0000000..1d7846e
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
++	g_crema_diag_log = get("diag_log") == "on";
 +	{
 +		const std::string resync = get("vertex_resync");
 +		g_crema_vertex_resync = resync == "draw" ? 2 : resync == "frame" ? 1 : 0;
