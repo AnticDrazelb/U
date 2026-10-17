@@ -3927,7 +3927,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..2c02ee2 100644
+index 599190a..624128e 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4177,7 +4177,7 @@ index 599190a..2c02ee2 100644
  		vkCmdBindVertexBuffers(m_state.currentCommandBuffer, binding.index, 1, &buffer, &bindOffset);
  	}
  }
-@@ -3875,6 +3988,10 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+@@ -3875,6 +3988,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
  }
  
@@ -4185,10 +4185,58 @@ index 599190a..2c02ee2 100644
 +void CremaTraceUpload(uint32 bufferOffset, uint32 size, uint32 stagingIndex, uint32 stagingOffset, const uint8* data); // VulkanRendererCore.cpp
 +#endif
 +
++#ifdef __ORBIS__
++// Crema frame trace: copies the given buffer cache ranges (offset, size) back to the CPU, after
++// all GPU work, and writes them to path as records (offset, size, bytes) - what the GPU really
++// reads for a vertex buffer, to compare with the game's memory
++void VulkanRenderer::CremaDumpBufferCache(const std::vector<std::pair<uint32, uint32>>& ranges, const char* path)
++{
++	uint32 total = 0;
++	for (auto& r : ranges)
++		total += r.second;
++	if (total == 0)
++		return;
++	VkBuffer readBuffer;
++	VkDeviceMemory readMemory;
++	if (!memoryManager->CreateBuffer(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, readBuffer, readMemory))
++		return;
++	draw_endRenderPass();
++	std::vector<VkBufferCopy> regions;
++	uint32 at = 0;
++	for (auto& r : ranges)
++	{
++		regions.push_back({r.first, at, r.second});
++		at += r.second;
++	}
++	barrier_sequentializeTransfer();
++	vkCmdCopyBuffer(m_state.currentCommandBuffer, m_bufferCache, readBuffer, (uint32)regions.size(), regions.data());
++	barrier_sequentializeTransfer();
++	SubmitCommandBuffer();
++	vkQueueWaitIdle(m_graphicsQueue);
++	uint8* data = nullptr;
++	vkMapMemory(m_logicalDevice, readMemory, 0, VK_WHOLE_SIZE, 0, (void**)&data);
++	if (FILE* out = fopen(path, "wb"))
++	{
++		at = 0;
++		for (auto& r : ranges)
++		{
++			fwrite(&r.first, 4, 1, out);
++			fwrite(&r.second, 4, 1, out);
++			fwrite(data + at, 1, r.second, out);
++			at += r.second;
++		}
++		fclose(out);
++	}
++	vkUnmapMemory(m_logicalDevice, readMemory);
++	memoryManager->DeleteBuffer(readBuffer, readMemory);
++	cemuLog_log(LogType::Force, "frame trace: {} vertex buffer ranges read back from the GPU to {}", ranges.size(), path);
++}
++#endif
++
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4000,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4048,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -4198,7 +4246,7 @@ index 599190a..2c02ee2 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4499,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4547,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -4207,7 +4255,7 @@ index 599190a..2c02ee2 100644
  	performanceMonitor.vk.numDescriptorSets.decrement();
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index d975e11..e449af9 100644
+index d975e11..a01caf6 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -212,7 +212,7 @@ public:
@@ -4228,7 +4276,17 @@ index d975e11..e449af9 100644
  	VkDescriptorSet backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter);
  
  	robin_hood::unordered_flat_map<uint64, robin_hood::unordered_flat_map<uint64, PipelineInfo*> > m_pipeline_info_cache; // using robin_hood::unordered_flat_map is twice as fast (1-2% overall CPU time reduction)
-@@ -434,6 +436,7 @@ private:
+@@ -335,6 +337,9 @@ public:
+ 	// renderer interface
+ 	void bufferCache_init(const sint32 bufferSize) override;
+ 	void bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset) override;
++#ifdef __ORBIS__
++	void CremaDumpBufferCache(const std::vector<std::pair<uint32, uint32>>& ranges, const char* path); // frame trace: what the GPU has
++#endif
+ 	void bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size) override;
+ 
+ 	void buffer_bindVertexBuffers(std::span<BindBufferParam> bindings) override;
+@@ -434,6 +439,7 @@ private:
  	VkRenderPass m_imguiRenderPass = VK_NULL_HANDLE;
  
  	VkDescriptorPool m_descriptorPool;
@@ -4236,7 +4294,7 @@ index d975e11..e449af9 100644
  
    public:
  	struct QueueFamilyIndices
-@@ -475,6 +478,7 @@ private:
+@@ -475,6 +481,7 @@ private:
  		struct
  		{
  			bool shaderRoundingModeRTEFloat32{ false };
@@ -4244,7 +4302,7 @@ index d975e11..e449af9 100644
  		}shaderFloatControls; // from VK_KHR_shader_float_controls
  
  		struct
-@@ -955,6 +959,7 @@ private:
+@@ -955,6 +962,7 @@ private:
  public:
  	bool GetDisableMultithreadedCompilation() const { return m_featureControl.disableMultithreadedCompilation; }
  	bool HasSPRIVRoundingModeRTE32() const { return m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32; }
@@ -4253,7 +4311,7 @@ index d975e11..e449af9 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..e48b43d 100644
+index 512ebee..15ea4df 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4480,7 +4538,7 @@ index 512ebee..e48b43d 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,162 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,173 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4491,6 +4549,7 @@ index 512ebee..e48b43d 100644
 +// shapes get different data from the game in some frames or the same data drawn differently
 +uint32 g_crema_trace_frames_left = 0; // TV frames still to record (VulkanRenderer::SwapBuffers)
 +static std::vector<uint8> s_cremaTrace;
++static std::map<uint32, uint32> s_cremaTraceVbRanges; // buffer cache offset -> bytes (frame trace)
 +uint32 g_crema_trace_frame = 0;
 +static std::mutex s_cremaTraceShotsMutex;
 +static std::vector<uint8> s_cremaTraceShots; // per shot: frame, width, height, 160x90 RGB
@@ -4556,6 +4615,11 @@ index 512ebee..e48b43d 100644
 +		CremaTraceRequestShot();
 +	if (--g_crema_trace_frames_left == 0)
 +	{
++		{
++			std::vector<std::pair<uint32, uint32>> ranges(s_cremaTraceVbRanges.begin(), s_cremaTraceVbRanges.end());
++			s_cremaTraceVbRanges.clear();
++			VulkanRenderer::GetInstance()->CremaDumpBufferCache(ranges, "/data/Crema/selftest/trace-gpuvb.bin");
++		}
 +		{
 +			std::this_thread::sleep_for(std::chrono::milliseconds(200)); // the last shot's thread
 +			std::lock_guard lock(s_cremaTraceShotsMutex);
@@ -4623,6 +4687,11 @@ index 512ebee..e48b43d 100644
 +	put32(vbAddr);
 +	put32(stride);
 +	put32(vbBindOffset); // where the GPU reads it in the buffer cache
++	if (vbAddr && vbBytes)
++	{
++		uint32& known = s_cremaTraceVbRanges[vbBindOffset];
++		known = std::max(known, vbBytes);
++	}
 +	put32(vbBytes);
 +	if (vbBytes)
 +		put(memory_getPointerFromPhysicalOffset(vbAddr), vbBytes);
