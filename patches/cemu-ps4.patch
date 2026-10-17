@@ -2554,6 +2554,25 @@ index 743ab67..b1fc494 100644
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
  
+diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp
+index 8b1348c..bae5c2e 100644
+--- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp
++++ b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp
+@@ -1151,6 +1151,14 @@ void LatteDecompiler_DecompileGeometryShader(uint64 shaderBaseHash, uint32* cont
+ 	else
+ 	{
+ 		shaderContext.parsedGSCopyShader = LatteGSCopyShaderParser_parse(gsCopyProgramData, gsCopyProgramSize);
++		// Crema: a copy program the parser can't read (Tokyo Mirage Sessions #FE's writes straight to
++		// memory, MEM_EXPORT) left this null and the analyzer read through it: the game closed at once.
++		// Now the geometry shader fails like any other unsupported one and its draws are skipped
++		if (!shaderContext.parsedGSCopyShader)
++		{
++			cemuLog_log(LogType::Force, "Geometry shader {:016x}: its copy program can't be parsed, skipped", shaderBaseHash);
++			shader->hasError = true;
++		}
+ 	}
+ 	for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
+ 	{
 diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h
 index 208ef2d..3c84732 100644
 --- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h
