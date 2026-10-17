@@ -834,7 +834,7 @@ index fc03753..e652458 100644
  // startPosition and endPosition are inclusive
  raLivenessRange* IMLRA_CreateRange(ppcImlGenContext_t* ppcImlGenContext, IMLSegment* imlSegment, IMLRegID virtualRegister, IMLName name, raInstructionEdge startPosition, raInstructionEdge endPosition)
 diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
-index c9758f3..3cd5fc7 100644
+index c9758f3..70a9ded 100644
 --- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 +++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
 @@ -11,6 +11,8 @@
@@ -1484,7 +1484,7 @@ index c9758f3..3cd5fc7 100644
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  	return true;
  }
-@@ -443,17 +988,134 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
+@@ -443,17 +988,167 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
  	s_ppcRecompilerState.recompilerSpinlock.lock();
  	std::set<uint32> entryAddresses;
  	entryAddresses.emplace(address);
@@ -1566,6 +1566,32 @@ index c9758f3..3cd5fc7 100644
 +		largeLock.lock();
 +	}
 +
++#ifdef __ORBIS__
++	// Crema setting return_entries: every return address in the range (the instruction after a call:
++	// bl, bcl, bclrl, bcctrl) is an entry point from the first compile on. Execution comes back there
++	// whenever a call returns through the jump table (a callee that ran interpreted, an HLE call),
++	// and Cemu compiles the whole range again for each new one - Breath of the Wild compiled 5-11 KiB
++	// functions 64+ times, ~1 s each on the PS4, running them interpreted meanwhile. The registers
++	// are stored around a call anyway, so these entries cost little. (v02.30's guessed entries -
++	// block starts after jumps, branch targets - made Sonic Lost World hang; returns aren't guesses.)
++	extern bool g_crema_return_entries;
++	if (g_crema_return_entries)
++	{
++		const uint32 rangeEnd = range.startAddress + range.length;
++		for (uint32 v = range.startAddress; v + 4 < rangeEnd; v += 4)
++		{
++			const uint32 op = memory_readU32(v);
++			const uint32 primary = op >> 26;
++			const uint32 xo = (op >> 1) & 0x3FF;
++			const bool call = (op & 1) != 0 && (primary == 18 || primary == 16 || (primary == 19 && (xo == 16 || xo == 528)));
++			if (!call)
++				continue;
++			const uint32 next = memory_readU32(v + 4);
++			if (next != 0 && (next >> 26) != 0) // skip what can't be an instruction (data after a call that doesn't return)
++				entryAddresses.emplace(v + 4);
++		}
++	}
++#endif
  	std::vector<std::pair<MPTR, uint32>> functionEntryPoints;
 +#ifdef __ORBIS__
 +	const uint64 compileCpuStart = CremaThreadCpuNs();
@@ -1575,6 +1601,13 @@ index c9758f3..3cd5fc7 100644
 -		return; // recompilation failed
 -	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
 +#ifdef __ORBIS__
++	if (!func && entryAddresses.size() > 1)
++	{
++		// the extra entries made the compile fail (one wasn't code after all): Cemu's single entry
++		entryAddresses.clear();
++		entryAddresses.emplace(address);
++		func = PPCRecompiler_recompileFunction(range, entryAddresses, functionEntryPoints, funcBoundaries);
++	}
 +	t_cremaLastCostMs = (uint32)((CremaThreadCpuNs() - compileCpuStart) / 1000000);
 +#endif
 +	bool activated = false;
@@ -1623,7 +1656,7 @@ index c9758f3..3cd5fc7 100644
  	SetThreadName("PPCRecompiler");
  #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
  	return;
-@@ -486,12 +1148,83 @@ void PPCRecompiler_thread()
+@@ -486,12 +1181,83 @@ void PPCRecompiler_thread()
  				s_ppcRecompilerState.recompilerSpinlock.unlock();
  				continue;
  			}
@@ -1707,7 +1740,7 @@ index c9758f3..3cd5fc7 100644
  	}
  }
  
-@@ -504,6 +1237,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
+@@ -504,6 +1270,41 @@ constexpr uint32 PPCRecompiler_GetNumAddressSpaceBlocks()
  
  std::bitset<PPCRecompiler_GetNumAddressSpaceBlocks()> ppcRecompiler_reservedBlockMask;
  
@@ -1749,7 +1782,7 @@ index c9758f3..3cd5fc7 100644
  void PPCRecompiler_reserveLookupTableBlock(uint32 offset)
  {
  	uint32 blockIndex = offset / PPC_REC_ALLOC_BLOCK_SIZE;
-@@ -609,6 +1377,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
+@@ -609,6 +1410,7 @@ void PPCRecompiler_invalidateRange(uint32 startAddr, uint32 endAddr)
  		PPCRecompiler_deleteFunction(rFunc);
  	// add entry to invalidation queue, this is used to invalidate functions for which recompilation has already started
  	s_ppcRecompilerState.invalidationRanges.emplace_back(startAddr, endAddr-startAddr);
@@ -1757,7 +1790,7 @@ index c9758f3..3cd5fc7 100644
  
  	s_ppcRecompilerState.recompilerSpinlock.unlock();
  }
-@@ -702,7 +1471,11 @@ void PPCRecompiler_init()
+@@ -702,7 +1504,11 @@ void PPCRecompiler_init()
  
  	// launch recompilation thread
      s_ppcRecompilerState.workerThreadStopSignal = false;
@@ -1770,7 +1803,7 @@ index c9758f3..3cd5fc7 100644
  }
  
  void PPCRecompiler_Shutdown()
-@@ -711,6 +1484,16 @@ void PPCRecompiler_Shutdown()
+@@ -711,6 +1517,16 @@ void PPCRecompiler_Shutdown()
      s_ppcRecompilerState.workerThreadStopSignal = true;
      if(s_ppcRecompilerState.workerThread.joinable())
          s_ppcRecompilerState.workerThread.join();
@@ -10701,10 +10734,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..e094124
+index 0000000..cbf8fe3
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,691 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10717,6 +10750,9 @@ index 0000000..e094124
 +extern bool g_crema_cl_shifts; // Cafe/HW/Espresso/Recompiler/BackendX64/BackendX64.cpp: Fast Shifts
 +extern bool g_crema_fast_cycles; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Cycle Counting
 +extern bool g_crema_fast_compares; // Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp: Compare Results
++// Return Entries (Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp): a function's return addresses are
++// entry points from its first compile, instead of one more compile of the whole function for each
++bool g_crema_return_entries = true;
 +extern bool g_crema_psq_indexed; // Cafe/HW/Espresso/Recompiler/PPCRecompilerImlGen.cpp: Indexed Paired Singles
 +namespace coreinit { extern std::atomic<bool> g_crema_thread_fairness; } // coreinit_Thread.cpp: Thread Fairness
 +namespace coreinit { extern std::atomic<bool> g_crema_core_balancing; } // coreinit_Thread.cpp: Core Balancing
@@ -10800,6 +10836,8 @@ index 0000000..e094124
 +		{"mii_data", "Mii Data When Missing", "Emulation",
 +			{{"crema", "Crema Miis"}, {"off", "None"}}, "crema", false,
 +			"Without the Wii U's Mii data, games that show Miis crash or show them without heads. Crema Miis: Crema's own simple Mii parts are used instead. A dump of the Wii U's Mii data is never replaced."},
++		{"return_entries", "Return Entries", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
++			"On: when a game function is compiled, every place a call inside it returns to is ready at once. Off: as in Cemu, each one makes the whole function compile again (about a second each on the PS4) and run in the slow interpreter meanwhile. Turn it off if a game hangs or crashes where it didn't before."},
 +		{"compare_results", "Compare Results", "Emulation", {{"fast", "Fast"}, {"exact", "Exact"}}, "fast", false,
 +			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
 +		{"psq_indexed", "Indexed Paired Singles", "Emulation", {{"on", "Recompiled"}, {"off", "Interpreted"}}, "on", false,
@@ -11303,6 +11341,7 @@ index 0000000..e094124
 +	config.vk_accurate_barriers = accurate;
 +	g_crema_cl_shifts = get("cl_shifts") == "on";
 +	g_crema_fast_compares = get("compare_results") != "exact";
++	g_crema_return_entries = get("return_entries") != "off";
 +	g_crema_psq_indexed = get("psq_indexed") != "off";
 +	coreinit::g_crema_thread_fairness = get("thread_fairness") != "off";
 +	coreinit::g_crema_core_balancing = get("core_balancing") == "on";
