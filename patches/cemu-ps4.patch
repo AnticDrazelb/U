@@ -7871,10 +7871,10 @@ index 0000000..e00d2d5
 +} // namespace CremaOnline
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 0000000..d03208a
+index 0000000..46cc750
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,1092 @@
+@@ -0,0 +1,1222 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -7898,6 +7898,8 @@ index 0000000..d03208a
 +
 +#include <imgui.h>
 +#include <atomic>
++#include <cmath>
++#include <ctime>
 +
 +#include <orbis/Pad.h>
 +
@@ -7908,6 +7910,7 @@ index 0000000..d03208a
 +extern "C" int g_crema_menu_open;
 +extern "C" int g_crema_touchpad_buttons;
 +extern "C" int g_crema_touch_pointer;
++extern "C" int g_crema_touch_tap;
 +// Cafe/HW/Latte/Core/LatteRenderTarget.cpp: drawn over the TV picture in the ImGui pass
 +extern void (*g_crema_overlay)(sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight);
 +extern std::shared_mutex g_audioMutex;
@@ -7924,6 +7927,7 @@ index 0000000..d03208a
 +		ROW_TV,
 +		ROW_POINTER,
 +		ROW_TOUCHPAD,
++		ROW_TAP,
 +		ROW_MOTION,
 +		ROW_CONTROLS,
 +		ROW_VOLUME,
@@ -8530,6 +8534,7 @@ index 0000000..d03208a
 +		case ROW_TV: return LatteGPUState.isDRCPrimary ? "GamePad Screen" : "TV Screen";
 +		case ROW_POINTER: return g_crema_touch_pointer ? "On" : "Off";
 +		case ROW_TOUCHPAD: return g_crema_touchpad_buttons ? "Minus / HOME" : "GamePad Touch Screen";
++		case ROW_TAP: return g_crema_touch_tap ? "On" : "Off";
 +		case ROW_MOTION: return MotionOn() ? "On" : "Off";
 +		case ROW_CONTROLS: return HasGameLayout(0) ? "This Game" : "All Games";
 +		case ROW_VOLUME: return std::to_string(Volume());
@@ -8540,8 +8545,8 @@ index 0000000..d03208a
 +
 +	const char* LabelOf(int row)
 +	{
-+		static const char* const LABELS[ROW_COUNT] = {"Resume", "TV Shows", "Touch Pointer", "Touchpad", "Motion Controls",
-+			"Controls", "Game Volume", "FPS Counter", "Restart Game", "Quit to Launcher"};
++		static const char* const LABELS[ROW_COUNT] = {"Resume", "TV Shows", "Touch Pointer", "Touchpad", "Tap to Touch",
++			"Motion Controls", "Controls", "Game Volume", "FPS Counter", "Restart Game", "Quit to Launcher"};
 +		return LABELS[row];
 +	}
 +
@@ -8583,6 +8588,10 @@ index 0000000..d03208a
 +		case ROW_TOUCHPAD:
 +			g_crema_touchpad_buttons = !g_crema_touchpad_buttons;
 +			Save("touchpad", g_crema_touchpad_buttons ? "buttons" : "touch");
++			break;
++		case ROW_TAP:
++			g_crema_touch_tap = !g_crema_touch_tap;
++			Save("touch_tap", g_crema_touch_tap ? "on" : "off");
 +			break;
 +		case ROW_MOTION:
 +		{
@@ -8811,6 +8820,80 @@ index 0000000..d03208a
 +		dl->AddText(small, 24.0f, ImVec2(x0 + 50, H - 76), Rgba(TEXT, 0.5f * a), "Circle: back");
 +	}
 +
++	// A row's icon, drawn with lines and shapes (the game's ImGui has no icon font), centred on c, size s
++	void DrawRowIcon(ImDrawList* dl, int row, ImVec2 c, float s, ImU32 col)
++	{
++		const float h = s * 0.5f, t = std::max(2.0f, s * 0.09f);
++		switch (row)
++		{
++		case ROW_RESUME:
++			dl->AddTriangleFilled(ImVec2(c.x - h * 0.6f, c.y - h * 0.8f), ImVec2(c.x + h * 0.8f, c.y), ImVec2(c.x - h * 0.6f, c.y + h * 0.8f), col);
++			break;
++		case ROW_TV:
++			dl->AddRect(ImVec2(c.x - h, c.y - h * 0.65f), ImVec2(c.x + h, c.y + h * 0.5f), col, 3.0f, 0, t);
++			dl->AddLine(ImVec2(c.x - h * 0.4f, c.y + h * 0.85f), ImVec2(c.x + h * 0.4f, c.y + h * 0.85f), col, t);
++			break;
++		case ROW_POINTER:
++			dl->AddTriangleFilled(ImVec2(c.x - h * 0.6f, c.y - h), ImVec2(c.x + h * 0.7f, c.y + h * 0.2f), ImVec2(c.x - h * 0.1f, c.y + h * 0.35f), col);
++			dl->AddLine(ImVec2(c.x - h * 0.05f, c.y + h * 0.3f), ImVec2(c.x + h * 0.4f, c.y + h), col, t);
++			break;
++		case ROW_TOUCHPAD:
++			dl->AddRect(ImVec2(c.x - h, c.y - h * 0.55f), ImVec2(c.x + h, c.y + h * 0.55f), col, 5.0f, 0, t);
++			dl->AddLine(ImVec2(c.x, c.y - h * 0.55f), ImVec2(c.x, c.y + h * 0.55f), col, t * 0.7f);
++			break;
++		case ROW_TAP:
++			dl->AddCircleFilled(c, h * 0.3f, col, 16);
++			dl->AddCircle(c, h * 0.75f, col, 24, t);
++			break;
++		case ROW_MOTION:
++			dl->AddRect(ImVec2(c.x - h * 0.75f, c.y - h * 0.3f), ImVec2(c.x + h * 0.75f, c.y + h * 0.3f), col, 4.0f, 0, t);
++			dl->PathArcTo(c, h, 3.6f, 5.8f, 12);
++			dl->PathStroke(col, 0, t);
++			break;
++		case ROW_CONTROLS:
++			dl->AddRect(ImVec2(c.x - h, c.y - h * 0.45f), ImVec2(c.x + h, c.y + h * 0.45f), col, h * 0.4f, 0, t);
++			dl->AddCircleFilled(ImVec2(c.x + h * 0.45f, c.y), h * 0.14f, col, 8);
++			dl->AddLine(ImVec2(c.x - h * 0.7f, c.y), ImVec2(c.x - h * 0.25f, c.y), col, t);
++			dl->AddLine(ImVec2(c.x - h * 0.47f, c.y - h * 0.22f), ImVec2(c.x - h * 0.47f, c.y + h * 0.22f), col, t);
++			break;
++		case ROW_VOLUME:
++			dl->AddRectFilled(ImVec2(c.x - h, c.y - h * 0.3f), ImVec2(c.x - h * 0.55f, c.y + h * 0.3f), col);
++			dl->AddTriangleFilled(ImVec2(c.x - h * 0.6f, c.y - h * 0.3f), ImVec2(c.x - h * 0.1f, c.y - h * 0.8f), ImVec2(c.x - h * 0.1f, c.y + h * 0.8f), col);
++			dl->AddTriangleFilled(ImVec2(c.x - h * 0.6f, c.y - h * 0.3f), ImVec2(c.x - h * 0.1f, c.y + h * 0.8f), ImVec2(c.x - h * 0.6f, c.y + h * 0.3f), col);
++			dl->PathArcTo(ImVec2(c.x - h * 0.1f, c.y), h * 0.55f, -0.8f, 0.8f, 8);
++			dl->PathStroke(col, 0, t);
++			dl->PathArcTo(ImVec2(c.x - h * 0.1f, c.y), h * 0.95f, -0.8f, 0.8f, 10);
++			dl->PathStroke(col, 0, t);
++			break;
++		case ROW_FPS:
++			for (int i = 0; i < 3; i++)
++			{
++				const float bx = c.x - h + i * h * 0.75f, bh = h * (0.6f + 0.55f * i);
++				dl->AddRectFilled(ImVec2(bx, c.y + h - bh), ImVec2(bx + h * 0.45f, c.y + h), col, 1.5f);
++			}
++			break;
++		case ROW_RESTART:
++			dl->PathArcTo(c, h * 0.8f, 0.6f, 5.6f, 18);
++			dl->PathStroke(col, 0, t);
++			dl->AddTriangleFilled(ImVec2(c.x + h * 0.95f, c.y - h * 0.15f), ImVec2(c.x + h * 0.35f, c.y - h * 0.15f), ImVec2(c.x + h * 0.7f, c.y + h * 0.4f), col);
++			break;
++		case ROW_QUIT:
++			dl->PathArcTo(c, h * 0.8f, -1.0f + 3.14159f * 1.5f - 3.14159f * 2.0f + 0.6f, 3.14159f * 1.5f - 0.6f + 3.14159f * 0.0f, 18);
++			dl->PathStroke(col, 0, t);
++			dl->AddLine(ImVec2(c.x, c.y - h), ImVec2(c.x, c.y - h * 0.1f), col, t);
++			break;
++		}
++	}
++
++	// Left/Right carets beside a value that changes with them
++	void DrawCarets(ImDrawList* dl, float left, float right, float cy, float s, ImU32 col)
++	{
++		dl->AddTriangleFilled(ImVec2(left, cy), ImVec2(left + s, cy - s), ImVec2(left + s, cy + s), col);
++		dl->AddTriangleFilled(ImVec2(right, cy), ImVec2(right - s, cy - s), ImVec2(right - s, cy + s), col);
++	}
++
++	float sHighlight = 0.0f, sHighlightVel = 0.0f;
++
 +	void Frame(sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight)
 +	{
 +		OrbisPadData data{};
@@ -8897,41 +8980,88 @@ index 0000000..d03208a
 +		const float W = (float)(imageX * 2 + imageWidth), H = (float)(imageY * 2 + imageHeight);
 +		const float a = sSlide;
 +		constexpr uint32 ACCENT = 0x9B7BFF, TEXT = 0xFFFFFF;
-+		dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Rgba(0x000000, 0.45f * a));
-+		const float width = 780.0f, x0 = W - width * a;
-+		dl->AddRectFilled(ImVec2(x0, 0), ImVec2(W, H), Rgba(0x0B0A1A, 0.92f * a));
-+		dl->AddLine(ImVec2(x0, 0), ImVec2(x0, H), Rgba(ACCENT, 0.9f * a), 2.0f);
++		// Resonance's look: the game behind a dark side panel on the left that slides in, its edge a
++		// glowing line; the header (Crema, the game, a pulsing tag), rows with icons and a highlight
++		// that glides between them, the clock and the buttons at the bottom
++		const float panelW = std::max(820.0f, W * 0.42f);
++		const float x0 = -panelW * 0.25f * (1.0f - a), right = x0 + panelW;
++		dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Rgba(0x000000, 0.30f * a));
++		const ImU32 dark = Rgba(0x040812, 0.93f * a), mid = Rgba(0x040812, 0.62f * a), clear = Rgba(0x040812, 0.0f);
++		dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(right, H), dark, mid, mid, dark);
++		dl->AddRectFilledMultiColor(ImVec2(right, 0), ImVec2(right + W * 0.15f, H), mid, clear, clear, mid);
++		dl->AddRectFilled(ImVec2(right - 2, 0), ImVec2(right, H), Rgba(ACCENT, 0.6f * a));
 +		if (sControls)
 +		{
-+			DrawControls(dl, title, font, small, x0, W, H, a, dt);
++			DrawControls(dl, title, font, small, x0, right, H, a, dt);
 +			return;
 +		}
-+		dl->AddText(title, 44.0f, ImVec2(x0 + 50, 90), Rgba(TEXT, a), "Crema");
-+		const std::string name = CafeSystem::GetForegroundTitleName();
-+		dl->AddText(small, 24.0f, ImVec2(x0 + 52, 148), Rgba(ACCENT, a), name.c_str());
-+		float y = 230.0f;
-+		for (int row = 0; row < ROW_COUNT; row++, y += 64.0f)
++		const float lx = x0 + 70.0f;
++		dl->AddText(title, 44.0f, ImVec2(lx, 78), Rgba(TEXT, a), "Crema");
++		// the tag: the game runs on while the menu is open
++		const char* tag = "IN-GAME MENU";
++		const float tagW = small->CalcTextSizeA(20.0f, FLT_MAX, 0.0f, tag).x + 28.0f;
++		const float pulse = 0.75f + 0.25f * std::sin((float)now * 3.0f);
++		const float tagX = lx + title->CalcTextSizeA(44.0f, FLT_MAX, 0.0f, "Crema").x + 20.0f;
++		dl->AddRectFilled(ImVec2(tagX, 92), ImVec2(tagX + tagW, 122), Rgba(ACCENT, 0.9f * a * pulse), 15.0f);
++		dl->AddText(small, 20.0f, ImVec2(tagX + 14, 96), Rgba(TEXT, a), tag);
++		std::string name = CafeSystem::GetForegroundTitleName();
++		while (!name.empty() && font->CalcTextSizeA(30.0f, FLT_MAX, 0.0f, name.c_str()).x > panelW - 140.0f)
++			name.pop_back();
++		dl->AddText(font, 30.0f, ImVec2(lx, 140), Rgba(ACCENT, a), name.c_str());
++
++		// rows: a gap before Restart and Quit
++		constexpr float ROW_H = 62.0f, TOP = 220.0f, GAP = 22.0f;
++		auto rowY = [&](float r) { return TOP + r * ROW_H + (r >= ROW_RESTART ? GAP : 0.0f); };
++		// the highlight glides (a spring) to the selected row
++		const float k = 170.0f, damp = 26.0f;
++		sHighlightVel += ((float)sSelected - sHighlight) * k * dt - sHighlightVel * damp * dt;
++		sHighlight += sHighlightVel * dt;
++		if (std::abs((float)sSelected - sHighlight) > ROW_COUNT)
++			sHighlight = (float)sSelected;
++		const float hy = rowY(std::clamp(sHighlight, 0.0f, (float)ROW_COUNT - 1));
++		const float hx0 = lx - 30.0f, hx1 = right - 40.0f;
++		dl->AddRectFilledMultiColor(ImVec2(hx0, hy - 6), ImVec2(hx1, hy + ROW_H - 12), Rgba(ACCENT, 0.55f * a), Rgba(ACCENT, 0.12f * a),
++			Rgba(ACCENT, 0.12f * a), Rgba(ACCENT, 0.55f * a));
++		dl->AddRectFilled(ImVec2(hx0, hy - 6), ImVec2(hx0 + 4, hy + ROW_H - 12), Rgba(0xFFFFFF, 0.9f * a));
++		dl->AddLine(ImVec2(lx - 10, rowY((float)ROW_RESTART) - GAP * 0.6f), ImVec2(hx1, rowY((float)ROW_RESTART) - GAP * 0.6f),
++			Rgba(ACCENT, 0.35f * a), 1.5f);
++		for (int row = 0; row < ROW_COUNT; row++)
 +		{
-+			if (row == ROW_RESTART)
-+			{
-+				dl->AddLine(ImVec2(x0 + 50, y - 8), ImVec2(W - 50, y - 8), Rgba(ACCENT, 0.35f * a), 1.5f);
-+				y += 14.0f;
-+			}
++			const float y = rowY((float)row);
 +			const bool sel = row == sSelected;
-+			if (sel)
-+				dl->AddRectFilled(ImVec2(x0 + 30, y - 6), ImVec2(W - 30, y + 52), Rgba(ACCENT, 0.30f * a), 10.0f);
-+			dl->AddText(font, 32.0f, ImVec2(x0 + 60, y + 4), Rgba(TEXT, a), LabelOf(row));
++			const float alpha = a * (sel ? 1.0f : 0.8f);
++			DrawRowIcon(dl, row, ImVec2(lx + 12, y + 22), 30.0f, Rgba(TEXT, alpha));
++			dl->AddText(font, 30.0f, ImVec2(lx + 50, y + 6), Rgba(TEXT, alpha), LabelOf(row));
 +			const std::string value = ValueOf(row);
-+			if (!value.empty())
-+			{
-+				const float tw = font->CalcTextSizeA(28.0f, FLT_MAX, 0.0f, value.c_str()).x;
-+				dl->AddText(font, 28.0f, ImVec2(W - 70 - tw, y + 8), Rgba(TEXT, 0.85f * a), value.c_str());
-+			}
++			if (value.empty())
++				continue;
++			const float tw = font->CalcTextSizeA(27.0f, FLT_MAX, 0.0f, value.c_str()).x;
++			const bool arrows = sel && row != ROW_CONTROLS;
++			const float vx = hx1 - 24.0f - tw - (arrows ? 22.0f : 0.0f);
++			dl->AddText(font, 27.0f, ImVec2(vx, y + 9), Rgba(TEXT, 0.9f * alpha), value.c_str());
++			if (arrows)
++				DrawCarets(dl, vx - 26.0f, hx1 - 14.0f, y + 24, 7.0f, Rgba(TEXT, 0.9f * alpha));
 +		}
-+		dl->AddText(small, 24.0f, ImVec2(x0 + 50, H - 110), Rgba(TEXT, 0.7f * a),
-+			"Cross: select    Left / Right: change    Circle or L3 + R3: back");
-+		dl->AddText(small, 24.0f, ImVec2(x0 + 50, H - 76), Rgba(TEXT, 0.5f * a),
-+			"The game keeps running while this menu is open.");
++
++		// the clock, top right
++		{
++			const time_t t = time(nullptr);
++			char clock[16];
++			strftime(clock, sizeof(clock), "%H:%M", localtime(&t));
++			const float cw = font->CalcTextSizeA(30.0f, FLT_MAX, 0.0f, clock).x;
++			dl->AddText(font, 30.0f, ImVec2(W - 60 - cw, 50), Rgba(TEXT, 0.9f * a), clock);
++		}
++		// the buttons
++		float bx = lx;
++		const float by = H - 80.0f;
++		auto hint = [&](const char* glyph, const char* text) {
++			bx += PS4Glyphs::Draw(dl, small, glyph, bx, by, 34.0f, a) + 10.0f;
++			dl->AddText(small, 24.0f, ImVec2(bx, by - 13), Rgba(TEXT, 0.85f * a), text);
++			bx += small->CalcTextSizeA(24.0f, FLT_MAX, 0.0f, text).x + 36.0f;
++		};
++		hint("Cross", "Select");
++		hint("D-Pad", "Change");
++		hint("Circle", "Back");
 +	}
 +} // namespace
 +
@@ -10790,10 +10920,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..cbf8fe3
+index 0000000..c75ede9
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,695 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -10840,6 +10970,7 @@ index 0000000..cbf8fe3
 +// input/api/PS4/PS4PadController.cpp
 +extern "C" int g_crema_touchpad_buttons; // 1: touchpad halves = Minus / HOME, no touch screen
 +extern "C" int g_crema_touch_pointer;    // the pointer over the picture
++extern "C" int g_crema_touch_tap;        // input/api/PS4/PS4PadController.cpp: Tap to Touch
 +
 +namespace CremaSettings
 +{
@@ -10916,6 +11047,8 @@ index 0000000..cbf8fe3
 +		{"touchpad", "Touchpad", "Controls",
 +			{{"touch", "GamePad Touch Screen"}, {"buttons", "Minus / HOME"}}, "touch", false,
 +			"Touch Screen: a click touches the GamePad screen at your finger, two fingers press Minus (left) or HOME (right). Minus / HOME: the touchpad's halves are those buttons."},
++		{"touch_tap", "Tap to Touch", "Controls", {{"on", "On"}, {"off", "Off"}}, "on", true,
++			"On: a quick tap on the touchpad touches the GamePad screen, like a phone. Off: only a click (pressing the touchpad down) touches it."},
 +		{"motion", "Motion Controls", "Controls", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"The DualShock 4's motion sensors move the GamePad: tilt and turn it."},
 +		// Online
@@ -11476,6 +11609,7 @@ index 0000000..cbf8fe3
 +
 +	g_crema_touchpad_buttons = get("touchpad") == "buttons" ? 1 : 0;
 +	g_crema_touch_pointer = get("touch_pointer") == "on" ? 1 : 0;
++	g_crema_touch_tap = get("touch_tap") != "off" ? 1 : 0;
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
@@ -11883,10 +12017,10 @@ index 0000000..132ae41
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 0000000..a6f7127
+index 0000000..139f689
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4364 @@
+@@ -0,0 +1,4417 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -12735,6 +12869,7 @@ index 0000000..a6f7127
 +		bool scope = false;  // "Apply To: All Games / This Game" (game settings)
 +		bool note = false;   // takes effect at the next game start
 +		std::string help;    // rows that aren't settings (the online worlds' files)
++		bool section = false; // a settings section's title: Cross opens or closes its settings
 +	};
 +
 +	// A PSP-style panel on the right: options to pick from, information text, or a settings list.
@@ -12745,7 +12880,8 @@ index 0000000..a6f7127
 +		std::vector<std::string> options;
 +		std::vector<std::string> lines; // information text (no options)
 +		std::vector<SettingRow> rows;   // settings list (Left/Right change the values)
-+		std::string category;           // settings list: one category, or all (game settings)
++		std::string category;           // settings list: the section it was opened on (empty: a game's)
++		std::set<std::string> expanded; // settings list: the sections showing their settings
 +		std::string gameId;             // settings list: the game's own settings, else global
 +		int selected = 0;
 +		int setting = -1;
@@ -12895,6 +13031,7 @@ index 0000000..a6f7127
 +		std::vector<std::string> m_wallpapers;
 +		std::vector<Item> m_items[CATEGORY_COUNT];
 +		int m_category = (int)Category::Games;
++		bool m_crossPressed = false; // the settings list's change came from Cross (a section toggles)
 +		int m_selected[CATEGORY_COUNT] = {};
 +		float m_categoryPos = (float)Category::Games;
 +		float m_itemPos[CATEGORY_COUNT] = {};
@@ -13843,9 +13980,17 @@ index 0000000..a6f7127
 +		m_panel.open = true;
 +		m_panel.category = category;
 +		m_panel.gameId = gameId;
-+		m_panel.title = category.empty() ? "Game Settings" : category;
++		m_panel.title = category.empty() ? "Game Settings" : "Settings";
++		// every section is listed; the one it was opened on shows its settings (a game's: all closed)
++		if (!category.empty())
++			m_panel.expanded.insert(category);
 +		BuildSettingRows();
 +		m_panel.selected = 0;
++		for (size_t i = 0; i < m_panel.rows.size(); i++)
++		{
++			if (!category.empty() && m_panel.rows[i].key == "__section__" + category)
++				m_panel.selected = (int)i;
++		}
 +		MoveSettingRow(0);
 +	}
 +
@@ -13857,10 +14002,14 @@ index 0000000..a6f7127
 +			rows.push_back({"Apply To", CremaSettings::IsCustom(game) ? "This Game" : "All Games", "", false, true});
 +		for (const char* category : CremaSettings::Categories())
 +		{
-+			if (!m_panel.category.empty() && m_panel.category != category)
++			// the section's title: Cross opens or closes it
++			const bool open = m_panel.expanded.count(category) != 0;
++			SettingRow section{category, open ? "" : "...", std::string("__section__") + category};
++			section.section = true;
++			section.help = open ? "Cross: close this section." : "Cross: open this section and see its settings.";
++			rows.push_back(section);
++			if (!open)
 +				continue;
-+			if (m_panel.category.empty())
-+				rows.push_back({category, "", "", true});
 +			for (const CremaSettings::Setting& setting : CremaSettings::All())
 +			{
 +				if (std::string(setting.category) != category)
@@ -13957,7 +14106,7 @@ index 0000000..a6f7127
 +		m_netCheck.join();
 +		m_netStatus = m_netStatusThread;
 +		Log("network library: " + m_netStatus);
-+		if (m_panel.open && m_panel.category == "Online")
++		if (m_panel.open && m_panel.expanded.count("Online"))
 +		{
 +			const int selected = m_panel.selected;
 +			BuildSettingRows();
@@ -14301,6 +14450,24 @@ index 0000000..a6f7127
 +	{
 +		if (m_panel.selected < 0 || m_panel.selected >= (int)m_panel.rows.size())
 +			return;
++		if (m_panel.rows[m_panel.selected].section)
++		{
++			// a section: Cross opens or closes it, Right opens, Left closes
++			const std::string key = m_panel.rows[m_panel.selected].key;
++			const std::string name = key.substr(std::string("__section__").size());
++			const bool open = m_panel.expanded.count(name) != 0;
++			if (direction < 0 || (open && direction > 0 && m_crossPressed))
++				m_panel.expanded.erase(name);
++			else
++				m_panel.expanded.insert(name);
++			BuildSettingRows();
++			for (size_t i = 0; i < m_panel.rows.size(); i++)
++			{
++				if (m_panel.rows[i].key == key)
++					m_panel.selected = (int)i;
++			}
++			return;
++		}
 +		const SettingRow& row = m_panel.rows[m_panel.selected];
 +		const std::string& game = m_panel.gameId;
 +		if (m_panel.setting == SET_GAME_PACKS)
@@ -14385,9 +14552,10 @@ index 0000000..a6f7127
 +			}
 +			else
 +			{
++				// the open sections' values
 +				for (const CremaSettings::Setting& setting : CremaSettings::All())
 +				{
-+					if (m_panel.category == setting.category)
++					if (m_panel.expanded.count(setting.category))
 +						CremaSettings::ResetGlobal(setting.key);
 +				}
 +			}
@@ -14498,7 +14666,9 @@ index 0000000..a6f7127
 +				}
 +				if (pressed & (BTN_LEFT | BTN_RIGHT | BTN_CROSS))
 +				{
++					m_crossPressed = (pressed & BTN_CROSS) != 0;
 +					ChangeSettingRow((pressed & BTN_LEFT) ? -1 : 1);
++					m_crossPressed = false;
 +					Play("category");
 +				}
 +				return;
@@ -15312,6 +15482,23 @@ index 0000000..a6f7127
 +				{
 +					Text(dl, m_bold, 26, ImVec2(x0 + 50, ry + 14), Rgba(theme.wave, m_panel.slide), row.label, false);
 +					dl->AddLine(ImVec2(x0 + 50, ry + 50), ImVec2(W - 50, ry + 50), Rgba(theme.wave, 0.35f * m_panel.slide), 1.5f);
++					continue;
++				}
++				if (row.section)
++				{
++					const bool sel = (int)i == m_panel.selected;
++					const bool open = row.value.empty();
++					if (sel)
++						dl->AddRectFilled(ImVec2(x0 + 30, ry - 4), ImVec2(W - 30, ry + 50), Rgba(theme.wave, 0.30f * m_panel.slide), 10.0f);
++					// an arrow: right when closed, down when open
++					const ImVec2 c(x0 + 62, ry + 23);
++					const ImU32 arrow = Rgba(theme.wave, m_panel.slide);
++					if (open)
++						dl->AddTriangleFilled(ImVec2(c.x - 9, c.y - 5), ImVec2(c.x + 9, c.y - 5), ImVec2(c.x, c.y + 8), arrow);
++					else
++						dl->AddTriangleFilled(ImVec2(c.x - 5, c.y - 9), ImVec2(c.x + 8, c.y), ImVec2(c.x - 5, c.y + 9), arrow);
++					Text(dl, m_bold, sel ? 32.0f : 30.0f, ImVec2(x0 + 86, ry + 4), Rgba(theme.wave, m_panel.slide), row.label);
++					dl->AddLine(ImVec2(x0 + 50, ry + 50), ImVec2(W - 50, ry + 50), Rgba(theme.wave, 0.25f * m_panel.slide), 1.0f);
 +					continue;
 +				}
 +				const bool sel = (int)i == m_panel.selected;
@@ -18508,10 +18695,10 @@ index a5f1f92..15a7b40 100644
  		
 diff --git a/src/input/api/PS4/PS4PadController.cpp b/src/input/api/PS4/PS4PadController.cpp
 new file mode 100644
-index 0000000..fb2c965
+index 0000000..e7f428a
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.cpp
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,299 @@
 +#include "input/api/PS4/PS4PadController.h"
 +
 +#include <orbis/Pad.h>
@@ -18520,6 +18707,7 @@ index 0000000..fb2c965
 +// Crema settings (gui/ps4/launcher/CremaSettings.cpp: Apply)
 +extern "C" int g_crema_touchpad_buttons = 0; // 1: touchpad halves = Minus / HOME, no touch screen
 +extern "C" int g_crema_touch_pointer = 1;    // the pointer over the picture
++extern "C" int g_crema_touch_tap = 1;        // a short tap touches too (else only a click)
 +// The DualShock 4's ScePad handle, for the launcher and the frontend (a user's pad opens once)
 +extern "C" int g_crema_pad_handle = -1;
 +// The in-game menu (gui/ps4/PS4PauseMenu.cpp) is open: the game gets no input
@@ -18675,18 +18863,52 @@ index 0000000..fb2c965
 +	OrbisPadData data{};
 +	const bool read = !g_crema_touchpad_buttons && !g_crema_menu_open && m_provider && m_provider->Read(m_slot, data);
 +	const bool finger = read && data.touch.fingers > 0;
-+	const bool touching = finger && data.touch.fingers == 1 && (data.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD);
++	bool touching = finger && data.touch.fingers == 1 && (data.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD);
 +	if (finger)
 +	{
 +		position.x = std::clamp((float)data.touch.touch[0].x / m_provider->m_touchMaxX, 0.0f, 1.0f);
 +		position.y = std::clamp((float)data.touch.touch[0].y / m_provider->m_touchMaxY, 0.0f, 1.0f);
 +	}
++	// Tap to Touch: one finger down and up within 0.3 s without sliding touches the screen there
++	// for 0.12 s (a phone-like tap; the click still works). Not for a Wii Remote's pointer.
++	if (g_crema_touch_tap && read && !m_hoverPointer)
++	{
++		const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++		if (touching)
++			m_tapDown = false; // a click is a touch already
++		else if (finger)
++		{
++			if (!m_tapDown)
++			{
++				m_tapDown = true;
++				m_tapMoved = data.touch.fingers != 1;
++				m_tapStart = now;
++				m_tapStartPos = position;
++			}
++			else if (data.touch.fingers != 1 || std::abs(position.x - m_tapStartPos.x) > 0.04f || std::abs(position.y - m_tapStartPos.y) > 0.06f)
++				m_tapMoved = true;
++		}
++		else if (m_tapDown)
++		{
++			if (!m_tapMoved && now - m_tapStart < 0.3)
++			{
++				m_tapUntil = now + 0.12;
++				m_tapPos = m_tapStartPos;
++			}
++			m_tapDown = false;
++		}
++		if (!touching && now < m_tapUntil)
++		{
++			touching = true;
++			position = m_tapPos;
++		}
++	}
 +	if (m_slot != 0)
 +		return m_hoverPointer ? finger : touching; // the overlay's cursor is player 1's
 +	std::scoped_lock lock(sCursorMutex);
-+	sCursorFinger = finger;
++	sCursorFinger = finger || touching;
 +	sCursorTouching = touching;
-+	if (finger)
++	if (finger || touching)
 +		sCursorPosition = position;
 +	return m_hoverPointer ? finger : touching;
 +}
@@ -18778,10 +19000,10 @@ index 0000000..fb2c965
 +}
 diff --git a/src/input/api/PS4/PS4PadController.h b/src/input/api/PS4/PS4PadController.h
 new file mode 100644
-index 0000000..2f3151f
+index 0000000..2cbd632
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,95 @@
 +#pragma once
 +
 +#include "input/api/Controller.h"
@@ -18862,6 +19084,10 @@ index 0000000..2f3151f
 +
 +	int m_slot = 0;
 +	bool m_hoverPointer = false;
++	// Tap to Touch: a short tap (no click) touches the GamePad screen where the finger was
++	bool m_tapDown = false, m_tapMoved = false;
++	double m_tapStart = 0.0, m_tapUntil = 0.0;
++	glm::vec2 m_tapStartPos{}, m_tapPos{};
 +	std::mutex m_motionMutex;
 +	WiiUMotionHandler m_motionHandler;
 +	MotionSample m_motionSample{};
