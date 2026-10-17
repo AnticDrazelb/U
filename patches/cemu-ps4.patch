@@ -261,10 +261,16 @@ index cf7ba19..686efd3 100644
 +#endif
 \ No newline at end of file
 diff --git a/src/Cafe/HW/Espresso/PPCTimer.cpp b/src/Cafe/HW/Espresso/PPCTimer.cpp
-index 257973a..2d7d62b 100644
+index 257973a..70c2d44 100644
 --- a/src/Cafe/HW/Espresso/PPCTimer.cpp
 +++ b/src/Cafe/HW/Espresso/PPCTimer.cpp
-@@ -75,19 +75,54 @@ int PPCTimer_initThread()
+@@ -1,4 +1,5 @@
+ #include "Cafe/HW/Espresso/Const.h"
++#include <atomic>
+ #include "config/ActiveSettings.h"
+ #include "util/helpers/fspinlock.h"
+ #include "util/highresolutiontimer/HighResolutionTimer.h"
+@@ -75,19 +76,54 @@ int PPCTimer_initThread()
  	return 0;
  }
  
@@ -319,7 +325,7 @@ index 257973a..2d7d62b 100644
  }
  
  uint64 PPCTimer_getRawTsc()
-@@ -126,6 +161,14 @@ FSpinlock sTimerSpinlock;
+@@ -126,6 +162,25 @@ FSpinlock sTimerSpinlock;
  // thread safe
  uint64 PPCTimer_getFromRDTSC()
  {
@@ -327,14 +333,25 @@ index 257973a..2d7d62b 100644
 +	// the normal speed (timer shift 3: *8 >> 3); other speeds take Cemu's way below
 +	if (s_cremaTicksPerTsc && ActiveSettings::GetTimerShiftFactor() == 3)
 +	{
-+		const uint64 elapsed = __rdtsc() - s_cremaTscBase;
-+		return (uint64)(((unsigned __int128)elapsed * s_cremaTicksPerTsc) >> 32);
++		// only forward, like Cemu's way below (which keeps the latest reading under a lock): the
++		// emulated cores run on different PS4 cores, whose counters (and an unordered RDTSC) can be a
++		// little apart - time going back made Super Mario Maker's camera jump between two heights
++		_mm_lfence();
++		const uint64 tsc = __rdtsc();
++		const uint64 elapsed = tsc > s_cremaTscBase ? tsc - s_cremaTscBase : 0; // a core a little behind the base
++		uint64 now = (uint64)(((unsigned __int128)elapsed * s_cremaTicksPerTsc) >> 32);
++		static std::atomic<uint64> s_latest{0};
++		uint64 latest = s_latest.load(std::memory_order_relaxed);
++		while (now > latest && !s_latest.compare_exchange_weak(latest, now, std::memory_order_relaxed))
++		{
++		}
++		return now > latest ? now : latest;
 +	}
 +#endif
  	sTimerSpinlock.lock();
  	_mm_mfence();
  	uint64 rdtscCurrentMeasure = __rdtsc();
-@@ -150,7 +193,18 @@ uint64 PPCTimer_getFromRDTSC()
+@@ -150,7 +205,18 @@ uint64 PPCTimer_getFromRDTSC()
  	#endif
  
  	uint64 remainder;
