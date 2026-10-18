@@ -4677,7 +4677,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..268e828 100644
+index 512ebee..247b7b2 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4696,7 +4696,45 @@ index 512ebee..268e828 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
-@@ -1297,8 +1291,132 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1196,6 +1190,37 @@ void VulkanRenderer::draw_updateDepthBias(bool forceUpdate)
+ 
+ bool s_syncOnNextDraw = false;
+ 
++#ifdef __ORBIS__
++// Crema: a draw with DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE set clears the depth buffer to DB_DEPTH_CLEAR
++// on the Wii U instead of depth testing (Cemu ignores the bit). Super Mario Maker clears its background
++// layer's depth buffer this way every frame - ignored, the layer's depth fed back from the frame before
++// and its ground and hill draws were rejected every other frame.
++extern uint32 g_crema_trace_frames_left;
++extern uint32 g_crema_trace_frame;
++bool g_crema_db_render_clear = true; // Crema setting depth_clear_draws (gui/ps4/launcher/CremaSettings.cpp)
++
++static void CremaDepthClearDraw(VkCommandBuffer cmd, CachedFBOVk* fbo)
++{
++	const uint32 dbRenderControl = LatteGPUState.contextRegister[mmDB_RENDER_CONTROL];
++	if (!fbo || !fbo->depthBuffer.texture)
++		return;
++	if (g_crema_trace_frames_left && fbo->depthBuffer.texture->baseTexture->physAddress == 0xf4240800)
++		cemuLog_log(LogType::Force, "trace frame {}: draw with depth buffer f4240800: DB_RENDER_CONTROL {:08x} DB_DEPTH_CLEAR {}",
++			g_crema_trace_frame, dbRenderControl, *(float*)&LatteGPUState.contextRegister[mmDB_DEPTH_CLEAR]);
++	if (!g_crema_db_render_clear || (dbRenderControl & 1) == 0)
++		return;
++	sint32 w, h;
++	fbo->depthBuffer.texture->baseTexture->GetEffectiveSize(w, h, fbo->depthBuffer.texture->firstMip);
++	VkClearAttachment clear{};
++	clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++	clear.clearValue.depthStencil.depth = std::clamp(*(float*)&LatteGPUState.contextRegister[mmDB_DEPTH_CLEAR], 0.0f, 1.0f);
++	VkClearRect rect{};
++	rect.rect.extent = {(uint32)w, (uint32)h};
++	rect.layerCount = 1;
++	vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
++}
++#endif
++
+ void VulkanRenderer::draw_setRenderPass()
+ {
+ 	CachedFBOVk* fboVk = m_state.activeFBO;
+@@ -1297,8 +1322,132 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
@@ -4829,7 +4867,7 @@ index 512ebee..268e828 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1426,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1457,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -4837,7 +4875,7 @@ index 512ebee..268e828 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1440,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1471,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -4845,7 +4883,7 @@ index 512ebee..268e828 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1448,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1479,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -4853,7 +4891,7 @@ index 512ebee..268e828 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1473,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1504,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -4871,7 +4909,7 @@ index 512ebee..268e828 100644
  		return;
  	}
  
-@@ -1451,8 +1576,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1607,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -4884,7 +4922,17 @@ index 512ebee..268e828 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1526,6 +1655,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1462,6 +1622,9 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+ 	m_state.descriptorSetsChanged = true;
+ 
+ 	draw_setRenderPass();
++#ifdef __ORBIS__
++	CremaDepthClearDraw(m_state.currentCommandBuffer, m_state.activeFBO);
++#endif
+ 
+ 	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
+ 	{
+@@ -1526,6 +1689,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -4892,7 +4940,7 @@ index 512ebee..268e828 100644
  		return;
  	}
  
-@@ -1640,8 +1770,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1804,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
@@ -4904,7 +4952,17 @@ index 512ebee..268e828 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,289 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1656,6 +1823,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+ 	}
+ 
+ 	draw_setRenderPass();
++#ifdef __ORBIS__
++	CremaDepthClearDraw(m_state.currentCommandBuffer, m_state.activeFBO);
++#endif
+ 
+ 	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
+ 	{
+@@ -1746,12 +1916,289 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5194,7 +5252,7 @@ index 512ebee..268e828 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2245,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2282,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
@@ -11915,10 +11973,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..47113df
+index 0000000..d8bd43e
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,725 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -11951,6 +12009,7 @@ index 0000000..47113df
 +extern bool g_crema_index_cache_off; // Cafe/HW/Latte/Core/LatteIndices.cpp: Index Cache
 +bool g_crema_vertex_copy = false; // Vertex Data: Copy Every Draw (Cafe/HW/Latte/Core/LatteBufferData.cpp)
 +extern bool g_crema_sync_depth_skip; // Cafe/HW/Latte/Core/LatteTexture.cpp: Overlapping Textures
++extern bool g_crema_db_render_clear; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp: Depth-Clearing Draws
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
@@ -12082,6 +12141,8 @@ index 0000000..47113df
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
 +			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
++		{"depth_clear_draws", "Depth-Clearing Draws", "Emulation", {{"on", "Clear"}, {"off", "Ignore"}}, "on", false,
++			"Clear: a draw the game marks as a depth clear clears the depth buffer, as on the Wii U (Super Mario Maker's ground and hills flickered without it). Ignore: as Cemu, the draw is depth tested like any other."},
 +		{"texture_sync", "Overlapping Textures", "Diagnostics", {{"all", "Sync All"}, {"nodepth", "Not Colour into Depth"}}, "all", false,
 +			"When a game uses the same memory for two pictures, Crema copies the newer one into the other. Sync All (Cemu): always. Not Colour into Depth: a colour picture is never copied into a depth buffer. Try it if parts of the scene vanish or flicker on the PS4 only."},
 +		{"vertex_copy", "Vertex Data", "Diagnostics", {{"cache", "Buffer Cache"}, {"copy", "Copy Every Draw"}}, "cache", false,
@@ -12559,6 +12620,7 @@ index 0000000..47113df
 +	g_crema_index_cache_off = get("index_cache") == "off";
 +	g_crema_vertex_copy = get("vertex_copy") == "copy";
 +	g_crema_sync_depth_skip = get("texture_sync") == "nodepth";
++	g_crema_db_render_clear = get("depth_clear_draws") != "off";
 +	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	g_crema_diag_log = get("diag_log") == "on";
