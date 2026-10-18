@@ -2607,10 +2607,10 @@ index a25e771..8fabdc5 100644
  #endif
  	options.strictMul = g_current_game_profile->GetAccurateShaderMul() != AccurateShaderMulOption::False;
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 43b116f..7d69686 100644
+index 43b116f..dc41f6e 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-@@ -511,6 +511,28 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
+@@ -511,6 +511,30 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
  
  }
  
@@ -2623,7 +2623,9 @@ index 43b116f..7d69686 100644
 +// with texture_sync = nodepth not done between a depth buffer and a colour texture
 +static bool CremaSyncSlice(LatteTexture* src, sint32 srcSlice, sint32 srcMip, LatteTexture* dst, sint32 dstSlice, sint32 dstMip)
 +{
-+	const bool mixed = src->isDepth != dst->isDepth;
++	// nodepth: never colour into a depth buffer (a depth buffer sharing memory with colour pictures gets
++	// their pixels as depth values, which the GPU then tests against); depth into colour still synced
++	const bool mixed = dst->isDepth && !src->isDepth;
 +	if (g_crema_trace_frames_left)
 +		cemuLog_log(LogType::Force, "trace frame {} draw {}: texture copy {:08x} {}x{} fmt {:04x} tm {}{} -> {:08x} {}x{} fmt {:04x} tm {}{}{}",
 +			g_crema_trace_frame, LatteGPUState.drawCallCounter, src->physAddress, src->width, src->height, (uint32)src->format, (uint32)src->tileMode, src->isDepth ? " depth" : "",
@@ -2639,7 +2641,7 @@ index 43b116f..7d69686 100644
  void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
  {
  	// note: Currently this function assumes that only one other texture is updated per slice/mip (if multiple overlap, we should merge the one with the latest timestamp the latest of each individually)
-@@ -536,7 +558,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
+@@ -536,7 +560,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
  					// baseTexture is target texture
  					if (baseSliceMipInfo->lastDynamicUpdate < subSliceMipInfo->lastDynamicUpdate)
  					{
@@ -2651,7 +2653,7 @@ index 43b116f..7d69686 100644
  						baseSliceMipInfo->lastDynamicUpdate = subSliceMipInfo->lastDynamicUpdate;
  						if(subTexture->isUpdatedOnGPU)
  							LatteTC_FlagSliceAsGPUUpdated(texture, baseSliceMipInfo->sliceIndex, baseSliceMipInfo->mipIndex);
-@@ -547,7 +573,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
+@@ -547,7 +575,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
  					// subTexture is target texture
  					if (subSliceMipInfo->lastDynamicUpdate < baseSliceMipInfo->lastDynamicUpdate)
  					{
@@ -2663,7 +2665,7 @@ index 43b116f..7d69686 100644
  						subSliceMipInfo->lastDynamicUpdate = baseSliceMipInfo->lastDynamicUpdate;
  						if (baseTexture->isUpdatedOnGPU)
  							LatteTC_FlagSliceAsGPUUpdated(texture, subSliceMipInfo->sliceIndex, subSliceMipInfo->mipIndex);
-@@ -983,8 +1013,18 @@ void LatteTexture_RecreateTextureWithDifferentMipSliceCount(LatteTexture* textur
+@@ -983,8 +1015,18 @@ void LatteTexture_RecreateTextureWithDifferentMipSliceCount(LatteTexture* textur
  // create new texture representation
  // if allowCreateNewDataTexture is true, a new texture will be created if necessary. If it is false, only existing textures may be used, except if a data-compatible version of the requested texture already exists and it's not view compatible (todo - we should differentiate between Latte compatible views and renderer compatible)
  // the returned view will map to the provided mip and slice range within the created texture, this is to match the behavior of lookupSliceEx
@@ -2682,7 +2684,7 @@ index 43b116f..7d69686 100644
  	if (format == Latte::E_GX2SURFFMT::INVALID_FORMAT)
  	{
  		cemuLog_logDebug(LogType::Force, "LatteTexture_CreateMapping(): Invalid format");
-@@ -1168,10 +1208,34 @@ LatteTextureView* LatteTC_GetTextureSliceViewOrTryCreate(MPTR srcImagePtr, MPTR
+@@ -1168,10 +1210,34 @@ LatteTextureView* LatteTC_GetTextureSliceViewOrTryCreate(MPTR srcImagePtr, MPTR
  void LatteTexture_UpdateDataToLatest(LatteTexture* texture)
  {
  	if (LatteTC_HasTextureChanged(texture))
@@ -2717,7 +2719,7 @@ index 43b116f..7d69686 100644
  		LatteTexture_UpdateCacheFromDynamicTextures(texture);
  		texture->reloadFromDynamicTextures = false;
  	}
-@@ -1233,6 +1297,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1233,6 +1299,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  	_AddTextureToGlobalList(this);
  	if (depth < 1)
  		depth = 1;
@@ -11913,7 +11915,7 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..60c2138
+index 0000000..47113df
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
 @@ -0,0 +1,721 @@
@@ -12080,8 +12082,8 @@ index 0000000..60c2138
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
 +			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
-+		{"texture_sync", "Overlapping Textures", "Diagnostics", {{"all", "Sync All"}, {"nodepth", "Not Depth with Colour"}}, "all", false,
-+			"When a game uses the same memory for two pictures, Crema copies the newer one into the other. Sync All (Cemu): always. Not Depth with Colour: never between a depth buffer and a colour picture. Try it if parts of the scene vanish or flicker on the PS4 only."},
++		{"texture_sync", "Overlapping Textures", "Diagnostics", {{"all", "Sync All"}, {"nodepth", "Not Colour into Depth"}}, "all", false,
++			"When a game uses the same memory for two pictures, Crema copies the newer one into the other. Sync All (Cemu): always. Not Colour into Depth: a colour picture is never copied into a depth buffer. Try it if parts of the scene vanish or flicker on the PS4 only."},
 +		{"vertex_copy", "Vertex Data", "Diagnostics", {{"cache", "Buffer Cache"}, {"copy", "Copy Every Draw"}}, "cache", false,
 +			"Buffer Cache (Cemu): models are copied to the GPU once and kept there until the game changes them. Copy Every Draw: each draw copies its model data from the game's memory again (slower). Try it if shapes are drawn wrong on the PS4 only."},
 +		{"index_cache", "Index Cache", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
