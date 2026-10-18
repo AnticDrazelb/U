@@ -4718,7 +4718,7 @@ index d975e11..d601688 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..3521ee1 100644
+index 512ebee..d1c232a 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -5055,7 +5055,7 @@ index 512ebee..3521ee1 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1746,12 +1954,468 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1954,481 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5382,6 +5382,8 @@ index 512ebee..3521ee1 100644
 +static void CremaTraceReadTarget(LatteTextureView* view, uint32 drawIndex);
 +static uint32 s_cremaDrawInFrame = 0, s_cremaDrawFrame = 0xFFFFFFFF;
 +
++static CachedFBOVk* m_crema_activeRenderpassFBO = nullptr; // frame trace: m_state.activeRenderpassFBO
++
 +static void CremaTraceRenderTarget(CachedFBOVk* fbo)
 +{
 +	if (g_crema_trace_frame != s_cremaDrawFrame)
@@ -5410,6 +5412,16 @@ index 512ebee..3521ee1 100644
 +				LatteGPUState.contextRegister[mmVGT_PRIMITIVE_TYPE],
 +				(unsigned long long)(LatteSHRC_GetActiveGeometryShader() ? LatteSHRC_GetActiveGeometryShader()->baseHash : 0));
 +			fflush(s_draws);
++			// the GPU objects behind it: Cemu's FBO, its Vulkan framebuffer, and the depth attachment's
++			// image view and image - the same every frame unless a different object gets attached
++			if (d)
++			{
++				LatteTextureViewVk* dv = (LatteTextureViewVk*)d;
++				fprintf(s_draws, "    fbo %p framebuffer %p render pass fbo %p | depth view %p imageview %p image %p | lookup view %p\n",
++					(void*)fbo, (void*)fbo->GetFramebufferObj()->m_frameBuffer, (void*)m_crema_activeRenderpassFBO,
++					(void*)d, (void*)dv->GetViewRGBA()->m_textureImageView, (void*)((LatteTextureVk*)d->baseTexture)->GetImageObj()->m_image,
++					(void*)LatteMRT::GetDepthAttachment());
++			}
 +		}
 +	}
 +	// depth-only draws (the game's depth resets) in the first 2 frames: their depth buffer read back right
@@ -5490,6 +5502,7 @@ index 512ebee..3521ee1 100644
  		draw_execute_continued(baseVertex, baseInstance, instanceCount, count, indexDataMPTR, indexType, drawcallContext);
 +#ifdef __ORBIS__
 +	CremaLayerTraceAfterDraw();
++	m_crema_activeRenderpassFBO = m_state.activeRenderpassFBO;
 +	if (g_crema_trace_frames_left)
 +		CremaTraceRenderTarget(m_state.activeFBO);
 +	if (g_crema_trace_frames_left)
@@ -5524,7 +5537,7 @@ index 512ebee..3521ee1 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2499,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2512,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
