@@ -4138,7 +4138,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..8822825 100644
+index 599190a..e7a01fa 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4321,10 +4321,10 @@ index 599190a..8822825 100644
 +	// source texture, 2: submit, 3: submit and wait, 4: barriers, submit and wait
 +	{
 +		static uint32 s_check = 0;
-+		static int s_mode = 6;
++		static int s_mode = 0;
 +		if ((s_check++ % 60) == 0)
 +		{
-+			int mode = 6; // default: the blit (Super Mario Maker's alternating picture stops with it)
++			int mode = 0;
 +			if (FILE* f = fopen("/data/Crema/selftest/present_mode", "rb"))
 +			{
 +				char c = 0;
@@ -4636,7 +4636,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..243367d 100644
+index 512ebee..503ae91 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4863,7 +4863,7 @@ index 512ebee..243367d 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,207 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,263 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4874,6 +4874,7 @@ index 512ebee..243367d 100644
 +// shapes get different data from the game in some frames or the same data drawn differently
 +uint32 g_crema_trace_frames_left = 0; // TV frames still to record (VulkanRenderer::SwapBuffers)
 +static std::vector<uint8> s_cremaTrace;
++void CremaTraceRenderTargetsWrite();
 +static std::map<uint32, uint32> s_cremaTraceVbRanges; // buffer cache offset -> bytes (frame trace)
 +uint32 g_crema_trace_frame = 0;
 +static std::mutex s_cremaTraceShotsMutex;
@@ -4944,6 +4945,7 @@ index 512ebee..243367d 100644
 +			std::vector<std::pair<uint32, uint32>> ranges(s_cremaTraceVbRanges.begin(), s_cremaTraceVbRanges.end());
 +			s_cremaTraceVbRanges.clear();
 +			VulkanRenderer::GetInstance()->CremaDumpBufferCache(ranges, "/data/Crema/selftest/trace-gpuvb.bin");
++			CremaTraceRenderTargetsWrite();
 +		}
 +		{
 +			std::this_thread::sleep_for(std::chrono::milliseconds(200)); // the last shot's thread
@@ -5053,6 +5055,58 @@ index 512ebee..243367d 100644
 +#endif
 +
 +static uint64 s_cremaBindOffsets[16]; // frame trace: the buffer cache offset each vertex buffer is bound at
++bool LatteTextureReadback_ReadbackToLinearBlocking(LatteTextureView* sourceView, uint8* dstPtr, uint32 dstWidth, uint32 dstHeight, uint32 dstPitch);
++
++// frame trace: in the first 4 traced frames, the render target is read back after every draw into
++// the background layer (f4524000), the sprite atlas (47f92800) and the GamePad picture (f5c7b800 when
++// 864 wide) - 64x36 samples each to selftest/trace-rt.bin - to find the first draw whose result
++// differs between two frames that get the same commands
++static std::vector<uint8> s_cremaRtShots;
++static uint32 s_cremaDrawInFrame = 0, s_cremaDrawFrame = 0xFFFFFFFF;
++
++static void CremaTraceRenderTarget(CachedFBOVk* fbo)
++{
++	if (g_crema_trace_frame != s_cremaDrawFrame)
++	{
++		s_cremaDrawFrame = g_crema_trace_frame;
++		s_cremaDrawInFrame = 0;
++	}
++	const uint32 drawIndex = s_cremaDrawInFrame++;
++	if (g_crema_trace_frame >= 4 || !fbo || !fbo->colorBuffer[0].texture)
++		return;
++	LatteTextureView* view = fbo->colorBuffer[0].texture;
++	LatteTexture* tex = view->baseTexture;
++	const MPTR addr = tex->physAddress;
++	if (!(addr == 0xf4524000 || addr == 0x47f92800 || (addr == 0xf5c7b800 && tex->width == 864)))
++		return;
++	const uint32 bpp = Latte::GetFormatBits(tex->format) / 8;
++	if (bpp != 4)
++		return;
++	std::vector<uint8> pixels((size_t)tex->width * tex->height * 4);
++	if (!LatteTextureReadback_ReadbackToLinearBlocking(view, pixels.data(), tex->width, tex->height, tex->width))
++		return;
++	const uint32 head[5] = {g_crema_trace_frame, drawIndex, addr, (uint32)tex->width, (uint32)tex->height};
++	s_cremaRtShots.insert(s_cremaRtShots.end(), (const uint8*)head, (const uint8*)head + sizeof(head));
++	for (uint32 y = 0; y < 36; y++)
++		for (uint32 x = 0; x < 64; x++)
++		{
++			const uint8* px = pixels.data() + ((size_t)(y * tex->height / 36) * tex->width + x * tex->width / 64) * 4;
++			s_cremaRtShots.insert(s_cremaRtShots.end(), px, px + 4);
++		}
++}
++
++void CremaTraceRenderTargetsWrite()
++{
++	if (s_cremaRtShots.empty())
++		return;
++	if (FILE* out = fopen("/data/Crema/selftest/trace-rt.bin", "wb"))
++	{
++		fwrite(s_cremaRtShots.data(), 1, s_cremaRtShots.size(), out);
++		fclose(out);
++	}
++	cemuLog_log(LogType::Force, "frame trace: {} render target pictures written to selftest/trace-rt.bin", s_cremaRtShots.size() / (20 + 64 * 36 * 4));
++	s_cremaRtShots.clear();
++}
 +
  void VulkanRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 instanceCount, uint32 count, MPTR indexDataMPTR, Latte::LATTE_VGT_DMA_INDEX_TYPE::E_INDEX_TYPE indexType, const LatteDrawcallContext& drawcallContext)
  {
@@ -5061,6 +5115,8 @@ index 512ebee..243367d 100644
  	else
  		draw_execute_continued(baseVertex, baseInstance, instanceCount, count, indexDataMPTR, indexType, drawcallContext);
 +#ifdef __ORBIS__
++	if (g_crema_trace_frames_left)
++		CremaTraceRenderTarget(m_state.activeFBO);
 +	if (g_crema_trace_frames_left)
 +		for (uint32 i = 0; i < 16; i++)
 +			s_cremaBindOffsets[i] = m_state.currentVertexBinding[i].offset;
