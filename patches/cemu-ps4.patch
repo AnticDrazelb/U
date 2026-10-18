@@ -4677,7 +4677,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..ffad13d 100644
+index 512ebee..48d4e86 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4734,7 +4734,59 @@ index 512ebee..ffad13d 100644
  void VulkanRenderer::draw_setRenderPass()
  {
  	CachedFBOVk* fboVk = m_state.activeFBO;
-@@ -1297,8 +1322,132 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1264,6 +1289,40 @@ void VulkanRenderer::draw_setRenderPass()
+ 	performanceMonitor.vk.numBeginRenderpassPerFrame.increment();
+ }
+ 
++#ifdef __ORBIS__
++// Crema experiment (selftest/depth_mode, read every second) - reading images back in the middle of the
++// frame stopped Super Mario Maker's alternating depth reset; which part of it matters:
++// 1: a full memory barrier after every render pass, 2: after every depth-only draw the pass ends and
++// its depth image goes to TRANSFER_SRC and back, 3: the same after every draw with a depth image,
++// 4: 2 with a full memory barrier instead of the layout change
++int g_crema_depth_mode = 0;
++static void CremaDepthModeRefresh()
++{
++	static uint32 s_check = 0;
++	if ((s_check++ % 30000) != 0)
++		return;
++	int mode = 0;
++	if (FILE* f = fopen("/data/Crema/selftest/depth_mode", "rb"))
++	{
++		char c = 0;
++		fread(&c, 1, 1, f);
++		fclose(f);
++		mode = (c >= '0' && c <= '9') ? c - '0' : 0;
++	}
++	if (mode != g_crema_depth_mode)
++		cemuLog_log(LogType::Force, "depth experiment: mode {}", mode);
++	g_crema_depth_mode = mode;
++}
++
++static void CremaFullBarrier(VkCommandBuffer cmd)
++{
++	VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++	b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++	b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
++}
++#endif
++
+ void VulkanRenderer::draw_endRenderPass()
+ {
+ 	if (!m_state.activeRenderpassFBO)
+@@ -1274,6 +1333,10 @@ void VulkanRenderer::draw_endRenderPass()
+ 		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+ 	sync_RenderPassStoreTextures(m_state.activeRenderpassFBO);
+ 	m_state.activeRenderpassFBO = nullptr;
++#ifdef __ORBIS__
++	if (g_crema_depth_mode == 1)
++		CremaFullBarrier(m_state.currentCommandBuffer);
++#endif
+ }
+ 
+ // Defined in the Common renderer
+@@ -1297,8 +1360,132 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
@@ -4867,7 +4919,7 @@ index 512ebee..ffad13d 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1457,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1495,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -4875,7 +4927,7 @@ index 512ebee..ffad13d 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1471,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1509,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -4883,7 +4935,7 @@ index 512ebee..ffad13d 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1479,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1517,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -4891,7 +4943,7 @@ index 512ebee..ffad13d 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1504,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1542,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -4909,7 +4961,7 @@ index 512ebee..ffad13d 100644
  		return;
  	}
  
-@@ -1451,8 +1607,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1645,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -4922,7 +4974,7 @@ index 512ebee..ffad13d 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1462,6 +1622,9 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1462,6 +1660,9 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	m_state.descriptorSetsChanged = true;
  
  	draw_setRenderPass();
@@ -4932,7 +4984,7 @@ index 512ebee..ffad13d 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1526,6 +1689,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1526,6 +1727,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -4940,7 +4992,7 @@ index 512ebee..ffad13d 100644
  		return;
  	}
  
-@@ -1640,8 +1804,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1842,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
@@ -4952,7 +5004,7 @@ index 512ebee..ffad13d 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1656,6 +1823,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1656,6 +1861,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	}
  
  	draw_setRenderPass();
@@ -4962,7 +5014,7 @@ index 512ebee..ffad13d 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1746,12 +1916,318 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1954,340 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5278,10 +5330,32 @@ index 512ebee..ffad13d 100644
 +		CremaTraceDraw(LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), baseVertex, instanceCount, count, (uint32)indexType, drawcallContext.isFirst,
 +			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX], (uint32)m_state.currentVertexBinding[0].offset, s_cremaBindOffsets, indexDataMPTR);
 +#endif
++#ifdef __ORBIS__
++	CremaDepthModeRefresh();
++	if (g_crema_depth_mode >= 2 && m_state.activeFBO && m_state.activeFBO->depthBuffer.texture &&
++		(g_crema_depth_mode == 3 || !m_state.activeFBO->colorBuffer[0].texture))
++	{
++		LatteTextureView* depthView = m_state.activeFBO->depthBuffer.texture;
++		draw_endRenderPass();
++		if (g_crema_depth_mode == 4)
++			CremaFullBarrier(m_state.currentCommandBuffer);
++		else
++		{
++			LatteTextureVk* depthTex = (LatteTextureVk*)depthView->baseTexture;
++			VkImageSubresourceLayers sub{};
++			sub.aspectMask = depthTex->GetImageAspect();
++			sub.baseArrayLayer = depthView->firstSlice;
++			sub.layerCount = 1;
++			sub.mipLevel = depthView->firstMip;
++			barrier_image<SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER, SYNC_OP::ANY_TRANSFER>(depthTex, sub, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++			barrier_image<SYNC_OP::ANY_TRANSFER, SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(depthTex, sub, depthTex->GetDefaultLayout());
++		}
++	}
++#endif
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2311,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2371,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
