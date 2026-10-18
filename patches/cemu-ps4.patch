@@ -4138,7 +4138,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..e7a01fa 100644
+index 599190a..4630ee8 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4217,21 +4217,40 @@ index 599190a..e7a01fa 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -2280,7 +2305,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+@@ -2280,7 +2305,32 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
  	occlusionQuery_notifyBeginCommandBuffer();
  
  	m_recordedDrawcalls = 0;
 +#if defined(__ORBIS__)
-+	// Crema: a submission is two kernel calls on the PS4 (~7% of Breath of the Wild's GPU thread
-+	// at 300 draws each); the PS4 GPU is mostly idle, so starting its work later costs nothing
-+	m_submitThreshold = 800;
++	// Crema: Cemu's 300 draws per submission again (800 before 2.93 saved kernel calls, but Super
++	// Mario Maker's frame then went to the GPU in one piece and every other frame came out wrong;
++	// split into pieces it didn't). selftest/submit_threshold overrides it (tests).
++	{
++		static uint32 s_check = 0;
++		static uint32 s_threshold = 300;
++		if ((s_check++ % 120) == 0)
++		{
++			uint32 threshold = 300;
++			if (FILE* f = fopen("/data/Crema/selftest/submit_threshold", "rb"))
++			{
++				char text[16] = {};
++				fread(text, 1, sizeof(text) - 1, f);
++				fclose(f);
++				threshold = std::clamp<uint32>((uint32)atoi(text), 10, 100000);
++			}
++			if (threshold != s_threshold)
++				cemuLog_log(LogType::Force, "submit threshold: {} draws", threshold);
++			s_threshold = threshold;
++		}
++		m_submitThreshold = s_threshold;
++	}
 +#else
  	m_submitThreshold = 300;
 +#endif
  	m_submitOnIdle = false;
  }
  
-@@ -2314,6 +2345,10 @@ void VulkanRenderer::WaitCommandBufferFinished(uint64 commandBufferId)
+@@ -2314,6 +2364,10 @@ void VulkanRenderer::WaitCommandBufferFinished(uint64 commandBufferId)
  		WaitForNextFinishedCommandBuffer();
  }
  
@@ -4242,7 +4261,7 @@ index 599190a..e7a01fa 100644
  void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
  {
  	SetThreadName("vkDriverPlCache");
-@@ -2331,7 +2366,11 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
+@@ -2331,7 +2385,11 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
  		}
  	}
  
@@ -4254,7 +4273,7 @@ index 599190a..e7a01fa 100644
  
  	while (true)
  	{
-@@ -2397,7 +2436,11 @@ void VulkanRenderer::CreatePipelineCache()
+@@ -2397,7 +2455,11 @@ void VulkanRenderer::CreatePipelineCache()
  	const auto dir = ActiveSettings::GetCachePath("shaderCache/driver/vk");
  	if (fs::exists(dir))
  	{
@@ -4266,7 +4285,7 @@ index 599190a..e7a01fa 100644
  		auto file = std::ifstream(filename, std::ios::in | std::ios::binary | std::ios::ate);
  		if (file.is_open())
  		{
-@@ -3038,7 +3081,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3038,7 +3100,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -4279,7 +4298,7 @@ index 599190a..e7a01fa 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3105,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3124,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -4288,7 +4307,7 @@ index 599190a..e7a01fa 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3113,9 +3161,21 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
+@@ -3113,9 +3180,21 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
  
  void VulkanBenchmarkPrintResults();
  
@@ -4310,7 +4329,7 @@ index 599190a..e7a01fa 100644
  
  	if (swapTV && IsSwapchainInfoValid(true))
  		SwapBuffer(true);
-@@ -3279,9 +3339,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3279,9 +3358,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  
  	// mark current swapchain image as well defined
  	chainInfo.hasDefinedSwapchainImage = true;
@@ -4454,7 +4473,7 @@ index 599190a..e7a01fa 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3494,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3513,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4467,7 +4486,7 @@ index 599190a..e7a01fa 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,10 +3996,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,10 +4015,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -4495,7 +4514,7 @@ index 599190a..e7a01fa 100644
  void VulkanRenderer::buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size)
  {
  	cemu_assert_debug(bufferIndex < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS);
-@@ -3875,6 +4088,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+@@ -3875,6 +4107,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
  }
  
@@ -4554,7 +4573,7 @@ index 599190a..e7a01fa 100644
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4148,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4167,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -4564,7 +4583,7 @@ index 599190a..e7a01fa 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4647,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4666,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
