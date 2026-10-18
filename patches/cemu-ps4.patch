@@ -2141,6 +2141,33 @@ index a561a20..61f945d 100644
  		g_currentCacheChronon++;
  }
  
+diff --git a/src/Cafe/HW/Latte/Core/LatteBufferData.cpp b/src/Cafe/HW/Latte/Core/LatteBufferData.cpp
+index 538f35e..6aaa3d9 100644
+--- a/src/Cafe/HW/Latte/Core/LatteBufferData.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteBufferData.cpp
+@@ -292,6 +292,22 @@ void LatteBufferCache_Sync(uint32 maxVtxIndex, uint32 baseInstance, uint32 insta
+ 			}
+ #endif
+ 
++#if defined(__ORBIS__)
++			// Crema setting vertex_copy (diagnostics): every draw's vertex data copied from the game's
++			// memory into fresh GPU memory, instead of read from the buffer cache
++			{
++				extern bool g_crema_vertex_copy; // gui/ps4/launcher/CremaSettings.cpp
++				if (g_crema_vertex_copy)
++				{
++					if (VulkanRenderer* vkRenderer = VulkanRenderer::GetInstance())
++					{
++						vkRenderer->CremaBindVertexCopy(bufferAddress, lookupRangeSize, bufferIndex);
++						continue;
++					}
++				}
++			}
++#endif
++
+ 			uint32 bindOffset = LatteBufferCache_retrieveDataInCache(bufferAddress, lookupRangeSize);
+ 			bindBufferArray[bindBufferArraySize].index = bufferIndex;
+ 			bindBufferArray[bindBufferArraySize].bindOffset = bindOffset;
 diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 index de67772..24b109b 100644
 --- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
@@ -3954,7 +3981,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..624128e 100644
+index 599190a..924d80e 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4189,7 +4216,7 @@ index 599190a..624128e 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,6 +3905,14 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,10 +3905,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -4204,7 +4231,20 @@ index 599190a..624128e 100644
  		vkCmdBindVertexBuffers(m_state.currentCommandBuffer, binding.index, 1, &buffer, &bindOffset);
  	}
  }
-@@ -3875,6 +3988,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+ 
++#ifdef __ORBIS__
++void VulkanRenderer::CremaBindVertexCopy(MPTR address, uint32 size, uint32 bufferIndex)
++{
++	auto copy = memoryManager->getMetalStrideWorkaroundAllocator().AllocateBufferMemory(size, 256);
++	memcpy(copy.memPtr, memory_getPointerFromPhysicalOffset(address), size);
++	buffer_bindVertexStrideWorkaroundBuffer(copy.vkBuffer, copy.bufferOffset, bufferIndex, size);
++}
++#endif
++
+ void VulkanRenderer::buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size)
+ {
+ 	cemu_assert_debug(bufferIndex < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS);
+@@ -3875,6 +3997,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
  }
  
@@ -4263,7 +4303,7 @@ index 599190a..624128e 100644
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4048,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4057,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -4273,7 +4313,7 @@ index 599190a..624128e 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4547,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4556,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -4282,7 +4322,7 @@ index 599190a..624128e 100644
  	performanceMonitor.vk.numDescriptorSets.decrement();
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index d975e11..a01caf6 100644
+index d975e11..f8c8bf3 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -212,7 +212,7 @@ public:
@@ -4303,7 +4343,7 @@ index d975e11..a01caf6 100644
  	VkDescriptorSet backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter);
  
  	robin_hood::unordered_flat_map<uint64, robin_hood::unordered_flat_map<uint64, PipelineInfo*> > m_pipeline_info_cache; // using robin_hood::unordered_flat_map is twice as fast (1-2% overall CPU time reduction)
-@@ -335,6 +337,9 @@ public:
+@@ -335,10 +337,16 @@ public:
  	// renderer interface
  	void bufferCache_init(const sint32 bufferSize) override;
  	void bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset) override;
@@ -4313,7 +4353,14 @@ index d975e11..a01caf6 100644
  	void bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size) override;
  
  	void buffer_bindVertexBuffers(std::span<BindBufferParam> bindings) override;
-@@ -434,6 +439,7 @@ private:
+ 	void buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size);
++#ifdef __ORBIS__
++	void CremaBindVertexCopy(MPTR address, uint32 size, uint32 bufferIndex); // Crema setting vertex_copy
++#endif
+ 	std::pair<VkBuffer, uint32> buffer_genStrideWorkaroundVertexBuffer(MPTR buffer, uint32 size, uint32 oldStride);
+ 	void buffer_bindUniformBuffer(LatteConst::ShaderType shaderType, uint32 bufferIndex, uint32 offset, uint32 size) override;
+ 
+@@ -434,6 +442,7 @@ private:
  	VkRenderPass m_imguiRenderPass = VK_NULL_HANDLE;
  
  	VkDescriptorPool m_descriptorPool;
@@ -4321,7 +4368,7 @@ index d975e11..a01caf6 100644
  
    public:
  	struct QueueFamilyIndices
-@@ -475,6 +481,7 @@ private:
+@@ -475,6 +484,7 @@ private:
  		struct
  		{
  			bool shaderRoundingModeRTEFloat32{ false };
@@ -4329,7 +4376,7 @@ index d975e11..a01caf6 100644
  		}shaderFloatControls; // from VK_KHR_shader_float_controls
  
  		struct
-@@ -955,6 +962,7 @@ private:
+@@ -955,6 +965,7 @@ private:
  public:
  	bool GetDisableMultithreadedCompilation() const { return m_featureControl.disableMultithreadedCompilation; }
  	bool HasSPRIVRoundingModeRTE32() const { return m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32; }
@@ -11443,10 +11490,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..0d3bc36
+index 0000000..3d963b9
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,717 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -11477,6 +11524,7 @@ index 0000000..0d3bc36
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 +extern bool g_crema_frame_wait; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp: Wait for GPU Each Frame
 +extern bool g_crema_index_cache_off; // Cafe/HW/Latte/Core/LatteIndices.cpp: Index Cache
++bool g_crema_vertex_copy = false; // Vertex Data: Copy Every Draw (Cafe/HW/Latte/Core/LatteBufferData.cpp)
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
@@ -11608,6 +11656,8 @@ index 0000000..0d3bc36
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
 +			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
++		{"vertex_copy", "Vertex Data", "Diagnostics", {{"cache", "Buffer Cache"}, {"copy", "Copy Every Draw"}}, "cache", false,
++			"Buffer Cache (Cemu): models are copied to the GPU once and kept there until the game changes them. Copy Every Draw: each draw copies its model data from the game's memory again (slower). Try it if shapes are drawn wrong on the PS4 only."},
 +		{"index_cache", "Index Cache", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"On (Cemu): the list of corners a model is drawn from is converted once and reused while the game doesn't change it. Off: converted again for every draw (a little slower). Try Off if shapes in a game are drawn wrong on the PS4 only."},
 +		{"frame_wait", "Wait for GPU Each Frame", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -12079,6 +12129,7 @@ index 0000000..0d3bc36
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
 +	g_crema_frame_wait = get("frame_wait") == "on";
 +	g_crema_index_cache_off = get("index_cache") == "off";
++	g_crema_vertex_copy = get("vertex_copy") == "copy";
 +	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	g_crema_diag_log = get("diag_log") == "on";
