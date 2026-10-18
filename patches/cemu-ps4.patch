@@ -4385,7 +4385,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..9e2f3f9 100644
+index 512ebee..243367d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4612,7 +4612,7 @@ index 512ebee..9e2f3f9 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,206 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,207 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4761,7 +4761,7 @@ index 512ebee..9e2f3f9 100644
 +	put32(vbAddr);
 +	put32(stride);
 +	put32(vbBindOffset); // where the GPU reads it in the buffer cache
-+	if (vbAddr && vbBytes)
++	if (vbAddr && vbBytes && vbBindOffset != 0xFFFFFFFF)
 +	{
 +		uint32& known = s_cremaTraceVbRanges[vbBindOffset];
 +		known = std::max(known, vbBytes);
@@ -4785,8 +4785,9 @@ index 512ebee..9e2f3f9 100644
 +		put32(bindOffset);
 +		put32(bytes);
 +		if (bytes)
-+		{
 +			put(memory_getPointerFromPhysicalOffset(r[0]), bytes);
++		if (bytes && bindOffset != 0xFFFFFFFF) // 0xFFFFFFFF: bound outside the buffer cache (Vertex Data: Copy Every Draw)
++		{
 +			uint32& known = s_cremaTraceVbRanges[bindOffset];
 +			known = std::max(known, bytes);
 +		}
