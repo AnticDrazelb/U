@@ -4677,7 +4677,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..247b7b2 100644
+index 512ebee..5db23a3 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4962,7 +4962,7 @@ index 512ebee..247b7b2 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1746,12 +1916,289 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1916,308 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5174,6 +5174,25 @@ index 512ebee..247b7b2 100644
 +	}
 +	const uint32 drawIndex = s_cremaDrawInFrame++;
 +	(void)drawIndex;
++	if (g_crema_trace_frame < 2 && fbo)
++	{
++		// per draw: colour and depth attachments and the depth registers (selftest/trace-draws.txt), the
++		// same lines as the PC comparison build's crema_trace_draws.txt
++		static FILE* s_draws = nullptr;
++		if (!s_draws)
++			s_draws = fopen("/data/Crema/selftest/trace-draws.txt", "w");
++		LatteTextureView* c = fbo->colorBuffer[0].texture;
++		LatteTextureView* d = fbo->depthBuffer.texture;
++		if (s_draws)
++		{
++			fprintf(s_draws, "frame %u draw %u: color %08x %dx%d depth %08x %dx%d fmt %04x DB_DEPTH_CONTROL %08x DB_DEPTH_BASE %08x DB_DEPTH_SIZE %08x DB_DEPTH_VIEW %08x vs %016llx\n",
++				g_crema_trace_frame, drawIndex, c ? c->baseTexture->physAddress : 0, c ? c->baseTexture->width : 0, c ? c->baseTexture->height : 0,
++				d ? d->baseTexture->physAddress : 0, d ? d->baseTexture->width : 0, d ? d->baseTexture->height : 0, d ? (uint32)d->baseTexture->format : 0,
++				LatteGPUState.contextRegister[0xA200], LatteGPUState.contextRegister[0xA003], LatteGPUState.contextRegister[0xA000], LatteGPUState.contextRegister[0xA001],
++				(unsigned long long)(LatteSHRC_GetActiveVertexShader() ? LatteSHRC_GetActiveVertexShader()->baseHash : 0));
++			fflush(s_draws);
++		}
++	}
 +	if (g_crema_trace_frame >= 6 || !fbo || !fbo->colorBuffer[0].texture)
 +		return;
 +	LatteTextureView* view = fbo->colorBuffer[0].texture;
@@ -5252,7 +5271,7 @@ index 512ebee..247b7b2 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2282,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2301,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
