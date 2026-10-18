@@ -19443,10 +19443,10 @@ index 0000000..abf6da9
 +}
 diff --git a/src/gui/ps4/launcher/gpu_selftest_depth.h b/src/gui/ps4/launcher/gpu_selftest_depth.h
 new file mode 100644
-index 0000000..51db4f4
+index 0000000..3c32347
 --- /dev/null
 +++ b/src/gui/ps4/launcher/gpu_selftest_depth.h
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,261 @@
 +// Crema GPU self-test: does a depth value written by the GPU reach the next operation that reads it?
 +// Super Mario Maker's depth-buffer readbacks on the PS4 came back one step late (the value from before
 +// the last write). Each case writes a new depth value to a D32 image and copies the image to a buffer
@@ -19476,7 +19476,7 @@ index 0000000..51db4f4
 +	// optimal layouts), the write by vkCmdClearAttachments inside a render pass (a draw-based clear) or by
 +	// vkCmdClearDepthStencilImage; `oneCommandBuffer`: all rounds recorded into one submission
 +	std::string depthtest_case(VkPhysicalDevice gpu, VkDevice device, uint32_t queueFamily, VkQueue queue, const char* name,
-+		bool generalLayout, bool clearInPass, bool oneCommandBuffer)
++		bool generalLayout, bool clearInPass, bool oneCommandBuffer, bool cachedReadback = false)
 +	{
 +		const uint32_t W = 64, H = 64, steps = 6;
 +		std::string result = std::string(name) + ":";
@@ -19547,7 +19547,8 @@ index 0000000..51db4f4
 +		vkCreateBuffer(device, &bci, nullptr, &buf);
 +		vkGetBufferMemoryRequirements(device, buf, &req);
 +		mai.allocationSize = req.size;
-+		mai.memoryTypeIndex = depthtest_memory_type(gpu, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++		mai.memoryTypeIndex = depthtest_memory_type(gpu, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++			(cachedReadback ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0));
 +		vkAllocateMemory(device, &mai, nullptr, &bufMem);
 +		vkBindBufferMemory(device, buf, bufMem, 0);
 +		float* mapped = nullptr;
@@ -19610,6 +19611,7 @@ index 0000000..51db4f4
 +		imageBarrier(clearLayout, passLayout, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, dsStages, dsAccess);
 +		submit();
 +
++		int cachedBad = 0;
 +		if (oneCommandBuffer)
 +			begin();
 +		for (uint32_t s = 0; s < steps; s++)
@@ -19641,7 +19643,7 @@ index 0000000..51db4f4
 +				imageBarrier(clearLayout, copyLayout, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 +			}
 +			VkBufferImageCopy region{};
-+			region.bufferOffset = (VkDeviceSize)s * W * H * 4;
++			region.bufferOffset = cachedReadback ? 0 : (VkDeviceSize)s * W * H * 4;
 +			region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
 +			region.imageExtent = {W, H, 1};
 +			vkCmdCopyImageToBuffer(cmd, img.image, copyLayout, buf, 1, &region);
@@ -19652,12 +19654,23 @@ index 0000000..51db4f4
 +			imageBarrier(copyLayout, passLayout, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, dsStages, dsAccess);
 +			if (!oneCommandBuffer)
 +				submit();
++			if (cachedReadback)
++			{
++				// the CPU reads the slot now (its cache gets the lines), the next step overwrites it
++				volatile float got = mapped[(H / 2) * W + W / 2];
++				result += fmt::format(" {:.2f}", (float)got);
++				const float expect = 0.1f * (float)(s + 1);
++				if (got < expect - 0.001f || got > expect + 0.001f)
++					cachedBad++;
++			}
 +		}
 +		if (oneCommandBuffer)
 +			submit();
 +
 +		int bad = 0;
-+		for (uint32_t s = 0; s < steps; s++)
++		if (cachedReadback)
++			result += cachedBad ? fmt::format(" -> WRONG in {} of {}", cachedBad, steps) : std::string(" -> ok");
++		for (uint32_t s = 0; s < (cachedReadback ? 0u : steps); s++)
 +		{
 +			const float* slot = mapped + (size_t)s * W * H;
 +			const float got = slot[(H / 2) * W + W / 2];
@@ -19666,7 +19679,8 @@ index 0000000..51db4f4
 +			if (got < expect - 0.001f || got > expect + 0.001f)
 +				bad++;
 +		}
-+		result += bad ? fmt::format(" -> WRONG in {} of {}", bad, steps) : std::string(" -> ok");
++		if (!cachedReadback)
++			result += bad ? fmt::format(" -> WRONG in {} of {}", bad, steps) : std::string(" -> ok");
 +
 +		vkDestroyFence(device, fence, nullptr);
 +		vkDestroyCommandPool(device, cpool, nullptr);
@@ -19689,6 +19703,8 @@ index 0000000..51db4f4
 +		out += depthtest_case(gpu, device, queueFamily, queue, "draw clear, optimal layouts, one submit", false, true, true) + "\n";
 +		out += depthtest_case(gpu, device, queueFamily, queue, "image clear, GENERAL, one submit", true, false, true) + "\n";
 +		out += depthtest_case(gpu, device, queueFamily, queue, "image clear, optimal layouts, one submit", false, false, true) + "\n";
++		out += depthtest_case(gpu, device, queueFamily, queue, "draw clear, GENERAL, CPU-cached readback reused", true, true, false, true) + "\n";
++		out += depthtest_case(gpu, device, queueFamily, queue, "image clear, optimal, CPU-cached readback reused", false, false, false, true) + "\n";
 +		return out;
 +	}
 +} // namespace
