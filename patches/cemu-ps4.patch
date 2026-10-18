@@ -3944,7 +3944,7 @@ index f503c10..d5bb8fa 100644
  
  VKFUNC_DEVICE(vkCreateSampler);
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
-index 7179087..28d148e 100644
+index 7179087..bf050a6 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
 @@ -10,6 +10,21 @@
@@ -4047,7 +4047,22 @@ index 7179087..28d148e 100644
  		inputAssembly.primitiveRestartEnable = false;
  		break;
  	default:
-@@ -843,7 +912,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
+@@ -499,6 +568,14 @@ void PipelineCompiler::InitRasterizerState(const LatteContextRegister& latteRegi
+ 
+ 	cemu_assert_debug(LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_ZCLIP_NEAR_DISABLE() == LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE()); // near or far clipping can be disabled individually
+ 	bool zClipEnable = LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE() == false;
++#ifdef __ORBIS__
++	// Crema setting depth_clip = off: no depth clipping (depth is clamped instead, as always) - a shape
++	// drawn exactly at the far plane, like Super Mario Maker's full-screen depth resets, can come out a
++	// rounding error beyond it on the PS4 GPU and be clipped away entirely
++	extern bool g_crema_depth_clip_off; // gui/ps4/launcher/CremaSettings.cpp
++	if (g_crema_depth_clip_off)
++		zClipEnable = false;
++#endif
+ 
+ 	// z-clipping
+ 	rasterizerExt.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT;
+@@ -843,7 +920,12 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
  	m_requestRobustBufferAccess = requireRobustBufferAccess;
  
  	// if required generate RECT emulation geometry shader
@@ -4061,7 +4076,7 @@ index 7179087..28d148e 100644
  	{
  		cemu_assert(m_vkGeometryShader == nullptr); // todo - handle cases where the game already provides a GS
  		m_rectEmulationGS = rectsEmulationGS_generate(pipelineInfo->vertexShader, latteRegister);
-@@ -1050,8 +1124,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
+@@ -1050,8 +1132,12 @@ void PipelineCompiler::TrackAsCached(uint64 baseHash, uint64 pipelineStateHash)
  // this can happen when:
  // - Streamout is used with too small of a buffer (probably? Could also be some issue with how the streamout array index is calculated -> We can maybe fix this in the future)
  // - The shader uses dynamic indices for uniform access. This will trigger the uniform mode to be FULL_CBANK
@@ -4074,7 +4089,7 @@ index 7179087..28d148e 100644
  	bool requiresRobustBufferAcces = false;
  	if (vertexShader)
  	{
-@@ -1085,6 +1163,11 @@ static void compilePipeline_thread(sint32 threadIndex)
+@@ -1085,6 +1171,11 @@ static void compilePipeline_thread(sint32 threadIndex)
  	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
  	if(threadIndex != 0)
  		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -4086,7 +4101,7 @@ index 7179087..28d148e 100644
  #endif
  	while (!s_compileThreadsShutdownSignal)
  	{
-@@ -1109,6 +1192,9 @@ void PipelineCompiler::CompileThreadPool_Start()
+@@ -1109,6 +1200,9 @@ void PipelineCompiler::CompileThreadPool_Start()
  		numCompileThreads = 2 + (cpuCoreCount - 3); // 2 plus one additionally for every extra core above 3
  
  	numCompileThreads = std::min(numCompileThreads, 8u); // cap at 8
@@ -12076,10 +12091,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..d8bd43e
+index 0000000..c9e4471
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,729 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -12113,6 +12128,7 @@ index 0000000..d8bd43e
 +bool g_crema_vertex_copy = false; // Vertex Data: Copy Every Draw (Cafe/HW/Latte/Core/LatteBufferData.cpp)
 +extern bool g_crema_sync_depth_skip; // Cafe/HW/Latte/Core/LatteTexture.cpp: Overlapping Textures
 +extern bool g_crema_db_render_clear; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp: Depth-Clearing Draws
++bool g_crema_depth_clip_off = false; // Depth Clipping (Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp)
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
@@ -12244,6 +12260,8 @@ index 0000000..d8bd43e
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
 +			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
++		{"depth_clip", "Depth Clipping", "Emulation", {{"game", "As the Game Sets"}, {"off", "Off"}}, "game", false,
++			"As the Game Sets (Cemu): shapes beyond the near or far plane are cut away when the game asks for it. Off: never cut, their depth is clamped to the plane instead. Try Off if parts of a scene vanish or flicker on the PS4 only."},
 +		{"depth_clear_draws", "Depth-Clearing Draws", "Emulation", {{"on", "Clear"}, {"off", "Ignore"}}, "on", false,
 +			"Clear: a draw the game marks as a depth clear clears the depth buffer, as on the Wii U (Super Mario Maker's ground and hills flickered without it). Ignore: as Cemu, the draw is depth tested like any other."},
 +		{"texture_sync", "Overlapping Textures", "Diagnostics", {{"all", "Sync All"}, {"nodepth", "Not Colour into Depth"}}, "all", false,
@@ -12724,6 +12742,7 @@ index 0000000..d8bd43e
 +	g_crema_vertex_copy = get("vertex_copy") == "copy";
 +	g_crema_sync_depth_skip = get("texture_sync") == "nodepth";
 +	g_crema_db_render_clear = get("depth_clear_draws") != "off";
++	g_crema_depth_clip_off = get("depth_clip") == "off";
 +	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	g_crema_diag_log = get("diag_log") == "on";
