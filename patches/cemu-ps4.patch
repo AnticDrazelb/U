@@ -4138,7 +4138,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..a7ecd70 100644
+index 599190a..dd89b21 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4307,12 +4307,14 @@ index 599190a..a7ecd70 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3113,9 +3180,24 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
+@@ -3113,9 +3180,28 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
  
  void VulkanBenchmarkPrintResults();
  
 +#ifdef __ORBIS__
 +void CremaTraceFrameDone(); // VulkanRendererCore.cpp: frame trace
++void CremaTraceRenderTargetsFrameEnd(); // VulkanRendererCore.cpp: render targets read back at the frame's end
++extern uint32 g_crema_trace_frames_left;
 +#endif
 +
 +bool g_crema_frame_wait = false; // Crema setting frame_wait (diagnostics): the CPU waits for the GPU every frame
@@ -4322,6 +4324,8 @@ index 599190a..a7ecd70 100644
  {
  	SubmitCommandBuffer();
 +#ifdef __ORBIS__
++	if (swapTV && g_crema_trace_frames_left)
++		CremaTraceRenderTargetsFrameEnd();
 +	if (swapTV)
 +		CremaTraceFrameDone();
 +	if (g_crema_frame_wait && swapTV)
@@ -4332,7 +4336,7 @@ index 599190a..a7ecd70 100644
  
  	if (swapTV && IsSwapchainInfoValid(true))
  		SwapBuffer(true);
-@@ -3279,9 +3361,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3279,9 +3365,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  
  	// mark current swapchain image as well defined
  	chainInfo.hasDefinedSwapchainImage = true;
@@ -4476,7 +4480,7 @@ index 599190a..a7ecd70 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3516,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3520,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4489,7 +4493,7 @@ index 599190a..a7ecd70 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,10 +4018,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,10 +4022,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -4517,7 +4521,7 @@ index 599190a..a7ecd70 100644
  void VulkanRenderer::buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size)
  {
  	cemu_assert_debug(bufferIndex < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS);
-@@ -3875,6 +4110,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+@@ -3875,6 +4114,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
  }
  
@@ -4576,7 +4580,7 @@ index 599190a..a7ecd70 100644
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4170,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4174,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -4586,7 +4590,7 @@ index 599190a..a7ecd70 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4669,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4673,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -4658,7 +4662,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..dba9a1a 100644
+index 512ebee..eb37330 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4885,7 +4889,7 @@ index 512ebee..dba9a1a 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,263 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,281 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5084,6 +5088,8 @@ index 512ebee..dba9a1a 100644
 +// 864 wide) - 64x36 samples each to selftest/trace-rt.bin - to find the first draw whose result
 +// differs between two frames that get the same commands
 +static std::vector<uint8> s_cremaRtShots;
++static std::vector<LatteTextureView*> s_cremaFrameTargets;
++static void CremaTraceReadTarget(LatteTextureView* view, uint32 drawIndex);
 +static uint32 s_cremaDrawInFrame = 0, s_cremaDrawFrame = 0xFFFFFFFF;
 +
 +static void CremaTraceRenderTarget(CachedFBOVk* fbo)
@@ -5094,15 +5100,31 @@ index 512ebee..dba9a1a 100644
 +		s_cremaDrawInFrame = 0;
 +	}
 +	const uint32 drawIndex = s_cremaDrawInFrame++;
-+	if (g_crema_trace_frame >= 4 || !fbo || !fbo->colorBuffer[0].texture)
++	(void)drawIndex;
++	if (g_crema_trace_frame >= 6 || !fbo || !fbo->colorBuffer[0].texture)
 +		return;
 +	LatteTextureView* view = fbo->colorBuffer[0].texture;
++	if (std::find(s_cremaFrameTargets.begin(), s_cremaFrameTargets.end(), view) == s_cremaFrameTargets.end())
++		s_cremaFrameTargets.push_back(view);
++}
++
++// at the end of each of the first 6 traced frames: every render target drawn in it, read back once
++void CremaTraceRenderTargetsFrameEnd()
++{
++	std::vector<LatteTextureView*> views;
++	views.swap(s_cremaFrameTargets);
++	if (g_crema_trace_frame >= 6)
++		return;
++	for (LatteTextureView* view : views)
++		CremaTraceReadTarget(view, 0xFFFF);
++}
++
++static void CremaTraceReadTarget(LatteTextureView* view, uint32 drawIndex)
++{
 +	LatteTexture* tex = view->baseTexture;
 +	const MPTR addr = tex->physAddress;
-+	if (!(addr == 0xf4524000 || addr == 0x47f92800 || (addr == 0xf5c7b800 && tex->width == 864)))
-+		return;
 +	const uint32 bpp = Latte::GetFormatBits(tex->format) / 8;
-+	if (bpp != 4)
++	if (bpp != 4 || tex->isDepth || tex->width > 4096 || tex->height > 4096)
 +		return;
 +	std::vector<uint8> pixels((size_t)tex->width * tex->height * 4);
 +	if (!LatteTextureReadback_ReadbackToLinearBlocking(view, pixels.data(), tex->width, tex->height, tex->width))
@@ -5149,7 +5171,7 @@ index 512ebee..dba9a1a 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2219,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2237,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
