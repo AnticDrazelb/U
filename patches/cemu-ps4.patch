@@ -4138,7 +4138,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..c9cbbcb 100644
+index 599190a..8822825 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4310,7 +4310,7 @@ index 599190a..c9cbbcb 100644
  
  	if (swapTV && IsSwapchainInfoValid(true))
  		SwapBuffer(true);
-@@ -3279,9 +3339,142 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3279,9 +3339,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  
  	// mark current swapchain image as well defined
  	chainInfo.hasDefinedSwapchainImage = true;
@@ -4321,10 +4321,10 @@ index 599190a..c9cbbcb 100644
 +	// source texture, 2: submit, 3: submit and wait, 4: barriers, submit and wait
 +	{
 +		static uint32 s_check = 0;
-+		static int s_mode = 0;
++		static int s_mode = 6;
 +		if ((s_check++ % 60) == 0)
 +		{
-+			int mode = 0;
++			int mode = 6; // default: the blit (Super Mario Maker's alternating picture stops with it)
 +			if (FILE* f = fopen("/data/Crema/selftest/present_mode", "rb"))
 +			{
 +				char c = 0;
@@ -4347,7 +4347,7 @@ index 599190a..c9cbbcb 100644
 +			barrier_image<IMAGE_WRITE | TRANSFER_WRITE, TRANSFER_READ>(baseImageTex, sub, VK_IMAGE_LAYOUT_GENERAL);
 +			barrier_image<TRANSFER_READ, TRANSFER_WRITE | IMAGE_WRITE>(baseImageTex, sub, baseImageTex->GetDefaultLayout());
 +		}
-+		if (s_mode == 5 || s_mode == 6)
++		if (s_mode >= 5 && s_mode <= 7)
 +		{
 +			// 5: the screenshot's source transitions (to TRANSFER_SRC_OPTIMAL and back); 6: also its blit
 +			auto baseImageTex = texViewVk->GetBaseImage();
@@ -4361,7 +4361,7 @@ index 599190a..c9cbbcb 100644
 +			static VkDeviceMemory s_tmpMem = VK_NULL_HANDLE;
 +			sint32 w, h;
 +			baseImageTex->GetEffectiveSize(w, h, 0);
-+			if (s_mode == 6 && s_tmp == VK_NULL_HANDLE)
++			if (s_mode >= 6 && s_tmp == VK_NULL_HANDLE)
 +			{
 +				VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
 +				ii.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -4383,15 +4383,16 @@ index 599190a..c9cbbcb 100644
 +				vkAllocateMemory(m_logicalDevice, &ai, nullptr, &s_tmpMem);
 +				vkBindImageMemory(m_logicalDevice, s_tmp, s_tmpMem, 0);
 +			}
-+			if (s_mode == 6 && s_tmp != VK_NULL_HANDLE)
++			if (s_mode >= 6 && s_tmp != VK_NULL_HANDLE)
 +			{
 +				VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 +				barrier_image<TRANSFER_READ, TRANSFER_WRITE>(s_tmp, range, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +				VkImageBlit b{};
 +				b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32)texViewVk->firstSlice, 1};
-+				b.srcOffsets[1] = {w, h, 1};
++				// 7: one pixel only
++				b.srcOffsets[1] = s_mode == 7 ? VkOffset3D{1, 1, 1} : VkOffset3D{std::min(w, 2048), std::min(h, 2048), 1};
 +				b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-+				b.dstOffsets[1] = {w, h, 1};
++				b.dstOffsets[1] = b.srcOffsets[1];
 +				vkCmdBlitImage(m_state.currentCommandBuffer, baseImageTex->GetImageObj()->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
 +			}
 +			barrier_image<TRANSFER_READ, TRANSFER_WRITE | IMAGE_WRITE>(baseImageTex, sub, baseImageTex->GetDefaultLayout());
@@ -4453,7 +4454,7 @@ index 599190a..c9cbbcb 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3493,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3494,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4466,7 +4467,7 @@ index 599190a..c9cbbcb 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,10 +3995,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,10 +3996,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -4494,7 +4495,7 @@ index 599190a..c9cbbcb 100644
  void VulkanRenderer::buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size)
  {
  	cemu_assert_debug(bufferIndex < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS);
-@@ -3875,6 +4087,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+@@ -3875,6 +4088,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
  }
  
@@ -4553,7 +4554,7 @@ index 599190a..c9cbbcb 100644
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4147,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4148,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -4563,7 +4564,7 @@ index 599190a..c9cbbcb 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4646,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4647,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
