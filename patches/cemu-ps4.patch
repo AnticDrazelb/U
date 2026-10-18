@@ -4138,7 +4138,7 @@ index f9788c9..85a3446 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a..924d80e 100644
+index 599190a..5cb4dbe 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 @@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
@@ -4310,7 +4310,51 @@ index 599190a..924d80e 100644
  
  	if (swapTV && IsSwapchainInfoValid(true))
  		SwapBuffer(true);
-@@ -3282,6 +3342,49 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3279,9 +3339,93 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+ 
+ 	// mark current swapchain image as well defined
+ 	chainInfo.hasDefinedSwapchainImage = true;
++
++#ifdef __ORBIS__
++	// Crema experiment (selftest/present_mode, read every second): what a screenshot does after this
++	// quad stopped Super Mario Maker's alternating picture. 1: the screenshot's two barriers on the
++	// source texture, 2: submit, 3: submit and wait, 4: barriers, submit and wait
++	{
++		static uint32 s_check = 0;
++		static int s_mode = 0;
++		if ((s_check++ % 60) == 0)
++		{
++			int mode = 0;
++			if (FILE* f = fopen("/data/Crema/selftest/present_mode", "rb"))
++			{
++				char c = 0;
++				fread(&c, 1, 1, f);
++				fclose(f);
++				mode = (c >= '0' && c <= '9') ? c - '0' : 0;
++			}
++			if (mode != s_mode)
++				cemuLog_log(LogType::Force, "present experiment: mode {}", mode);
++			s_mode = mode;
++		}
++		if (s_mode == 1 || s_mode == 4)
++		{
++			auto baseImageTex = texViewVk->GetBaseImage();
++			VkImageSubresourceLayers sub{};
++			sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++			sub.baseArrayLayer = texViewVk->firstSlice;
++			sub.layerCount = 1;
++			sub.mipLevel = 0;
++			barrier_image<IMAGE_WRITE | TRANSFER_WRITE, TRANSFER_READ>(baseImageTex, sub, VK_IMAGE_LAYOUT_GENERAL);
++			barrier_image<TRANSFER_READ, TRANSFER_WRITE | IMAGE_WRITE>(baseImageTex, sub, baseImageTex->GetDefaultLayout());
++		}
++		if (s_mode >= 2)
++		{
++			SubmitCommandBuffer();
++			if (s_mode >= 3)
++				WaitCommandBufferFinished(GetCurrentCommandBufferId());
++		}
++	}
++#endif
  }
  
  void VulkanRenderer::CreateDescriptorPool()
@@ -4360,7 +4404,7 @@ index 599190a..924d80e 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3403,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3444,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -4373,7 +4417,7 @@ index 599190a..924d80e 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,10 +3905,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,10 +3946,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -4401,7 +4445,7 @@ index 599190a..924d80e 100644
  void VulkanRenderer::buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size)
  {
  	cemu_assert_debug(bufferIndex < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS);
-@@ -3875,6 +3997,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+@@ -3875,6 +4038,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
  }
  
@@ -4460,7 +4504,7 @@ index 599190a..924d80e 100644
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4057,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4098,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -4470,7 +4514,7 @@ index 599190a..924d80e 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4556,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4597,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
