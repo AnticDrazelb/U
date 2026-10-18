@@ -4338,7 +4338,7 @@ index d975e11..a01caf6 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..15ea4df 100644
+index 512ebee..9e2f3f9 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4565,7 +4565,7 @@ index 512ebee..15ea4df 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,173 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,206 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -4681,7 +4681,7 @@ index 512ebee..15ea4df 100644
 +	put(&h, 8);
 +}
 +
-+static void CremaTraceDraw(LatteDecompilerShader* vs, LatteDecompilerShader* ps, uint32 baseVertex, uint32 instanceCount, uint32 count, uint32 indexType, bool first, uint32 vsUniformOffset, uint32 vbBindOffset)
++static void CremaTraceDraw(LatteDecompilerShader* vs, LatteDecompilerShader* ps, uint32 baseVertex, uint32 instanceCount, uint32 count, uint32 indexType, bool first, uint32 vsUniformOffset, uint32 vbBindOffset, const uint64* bindOffsets, MPTR indexData)
 +{
 +	auto put = [](const void* p, size_t n) { s_cremaTrace.insert(s_cremaTrace.end(), (const uint8*)p, (const uint8*)p + n); };
 +	auto put32 = [&](uint32 v) { put(&v, 4); };
@@ -4722,8 +4722,38 @@ index 512ebee..15ea4df 100644
 +	put32(vbBytes);
 +	if (vbBytes)
 +		put(memory_getPointerFromPhysicalOffset(vbAddr), vbBytes);
++	// every vertex buffer the fetch shader reads: index, address, stride, size, buffer cache offset, data
++	LatteFetchShader* fetch = LatteSHRC_GetActiveFetchShader();
++	const uint32 groups = fetch ? (uint32)fetch->bufferGroups.size() : 0;
++	put32(groups);
++	for (uint32 g = 0; g < groups; g++)
++	{
++		const uint32 index = fetch->bufferGroups[g].attributeBufferIndex;
++		const uint32* r = LatteGPUState.contextRegister + mmSQ_VTX_ATTRIBUTE_BLOCK_START + index * 7;
++		const uint32 bytes = r[0] ? std::min<uint32>(r[1] + 1, 4096) : 0;
++		const uint32 bindOffset = index < 16 ? (uint32)bindOffsets[index] : 0;
++		put32(index);
++		put32(r[0]);
++		put32((r[2] >> 11) & 0xFFFF);
++		put32(bindOffset);
++		put32(bytes);
++		if (bytes)
++		{
++			put(memory_getPointerFromPhysicalOffset(r[0]), bytes);
++			uint32& known = s_cremaTraceVbRanges[bindOffset];
++			known = std::max(known, bytes);
++		}
++	}
++	// index data (as the game has it)
++	put32(indexData);
++	const uint32 indexBytes = indexData ? std::min<uint32>(count * 4, 1024) : 0;
++	put32(indexBytes);
++	if (indexBytes)
++		put(memory_getPointerFromVirtualOffset(indexData), indexBytes);
 +}
 +#endif
++
++static uint64 s_cremaBindOffsets[16]; // frame trace: the buffer cache offset each vertex buffer is bound at
 +
  void VulkanRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 instanceCount, uint32 count, MPTR indexDataMPTR, Latte::LATTE_VGT_DMA_INDEX_TYPE::E_INDEX_TYPE indexType, const LatteDrawcallContext& drawcallContext)
  {
@@ -4733,8 +4763,11 @@ index 512ebee..15ea4df 100644
  		draw_execute_continued(baseVertex, baseInstance, instanceCount, count, indexDataMPTR, indexType, drawcallContext);
 +#ifdef __ORBIS__
 +	if (g_crema_trace_frames_left)
++		for (uint32 i = 0; i < 16; i++)
++			s_cremaBindOffsets[i] = m_state.currentVertexBinding[i].offset;
++	if (g_crema_trace_frames_left)
 +		CremaTraceDraw(LatteSHRC_GetActiveVertexShader(), LatteSHRC_GetActivePixelShader(), baseVertex, instanceCount, count, (uint32)indexType, drawcallContext.isFirst,
-+			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX], (uint32)m_state.currentVertexBinding[0].offset);
++			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX], (uint32)m_state.currentVertexBinding[0].offset, s_cremaBindOffsets, indexDataMPTR);
 +#endif
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
