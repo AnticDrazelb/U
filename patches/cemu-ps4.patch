@@ -2181,10 +2181,19 @@ index de67772..24b109b 100644
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
 diff --git a/src/Cafe/HW/Latte/Core/LatteIndices.cpp b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-index a237644..ed31128 100644
+index a237644..8007985 100644
 --- a/src/Cafe/HW/Latte/Core/LatteIndices.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-@@ -26,6 +26,8 @@ struct
+@@ -10,6 +10,8 @@
+ #include <arm_neon.h>
+ #endif
+ 
++bool g_crema_index_cache_off = false; // Crema setting index_cache (gui/ps4/launcher/CremaSettings.cpp)
++
+ struct
+ {
+ 	struct CacheEntry
+@@ -26,6 +28,8 @@ struct
  		uint32 outputCount;
  		Renderer::IndexAllocation indexAllocation;
  	};
@@ -2193,7 +2202,7 @@ index a237644..ed31128 100644
  	std::array<CacheEntry, 8> entry;
  	uint64 currentUsageCounter{0};
  }LatteIndexCache{};
-@@ -644,8 +646,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
+@@ -644,8 +648,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
  	}
  }
  
@@ -2244,7 +2253,25 @@ index a237644..ed31128 100644
  	// what this should do:
  	// [x] use fast SIMD-based index decoding
  	// [x] unpack QUAD indices to triangle indices
-@@ -682,6 +726,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -658,6 +704,17 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+ 	{
+ 		return entry.lastPtr == indexData && entry.lastCount == count && entry.lastPrimitiveMode == primitiveMode && entry.lastIndexType == indexType;
+ 	});
++#ifdef __ORBIS__
++	// Crema setting index_cache = off (diagnostics): every draw decodes its indices again
++	extern bool g_crema_index_cache_off;
++	if (g_crema_index_cache_off && cacheEntry != LatteIndexCache.entry.end())
++	{
++		g_renderer->indexData_releaseIndexMemory(cacheEntry->indexAllocation);
++		cacheEntry->lastPtr = nullptr;
++		cacheEntry->lastCount = 0;
++		cacheEntry = LatteIndexCache.entry.end();
++	}
++#endif
+ 	if (cacheEntry != LatteIndexCache.entry.end())
+ 	{
+ 		indexMax = cacheEntry->indexMax;
+@@ -682,6 +739,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  
  	// calculate index output size
  	uint32 indexOutputSize = LatteIndices_calculateIndexOutputSize(primitiveMode, indexType, count);
@@ -2263,7 +2290,7 @@ index a237644..ed31128 100644
  	if (indexOutputSize == 0)
  	{
  		outputCount = count;
-@@ -696,7 +752,14 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -696,7 +765,14 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  
  	// decode indices
  	indexMax = std::numeric_limits<uint32>::min();
@@ -2279,7 +2306,7 @@ index a237644..ed31128 100644
  	{
  		// unpack quads into triangles
  		if (indexType == LatteIndexType::AUTO)
-@@ -838,7 +901,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -838,7 +914,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  	}
  	// the above algorithms use a fast approach to get indexMax which does not filter out indices matching primitiveRestartIndex
  	// here we use a fallback in case the determined index equals the primitive restart index
@@ -11383,10 +11410,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..6004c25
+index 0000000..0d3bc36
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,713 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -11416,6 +11443,7 @@ index 0000000..6004c25
 +bool g_crema_uniforms_uncached = false;
 +extern bool g_crema_queries_visible; // Cafe/HW/Latte/Renderer/Vulkan/VulkanQuery.cpp
 +extern bool g_crema_frame_wait; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp: Wait for GPU Each Frame
++extern bool g_crema_index_cache_off; // Cafe/HW/Latte/Core/LatteIndices.cpp: Index Cache
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
@@ -11547,6 +11575,8 @@ index 0000000..6004c25
 +			"Games ask the GPU whether an object would be visible and skip it if not. Real: the GPU's answer. Always Visible: everything is drawn. Try it if scenery is missing on the PS4 only."},
 +		{"vertex_fetch", "Vertex Fetch", "Diagnostics", {{"aligned", "Aligned"}, {"unaligned", "Unaligned (Test)"}}, "aligned", false,
 +			"How the GPU reads model data. Aligned (default): split into pieces the PS4 GPU reads right (fixed Sonic Lost World's legs). Unaligned: one read per value, as Cemu does on a PC's AMD GPU - for testing a game whose shapes squash or stretch on the PS4 only. Shaders compile again the first time."},
++		{"index_cache", "Index Cache", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
++			"On (Cemu): the list of corners a model is drawn from is converted once and reused while the game doesn't change it. Off: converted again for every draw (a little slower). Try Off if shapes in a game are drawn wrong on the PS4 only."},
 +		{"frame_wait", "Wait for GPU Each Frame", "Diagnostics", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: at the end of every frame the CPU waits until the GPU has finished all its work (slower). For finding a picture that goes wrong only when the CPU runs ahead of the GPU."},
 +		{"uniform_memory", "Upload Memory", "Diagnostics", {{"cached", "Cached"}, {"uncached", "Uncached"}}, "cached", false,
@@ -12015,6 +12045,7 @@ index 0000000..6004c25
 +	g_crema_denorm_preserve = get("denormals") == "on";
 +	g_crema_uniforms_uncached = get("uniform_memory") == "uncached";
 +	g_crema_frame_wait = get("frame_wait") == "on";
++	g_crema_index_cache_off = get("index_cache") == "off";
 +	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
 +	g_crema_queries_visible = get("occlusion_queries") == "visible";
 +	g_crema_diag_log = get("diag_log") == "on";
