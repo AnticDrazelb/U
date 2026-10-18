@@ -2420,7 +2420,7 @@ index dbc3cff..eea3451 100644
  
  #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-index f1556f8..463ea9e 100644
+index f1556f8..7760a21 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 @@ -17,7 +17,15 @@
@@ -2501,7 +2501,20 @@ index f1556f8..463ea9e 100644
  
  	// check for texture changes
  	if (checkForTextureChanges)
-@@ -864,6 +913,34 @@ void LatteRenderTarget_getScreenImageArea(sint32* x, sint32* y, sint32* width, s
+@@ -741,6 +790,12 @@ void LatteRenderTarget_itHLEClearColorDepthStencil(uint32 clearMask,
+ {
+ 	uint32 depthBufferMipIndex = 0; // todo
+ 	uint32 colorBufferMipIndex = 0; // todo
++#if defined(__ORBIS__)
++	if (g_crema_trace_frames_left)
++		cemuLog_log(LogType::Force, "trace frame {} draw {}: clear mask {} color {:08x} {}x{} depth {:08x} {}x{} fmt {:04x} depth value {}",
++			g_crema_trace_frame, LatteGPUState.drawCallCounter, clearMask, colorBufferMPTR, colorBufferWidth, colorBufferHeight,
++			depthBufferMPTR, depthBufferWidth, depthBufferHeight, (uint32)depthBufferFormat, clearDepth);
++#endif
+ 
+ 	bool hasColorClear = (clearMask & 1);
+ 	bool hasDepthClear = (clearMask & 2);
+@@ -864,6 +919,34 @@ void LatteRenderTarget_getScreenImageArea(sint32* x, sint32* y, sint32* width, s
  		*fullHeight = h;
  }
  
@@ -2536,7 +2549,7 @@ index f1556f8..463ea9e 100644
  void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPadView)
  {
  	// make sure texture is updated to latest data in cache
-@@ -961,6 +1038,20 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -961,6 +1044,20 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  
  			filter = LatteTextureView::MagFilter::kNearestNeighbor;
  		}
@@ -2557,7 +2570,7 @@ index f1556f8..463ea9e 100644
  	}
  	cemu_assert(shader);
  	g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
-@@ -970,6 +1061,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -970,6 +1067,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  	swkbd_render(!isPadView);
  	nn::erreula::render(!isPadView);
  	LatteOverlay_render(isPadView);
@@ -4662,7 +4675,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..eb37330 100644
+index 512ebee..268e828 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4889,7 +4902,7 @@ index 512ebee..eb37330 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1746,12 +1879,281 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1879,289 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5106,6 +5119,14 @@ index 512ebee..eb37330 100644
 +	LatteTextureView* view = fbo->colorBuffer[0].texture;
 +	if (std::find(s_cremaFrameTargets.begin(), s_cremaFrameTargets.end(), view) == s_cremaFrameTargets.end())
 +		s_cremaFrameTargets.push_back(view);
++	LatteTextureView* depth = fbo->depthBuffer.texture;
++	if (g_crema_trace_frame < 2 && view->baseTexture->physAddress == 0xf4524000)
++		cemuLog_log(LogType::Force, "trace frame {} layer draw {}: DB_DEPTH_CONTROL {:08x} DB_SHADER_CONTROL {:08x} depth attachment {}",
++			g_crema_trace_frame, drawIndex, LatteGPUState.contextRegister[0xA200], LatteGPUState.contextRegister[0xA203],
++			depth ? fmt::format("{:08x} {}x{} fmt {:04x}", depth->baseTexture->physAddress, depth->baseTexture->width, depth->baseTexture->height, (uint32)depth->baseTexture->format) : std::string("none"));
++	if (depth && depth->baseTexture->format == Latte::E_GX2SURFFMT::D32_FLOAT &&
++		std::find(s_cremaFrameTargets.begin(), s_cremaFrameTargets.end(), depth) == s_cremaFrameTargets.end())
++		s_cremaFrameTargets.push_back(depth);
 +}
 +
 +// at the end of each of the first 6 traced frames: every render target drawn in it, read back once
@@ -5124,12 +5145,12 @@ index 512ebee..eb37330 100644
 +	LatteTexture* tex = view->baseTexture;
 +	const MPTR addr = tex->physAddress;
 +	const uint32 bpp = Latte::GetFormatBits(tex->format) / 8;
-+	if (bpp != 4 || tex->isDepth || tex->width > 4096 || tex->height > 4096)
++	if (bpp != 4 || tex->width > 4096 || tex->height > 4096)
 +		return;
 +	std::vector<uint8> pixels((size_t)tex->width * tex->height * 4);
 +	if (!LatteTextureReadback_ReadbackToLinearBlocking(view, pixels.data(), tex->width, tex->height, tex->width))
 +		return;
-+	const uint32 head[5] = {g_crema_trace_frame, drawIndex, addr, (uint32)tex->width, (uint32)tex->height};
++	const uint32 head[5] = {g_crema_trace_frame, drawIndex | (tex->isDepth ? 0x10000u : 0u), addr, (uint32)tex->width, (uint32)tex->height};
 +	s_cremaRtShots.insert(s_cremaRtShots.end(), (const uint8*)head, (const uint8*)head + sizeof(head));
 +	for (uint32 y = 0; y < 36; y++)
 +		for (uint32 x = 0; x < 64; x++)
@@ -5171,7 +5192,7 @@ index 512ebee..eb37330 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2237,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2245,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
