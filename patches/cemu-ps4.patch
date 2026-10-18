@@ -3093,7 +3093,7 @@ index 293d959..27edce6 100644
  	return v;
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
-index 86b4d75..1ccc4b9 100644
+index 86b4d75..a1bc8df 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.cpp
 @@ -22,10 +22,15 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
@@ -3113,10 +3113,32 @@ index 86b4d75..1ccc4b9 100644
  	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
  	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
  	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-@@ -141,4 +146,17 @@ void LatteTextureVk::AllocateOnHost()
+@@ -141,4 +146,39 @@ void LatteTextureVk::AllocateOnHost()
  {
  	auto allocationInfo = VulkanRenderer::GetInstance()->GetMemoryManager()->imageMemoryAllocate(GetImageObj()->m_image);
  	vkObjTex->m_allocation = allocationInfo;
++#if defined(__ORBIS__)
++	{
++		// Crema (Diagnostic Log): where each texture's image is placed in the texture heap (selftest/texalloc.txt),
++		// to find images the GPU uses past the size the driver reported (overlapping their neighbours)
++		extern bool g_crema_diag_log;
++		static FILE* s_alloc = nullptr;
++		if (g_crema_diag_log)
++		{
++			if (!s_alloc)
++				s_alloc = fopen("/data/Crema/selftest/texalloc.txt", "w");
++			if (s_alloc)
++			{
++				VkMemoryRequirements req{};
++				vkGetImageMemoryRequirements(m_vkr->GetLogicalDevice(), GetImageObj()->m_image, &req);
++				fprintf(s_alloc, "tex %08x %dx%dx%d mips %d fmt %04x tm %u depth %d: type %08x chunk %u offset %08x size %08x align %llx\n",
++					physAddress, width, height, depth, mipLevels, (uint32)format, (uint32)tileMode, isDepth ? 1 : 0,
++					allocationInfo->typeFilter, allocationInfo->mem.chunkIndex, allocationInfo->mem.offset, allocationInfo->allocationSize, (unsigned long long)req.alignment);
++				fflush(s_alloc);
++			}
++		}
++	}
++#endif
 +#if defined(__ORBIS__)
 +	// Crema: large textures with the driver's memory requirement next to them (a Virtual Console
 +	// game's GPU read ~240 MB past a 1920x16384 texture placed in a 16 MB block)
