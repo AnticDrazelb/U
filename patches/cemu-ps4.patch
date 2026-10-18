@@ -4677,7 +4677,7 @@ index d975e11..f8c8bf3 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..5db23a3 100644
+index 512ebee..ffad13d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -4962,7 +4962,7 @@ index 512ebee..5db23a3 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1746,12 +1916,308 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1916,318 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5193,6 +5193,16 @@ index 512ebee..5db23a3 100644
 +			fflush(s_draws);
 +		}
 +	}
++	// depth-only draws (the game's depth resets) in the first 2 frames: their depth buffer read back right
++	// after the draw, to see whether the reset wrote anything
++	if (g_crema_trace_frame < 2 && fbo && !fbo->colorBuffer[0].texture && fbo->depthBuffer.texture &&
++		fbo->depthBuffer.texture->baseTexture->format == Latte::E_GX2SURFFMT::D32_FLOAT)
++	{
++		cemuLog_log(LogType::Force, "trace frame {} draw {}: depth-only draw, DB_SHADER_CONTROL {:08x} DB_RENDER_CONTROL {:08x} DB_RENDER_OVERRIDE {:08x} CB_COLOR_CONTROL {:08x} SPI_PS_IN_CONTROL_0 {:08x} SQ_PGM_EXPORTS_PS {:08x}",
++			g_crema_trace_frame, drawIndex, LatteGPUState.contextRegister[0xA203], LatteGPUState.contextRegister[0xA343], LatteGPUState.contextRegister[0xA344],
++			LatteGPUState.contextRegister[0xA202], LatteGPUState.contextRegister[0xA1B3], LatteGPUState.contextRegister[0xA215]);
++		CremaTraceReadTarget(fbo->depthBuffer.texture, drawIndex);
++	}
 +	if (g_crema_trace_frame >= 6 || !fbo || !fbo->colorBuffer[0].texture)
 +		return;
 +	LatteTextureView* view = fbo->colorBuffer[0].texture;
@@ -5271,7 +5281,7 @@ index 512ebee..5db23a3 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2301,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2311,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
