@@ -1,7 +1,7 @@
 From 0c64ceb7ebcec8f5984d00ceb10cbb01a2daa407 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Mon, 19 Oct 2026 07:01:37 +0300
-Subject: [PATCH 1/2] PS4: GS ring probe - read VGT_ESGS/GSVS_RING_SIZE back
+Subject: [PATCH 1/3] PS4: GS ring probe - read VGT_ESGS/GSVS_RING_SIZE back
  around the preamble write
 
 ---
@@ -109,7 +109,7 @@ index 7b22ab2..fea1014 100644
 From b07fa5c741d96d84278fb429d2c703b07048cf91 Mon Sep 17 00:00:00 2001
 From: Hadi <shiro@DESKTOP-6QPFRA3.localdomain>
 Date: Mon, 19 Oct 2026 07:12:26 +0300
-Subject: [PATCH 2/2] PS4: GS ring probe control read (VGT_NUM_INSTANCES,
+Subject: [PATCH 2/3] PS4: GS ring probe control read (VGT_NUM_INSTANCES,
  VGT_PRIMITIVE_TYPE)
 
 ---
@@ -159,6 +159,56 @@ index fea1014..d4dc52d 100644
     }
  #endif
  
+-- 
+2.53.0
+
+
+From 7d010de97ed0e5d3b02e0d7c6bf0c829298490c9 Mon Sep 17 00:00:00 2001
+From: Hadi <shiro@DESKTOP-6QPFRA3.localdomain>
+Date: Mon, 19 Oct 2026 07:42:50 +0300
+Subject: [PATCH 3/3] PS4: GS rings at least ac_ps4_gs_ring_min (8 MiB) - the
+ VGT wraps them at a larger size than RADV programs
+
+---
+ src/amd/vulkan/radv_queue.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index d4dc52d..0661c6a 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -41,7 +41,14 @@ void ac_ps4_trace(const char *fmt, ...);
+  * on the PS4 the GS wrote at least 2 MiB into a 1.25 MiB GS->VS ring (Donkey Kong Country:
+  * Tropical Freeze, every crash at the ring's base + 0x200000) - on Linux such writes land in the
+  * next buffer or are dropped by the VM, on the PS4 a GPU page fault ends the app. */
+-#define PS4_RING_ALLOC(size) MAX2((size) * 4, 4u << 20)
++#define PS4_RING_ALLOC(size) MAX2((size) * 2, 4u << 20)
++/* The GS rings as RADV sizes them (VGT_*_RING_SIZE, the descriptors' bounds) at least this large
++ * (bytes, 0 = RADV's sizes). Register read-back does not work on the PS4, but the GS writes past the
++ * programmed GS->VS ring (above), so the VGT apparently wraps the rings at a size of the system's,
++ * larger than RADV's: what the GS wrote past RADV's size the copy shader then reads outside its
++ * descriptor's bounds - as zeros - and those primitives vanish (Super Mario Maker's tiles, a
++ * different set every frame). Crema setting GS Ring Size. */
++int ac_ps4_gs_ring_min = 8u << 20;
+ #else
+ #define PS4_FAIL(label) goto label
+ #define PS4_RING_ALLOC(size) (size)
+@@ -1318,6 +1325,15 @@ radv_update_preambles(struct radv_queue_state *queue, struct radv_device *device
+       *has_follower |= !!cmd_buffer->gang.cs;
+    }
+ 
++#ifdef __PS4__
++   if (ac_ps4_gs_ring_min) {
++      if (needs.esgs_ring_size)
++         needs.esgs_ring_size = MAX2(needs.esgs_ring_size, (uint32_t)ac_ps4_gs_ring_min);
++      if (needs.gsvs_ring_size)
++         needs.gsvs_ring_size = MAX2(needs.gsvs_ring_size, (uint32_t)ac_ps4_gs_ring_min);
++   }
++#endif
++
+    /* Sanitize scratch size information. */
+    needs.scratch_waves =
+       needs.scratch_size_per_wave ? MIN2(needs.scratch_waves, UINT32_MAX / needs.scratch_size_per_wave) : 0;
 -- 
 2.53.0
 

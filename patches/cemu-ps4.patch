@@ -12311,10 +12311,10 @@ index 0000000..a6d4cc6
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 0000000..c9e4471
+index 0000000..c06e5fd
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,736 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -12350,6 +12350,7 @@ index 0000000..c9e4471
 +extern bool g_crema_db_render_clear; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp: Depth-Clearing Draws
 +bool g_crema_depth_clip_off = false; // Depth Clipping (Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp)
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
++extern "C" int ac_ps4_gs_ring_min; // Mesa radv_queue.c: GS Ring Size
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
 +// occlusion query readback, draw capture) - off: none of it runs
@@ -12486,6 +12487,8 @@ index 0000000..c9e4471
 +			"Clear: a draw the game marks as a depth clear clears the depth buffer, as on the Wii U (Super Mario Maker's ground and hills flickered without it). Ignore: as Cemu, the draw is depth tested like any other."},
 +		{"texture_sync", "Overlapping Textures", "Diagnostics", {{"all", "Sync All"}, {"nodepth", "Not Colour into Depth"}}, "all", false,
 +			"When a game uses the same memory for two pictures, Crema copies the newer one into the other. Sync All (Cemu): always. Not Colour into Depth: a colour picture is never copied into a depth buffer. Try it if parts of the scene vanish or flicker on the PS4 only."},
++		{"gs_ring", "Geometry Shader Rings", "Diagnostics", {{"8", "8 MB"}, {"16", "16 MB"}, {"32", "32 MB"}, {"0", "Driver Size"}}, "8", false,
++			"Memory for geometry shaders (shapes a game builds on the GPU, e.g. tiles or sprites). Driver Size: what the Linux driver picks - on the PS4 parts of such shapes then vanish or flicker. Larger sizes use more memory."},
 +		{"vertex_copy", "Vertex Data", "Diagnostics", {{"cache", "Buffer Cache"}, {"copy", "Copy Every Draw"}}, "cache", false,
 +			"Buffer Cache (Cemu): models are copied to the GPU once and kept there until the game changes them. Copy Every Draw: each draw copies its model data from the game's memory again (slower). Try it if shapes are drawn wrong on the PS4 only."},
 +		{"index_cache", "Index Cache", "Diagnostics", {{"on", "On"}, {"off", "Off"}}, "on", false,
@@ -12960,6 +12963,10 @@ index 0000000..c9e4471
 +	g_crema_frame_wait = get("frame_wait") == "on";
 +	g_crema_index_cache_off = get("index_cache") == "off";
 +	g_crema_vertex_copy = get("vertex_copy") == "copy";
++	{
++		const std::string ring = get("gs_ring");
++		ac_ps4_gs_ring_min = ring == "0" ? 0 : ring == "16" ? (16 << 20) : ring == "32" ? (32 << 20) : (8 << 20);
++	}
 +	g_crema_sync_depth_skip = get("texture_sync") == "nodepth";
 +	g_crema_db_render_clear = get("depth_clear_draws") != "off";
 +	g_crema_depth_clip_off = get("depth_clip") == "off";
