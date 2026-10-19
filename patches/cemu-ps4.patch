@@ -3366,7 +3366,7 @@ index dbc3cff9..eea34516 100644
  
  #define beginPerfMonProfiling(__obj) if( THasProfiling ) __obj.beginMeasuring()
 diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
-index f1556f8e..7760a218 100644
+index f1556f8e..d2339fe8 100644
 --- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
 @@ -17,7 +17,15 @@
@@ -3495,10 +3495,15 @@ index f1556f8e..7760a218 100644
  void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPadView)
  {
  	// make sure texture is updated to latest data in cache
-@@ -961,6 +1044,20 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -961,6 +1044,25 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  
  			filter = LatteTextureView::MagFilter::kNearestNeighbor;
  		}
++		else if (scaling_filter == kFsrRcasFilter && RendererOutputShader::s_fsr_rcas_shader)
++		{
++			shader = renderUpsideDown ? RendererOutputShader::s_fsr_rcas_shader_ud : RendererOutputShader::s_fsr_rcas_shader;
++			filter = LatteTextureView::MagFilter::kNearestNeighbor; // the shader fetches texels itself
++		}
 +		else if (scaling_filter == kFsrFilter && RendererOutputShader::s_fsr_shader)
 +		{
 +			if (renderUpsideDown)
@@ -3516,7 +3521,7 @@ index f1556f8e..7760a218 100644
  	}
  	cemu_assert(shader);
  	g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
-@@ -970,6 +1067,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
+@@ -970,6 +1072,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
  	swkbd_render(!isPadView);
  	nn::erreula::render(!isPadView);
  	LatteOverlay_render(isPadView);
@@ -3879,10 +3884,10 @@ index 9d6a4385..75833f4f 100644
  		// OpenGL defines
  		src->add("#define ATTR_LAYOUT(__location) layout(location = __location)" _CRLF);
 diff --git a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp
-index a43b7eed..8fb05b8c 100644
+index a43b7eed..5df2ecbd 100644
 --- a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.cpp
-@@ -244,6 +244,97 @@ fragment float4 main0(VertexOut in [[stage_in]], texture2d<float> textureSrc [[t
+@@ -244,6 +244,128 @@ fragment float4 main0(VertexOut in [[stage_in]], texture2d<float> textureSrc [[t
  }
  )";
  
@@ -3928,9 +3933,9 @@ index a43b7eed..8fb05b8c 100644
 +	aW += w;
 +}
 +
-+void outputShader()
++vec3 fsrEasu(vec2 uv)
 +{
-+	vec2 pp = passUV * textureSrcResolution - 0.5;
++	vec2 pp = uv * textureSrcResolution - 0.5;
 +	vec2 fp = floor(pp);
 +	pp -= fp;
 +	ivec2 p = ivec2(fp);
@@ -3973,70 +3978,113 @@ index a43b7eed..8fb05b8c 100644
 +	fsrTapW(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, n);
 +	vec3 mn = min(min(f, g), min(j, k));
 +	vec3 mx = max(max(f, g), max(j, k));
-+	colorOut0 = vec4(clamp(aC / aW, mn, mx), 1.0);
++	return clamp(aC / aW, mn, mx);
++}
++)";
++
++const std::string RendererOutputShader::s_fsr_easu_main_source =
++R"(
++void outputShader()
++{
++	colorOut0 = vec4(fsrEasu(passUV), 1.0);
++}
++)";
++
++// FSR 1 as AMD made it: EASU, then RCAS (robust contrast adaptive sharpening). RCAS works on the
++// upscaled picture's pixel and its 4 neighbours; in one pass those are upscaled here too (5 EASU
++// per pixel). Sharpness 0.2 stops, AMD's default.
++const std::string RendererOutputShader::s_fsr_rcas_main_source =
++R"(
++void outputShader()
++{
++	vec2 px = 1.0 / outputResolution;
++	vec3 e = fsrEasu(passUV);
++	vec3 b = fsrEasu(passUV + vec2(0.0, -px.y));
++	vec3 d = fsrEasu(passUV + vec2(-px.x, 0.0));
++	vec3 f = fsrEasu(passUV + vec2(px.x, 0.0));
++	vec3 h = fsrEasu(passUV + vec2(0.0, px.y));
++	vec3 mn4 = min(min(b, d), min(f, h));
++	vec3 mx4 = max(max(b, d), max(f, h));
++	vec3 hitMin = min(mn4, e) / (4.0 * mx4 + 1.0 / 65536.0);
++	vec3 hitMax = (1.0 - max(mx4, e)) / (4.0 * mn4 - 4.0 - 1.0 / 65536.0);
++	vec3 lobeRGB = max(-hitMin, hitMax);
++	float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * exp2(-0.2);
++	colorOut0 = vec4(clamp((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 0.0, 1.0), 1.0);
 +}
 +)";
 +
  RendererOutputShader::RendererOutputShader(const std::string& vertex_source, const std::string& fragment_source)
  {
      std::string finalFragmentSrc;
-@@ -300,6 +391,9 @@ RendererOutputShader* RendererOutputShader::s_bicubic_shader_ud;
+@@ -300,6 +422,11 @@ RendererOutputShader* RendererOutputShader::s_bicubic_shader_ud;
  RendererOutputShader* RendererOutputShader::s_hermit_shader;
  RendererOutputShader* RendererOutputShader::s_hermit_shader_ud;
  
 +RendererOutputShader* RendererOutputShader::s_fsr_shader;
 +RendererOutputShader* RendererOutputShader::s_fsr_shader_ud;
++RendererOutputShader* RendererOutputShader::s_fsr_rcas_shader;
++RendererOutputShader* RendererOutputShader::s_fsr_rcas_shader_ud;
 +
  std::string RendererOutputShader::GetOpenGlVertexSource(bool render_upside_down)
  {
  	// vertex shader
-@@ -527,6 +621,9 @@ void RendererOutputShader::InitializeStatic()
+@@ -527,6 +654,11 @@ void RendererOutputShader::InitializeStatic()
  
      	s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
      	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
 +
-+    	s_fsr_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source);
-+    	s_fsr_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source);
++    	s_fsr_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source + s_fsr_easu_main_source);
++    	s_fsr_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source + s_fsr_easu_main_source);
++    	s_fsr_rcas_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source + s_fsr_rcas_main_source);
++    	s_fsr_rcas_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source + s_fsr_rcas_main_source);
  		break;
      }
  #endif
-@@ -546,6 +643,9 @@ void RendererOutputShader::InitializeStatic()
+@@ -546,6 +678,11 @@ void RendererOutputShader::InitializeStatic()
  
      	s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
      	s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
 +
-+    	s_fsr_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source);
-+    	s_fsr_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source);
++    	s_fsr_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source + s_fsr_easu_main_source);
++    	s_fsr_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source + s_fsr_easu_main_source);
++    	s_fsr_rcas_shader = new RendererOutputShader(vertex_source, s_fsr_shader_source + s_fsr_rcas_main_source);
++    	s_fsr_rcas_shader_ud = new RendererOutputShader(vertex_source_ud, s_fsr_shader_source + s_fsr_rcas_main_source);
  		break;
      }
  #endif
-@@ -562,4 +662,7 @@ void RendererOutputShader::ShutdownStatic()
+@@ -562,4 +699,9 @@ void RendererOutputShader::ShutdownStatic()
  
  	delete s_hermit_shader;
  	delete s_hermit_shader_ud;
 +
 +	delete s_fsr_shader;
 +	delete s_fsr_shader_ud;
++	delete s_fsr_rcas_shader;
++	delete s_fsr_rcas_shader_ud;
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h
-index 433a3308..b72c18fa 100644
+index 433a3308..60acb9bb 100644
 --- a/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h
 +++ b/src/Cafe/HW/Latte/Renderer/RendererOuputShader.h
-@@ -50,6 +50,9 @@ public:
+@@ -50,6 +50,11 @@ public:
  	static RendererOutputShader* s_hermit_shader;
  	static RendererOutputShader* s_hermit_shader_ud;
  
 +	static RendererOutputShader* s_fsr_shader;
 +	static RendererOutputShader* s_fsr_shader_ud;
++	static RendererOutputShader* s_fsr_rcas_shader; // FSR 1 with RCAS sharpening
++	static RendererOutputShader* s_fsr_rcas_shader_ud;
 +
  	static std::string GetOpenGlVertexSource(bool render_upside_down);
  	static std::string GetVulkanVertexSource(bool render_upside_down);
  	static std::string GetMetalVertexSource(bool render_upside_down);
-@@ -65,6 +68,7 @@ private:
+@@ -65,6 +70,9 @@ private:
  	static const std::string s_copy_shader_source;
  	static const std::string s_bicubic_shader_source;
  	static const std::string s_hermite_shader_source;
-+	static const std::string s_fsr_shader_source;
++	static const std::string s_fsr_shader_source; // EASU as fsrEasu(uv)
++	static const std::string s_fsr_easu_main_source;
++	static const std::string s_fsr_rcas_main_source;
  
  	static const std::string s_bicubic_shader_source_vk;
  	static const std::string s_hermite_shader_source_vk;
@@ -11343,14 +11391,15 @@ index 00000000..0a576dfc
 +	size_t m_readPos = 0, m_count = 0;
 +};
 diff --git a/src/config/CemuConfig.h b/src/config/CemuConfig.h
-index 48c396f2..5e5c5b66 100644
+index 48c396f2..498bf6ea 100644
 --- a/src/config/CemuConfig.h
 +++ b/src/config/CemuConfig.h
-@@ -94,6 +94,7 @@ enum UpscalingFilter
+@@ -94,6 +94,8 @@ enum UpscalingFilter
  	kBicubicFilter,
  	kBicubicHermiteFilter,
  	kNearestNeighborFilter,
 +	kFsrFilter, // AMD FSR 1 EASU (RendererOuputShader.cpp), Vulkan/OpenGL
++	kFsrRcasFilter, // AMD FSR 1 EASU + RCAS sharpening
  };
  
  enum FullscreenScaling
@@ -14136,10 +14185,10 @@ index 00000000..ab078b27
 +} // namespace PS4CheatsPage
 diff --git a/src/gui/ps4/PS4PauseMenu.cpp b/src/gui/ps4/PS4PauseMenu.cpp
 new file mode 100644
-index 00000000..744178a2
+index 00000000..4c2f7bda
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,1542 @@
+@@ -0,0 +1,1549 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -14185,6 +14234,7 @@ index 00000000..744178a2
 +extern "C" int g_crema_touchpad_buttons;
 +extern "C" int g_crema_touch_pointer;
 +extern "C" int g_crema_touch_tap;
++extern "C" int g_crema_touchpad_laptop;
 +// Cafe/HW/Latte/Core/LatteRenderTarget.cpp: drawn over the TV picture in the ImGui pass
 +extern void (*g_crema_overlay)(sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight);
 +extern std::shared_mutex g_audioMutex;
@@ -14988,7 +15038,7 @@ index 00000000..744178a2
 +		case ROW_LOAD: return fmt::format("Slot {}", sSlot);
 +		case ROW_TV: return LatteGPUState.isDRCPrimary ? "GamePad Screen" : "TV Screen";
 +		case ROW_POINTER: return g_crema_touch_pointer ? "On" : "Off";
-+		case ROW_TOUCHPAD: return g_crema_touchpad_buttons ? "Minus / HOME" : "GamePad Touch Screen";
++		case ROW_TOUCHPAD: return g_crema_touchpad_buttons ? "Minus / HOME" : g_crema_touchpad_laptop ? "Laptop Touchpad" : "GamePad Touch Screen";
 +		case ROW_TAP: return g_crema_touch_tap ? "On" : "Off";
 +		case ROW_MOTION: return MotionOn() ? "On" : "Off";
 +		case ROW_CONTROLS: return HasGameLayout(0) ? "This Game" : "All Games";
@@ -15059,9 +15109,15 @@ index 00000000..744178a2
 +			Save("touch_pointer", g_crema_touch_pointer ? "on" : "off");
 +			break;
 +		case ROW_TOUCHPAD:
-+			g_crema_touchpad_buttons = !g_crema_touchpad_buttons;
-+			Save("touchpad", g_crema_touchpad_buttons ? "buttons" : "touch");
++		{
++			// Touch Screen -> Laptop Touchpad -> Minus / HOME (Left: the other way)
++			const int mode = g_crema_touchpad_buttons ? 2 : g_crema_touchpad_laptop ? 1 : 0;
++			const int next = (mode + (direction < 0 ? 2 : 1)) % 3;
++			g_crema_touchpad_buttons = next == 2;
++			g_crema_touchpad_laptop = next == 1;
++			Save("touchpad", next == 2 ? "buttons" : next == 1 ? "laptop" : "touch");
 +			break;
++		}
 +		case ROW_TAP:
 +			g_crema_touch_tap = !g_crema_touch_tap;
 +			Save("touch_tap", g_crema_touch_tap ? "on" : "off");
@@ -17505,10 +17561,10 @@ index 00000000..a6d4cc6e
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 00000000..c06e5fd3
+index 00000000..bb0894fb
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,736 @@
+@@ -0,0 +1,742 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -17566,6 +17622,8 @@ index 00000000..c06e5fd3
 +extern "C" int g_crema_touchpad_buttons; // 1: touchpad halves = Minus / HOME, no touch screen
 +extern "C" int g_crema_touch_pointer;    // the pointer over the picture
 +extern "C" int g_crema_touch_tap;        // input/api/PS4/PS4PadController.cpp: Tap to Touch
++extern "C" int g_crema_touchpad_laptop;  // Laptop Touchpad: the pointer moves on from where it was
++extern "C" float g_crema_touch_speed;    // Pointer Speed
 +
 +namespace CremaSettings
 +{
@@ -17585,8 +17643,8 @@ index 00000000..c06e5fd3
 +		{"scaling", "Picture Size", "Display", {{"keep", "Keep Aspect Ratio"}, {"stretch", "Stretch"}},
 +			"keep", false, "Stretch fills the whole TV even when the game's picture has another shape."},
 +		{"upscale_filter", "Upscaling Filter", "Display",
-+			{{"bicubic", "Bicubic"}, {"linear", "Bilinear"}, {"hermite", "Hermite"}, {"nearest", "Nearest"}, {"fsr", "FSR 1"}},
-+			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest. FSR 1 (AMD FidelityFX Super Resolution) keeps edges sharp without jaggies; it makes the picture look better, not the game faster."},
++			{{"bicubic", "Bicubic"}, {"linear", "Bilinear"}, {"hermite", "Hermite"}, {"nearest", "Nearest"}, {"fsr", "FSR 1"}, {"fsr_rcas", "FSR 1 + Sharpening"}},
++			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest. FSR 1 (AMD FidelityFX Super Resolution) keeps edges sharp without jaggies; FSR 1 + Sharpening adds AMD's RCAS pass, as FSR 1 is meant to be used (more GPU work). They make the picture look better, not the game faster."},
 +		// Emulation
 +		{"cpu_mode", "CPU Mode", "Emulation",
 +			{{"auto", "Auto"}, {"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}, {"interpreter", "Interpreter (Debug)"}}, "auto", false,
@@ -17642,8 +17700,10 @@ index 00000000..c06e5fd3
 +			"Sound queued ahead of playback. Longer: fewer crackles when a game slows down, a little more delay."},
 +		// Controls
 +		{"touchpad", "Touchpad", "Controls",
-+			{{"touch", "GamePad Touch Screen"}, {"buttons", "Minus / HOME"}}, "touch", false,
-+			"Touch Screen: a click touches the GamePad screen at your finger, two fingers press Minus (left) or HOME (right). Minus / HOME: the touchpad's halves are those buttons."},
++			{{"touch", "GamePad Touch Screen"}, {"laptop", "Laptop Touchpad"}, {"buttons", "Minus / HOME"}}, "touch", false,
++			"Touch Screen: a click touches the GamePad screen at your finger, two fingers press Minus (left) or HOME (right). Laptop Touchpad: sliding a finger moves the pointer on from where it was, like a laptop's touchpad; a click or a tap touches the screen at the pointer (click and slide to drag). Minus / HOME: the touchpad's halves are those buttons."},
++		{"touch_speed", "Pointer Speed", "Controls", {{"slow", "Slow"}, {"normal", "Normal"}, {"fast", "Fast"}}, "normal", false,
++			"How far the pointer moves for a finger's slide in Laptop Touchpad mode."},
 +		{"touch_tap", "Tap to Touch", "Controls", {{"on", "On"}, {"off", "Off"}}, "on", true,
 +			"On: a quick tap on the touchpad touches the GamePad screen, like a phone. Off: only a click (pressing the touchpad down) touches it."},
 +		{"motion", "Motion Controls", "Controls", {{"on", "On"}, {"off", "Off"}}, "on", false,
@@ -18203,7 +18263,7 @@ index 00000000..c06e5fd3
 +	config.SetAccountSelectedService(ActiveSettings::GetPersistentId(), Get("online") != "off" ? NetworkService::Pretendo : NetworkService::Offline);
 +	const std::string upscale = get("upscale_filter");
 +	config.upscale_filter = upscale == "linear" ? kLinearFilter : upscale == "hermite" ? kBicubicHermiteFilter :
-+		upscale == "nearest" ? kNearestNeighborFilter : upscale == "fsr" ? kFsrFilter : kBicubicFilter;
++		upscale == "nearest" ? kNearestNeighborFilter : upscale == "fsr" ? kFsrFilter : upscale == "fsr_rcas" ? kFsrRcasFilter : kBicubicFilter;
 +	config.fullscreen_scaling = get("scaling") == "stretch" ? kStretch : kKeepAspectRatio;
 +	config.overlay.position = get("show_fps") == "on" ? ScreenPosition::kTopLeft : ScreenPosition::kDisabled;
 +	config.overlay.fps = true;
@@ -18234,6 +18294,8 @@ index 00000000..c06e5fd3
 +	cemuLog_setActiveLoggingFlags(logFlags);
 +
 +	g_crema_touchpad_buttons = get("touchpad") == "buttons" ? 1 : 0;
++	g_crema_touchpad_laptop = get("touchpad") == "laptop" ? 1 : 0;
++	g_crema_touch_speed = get("touch_speed") == "slow" ? 1.0f : get("touch_speed") == "fast" ? 2.4f : 1.6f;
 +	g_crema_touch_pointer = get("touch_pointer") == "on" ? 1 : 0;
 +	g_crema_touch_tap = get("touch_tap") != "off" ? 1 : 0;
 +	Recommendation recommendation;
@@ -25758,10 +25820,10 @@ index a5f1f926..15a7b40b 100644
  		
 diff --git a/src/input/api/PS4/PS4PadController.cpp b/src/input/api/PS4/PS4PadController.cpp
 new file mode 100644
-index 00000000..e7f428a3
+index 00000000..122b7a74
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.cpp
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,331 @@
 +#include "input/api/PS4/PS4PadController.h"
 +
 +#include <orbis/Pad.h>
@@ -25771,6 +25833,8 @@ index 00000000..e7f428a3
 +extern "C" int g_crema_touchpad_buttons = 0; // 1: touchpad halves = Minus / HOME, no touch screen
 +extern "C" int g_crema_touch_pointer = 1;    // the pointer over the picture
 +extern "C" int g_crema_touch_tap = 1;        // a short tap touches too (else only a click)
++extern "C" int g_crema_touchpad_laptop = 0;  // Laptop Touchpad: sliding moves the pointer on from where it was
++extern "C" float g_crema_touch_speed = 1.6f; // Pointer Speed (Laptop Touchpad)
 +// The DualShock 4's ScePad handle, for the launcher and the frontend (a user's pad opens once)
 +extern "C" int g_crema_pad_handle = -1;
 +// The in-game menu (gui/ps4/PS4PauseMenu.cpp) is open: the game gets no input
@@ -25925,12 +25989,42 @@ index 00000000..e7f428a3
 +{
 +	OrbisPadData data{};
 +	const bool read = !g_crema_touchpad_buttons && !g_crema_menu_open && m_provider && m_provider->Read(m_slot, data);
-+	const bool finger = read && data.touch.fingers > 0;
++	bool finger = read && data.touch.fingers > 0;
 +	bool touching = finger && data.touch.fingers == 1 && (data.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD);
 +	if (finger)
 +	{
 +		position.x = std::clamp((float)data.touch.touch[0].x / m_provider->m_touchMaxX, 0.0f, 1.0f);
 +		position.y = std::clamp((float)data.touch.touch[0].y / m_provider->m_touchMaxY, 0.0f, 1.0f);
++	}
++	// Laptop Touchpad: the pointer stays where it was left; one finger sliding moves it by how far
++	// the finger went (faster slides further, as on a laptop), a new finger anywhere doesn't make it
++	// jump. Called twice per poll (has_position, get_position): the second sees no movement.
++	if (g_crema_touchpad_laptop && read)
++	{
++		const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++		if (data.touch.fingers == 1)
++		{
++			const uint8 id = data.touch.touch[0].finger;
++			if (m_padDown && id == m_padFingerId)
++			{
++				const glm::vec2 delta = position - m_padLast;
++				const float distance = glm::length(delta);
++				if (distance > 0.0f)
++				{
++					const float acceleration = 1.0f + std::min(distance * 40.0f, 2.0f);
++					m_padCursor = glm::clamp(m_padCursor + delta * g_crema_touch_speed * acceleration, glm::vec2(0.0f), glm::vec2(1.0f));
++					m_padMoved = now;
++				}
++			}
++			m_padDown = true;
++			m_padFingerId = id;
++			m_padLast = position;
++		}
++		else
++			m_padDown = false;
++		position = m_padCursor;
++		// the pointer shows while a finger is down and for 3 s after it last moved
++		finger = finger || now - m_padMoved < 3.0;
 +	}
 +	// Tap to Touch: one finger down and up within 0.3 s without sliding touches the screen there
 +	// for 0.12 s (a phone-like tap; the click still works). Not for a Wii Remote's pointer.
@@ -26063,10 +26157,10 @@ index 00000000..e7f428a3
 +}
 diff --git a/src/input/api/PS4/PS4PadController.h b/src/input/api/PS4/PS4PadController.h
 new file mode 100644
-index 00000000..2cbd6325
+index 00000000..280be311
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,100 @@
 +#pragma once
 +
 +#include "input/api/Controller.h"
@@ -26149,6 +26243,11 @@ index 00000000..2cbd6325
 +	bool m_hoverPointer = false;
 +	// Tap to Touch: a short tap (no click) touches the GamePad screen where the finger was
 +	bool m_tapDown = false, m_tapMoved = false;
++	// Laptop Touchpad: the pointer, and the finger moving it
++	glm::vec2 m_padCursor{0.5f, 0.5f}, m_padLast{};
++	bool m_padDown = false;
++	uint8 m_padFingerId = 0;
++	double m_padMoved = -10.0;
 +	double m_tapStart = 0.0, m_tapUntil = 0.0;
 +	glm::vec2 m_tapStartPos{}, m_tapPos{};
 +	std::mutex m_motionMutex;
