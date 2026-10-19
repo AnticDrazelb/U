@@ -10492,21 +10492,27 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..711d49c5 100644
+index 16b8d73c..af8b3d4a 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-@@ -8,6 +8,10 @@
+@@ -4,10 +4,16 @@
+ #include "Cafe/HW/Latte/Renderer/Renderer.h"
+ 
+ #include <imgui.h>
++#include <chrono>
+ #include "imgui/imgui_extension.h"
  #include "util/helpers/helpers.h"
  #include "resource/IconsFontAwesome5.h"
  
 +#if defined(__ORBIS__)
 +void CremaImeNewAppearance(); // below: the PS4 keyboard for the game
++void CremaImeStringRead();
 +#endif
 +
  #define SWKBD_FORM_STRING_MAX_LENGTH	(4096) // counted in 16-bit characters
  
  #define SWKBD_STATE_BLANK				(0)	// not visible
-@@ -192,6 +196,10 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
+@@ -192,6 +198,10 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
  
  uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  {
@@ -10517,7 +10523,7 @@ index 16b8d73c..711d49c5 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->decideButtonWasPressed = false;
-@@ -227,6 +235,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+@@ -227,6 +237,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  
  uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  {
@@ -10525,7 +10531,7 @@ index 16b8d73c..711d49c5 100644
  	// todo: Figure out what the difference between AppearInputForm and AppearKeyboard is?
  	uint32 argPtr = MEMPTR(keyboardArg).GetMPTR();
  	for(sint32 i=0; i<0x180; i += 4)
-@@ -234,6 +243,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -234,6 +245,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  		debug_printf("+0x%03x: 0x%08x\n", i, memory_readU32(argPtr+i));
  	}
  
@@ -10535,7 +10541,17 @@ index 16b8d73c..711d49c5 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -397,8 +409,145 @@ void SwkbdCalc(void* controllerInfo)
+@@ -260,6 +274,9 @@ uint32 SwkbdDisappearKeyboard()
+ 
+ uint16be* SwkbdGetInputFormString()
+ {
++#if defined(__ORBIS__)
++	CremaImeStringRead();
++#endif
+ 	for(sint32 i=0; i<swkbdInternalState->formStringLength; i++)
+ 		swkbdInternalState->formStringBufferBE[i] = swkbdInternalState->formStringBuffer[i];
+ 	cemu_assert(swkbdInternalState->formStringLength < SWKBD_FORM_STRING_MAX_LENGTH);
+@@ -397,8 +414,165 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
@@ -10562,6 +10578,9 @@ index 16b8d73c..711d49c5 100644
 +		DONE,   // its text was handed over; waits for the game to hide its keyboard
 +	};
 +	CremaIme s_ime = CremaIme::IDLE;
++	bool s_okPending = false;
++	std::chrono::steady_clock::time_point s_okAt;
++	uint32 s_stringReads = 0;
 +	std::u16string s_imeText;
 +	char16_t s_imeTitle[64];
 +
@@ -10645,8 +10664,17 @@ index 16b8d73c..711d49c5 100644
 +		}
 +		else
 +			cemuLog_log(LogType::Force, "swkbd: PS4 keyboard cancelled, the game's text kept");
-+		swkbd_finishInput();
++		// OK a moment after the text is in place: a game that reads the text each frame and acts on
++		// the copy it read before OK (Super Smash Bros.' Mii names) then has the typed one
++		s_okAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
++		s_okPending = true;
 +	}
++}
++
++void CremaImeStringRead()
++{
++	if (s_stringReads++ < 3 || s_okPending)
++		cemuLog_log(LogType::Force, "swkbd: the game reads the text ({} characters)", swkbdInternalState->formStringLength);
 +}
 +
 +// the game shows its keyboard again: the PS4's opens again too
@@ -10654,6 +10682,8 @@ index 16b8d73c..711d49c5 100644
 +{
 +	if (s_ime == CremaIme::DONE)
 +		s_ime = CremaIme::IDLE;
++	s_okPending = false;
++	s_stringReads = 0;
 +}
 +#endif
 +
@@ -10676,6 +10706,12 @@ index 16b8d73c..711d49c5 100644
 +		CremaImeOpen();
 +	else if (s_ime == CremaIme::OPEN)
 +		CremaImeUpdate();
++	if (s_okPending && std::chrono::steady_clock::now() >= s_okAt)
++	{
++		s_okPending = false;
++		cemuLog_log(LogType::Force, "swkbd: OK given ({} reads of the text so far)", s_stringReads);
++		swkbd_finishInput();
++	}
 +	return; // never Cemu's drawn keyboard
 +#endif
  	// only render if active
