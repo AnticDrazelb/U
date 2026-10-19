@@ -999,10 +999,22 @@ index 850fb6bd..a8d23848 100644
  			{
  				virtualMountPath = fs::path(fmt::format("/vol/aoc{:016x}/", aocTitleId)) / virtualMountPath;
 diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp
-index cf7ba195..0b1903de 100644
+index cf7ba195..962e02ce 100644
 --- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp
 +++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterHLE.cpp
-@@ -22,6 +22,122 @@ HLECALL s_ppcHleTable[HLE_TABLE_CAPACITY]{};
+@@ -11,6 +11,11 @@ void PPCInterpreter_handleUnsupportedHLECall(PPCInterpreter_t* hCPU)
+ 	if (s_unsupportedHLECalls.find(tempString) == s_unsupportedHLECalls.end())
+ 	{
+ 		cemuLog_log(LogType::UnsupportedAPI, "{}", tempString);
++#if defined(__ORBIS__)
++		// Crema: always in the log (once per function), with the caller - a feature that does nothing in
++		// a game is often one of these
++		cemuLog_log(LogType::Force, "{} (called from {:08x})", tempString, hCPU->spr.LR);
++#endif
+ 		s_unsupportedHLECalls.emplace(tempString);
+ 	}
+ 	hCPU->gpr[3] = 0;
+@@ -22,6 +27,122 @@ HLECALL s_ppcHleTable[HLE_TABLE_CAPACITY]{};
  sint32 s_ppcHleTableWriteIndex = 0;
  std::mutex s_ppcHleTableMutex;
  
@@ -1125,7 +1137,7 @@ index cf7ba195..0b1903de 100644
  HLEIDX PPCInterpreter_registerHLECall(HLECALL hleCall, std::string hleName)
  {
  	std::unique_lock _l(s_ppcHleTableMutex);
-@@ -39,6 +155,9 @@ HLEIDX PPCInterpreter_registerHLECall(HLECALL hleCall, std::string hleName)
+@@ -39,6 +160,9 @@ HLEIDX PPCInterpreter_registerHLECall(HLECALL hleCall, std::string hleName)
  	}
  	cemu_assert(s_ppcHleTableWriteIndex < HLE_TABLE_CAPACITY);
  	s_ppcHleTable[s_ppcHleTableWriteIndex] = hleCall;
@@ -1135,7 +1147,7 @@ index cf7ba195..0b1903de 100644
  	HLEIDX funcIndex = s_ppcHleTableWriteIndex;
  	s_ppcHleTableWriteIndex++;
  	return funcIndex;
-@@ -67,6 +186,18 @@ void PPCInterpreter_virtualHLE(PPCInterpreter_t* hCPU, unsigned int opcode)
+@@ -67,6 +191,18 @@ void PPCInterpreter_virtualHLE(PPCInterpreter_t* hCPU, unsigned int opcode)
  		// os lib function
  		auto hleCall = PPCInterpreter_getHLECall(hleFuncId);
  		cemu_assert(hleCall);
@@ -10480,7 +10492,7 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..59cfb8d4 100644
+index 16b8d73c..711d49c5 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
 @@ -8,6 +8,10 @@
@@ -10494,17 +10506,26 @@ index 16b8d73c..59cfb8d4 100644
  #define SWKBD_FORM_STRING_MAX_LENGTH	(4096) // counted in 16-bit characters
  
  #define SWKBD_STATE_BLANK				(0)	// not visible
-@@ -192,6 +196,9 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
+@@ -192,6 +196,10 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
  
  uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  {
++	cemuLog_log(LogType::Force, "swkbd: {}", "SwkbdAppearInputForm");
 +#if defined(__ORBIS__)
 +	CremaImeNewAppearance();
 +#endif
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->decideButtonWasPressed = false;
-@@ -234,6 +241,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -227,6 +235,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+ 
+ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+ {
++	cemuLog_log(LogType::Force, "swkbd: {}", "SwkbdAppearKeyboard");
+ 	// todo: Figure out what the difference between AppearInputForm and AppearKeyboard is?
+ 	uint32 argPtr = MEMPTR(keyboardArg).GetMPTR();
+ 	for(sint32 i=0; i<0x180; i += 4)
+@@ -234,6 +243,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  		debug_printf("+0x%03x: 0x%08x\n", i, memory_readU32(argPtr+i));
  	}
  
@@ -10514,7 +10535,7 @@ index 16b8d73c..59cfb8d4 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -397,8 +407,145 @@ void SwkbdCalc(void* controllerInfo)
+@@ -397,8 +409,145 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
