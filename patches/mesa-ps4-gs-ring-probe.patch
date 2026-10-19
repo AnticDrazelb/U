@@ -1,8 +1,8 @@
 From 0c64ceb7ebcec8f5984d00ceb10cbb01a2daa407 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Mon, 19 Oct 2026 07:01:37 +0300
-Subject: [PATCH] PS4: GS ring probe - read VGT_ESGS/GSVS_RING_SIZE back around
- the preamble write
+Subject: [PATCH 1/2] PS4: GS ring probe - read VGT_ESGS/GSVS_RING_SIZE back
+ around the preamble write
 
 ---
  src/amd/vulkan/radv_queue.c | 55 +++++++++++++++++++++++++++++++++++++
@@ -102,6 +102,63 @@ index 7b22ab2..fea1014 100644
     if (use_ace) {
        result = radv_update_gang_preambles(queue);
        if (result != VK_SUCCESS)
+-- 
+2.53.0
+
+
+From b07fa5c741d96d84278fb429d2c703b07048cf91 Mon Sep 17 00:00:00 2001
+From: Hadi <shiro@DESKTOP-6QPFRA3.localdomain>
+Date: Mon, 19 Oct 2026 07:12:26 +0300
+Subject: [PATCH 2/2] PS4: GS ring probe control read (VGT_NUM_INSTANCES,
+ VGT_PRIMITIVE_TYPE)
+
+---
+ src/amd/vulkan/radv_queue.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index fea1014..d4dc52d 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -417,8 +417,15 @@ radv_emit_gs_ring_sizes(struct radv_device *device, struct radv_cmd_stream *cs,
+    radeon_end();
+ 
+ #ifdef __PS4__
+-   if (ps4_ring_probe_bo)
++   if (ps4_ring_probe_bo) {
+       ps4_ring_probe_copy(cs, 1);
++      radeon_begin(cs);
++      radeon_set_uconfig_reg(0x30934, 0x1234);
++      radeon_end();
++      const uint64_t va = radv_buffer_get_va(ps4_ring_probe_bo) + 16;
++      ac_emit_cp_copy_data(cs->b, COPY_DATA_REG, COPY_DATA_DST_MEM, 0x30934 >> 2, va, AC_CP_COPY_DATA_WR_CONFIRM, false);
++      ac_emit_cp_copy_data(cs->b, COPY_DATA_REG, COPY_DATA_DST_MEM, 0x30908 >> 2, va + 4, AC_CP_COPY_DATA_WR_CONFIRM, false);
++   }
+ #endif
+ }
+ 
+@@ -928,7 +935,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+                       RADV_BO_PRIORITY_SCRATCH, 0, true, &ps4_ring_probe_bo) == VK_SUCCESS) {
+       ps4_ring_probe_map = (volatile uint32_t *)radv_buffer_map(ws, ps4_ring_probe_bo);
+       if (ps4_ring_probe_map)
+-         for (unsigned i = 0; i < 4; i++)
++         for (unsigned i = 0; i < 6; i++)
+             ps4_ring_probe_map[i] = 0xdeadbeef;
+       else
+          ps4_ring_probe_bo = NULL;
+@@ -1674,10 +1681,10 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
+    {
+       static unsigned probe_count;
+       if (ps4_ring_probe_map && ps4_ring_probe_sizes[1] && (probe_count++ % 600) == 0 && probe_count < 6000)
+-         ac_ps4_trace("radv/ps4: GS ring sizes programmed esgs %#x gsvs %#x (regs %#x %#x) | read before %#x %#x after %#x %#x\n",
++         ac_ps4_trace("radv/ps4: GS ring sizes programmed esgs %#x gsvs %#x (regs %#x %#x) | read before %#x %#x after %#x %#x | control NUM_INSTANCES %#x (wrote 0x1234) PRIMITIVE_TYPE %#x\n",
+                       ps4_ring_probe_sizes[0], ps4_ring_probe_sizes[1], ps4_ring_probe_sizes[0] >> 8,
+                       ps4_ring_probe_sizes[1] >> 8, ps4_ring_probe_map[0], ps4_ring_probe_map[1], ps4_ring_probe_map[2],
+-                      ps4_ring_probe_map[3]);
++                      ps4_ring_probe_map[3], ps4_ring_probe_map[4], ps4_ring_probe_map[5]);
+    }
+ #endif
+ 
 -- 
 2.53.0
 
