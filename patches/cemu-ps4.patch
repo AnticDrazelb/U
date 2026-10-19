@@ -10479,6 +10479,187 @@ index 6cb1599a..c4cb0a7e 100644
  			if (numQueuedFramesSndGeneric == snd_core::getNumProcessedFrames())
  			{
  				AXOut_updateDevicePlayState(true);
+diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
+index 16b8d73c..59cfb8d4 100644
+--- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
++++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
+@@ -8,6 +8,10 @@
+ #include "util/helpers/helpers.h"
+ #include "resource/IconsFontAwesome5.h"
+ 
++#if defined(__ORBIS__)
++void CremaImeNewAppearance(); // below: the PS4 keyboard for the game
++#endif
++
+ #define SWKBD_FORM_STRING_MAX_LENGTH	(4096) // counted in 16-bit characters
+ 
+ #define SWKBD_STATE_BLANK				(0)	// not visible
+@@ -192,6 +196,9 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
+ 
+ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+ {
++#if defined(__ORBIS__)
++	CremaImeNewAppearance();
++#endif
+ 	swkbdInternalState->formStringLength = 0;
+ 	swkbdInternalState->isActive = true;
+ 	swkbdInternalState->decideButtonWasPressed = false;
+@@ -234,6 +241,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+ 		debug_printf("+0x%03x: 0x%08x\n", i, memory_readU32(argPtr+i));
+ 	}
+ 
++#if defined(__ORBIS__)
++	CremaImeNewAppearance();
++#endif
+ 	swkbdInternalState->formStringLength = 0;
+ 	swkbdInternalState->isActive = true;
+ 	swkbdInternalState->keyboardOnlyMode = true;
+@@ -397,8 +407,145 @@ void SwkbdCalc(void* controllerInfo)
+ }
+ 
+ void swkbd_keyInput(uint32 keyCode);
++void swkbd_inputStringChanged();
++void swkbd_finishInput();
++
++#if defined(__ORBIS__)
++// Crema: the game's keyboard is the PS4's own (its IME dialog: every language, Cross to type, as
++// the package says Cross confirms) instead of Cemu's drawn one. It opens with the game's text when
++// the game shows its keyboard; Done hands the text over as the Wii U keyboard's OK; Cancel keeps
++// the text the game gave (the Wii U keyboard has no cancel the game would expect).
++#include <orbis/CommonDialog.h>
++#include <orbis/ImeDialog.h>
++#include <orbis/Sysmodule.h>
++#include <orbis/UserService.h>
++extern "C" int g_crema_ime_open; // input/api/PS4/PS4PadController.cpp: the game gets no pad input meanwhile
++
++namespace
++{
++	enum class CremaIme
++	{
++		IDLE,   // nothing shown
++		OPEN,   // the PS4 keyboard is up
++		DONE,   // its text was handed over; waits for the game to hide its keyboard
++	};
++	CremaIme s_ime = CremaIme::IDLE;
++	std::u16string s_imeText;
++	char16_t s_imeTitle[64];
++
++	sint32 CremaImeMaxLength()
++	{
++		sint32 maxLength = swkbdInternalState->maxTextLength;
++		if (swkbdInternalState->keyboardOnlyMode)
++		{
++			const uint32 size = swkbdInternalState->keyboardArg.receiverArg.stringBufSize;
++			maxLength = size > 1 ? (sint32)size - 1 : SWKBD_FORM_STRING_MAX_LENGTH - 1;
++		}
++		return std::clamp<sint32>(maxLength, 1, SWKBD_FORM_STRING_MAX_LENGTH - 1);
++	}
++
++	void CremaImeOpen()
++	{
++		static bool s_loaded = false;
++		if (!s_loaded)
++		{
++			sceSysmoduleLoadModule(ORBIS_SYSMODULE_IME_DIALOG);
++			sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_COMMON_DIALOG);
++			sceCommonDialogInitialize();
++			s_loaded = true;
++		}
++		const sint32 maxLength = CremaImeMaxLength();
++		s_imeText.assign((size_t)maxLength + 8, u'\0');
++		for (sint32 i = 0; i < swkbdInternalState->formStringLength && i < maxLength; i++)
++			s_imeText[i] = (char16_t)swkbdInternalState->formStringBuffer[i];
++		const char* title = "Wii U Keyboard";
++		size_t n = 0;
++		for (; title[n] && n + 1 < std::size(s_imeTitle); n++)
++			s_imeTitle[n] = (char16_t)title[n];
++		s_imeTitle[n] = u'\0';
++		int user = 0;
++		sceUserServiceGetInitialUser(&user);
++		OrbisImeDialogSetting setting = {};
++		setting.userId = (uint32_t)user;
++		setting.type = ORBIS_TYPE_DEFAULT;
++		setting.enterLabel = ORBIS_BUTTON_LABEL_DEFAULT;
++		setting.maxTextLength = (uint32_t)maxLength;
++		setting.inputTextBuffer = reinterpret_cast<wchar_t*>(s_imeText.data());
++		setting.posx = 1920.0f / 2;
++		setting.posy = 1080.0f / 2;
++		setting.horizontalAlignment = ORBIS_H_CENTER;
++		setting.verticalAlignment = ORBIS_V_CENTER;
++		setting.title = reinterpret_cast<const wchar_t*>(s_imeTitle);
++		const int result = sceImeDialogInit(&setting, nullptr);
++		cemuLog_log(LogType::Force, "swkbd: PS4 keyboard for the game ({} characters at most): {:#x}", maxLength, (uint32)result);
++		if (result < 0)
++		{
++			// no PS4 keyboard: the text stays, as if confirmed
++			swkbd_finishInput();
++			s_ime = CremaIme::DONE;
++			return;
++		}
++		s_ime = CremaIme::OPEN;
++		g_crema_ime_open = 1;
++	}
++
++	void CremaImeUpdate()
++	{
++		const OrbisDialogStatus status = sceImeDialogGetStatus();
++		if (status == ORBIS_DIALOG_STATUS_RUNNING)
++			return;
++		OrbisDialogResult result = {};
++		if (status == ORBIS_DIALOG_STATUS_STOPPED)
++			sceImeDialogGetResult(&result);
++		sceImeDialogTerm();
++		g_crema_ime_open = 0;
++		s_ime = CremaIme::DONE;
++		if (status == ORBIS_DIALOG_STATUS_STOPPED && result.endstatus == ORBIS_DIALOG_OK)
++		{
++			sint32 length = 0;
++			const sint32 maxLength = CremaImeMaxLength();
++			for (; length < maxLength && s_imeText[length] != u'\0'; length++)
++				swkbdInternalState->formStringBuffer[length] = (wchar_t)s_imeText[length];
++			swkbdInternalState->formStringBuffer[length] = '\0';
++			swkbdInternalState->formStringLength = length;
++			swkbd_inputStringChanged();
++			cemuLog_log(LogType::Force, "swkbd: {} characters typed", length);
++		}
++		else
++			cemuLog_log(LogType::Force, "swkbd: PS4 keyboard cancelled, the game's text kept");
++		swkbd_finishInput();
++	}
++}
++
++// the game shows its keyboard again: the PS4's opens again too
++void CremaImeNewAppearance()
++{
++	if (s_ime == CremaIme::DONE)
++		s_ime = CremaIme::IDLE;
++}
++#endif
++
+ void swkbd_render(bool mainWindow)
+ {
++#if defined(__ORBIS__)
++	if (swkbdInternalState == NULL || swkbdInternalState->isActive == false)
++	{
++		if (s_ime == CremaIme::OPEN)
++		{
++			// the game hid its keyboard first
++			sceImeDialogAbort();
++			sceImeDialogTerm();
++			g_crema_ime_open = 0;
++		}
++		s_ime = CremaIme::IDLE;
++		return;
++	}
++	if (s_ime == CremaIme::IDLE)
++		CremaImeOpen();
++	else if (s_ime == CremaIme::OPEN)
++		CremaImeUpdate();
++	return; // never Cemu's drawn keyboard
++#endif
+ 	// only render if active
+ 	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
+ 		return;
 diff --git a/src/Cemu/Logging/CemuLogging.h b/src/Cemu/Logging/CemuLogging.h
 index 6a23d902..bedf0b60 100644
 --- a/src/Cemu/Logging/CemuLogging.h
@@ -25859,10 +26040,10 @@ index a5f1f926..15a7b40b 100644
  		
 diff --git a/src/input/api/PS4/PS4PadController.cpp b/src/input/api/PS4/PS4PadController.cpp
 new file mode 100644
-index 00000000..22c7fef6
+index 00000000..b9f46677
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.cpp
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,384 @@
 +#include "input/api/PS4/PS4PadController.h"
 +
 +#include <orbis/Pad.h>
@@ -25878,6 +26059,8 @@ index 00000000..22c7fef6
 +extern "C" int g_crema_pad_handle = -1;
 +// The in-game menu (gui/ps4/PS4PauseMenu.cpp) is open: the game gets no input
 +extern "C" int g_crema_menu_open = 0;
++// The PS4 keyboard is up for the game (Cafe/OS/libs/swkbd/swkbd.cpp): the game gets no input either
++extern "C" int g_crema_ime_open = 0;
 +
 +namespace
 +{
@@ -26078,7 +26261,7 @@ index 00000000..22c7fef6
 +bool PS4PadController::ReadTouch(glm::vec2& position)
 +{
 +	OrbisPadData data{};
-+	const bool read = !g_crema_touchpad_buttons && !g_crema_menu_open && m_provider && m_provider->Read(m_slot, data);
++	const bool read = !g_crema_touchpad_buttons && !g_crema_menu_open && !g_crema_ime_open && m_provider && m_provider->Read(m_slot, data);
 +	bool finger = read && data.touch.fingers > 0;
 +	bool touching = finger && data.touch.fingers == 1 && (data.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD);
 +	if (finger)
@@ -26211,7 +26394,7 @@ index 00000000..22c7fef6
 +{
 +	ControllerState result{};
 +	OrbisPadData data{};
-+	if (g_crema_menu_open || !m_provider || !m_provider->Read(m_slot, data))
++	if (g_crema_menu_open || g_crema_ime_open || !m_provider || !m_provider->Read(m_slot, data))
 +		return result;
 +	const uint32 b = data.buttons;
 +	const std::pair<uint32, uint32> buttons[] = {
