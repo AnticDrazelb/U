@@ -10434,7 +10434,7 @@ index 46080a4e..f5128003 100644
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
-index 6cb1599a..3b5a3cc0 100644
+index 6cb1599a..c4cb0a7e 100644
 --- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
 +++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
 @@ -482,6 +482,18 @@ namespace snd_core
@@ -10456,6 +10456,29 @@ index 6cb1599a..3b5a3cc0 100644
  		// if we haven't buffered any blocks, we will wait less time than usual
  		bool additional_blocks_required = false;
  		{
+@@ -520,6 +532,22 @@ namespace snd_core
+ 
+ 		if (snd_core::isInitialized())
+ 		{
++#if defined(__ORBIS__)
++			// Crema: a queued frame that never got processed (its message lost, or a save state loaded
++			// with another queue) left the counts apart for good: no more audio frames, and games that
++			// wait for theirs stopped. After 100 ms apart they're set equal again.
++			{
++				static auto s_apartSince = now;
++				const uint32 processed = snd_core::getNumProcessedFrames();
++				if (numQueuedFramesSndGeneric == processed)
++					s_apartSince = now;
++				else if (now - s_apartSince > std::chrono::milliseconds(100))
++				{
++					numQueuedFramesSndGeneric = processed;
++					s_apartSince = now;
++				}
++			}
++#endif
+ 			if (numQueuedFramesSndGeneric == snd_core::getNumProcessedFrames())
+ 			{
+ 				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cemu/Logging/CemuLogging.h b/src/Cemu/Logging/CemuLogging.h
 index 6a23d902..bedf0b60 100644
 --- a/src/Cemu/Logging/CemuLogging.h
@@ -18705,10 +18728,10 @@ index 00000000..132ae41c
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 00000000..139f6896
+index 00000000..7a38445a
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4417 @@
+@@ -0,0 +1,4433 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -18763,6 +18786,7 @@ index 00000000..139f6896
 +
 +extern "C" void ps4_boot_trace(const char* line); // port/ps4_crashlog.cpp
 +extern "C" int g_crema_pad_handle;                // input/api/PS4/PS4PadController.cpp
++extern "C" int crema_pad_find_connected(int32_t except, int32_t* userOut); // PS4PadController.cpp
 +// the network library's shares (port/ps4_netfs.cpp)
 +extern "C" int ps4_netfs_check(const char* name, char* message, size_t size);
 +extern "C" void ps4_netfs_forget();
@@ -19171,6 +19195,21 @@ index 00000000..139f6896
 +			int pad = scePadGetHandle(m_user, 0, 0);
 +			if (pad < 0)
 +				pad = scePadOpen(m_user, 0, 0, nullptr);
++			// the user's pad still not connected: another signed-in user's that is (a controller that
++			// came back may belong to another user now)
++			OrbisPadData state{};
++			if (pad < 0 || scePadReadState(pad, &state) != 0 || !state.connected)
++			{
++				int32_t user = -1;
++				const int other = crema_pad_find_connected(m_user, &user);
++				if (other >= 0)
++				{
++					Log(fmt::format("pad: user {:#x}'s pad is gone, user {:#x}'s takes over", (uint32_t)m_user, (uint32_t)user));
++					pad = other;
++					m_user = user;
++					g_crema_pad_handle = other;
++				}
++			}
 +			Log(fmt::format("pad: reads failing ({:#x}, connected {}) for 2 s, handle {} -> {}", (uint32_t)m_lastRead,
 +				m_lastConnected, m_pad, pad));
 +			if (pad >= 0)
@@ -25820,10 +25859,10 @@ index a5f1f926..15a7b40b 100644
  		
 diff --git a/src/input/api/PS4/PS4PadController.cpp b/src/input/api/PS4/PS4PadController.cpp
 new file mode 100644
-index 00000000..122b7a74
+index 00000000..22c7fef6
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.cpp
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,382 @@
 +#include "input/api/PS4/PS4PadController.h"
 +
 +#include <orbis/Pad.h>
@@ -25846,6 +25885,32 @@ index 00000000..122b7a74
 +	std::mutex sCursorMutex;
 +	bool sCursorFinger = false, sCursorTouching = false;
 +	glm::vec2 sCursorPosition{};
++}
++
++// A signed-in user's DualShock 4 that is connected (opened if it isn't yet): after the pad in use
++// went away (turned off, or the PS4 asked who uses a controller that came back), any user's
++// connected pad takes over. -1 if there's none; except: a user to skip (its pad is the dead one).
++extern "C" int crema_pad_find_connected(int32_t except, int32_t* userOut)
++{
++	OrbisUserServiceLoginUserIdList users{};
++	if (sceUserServiceGetLoginUserIdList(&users) != 0)
++		return -1;
++	for (int32_t user : users.userId)
++	{
++		if (user == ORBIS_USER_SERVICE_USER_ID_INVALID || user == except)
++			continue;
++		int handle = scePadGetHandle(user, 0, 0);
++		if (handle < 0)
++			handle = scePadOpen(user, 0, 0, nullptr);
++		OrbisPadData data{};
++		if (handle >= 0 && scePadReadState(handle, &data) == 0 && data.connected)
++		{
++			if (userOut)
++				*userOut = user;
++			return handle;
++		}
++	}
++	return -1;
 +}
 +
 +bool PS4Pad_GetTouchCursor(glm::vec2& position, bool& touching)
@@ -25953,7 +26018,32 @@ index 00000000..122b7a74
 +		return false;
 +	// scePadReadState: the latest state (scePadRead returned nothing for half-second stretches
 +	// in DolphinPS4)
-+	return scePadReadState(m_pads[slot].handle, &data) == 0 && data.connected;
++	const bool ok = scePadReadState(m_pads[slot].handle, &data) == 0 && data.connected;
++	// player 1's pad gone for 2 s: another signed-in user's connected pad takes over (and the menus'
++	// handle with it)
++	if (slot == 0)
++	{
++		const auto now = std::chrono::steady_clock::now();
++		if (ok)
++			m_lostSince = {};
++		else if (m_lostSince == std::chrono::steady_clock::time_point{})
++			m_lostSince = now;
++		else if (now - m_lostSince > std::chrono::seconds(2))
++		{
++			m_lostSince = now;
++			int32_t user = -1;
++			const int handle = crema_pad_find_connected(m_pads[0].user, &user);
++			if (handle >= 0)
++			{
++				cemuLog_log(LogType::Force, "PS4Pad: player 1's pad (user {:#x}) is gone; user {:#x}'s pad takes over", (uint32)m_pads[0].user, (uint32)user);
++				m_pads[0].handle = handle;
++				m_pads[0].user = user;
++				m_pads[0].motion = reinterpret_cast<int32_t (*)(int32_t, bool)>(&scePadSetMotionSensorState)(handle, true) == 0;
++				g_crema_pad_handle = handle;
++			}
++		}
++	}
++	return ok;
 +}
 +
 +bool PS4PadControllerProvider::HasMotion(int slot)
@@ -26157,10 +26247,10 @@ index 00000000..122b7a74
 +}
 diff --git a/src/input/api/PS4/PS4PadController.h b/src/input/api/PS4/PS4PadController.h
 new file mode 100644
-index 00000000..280be311
+index 00000000..20fe1c2f
 --- /dev/null
 +++ b/src/input/api/PS4/PS4PadController.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,101 @@
 +#pragma once
 +
 +#include "input/api/Controller.h"
@@ -26204,6 +26294,7 @@ index 00000000..280be311
 +	};
 +	std::mutex m_mutex;
 +	Pad m_pads[kMaxPads];
++	std::chrono::steady_clock::time_point m_lostSince{}; // player 1's pad not connected since
 +	std::chrono::steady_clock::time_point m_lastRefresh{};
 +	float m_touchMaxX = 1919.0f, m_touchMaxY = 942.0f; // touchpad coordinate range
 +};
