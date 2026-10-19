@@ -1158,7 +1158,7 @@ index cf7ba195..0b1903de 100644
 +#endif
 \ No newline at end of file
 diff --git a/src/Cafe/HW/Espresso/PPCState.h b/src/Cafe/HW/Espresso/PPCState.h
-index fd943d39..d2920600 100644
+index fd943d39..797ff2e1 100644
 --- a/src/Cafe/HW/Espresso/PPCState.h
 +++ b/src/Cafe/HW/Espresso/PPCState.h
 @@ -104,6 +104,14 @@ struct PPCInterpreter_t
@@ -1167,12 +1167,12 @@ index fd943d39..d2920600 100644
  	void* rspTemp;
 +	// Crema save states: the outermost HLE call this core context is in, as it was entered
 +	// (PPCInterpreterHLE.cpp CremaCallHLE); a thread waiting in one is restarted or finished on load
-+	uint32 cremaHleDepth;
-+	uint32 cremaHleId;
-+	uint32 cremaHleIP;
-+	uint32 cremaHleLR;
-+	uint32 cremaHleSP;
-+	uint32 cremaHleArgs[8];
++	uint32 cremaHleDepth{};
++	uint32 cremaHleId{};
++	uint32 cremaHleIP{};
++	uint32 cremaHleLR{};
++	uint32 cremaHleSP{};
++	uint32 cremaHleArgs[8]{};
  };
  
  // parameter access (legacy C style)
@@ -8355,7 +8355,7 @@ index b2c50069..478dd4f8 100644
  };
  
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
-index 9fe4bead..549aa58e 100644
+index 9fe4bead..2fbe8b98 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 +++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
 @@ -14,6 +14,7 @@
@@ -9074,8 +9074,8 @@ index 9fe4bead..549aa58e 100644
 +						if (cpu.cremaHleDepth != 1 || t->context.srr0 != cpu.cremaHleIP)
 +						{
 +							quiet = false;
-+							why = fmt::format("thread {:08x} waits inside a callback of {} (depth {})", state.thread,
-+								CremaHLEName(cpu.cremaHleId), cpu.cremaHleDepth);
++							why = fmt::format("thread {:08x} waits inside a callback of {} (depth {}, at {:08x}, entered at {:08x})", state.thread,
++								CremaHLEName(cpu.cremaHleId), cpu.cremaHleDepth, (uint32)t->context.srr0, cpu.cremaHleIP);
 +							break;
 +						}
 +						state.kind = t->currentWaitQueue ? CremaThreadState::RESTART : CremaThreadState::FINISH;
