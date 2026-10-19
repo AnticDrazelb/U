@@ -4718,7 +4718,7 @@ index d975e11..d601688 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..d1c232a 100644
+index 512ebee..0d6c6a5 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -5055,7 +5055,7 @@ index 512ebee..d1c232a 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1746,12 +1954,481 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +1954,486 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5255,8 +5255,9 @@ index 512ebee..d1c232a 100644
 +// width, height, rows) and the rows
 +namespace
 +{
-+	constexpr uint32 kLayerFrames = 120;
-+	constexpr uint32 kLayerSlotBytes = 256u << 10; // per frame and image
++	constexpr uint32 kLayerFrames = 8;
++	constexpr uint32 kLayerDrawsPerFrame = 16;
++	constexpr uint32 kLayerSlotBytes = 192u << 10; // per draw and image
 +	VkBuffer s_layerBuffer = VK_NULL_HANDLE;
 +	VkDeviceMemory s_layerMemory = VK_NULL_HANDLE;
 +	uint8* s_layerPtr = nullptr;
@@ -5267,6 +5268,7 @@ index 512ebee..d1c232a 100644
 +	LatteTextureView* s_layerColor = nullptr;
 +	LatteTextureView* s_layerDepth = nullptr;
 +	struct LayerSlot { uint32 frame, kind, width, height, rows, valid; };
++	uint32 s_layerDrawInPass = 0;
 +	std::vector<LayerSlot> s_layerSlots;
 +}
 +
@@ -5277,19 +5279,20 @@ index 512ebee..d1c232a 100644
 +	CachedFBOVk* fbo = m_state.activeFBO;
 +	LatteTextureView* color = fbo ? fbo->colorBuffer[0].texture : nullptr;
 +	const bool inLayer = color && color->baseTexture->physAddress == 0xf4524000;
-+	if (inLayer)
++	if (!inLayer)
 +	{
-+		s_layerInPass = true;
-+		s_layerColor = color;
-+		if (fbo->depthBuffer.texture)
-+			s_layerDepth = fbo->depthBuffer.texture;
++		if (s_layerInPass)
++			s_layerCopiedThisFrame = true; // the pass is over for this frame
++		s_layerInPass = false;
 +		return;
 +	}
-+	if (!s_layerInPass || s_layerCopiedThisFrame)
++	if (s_layerCopiedThisFrame || s_layerDrawInPass >= kLayerDrawsPerFrame)
 +		return;
-+	// the layer pass just ended: copy every 16th row of its colour and depth images
-+	s_layerInPass = false;
-+	s_layerCopiedThisFrame = true;
++	s_layerInPass = true;
++	s_layerColor = color;
++	s_layerDepth = fbo->depthBuffer.texture;
++	// after this draw of the layer pass: copy every 16th row of its colour and depth images
++	const uint32 drawInPass = s_layerDrawInPass++;
 +	draw_endRenderPass();
 +	LatteTextureView* views[2] = {s_layerColor, s_layerDepth};
 +	for (uint32 kind = 0; kind < 2; kind++)
@@ -5300,7 +5303,7 @@ index 512ebee..d1c232a 100644
 +		LatteTextureVk* tex = (LatteTextureVk*)view->baseTexture;
 +		const uint32 w = (uint32)tex->width, h = (uint32)tex->height;
 +		const uint32 rows = std::min<uint32>((h + 15) / 16, kLayerSlotBytes / (w * 4));
-+		const uint32 slot = s_layerFrame * 2 + kind;
++		const uint32 slot = (s_layerFrame * kLayerDrawsPerFrame + drawInPass) * 2 + kind;
 +		VkImageSubresourceLayers sub{};
 +		sub.aspectMask = tex->GetImageAspect();
 +		sub.baseArrayLayer = 0;
@@ -5319,7 +5322,7 @@ index 512ebee..d1c232a 100644
 +		barrier_image<SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER, SYNC_OP::TRANSFER_READ>(tex, sub, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 +		vkCmdCopyImageToBuffer(m_state.currentCommandBuffer, tex->GetImageObj()->m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_layerBuffer, (uint32)regions.size(), regions.data());
 +		barrier_image<SYNC_OP::TRANSFER_READ, SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(tex, sub, tex->GetDefaultLayout());
-+		s_layerSlots.push_back({s_layerFrame, kind, w, h, rows, slot});
++		s_layerSlots.push_back({s_layerFrame | (drawInPass << 16), kind, w, h, rows, slot});
 +	}
 +}
 +
@@ -5335,7 +5338,7 @@ index 512ebee..d1c232a 100644
 +			return;
 +		fclose(f);
 +		remove("/data/Crema/selftest/layertrace");
-+		if (!s_layerBuffer && !memoryManager->CreateBuffer((VkDeviceSize)kLayerFrames * 2 * kLayerSlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++		if (!s_layerBuffer && !memoryManager->CreateBuffer((VkDeviceSize)kLayerFrames * kLayerDrawsPerFrame * 2 * kLayerSlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 +				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s_layerBuffer, s_layerMemory))
 +		{
 +			cemuLog_log(LogType::Force, "layer trace: no memory");
@@ -5348,12 +5351,14 @@ index 512ebee..d1c232a 100644
 +		s_layerActive = true;
 +		s_layerInPass = false;
 +		s_layerCopiedThisFrame = false;
++		s_layerDrawInPass = 0;
 +		cemuLog_log(LogType::Force, "layer trace: recording {} frames", kLayerFrames);
 +		return;
 +	}
 +	s_layerFrame++;
 +	s_layerCopiedThisFrame = false;
 +	s_layerInPass = false;
++	s_layerDrawInPass = 0;
 +	if (s_layerFrame < kLayerFrames)
 +		return;
 +	s_layerActive = false;
@@ -5537,7 +5542,7 @@ index 512ebee..d1c232a 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2512,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2517,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
