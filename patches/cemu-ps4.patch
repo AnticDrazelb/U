@@ -4718,7 +4718,7 @@ index d975e11..d601688 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee..0d6c6a5 100644
+index 512ebee..201d3fd 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
@@ -5025,7 +5025,31 @@ index 512ebee..0d6c6a5 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1526,6 +1727,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1514,6 +1715,23 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+ 		draw_prepareDynamicOffsetsForDescriptorSet(VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY, dynamicOffsets, numDynOffsets, pipeline_info);
+ 		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
+ 	}
++#ifdef __ORBIS__
++	// frame trace: what the GPU is told for each point-list draw (Super Mario Maker's layer tiles, of which
++	// a different subset comes out empty every other frame)
++	if (g_crema_trace_frames_left && g_crema_trace_frame < 4 && LatteGPUState.contextRegister[mmVGT_PRIMITIVE_TYPE] == 1)
++	{
++		std::string idx;
++		if (hostIndexType == INDEX_TYPE::U16 && indexReservation)
++			for (uint32 i = 0; i < std::min<uint32>(hostIndexCount, 8); i++)
++				idx += fmt::format(" {}", ((uint16*)indexReservation->memPtr)[i]);
++		cemuLog_log(LogType::Force, "trace frame {}: point draw count {} host {} type {} indexbuf {}:{:#x} indices{} max {} baseVertex {} vb0 {:#x} pipeline {} vsUniform {:#x} psUniform {:#x} rp fbo {} viewport {}x{} at {},{} scissor {}x{}",
++			g_crema_trace_frame, count, hostIndexCount, (uint32)hostIndexType, indexReservation ? indexReservation->bufferIndex : 0, indexReservation ? indexReservation->bufferOffset : 0,
++			idx, indexMax, baseVertex, (uint64)m_state.currentVertexBinding[0].offset, (void*)m_state.currentPipeline,
++			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX], dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT],
++			(void*)m_state.activeRenderpassFBO, m_state.currentViewport.width, m_state.currentViewport.height, m_state.currentViewport.x, m_state.currentViewport.y,
++			m_state.currentScissorRect.extent.width, m_state.currentScissorRect.extent.height);
++	}
++#endif
+ 	// draw
+ 	if (hostIndexType != INDEX_TYPE::NONE)
+ 		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
+@@ -1526,6 +1744,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -5033,7 +5057,7 @@ index 512ebee..0d6c6a5 100644
  		return;
  	}
  
-@@ -1640,8 +1842,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1859,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
@@ -5045,7 +5069,7 @@ index 512ebee..0d6c6a5 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1656,6 +1861,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1656,6 +1878,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	}
  
  	draw_setRenderPass();
@@ -5055,7 +5079,31 @@ index 512ebee..0d6c6a5 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1746,12 +1954,486 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1737,6 +1962,23 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+ 		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
+ 	}
+ 
++#ifdef __ORBIS__
++	// frame trace: what the GPU is told for each point-list draw (Super Mario Maker's layer tiles, of which
++	// a different subset comes out empty every other frame)
++	if (g_crema_trace_frames_left && g_crema_trace_frame < 4 && LatteGPUState.contextRegister[mmVGT_PRIMITIVE_TYPE] == 1)
++	{
++		std::string idx;
++		if (hostIndexType == INDEX_TYPE::U16 && indexReservation)
++			for (uint32 i = 0; i < std::min<uint32>(hostIndexCount, 8); i++)
++				idx += fmt::format(" {}", ((uint16*)indexReservation->memPtr)[i]);
++		cemuLog_log(LogType::Force, "trace frame {}: point draw count {} host {} type {} indexbuf {}:{:#x} indices{} max {} baseVertex {} vb0 {:#x} pipeline {} vsUniform {:#x} psUniform {:#x} rp fbo {} viewport {}x{} at {},{} scissor {}x{}",
++			g_crema_trace_frame, count, hostIndexCount, (uint32)hostIndexType, indexReservation ? indexReservation->bufferIndex : 0, indexReservation ? indexReservation->bufferOffset : 0,
++			idx, indexMax, baseVertex, (uint64)m_state.currentVertexBinding[0].offset, (void*)m_state.currentPipeline,
++			dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX], dynamicOffsetInfo.uniformVarBufferOffset[VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT],
++			(void*)m_state.activeRenderpassFBO, m_state.currentViewport.width, m_state.currentViewport.height, m_state.currentViewport.x, m_state.currentViewport.y,
++			m_state.currentScissorRect.extent.width, m_state.currentScissorRect.extent.height);
++	}
++#endif
+ 	// draw
+ 	if (hostIndexType != INDEX_TYPE::NONE)
+ 		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
+@@ -1746,12 +1988,486 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -5542,7 +5590,7 @@ index 512ebee..0d6c6a5 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2517,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2551,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
