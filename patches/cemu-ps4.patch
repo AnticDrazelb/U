@@ -10492,10 +10492,10 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..af8b3d4a 100644
+index 16b8d73c..41b5aa42 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-@@ -4,10 +4,16 @@
+@@ -4,10 +4,18 @@
  #include "Cafe/HW/Latte/Renderer/Renderer.h"
  
  #include <imgui.h>
@@ -10507,12 +10507,45 @@ index 16b8d73c..af8b3d4a 100644
 +#if defined(__ORBIS__)
 +void CremaImeNewAppearance(); // below: the PS4 keyboard for the game
 +void CremaImeStringRead();
++extern uint32 g_cremaSwkbdTrace; // calls still to log
++#define CREMA_SWKBD_TRACE(...) do { if (g_cremaSwkbdTrace) { g_cremaSwkbdTrace--; cemuLog_log(LogType::Force, __VA_ARGS__); } } while (0)
 +#endif
 +
  #define SWKBD_FORM_STRING_MAX_LENGTH	(4096) // counted in 16-bit characters
  
  #define SWKBD_STATE_BLANK				(0)	// not visible
-@@ -192,6 +198,10 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
+@@ -108,6 +116,9 @@ uint32 SwkbdGetStateKeyboard()
+ 	uint32 r = SWKBD_STATE_BLANK;
+ 	if( swkbdInternalState->isActive )
+ 		r = SWKBD_STATE_DISPLAYED;
++#if defined(__ORBIS__)
++	CREMA_SWKBD_TRACE("swkbd trace: GetStateKeyboard -> {}", r);
++#endif
+ 	return r;
+ }
+ 
+@@ -116,6 +127,9 @@ uint32 SwkbdGetStateInputForm()
+ 	uint32 r = SWKBD_STATE_BLANK;
+ 	if( swkbdInternalState->isActive )
+ 		r = SWKBD_STATE_DISPLAYED;
++#if defined(__ORBIS__)
++	CREMA_SWKBD_TRACE("swkbd trace: GetStateInputForm -> {}", r);
++#endif
+ 	return r;
+ }
+ 
+@@ -155,6 +169,10 @@ struct swkdbIEventReceiverVTable_t
+ 
+ uint32 SwkbdSetReceiver(const swkbdReceiverArg_t* receiverArg)
+ {
++#if defined(__ORBIS__)
++	cemuLog_log(LogType::Force, "swkbd: SetReceiver (event receiver {:08x}, string buffer {:08x}, {} characters)",
++		receiverArg->IEventReceiver.GetMPTR(), receiverArg->stringBuf.GetMPTR(), (sint32)receiverArg->stringBufSize);
++#endif
+ 	if(swkbdInternalState == nullptr)
+ 		return 0;
+ 	swkbdInternalState->keyboardArg.receiverArg = *receiverArg;
+@@ -192,6 +210,10 @@ static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursor
  
  uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  {
@@ -10523,7 +10556,7 @@ index 16b8d73c..af8b3d4a 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->decideButtonWasPressed = false;
-@@ -227,6 +237,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+@@ -227,6 +249,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  
  uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  {
@@ -10531,7 +10564,7 @@ index 16b8d73c..af8b3d4a 100644
  	// todo: Figure out what the difference between AppearInputForm and AppearKeyboard is?
  	uint32 argPtr = MEMPTR(keyboardArg).GetMPTR();
  	for(sint32 i=0; i<0x180; i += 4)
-@@ -234,6 +245,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -234,6 +257,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  		debug_printf("+0x%03x: 0x%08x\n", i, memory_readU32(argPtr+i));
  	}
  
@@ -10541,17 +10574,52 @@ index 16b8d73c..af8b3d4a 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -260,6 +274,9 @@ uint32 SwkbdDisappearKeyboard()
+@@ -246,6 +272,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+ 
+ uint32 SwkbdDisappearInputForm()
+ {
++#if defined(__ORBIS__)
++	cemuLog_log(LogType::Force, "swkbd: DisappearInputForm ({} characters in the form)", swkbdInternalState->formStringLength);
++#endif
+ 	debug_printf("SwkbdDisappearInputForm__3RplFv\n");
+ 	swkbdInternalState->isActive = false;
+ 	return 1;
+@@ -253,6 +282,9 @@ uint32 SwkbdDisappearInputForm()
+ 
+ uint32 SwkbdDisappearKeyboard()
+ {
++#if defined(__ORBIS__)
++	cemuLog_log(LogType::Force, "swkbd: DisappearKeyboard");
++#endif
+ 	debug_printf("SwkbdDisappearKeyboard__3RplFv\n");
+ 	swkbdInternalState->isActive = false;
+ 	return 1;
+@@ -260,6 +292,11 @@ uint32 SwkbdDisappearKeyboard()
  
  uint16be* SwkbdGetInputFormString()
  {
 +#if defined(__ORBIS__)
 +	CremaImeStringRead();
++	CREMA_SWKBD_TRACE("swkbd trace: GetInputFormString -> {} characters (from {:08x})", swkbdInternalState->formStringLength,
++		PPCInterpreter_getCurrentInstance() ? PPCInterpreter_getCurrentInstance()->spr.LR : 0);
 +#endif
  	for(sint32 i=0; i<swkbdInternalState->formStringLength; i++)
  		swkbdInternalState->formStringBufferBE[i] = swkbdInternalState->formStringBuffer[i];
  	cemu_assert(swkbdInternalState->formStringLength < SWKBD_FORM_STRING_MAX_LENGTH);
-@@ -397,8 +414,165 @@ void SwkbdCalc(void* controllerInfo)
+@@ -267,8 +304,11 @@ uint16be* SwkbdGetInputFormString()
+ 	return swkbdInternalState->formStringBufferBE;
+ }
+ 
+-uint32 SwkbdIsDecideOkButton(uint8*)
++uint32 SwkbdIsDecideOkButton(uint8* outIsSelect)
+ {
++#if defined(__ORBIS__)
++	CREMA_SWKBD_TRACE("swkbd trace: IsDecideOkButton({:08x}) -> {}", MEMPTR<uint8>(outIsSelect).GetMPTR(), swkbdInternalState->decideButtonWasPressed ? 1 : 0);
++#endif
+ 	if (swkbdInternalState->decideButtonWasPressed)
+ 		return 1;
+ 	return 0;
+@@ -397,8 +437,168 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
@@ -10671,6 +10739,8 @@ index 16b8d73c..af8b3d4a 100644
 +	}
 +}
 +
++uint32 g_cremaSwkbdTrace = 0;
++
 +void CremaImeStringRead()
 +{
 +	if (s_stringReads++ < 3 || s_okPending)
@@ -10709,6 +10779,7 @@ index 16b8d73c..af8b3d4a 100644
 +	if (s_okPending && std::chrono::steady_clock::now() >= s_okAt)
 +	{
 +		s_okPending = false;
++		g_cremaSwkbdTrace = 200;
 +		cemuLog_log(LogType::Force, "swkbd: OK given ({} reads of the text so far)", s_stringReads);
 +		swkbd_finishInput();
 +	}
@@ -10717,6 +10788,18 @@ index 16b8d73c..af8b3d4a 100644
  	// only render if active
  	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
  		return;
+@@ -596,6 +796,11 @@ void swkbd_inputStringChanged()
+ 			//swkbdInternalState->keyboardArg.cursorPos = copyLength;
+ 		}
+ 		// IEventReceiver callback
++#if defined(__ORBIS__)
++		cemuLog_log(LogType::Force, "swkbd: text to the game's buffer {:08x} ({} characters), event receiver {:08x}",
++			swkbdInternalState->keyboardArg.receiverArg.stringBuf.GetMPTR(), (sint32)swkbdInternalState->keyboardArg.receiverArg.stringBufSize,
++			swkbdInternalState->keyboardArg.receiverArg.IEventReceiver.GetMPTR());
++#endif
+ 		if (swkbdInternalState->keyboardArg.receiverArg.IEventReceiver)
+ 		{
+ 			SwkbdIEventReceiver_t* eventReceiver = swkbdInternalState->keyboardArg.receiverArg.IEventReceiver.GetPtr();
 diff --git a/src/Cemu/Logging/CemuLogging.h b/src/Cemu/Logging/CemuLogging.h
 index 6a23d902..bedf0b60 100644
 --- a/src/Cemu/Logging/CemuLogging.h
