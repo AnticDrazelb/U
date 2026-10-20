@@ -19273,10 +19273,10 @@ index 00000000..132ae41c
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 00000000..46affd2c
+index 00000000..6b9ab3f6
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4455 @@
+@@ -0,0 +1,4547 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -19983,13 +19983,16 @@ index 00000000..46affd2c
 +		std::vector<LibraryEntry> library;
 +		std::vector<fs::path> candidates;
 +		std::error_code ec;
-+		const bool network = gamesDir.rfind("/net/", 0) == 0;
++		const auto started = std::chrono::steady_clock::now();
++		size_t entries = 0;
 +		for (auto it = fs::recursive_directory_iterator(gamesDir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
 +		{
-+			if (network && it->is_directory(ec))
++			entries++;
++			if (it->is_directory(ec))
 +			{
-+				// over the network every folder costs a round trip: a game's content and meta
-+				// folders hold thousands of files and nothing to find
++				// a game's content and meta folders hold thousands of files and nothing to find
++				// (Breath of the Wild's content: tens of thousands - 18 s on the PS4's disk, every
++				// start); over the network every folder costs a round trip too
 +				const std::string folder = Lower(it->path().filename().string());
 +				if (folder == "content" || folder == "meta")
 +					it.disable_recursion_pending();
@@ -20007,6 +20010,7 @@ index 00000000..46affd2c
 +				candidates.push_back(path);
 +		}
 +		std::sort(candidates.begin(), candidates.end());
++		const auto listed = std::chrono::steady_clock::now();
 +		for (const fs::path& path : candidates)
 +		{
 +			LibraryEntry entry;
@@ -20055,6 +20059,9 @@ index 00000000..46affd2c
 +				entry.title = path.stem().string();
 +			library.push_back(std::move(entry));
 +		}
++		auto ms = [](auto a, auto b) { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
++		Log(fmt::format("scan of {}: {} entries listed in {} ms, {} titles read in {} ms", gamesDir, entries, ms(started, listed),
++			candidates.size(), ms(listed, std::chrono::steady_clock::now())));
 +		return library;
 +	}
 +
@@ -20104,11 +20111,13 @@ index 00000000..46affd2c
 +	constexpr const char* TAB_NAMES[TAB_COUNT] = {"Library", "Settings", "Themes"};
 +	constexpr const char* SORT_NAMES[][2] = {{"title", "A-Z"}, {"recent", "Recently Played"}};
 +
++	constexpr int GAME_LOADING = -3, GAME_PLACEHOLDER = -4;
++
 +	struct Item
 +	{
 +		std::string label;
 +		std::string detail; // right-hand value (settings) or subtitle
-+		int game = -1;      // index into games (Games category)
++		int game = -1;      // index into games (Games category); GAME_LOADING / GAME_PLACEHOLDER while they're read
 +		int theme = -1;     // index into THEMES, or -2 - wallpaper index
 +		int setting = -1;
 +	};
@@ -20344,6 +20353,14 @@ index 00000000..46affd2c
 +		// the menu. Any button skips it.
 +		bool m_intro = true;
 +		float m_introTime = 0.0f;
++		// the games are read on a thread while the menu runs (the scan took 18 s with every game's
++		// content folder walked); FinishGameScan takes them when it's done
++		std::thread m_scanThread;
++		std::atomic<bool> m_scanDone{false};
++		std::vector<LibraryEntry> m_scanResult;
++		bool m_gamesLoading = false;
++		float m_gamesFade = 1.0f; // the games fading in once read
++		void FinishGameScan();
 +		ImTextureID m_introConsole{}, m_introCoffee{}, m_introTitle{};
 +		float m_introConsoleAspect = 1.0f, m_introCoffeeAspect = 1.0f, m_introTitleAspect = 4.0f;
 +		ImTextureID m_glow{}; // a soft round light (white, gaussian alpha)
@@ -20947,6 +20964,8 @@ index 00000000..46affd2c
 +
 +	void Menu::RefreshGames()
 +	{
++		if (m_gamesLoading)
++			return; // the first reading of the games isn't done yet
 +		const int gamesIndex = (int)Category::Games;
 +		std::string selectedPath;
 +		const auto& items = m_items[gamesIndex];
@@ -21121,7 +21140,13 @@ index 00000000..46affd2c
 +				detail += "  -  Starts when Crema opens";
 +			games.push_back({game.title, detail, i, -1, -1});
 +		}
-+		if (games.empty())
++		if (games.empty() && m_gamesLoading)
++		{
++			games.push_back({"Loading games...", "Reading " + GamesFolder(), GAME_LOADING});
++			for (int k = 0; k < 3; k++)
++				games.push_back({"", "", GAME_PLACEHOLDER});
++		}
++		else if (games.empty())
 +			games.push_back({"No games found", "Copy games to " + GamesFolder() + ", then press Square"});
 +		for (int c = 0; c < CATEGORY_COUNT; c++)
 +			m_selected[c] = std::clamp(m_selected[c], 0, std::max(0, (int)m_items[c].size() - 1));
@@ -22638,6 +22663,38 @@ index 00000000..46affd2c
 +			max.x - min.x - 24);
 +	}
 +
++	void Menu::FinishGameScan()
++	{
++		if (!m_gamesLoading || !m_scanDone)
++			return;
++		m_scanThread.join();
++		m_gamesLoading = false;
++		BuildGames(std::move(m_scanResult));
++		m_scanResult.clear();
++		BuildItems();
++		// Start on the game played last.
++		auto& games = m_items[(int)Category::Games];
++		for (size_t i = 0; i < games.size(); i++)
++		{
++			if (games[i].game >= 0 && m_games[games[i].game].path == m_prefs.lastGame)
++			{
++				m_selected[(int)Category::Games] = (int)i;
++				m_itemPos[(int)Category::Games] = (float)i;
++			}
++		}
++		m_gamesFade = 0.0f;
++		Log("menu: " + std::to_string(m_games.size()) + " games");
++	}
++
++	// the spinner of "Loading games...": an arc going round
++	static void DrawSpinner(ImDrawList* dl, ImVec2 c, float r, ImU32 track, ImU32 arc, float time, float thickness)
++	{
++		dl->AddCircle(c, r, track, 40, thickness);
++		const float a0 = time * 5.0f;
++		dl->PathArcTo(c, r, a0, a0 + 1.7f, 20);
++		dl->PathStroke(arc, 0, thickness);
++	}
++
 +	void Menu::DrawItem(ImDrawList* dl, const Item& item, float y, bool selected, float alpha)
 +	{
 +		const Theme& theme = CurrentTheme();
@@ -22648,8 +22705,27 @@ index 00000000..46affd2c
 +		const ImVec2 iconMax(x + iconW * 0.5f, y + iconH * 0.5f);
 +		const ImU32 text = Rgba(theme.text, alpha);
 +
-+		if (item.game >= 0)
++		if (item.game == GAME_LOADING || item.game == GAME_PLACEHOLDER)
 +		{
++			// while the games are read: a spinner, then pulsing placeholder rows where they'll go
++			const float pulse = 0.45f + 0.35f * (0.5f + 0.5f * std::sin(m_time * 4.0f));
++			if (item.game == GAME_LOADING)
++			{
++				DrawSpinner(dl, ImVec2(x, y), 34.0f, Rgba(theme.text, alpha * 0.2f), Rgba(theme.wave, alpha), m_time, 6.0f);
++			}
++			else
++			{
++				const ImU32 block = Rgba(theme.text, alpha * 0.18f * pulse);
++				dl->AddRectFilled(ImVec2(x - 46, y - 46), ImVec2(x + 46, y + 46), block, 12.0f);
++				const float tx0 = x + iconW * 0.5f + 36.0f;
++				dl->AddRectFilled(ImVec2(tx0, y - 26), ImVec2(tx0 + 380, y - 6), block, 8.0f);
++				dl->AddRectFilled(ImVec2(tx0, y + 10), ImVec2(tx0 + 200, y + 26), block, 6.0f);
++				return;
++			}
++		}
++		else if (item.game >= 0)
++		{
++			alpha *= m_gamesFade;
 +			// The icon, square, centred where the banner would be.
 +			const Game& game = m_games[item.game];
 +			const float ch = selected ? 140.0f : 104.0f;
@@ -22861,6 +22937,7 @@ index 00000000..46affd2c
 +		const Theme& theme = CurrentTheme();
 +
 +		Approach(m_categoryPos, (float)m_category, 12.0f, dt);
++		m_gamesFade = std::min(1.0f, m_gamesFade + dt / 0.4f);
 +		for (int c = 0; c < CATEGORY_COUNT; c++)
 +			Approach(m_itemPos[c], (float)m_selected[c], 14.0f, dt);
 +
@@ -23274,10 +23351,29 @@ index 00000000..46affd2c
 +		const int count = (int)items.size();
 +		const bool any = count > 0 && items[0].game >= 0;
 +		Text(dl, m_bold, 50, ImVec2(90, 150), Rgba(theme.text, alpha), "Your games");
-+		std::string sub = any ? std::to_string(count) + (count == 1 ? " game" : " games") : "No games yet";
++		std::string sub = any ? std::to_string(count) + (count == 1 ? " game" : " games") : m_gamesLoading ? "Loading games..." : "No games yet";
 +		if (any)
 +			sub += "  -  " + SortName();
-+		Text(dl, m_bold, 26, ImVec2(92, 214), Rgba(theme.wave, alpha * (m_sortShown > 0.0f ? 1.0f : 0.85f)), sub, false);
++		const float subX = m_gamesLoading ? 128.0f : 92.0f;
++		if (m_gamesLoading)
++			DrawSpinner(dl, ImVec2(106, 230), 11.0f, Rgba(theme.text, alpha * 0.2f), Rgba(theme.wave, alpha), m_time, 3.5f);
++		Text(dl, m_bold, 26, ImVec2(subX, 214), Rgba(theme.wave, alpha * (m_sortShown > 0.0f ? 1.0f : 0.85f)), sub, false);
++		if (m_gamesLoading)
++		{
++			// placeholder covers where the games will be
++			const float pulse = 0.45f + 0.35f * (0.5f + 0.5f * std::sin(m_time * 4.0f));
++			for (int k = 0; k < 4; k++)
++			{
++				const float h = k == 0 ? 400.0f : 300.0f, w = h * 0.72f;
++				const float cx = W * 0.5f + (k == 0 ? 0.0f : 260.0f + (k - 1) * 250.0f);
++				const ImVec2 a(cx - w * 0.5f, 720.0f - h), b(cx + w * 0.5f, 720.0f);
++				dl->AddRectFilled(a, b, Rgba(theme.text, alpha * 0.16f * pulse * (1.0f - 0.25f * k)), 14.0f);
++				if (k == 0)
++					dl->AddRect(ImVec2(a.x - 6, a.y - 6), ImVec2(b.x + 6, b.y + 6), Rgba(theme.wave, alpha * 0.8f), 18.0f, 0, 3.0f);
++			}
++			return;
++		}
++		alpha *= m_gamesFade;
 +		if (!any)
 +		{
 +			const std::string line1 = "Copy your games to " + GamesFolder();
@@ -23529,22 +23625,15 @@ index 00000000..46affd2c
 +		step("assets (fonts, sounds, pictures)");
 +		LoadSources();
 +		step("game sources");
-+		BuildGames(ScanAllGames());
-+		step("game scan");
++		m_gamesLoading = true;
++		m_scanThread = std::thread([this] {
++			m_scanResult = ScanAllGames();
++			m_scanDone = true;
++		});
 +		LoadPlayed();
 +		ApplyPreferences();
 +		BuildItems();
-+		step("menu items");
-+		// Start on the game played last.
-+		auto& games = m_items[(int)Category::Games];
-+		for (size_t i = 0; i < games.size(); i++)
-+		{
-+			if (games[i].game >= 0 && m_games[games[i].game].path == m_prefs.lastGame)
-+			{
-+				m_selected[(int)Category::Games] = (int)i;
-+				m_itemPos[(int)Category::Games] = (float)i;
-+			}
-+		}
++		step("menu items (games read meanwhile)");
 +		m_tabPos = (float)LibraryTab();
 +		// The first start: the language list, then the menu style.
 +		if (!languageChosen)
@@ -23585,7 +23674,7 @@ index 00000000..46affd2c
 +				fs::remove(notePath, ec);
 +			}
 +		}
-+		Log("menu: " + std::to_string(m_games.size()) + " games, " + std::to_string(m_wallpapers.size()) + " wallpapers");
++		Log("menu: shown, " + std::to_string(m_wallpapers.size()) + " wallpapers; games being read");
 +		// Updates: packages already installed go from /data/pkg; then GitHub is asked (Settings >
 +		// Automatic Updates).
 +		m_updatePrefix = CremaUpdater::PackagePrefix(m_assetsDir);
@@ -23660,6 +23749,7 @@ index 00000000..46affd2c
 +				mark = t;
 +			};
 +			step(0);
++			FinishGameScan();
 +			UpdateCoverDownload();
 +			step(1);
 +			UpdateNetworkCheck();
@@ -23696,6 +23786,8 @@ index 00000000..46affd2c
 +				break;
 +			}
 +		}
++		if (m_scanThread.joinable())
++			m_scanThread.join();
 +		m_coverCancel = true;
 +		if (m_coverThread.joinable())
 +			m_coverThread.join();
