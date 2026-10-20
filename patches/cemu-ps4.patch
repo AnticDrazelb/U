@@ -1169,6 +1169,61 @@ index cf7ba195..962e02ce 100644
 +}
 +#endif
 \ No newline at end of file
+diff --git a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterImpl.cpp b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterImpl.cpp
+index 547472ab..39dfedd1 100644
+--- a/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterImpl.cpp
++++ b/src/Cafe/HW/Espresso/Interpreter/PPCInterpreterImpl.cpp
+@@ -3,6 +3,24 @@
+ #include "Cafe/HW/Espresso/Debugger/Debugger.h"
+ #include "Cafe/HW/Espresso/Debugger/GDBStub.h"
+ 
++#if defined(__ORBIS__)
++std::atomic<uint32> g_crema_watch_addr{0};
++static std::atomic<uint32> s_crema_watch_logged{0};
++static void CremaWatchWrite(PPCInterpreter_t* hCPU, uint32 address, uint32 size, uint64 value)
++{
++	const uint32 watch = g_crema_watch_addr.load(std::memory_order_relaxed);
++	if (!watch || address + size <= watch || address >= watch + 0x20)
++		return;
++	if (s_crema_watch_logged.fetch_add(1) >= 40)
++		return;
++	cemuLog_log(LogType::Force, "watch: {}-byte write of {:x} to {:08x} by the instruction at {:08x} (LR {:08x}, r1 {:08x}, core {})", size, value,
++		address, hCPU->instructionPointer, hCPU->spr.LR, hCPU->gpr[1], hCPU->spr.UPIR);
++}
++#define CREMA_WATCH(addr, size, value) CremaWatchWrite(hCPU, addr, size, (uint64)(value))
++#else
++#define CREMA_WATCH(addr, size, value)
++#endif
++
+ class PPCItpCafeOSUsermode
+ {
+ public:
+@@ -26,21 +44,25 @@ public:
+ 
+ 	inline static void ppcMem_writeDataU64(PPCInterpreter_t* hCPU, uint32 address, uint64 v)
+ 	{
++		CREMA_WATCH(address, 8, v);
+ 		*(uint64*)(memory_getPointerFromVirtualOffset(address)) = CPU_swapEndianU64(v);
+ 	}
+ 
+ 	inline static void ppcMem_writeDataU32(PPCInterpreter_t* hCPU, uint32 address, uint32 v)
+ 	{
++		CREMA_WATCH(address, 4, v);
+ 		*(uint32*)(memory_getPointerFromVirtualOffset(address)) = CPU_swapEndianU32(v);
+ 	}
+ 
+ 	inline static void ppcMem_writeDataU16(PPCInterpreter_t* hCPU, uint32 address, uint16 v)
+ 	{
++		CREMA_WATCH(address, 2, v);
+ 		*(uint16*)(memory_getPointerFromVirtualOffset(address)) = CPU_swapEndianU16(v);
+ 	}
+ 
+ 	inline static void ppcMem_writeDataU8(PPCInterpreter_t* hCPU, uint32 address, uint8 v)
+ 	{
++		CREMA_WATCH(address, 1, v);
+ 		*(uint8*)(memory_getPointerFromVirtualOffset(address)) = v;
+ 	}
+ 	
 diff --git a/src/Cafe/HW/Espresso/PPCState.h b/src/Cafe/HW/Espresso/PPCState.h
 index fd943d39..797ff2e1 100644
 --- a/src/Cafe/HW/Espresso/PPCState.h
@@ -8014,6 +8069,80 @@ index 7e583195..7420fe5b 100644
 +
  	void InitializeMEM();
  }
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Memory.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Memory.cpp
+index 80ec212d..56da37c0 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Memory.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Memory.cpp
+@@ -5,6 +5,22 @@
+ #include "Cafe/GraphicPack/GraphicPack2.h"
+ #include "Cafe/CafeSystem.h"
+ 
++
++#if defined(__ORBIS__)
++extern std::atomic<uint32> g_crema_watch_addr; // PPCInterpreterImpl.cpp: the write watch (diagnostics)
++static void CremaWatchRange(const char* what, uint32 dst, uint32 size)
++{
++	const uint32 watch = g_crema_watch_addr.load(std::memory_order_relaxed);
++	if (!watch || dst + size <= watch || dst >= watch + 0x20)
++		return;
++	PPCInterpreter_t* hCPU = PPCInterpreter_getCurrentInstance();
++	cemuLog_log(LogType::Force, "watch: {} of {} bytes at {:08x} (called from {:08x})", what, size, dst, hCPU ? hCPU->spr.LR : 0);
++}
++#define CREMA_WATCH_RANGE(what, dst, size) CremaWatchRange(what, (uint32)(dst), (uint32)(size))
++#else
++#define CREMA_WATCH_RANGE(what, dst, size)
++#endif
++
+ namespace coreinit
+ {
+ 
+@@ -45,6 +61,7 @@ namespace coreinit
+ 
+ 	void DCZeroRange(MPTR addr, uint32 size)
+ 	{
++		CREMA_WATCH_RANGE("DCZeroRange", addr, size);
+ 		MPTR alignedAddr = addr & ~31;
+ 		uint32 cachlineOffset = addr & 31;
+ 		uint32 blocks = (cachlineOffset + size + 31) / 32;
+@@ -70,12 +87,14 @@ namespace coreinit
+ 
+ 	void* coreinit_memset(void* dst, uint32 value, uint32 size)
+ 	{
++		CREMA_WATCH_RANGE("memset", memory_getVirtualOffsetFromPointer(dst), size);
+ 		memset(dst, value, size);
+ 		return dst;
+ 	}
+ 
+ 	void* coreinit_memcpy(MEMPTR<void> dst, MEMPTR<void> src, uint32 size)
+ 	{
++		CREMA_WATCH_RANGE("memcpy", dst.GetMPTR(), size);
+ 		if (dst.GetMPTR() == 0xFFFFFFFF)
+ 		{
+ 			// games this was seen in: The Swapper
+@@ -94,6 +113,7 @@ namespace coreinit
+ 
+ 	void* coreinit_memmove(MEMPTR<void> dst, void* src, uint32 size)
+ 	{
++		CREMA_WATCH_RANGE("memmove", dst.GetMPTR(), size);
+ 		if (size > 0)
+ 		{
+ 			memmove(dst.GetPtr(), src, size);
+@@ -105,6 +125,7 @@ namespace coreinit
+ 
+ 	void* OSBlockMove(MEMPTR<void> dst, MEMPTR<void> src, uint32 size, bool flushDC)
+ 	{
++		CREMA_WATCH_RANGE("OSBlockMove", dst.GetMPTR(), size);
+ 		if (size > 0)
+ 		{
+ 			memmove(dst.GetPtr(), src.GetPtr(), size);
+@@ -116,6 +137,7 @@ namespace coreinit
+ 
+ 	void* OSBlockSet(MEMPTR<void> dst, uint32 value, uint32 size)
+ 	{
++		CREMA_WATCH_RANGE("OSBlockSet", dst.GetMPTR(), size);
+ 		memset(dst.GetPtr(), value&0xFF, size);
+ 		return dst.GetPtr();
+ 	}
 diff --git a/src/Cafe/OS/libs/coreinit/coreinit_MemoryMapping.cpp b/src/Cafe/OS/libs/coreinit/coreinit_MemoryMapping.cpp
 index d32a105c..cfce570f 100644
 --- a/src/Cafe/OS/libs/coreinit/coreinit_MemoryMapping.cpp
@@ -10492,10 +10621,14 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..fecbae78 100644
+index 16b8d73c..327e02f0 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-@@ -4,10 +4,21 @@
+@@ -1,13 +1,26 @@
+ #include "Cafe/OS/common/OSCommon.h"
++#include "Cafe/HW/Espresso/Recompiler/PPCRecompiler.h"
+ #include "Cafe/OS/libs/coreinit/coreinit_FS.h"
+ #include "Cafe/OS/libs/gx2/GX2.h"
  #include "Cafe/HW/Latte/Renderer/Renderer.h"
  
  #include <imgui.h>
@@ -10510,6 +10643,7 @@ index 16b8d73c..fecbae78 100644
 +extern uint32 g_cremaSwkbdTrace; // calls still to log
 +extern uint32 g_cremaSwkbdReaderR29; // diagnostics: r29 of the last text read
 +extern std::chrono::steady_clock::time_point g_cremaSwkbdDumpAt;
++extern std::chrono::steady_clock::time_point g_cremaSwkbdWatchUntil;
 +void CremaSwkbdDumpTarget(const char* when);
 +#define CREMA_SWKBD_TRACE(...) do { if (g_cremaSwkbdTrace) { g_cremaSwkbdTrace--; cemuLog_log(LogType::Force, __VA_ARGS__); } } while (0)
 +#endif
@@ -10517,7 +10651,7 @@ index 16b8d73c..fecbae78 100644
  #define SWKBD_FORM_STRING_MAX_LENGTH	(4096) // counted in 16-bit characters
  
  #define SWKBD_STATE_BLANK				(0)	// not visible
-@@ -108,6 +119,9 @@ uint32 SwkbdGetStateKeyboard()
+@@ -108,6 +121,9 @@ uint32 SwkbdGetStateKeyboard()
  	uint32 r = SWKBD_STATE_BLANK;
  	if( swkbdInternalState->isActive )
  		r = SWKBD_STATE_DISPLAYED;
@@ -10527,7 +10661,7 @@ index 16b8d73c..fecbae78 100644
  	return r;
  }
  
-@@ -116,6 +130,9 @@ uint32 SwkbdGetStateInputForm()
+@@ -116,6 +132,9 @@ uint32 SwkbdGetStateInputForm()
  	uint32 r = SWKBD_STATE_BLANK;
  	if( swkbdInternalState->isActive )
  		r = SWKBD_STATE_DISPLAYED;
@@ -10537,7 +10671,7 @@ index 16b8d73c..fecbae78 100644
  	return r;
  }
  
-@@ -155,6 +172,10 @@ struct swkdbIEventReceiverVTable_t
+@@ -155,6 +174,10 @@ struct swkdbIEventReceiverVTable_t
  
  uint32 SwkbdSetReceiver(const swkbdReceiverArg_t* receiverArg)
  {
@@ -10548,7 +10682,7 @@ index 16b8d73c..fecbae78 100644
  	if(swkbdInternalState == nullptr)
  		return 0;
  	swkbdInternalState->keyboardArg.receiverArg = *receiverArg;
-@@ -189,13 +210,27 @@ typedef struct
+@@ -189,13 +212,27 @@ typedef struct
  }swkbdAppearArg_t;
  
  static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursorIndex has invalid offset");
@@ -10576,7 +10710,7 @@ index 16b8d73c..fecbae78 100644
  
  	// setup max text length
  	swkbdInternalState->maxTextLength = (sint32)(uint32)appearArg->maxTextLength;
-@@ -227,6 +262,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+@@ -227,6 +264,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  
  uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  {
@@ -10584,7 +10718,7 @@ index 16b8d73c..fecbae78 100644
  	// todo: Figure out what the difference between AppearInputForm and AppearKeyboard is?
  	uint32 argPtr = MEMPTR(keyboardArg).GetMPTR();
  	for(sint32 i=0; i<0x180; i += 4)
-@@ -234,6 +270,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -234,6 +272,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  		debug_printf("+0x%03x: 0x%08x\n", i, memory_readU32(argPtr+i));
  	}
  
@@ -10594,7 +10728,7 @@ index 16b8d73c..fecbae78 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -246,6 +285,22 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -246,6 +287,31 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  
  uint32 SwkbdDisappearInputForm()
  {
@@ -10611,13 +10745,22 @@ index 16b8d73c..fecbae78 100644
 +			cemuLog_log(LogType::Force, "swkbd: reader object {:08x} +f0: {}", obj, bytes);
 +			CremaSwkbdDumpTarget("at hide");
 +			g_cremaSwkbdDumpAt = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++			const uint32 target = memory_readU32(obj + 0x104);
++			if (target >= 0x10000000 && target < 0x50000000)
++			{
++				extern std::atomic<uint32> g_crema_watch_addr;
++				g_crema_watch_addr = target;
++				PPCRecompiler_Disable();
++				g_cremaSwkbdWatchUntil = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++				cemuLog_log(LogType::Force, "watch: writes to {:08x} for 10 s (game code interpreted meanwhile)", target);
++			}
 +		}
 +	}
 +#endif
  	debug_printf("SwkbdDisappearInputForm__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -253,6 +308,9 @@ uint32 SwkbdDisappearInputForm()
+@@ -253,6 +319,9 @@ uint32 SwkbdDisappearInputForm()
  
  uint32 SwkbdDisappearKeyboard()
  {
@@ -10627,7 +10770,7 @@ index 16b8d73c..fecbae78 100644
  	debug_printf("SwkbdDisappearKeyboard__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -260,6 +318,13 @@ uint32 SwkbdDisappearKeyboard()
+@@ -260,6 +329,13 @@ uint32 SwkbdDisappearKeyboard()
  
  uint16be* SwkbdGetInputFormString()
  {
@@ -10641,7 +10784,7 @@ index 16b8d73c..fecbae78 100644
  	for(sint32 i=0; i<swkbdInternalState->formStringLength; i++)
  		swkbdInternalState->formStringBufferBE[i] = swkbdInternalState->formStringBuffer[i];
  	cemu_assert(swkbdInternalState->formStringLength < SWKBD_FORM_STRING_MAX_LENGTH);
-@@ -267,8 +332,11 @@ uint16be* SwkbdGetInputFormString()
+@@ -267,8 +343,11 @@ uint16be* SwkbdGetInputFormString()
  	return swkbdInternalState->formStringBufferBE;
  }
  
@@ -10654,7 +10797,7 @@ index 16b8d73c..fecbae78 100644
  	if (swkbdInternalState->decideButtonWasPressed)
  		return 1;
  	return 0;
-@@ -397,8 +465,191 @@ void SwkbdCalc(void* controllerInfo)
+@@ -397,8 +476,200 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
@@ -10777,6 +10920,7 @@ index 16b8d73c..fecbae78 100644
 +uint32 g_cremaSwkbdTrace = 0;
 +uint32 g_cremaSwkbdReaderR29 = 0;
 +std::chrono::steady_clock::time_point g_cremaSwkbdDumpAt{};
++std::chrono::steady_clock::time_point g_cremaSwkbdWatchUntil{};
 +
 +void CremaSwkbdDumpTarget(const char* when)
 +{
@@ -10813,6 +10957,14 @@ index 16b8d73c..fecbae78 100644
  void swkbd_render(bool mainWindow)
  {
 +#if defined(__ORBIS__)
++	if (g_cremaSwkbdWatchUntil != std::chrono::steady_clock::time_point{} && std::chrono::steady_clock::now() >= g_cremaSwkbdWatchUntil)
++	{
++		extern std::atomic<uint32> g_crema_watch_addr;
++		g_cremaSwkbdWatchUntil = {};
++		g_crema_watch_addr = 0;
++		PPCRecompiler_Enable();
++		cemuLog_log(LogType::Force, "watch: off, recompiler on again");
++	}
 +	if (swkbdInternalState && g_cremaSwkbdDumpAt != std::chrono::steady_clock::time_point{} && std::chrono::steady_clock::now() >= g_cremaSwkbdDumpAt)
 +	{
 +		g_cremaSwkbdDumpAt = {};
@@ -10846,7 +10998,7 @@ index 16b8d73c..fecbae78 100644
  	// only render if active
  	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
  		return;
-@@ -596,6 +847,11 @@ void swkbd_inputStringChanged()
+@@ -596,6 +867,11 @@ void swkbd_inputStringChanged()
  			//swkbdInternalState->keyboardArg.cursorPos = copyLength;
  		}
  		// IEventReceiver callback
