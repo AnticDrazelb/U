@@ -10492,10 +10492,10 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..3286f2a2 100644
+index 16b8d73c..58c2bd87 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-@@ -4,10 +4,18 @@
+@@ -4,10 +4,19 @@
  #include "Cafe/HW/Latte/Renderer/Renderer.h"
  
  #include <imgui.h>
@@ -10508,13 +10508,14 @@ index 16b8d73c..3286f2a2 100644
 +void CremaImeNewAppearance(); // below: the PS4 keyboard for the game
 +void CremaImeStringRead();
 +extern uint32 g_cremaSwkbdTrace; // calls still to log
++extern uint32 g_cremaSwkbdReaderR29; // diagnostics: r29 of the last text read
 +#define CREMA_SWKBD_TRACE(...) do { if (g_cremaSwkbdTrace) { g_cremaSwkbdTrace--; cemuLog_log(LogType::Force, __VA_ARGS__); } } while (0)
 +#endif
 +
  #define SWKBD_FORM_STRING_MAX_LENGTH	(4096) // counted in 16-bit characters
  
  #define SWKBD_STATE_BLANK				(0)	// not visible
-@@ -108,6 +116,9 @@ uint32 SwkbdGetStateKeyboard()
+@@ -108,6 +117,9 @@ uint32 SwkbdGetStateKeyboard()
  	uint32 r = SWKBD_STATE_BLANK;
  	if( swkbdInternalState->isActive )
  		r = SWKBD_STATE_DISPLAYED;
@@ -10524,7 +10525,7 @@ index 16b8d73c..3286f2a2 100644
  	return r;
  }
  
-@@ -116,6 +127,9 @@ uint32 SwkbdGetStateInputForm()
+@@ -116,6 +128,9 @@ uint32 SwkbdGetStateInputForm()
  	uint32 r = SWKBD_STATE_BLANK;
  	if( swkbdInternalState->isActive )
  		r = SWKBD_STATE_DISPLAYED;
@@ -10534,7 +10535,7 @@ index 16b8d73c..3286f2a2 100644
  	return r;
  }
  
-@@ -155,6 +169,10 @@ struct swkdbIEventReceiverVTable_t
+@@ -155,6 +170,10 @@ struct swkdbIEventReceiverVTable_t
  
  uint32 SwkbdSetReceiver(const swkbdReceiverArg_t* receiverArg)
  {
@@ -10545,7 +10546,7 @@ index 16b8d73c..3286f2a2 100644
  	if(swkbdInternalState == nullptr)
  		return 0;
  	swkbdInternalState->keyboardArg.receiverArg = *receiverArg;
-@@ -189,13 +207,27 @@ typedef struct
+@@ -189,13 +208,27 @@ typedef struct
  }swkbdAppearArg_t;
  
  static_assert(offsetof(swkbdAppearArg_t, cursorIndex) == 0xC4, "appearArg.cursorIndex has invalid offset");
@@ -10573,7 +10574,7 @@ index 16b8d73c..3286f2a2 100644
  
  	// setup max text length
  	swkbdInternalState->maxTextLength = (sint32)(uint32)appearArg->maxTextLength;
-@@ -227,6 +259,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
+@@ -227,6 +260,7 @@ uint32 SwkbdAppearInputForm(const swkbdAppearArg_t* appearArg)
  
  uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  {
@@ -10581,7 +10582,7 @@ index 16b8d73c..3286f2a2 100644
  	// todo: Figure out what the difference between AppearInputForm and AppearKeyboard is?
  	uint32 argPtr = MEMPTR(keyboardArg).GetMPTR();
  	for(sint32 i=0; i<0x180; i += 4)
-@@ -234,6 +267,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -234,6 +268,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  		debug_printf("+0x%03x: 0x%08x\n", i, memory_readU32(argPtr+i));
  	}
  
@@ -10591,7 +10592,7 @@ index 16b8d73c..3286f2a2 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -246,6 +282,20 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -246,6 +283,20 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  
  uint32 SwkbdDisappearInputForm()
  {
@@ -10612,7 +10613,7 @@ index 16b8d73c..3286f2a2 100644
  	debug_printf("SwkbdDisappearInputForm__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -253,6 +303,9 @@ uint32 SwkbdDisappearInputForm()
+@@ -253,6 +304,9 @@ uint32 SwkbdDisappearInputForm()
  
  uint32 SwkbdDisappearKeyboard()
  {
@@ -10622,7 +10623,7 @@ index 16b8d73c..3286f2a2 100644
  	debug_printf("SwkbdDisappearKeyboard__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -260,6 +313,13 @@ uint32 SwkbdDisappearKeyboard()
+@@ -260,6 +314,13 @@ uint32 SwkbdDisappearKeyboard()
  
  uint16be* SwkbdGetInputFormString()
  {
@@ -10636,7 +10637,7 @@ index 16b8d73c..3286f2a2 100644
  	for(sint32 i=0; i<swkbdInternalState->formStringLength; i++)
  		swkbdInternalState->formStringBufferBE[i] = swkbdInternalState->formStringBuffer[i];
  	cemu_assert(swkbdInternalState->formStringLength < SWKBD_FORM_STRING_MAX_LENGTH);
-@@ -267,8 +327,11 @@ uint16be* SwkbdGetInputFormString()
+@@ -267,8 +328,11 @@ uint16be* SwkbdGetInputFormString()
  	return swkbdInternalState->formStringBufferBE;
  }
  
@@ -10649,7 +10650,7 @@ index 16b8d73c..3286f2a2 100644
  	if (swkbdInternalState->decideButtonWasPressed)
  		return 1;
  	return 0;
-@@ -397,8 +460,169 @@ void SwkbdCalc(void* controllerInfo)
+@@ -397,8 +461,169 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
@@ -10819,7 +10820,7 @@ index 16b8d73c..3286f2a2 100644
  	// only render if active
  	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
  		return;
-@@ -596,6 +820,11 @@ void swkbd_inputStringChanged()
+@@ -596,6 +821,11 @@ void swkbd_inputStringChanged()
  			//swkbdInternalState->keyboardArg.cursorPos = copyLength;
  		}
  		// IEventReceiver callback
