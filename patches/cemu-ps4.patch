@@ -10429,10 +10429,18 @@ index a925a178..410d5165 100644
  }
 \ No newline at end of file
 diff --git a/src/Cafe/OS/libs/padscore/padscore.cpp b/src/Cafe/OS/libs/padscore/padscore.cpp
-index 3faa5fba..21f62645 100644
+index 3faa5fba..a63931b2 100644
 --- a/src/Cafe/OS/libs/padscore/padscore.cpp
 +++ b/src/Cafe/OS/libs/padscore/padscore.cpp
-@@ -54,7 +54,8 @@ namespace padscore
+@@ -6,6 +6,7 @@
+ #include "Cafe/OS/libs/coreinit/coreinit_SystemInfo.h"
+ #include "WindowSystem.h"
+ #include "input/InputManager.h"
++#include "input/api/Controller.h"
+ 
+ // KPAD
+ 
+@@ -54,7 +55,8 @@ namespace padscore
  
  	WPADState_t g_wpad_state = kWPADStateMaster;
  
@@ -10442,7 +10450,7 @@ index 3faa5fba..21f62645 100644
  		SysAllocator<coreinit::OSAlarm_t> alarm;
  		bool kpad_initialized = false;
  
-@@ -72,7 +73,9 @@ namespace padscore
+@@ -72,7 +74,9 @@ namespace padscore
  		} controller_data[InputManager::kMaxWPADControllers] = {};
  
  		int max_controllers = kWPADMaxControllers; // max bt controllers?
@@ -10453,7 +10461,76 @@ index 3faa5fba..21f62645 100644
  }
  
  
-@@ -823,3 +826,71 @@ namespace padscore
+@@ -689,6 +693,20 @@ namespace padscore
+ 
+ #pragma endregion
+ 
++#if defined(__ORBIS__)
++	// Crema: a player's controller exists (players 2-4: a Pro Controller each) before a PS4 user
++	// with a DualShock 4 signs in for it - it counts as connected only with a pad behind it
++	static bool CremaWpadConnected(const std::shared_ptr<WPADController>& controller)
++	{
++		for (const auto& pad : controller->get_controllers())
++		{
++			if (pad && pad->is_connected())
++				return true;
++		}
++		return false;
++	}
++#endif
++
+ 	void TickFunction(PPCInterpreter_t* hCPU)
+ 	{
+ 		auto& instance = InputManager::instance();
+@@ -707,6 +725,21 @@ namespace padscore
+ 
+ 				if (const auto controller = instance.get_wpad_controller(i))
+ 				{
++#if defined(__ORBIS__)
++					// no pad behind it: no controller (reported once if it was connected); its
++					// connection and its extension are reported when one comes
++					if (!CremaWpadConnected(controller))
++					{
++						if (controller->m_status == WPADController::ConnectCallbackStatus::None)
++						{
++							controller->m_status = WPADController::ConnectCallbackStatus::ReportConnect;
++							controller->m_extension_status = WPADController::ConnectCallbackStatus::ReportConnect;
++							cemuLog_log(LogType::InputAPI, "Calling WPADConnectCallback({}, {})", i, WPAD_ERR_NO_CONTROLLER);
++							PPCCoreCallback(g_padscore.controller_data[i].connectCallback, i, WPAD_ERR_NO_CONTROLLER);
++						}
++						continue;
++					}
++#endif
+ 					if (controller->m_status == WPADController::ConnectCallbackStatus::ReportDisconnect || controller->was_home_button_down()) // fixed!
+ 					{
+ 						controller->m_status = WPADController::ConnectCallbackStatus::ReportConnect;
+@@ -732,6 +765,14 @@ namespace padscore
+ 			{
+ 				if (const auto controller = instance.get_wpad_controller(i))
+ 				{
++#if defined(__ORBIS__)
++					// an extension only after its controller was reported connected (the game sets the
++					// channel up then: Mario Kart 8 wrote through a null pointer for a Pro Controller
++					// "extension" on a channel it had just been told was empty)
++					if (!CremaWpadConnected(controller) ||
++						(g_padscore.controller_data[i].connectCallback && controller->m_status != WPADController::ConnectCallbackStatus::None))
++						continue;
++#endif
+ 					if (controller->m_extension_status == WPADController::ConnectCallbackStatus::ReportConnect)
+ 					{
+ 						controller->m_extension_status = WPADController::ConnectCallbackStatus::None;
+@@ -749,6 +790,10 @@ namespace padscore
+ 			{
+ 				if (const auto controller = instance.get_wpad_controller(i))
+ 				{
++#if defined(__ORBIS__)
++					if (!CremaWpadConnected(controller))
++						continue;
++#endif
+ 					cemuLog_log(LogType::InputAPI, "Calling WPADsamplingCallback({})", i);
+ 					PPCCoreCallback(g_padscore.controller_data[i].sampling_callback, i);
+ 				}
+@@ -823,3 +868,71 @@ namespace padscore
  	}
  
  }
@@ -19273,10 +19350,10 @@ index 00000000..132ae41c
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 00000000..6b9ab3f6
+index 00000000..1db16f63
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4547 @@
+@@ -0,0 +1,5048 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -19367,6 +19444,21 @@ index 00000000..6b9ab3f6
 +	ImU32 Rgba(uint32_t rgb, float alpha = 1.0f)
 +	{
 +		return IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, (int)(std::clamp(alpha, 0.0f, 1.0f) * 255.0f));
++	}
++
++	// The colour between a and b (t = 0: a, 1: b).
++	uint32_t MixRgb(uint32_t a, uint32_t b, float t)
++	{
++		if (t <= 0.0f)
++			return a;
++		t = std::min(t, 1.0f);
++		uint32_t out = 0;
++		for (int shift = 0; shift <= 16; shift += 8)
++		{
++			const float ca = (float)((a >> shift) & 0xFF), cb = (float)((b >> shift) & 0xFF);
++			out |= (uint32_t)std::lround(ca + (cb - ca) * t) << shift;
++		}
++		return out;
 +	}
 +
 +	// A quad with a colour per corner (ImGui has the rectangle version only).
@@ -19877,7 +19969,8 @@ index 00000000..6b9ab3f6
 +		bool clock = true;
 +		std::string gamesDir; // Settings -> Game Folder; empty = data_dir/games
 +		std::string lastGame;
-+		std::string style;           // "library" (covers) or "xmb"; empty: not chosen yet (asked)
++		std::string style;           // "library" (covers), "xmb", "wiiu" (Wii U Menu) or "gamepad" (GamePad Screen);
++		                             // empty: not chosen yet (asked)
 +		std::string sort = "title";  // "title", "recent" (last played first)
 +		std::string defaultGame;     // starts by itself when the app opens
 +		bool autoUpdate = true;      // look for a new version on GitHub when the launcher opens
@@ -19909,7 +20002,7 @@ index 00000000..6b9ab3f6
 +				else if (key == "last_game")
 +					lastGame = value;
 +				else if (key == "style")
-+					style = value == "xmb" ? "xmb" : value == "library" ? "library" : "";
++					style = value == "xmb" || value == "library" || value == "wiiu" || value == "gamepad" ? value : "";
 +				else if (key == "sort")
 +					sort = value;
 +				else if (key == "default_game")
@@ -20239,6 +20332,16 @@ index 00000000..6b9ab3f6
 +		void ActivateItem(const Item& item);
 +		bool Library() const { return m_prefs.style != "xmb"; }
 +		int LibraryTab() const;
++		// Two styles built on the Library (Library() is true for them): only the Games tab differs.
++		// Wii U Menu: a light grid of tiles, 15 to a page; GamePad Screen: the game on a "TV",
++		// the games on a GamePad under it.
++		bool WiiUStyle() const { return m_prefs.style == "wiiu"; }
++		bool GamePadStyle() const { return m_prefs.style == "gamepad"; }
++		int StyleOption() const;
++		std::string StyleName() const;
++		float GamesTabShown() const;
++		float WiiULight() const { return WiiUStyle() ? GamesTabShown() : 0.0f; }
++		int GridMove(int selected, int count, uint32_t pressed) const;
 +		void LoadPlayed();
 +		void SavePlayed() const;
 +		int64_t Played(const std::string& path) const
@@ -20261,6 +20364,15 @@ index 00000000..6b9ab3f6
 +		void DrawLibraryGames(ImDrawList* dl, float alpha);
 +		void DrawLibraryList(ImDrawList* dl, float alpha);
 +		void DrawLibraryHints(ImDrawList* dl);
++		void DrawNoGames(ImDrawList* dl, float alpha, uint32_t ink, float y, bool shadow);
++		void DrawFittedTile(ImDrawList* dl, const Game& game, ImVec2 min, ImVec2 max, float alpha, float rounding);
++		void DrawWiiUBackground();
++		void DrawWiiUTopBar(ImDrawList* dl, float alpha);
++		void DrawWiiUDock(ImDrawList* dl, float alpha);
++		void DrawWiiUGames(ImDrawList* dl, float alpha, float dt);
++		void DrawGamePadBackground();
++		void DrawGamePadGames(ImDrawList* dl, float alpha, float dt);
++		void DrawGamePadTv(ImDrawList* dl, const Game& game, float alpha);
 +		void DrawCover(ImDrawList* dl, const Game& game, ImVec2 a, ImVec2 b, ImVec2 c, ImVec2 d, float alpha, int focus);
 +		void DrawGameTile(ImDrawList* dl, const Game& game, ImVec2 min, ImVec2 max, float alpha, float rounding);
 +		void Text(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, ImU32 color, const std::string& text, bool shadow = true);
@@ -20360,6 +20472,12 @@ index 00000000..6b9ab3f6
 +		std::vector<LibraryEntry> m_scanResult;
 +		bool m_gamesLoading = false;
 +		float m_gamesFade = 1.0f; // the games fading in once read
++		std::string m_userName = "Player"; // the PS4 user's name (the Wii U Menu's top bar)
++		float m_gridPage = 0.0f;  // Wii U Menu: the page shown (they slide sideways)
++		float m_gridPop = 1.0f;   // Wii U Menu: the selected tile growing
++		int m_gridLast = -1;      // Wii U Menu: the tile selected last frame
++		int m_padShown = -1, m_padPrev = -1; // GamePad Screen: the game on the TV, the one fading out
++		float m_padFade = 1.0f;
 +		void FinishGameScan();
 +		ImTextureID m_introConsole{}, m_introCoffee{}, m_introTitle{};
 +		float m_introConsoleAspect = 1.0f, m_introCoffeeAspect = 1.0f, m_introTitleAspect = 4.0f;
@@ -21114,7 +21232,7 @@ index 00000000..6b9ab3f6
 +		settings.push_back({"Language", PS4Lang::Current().name, -1, -1, SET_LANGUAGE});
 +		settings.push_back({"Sound Effects", m_prefs.sounds ? "On" : "Off", -1, -1, SET_SOUNDS});
 +		settings.push_back({"Volume", std::to_string(m_prefs.volume), -1, -1, SET_VOLUME});
-+		settings.push_back({"Menu Style", Library() ? "Library" : "XMB", -1, -1, SET_STYLE});
++		settings.push_back({"Menu Style", StyleName(), -1, -1, SET_STYLE});
 +		settings.push_back({"Clock", m_prefs.clock ? "On" : "Off", -1, -1, SET_CLOCK});
 +		settings.push_back({"Game Folder", GamesFolder(), -1, -1, SET_GAMES_DIR});
 +		settings.push_back({"Download Covers", "Box art from GameTDB for your games", -1, -1, SET_COVERS});
@@ -21205,10 +21323,11 @@ index 00000000..6b9ab3f6
 +		}
 +		case SET_STYLE:
 +			m_panel.title = "Menu Style";
-+			m_panel.options = {"Library", "XMB"};
-+			m_panel.selected = Library() ? 0 : 1;
++			m_panel.options = {"Library", "XMB", "Wii U Menu", "GamePad Screen"};
++			m_panel.selected = StyleOption();
 +			m_panel.lines = {"", "Library: your games in a row,", "tabs switched with L1 / R1.", "",
-+				"XMB: the PSP-style columns."};
++				"XMB: the PSP-style columns.", "", "Wii U Menu: a grid of tiles,", "like the Wii U's home screen.", "",
++				"GamePad Screen: the game on the", "TV, your games on the GamePad."};
 +			break;
 +		case SET_CLOCK:
 +			m_panel.title = "Clock";
@@ -21912,11 +22031,14 @@ index 00000000..6b9ab3f6
 +			}
 +			break;
 +		case SET_STYLE:
-+			m_prefs.style = option == 0 ? "library" : "xmb";
++		{
++			constexpr const char* STYLES[] = {"library", "xmb", "wiiu", "gamepad"};
++			m_prefs.style = STYLES[std::clamp(option, 0, (int)std::size(STYLES) - 1)];
 +			m_firstStyle = false;
 +			m_tabPos = (float)LibraryTab();
 +			Log("menu style: " + m_prefs.style);
 +			break;
++		}
 +		case SET_RESET_ALL:
 +			if (option == 1)
 +				CremaSettings::ResetAll();
@@ -22273,6 +22395,18 @@ index 00000000..6b9ab3f6
 +			nextItem = games ? BTN_RIGHT : BTN_DOWN;
 +			prevPage = nextPage = 0;
 +		}
++		// The Wii U Menu: the D-pad moves in the grid of tiles (15 to a page, the pages side by side).
++		if (Library() && WiiUStyle() && games && count > 0 && items[0].game >= 0 && !(pressed & (BTN_L1 | BTN_R1)) &&
++			(pressed & (BTN_LEFT | BTN_RIGHT | BTN_UP | BTN_DOWN)))
++		{
++			const int target = GridMove(selected, count, pressed);
++			if (target != selected)
++			{
++				selected = target;
++				Play("move");
++			}
++			return;
++		}
 +		if ((pressed & prevTab) && prevCategory >= 0)
 +		{
 +			m_category = prevCategory;
@@ -22409,6 +22543,68 @@ index 00000000..6b9ab3f6
 +				return i;
 +		}
 +		return 0;
++	}
++
++	int Menu::StyleOption() const
++	{
++		return m_prefs.style == "xmb" ? 1 : WiiUStyle() ? 2 : GamePadStyle() ? 3 : 0;
++	}
++
++	std::string Menu::StyleName() const
++	{
++		constexpr const char* NAMES[] = {"Library", "XMB", "Wii U Menu", "GamePad Screen"};
++		return NAMES[StyleOption()];
++	}
++
++	// 1 while the Library's Games tab is shown, 0 on the others (follows the tab highlight).
++	float Menu::GamesTabShown() const
++	{
++		int games = 0;
++		for (int i = 0; i < TAB_COUNT; i++)
++		{
++			if (TABS[i] == Category::Games)
++				games = i;
++		}
++		return std::clamp(1.0f - std::abs(m_tabPos - (float)games), 0.0f, 1.0f);
++	}
++
++	// The Wii U Menu's grid: 5 x 3 tiles a page. Left / Right past the edge go to the next or the
++	// previous page (round), else to the other end of the row; Up / Down wrap in the page.
++	int Menu::GridMove(int selected, int count, uint32_t pressed) const
++	{
++		constexpr int COLS = 5, ROWS = 3, PAGE = COLS * ROWS;
++		const int pages = (count + PAGE - 1) / PAGE;
++		const int page = selected / PAGE, local = selected % PAGE, row = local / COLS, col = local % COLS;
++		auto at = [&](int p, int r, int c) { return std::min(count - 1, p * PAGE + r * COLS + c); };
++		if (pressed & BTN_RIGHT)
++		{
++			if (col < COLS - 1 && selected + 1 < count)
++				return selected + 1;
++			return at(pages > 1 ? (page + 1) % pages : page, row, 0);
++		}
++		if (pressed & BTN_LEFT)
++		{
++			if (col > 0)
++				return selected - 1;
++			return at(pages > 1 ? (page + pages - 1) % pages : page, row, COLS - 1);
++		}
++		if (pressed & BTN_DOWN)
++		{
++			if (row < ROWS - 1 && page * PAGE + (row + 1) * COLS < count)
++				return std::min(count - 1, selected + COLS);
++			return page * PAGE + col; // back to the top row
++		}
++		if (pressed & BTN_UP)
++		{
++			if (row > 0)
++				return selected - COLS;
++			for (int r = ROWS - 1; r > 0; r--)
++			{
++				if (page * PAGE + r * COLS < count)
++					return at(page, r, col); // round to the page's bottom row
++			}
++		}
++		return selected;
 +	}
 +
 +	std::string Menu::SortName() const
@@ -22930,7 +23126,13 @@ index 00000000..6b9ab3f6
 +	void Menu::Draw(float dt)
 +	{
 +		if (Library())
++		{
 +			DrawLibraryBackground();
++			if (WiiUStyle())
++				DrawWiiUBackground();
++			else if (GamePadStyle())
++				DrawGamePadBackground();
++		}
 +		else
 +			DrawBackground();
 +		ImDrawList* dl = ImGui::GetForegroundDrawList();
@@ -23273,16 +23475,19 @@ index 00000000..6b9ab3f6
 +		Approach(m_tabPos, (float)tab, 14.0f, dt);
 +		if (m_sortShown > 0.0f)
 +			m_sortShown -= dt;
++		// the Wii U Menu's Games tab is light: its own top bar (the user, a dark clock)
++		const float light = WiiULight();
 +
 +		// Top bar: the logo, the tabs between L1 and R1, the clock.
 +		if (m_logo)
-+			dl->AddImage(m_logo, ImVec2(66, 40), ImVec2(140, 114), ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 235));
++			dl->AddImage(m_logo, ImVec2(66, 40), ImVec2(140, 114), ImVec2(0, 0), ImVec2(1, 1),
++				IM_COL32(255, 255, 255, (int)(235 * (1.0f - light))));
 +		{
 +			float x = 156.0f;
 +			for (const char ch : std::string("CREMA"))
 +			{
 +				const std::string letter(1, ch);
-+				Text(dl, m_bold, 30, ImVec2(x, 62), Rgba(theme.text, 0.95f), letter);
++				Text(dl, m_bold, 30, ImVec2(x, 62), Rgba(theme.text, 0.95f * (1.0f - light)), letter);
 +				x += TextWidth(m_bold, 30, letter) + 7.0f;
 +			}
 +		}
@@ -23302,7 +23507,7 @@ index 00000000..6b9ab3f6
 +				x += tabW[i];
 +			}
 +		}
-+		dl->AddRectFilled(ImVec2(barX - 8, BAR_Y - 6), ImVec2(barX + total + 8, BAR_Y + BAR_H + 6), Rgba(0x000000, 0.28f), 16.0f);
++		dl->AddRectFilled(ImVec2(barX - 8, BAR_Y - 6), ImVec2(barX + total + 8, BAR_Y + BAR_H + 6), Rgba(0x000000, 0.28f + 0.42f * light), 16.0f);
 +		dl->AddRect(ImVec2(barX - 8, BAR_Y - 6), ImVec2(barX + total + 8, BAR_Y + BAR_H + 6), Rgba(theme.text, 0.14f), 16.0f, 0, 1.5f);
 +		{
 +			// The highlight slides between the tabs.
@@ -23332,12 +23537,18 @@ index 00000000..6b9ab3f6
 +			char clock[32];
 +			std::strftime(clock, sizeof(clock), "%H:%M", &local);
 +			const float tw = TextWidth(m_bold, 36, clock);
-+			Text(dl, m_bold, 36, ImVec2(W - 90 - tw, 62), Rgba(theme.text, 0.95f), clock);
++			Text(dl, m_bold, 36, ImVec2(W - 90 - tw, 62), Rgba(MixRgb(theme.text, 0x3A4250, light), 0.95f), clock, light < 0.5f);
 +		}
++		if (light > 0.0f)
++			DrawWiiUTopBar(dl, light);
 +
 +		// The tab's page; it fades in while the highlight moves.
 +		const float alpha = std::clamp(1.0f - std::abs(m_tabPos - tab) * 1.6f, 0.0f, 1.0f);
-+		if (TABS[tab] == Category::Games)
++		if (TABS[tab] == Category::Games && WiiUStyle())
++			DrawWiiUGames(dl, alpha, dt);
++		else if (TABS[tab] == Category::Games && GamePadStyle())
++			DrawGamePadGames(dl, alpha, dt);
++		else if (TABS[tab] == Category::Games)
 +			DrawLibraryGames(dl, alpha);
 +		else
 +			DrawLibraryList(dl, alpha);
@@ -23517,12 +23728,17 @@ index 00000000..6b9ab3f6
 +	{
 +		const Theme& theme = CurrentTheme();
 +		const float y = H - 62.0f;
-+		const ImU32 text = Rgba(theme.text, 0.85f);
-+		dl->AddLine(ImVec2(70, y - 46), ImVec2(W - 70, y - 46), Rgba(theme.text, 0.10f), 1.5f);
++		// the Wii U Menu's Games tab: dark hints on its white dock
++		const float light = WiiULight();
++		const uint32_t ink = MixRgb(theme.text, 0x3A4250, light);
++		const ImU32 text = Rgba(ink, 0.85f);
++		if (light > 0.0f)
++			DrawWiiUDock(dl, light);
++		dl->AddLine(ImVec2(70, y - 46), ImVec2(W - 70, y - 46), Rgba(theme.text, 0.10f * (1.0f - light)), 1.5f);
 +		float x = 90.0f;
 +		auto left = [&](const char* glyph, const std::string& label) {
 +			x += PS4Glyphs::Draw(dl, m_bold, glyph, x, y, 36, 0.9f) + 12;
-+			Text(dl, m_font, 28, ImVec2(x, y - 17), text, label);
++			Text(dl, m_font, 28, ImVec2(x, y - 17), text, label, light < 0.5f);
 +			x += TextWidth(m_font, 28, label) + 44;
 +		};
 +		const bool games = m_category == (int)Category::Games;
@@ -23530,7 +23746,7 @@ index 00000000..6b9ab3f6
 +		const bool hasGame = games && !items.empty() && items[0].game >= 0;
 +		left("D-Pad", "Browse");
 +		left("Cross", games ? "Play" : "Select");
-+		if (hasGame)
++		if (hasGame && light < 0.5f)
 +		{
 +			char counter[32];
 +			snprintf(counter, sizeof(counter), "%02d / %02d", m_selected[m_category] + 1, (int)items.size());
@@ -23541,7 +23757,7 @@ index 00000000..6b9ab3f6
 +		auto right = [&](const char* glyph, const std::string& label) {
 +			const float lw = TextWidth(m_font, 28, label);
 +			rx -= lw;
-+			Text(dl, m_font, 28, ImVec2(rx, y - 17), text, label);
++			Text(dl, m_font, 28, ImVec2(rx, y - 17), text, label, light < 0.5f);
 +			const float gw = PS4Glyphs::Width(glyph, 36);
 +			rx -= gw + 12;
 +			PS4Glyphs::Draw(dl, m_bold, glyph, rx, y, 36, 0.9f);
@@ -23554,6 +23770,363 @@ index 00000000..6b9ab3f6
 +			if (hasGame)
 +				right("Triangle", "Options");
 +		}
++	}
++
++	// ---------------------------------------------------------------------------------------------
++	// Two Library styles with their own Games tab: the Wii U Menu (a light grid of tiles, like the
++	// console's home screen) and the GamePad Screen (the game on a "TV", the games on a GamePad).
++	// The other tabs, the panels and the buttons are the Library's.
++
++	constexpr uint32_t WIIU_INK = 0x3A4250, WIIU_BLUE = 0x2AA7E8, WIIU_PAPER = 0xEEF1F5, WIIU_LINE = 0xD5DAE2;
++
++	// "No games": what the Library says, at height y.
++	void Menu::DrawNoGames(ImDrawList* dl, float alpha, uint32_t ink, float y, bool shadow)
++	{
++		const std::string line1 = "Copy your games to " + GamesFolder();
++		const std::string line2 = "then press Square to look again (or pick a folder in Settings).";
++		Text(dl, m_bold, 36, ImVec2(W * 0.5f - TextWidth(m_bold, 36, line1) * 0.5f, y), Rgba(ink, alpha), line1, shadow);
++		Text(dl, m_font, 28, ImVec2(W * 0.5f - TextWidth(m_font, 28, line2) * 0.5f, y + 60), Rgba(ink, alpha * 0.75f), line2, shadow);
++	}
++
++	// A game's tile in a square: box art keeps its shape (centred), an icon fills it.
++	void Menu::DrawFittedTile(ImDrawList* dl, const Game& game, ImVec2 min, ImVec2 max, float alpha, float rounding)
++	{
++		if (game.cover && std::abs(game.coverAspect - 1.0f) > 0.05f)
++		{
++			const float w = max.x - min.x, h = max.y - min.y;
++			const float aspect = std::clamp(game.coverAspect, 0.4f, 2.5f);
++			float fw = w, fh = w / aspect;
++			if (fh > h)
++			{
++				fh = h;
++				fw = h * aspect;
++			}
++			const ImVec2 c((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
++			min = ImVec2(c.x - fw * 0.5f, c.y - fh * 0.5f);
++			max = ImVec2(c.x + fw * 0.5f, c.y + fh * 0.5f);
++		}
++		DrawGameTile(dl, game, min, max, alpha, rounding);
++	}
++
++	// The Wii U Menu's background on the Games tab: light grey-white with faint diagonal stripes.
++	void Menu::DrawWiiUBackground()
++	{
++		const float light = WiiULight();
++		if (light <= 0.0f)
++			return;
++		ImDrawList* dl = ImGui::GetBackgroundDrawList();
++		dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Rgba(WIIU_PAPER, light));
++		constexpr float STRIPE = 64.0f;
++		const float shift = std::fmod(m_time * 10.0f, STRIPE);
++		for (float x = -H - STRIPE + shift; x < W; x += STRIPE)
++		{
++			dl->AddQuadFilled(ImVec2(x, H), ImVec2(x + 26, H), ImVec2(x + 26 + H, 0), ImVec2(x + H, 0),
++				Rgba(0xFFFFFF, 0.55f * light));
++		}
++		// a soft shade under the top bar and over the dock
++		const ImU32 shade = Rgba(0xDCE2EA, light), clear = Rgba(0xDCE2EA, 0.0f);
++		dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, 150), shade, shade, clear, clear);
++		dl->AddRectFilledMultiColor(ImVec2(0, H - 200), ImVec2(W, H), clear, clear, shade, shade);
++	}
++
++	// The Wii U Menu's top bar: the user (a round avatar and the name) on the left.
++	void Menu::DrawWiiUTopBar(ImDrawList* dl, float alpha)
++	{
++		const ImVec2 c(104, 80);
++		const float r = 34.0f;
++		dl->AddCircleFilled(ImVec2(c.x + 2, c.y + 4), r + 3, Rgba(0x000000, alpha * 0.10f), 40);
++		dl->AddCircleFilled(c, r + 4, Rgba(0xFFFFFF, alpha), 40);
++		dl->AddCircleFilled(c, r, Rgba(WIIU_BLUE, alpha), 40);
++		// a person: head and shoulders
++		dl->AddCircleFilled(ImVec2(c.x, c.y - 9), 11.0f, Rgba(0xFFFFFF, alpha), 24);
++		dl->PathArcTo(ImVec2(c.x, c.y + 23), 20.0f, 3.14159265f, 2.0f * 3.14159265f, 20);
++		dl->PathFillConvex(Rgba(0xFFFFFF, alpha));
++		Text(dl, m_bold, 30, ImVec2(c.x + r + 22, 62), Rgba(WIIU_INK, alpha), m_userName, false);
++	}
++
++	// The Wii U Menu's dock: a white bar along the bottom with round buttons in the middle (the
++	// tabs' icons, the Games one lit); the button hints are drawn on it.
++	void Menu::DrawWiiUDock(ImDrawList* dl, float alpha)
++	{
++		const ImVec2 d0(50, H - 112), d1(W - 50, H - 14);
++		dl->AddRectFilled(ImVec2(d0.x, d0.y + 4), ImVec2(d1.x, d1.y + 4), Rgba(0x000000, alpha * 0.06f), 48.0f);
++		dl->AddRectFilled(d0, d1, Rgba(0xFFFFFF, alpha * 0.92f), 48.0f);
++		dl->AddRect(d0, d1, Rgba(WIIU_LINE, alpha), 48.0f, 0, 2.0f);
++		const float cy = (d0.y + d1.y) * 0.5f;
++		for (int i = 0; i < TAB_COUNT; i++)
++		{
++			const bool on = TABS[i] == Category::Games;
++			const ImVec2 c(W * 0.5f + (i - (TAB_COUNT - 1) * 0.5f) * 84.0f, cy);
++			dl->AddCircleFilled(c, 32.0f, Rgba(on ? WIIU_BLUE : 0xF4F6F9, alpha), 36);
++			dl->AddCircle(c, 32.0f, Rgba(on ? WIIU_BLUE : 0xC9D0DA, alpha), 36, 2.0f);
++			DrawCategoryIcon(dl, TABS[i], c, 34.0f, Rgba(on ? 0xFFFFFF : 0x6A7486, alpha));
++		}
++	}
++
++	void Menu::DrawWiiUGames(ImDrawList* dl, float alpha, float dt)
++	{
++		const int c = (int)Category::Games;
++		const auto& items = m_items[c];
++		const int count = (int)items.size();
++		const bool any = count > 0 && items[0].game >= 0;
++		constexpr int COLS = 5, ROWS = 3, PAGE = COLS * ROWS;
++		constexpr float TILE = 210.0f, GAP = 26.0f, TOP = 160.0f, ROUND = 18.0f;
++		const float left = (W - (COLS * TILE + (COLS - 1) * GAP)) * 0.5f;
++		const float captionY = TOP + ROWS * TILE + (ROWS - 1) * GAP + 22.0f;
++		auto tileAt = [&](int k) { return ImVec2(left + (k % COLS) * (TILE + GAP), TOP + (k / COLS) * (TILE + GAP)); };
++
++		if (m_gamesLoading)
++		{
++			// pulsing empty tiles where the games will be
++			const float pulse = 0.45f + 0.35f * (0.5f + 0.5f * std::sin(m_time * 4.0f));
++			for (int k = 0; k < PAGE; k++)
++			{
++				const ImVec2 a = tileAt(k), b(a.x + TILE, a.y + TILE);
++				dl->AddRectFilled(a, b, Rgba(0xFFFFFF, alpha * (0.45f + 0.4f * pulse)), ROUND);
++				dl->AddRect(a, b, Rgba(WIIU_LINE, alpha), ROUND, 0, 2.5f);
++				dl->AddRectFilled(ImVec2(a.x + 14, a.y + 14), ImVec2(b.x - 14, b.y - 14), Rgba(WIIU_INK, alpha * 0.07f * pulse), 12.0f);
++			}
++			const std::string caption = "Loading games...";
++			const float tw = TextWidth(m_bold, 30, caption);
++			const float x = W * 0.5f - (tw + 40) * 0.5f;
++			DrawSpinner(dl, ImVec2(x + 12, captionY + 18), 12.0f, Rgba(WIIU_INK, alpha * 0.15f), Rgba(WIIU_BLUE, alpha), m_time, 4.0f);
++			Text(dl, m_bold, 30, ImVec2(x + 40, captionY), Rgba(WIIU_INK, alpha), caption, false);
++			return;
++		}
++		alpha *= m_gamesFade;
++		if (!any)
++		{
++			DrawNoGames(dl, alpha, WIIU_INK, 470, false);
++			return;
++		}
++
++		const int selected = std::clamp(m_selected[c], 0, count - 1);
++		const int pages = (count + PAGE - 1) / PAGE;
++		Approach(m_gridPage, (float)(selected / PAGE), 10.0f, dt);
++		if (selected != m_gridLast)
++		{
++			m_gridLast = selected;
++			m_gridPop = 0.0f;
++		}
++		Approach(m_gridPop, 1.0f, 12.0f, dt);
++
++		auto tile = [&](const Game& game, ImVec2 a, ImVec2 b, float a1) {
++			dl->AddRectFilled(ImVec2(a.x + 2, a.y + 5), ImVec2(b.x + 2, b.y + 5), Rgba(0x000000, a1 * 0.07f), ROUND);
++			dl->AddRectFilled(a, b, Rgba(0xFFFFFF, a1), ROUND);
++			const float inset = (b.x - a.x) * 0.06f;
++			DrawFittedTile(dl, game, ImVec2(a.x + inset, a.y + inset), ImVec2(b.x - inset, b.y - inset), a1, 10.0f);
++			dl->AddRect(a, b, Rgba(WIIU_LINE, a1), ROUND, 0, 2.5f);
++		};
++		ImVec2 selA, selB;
++		bool selShown = false;
++		for (int p = 0; p < pages; p++)
++		{
++			const float offset = ((float)p - m_gridPage) * W;
++			if (std::abs(offset) >= W)
++				continue;
++			for (int k = 0; k < PAGE && p * PAGE + k < count; k++)
++			{
++				const int i = p * PAGE + k;
++				if (items[i].game < 0)
++					continue;
++				ImVec2 a = tileAt(k);
++				a.x += offset;
++				const ImVec2 b(a.x + TILE, a.y + TILE);
++				if (i == selected)
++				{
++					selA = a;
++					selB = b;
++					selShown = true;
++					continue; // drawn last, over its neighbours
++				}
++				tile(m_games[items[i].game], a, b, alpha);
++			}
++		}
++		if (selShown)
++		{
++			// the selected tile: a little bigger (a spring), a thick blue frame
++			const float grow = TILE * 0.035f * m_gridPop;
++			const ImVec2 a(selA.x - grow, selA.y - grow), b(selB.x + grow, selB.y + grow);
++			tile(m_games[items[selected].game], a, b, alpha);
++			const float pulse = 0.5f + 0.5f * std::sin(m_time * 3.0f);
++			dl->AddRect(ImVec2(a.x - 9, a.y - 9), ImVec2(b.x + 9, b.y + 9), Rgba(WIIU_BLUE, alpha * (0.18f + 0.12f * pulse)), ROUND + 9, 0, 6.0f);
++			dl->AddRect(ImVec2(a.x - 4, a.y - 4), ImVec2(b.x + 4, b.y + 4), Rgba(WIIU_BLUE, alpha), ROUND + 4, 0, 6.0f);
++		}
++
++		// the selected game's title under the grid, the page dots under it
++		const Game& game = m_games[items[selected].game];
++		const float titleSize = TextWidth(m_bold, 40, game.title) > W - 300 ? 30.0f : 40.0f;
++		const float tw = TextWidth(m_bold, titleSize, game.title);
++		Text(dl, m_bold, titleSize, ImVec2(W * 0.5f - tw * 0.5f, captionY), Rgba(WIIU_INK, alpha), game.title, false);
++		if (pages > 1)
++		{
++			constexpr float DOT = 26.0f;
++			const float x0 = W * 0.5f - (pages - 1) * DOT * 0.5f;
++			for (int p = 0; p < pages; p++)
++			{
++				const bool on = p == selected / PAGE;
++				dl->AddCircleFilled(ImVec2(x0 + p * DOT, captionY + 66), on ? 7.0f : 5.5f, Rgba(on ? WIIU_BLUE : 0xC3CAD4, alpha), 20);
++			}
++		}
++	}
++
++	// The GamePad Screen's background on the Games tab: the theme's dark colour, flat.
++	void Menu::DrawGamePadBackground()
++	{
++		const float shown = GamesTabShown();
++		if (shown <= 0.0f)
++			return;
++		ImDrawList* dl = ImGui::GetBackgroundDrawList();
++		const Theme& theme = CurrentTheme();
++		if (m_wallpaper)
++			dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Rgba(0x000000, 0.45f * shown));
++		else
++			dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Rgba(theme.bottom, 0.85f * shown));
++		// a faint light behind the TV half
++		const ImU32 glow = Rgba(theme.wave, 0.07f * shown), clear = Rgba(theme.wave, 0.0f);
++		dl->AddRectFilledMultiColor(ImVec2(0, 130), ImVec2(W, 600), clear, clear, glow, glow);
++	}
++
++	// The GamePad Screen's TV half: the cover, the title, the details, Play.
++	void Menu::DrawGamePadTv(ImDrawList* dl, const Game& game, float alpha)
++	{
++		const Theme& theme = CurrentTheme();
++		constexpr float TOP = 160.0f, CH = 400.0f, X = 190.0f;
++		const float aspect = game.cover ? std::clamp(game.coverAspect, 0.55f, 1.0f) : 0.75f;
++		const ImVec2 a(X, TOP), b(X + CH * aspect, TOP + CH);
++		dl->AddRectFilled(ImVec2(a.x + 10, a.y + 14), ImVec2(b.x + 10, b.y + 14), Rgba(0x000000, alpha * 0.35f), 14.0f);
++		DrawGameTile(dl, game, a, b, alpha, 14.0f);
++		dl->AddRect(a, b, Rgba(theme.text, alpha * 0.25f), 14.0f, 0, 2.0f);
++
++		const float tx = b.x + 70.0f, room = W - 170.0f - tx;
++		const float size = TextWidth(m_bold, 58, game.title) > room * 1.6f ? 44.0f : 58.0f;
++		const std::string title = WrapText(m_bold, size, game.title, room);
++		const int lines = 1 + (int)std::count(title.begin(), title.end(), '\n');
++		Text(dl, m_bold, size, ImVec2(tx, TOP + 10), Rgba(theme.text, alpha), title);
++		float y = TOP + 10 + lines * size * 1.15f + 18.0f;
++		std::string details = game.homebrew ? "Homebrew" : "Wii U";
++		if (game.version)
++			details += "  -  v" + std::to_string(game.version);
++		if (!game.region.empty())
++			details += "  -  " + game.region;
++		if (!game.format.empty())
++			details += "  -  " + game.format;
++		if (!game.id.empty())
++			details += "  -  " + game.id;
++		Text(dl, m_font, 28, ImVec2(tx, y), Rgba(theme.text, alpha * 0.75f), details);
++		y += 46.0f;
++		std::string played = PlayedText(Played(game.path));
++		if (!m_prefs.defaultGame.empty() && game.path == m_prefs.defaultGame)
++			played += "  -  Starts when Crema opens";
++		Text(dl, m_font, 28, ImVec2(tx, y), Rgba(theme.wave, alpha * 0.95f), played);
++
++		// Play: a pill
++		const float cw = PS4Glyphs::Width("Cross", 38), pw = TextWidth(m_bold, 32, "Play");
++		const float bh = 62.0f, bw = cw + 14 + pw + 64, by = TOP + CH - bh;
++		const ImVec2 p0(tx, by), p1(tx + bw, by + bh);
++		dl->AddRectFilled(p0, p1, Rgba(theme.wave, alpha * 0.20f), bh * 0.5f);
++		dl->AddRect(p0, p1, Rgba(theme.wave, alpha * 0.95f), bh * 0.5f, 0, 2.5f);
++		PS4Glyphs::Draw(dl, m_bold, "Cross", tx + 32, by + bh * 0.5f, 38, alpha);
++		Text(dl, m_bold, 32, ImVec2(tx + 32 + cw + 14, by + 12), Rgba(theme.text, alpha), "Play");
++	}
++
++	void Menu::DrawGamePadGames(ImDrawList* dl, float alpha, float dt)
++	{
++		const Theme& theme = CurrentTheme();
++		const int c = (int)Category::Games;
++		const auto& items = m_items[c];
++		const int count = (int)items.size();
++		const bool any = count > 0 && items[0].game >= 0;
++
++		// the TV: a dark frame over the upper half
++		const ImVec2 t0(120, 132), t1(W - 120, 592);
++		dl->AddRectFilled(t0, t1, Rgba(0x000000, alpha * 0.22f), 22.0f);
++		dl->AddRect(t0, t1, Rgba(theme.text, alpha * 0.10f), 22.0f, 0, 2.0f);
++
++		// the GamePad: a light body with a darker rim, the sticks, the D-pad, the buttons, its screen
++		const float px0 = W * 0.2f, px1 = W * 0.8f, py0 = 620.0f, py1 = 950.0f;
++		const float round = (py1 - py0) * 0.36f;
++		dl->AddRectFilled(ImVec2(px0 + 6, py0 + 12), ImVec2(px1 + 6, py1 + 12), Rgba(0x000000, alpha * 0.35f), round);
++		dl->AddRectFilled(ImVec2(px0 - 6, py0 - 6), ImVec2(px1 + 6, py1 + 6), Rgba(0x9AA3B0, alpha), round + 6);
++		dl->AddRectFilled(ImVec2(px0, py0), ImVec2(px1, py1), Rgba(WIIU_PAPER, alpha), round);
++		const ImU32 control = Rgba(0x5A6270, alpha);
++		for (const float sx : {px0 + 100.0f, px1 - 100.0f})
++		{
++			dl->AddCircleFilled(ImVec2(sx, py0 + 92), 36.0f, Rgba(0xC9D0DA, alpha), 32);
++			dl->AddCircleFilled(ImVec2(sx, py0 + 92), 24.0f, Rgba(0x7C8594, alpha), 32);
++		}
++		{
++			const ImVec2 d(px0 + 100, py0 + 228);
++			dl->AddRectFilled(ImVec2(d.x - 36, d.y - 11), ImVec2(d.x + 36, d.y + 11), control, 4.0f);
++			dl->AddRectFilled(ImVec2(d.x - 11, d.y - 36), ImVec2(d.x + 11, d.y + 36), control, 4.0f);
++			const ImVec2 e(px1 - 100, py0 + 228);
++			for (const ImVec2 o : {ImVec2(0, -30), ImVec2(30, 0), ImVec2(0, 30), ImVec2(-30, 0)})
++				dl->AddCircleFilled(ImVec2(e.x + o.x, e.y + o.y), 13.0f, control, 20);
++		}
++		const ImVec2 s0(px0 + 200, py0 + 34), s1(px1 - 200, py1 - 34);
++		dl->AddRectFilled(s0, s1, Rgba(0x14171C, alpha), 10.0f);
++		dl->AddRect(s0, s1, Rgba(0x2C313A, alpha), 10.0f, 0, 4.0f);
++		const float sx = (s0.x + s1.x) * 0.5f, sy = (s0.y + s1.y) * 0.5f - 12.0f;
++		constexpr float T = 168.0f, STEP = 192.0f;
++
++		if (m_gamesLoading)
++		{
++			const std::string caption = "Loading games...";
++			DrawSpinner(dl, ImVec2(W * 0.5f, 320), 30.0f, Rgba(theme.text, alpha * 0.2f), Rgba(theme.wave, alpha), m_time, 6.0f);
++			Text(dl, m_bold, 32, ImVec2(W * 0.5f - TextWidth(m_bold, 32, caption) * 0.5f, 380), Rgba(theme.text, alpha), caption);
++			const float pulse = 0.45f + 0.35f * (0.5f + 0.5f * std::sin(m_time * 4.0f));
++			dl->PushClipRect(s0, s1, true);
++			for (int k = -2; k <= 2; k++)
++			{
++				const ImVec2 a(sx + k * STEP - T * 0.5f, sy - T * 0.5f);
++				dl->AddRectFilled(a, ImVec2(a.x + T, a.y + T), Rgba(0xFFFFFF, alpha * 0.12f * pulse * (k == 0 ? 1.4f : 1.0f)), 12.0f);
++			}
++			dl->PopClipRect();
++			DrawSpinner(dl, ImVec2(s1.x - 26, s1.y - 24), 9.0f, Rgba(0xFFFFFF, alpha * 0.15f), Rgba(WIIU_BLUE, alpha), m_time, 3.0f);
++			return;
++		}
++		alpha *= m_gamesFade;
++		if (!any)
++		{
++			DrawNoGames(dl, alpha, theme.text, 300, true);
++			return;
++		}
++
++		// the TV: the selected game, crossfading from the one before
++		const int selected = std::clamp(m_selected[c], 0, count - 1);
++		const int game = items[selected].game;
++		if (game != m_padShown)
++		{
++			m_padPrev = m_padShown;
++			m_padShown = game;
++			m_padFade = 0.0f;
++		}
++		m_padFade = std::min(1.0f, m_padFade + dt / 0.18f);
++		if (m_padFade < 1.0f && m_padPrev >= 0 && m_padPrev < (int)m_games.size())
++			DrawGamePadTv(dl, m_games[m_padPrev], alpha * (1.0f - m_padFade));
++		DrawGamePadTv(dl, m_games[game], alpha * m_padFade);
++
++		// the GamePad's screen: the games in a row, scrolling with the selection
++		const float pos = m_itemPos[c];
++		dl->PushClipRect(s0, s1, true);
++		for (int i = 0; i < count; i++)
++		{
++			const float d = (float)i - pos;
++			if (std::abs(d) > 3.5f || items[i].game < 0)
++				continue;
++			const ImVec2 a(sx + d * STEP - T * 0.5f, sy - T * 0.5f), b(a.x + T, a.y + T);
++			dl->AddRectFilled(a, b, Rgba(0x2A2F38, alpha), 12.0f);
++			DrawFittedTile(dl, m_games[items[i].game], ImVec2(a.x + 6, a.y + 6), ImVec2(b.x - 6, b.y - 6), alpha, 8.0f);
++			if (i == selected)
++				dl->AddRect(ImVec2(a.x - 4, a.y - 4), ImVec2(b.x + 4, b.y + 4), Rgba(WIIU_BLUE, alpha), 15.0f, 0, 5.0f);
++			else
++				dl->AddRectFilled(a, b, Rgba(0x000000, alpha * 0.35f), 12.0f);
++		}
++		char counter[32];
++		snprintf(counter, sizeof(counter), "%d / %d", selected + 1, count);
++		const float cw = TextWidth(m_font, 22, counter);
++		Text(dl, m_font, 22, ImVec2(sx - cw * 0.5f, s1.y - 32), Rgba(0xC9D0DA, alpha), counter, false);
++		dl->PopClipRect();
 +	}
 +
 +	// how long a startup step took (launcher.log and the boot trace)
@@ -23577,6 +24150,11 @@ index 00000000..6b9ab3f6
 +		sceUserServiceInitialize(nullptr);
 +		sceUserServiceGetInitialUser(&user);
 +		m_user = user;
++		{
++			char name[32] = {};
++			if (sceUserServiceGetUserName(user, name, sizeof(name) - 1) == 0 && name[0])
++				m_userName = name;
++		}
 +
 +		IMGUI_CHECKVERSION();
 +		ImGuiContext* context = ImGui::CreateContext();
