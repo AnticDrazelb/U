@@ -143,6 +143,10 @@ int traceFd() {
         }
         if (gameRun || stat("/data/Crema/last-stop.txt", &st) == 0)
             rename("/data/Crema/boot-trace.log", "/data/Crema/boot-trace-game.log");
+        else if (previous >= 0)
+            // the launcher's run (the app restarts into the game it picked): kept as
+            // boot-trace-launcher.log, for its start-up times
+            rename("/data/Crema/boot-trace.log", "/data/Crema/boot-trace-launcher.log");
         g_traceFd = open("/data/Crema/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;

@@ -19273,10 +19273,10 @@ index 00000000..132ae41c
 +} // namespace CremaUpdater
 diff --git a/src/gui/ps4/launcher/Launcher.cpp b/src/gui/ps4/launcher/Launcher.cpp
 new file mode 100644
-index 00000000..7a38445a
+index 00000000..46affd2c
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,4433 @@
+@@ -0,0 +1,4455 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -23460,9 +23460,22 @@ index 00000000..7a38445a
 +		}
 +	}
 +
++	// how long a startup step took (launcher.log and the boot trace)
++	struct StepTimer
++	{
++		std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++		void operator()(const char* step)
++		{
++			const auto now = std::chrono::steady_clock::now();
++			Log(fmt::format("start: {} {} ms", step, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count()));
++			last = now;
++		}
++	};
++
 +	std::string Menu::Run()
 +	{
 +		s_log = fopen((m_dataDir + "/launcher.log").c_str(), "w");
++		StepTimer step;
 +		CremaSettings::Load(m_dataDir);
 +		int user = 0;
 +		sceUserServiceInitialize(nullptr);
@@ -23476,11 +23489,13 @@ index 00000000..7a38445a
 +		io.IniFilename = nullptr;
 +		io.LogFilename = nullptr;
 +		io.DisplaySize = ImVec2(W, H);
++		step("settings, user");
 +		if (!m_display.Initialize())
 +		{
 +			ImGui::DestroyContext(context);
 +			return {};
 +		}
++		step("display (Vulkan)");
 +		// a GPU self-test waiting in data_dir/selftest (gpu_selftest_core.h)
 +		{
 +			const std::string selftest = m_display.RunGpuSelfTest(m_dataDir + "/selftest");
@@ -23504,15 +23519,22 @@ index 00000000..7a38445a
 +				system == 8 ? "ru" : system == 9 ? "ko" : system == 10 || system == 11 ? "zh" : system == 16 ? "pl" :
 +				system == 19 ? "tr" : "en";
 +		}
++		step("GPU self-test check");
 +		PS4Lang::Load(m_assetsDir, suggested);
++		step("language");
 +		m_audio.Start();
 +		m_input.Open(user);
++		step("audio, controller");
 +		LoadAssets();
++		step("assets (fonts, sounds, pictures)");
 +		LoadSources();
++		step("game sources");
 +		BuildGames(ScanAllGames());
++		step("game scan");
 +		LoadPlayed();
 +		ApplyPreferences();
 +		BuildItems();
++		step("menu items");
 +		// Start on the game played last.
 +		auto& games = m_items[(int)Category::Games];
 +		for (size_t i = 0; i < games.size(); i++)
