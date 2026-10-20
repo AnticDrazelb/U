@@ -10492,7 +10492,7 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..c7cec785 100644
+index 16b8d73c..3286f2a2 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
 @@ -4,10 +4,18 @@
@@ -10591,17 +10591,28 @@ index 16b8d73c..c7cec785 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -246,6 +282,9 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -246,6 +282,20 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  
  uint32 SwkbdDisappearInputForm()
  {
 +#if defined(__ORBIS__)
 +	cemuLog_log(LogType::Force, "swkbd: DisappearInputForm ({} characters in the form)", swkbdInternalState->formStringLength);
++	{
++		extern uint32 g_cremaSwkbdReaderR29;
++		const uint32 obj = g_cremaSwkbdReaderR29;
++		if (obj >= 0x10000000 && obj < 0x50000000)
++		{
++			std::string bytes;
++			for (uint32 k = 0xf0; k < 0x120; k++)
++				bytes += fmt::format("{:02x}{}", memory_readU8(obj + k), (k & 3) == 3 ? " " : "");
++			cemuLog_log(LogType::Force, "swkbd: reader object {:08x} +f0: {}", obj, bytes);
++		}
++	}
 +#endif
  	debug_printf("SwkbdDisappearInputForm__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -253,6 +292,9 @@ uint32 SwkbdDisappearInputForm()
+@@ -253,6 +303,9 @@ uint32 SwkbdDisappearInputForm()
  
  uint32 SwkbdDisappearKeyboard()
  {
@@ -10611,19 +10622,21 @@ index 16b8d73c..c7cec785 100644
  	debug_printf("SwkbdDisappearKeyboard__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -260,6 +302,11 @@ uint32 SwkbdDisappearKeyboard()
+@@ -260,6 +313,13 @@ uint32 SwkbdDisappearKeyboard()
  
  uint16be* SwkbdGetInputFormString()
  {
 +#if defined(__ORBIS__)
 +	CremaImeStringRead();
++	if (PPCInterpreter_getCurrentInstance())
++		g_cremaSwkbdReaderR29 = PPCInterpreter_getCurrentInstance()->gpr[29];
 +	CREMA_SWKBD_TRACE("swkbd trace: GetInputFormString -> {} characters (from {:08x})", swkbdInternalState->formStringLength,
 +		PPCInterpreter_getCurrentInstance() ? PPCInterpreter_getCurrentInstance()->spr.LR : 0);
 +#endif
  	for(sint32 i=0; i<swkbdInternalState->formStringLength; i++)
  		swkbdInternalState->formStringBufferBE[i] = swkbdInternalState->formStringBuffer[i];
  	cemu_assert(swkbdInternalState->formStringLength < SWKBD_FORM_STRING_MAX_LENGTH);
-@@ -267,8 +314,11 @@ uint16be* SwkbdGetInputFormString()
+@@ -267,8 +327,11 @@ uint16be* SwkbdGetInputFormString()
  	return swkbdInternalState->formStringBufferBE;
  }
  
@@ -10636,7 +10649,7 @@ index 16b8d73c..c7cec785 100644
  	if (swkbdInternalState->decideButtonWasPressed)
  		return 1;
  	return 0;
-@@ -397,8 +447,168 @@ void SwkbdCalc(void* controllerInfo)
+@@ -397,8 +460,169 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
@@ -10757,6 +10770,7 @@ index 16b8d73c..c7cec785 100644
 +}
 +
 +uint32 g_cremaSwkbdTrace = 0;
++uint32 g_cremaSwkbdReaderR29 = 0;
 +
 +void CremaImeStringRead()
 +{
@@ -10805,7 +10819,7 @@ index 16b8d73c..c7cec785 100644
  	// only render if active
  	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
  		return;
-@@ -596,6 +806,11 @@ void swkbd_inputStringChanged()
+@@ -596,6 +820,11 @@ void swkbd_inputStringChanged()
  			//swkbdInternalState->keyboardArg.cursorPos = copyLength;
  		}
  		// IEventReceiver callback
