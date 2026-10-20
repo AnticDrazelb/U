@@ -10621,7 +10621,7 @@ index 6cb1599a..c4cb0a7e 100644
  			{
  				AXOut_updateDevicePlayState(true);
 diff --git a/src/Cafe/OS/libs/swkbd/swkbd.cpp b/src/Cafe/OS/libs/swkbd/swkbd.cpp
-index 16b8d73c..327e02f0 100644
+index 16b8d73c..c7fd95ae 100644
 --- a/src/Cafe/OS/libs/swkbd/swkbd.cpp
 +++ b/src/Cafe/OS/libs/swkbd/swkbd.cpp
 @@ -1,13 +1,26 @@
@@ -10728,7 +10728,7 @@ index 16b8d73c..327e02f0 100644
  	swkbdInternalState->formStringLength = 0;
  	swkbdInternalState->isActive = true;
  	swkbdInternalState->keyboardOnlyMode = true;
-@@ -246,6 +287,31 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
+@@ -246,6 +287,21 @@ uint32 SwkbdAppearKeyboard(const SwkbdKeyboardArg_t* keyboardArg)
  
  uint32 SwkbdDisappearInputForm()
  {
@@ -10743,24 +10743,14 @@ index 16b8d73c..327e02f0 100644
 +			for (uint32 k = 0xf0; k < 0x120; k++)
 +				bytes += fmt::format("{:02x}{}", memory_readU8(obj + k), (k & 3) == 3 ? " " : "");
 +			cemuLog_log(LogType::Force, "swkbd: reader object {:08x} +f0: {}", obj, bytes);
-+			CremaSwkbdDumpTarget("at hide");
-+			g_cremaSwkbdDumpAt = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-+			const uint32 target = memory_readU32(obj + 0x104);
-+			if (target >= 0x10000000 && target < 0x50000000)
-+			{
-+				extern std::atomic<uint32> g_crema_watch_addr;
-+				g_crema_watch_addr = target;
-+				PPCRecompiler_Disable();
-+				g_cremaSwkbdWatchUntil = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-+				cemuLog_log(LogType::Force, "watch: writes to {:08x} for 10 s (game code interpreted meanwhile)", target);
-+			}
++
 +		}
 +	}
 +#endif
  	debug_printf("SwkbdDisappearInputForm__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -253,6 +319,9 @@ uint32 SwkbdDisappearInputForm()
+@@ -253,6 +309,9 @@ uint32 SwkbdDisappearInputForm()
  
  uint32 SwkbdDisappearKeyboard()
  {
@@ -10770,7 +10760,7 @@ index 16b8d73c..327e02f0 100644
  	debug_printf("SwkbdDisappearKeyboard__3RplFv\n");
  	swkbdInternalState->isActive = false;
  	return 1;
-@@ -260,6 +329,13 @@ uint32 SwkbdDisappearKeyboard()
+@@ -260,6 +319,13 @@ uint32 SwkbdDisappearKeyboard()
  
  uint16be* SwkbdGetInputFormString()
  {
@@ -10784,7 +10774,7 @@ index 16b8d73c..327e02f0 100644
  	for(sint32 i=0; i<swkbdInternalState->formStringLength; i++)
  		swkbdInternalState->formStringBufferBE[i] = swkbdInternalState->formStringBuffer[i];
  	cemu_assert(swkbdInternalState->formStringLength < SWKBD_FORM_STRING_MAX_LENGTH);
-@@ -267,8 +343,11 @@ uint16be* SwkbdGetInputFormString()
+@@ -267,8 +333,11 @@ uint16be* SwkbdGetInputFormString()
  	return swkbdInternalState->formStringBufferBE;
  }
  
@@ -10797,7 +10787,7 @@ index 16b8d73c..327e02f0 100644
  	if (swkbdInternalState->decideButtonWasPressed)
  		return 1;
  	return 0;
-@@ -397,8 +476,200 @@ void SwkbdCalc(void* controllerInfo)
+@@ -397,8 +466,199 @@ void SwkbdCalc(void* controllerInfo)
  }
  
  void swkbd_keyInput(uint32 keyCode);
@@ -10989,7 +10979,6 @@ index 16b8d73c..327e02f0 100644
 +	if (s_okPending && std::chrono::steady_clock::now() >= s_okAt)
 +	{
 +		s_okPending = false;
-+		g_cremaSwkbdTrace = 200;
 +		cemuLog_log(LogType::Force, "swkbd: OK given ({} reads of the text so far)", s_stringReads);
 +		swkbd_finishInput();
 +	}
@@ -10998,7 +10987,7 @@ index 16b8d73c..327e02f0 100644
  	// only render if active
  	if( swkbdInternalState == NULL || swkbdInternalState->isActive == false)
  		return;
-@@ -596,6 +867,11 @@ void swkbd_inputStringChanged()
+@@ -596,6 +856,11 @@ void swkbd_inputStringChanged()
  			//swkbdInternalState->keyboardArg.cursorPos = copyLength;
  		}
  		// IEventReceiver callback
@@ -16319,10 +16308,10 @@ index 00000000..7c96bca0
 +} // namespace PS4PauseMenu
 diff --git a/src/gui/ps4/PS4WindowSystem.cpp b/src/gui/ps4/PS4WindowSystem.cpp
 new file mode 100644
-index 00000000..8c32a6d4
+index 00000000..bc691781
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,944 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -16628,6 +16617,30 @@ index 00000000..8c32a6d4
 +		png_destroy_write_struct(&png, &info);
 +		fclose(file);
 +		return ok;
++	}
++
++	// The Wii U's NG word lists (system title 0005001b10053000), which games' built-in profanity
++	// filter (nn::ngc) reads: without them the filter fails and a game may wipe what was typed
++	// (Super Smash Bros. erased every Mii name right after taking it). Missing lists are created
++	// empty - a UTF-16 byte order mark and no words - so the filter loads and lets names through;
++	// lists already there (from a Wii U) are kept.
++	void CreateNgWordLists()
++	{
++		const fs::path folder = ActiveSettings::GetMlcPath() / "sys/title/0005001b/10053000/content";
++		std::error_code ec;
++		fs::create_directories(folder, ec);
++		int created = 0;
++		for (int i = 0; i < 64; i++)
++		{
++			const fs::path file = folder / fmt::format("{}.txt", i);
++			if (fs::exists(file, ec))
++				continue;
++			std::ofstream out(file, std::ios::binary);
++			out.write("\xFE\xFF", 2);
++			created += out.good() ? 1 : 0;
++		}
++		if (created)
++			Trace(fmt::format("NG word lists: {} empty ones created (games' name filters need them)", created));
 +	}
 +
 +	bool IsLaunchable(const fs::path& path)
@@ -16959,6 +16972,7 @@ index 00000000..8c32a6d4
 +		CremaSettings::Load(_pathToUtf8(kDataRoot));
 +		CremaSettings::MountNetworkLibrary();
 +		CremaOnline::CreateFolders(_pathToUtf8(kDataRoot), _pathToUtf8(ActiveSettings::GetMlcPath()));
++		CreateNgWordLists();
 +		Trace(CremaOnline::Stage(_pathToUtf8(kDataRoot), _pathToUtf8(ActiveSettings::GetMlcPath()), CremaSettings::Get("online")));
 +		if (!CreateDefaultMLCFiles(ActiveSettings::GetMlcPath()))
 +			Trace(fmt::format("cannot create the mlc folders in {}", _pathToUtf8(ActiveSettings::GetMlcPath())));
