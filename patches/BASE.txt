@@ -1,2 +1,2 @@
 base: cc6fea125a5d4f559c662d13c5f4af0b6dd0876f cemu-project/Cemu main (2026-10-04) "PPCRec: Lower optimized single-precision stores to SINGLE_FTZ"
-mesa: DolphinPS4 Mesa 26.0.8 + patches/mesa-ps4.patch + patches/mesa-ps4-aligned-vertex-fetch.patch
+mesa: Mesa 26.0.8 + patches/mesa-ps4.patch, mesa-ps4-aligned-vertex-fetch.patch, mesa-ps4-vertex-fetch-switch.patch, mesa-ps4-flush-all-draws.patch, mesa-ps4-gs-ring-probe.patch (in that order; see docs/BUILDING.md)
