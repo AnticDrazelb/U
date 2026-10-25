@@ -3105,7 +3105,7 @@ index 22d2dc0b..0c29eb95 100644
  // texture readback
  
 diff --git a/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp b/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp
-index a561a20c..61f945de 100644
+index a561a20c..22d8aa28 100644
 --- a/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp
 @@ -7,6 +7,9 @@
@@ -3118,7 +3118,7 @@ index a561a20c..61f945de 100644
  
  template<typename TRangeType, typename TNodeObject>
  class IntervalTree
-@@ -1565,6 +1568,8 @@ uint32 LatteBufferCache_retrieveDataInCache(MPTR physAddress, uint32 size)
+@@ -1565,16 +1568,25 @@ uint32 LatteBufferCache_retrieveDataInCache(MPTR physAddress, uint32 size)
  	range->flagInUse();
  
  	range->checkAndSyncModificationsIfChrononChanged(physAddress, size);
@@ -3127,20 +3127,153 @@ index a561a20c..61f945de 100644
  
  	return range->getBufferOffset(physAddress);
  }
-@@ -1726,7 +1731,7 @@ void LatteBufferCache_notifyDrawDone()
+ 
++#if defined(__ORBIS__)
++static void CremaDirectMark(MPTR address, uint32 size, bool gpu); // direct_vertex, below
++#endif
++
+ void LatteBufferCache_copyStreamoutDataToCache(MPTR physAddress, uint32 size, uint32 streamoutBufferOffset)
+ {
+ 	if (size == 0)
+ 		return;
+ 	cemu_assert_debug(size >= 16);
+ 
++#if defined(__ORBIS__)
++	CremaDirectMark(physAddress, size, true); // only the buffer cache has this data now
++#endif
+ 	auto range = LatteBufferCache_reserveRange(physAddress, size);
+ 	range->flagInUse();
+ 
+@@ -1696,8 +1708,96 @@ FSpinlock g_spinlockDCFlushQueue;
+ SparseBitset* s_DCFlushQueue = new SparseBitset();
+ SparseBitset* s_DCFlushQueueAlternate = new SparseBitset();
+ 
++#if defined(__ORBIS__)
++// Crema setting direct_vertex (Experimental): vertex buffers the GPU reads straight from the Wii U's
++// memory, imported into Vulkan (VulkanRenderer::CremaImportGuestMemory), instead of from a copy in
++// the buffer cache - no lookup, copy or change tracking on the GPU thread, no cache memory.
++//   1 Static Data: only data the game hasn't flushed from its CPU cache for kCremaStaticFrames
++//     frames (on the Wii U the CPU must flush what it writes before the GPU reads it, so a flush
++//     marks a change). Cemu tells the game its GPU work is done when the GPU thread has processed
++//     it, before the PS4's GPU has drawn it; data written right after could be read half-changed,
++//     which the buffer cache's copy hides - static data isn't rewritten.
++//   2 All Data: every vertex buffer in the imported range.
++// Never data a draw wrote with streamout (only the buffer cache has it) until the CPU writes there.
++int g_crema_direct_vertex = 0;
++
++namespace
++{
++	constexpr uint32 kCremaDirectBlockShift = 16; // 64 KiB blocks
++	constexpr uint32 kCremaStaticFrames = 4;
++	constexpr uint32 kCremaGpuWritten = 0xFFFFFFFF; // block holds streamout output
++	MPTR s_cremaDirectBase = 0;
++	std::atomic<uint32> s_cremaDirectSize{0}; // 0: no imported memory (set last, read first)
++	std::unique_ptr<std::atomic<uint32>[]> s_cremaDirectWrites; // per block: frame of the last CPU write
++	std::atomic<uint32> s_cremaDirectFrame{0}; // TV frames shown
++}
++
++void LatteBufferCache_CremaDirectInit(MPTR base, uint32 size)
++{
++	const uint32 blocks = (size + (1u << kCremaDirectBlockShift) - 1) >> kCremaDirectBlockShift;
++	// allocated once (CPU threads may read it any time after): a later start of a game only resets it
++	const uint32 previous = s_cremaDirectSize.load(std::memory_order_acquire);
++	if (previous == 0)
++		s_cremaDirectWrites.reset(new std::atomic<uint32>[blocks]);
++	else if (previous != size || base != s_cremaDirectBase)
++		return; // can't happen (MEM2 doesn't move); keep the table as it is
++	// everything counts as just written: the first frames go through the buffer cache
++	const uint32 now = s_cremaDirectFrame.load(std::memory_order_relaxed);
++	for (uint32 i = 0; i < blocks; i++)
++		s_cremaDirectWrites[i].store(now, std::memory_order_relaxed);
++	s_cremaDirectBase = base;
++	s_cremaDirectSize.store(size, std::memory_order_release);
++}
++
++static void CremaDirectMark(MPTR address, uint32 size, bool gpu)
++{
++	const uint32 directSize = s_cremaDirectSize.load(std::memory_order_acquire);
++	if (directSize == 0)
++		return;
++	const uint32 value = gpu ? kCremaGpuWritten : s_cremaDirectFrame.load(std::memory_order_relaxed);
++	uint64 begin = address, end = (uint64)address + size;
++	if (address == 0 || size == 0xFFFFFFFF)
++	{
++		begin = s_cremaDirectBase; // a global flush: everything may have changed
++		end = (uint64)s_cremaDirectBase + directSize;
++	}
++	begin = std::max<uint64>(begin, s_cremaDirectBase);
++	end = std::min<uint64>(end, (uint64)s_cremaDirectBase + directSize);
++	if (begin >= end)
++		return;
++	const uint32 first = (uint32)((begin - s_cremaDirectBase) >> kCremaDirectBlockShift);
++	const uint32 last = (uint32)((end - 1 - s_cremaDirectBase) >> kCremaDirectBlockShift);
++	for (uint32 i = first; i <= last; i++)
++		s_cremaDirectWrites[i].store(value, std::memory_order_relaxed);
++}
++
++bool LatteBufferCache_CremaDirectUsable(MPTR address, uint32 size)
++{
++	const uint32 directSize = s_cremaDirectSize.load(std::memory_order_acquire);
++	if (directSize == 0 || g_crema_direct_vertex == 0 || size == 0)
++		return false;
++	if (address < s_cremaDirectBase || (uint64)address + size > (uint64)s_cremaDirectBase + directSize)
++		return false;
++	const uint32 now = s_cremaDirectFrame.load(std::memory_order_relaxed);
++	const uint32 first = (address - s_cremaDirectBase) >> kCremaDirectBlockShift;
++	const uint32 last = (address + size - 1 - s_cremaDirectBase) >> kCremaDirectBlockShift;
++	for (uint32 i = first; i <= last; i++)
++	{
++		const uint32 written = s_cremaDirectWrites[i].load(std::memory_order_relaxed);
++		if (written == kCremaGpuWritten)
++			return false;
++		if (g_crema_direct_vertex == 1 && now - written < kCremaStaticFrames)
++			return false;
++	}
++	return true;
++}
++#endif
++
+ void LatteBufferCache_notifyDCFlush(MPTR address, uint32 size)
+ {
++#if defined(__ORBIS__)
++	CremaDirectMark(address, size, false);
++#endif
+ 	if (address == 0 || size == 0xFFFFFFFF)
+ 		return; // global flushes are ignored for now
+ 
+@@ -1726,7 +1826,10 @@ void LatteBufferCache_notifyDrawDone()
  
  void LatteBufferCache_notifySwapTVScanBuffer()
  {
 -	if( ActiveSettings::FlushGPUCacheOnSwap() )
++#if defined(__ORBIS__)
++	s_cremaDirectFrame.fetch_add(1, std::memory_order_relaxed);
++#endif
 +	if( ActiveSettings::FlushGPUCacheOnSwap() || g_crema_vertex_resync != 0 )
  		g_currentCacheChronon++;
  }
  
+diff --git a/src/Cafe/HW/Latte/Core/LatteBufferCache.h b/src/Cafe/HW/Latte/Core/LatteBufferCache.h
+index bfcc14a4..6579cee1 100644
+--- a/src/Cafe/HW/Latte/Core/LatteBufferCache.h
++++ b/src/Cafe/HW/Latte/Core/LatteBufferCache.h
+@@ -16,3 +16,11 @@ void LatteBufferCache_incrementalCleanup();
+ void LatteBufferCache_getStats(uint32& heapSize, uint32& allocationSize, uint32& allocNum);
+ 
+ void LatteBufferCache_notifySwapTVScanBuffer();
++
++#if defined(__ORBIS__)
++// Crema setting direct_vertex (LatteBufferCache.cpp): the Wii U memory range the GPU can read
++// directly, and whether a vertex buffer there may be read from it now
++extern int g_crema_direct_vertex;
++void LatteBufferCache_CremaDirectInit(MPTR base, uint32 size);
++bool LatteBufferCache_CremaDirectUsable(MPTR address, uint32 size);
++#endif
 diff --git a/src/Cafe/HW/Latte/Core/LatteBufferData.cpp b/src/Cafe/HW/Latte/Core/LatteBufferData.cpp
-index 538f35e3..6aaa3d91 100644
+index 538f35e3..e63f44e7 100644
 --- a/src/Cafe/HW/Latte/Core/LatteBufferData.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteBufferData.cpp
-@@ -292,6 +292,22 @@ void LatteBufferCache_Sync(uint32 maxVtxIndex, uint32 baseInstance, uint32 insta
+@@ -292,6 +292,29 @@ void LatteBufferCache_Sync(uint32 maxVtxIndex, uint32 baseInstance, uint32 insta
  			}
  #endif
  
@@ -3157,6 +3290,13 @@ index 538f35e3..6aaa3d91 100644
 +						continue;
 +					}
 +				}
++			}
++			// Crema setting direct_vertex (Experimental): straight from the Wii U's memory when the
++			// range may be read from there (LatteBufferCache.cpp), else the buffer cache below
++			if (g_crema_direct_vertex != 0)
++			{
++				if (VulkanRenderer* vkRenderer = VulkanRenderer::GetInstance(); vkRenderer && vkRenderer->CremaBindVertexDirect(bufferAddress, lookupRangeSize, bufferIndex))
++					continue;
 +			}
 +#endif
 +
@@ -5179,7 +5319,7 @@ index b7dc5001..c9b170af 100644
  
  void* dlopen_vulkan_loader()
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
-index f503c108..d5bb8fa6 100644
+index f503c108..725cc69d 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h
 @@ -11,6 +11,11 @@ bool InitializeGlobalVulkan();
@@ -5241,7 +5381,17 @@ index f503c108..d5bb8fa6 100644
  
  // event
  VKFUNC_DEVICE(vkCreateEvent);
-@@ -226,6 +237,7 @@ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
+@@ -219,6 +230,9 @@ VKFUNC_DEVICE(vkBindBufferMemory);
+ VKFUNC_DEVICE(vkMapMemory);
+ VKFUNC_DEVICE(vkUnmapMemory);
+ VKFUNC_DEVICE(vkGetBufferMemoryRequirements);
++#ifdef __ORBIS__
++VKFUNC_DEVICE(vkGetMemoryHostPointerPropertiesEXT); // Crema setting direct_vertex (VK_EXT_external_memory_host)
++#endif
+ VKFUNC_DEVICE(vkFlushMappedMemoryRanges);
+ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
+ 
+@@ -226,6 +240,7 @@ VKFUNC_DEVICE(vkInvalidateMappedMemoryRanges);
  VKFUNC_DEVICE(vkCreateImage);
  VKFUNC_DEVICE(vkDestroyImage);
  VKFUNC_DEVICE(vkGetImageMemoryRequirements);
@@ -5474,10 +5624,20 @@ index f9788c9c..85a3446f 100644
  		list_queryFragments.erase(list_queryFragments.begin());
  	}
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-index 599190a4..08f30163 100644
+index 599190a4..41d64cbd 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
-@@ -113,6 +113,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
+@@ -7,6 +7,9 @@
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.h"
+ 
+ #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
++#ifdef __ORBIS__
++#include "util/MemMapper/MemMapper.h" // CremaSetGpuReadable (direct_vertex)
++#endif
+ #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
+ #include "Cafe/HW/Latte/Core/LatteOverlay.h"
+ 
+@@ -113,6 +116,8 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
  	requiredExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -5486,7 +5646,7 @@ index 599190a4..08f30163 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -318,6 +320,11 @@ void VulkanRenderer::GetDeviceFeatures()
+@@ -318,6 +323,11 @@ void VulkanRenderer::GetDeviceFeatures()
  	m_featureControl.deviceExtensions.pipeline_creation_cache_control = pcc.pipelineCreationCacheControl;
  	m_featureControl.deviceExtensions.custom_border_color_without_format = m_featureControl.deviceExtensions.custom_border_color && bcf.customBorderColorWithoutFormat;
  	m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32 = m_featureControl.deviceExtensions.shader_float_controls && pfcp.shaderRoundingModeRTEFloat32;
@@ -5498,7 +5658,7 @@ index 599190a4..08f30163 100644
  	if(!m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32)
  		cemuLog_log(LogType::Force, "Shader round mode control not available on this device or driver. Some rendering issues might occur.");
  
-@@ -804,6 +811,17 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+@@ -804,6 +814,17 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
  	void* bufferPtr;
  	// init ringbuffer for uniform vars
  	m_uniformVarBufferMemoryIsCoherent = false;
@@ -5516,7 +5676,7 @@ index 599190a4..08f30163 100644
  	if (memoryManager->CreateBuffer(UNIFORMVAR_RINGBUFFER_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_uniformVarBuffer, m_uniformVarBufferMemory))
  		m_uniformVarBufferMemoryIsCoherent = true;
  	else if (memoryManager->CreateBuffer(UNIFORMVAR_RINGBUFFER_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_uniformVarBuffer, m_uniformVarBufferMemory))
-@@ -876,6 +894,9 @@ VulkanRenderer::~VulkanRenderer()
+@@ -876,6 +897,9 @@ VulkanRenderer::~VulkanRenderer()
  	}
  
  	vkDestroyDescriptorPool(m_logicalDevice, m_descriptorPool, nullptr);
@@ -5526,7 +5686,17 @@ index 599190a4..08f30163 100644
  
  	for(auto& i : m_backbufferBlitPipelineCache)
  	{
-@@ -1491,6 +1512,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
+@@ -900,6 +924,9 @@ VulkanRenderer::~VulkanRenderer()
+ 	memoryManager->DeleteBuffer(m_xfbRingBuffer, m_xfbRingBufferMemory);
+ 	memoryManager->DeleteBuffer(m_occlusionQueries.bufferQueryResults, m_occlusionQueries.memoryQueryResults);
+ 	memoryManager->DeleteBuffer(m_bufferCache, m_bufferCacheMemory);
++#ifdef __ORBIS__
++	memoryManager->DeleteBuffer(m_cremaGuestMem, m_cremaGuestMemMemory); // direct_vertex (the memory itself stays)
++#endif
+ 
+ 	m_padSwapchainInfo = nullptr;
+ 	m_mainSwapchainInfo = nullptr;
+@@ -1491,6 +1518,8 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
  	requiredInstanceExtensions.emplace_back(VK_KHR_SURFACE_EXTENSION_NAME);
  	#if BOOST_OS_WINDOWS
  	requiredInstanceExtensions.emplace_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
@@ -5535,7 +5705,7 @@ index 599190a4..08f30163 100644
  	#elif BOOST_OS_LINUX || BOOST_OS_BSD
  	auto backend = WindowSystem::GetWindowInfo().window_main.backend;
  	if(backend == WindowSystem::WindowHandleInfo::Backend::X11)
-@@ -1578,7 +1601,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
+@@ -1578,7 +1607,7 @@ VkSurfaceKHR VulkanRenderer::CreateWinSurface(VkInstance instance, HWND hwindow)
  }
  #endif
  
@@ -5544,7 +5714,7 @@ index 599190a4..08f30163 100644
  VkSurfaceKHR VulkanRenderer::CreateXlibSurface(VkInstance instance, Display* dpy, Window window)
  {
      VkXlibSurfaceCreateInfoKHR sci{};
-@@ -1642,6 +1665,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
+@@ -1642,6 +1671,8 @@ VkSurfaceKHR VulkanRenderer::CreateFramebufferSurface(VkInstance instance, Windo
  {
  #if BOOST_OS_WINDOWS
  	return CreateWinSurface(instance, static_cast<HWND>(windowInfo.surface));
@@ -5553,7 +5723,7 @@ index 599190a4..08f30163 100644
  #elif BOOST_OS_LINUX || BOOST_OS_BSD
  	if(windowInfo.backend == WindowSystem::WindowHandleInfo::Backend::X11)
  		return CreateXlibSurface(instance, static_cast<Display*>(windowInfo.display), reinterpret_cast<Window>(windowInfo.surface));
-@@ -2280,7 +2305,32 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
+@@ -2280,7 +2311,32 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
  	occlusionQuery_notifyBeginCommandBuffer();
  
  	m_recordedDrawcalls = 0;
@@ -5586,7 +5756,7 @@ index 599190a4..08f30163 100644
  	m_submitOnIdle = false;
  }
  
-@@ -2314,6 +2364,10 @@ void VulkanRenderer::WaitCommandBufferFinished(uint64 commandBufferId)
+@@ -2314,6 +2370,10 @@ void VulkanRenderer::WaitCommandBufferFinished(uint64 commandBufferId)
  		WaitForNextFinishedCommandBuffer();
  }
  
@@ -5597,7 +5767,7 @@ index 599190a4..08f30163 100644
  void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
  {
  	SetThreadName("vkDriverPlCache");
-@@ -2331,7 +2385,11 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
+@@ -2331,7 +2391,11 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
  		}
  	}
  
@@ -5609,7 +5779,7 @@ index 599190a4..08f30163 100644
  
  	while (true)
  	{
-@@ -2397,7 +2455,11 @@ void VulkanRenderer::CreatePipelineCache()
+@@ -2397,7 +2461,11 @@ void VulkanRenderer::CreatePipelineCache()
  	const auto dir = ActiveSettings::GetCachePath("shaderCache/driver/vk");
  	if (fs::exists(dir))
  	{
@@ -5621,7 +5791,7 @@ index 599190a4..08f30163 100644
  		auto file = std::ifstream(filename, std::ios::in | std::ios::binary | std::ios::ate);
  		if (file.is_open())
  		{
-@@ -3038,7 +3100,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3038,7 +3106,12 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  
  	const size_t currentFrameCmdBufferID = GetCurrentCommandBufferId();
  
@@ -5634,7 +5804,7 @@ index 599190a4..08f30163 100644
  	SubmitCommandBuffer(presentSemaphore); // submit all command and signal semaphore
  
  	cemu_assert_debug(m_numSubmittedCmdBuffers > 0);
-@@ -3057,7 +3124,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
+@@ -3057,7 +3130,7 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
  	presentInfo.pSwapchains = &chainInfo.m_swapchain;
  	presentInfo.pImageIndices = &chainInfo.swapchainImageIndex;
  	// wait on command buffer semaphore
@@ -5643,7 +5813,7 @@ index 599190a4..08f30163 100644
  	presentInfo.pWaitSemaphores = &presentSemaphore;
  
  	// if present_wait is available and enabled, add frame markers to present requests
-@@ -3113,9 +3180,30 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
+@@ -3113,9 +3186,30 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
  
  void VulkanBenchmarkPrintResults();
  
@@ -5674,7 +5844,7 @@ index 599190a4..08f30163 100644
  
  	if (swapTV && IsSwapchainInfoValid(true))
  		SwapBuffer(true);
-@@ -3279,9 +3367,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
+@@ -3279,9 +3373,143 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
  
  	// mark current swapchain image as well defined
  	chainInfo.hasDefinedSwapchainImage = true;
@@ -5818,7 +5988,7 @@ index 599190a4..08f30163 100644
  {
  	std::array<VkDescriptorPoolSize, 4> poolSizes = {};
  	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-@@ -3300,8 +3522,10 @@ void VulkanRenderer::CreateDescriptorPool()
+@@ -3300,8 +3528,10 @@ void VulkanRenderer::CreateDescriptorPool()
  	poolInfo.maxSets = 1024 * 256;
  	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
  
@@ -5831,7 +6001,7 @@ index 599190a4..08f30163 100644
  }
  
  VkDescriptorSet VulkanRenderer::backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter)
-@@ -3800,10 +4024,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
+@@ -3800,10 +4030,27 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
  			continue;
  		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
  		VkDeviceSize bindOffset = binding.bindOffset;
@@ -5859,10 +6029,105 @@ index 599190a4..08f30163 100644
  void VulkanRenderer::buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size)
  {
  	cemu_assert_debug(bufferIndex < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS);
-@@ -3875,6 +4116,58 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+@@ -3873,8 +4120,153 @@ void VulkanRenderer::bufferCache_init(const sint32 bufferSize)
+ 	*/
+ 	if(!m_useHostMemoryForCache)
  		memoryManager->CreateBuffer(bufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0, m_bufferCache, m_bufferCacheMemory);
++#ifdef __ORBIS__
++	if (g_crema_direct_vertex != 0)
++		CremaImportGuestMemory();
++#endif
  }
  
++#ifdef __ORBIS__
++// Crema setting direct_vertex: the Wii U's MEM2 (where games keep their models) as one Vulkan buffer
++// over the memory itself (VK_EXT_external_memory_host; the PS4 winsys gives it GPU address = CPU
++// address, port/mesa/ac_ps4_drm.c). Anything that fails leaves the buffer cache doing all the work.
++void VulkanRenderer::CremaImportGuestMemory()
++{
++	const MPTR base = mmuRange_MEM2.getBase();
++	const uint32 size = (uint32)std::min<uint64>((uint64)mmuRange_MEM2.getEnd() - base, kCremaDirectBindTag - 0x10000) & ~0x3FFFu;
++	void* hostPtr = memory_getPointerFromVirtualOffset(base);
++	if (m_cremaGuestMem != VK_NULL_HANDLE)
++	{
++		// imported for an earlier start of a game in this process: the same memory, tracked afresh
++		LatteBufferCache_CremaDirectInit(m_cremaGuestMemBase, size);
++		return;
++	}
++	auto fail = [&](const char* why, VkResult r) {
++		cemuLog_log(LogType::Force, "Direct Vertex Data: off ({}{}) - the buffer cache is used", why,
++			r != VK_SUCCESS ? fmt::format(", VkResult {}", (sint32)r) : std::string());
++		if (m_cremaGuestMem != VK_NULL_HANDLE)
++			vkDestroyBuffer(m_logicalDevice, m_cremaGuestMem, nullptr);
++		if (m_cremaGuestMemMemory != VK_NULL_HANDLE)
++			vkFreeMemory(m_logicalDevice, m_cremaGuestMemMemory, nullptr);
++		m_cremaGuestMem = VK_NULL_HANDLE;
++		m_cremaGuestMemMemory = VK_NULL_HANDLE;
++	};
++	if (!m_featureControl.deviceExtensions.external_memory_host || !vkGetMemoryHostPointerPropertiesEXT)
++		return fail("the GPU driver can't import memory", VK_SUCCESS);
++	if (!mmuRange_MEM2.isMapped())
++		return fail("MEM2 isn't mapped yet", VK_SUCCESS);
++	if (!MemMapper::CremaSetGpuReadable(hostPtr, size))
++		return fail("the memory can't be made GPU-readable", VK_SUCCESS);
++
++	VkMemoryHostPointerPropertiesEXT hostProps{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
++	VkResult r = vkGetMemoryHostPointerPropertiesEXT(m_logicalDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPtr, &hostProps);
++	if (r != VK_SUCCESS || hostProps.memoryTypeBits == 0)
++		return fail("no memory type for host memory", r);
++
++	VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
++	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++	VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++	bufferInfo.pNext = &external;
++	bufferInfo.size = size;
++	bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
++	bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++	r = vkCreateBuffer(m_logicalDevice, &bufferInfo, nullptr, &m_cremaGuestMem);
++	if (r != VK_SUCCESS)
++		return fail("vkCreateBuffer", r);
++	VkMemoryRequirements requirements;
++	vkGetBufferMemoryRequirements(m_logicalDevice, m_cremaGuestMem, &requirements);
++	const uint32 types = requirements.memoryTypeBits & hostProps.memoryTypeBits;
++	if (types == 0 || requirements.size > size)
++		return fail("the buffer can't live in host memory", VK_SUCCESS);
++
++	VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
++	import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++	import.pHostPointer = hostPtr;
++	VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++	allocInfo.pNext = &import;
++	allocInfo.allocationSize = size;
++	allocInfo.memoryTypeIndex = (uint32)std::countr_zero(types);
++	r = vkAllocateMemory(m_logicalDevice, &allocInfo, nullptr, &m_cremaGuestMemMemory);
++	if (r != VK_SUCCESS)
++		return fail("importing the memory", r);
++	r = vkBindBufferMemory(m_logicalDevice, m_cremaGuestMem, m_cremaGuestMemMemory, 0);
++	if (r != VK_SUCCESS)
++		return fail("vkBindBufferMemory", r);
++
++	m_cremaGuestMemBase = base;
++	LatteBufferCache_CremaDirectInit(base, size);
++	cemuLog_log(LogType::Force, "Direct Vertex Data: {} - the GPU reads vertex buffers in {:08x}-{:08x} from the Wii U's memory",
++		g_crema_direct_vertex == 2 ? "all data" : "static data", base, base + size);
++}
++
++bool VulkanRenderer::CremaBindVertexDirect(MPTR address, uint32 size, uint32 bufferIndex)
++{
++	if (m_cremaGuestMem == VK_NULL_HANDLE || !LatteBufferCache_CremaDirectUsable(address, size))
++		return false;
++	const uint32 offset = address - m_cremaGuestMemBase;
++	const uint32 tagged = kCremaDirectBindTag | offset;
++	if (m_state.currentVertexBinding[bufferIndex].offset != tagged)
++	{
++		m_state.currentVertexBinding[bufferIndex].offset = tagged;
++		VkDeviceSize bindOffset = offset;
++		vkCmdBindVertexBuffers(m_state.currentCommandBuffer, bufferIndex, 1, &m_cremaGuestMem, &bindOffset);
++	}
++	return true;
++}
++#endif
++
 +#ifdef __ORBIS__
 +void CremaTraceUpload(uint32 bufferOffset, uint32 size, uint32 stagingIndex, uint32 stagingOffset, const uint8* data); // VulkanRendererCore.cpp
 +#endif
@@ -5918,7 +6183,7 @@ index 599190a4..08f30163 100644
  void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset)
  {
  	draw_endRenderPass();
-@@ -3883,6 +4176,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
+@@ -3883,6 +4275,9 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
  
  	auto uploadResv = vkMemAllocator.AllocateBufferMemory(size, 256);
  	memcpy(uploadResv.memPtr, buffer, size);
@@ -5928,7 +6193,7 @@ index 599190a4..08f30163 100644
  
  	vkMemAllocator.FlushReservation(uploadResv);
  
-@@ -4379,6 +4675,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
+@@ -4379,6 +4774,6 @@ VKRObjectDescriptorSet::VKRObjectDescriptorSet()
  VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
  {
  	auto vkr = VulkanRenderer::GetInstance();
@@ -5937,7 +6202,7 @@ index 599190a4..08f30163 100644
  	performanceMonitor.vk.numDescriptorSets.decrement();
  }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
-index d975e116..d601688d 100644
+index d975e116..0c8e2f07 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
 @@ -212,7 +212,7 @@ public:
@@ -5958,7 +6223,7 @@ index d975e116..d601688d 100644
  	VkDescriptorSet backbufferBlit_createDescriptorSet(VkDescriptorSetLayout descriptor_set_layout, LatteTextureViewVk* texViewVk, bool useLinearTexFilter);
  
  	robin_hood::unordered_flat_map<uint64, robin_hood::unordered_flat_map<uint64, PipelineInfo*> > m_pipeline_info_cache; // using robin_hood::unordered_flat_map is twice as fast (1-2% overall CPU time reduction)
-@@ -335,10 +337,18 @@ public:
+@@ -335,10 +337,21 @@ public:
  	// renderer interface
  	void bufferCache_init(const sint32 bufferSize) override;
  	void bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset) override;
@@ -5973,11 +6238,14 @@ index d975e116..d601688d 100644
  	void buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size);
 +#ifdef __ORBIS__
 +	void CremaBindVertexCopy(MPTR address, uint32 size, uint32 bufferIndex); // Crema setting vertex_copy
++	// Crema setting direct_vertex: binds a vertex buffer straight from the Wii U's memory when it may
++	// be read from there (LatteBufferCache_CremaDirectUsable); false: use the buffer cache
++	bool CremaBindVertexDirect(MPTR address, uint32 size, uint32 bufferIndex);
 +#endif
  	std::pair<VkBuffer, uint32> buffer_genStrideWorkaroundVertexBuffer(MPTR buffer, uint32 size, uint32 oldStride);
  	void buffer_bindUniformBuffer(LatteConst::ShaderType shaderType, uint32 bufferIndex, uint32 offset, uint32 size) override;
  
-@@ -434,6 +444,7 @@ private:
+@@ -434,6 +447,7 @@ private:
  	VkRenderPass m_imguiRenderPass = VK_NULL_HANDLE;
  
  	VkDescriptorPool m_descriptorPool;
@@ -5985,7 +6253,7 @@ index d975e116..d601688d 100644
  
    public:
  	struct QueueFamilyIndices
-@@ -475,6 +486,7 @@ private:
+@@ -475,6 +489,7 @@ private:
  		struct
  		{
  			bool shaderRoundingModeRTEFloat32{ false };
@@ -5993,7 +6261,25 @@ index d975e116..d601688d 100644
  		}shaderFloatControls; // from VK_KHR_shader_float_controls
  
  		struct
-@@ -955,6 +967,7 @@ private:
+@@ -656,6 +671,17 @@ private:
+ 	VkBuffer m_importedMem = VK_NULL_HANDLE;
+ 	VkDeviceMemory m_importedMemMemory = VK_NULL_HANDLE;
+ 	MPTR m_importedMemBaseAddress = 0;
++#ifdef __ORBIS__
++	// Crema setting direct_vertex: the Wii U's MEM2 imported as a vertex buffer, separately from
++	// Cemu's m_importedMem path (which also moves uniforms and streamout and stays compiled out).
++	// Bound vertex buffers from it are tagged in currentVertexBinding as kCremaDirectBindTag | offset
++	// (buffer cache offsets stay far below it).
++	static constexpr uint32 kCremaDirectBindTag = 0x80000000;
++	VkBuffer m_cremaGuestMem = VK_NULL_HANDLE;
++	VkDeviceMemory m_cremaGuestMemMemory = VK_NULL_HANDLE;
++	MPTR m_cremaGuestMemBase = 0;
++	void CremaImportGuestMemory();
++#endif
+ 
+ 	// command buffer, garbage collection, synchronization
+ 	static constexpr uint32 kCommandBufferPoolSize = 128;
+@@ -955,6 +981,7 @@ private:
  public:
  	bool GetDisableMultithreadedCompilation() const { return m_featureControl.disableMultithreadedCompilation; }
  	bool HasSPRIVRoundingModeRTE32() const { return m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32; }
@@ -6002,7 +6288,7 @@ index d975e116..d601688d 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee8..e13a89ac 100644
+index 512ebee8..d50e3238 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 @@ -576,6 +576,14 @@ uint64 VulkanRenderer::GetDescriptorSetStateHash(LatteDecompilerShader* shader)
@@ -6426,7 +6712,7 @@ index 512ebee8..e13a89ac 100644
  	// draw
  	if (hostIndexType != INDEX_TYPE::NONE)
  		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
-@@ -1746,12 +2006,486 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +2006,487 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -6577,7 +6863,8 @@ index 512ebee8..e13a89ac 100644
 +	put32(vbAddr);
 +	put32(stride);
 +	put32(vbBindOffset); // where the GPU reads it in the buffer cache
-+	if (vbAddr && vbBytes && vbBindOffset != 0xFFFFFFFF)
++	// only bindings into the buffer cache (0xFFFFFFFF: Copy Every Draw, 0x8xxxxxxx: Direct Vertex Data)
++	if (vbAddr && vbBytes && vbBindOffset < 0x80000000)
 +	{
 +		uint32& known = s_cremaTraceVbRanges[vbBindOffset];
 +		known = std::max(known, vbBytes);
@@ -6602,7 +6889,7 @@ index 512ebee8..e13a89ac 100644
 +		put32(bytes);
 +		if (bytes)
 +			put(memory_getPointerFromPhysicalOffset(r[0]), bytes);
-+		if (bytes && bindOffset != 0xFFFFFFFF) // 0xFFFFFFFF: bound outside the buffer cache (Vertex Data: Copy Every Draw)
++		if (bytes && bindOffset < 0x80000000) // else bound outside the buffer cache (0xFFFFFFFF: Copy Every Draw, 0x8xxxxxxx: Direct Vertex Data)
 +		{
 +			uint32& known = s_cremaTraceVbRanges[bindOffset];
 +			known = std::max(known, bytes);
@@ -6913,7 +7200,7 @@ index 512ebee8..e13a89ac 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2569,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2570,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
@@ -18450,10 +18737,10 @@ index 00000000..a6d4cc6e
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 00000000..9ee8e9cc
+index 00000000..ea860d99
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,785 @@
+@@ -0,0 +1,792 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -18501,6 +18788,7 @@ index 00000000..9ee8e9cc
 +// Crema setting float_inputs: Exact clears denormals-are-zero in the guest threads (coreinit_Thread.cpp)
 +bool g_crema_exact_float_inputs = false;
 +extern int g_crema_vertex_resync; // Cafe/HW/Latte/Core/LatteBufferCache.cpp
++extern int g_crema_direct_vertex; // Cafe/HW/Latte/Core/LatteBufferCache.cpp: Direct Vertex Data
 +
 +#include <algorithm>
 +#include <atomic>
@@ -18588,6 +18876,8 @@ index 00000000..9ee8e9cc
 +			"Recompiled: the indexed quantized loads and stores (psq_lx, psq_stx) run as PS4 code, faster (Ninja Gaiden 3). Interpreted: as Cemu on a PC does. Try Interpreted if a game's models or animations come out wrong."},
 +		{"core_layout", "Core Layout", "Emulation", {{"spread", "Spread"}, {"clustered", "Clustered"}, {"split", "Split"}}, "spread", false,
 +			"Which PS4 cores the emulation runs on. The PS4's CPU is two modules of four cores, each with its own cache, and passing work between the modules is several times slower than inside one. Spread: every thread on any core, as the PS4 decides. Clustered: the three emulated Wii U cores and the GPU thread, which pass work to each other all the time, share the first module. Split: as Clustered, and everything else (shader compiling, the recompiler, the graphics driver) on the second module, so it never pushes their data out of the cache. Compare with the FPS counter."},
++		{"direct_vertex", "Direct Vertex Data (Experimental)", "Emulation", {{"off", "Off"}, {"static", "Static Data"}, {"all", "All Data"}}, "off", false,
++			"Where the GPU reads the game's models from. Off (Cemu): from copies the GPU thread keeps in a buffer cache, checked and updated as the game changes them. Static Data: models the game hasn't changed for a few frames are read straight from the Wii U's memory (the PS4's CPU and GPU share one memory) - less work for the GPU thread and no copies; everything else as Off. All Data: every model straight from memory, also the ones the game rewrites each frame (fastest, but a shape the game changes while the GPU still draws it can flicker or tear for a frame). If a game crashes, shows torn or flickering shapes, or stops, set Off. Takes effect at the next game start."},
 +		{"core_balancing", "Core Balancing (Experimental)", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: when the Wii U's core 1 has nothing to run, it runs threads waiting for the busy cores 0 and 2 (Wii U games pin their threads to cores, and the PS4 runs them at different speeds). Faster in Breath of the Wild. A game that relies on its threads' cores may crash or misbehave: then Off."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -19161,6 +19451,10 @@ index 00000000..9ee8e9cc
 +	g_crema_diag_log = get("diag_log") == "on";
 +	g_crema_exact_float_inputs = get("float_inputs") == "exact";
 +	{
++		const std::string direct = get("direct_vertex");
++		g_crema_direct_vertex = direct == "all" ? 2 : direct == "static" ? 1 : 0;
++	}
++	{
 +		const std::string resync = get("vertex_resync");
 +		g_crema_vertex_resync = resync == "draw" ? 2 : resync == "frame" ? 1 : 0;
 +	}
@@ -19233,9 +19527,9 @@ index 00000000..9ee8e9cc
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, speed preset {}, core layout {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, speed preset {}, core layout {}, direct vertex data {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), preset, get("core_layout"), get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), preset, get("core_layout"), get("direct_vertex"), get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings
@@ -28440,12 +28734,26 @@ index 00000000..2eb99e46
 +{
 +	return sCurrentFiber->m_privateData;
 +}
+diff --git a/src/util/MemMapper/MemMapper.h b/src/util/MemMapper/MemMapper.h
+index be307384..a0507de7 100644
+--- a/src/util/MemMapper/MemMapper.h
++++ b/src/util/MemMapper/MemMapper.h
+@@ -21,4 +21,8 @@ namespace MemMapper
+ 
+ 	void* AllocateMemory(void* baseAddr, size_t size, PAGE_PERMISSION permissionFlags, bool fromReservation = false);
+ 	void FreeMemory(void* baseAddr, size_t size, bool fromReservation = false);
++#if defined(__ORBIS__)
++	// MemMapperPS4.cpp: lets the GPU read committed memory where it is (Crema setting direct_vertex)
++	bool CremaSetGpuReadable(void* baseAddr, size_t size);
++#endif
+ };
+\ No newline at end of file
 diff --git a/src/util/MemMapper/MemMapperPS4.cpp b/src/util/MemMapper/MemMapperPS4.cpp
 new file mode 100644
-index 00000000..ff346d06
+index 00000000..b558deff
 --- /dev/null
 +++ b/src/util/MemMapper/MemMapperPS4.cpp
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,280 @@
 +// PS4 memory mapping. Large PROT_NONE mmaps fail on the PS4 (4 GiB+ is ENOMEM) and regular
 +// flexible memory is only ~255 MiB, so:
 +//  - reservations come from sceKernelReserveVirtualRange (placed away from 0x200000000, where
@@ -28468,6 +28776,16 @@ index 00000000..ff346d06
 +	int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t* physOut);
 +	int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
 +	int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align);
++	struct CremaVirtualQueryInfo
++	{
++		void* start;
++		void* end;
++		off_t offset;
++		int32_t protection, memoryType;
++		uint32_t isFlexible : 1, isDirect : 1, isStack : 1, isPooled : 1, isCommitted : 1;
++		char name[32];
++	};
++	int32_t sceKernelVirtualQuery(const void* addr, int32_t flags, CremaVirtualQueryInfo* info, size_t infoSize);
 +}
 +
 +namespace MemMapper
@@ -28476,6 +28794,7 @@ index 00000000..ff346d06
 +	constexpr int32_t kMapFixed = 0x10;
 +	constexpr int32_t kMemoryTypeWbOnion = 0;
 +	constexpr int32_t kProtCpuRead = 0x1, kProtCpuWrite = 0x2, kProtCpuExec = 0x4;
++	constexpr int32_t kProtGpuRead = 0x10;
 +	constexpr off_t kNotCommitted = -1;
 +
 +	struct Reservation
@@ -28486,6 +28805,16 @@ index 00000000..ff346d06
 +	};
 +	std::mutex sMutex;
 +	std::vector<Reservation> sReservations;
++	// ranges the GPU reads directly (CremaSetGpuReadable): their pages are committed GPU-readable
++	std::vector<std::pair<uintptr_t, uintptr_t>> sGpuReadable;
++
++	static int32_t GpuBits(uintptr_t addr, size_t len)
++	{
++		for (auto& [begin, end] : sGpuReadable)
++			if (addr < end && addr + len > begin)
++				return kProtGpuRead;
++		return 0;
++	}
 +	uintptr_t sNextHint = 0x4000000000ull; // the app heap lives at 0x1000000000+, vss at 0x2000000000
 +
 +	size_t GetPageSize()
@@ -28575,7 +28904,7 @@ index 00000000..ff346d06
 +		{
 +			if (res.phys[i] != kNotCommitted)
 +			{
-+				sceKernelMprotect((void*)(res.base + i * kPage), kPage, prot);
++				sceKernelMprotect((void*)(res.base + i * kPage), kPage, prot | GpuBits(res.base + i * kPage, kPage));
 +				i++;
 +				continue;
 +			}
@@ -28591,7 +28920,8 @@ index 00000000..ff346d06
 +				return false;
 +			}
 +			void* addr = (void*)(res.base + i * kPage);
-+			r = sceKernelMapDirectMemory(&addr, len, prot | kProtCpuRead | kProtCpuWrite, kMapFixed, phys, kPage);
++			const int32_t gpu = GpuBits(res.base + i * kPage, len);
++			r = sceKernelMapDirectMemory(&addr, len, prot | kProtCpuRead | kProtCpuWrite | gpu, kMapFixed, phys, kPage);
 +			if (r != 0 || addr != (void*)(res.base + i * kPage))
 +			{
 +				cemuLog_log(LogType::Force, "MemMapper: mapping {:#x} bytes at {:#x} failed ({:#x})", len, res.base + i * kPage, (uint32)r);
@@ -28600,7 +28930,7 @@ index 00000000..ff346d06
 +			}
 +			memset(addr, 0, len); // direct memory isn't zeroed; committed memory must read as zero
 +			if ((prot & kProtCpuWrite) == 0)
-+				sceKernelMprotect(addr, len, prot);
++				sceKernelMprotect(addr, len, prot | gpu);
 +			for (size_t p = i; p < runEnd; p++)
 +				res.phys[p] = phys + (off_t)((p - i) * kPage);
 +			i = runEnd;
@@ -28654,6 +28984,54 @@ index 00000000..ff346d06
 +			// unmapping also dropped the reservation of this page: take it back
 +			sceKernelReserveVirtualRange(&addr, kPage, kMapFixed, kPage);
 +		}
++	}
++
++	// Crema setting direct_vertex: lets the GPU read [baseAddr, +size) of a reservation where it is
++	// (Renderer/Vulkan: the Wii U's memory imported with VK_EXT_external_memory_host). All of it
++	// must be committed already - a GPU read from an uncommitted page is a GPU page fault, which
++	// ends the app - and stays CPU read/write; pages committed there later are GPU-readable too.
++	bool CremaSetGpuReadable(void* baseAddr, size_t size)
++	{
++		std::lock_guard _l(sMutex);
++		const uintptr_t begin = (uintptr_t)baseAddr;
++		Reservation* res = FindReservation(begin);
++		if (!res || begin % kPage || size % kPage || begin + size > res->base + res->size)
++		{
++			cemuLog_log(LogType::Force, "MemMapper: GPU access to {:#x} bytes at {} refused: not whole pages of one reservation", size, baseAddr);
++			return false;
++		}
++		const size_t first = (begin - res->base) / kPage, last = first + size / kPage;
++		for (size_t i = first; i < last; i++)
++		{
++			if (res->phys[i] == kNotCommitted)
++			{
++				cemuLog_log(LogType::Force, "MemMapper: GPU access refused: page {:#x} isn't committed", res->base + i * kPage);
++				return false;
++			}
++		}
++		const int32_t r = sceKernelMprotect(baseAddr, size, kProtCpuRead | kProtCpuWrite | kProtGpuRead);
++		if (r != 0)
++		{
++			cemuLog_log(LogType::Force, "MemMapper: making {:#x} bytes at {} GPU-readable failed ({:#x})", size, baseAddr, (uint32)r);
++			sceKernelMprotect(baseAddr, size, kProtCpuRead | kProtCpuWrite);
++			return false;
++		}
++		// the kernel must really have given the GPU access (else its first read is a page fault):
++		// check the protection the first and the last page now have
++		for (uintptr_t page : {begin, begin + size - kPage})
++		{
++			CremaVirtualQueryInfo info{};
++			const int32_t q = sceKernelVirtualQuery((const void*)page, 0, &info, sizeof(info));
++			if (q != 0 || (info.protection & kProtGpuRead) == 0)
++			{
++				cemuLog_log(LogType::Force, "MemMapper: {:#x} isn't GPU-readable after all (query {:#x}, protection {:#x})", page, (uint32)q, (uint32)info.protection);
++				sceKernelMprotect(baseAddr, size, kProtCpuRead | kProtCpuWrite);
++				return false;
++			}
++		}
++		sGpuReadable.emplace_back(begin, begin + size);
++		cemuLog_log(LogType::Force, "MemMapper: {:#x} bytes at {} are GPU-readable", size, baseAddr);
++		return true;
 +	}
 +};
 diff --git a/src/util/helpers/Semaphore.h b/src/util/helpers/Semaphore.h

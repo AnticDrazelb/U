@@ -109,6 +109,8 @@ struct amdgpu_bo {
    bool tail_reported;
    bool gpu_ro; /* mapped GPU read-only (command buffers) */
    bool write_combined; /* garlic memory (VRAM); else CPU-cached onion */
+   bool user_mem; /* the app's own memory (VK_EXT_external_memory_host): GPU VA = its CPU address,
+                   * nothing of ours to map, unmap or release (ac_drm_create_bo_from_user_mem) */
 };
 
 struct amdgpu_va {
@@ -362,11 +364,11 @@ ps4_check_overlaps(ac_drm_device *dev, FILE *f)
    unsigned found = 0;
    for (unsigned a = 1; a < dev->num_bos && found < 20; a++) {
       struct amdgpu_bo *x = dev->bos[a];
-      if (!x)
+      if (!x || x->user_mem)
          continue;
       for (unsigned c = a + 1; c < dev->num_bos && found < 20; c++) {
          struct amdgpu_bo *y = dev->bos[c];
-         if (y && x->phys < y->phys + (off_t)y->size && y->phys < x->phys + (off_t)x->size) {
+         if (y && !y->user_mem && x->phys < y->phys + (off_t)y->size && y->phys < x->phys + (off_t)x->size) {
             fprintf(f, "  PHYS OVERLAP: bo %u [%#llx+%#llx] and bo %u [%#llx+%#llx]\n", x->handle,
                     (unsigned long long)x->phys, (unsigned long long)x->size, y->handle,
                     (unsigned long long)y->phys, (unsigned long long)y->size);
@@ -1233,6 +1235,28 @@ ps4_bo(ac_drm_device *dev, uint32_t handle)
    return handle && handle < num ? __atomic_load_n(&bos[handle], __ATOMIC_ACQUIRE) : NULL;
 }
 
+/* Gives a new buffer its handle. */
+static void
+ps4_register_bo(ac_drm_device *dev, struct amdgpu_bo *bo)
+{
+   simple_mtx_lock(&dev->lock);
+   if (dev->num_bos + 1 >= dev->bos_cap) {
+      const unsigned cap = MAX2(dev->bos_cap * 2, 1024);
+      struct amdgpu_bo **bigger = calloc(cap, sizeof(*bigger));
+      if (dev->num_bos)
+         memcpy(bigger, dev->bos, dev->num_bos * sizeof(*bigger));
+      /* The old table is deliberately kept (see struct ac_drm_device). */
+      __atomic_store_n(&dev->bos, bigger, __ATOMIC_RELEASE);
+      dev->bos_cap = cap;
+   }
+   if (dev->num_bos == 0)
+      dev->num_bos = 1; /* handle 0 is invalid */
+   bo->handle = dev->num_bos;
+   dev->bos[bo->handle] = bo;
+   __atomic_store_n(&dev->num_bos, bo->handle + 1, __ATOMIC_RELEASE);
+   simple_mtx_unlock(&dev->lock);
+}
+
 int
 ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *out)
 {
@@ -1281,22 +1305,7 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
       return -ENOMEM;
    }
 
-   simple_mtx_lock(&dev->lock);
-   if (dev->num_bos + 1 >= dev->bos_cap) {
-      const unsigned cap = MAX2(dev->bos_cap * 2, 1024);
-      struct amdgpu_bo **bigger = calloc(cap, sizeof(*bigger));
-      if (dev->num_bos)
-         memcpy(bigger, dev->bos, dev->num_bos * sizeof(*bigger));
-      /* The old table is deliberately kept (see struct ac_drm_device). */
-      __atomic_store_n(&dev->bos, bigger, __ATOMIC_RELEASE);
-      dev->bos_cap = cap;
-   }
-   if (dev->num_bos == 0)
-      dev->num_bos = 1; /* handle 0 is invalid */
-   bo->handle = dev->num_bos;
-   dev->bos[bo->handle] = bo;
-   __atomic_store_n(&dev->num_bos, bo->handle + 1, __ATOMIC_RELEASE);
-   simple_mtx_unlock(&dev->lock);
+   ps4_register_bo(dev, bo);
 
    out->abo = bo;
    __atomic_add_fetch(&dev->bo_bytes, bo->size, __ATOMIC_RELAXED);
@@ -1321,6 +1330,13 @@ ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
 static void
 ps4_do_free(ac_drm_device *dev, struct amdgpu_bo *b)
 {
+   if (b->user_mem) {
+      /* the app's memory stays the app's: only the handle goes */
+      ps4_record(dev, 'F', b, b->last_va, b->size);
+      dev->bos[b->handle] = NULL;
+      free(b);
+      return;
+   }
    if (b->cpu_owned)
       sceKernelMunmap(b->cpu, b->size);
    const int rr = sceKernelReleaseDirectMemory(b->phys, b->size + PS4_TAIL);
@@ -1357,12 +1373,47 @@ ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type, uint32_t s
    return -ENOSYS;
 }
 
+/* User memory (VK_EXT_external_memory_host): the app's own direct memory, which it has already
+ * made GPU-readable (Crema: the Wii U's memory, MemMapper::CremaSetGpuReadable). GPU addresses
+ * are CPU addresses here and direct memory can't be mapped a second time, so the buffer's GPU
+ * address must be the memory's own: RADV's next va_range_alloc on this thread
+ * (radv_amdgpu_winsys_bo_from_ptr: create, va_range_alloc, export, MAP - in that order) is
+ * answered with it, and the MAP, UNMAP and free leave the memory alone. */
+static __thread uint64_t ps4_pending_user_va, ps4_pending_user_size;
+
 int
 ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_drm_bo *bo)
 {
-   /* GPU addresses are CPU addresses here, but user memory can't be mapped a second time at the
-    * address the winsys picks. */
-   return -ENOSYS;
+   const uint64_t addr = (uintptr_t)cpu;
+   const uint64_t aligned = align64(size, PS4_PAGE);
+   const bool in_window = (addr < dev->va_start + PS4_VA_SIZE && addr + aligned > dev->va_start) ||
+                          (addr < dev->va32_start + PS4_VA32_SIZE * 2 && addr + aligned > dev->va32_start);
+   if (!size || (addr % PS4_PAGE) || addr + aligned > PS4_GPU_VA_LIMIT || in_window) {
+      ps4_log("radv/ps4: user memory %#llx (+%#llx) refused: %s\n", (unsigned long long)addr,
+              (unsigned long long)size,
+              !size || (addr % PS4_PAGE) ? "not page aligned"
+              : in_window                ? "inside the GPU VA window"
+                                         : "beyond the GPU's address range");
+      return -EINVAL;
+   }
+   struct amdgpu_bo *b = calloc(1, sizeof(*b));
+   if (!b)
+      return -ENOMEM;
+   b->size = aligned;
+   b->phys = -1;
+   b->pad_phys = -1;
+   b->heap = AMDGPU_GEM_DOMAIN_GTT;
+   b->cpu = cpu;
+   b->last_va = addr;
+   b->user_mem = true;
+   ps4_register_bo(dev, b);
+   bo->abo = b;
+   ps4_pending_user_va = addr;
+   ps4_pending_user_size = size;
+   ps4_record(dev, 'A', b, addr, aligned);
+   ps4_log("radv/ps4: bo %u: user memory at %#llx (%#llx bytes)\n", b->handle,
+           (unsigned long long)addr, (unsigned long long)aligned);
+   return 0;
 }
 
 int
@@ -1486,6 +1537,16 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
                  (unsigned long long)offset, (unsigned long long)size);
          return -EINVAL;
       }
+      if (b->user_mem) {
+         /* already mapped (by the app, GPU-readable): only its own address is right */
+         if (offset == 0 && addr == (uintptr_t)b->cpu) {
+            ps4_record(dev, 'M', b, addr, size);
+            return 0;
+         }
+         ps4_log("radv/ps4: user memory bo %u mapped at %#llx (+%#llx) instead of %p - refused\n",
+                 bo_handle, (unsigned long long)addr, (unsigned long long)offset, b->cpu);
+         return -EINVAL;
+      }
       void *a = (void *)(uintptr_t)addr;
       const uint64_t cpu = (uintptr_t)b->cpu;
       if (b->cpu && addr != cpu) {
@@ -1559,6 +1620,12 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
    }
    case AMDGPU_VA_OP_UNMAP:
    case AMDGPU_VA_OP_CLEAR: {
+      struct amdgpu_bo *ub = ps4_bo(dev, bo_handle);
+      if (ub && ub->user_mem) {
+         /* never munmap the app's memory (ps4_do_unmap would, and reserve the hole) */
+         ps4_record(dev, 'U', ub, addr, size);
+         return 0;
+      }
       ps4_defer(dev, (struct ps4_deferred){.op = 'U', .bo = ps4_bo(dev, bo_handle),
                                            .handle = bo_handle, .addr = addr, .size = size});
       return 0;
@@ -1639,6 +1706,16 @@ ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type
                       uint64_t *va_base_allocated, amdgpu_va_handle *va_range_handle,
                       uint64_t flags)
 {
+   if (ps4_pending_user_va) {
+      /* the address of the user memory just created on this thread (ac_drm_create_bo_from_user_mem) */
+      const uint64_t user_va = ps4_pending_user_va, user_size = ps4_pending_user_size;
+      ps4_pending_user_va = 0;
+      if (size == user_size && !va_base_required && !(flags & AMDGPU_VA_RANGE_32_BIT)) {
+         *va_base_allocated = user_va;
+         *va_range_handle = NULL; /* ac_drm_va_range_free(NULL): nothing to give back */
+         return 0;
+      }
+   }
    struct util_vma_heap *heap = flags & AMDGPU_VA_RANGE_32_BIT ? &dev->va32_heap : &dev->va_heap;
    size = align64(size, PS4_PAGE) + PS4_TAIL;
    const uint64_t align = MAX2(util_next_power_of_two64(MAX2(va_base_alignment, 1)), PS4_PAGE);

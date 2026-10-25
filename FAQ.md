@@ -116,6 +116,11 @@ set *Apply To* to *This Game*; the game keeps its own copy from then on.
 - **Core Layout**: *Clustered* keeps the emulated Wii U cores and the GPU thread on one of the
   PS4 CPU's two 4-core modules (one shared cache, fast hand-offs); *Split* also moves everything
   else to the other module. Compare against *Spread* with the FPS counter.
+- **Direct Vertex Data (Experimental)**: the GPU reads the game's models straight from the Wii U's
+  memory instead of from copies the GPU thread keeps. *Static Data* does it only for models that
+  haven't changed for a few frames; *All Data* for everything (faster, but a model the game is
+  rewriting can flicker for a frame). Set *Off* if a game crashes or shows torn shapes. Details in
+  [docs/performance-notes.md](docs/performance-notes.md).
 - **Texture Quality**: *Reduced* or *Low* reads textures from their smaller mipmaps with simpler
   filtering: less GPU memory traffic, blurrier surfaces.
 - **Diagnostics**: keep everything *Off* for the best speed. Turn them on only to report a problem.
