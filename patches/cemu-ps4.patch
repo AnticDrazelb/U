@@ -3625,10 +3625,10 @@ index a25e7711..8fabdc51 100644
  #endif
  	options.strictMul = g_current_game_profile->GetAccurateShaderMul() != AccurateShaderMulOption::False;
 diff --git a/src/Cafe/HW/Latte/Core/LatteTexture.cpp b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-index 43b116ff..dc41f6e5 100644
+index 43b116ff..b287adeb 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTexture.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteTexture.cpp
-@@ -511,6 +511,30 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
+@@ -511,6 +511,34 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
  
  }
  
@@ -3636,6 +3636,10 @@ index 43b116ff..dc41f6e5 100644
 +extern uint32 g_crema_trace_frames_left; // Renderer/Vulkan/VulkanRendererCore.cpp: frame trace
 +extern uint32 g_crema_trace_frame;
 +bool g_crema_sync_depth_skip = false; // Crema setting texture_sync = nodepth (gui/ps4/launcher/CremaSettings.cpp)
++// Crema setting render_scale (CremaSettings.cpp): the size of the game's screen-sized surfaces,
++// 1 = as the game makes them (LatteTexture::LatteTexture; back to 1 by LatteThread.cpp when a
++// graphic pack sets texture sizes itself)
++float g_crema_render_scale = 1.0f;
 +
 +// a slice copied from one texture to another that overlaps it in memory: logged while tracing, and
 +// with texture_sync = nodepth not done between a depth buffer and a colour texture
@@ -3659,7 +3663,7 @@ index 43b116ff..dc41f6e5 100644
  void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
  {
  	// note: Currently this function assumes that only one other texture is updated per slice/mip (if multiple overlap, we should merge the one with the latest timestamp the latest of each individually)
-@@ -536,7 +560,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
+@@ -536,7 +564,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
  					// baseTexture is target texture
  					if (baseSliceMipInfo->lastDynamicUpdate < subSliceMipInfo->lastDynamicUpdate)
  					{
@@ -3671,7 +3675,7 @@ index 43b116ff..dc41f6e5 100644
  						baseSliceMipInfo->lastDynamicUpdate = subSliceMipInfo->lastDynamicUpdate;
  						if(subTexture->isUpdatedOnGPU)
  							LatteTC_FlagSliceAsGPUUpdated(texture, baseSliceMipInfo->sliceIndex, baseSliceMipInfo->mipIndex);
-@@ -547,7 +575,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
+@@ -547,7 +579,11 @@ void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
  					// subTexture is target texture
  					if (subSliceMipInfo->lastDynamicUpdate < baseSliceMipInfo->lastDynamicUpdate)
  					{
@@ -3683,7 +3687,7 @@ index 43b116ff..dc41f6e5 100644
  						subSliceMipInfo->lastDynamicUpdate = baseSliceMipInfo->lastDynamicUpdate;
  						if (baseTexture->isUpdatedOnGPU)
  							LatteTC_FlagSliceAsGPUUpdated(texture, subSliceMipInfo->sliceIndex, subSliceMipInfo->mipIndex);
-@@ -983,8 +1015,18 @@ void LatteTexture_RecreateTextureWithDifferentMipSliceCount(LatteTexture* textur
+@@ -983,8 +1019,18 @@ void LatteTexture_RecreateTextureWithDifferentMipSliceCount(LatteTexture* textur
  // create new texture representation
  // if allowCreateNewDataTexture is true, a new texture will be created if necessary. If it is false, only existing textures may be used, except if a data-compatible version of the requested texture already exists and it's not view compatible (todo - we should differentiate between Latte compatible views and renderer compatible)
  // the returned view will map to the provided mip and slice range within the created texture, this is to match the behavior of lookupSliceEx
@@ -3702,7 +3706,7 @@ index 43b116ff..dc41f6e5 100644
  	if (format == Latte::E_GX2SURFFMT::INVALID_FORMAT)
  	{
  		cemuLog_logDebug(LogType::Force, "LatteTexture_CreateMapping(): Invalid format");
-@@ -1168,10 +1210,34 @@ LatteTextureView* LatteTC_GetTextureSliceViewOrTryCreate(MPTR srcImagePtr, MPTR
+@@ -1168,10 +1214,34 @@ LatteTextureView* LatteTC_GetTextureSliceViewOrTryCreate(MPTR srcImagePtr, MPTR
  void LatteTexture_UpdateDataToLatest(LatteTexture* texture)
  {
  	if (LatteTC_HasTextureChanged(texture))
@@ -3737,7 +3741,7 @@ index 43b116ff..dc41f6e5 100644
  		LatteTexture_UpdateCacheFromDynamicTextures(texture);
  		texture->reloadFromDynamicTextures = false;
  	}
-@@ -1233,6 +1299,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+@@ -1233,6 +1303,21 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
  	_AddTextureToGlobalList(this);
  	if (depth < 1)
  		depth = 1;
@@ -3759,6 +3763,32 @@ index 43b116ff..dc41f6e5 100644
  	// setup texture object
  	this->physAddress = physAddress;
  	this->dim = dim;
+@@ -1318,6 +1403,25 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
+ 			}
+ 		}
+ 	}
++#if defined(__ORBIS__)
++	// Crema: Render Resolution below 100% - the game's screen-sized surfaces (TV and GamePad colour
++	// and depth buffers, and their half and quarter-size effect buffers: anything 16:9) are made
++	// smaller, as a resolution graphic pack's texture rules would. Linear surfaces (video frames,
++	// CPU readbacks) and compressed textures (never rendered to) keep their size. A depth buffer's
++	// height is padded to 8 rows (LatteRenderTarget.cpp), so 8 rows off still matches its colour buffer
++	const sint32 crema169Height = ((sint32)width * 9 + 8) / 16;
++	if (g_crema_render_scale < 1.0f && !this->overwriteInfo.hasResolutionOverwrite &&
++		(dim == Latte::E_DIM::DIM_2D || dim == Latte::E_DIM::DIM_2D_MSAA) &&
++		tileMode != Latte::E_HWTILEMODE::TM_LINEAR_GENERAL && tileMode != Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED &&
++		!Latte::IsCompressedFormat(format) && width >= 256 &&
++		std::abs((sint32)height - crema169Height) <= std::max<sint32>(8, crema169Height * 3 / 100))
++	{
++		this->overwriteInfo.hasResolutionOverwrite = true;
++		this->overwriteInfo.width = std::max<sint32>(1, (sint32)((float)width * g_crema_render_scale + 0.5f));
++		this->overwriteInfo.height = std::max<sint32>(1, (sint32)((float)height * g_crema_render_scale + 0.5f));
++		this->overwriteInfo.depth = depth;
++	}
++#endif
+ 	// determine if this texture should ever be mirrored to CPU RAM
+ 	if (this->tileMode == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
+ 	{
 diff --git a/src/Cafe/HW/Latte/Core/LatteTextureCache.cpp b/src/Cafe/HW/Latte/Core/LatteTextureCache.cpp
 index b1ed968b..10a6065c 100644
 --- a/src/Cafe/HW/Latte/Core/LatteTextureCache.cpp
@@ -3838,7 +3868,7 @@ index 7b8a0b7b..6a0b4178 100644
  		{
  			debug_printf("Reload texture 0x%08x res %dx%d memRange %08x-%08x SwizzleChange: %s\n", textureView->baseTexture->physAddress, textureView->baseTexture->width, textureView->baseTexture->height, textureView->baseTexture->texDataPtrLow, textureView->baseTexture->texDataPtrHigh, swizzleChanged ? "yes" : "no");
 diff --git a/src/Cafe/HW/Latte/Core/LatteThread.cpp b/src/Cafe/HW/Latte/Core/LatteThread.cpp
-index 743ab679..b1fc4943 100644
+index 743ab679..31c755eb 100644
 --- a/src/Cafe/HW/Latte/Core/LatteThread.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteThread.cpp
 @@ -18,6 +18,10 @@
@@ -3863,6 +3893,34 @@ index 743ab679..b1fc4943 100644
  	sint32 w,h;
  	WindowSystem::GetWindowPhysSize(w,h);
  
+@@ -192,6 +200,27 @@ int Latte_ThreadEntry()
+ 			}
+ 		}
+ 	}
++#if defined(__ORBIS__)
++	// Crema: Render Resolution is left to a graphic pack that sets texture sizes itself (a resolution
++	// pack), or the game's surfaces would end up half the pack's size and half Crema's
++	extern float g_crema_render_scale; // LatteTexture.cpp
++	if (g_crema_render_scale < 1.0f)
++	{
++		for (auto& pack : GraphicPack2::GetActiveGraphicPacks())
++		{
++			for (auto& rule : pack->GetTextureRules())
++			{
++				if (g_crema_render_scale < 1.0f && (rule.overwrite_settings.width >= 0 || rule.overwrite_settings.height >= 0))
++				{
++					cemuLog_log(LogType::Force, "Render Resolution {}%: off, graphic pack \"{}\" sets the resolution", (int)(g_crema_render_scale * 100.0f + 0.5f), pack->GetName());
++					g_crema_render_scale = 1.0f;
++				}
++			}
++		}
++		if (g_crema_render_scale < 1.0f)
++			cemuLog_log(LogType::Force, "Render Resolution {}%", (int)(g_crema_render_scale * 100.0f + 0.5f));
++	}
++#endif
+ 	// load disk shader cache
+     LatteShaderCache_Load();
+ 	// init registers
 diff --git a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp b/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp
 index 8b1348c9..bae5c2e6 100644
 --- a/src/Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.cpp
@@ -5797,10 +5855,25 @@ index d975e116..d601688d 100644
  	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
  	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
 diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-index 512ebee8..201d3fdd 100644
+index 512ebee8..e13a89ac 100644
 --- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
 +++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp
-@@ -616,14 +616,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
+@@ -576,6 +576,14 @@ uint64 VulkanRenderer::GetDescriptorSetStateHash(LatteDecompilerShader* shader)
+ 	return hash;
+ }
+ 
++#if defined(__ORBIS__)
++// Crema setting texture_quality (gui/ps4/launcher/CremaSettings.cpp): mip levels added to the LOD
++// of mipmapped textures, and the highest anisotropic filtering (1 << n samples, 0 = off, -1 = as
++// the game sets)
++sint32 g_crema_texture_lod_bias = 0;
++sint32 g_crema_texture_max_aniso = -1;
++#endif
++
+ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo* pipeline_info, LatteDecompilerShader* shader)
+ {
+ 	const uint64 stateHash = GetDescriptorSetStateHash(shader);
+@@ -616,14 +624,8 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
  	dsInfo->m_vkObjDescriptorSet = new VKRObjectDescriptorSet();
  	auto vkObjDS = dsInfo->m_vkObjDescriptorSet;
  
@@ -5816,7 +5889,31 @@ index 512ebee8..201d3fdd 100644
  	{
  		UnrecoverableError(fmt::format("Failed to allocate descriptor sets. Currently allocated: Descriptors={} TextureSamplers={} DynUniformBuffers={} StorageBuffers={}",
  			performanceMonitor.vk.numDescriptorSets.get(),
-@@ -1196,6 +1190,37 @@ void VulkanRenderer::draw_updateDepthBias(bool forceUpdate)
+@@ -744,6 +746,12 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
+ 			// apply absolute lod bias from graphic pack
+ 			if (baseTexture->overwriteInfo.hasLodBias)
+ 				iLodBias = baseTexture->overwriteInfo.lodBias;
++#if defined(__ORBIS__)
++			// Crema: Texture Quality - mipmapped textures are read from smaller mip levels (less
++			// memory traffic for the GPU); render targets have one level and stay as they are
++			if (g_crema_texture_lod_bias > 0 && baseTexture->mipLevels > 1)
++				iLodBias += g_crema_texture_lod_bias * 64;
++#endif
+ 
+ 			auto filterMip = samplerWords->WORD0.get_MIP_FILTER();
+ 			if (filterMip == Latte::LATTE_SQ_TEX_SAMPLER_WORD0_0::E_Z_FILTER::NONE)
+@@ -805,6 +813,10 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
+ 
+ 			if (baseTexture->overwriteInfo.anisotropicLevel >= 0)
+ 				maxAniso = baseTexture->overwriteInfo.anisotropicLevel;
++#if defined(__ORBIS__)
++			if (g_crema_texture_max_aniso >= 0)
++				maxAniso = std::min<sint32>((sint32)maxAniso, g_crema_texture_max_aniso);
++#endif
+ 
+ 			if (maxAniso > 0)
+ 			{
+@@ -1196,6 +1208,37 @@ void VulkanRenderer::draw_updateDepthBias(bool forceUpdate)
  
  bool s_syncOnNextDraw = false;
  
@@ -5854,7 +5951,7 @@ index 512ebee8..201d3fdd 100644
  void VulkanRenderer::draw_setRenderPass()
  {
  	CachedFBOVk* fboVk = m_state.activeFBO;
-@@ -1264,6 +1289,40 @@ void VulkanRenderer::draw_setRenderPass()
+@@ -1264,6 +1307,40 @@ void VulkanRenderer::draw_setRenderPass()
  	performanceMonitor.vk.numBeginRenderpassPerFrame.increment();
  }
  
@@ -5895,7 +5992,7 @@ index 512ebee8..201d3fdd 100644
  void VulkanRenderer::draw_endRenderPass()
  {
  	if (!m_state.activeRenderpassFBO)
-@@ -1274,6 +1333,10 @@ void VulkanRenderer::draw_endRenderPass()
+@@ -1274,6 +1351,10 @@ void VulkanRenderer::draw_endRenderPass()
  		vkCmdEndRenderPass(m_state.currentCommandBuffer);
  	sync_RenderPassStoreTextures(m_state.activeRenderpassFBO);
  	m_state.activeRenderpassFBO = nullptr;
@@ -5906,7 +6003,7 @@ index 512ebee8..201d3fdd 100644
  }
  
  // Defined in the Common renderer
-@@ -1297,8 +1360,132 @@ void VulkanRenderer::draw_handleSpecialState5()
+@@ -1297,8 +1378,132 @@ void VulkanRenderer::draw_handleSpecialState5()
  		vpWidth, vpHeight);
  }
  
@@ -6039,7 +6136,7 @@ index 512ebee8..201d3fdd 100644
  	m_state.drawSequenceSkip = false;
  
  	bool streamoutEnable = LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0;
-@@ -1308,6 +1495,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1308,6 +1513,7 @@ void VulkanRenderer::draw_beginSequence()
  	if (LatteGPUState.activeShaderHasError)
  	{
  		cemuLog_logDebugOnce(LogType::Force, "Skipping drawcalls due to shader error");
@@ -6047,7 +6144,7 @@ index 512ebee8..201d3fdd 100644
  		m_state.drawSequenceSkip = true;
  		cemu_assert_debug(false);
  		return;
-@@ -1321,6 +1509,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1321,6 +1527,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!LatteMRT::UpdateCurrentFBO())
  		{
  			debug_printf("Rendertarget invalid\n");
@@ -6055,7 +6152,7 @@ index 512ebee8..201d3fdd 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1328,6 +1517,7 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1328,6 +1535,7 @@ void VulkanRenderer::draw_beginSequence()
  		if (!hasValidFramebufferAttached && !streamoutEnable)
  		{
  			debug_printf("Drawcall with no color buffer or depth buffer attached\n");
@@ -6063,7 +6160,7 @@ index 512ebee8..201d3fdd 100644
  			m_state.drawSequenceSkip = true;
  			return; // no render target
  		}
-@@ -1352,13 +1542,17 @@ void VulkanRenderer::draw_beginSequence()
+@@ -1352,13 +1560,17 @@ void VulkanRenderer::draw_beginSequence()
  		rasterizerEnable = true;
  
  	if (rasterizerEnable == false && streamoutEnable == false)
@@ -6081,7 +6178,7 @@ index 512ebee8..201d3fdd 100644
  		return;
  	}
  
-@@ -1451,8 +1645,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1451,8 +1663,12 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	{
  		// invalid/uninitialized pipeline
  		m_state.activeVertexDS = nullptr;
@@ -6094,7 +6191,7 @@ index 512ebee8..201d3fdd 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	draw_prepareDescriptorSets(pipeline_info, vertexDS, pixelDS, geometryDS);
-@@ -1462,6 +1660,9 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1462,6 +1678,9 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  	m_state.descriptorSetsChanged = true;
  
  	draw_setRenderPass();
@@ -6104,7 +6201,7 @@ index 512ebee8..201d3fdd 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1514,6 +1715,23 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
+@@ -1514,6 +1733,23 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance,
  		draw_prepareDynamicOffsetsForDescriptorSet(VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY, dynamicOffsets, numDynOffsets, pipeline_info);
  		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
  	}
@@ -6128,7 +6225,7 @@ index 512ebee8..201d3fdd 100644
  	// draw
  	if (hostIndexType != INDEX_TYPE::NONE)
  		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
-@@ -1526,6 +1744,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1526,6 +1762,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  {
  	if (m_state.drawSequenceSkip)
  	{
@@ -6136,7 +6233,7 @@ index 512ebee8..201d3fdd 100644
  		return;
  	}
  
-@@ -1640,8 +1859,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1640,8 +1877,11 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	{
  		// invalid/uninitialized pipeline
  		//m_state.activeVertexDS = nullptr;
@@ -6148,7 +6245,7 @@ index 512ebee8..201d3fdd 100644
  
  	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
  	if (m_state.activeVertexDS)
-@@ -1656,6 +1878,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1656,6 +1896,9 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	}
  
  	draw_setRenderPass();
@@ -6158,7 +6255,7 @@ index 512ebee8..201d3fdd 100644
  
  	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
  	{
-@@ -1737,6 +1962,23 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1737,6 +1980,23 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  		vkCmdBindDescriptorSets(m_state.currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkObjPipeline->m_pipelineLayout, 2, 1, &geometryDS->m_vkObjDescriptorSet->descriptorSet, numDynOffsets, dynamicOffsets);
  	}
  
@@ -6182,7 +6279,7 @@ index 512ebee8..201d3fdd 100644
  	// draw
  	if (hostIndexType != INDEX_TYPE::NONE)
  		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
-@@ -1746,12 +1988,486 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
+@@ -1746,12 +2006,486 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
  	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
  }
  
@@ -6669,7 +6766,7 @@ index 512ebee8..201d3fdd 100644
  	m_state.colorBufferSyncPending = false;
  	LatteGPUState.drawCallCounter++;
  }
-@@ -1835,6 +2551,49 @@ void VulkanRenderer::draw_endSequence()
+@@ -1835,6 +2569,49 @@ void VulkanRenderer::draw_endSequence()
  	{
  		SubmitCommandBuffer();
  	}
@@ -18206,10 +18303,10 @@ index 00000000..a6d4cc6e
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 00000000..bb0894fb
+index 00000000..c5d3be18
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,742 @@
+@@ -0,0 +1,758 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -18242,6 +18339,9 @@ index 00000000..bb0894fb
 +extern bool g_crema_index_cache_off; // Cafe/HW/Latte/Core/LatteIndices.cpp: Index Cache
 +bool g_crema_vertex_copy = false; // Vertex Data: Copy Every Draw (Cafe/HW/Latte/Core/LatteBufferData.cpp)
 +extern bool g_crema_sync_depth_skip; // Cafe/HW/Latte/Core/LatteTexture.cpp: Overlapping Textures
++extern float g_crema_render_scale; // Cafe/HW/Latte/Core/LatteTexture.cpp: Render Resolution
++extern sint32 g_crema_texture_lod_bias; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp: Texture Quality
++extern sint32 g_crema_texture_max_aniso; // the same file
 +extern bool g_crema_db_render_clear; // Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp: Depth-Clearing Draws
 +bool g_crema_depth_clip_off = false; // Depth Clipping (Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp)
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
@@ -18290,6 +18390,12 @@ index 00000000..bb0894fb
 +		{"upscale_filter", "Upscaling Filter", "Display",
 +			{{"bicubic", "Bicubic"}, {"linear", "Bilinear"}, {"hermite", "Hermite"}, {"nearest", "Nearest"}, {"fsr", "FSR 1"}, {"fsr_rcas", "FSR 1 + Sharpening"}},
 +			"bicubic", false, "How the game's picture is scaled up to the TV: Bicubic is the smoothest, Nearest the sharpest. FSR 1 (AMD FidelityFX Super Resolution) keeps edges sharp without jaggies; FSR 1 + Sharpening adds AMD's RCAS pass, as FSR 1 is meant to be used (more GPU work). They make the picture look better, not the game faster."},
++		{"render_scale", "Render Resolution", "Display",
++			{{"100", "100% (Native)"}, {"75", "75%"}, {"50", "50%"}}, "100", false,
++			"The size the game draws its picture at, before it is scaled up to the TV (720p games: 75% is 960x540, 50% is 640x360). Lower: less work for the GPU, so faster in games the GPU holds back, but a softer picture (FSR 1 as the Upscaling Filter keeps it sharper). No help when the CPU is the limit (the Performance Log shows which). A graphic pack that sets the resolution itself wins over it. If a game shows black or misplaced parts below 100%, set it back for that game."},
++		{"texture_quality", "Texture Quality", "Display",
++			{{"full", "Full"}, {"reduced", "Reduced"}, {"low", "Low"}}, "full", false,
++			"Full: textures as the game draws them. Reduced: the GPU reads textures from their half-size copies (mipmaps) and filters them more simply (2x anisotropic at most), less memory traffic. Low: quarter-size copies and no anisotropic filtering, blurrier. Helps games the GPU holds back; the game's own screens and effects are not affected."},
 +		// Emulation
 +		{"cpu_mode", "CPU Mode", "Emulation",
 +			{{"auto", "Auto"}, {"multi", "Multi-core Recompiler"}, {"single", "Single-core Recompiler"}, {"interpreter", "Interpreter (Debug)"}}, "auto", false,
@@ -18867,6 +18973,13 @@ index 00000000..bb0894fb
 +		ac_ps4_gs_ring_min = ring == "0" ? 0 : ring == "16" ? (16 << 20) : ring == "32" ? (32 << 20) : (8 << 20);
 +	}
 +	g_crema_sync_depth_skip = get("texture_sync") == "nodepth";
++	{
++		const std::string scale = get("render_scale");
++		g_crema_render_scale = scale == "75" ? 0.75f : scale == "50" ? 0.5f : 1.0f;
++		const std::string textures = get("texture_quality");
++		g_crema_texture_lod_bias = textures == "low" ? 2 : textures == "reduced" ? 1 : 0;
++		g_crema_texture_max_aniso = textures == "low" ? 0 : textures == "reduced" ? 1 : -1;
++	}
 +	g_crema_db_render_clear = get("depth_clear_draws") != "off";
 +	g_crema_depth_clip_off = get("depth_clip") == "off";
 +	ac_ps4_unaligned_vertex_fetch = get("vertex_fetch") == "unaligned" ? 1 : 0;
@@ -18946,9 +19059,9 @@ index 00000000..bb0894fb
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings

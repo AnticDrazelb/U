@@ -107,6 +107,11 @@ set *Apply To* to *This Game*; the game keeps its own copy from then on.
 - **Compare Results**: *Fast*; use *Exact* if a game misbehaves.
 - **Thread Fairness**: only for games that need it (Tekken Tag Tournament 2).
 - **VSync**: *On* removes tearing, at a little delay.
+- **Render Resolution**: *75%* or *50%* draws the game smaller and scales it up to the TV: less GPU
+  work, a softer picture (pair it with the *FSR 1* upscaling filter). A resolution graphic pack wins
+  over it.
+- **Texture Quality**: *Reduced* or *Low* reads textures from their smaller mipmaps with simpler
+  filtering: less GPU memory traffic, blurrier surfaces.
 - **Diagnostics**: keep everything *Off* for the best speed. Turn them on only to report a problem.
 
 **Which settings are best for my game?**
@@ -136,7 +141,9 @@ starts are smoother: the functions a game needed last time are prepared in advan
 **Why does a game slow down in busy scenes?**
 The PS4's CPU is usually the bottleneck, not its GPU. Keep every Diagnostics switch off, and try
 *Graphics Accuracy: Fast* in that game's settings. Graphic packs that raise the resolution or the
-frame rate cost speed.
+frame rate cost speed. When the GPU is the limit (the *Performance Log* shows its load), *Render
+Resolution: 75%* and *Texture Quality: Reduced* in **Settings → Display** take work off it; they
+don't help when the CPU is the limit.
 
 **Does a PS4 Pro help?**
 Yes. Turn on **Settings → System → Boost Mode** in the PS4's own settings, then start Crema: its CPU

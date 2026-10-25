@@ -166,7 +166,7 @@ player has.
 
 | Group | Highlights |
 |---|---|
-| Display | TV Shows (TV or GamePad screen), touch pointer, FPS counter, VSync, picture size, upscaling filter |
+| Display | TV Shows (TV or GamePad screen), touch pointer, FPS counter, VSync, picture size, upscaling filter, render resolution (100 / 75 / 50%), texture quality |
 | Emulation | CPU mode (Auto, multi-core, single-core), thread quantum, shader compilation, graphics accuracy, console language, Mii data, compare results, thread fairness |
 | Audio | Game volume, GamePad speaker, audio buffer |
 | Controls | Touchpad mode (touch screen or Minus / HOME), motion controls |
