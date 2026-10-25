@@ -852,8 +852,22 @@ extern "C" void ps4_boot_trace(const char* stage);
 extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
 extern "C" void ps4_install_signal_stack();        // port/ps4_crashlog.cpp
 
+// Crema setting core_layout (src/gui/ps4/launcher/CremaSettings.cpp), set before the game's threads
+// start. The PS4's CPU is two Jaguar modules of four cores, each module with its own L2 cache;
+// a cache line moving between the modules costs several times what it does inside one.
+//   0 Spread:    every thread on any of the app's cores (the scheduler's choice)
+//   1 Clustered: the emulation's busiest threads (ps4_boost_thread: the emulated CPU cores and
+//                the GPU thread, which hand work to each other constantly) on module 0
+//   2 Split:     as 1, and threads started afterwards on module 1, so shader compilers, the
+//                recompiler's workers and the driver's threads don't evict their cache
+extern "C" {
+int g_crema_core_layout = 0;
+}
+
 namespace {
 constexpr uint64_t kAppCores = 0x7F;  // every core the app may use (the 7th is shared with the system)
+constexpr uint64_t kModule0Cores = 0x0F; // cores 0-3: the first Jaguar module, all the app's
+constexpr uint64_t kModule1Cores = 0x70; // cores 4-6 of the second (the 7th is the system's)
 // Every thread gets at least this much stack. The system's default is far smaller than a PC's
 // (logged at the first thread), and shader translation (glslang) and the driver's shader
 // compiler recurse deeply on large shaders; a thread out of stack is ended by the system with
@@ -870,7 +884,8 @@ struct ThreadStart {
 void* startOnAppCores(void* raw) {
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
-    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kAppCores);
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(),
+                                                            g_crema_core_layout == 2 ? kModule1Cores : kAppCores);
     ps4_install_signal_stack();
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name
@@ -979,6 +994,8 @@ extern "C" void ps4_tsc_probe() {
 extern "C" int scePthreadSetprio(void* thread, int prio);
 extern "C" void ps4_boost_thread() {
     scePthreadSetprio(scePthreadSelf(), 650);
+    if (g_crema_core_layout != 0)
+        reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kModule0Cores);
 }
 
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {

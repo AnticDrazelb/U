@@ -18450,10 +18450,10 @@ index 00000000..a6d4cc6e
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 00000000..3830e8bc
+index 00000000..9ee8e9cc
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,778 @@
+@@ -0,0 +1,785 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -18494,6 +18494,7 @@ index 00000000..3830e8bc
 +extern "C" int ac_ps4_flush_all_draws; // Mesa radv_cmd_buffer.c: GPU Driver Checks, Flush Caches
 +extern "C" int ac_ps4_gs_ring_min; // Mesa radv_queue.c: GS Ring Size
 +extern "C" int ac_ps4_unaligned_vertex_fetch; // Mesa src/amd/common/ac_shader_util.c: Vertex Fetch
++extern "C" int g_crema_core_layout; // port/ps4_runtime.cpp: Core Layout
 +// Crema setting diag_log: the GPU diagnostics' log lines and checks (draw counts, skinned vertex layouts,
 +// occlusion query readback, draw capture) - off: none of it runs
 +bool g_crema_diag_log = false;
@@ -18566,7 +18567,7 @@ index 00000000..3830e8bc
 +			"Current: Cemu's newest shader translation. Cemu 2.6: two older behaviors back (an out-of-range index register clamps, and every shader's buffer reads are bounds-checked), for a game that looks wrong here but right in Cemu 2.6 on a PC."},
 +		{"speed_preset", "Speed Preset", "Emulation",
 +			{{"off", "Off"}, {"fast", "Fast"}, {"fastest", "Fastest"}}, "off", false,
-+			"One switch for the speed-ups that cost picture quality or accuracy, over the settings below them. Fast: Graphics Accuracy Fast, Render Resolution 75%, Texture Quality Reduced, FSR 1 upscaling. Fastest: also Render Resolution 50%, Texture Quality Low and native Quad Draws. If a game flickers, shows black parts or torn shapes, go back to Off (or Fast) for that game. Off: every setting as you set it."},
++			"One switch for the speed-ups that cost picture quality or accuracy, over the settings below them. Fast: Graphics Accuracy Fast, Render Resolution 75%, Texture Quality Reduced, FSR 1 upscaling, Core Layout Clustered. Fastest: also Render Resolution 50%, Texture Quality Low and native Quad Draws. If a game flickers, shows black parts or torn shapes, go back to Off (or Fast) for that game. Off: every setting as you set it."},
 +		{"recommended", "Recommended Settings", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"On: each game tested on the PS4 starts with the settings found best for it (game-settings.ini, updated from GitHub when Crema opens; Triangle > Information shows them). A game set to its own settings keeps those. Off: every game uses your settings for all games."},
 +		{"language", "Language", "Emulation",
@@ -18585,6 +18586,8 @@ index 00000000..3830e8bc
 +			"Fast: the recompiled code skips condition flags that are overwritten before use, and treats the ones a call may change as unused after it (faster on the PS4). Exact: keeps every flag, as Cemu does. Use Exact if a game misbehaves."},
 +		{"psq_indexed", "Indexed Paired Singles", "Emulation", {{"on", "Recompiled"}, {"off", "Interpreted"}}, "on", false,
 +			"Recompiled: the indexed quantized loads and stores (psq_lx, psq_stx) run as PS4 code, faster (Ninja Gaiden 3). Interpreted: as Cemu on a PC does. Try Interpreted if a game's models or animations come out wrong."},
++		{"core_layout", "Core Layout", "Emulation", {{"spread", "Spread"}, {"clustered", "Clustered"}, {"split", "Split"}}, "spread", false,
++			"Which PS4 cores the emulation runs on. The PS4's CPU is two modules of four cores, each with its own cache, and passing work between the modules is several times slower than inside one. Spread: every thread on any core, as the PS4 decides. Clustered: the three emulated Wii U cores and the GPU thread, which pass work to each other all the time, share the first module. Split: as Clustered, and everything else (shader compiling, the recompiler, the graphics driver) on the second module, so it never pushes their data out of the cache. Compare with the FPS counter."},
 +		{"core_balancing", "Core Balancing (Experimental)", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
 +			"On: when the Wii U's core 1 has nothing to run, it runs threads waiting for the busy cores 0 and 2 (Wii U games pin their threads to cores, and the PS4 runs them at different speeds). Faster in Breath of the Wild. A game that relies on its threads' cores may crash or misbehave: then Off."},
 +		{"thread_fairness", "Thread Fairness", "Emulation", {{"off", "Off"}, {"on", "On"}}, "off", false,
@@ -19088,7 +19091,7 @@ index 00000000..3830e8bc
 +	std::map<std::string, std::string> presetValues;
 +	if (preset == "fast" || preset == "fastest")
 +	{
-+		presetValues = {{"gpu_accuracy", "fast"}, {"render_scale", "75"}, {"texture_quality", "reduced"}, {"upscale_filter", "fsr"}};
++		presetValues = {{"gpu_accuracy", "fast"}, {"render_scale", "75"}, {"texture_quality", "reduced"}, {"upscale_filter", "fsr"}, {"core_layout", "clustered"}};
 +		if (preset == "fastest")
 +		{
 +			presetValues["render_scale"] = "50";
@@ -19140,6 +19143,10 @@ index 00000000..3830e8bc
 +		ac_ps4_gs_ring_min = ring == "0" ? 0 : ring == "16" ? (16 << 20) : ring == "32" ? (32 << 20) : (8 << 20);
 +	}
 +	g_crema_sync_depth_skip = get("texture_sync") == "nodepth";
++	{
++		const std::string layout = get("core_layout");
++		g_crema_core_layout = layout == "split" ? 2 : layout == "clustered" ? 1 : 0;
++	}
 +	{
 +		const std::string scale = get("render_scale");
 +		g_crema_render_scale = scale == "75" ? 0.75f : scale == "50" ? 0.5f : 1.0f;
@@ -19226,9 +19233,9 @@ index 00000000..3830e8bc
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, speed preset {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, speed preset {}, core layout {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), preset, get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), preset, get("core_layout"), get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings

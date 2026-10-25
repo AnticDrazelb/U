@@ -112,7 +112,10 @@ set *Apply To* to *This Game*; the game keeps its own copy from then on.
   over it.
 - **Speed Preset**: *Fast* or *Fastest* turns on the speed-ups that cost picture quality or
   accuracy in one go (Graphics Accuracy Fast, a lower Render Resolution and Texture Quality, FSR 1
-  upscaling; *Fastest* also native Quad Draws). Go back to *Off* for a game that looks wrong.
+  upscaling, Core Layout Clustered; *Fastest* also native Quad Draws). Go back to *Off* for a game that looks wrong.
+- **Core Layout**: *Clustered* keeps the emulated Wii U cores and the GPU thread on one of the
+  PS4 CPU's two 4-core modules (one shared cache, fast hand-offs); *Split* also moves everything
+  else to the other module. Compare against *Spread* with the FPS counter.
 - **Texture Quality**: *Reduced* or *Low* reads textures from their smaller mipmaps with simpler
   filtering: less GPU memory traffic, blurrier surfaces.
 - **Diagnostics**: keep everything *Off* for the best speed. Turn them on only to report a problem.
