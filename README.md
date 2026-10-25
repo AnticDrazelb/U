@@ -167,7 +167,7 @@ player has.
 | Group | Highlights |
 |---|---|
 | Display | TV Shows (TV or GamePad screen), touch pointer, FPS counter, VSync, picture size, upscaling filter, render resolution (100 / 75 / 50%), texture quality |
-| Emulation | CPU mode (Auto, multi-core, single-core), thread quantum, shader compilation, graphics accuracy, console language, Mii data, compare results, thread fairness |
+| Emulation | Speed preset (Off, Fast, Fastest), CPU mode (Auto, multi-core, single-core), thread quantum, shader compilation, graphics accuracy, console language, Mii data, compare results, thread fairness |
 | Audio | Game volume, GamePad speaker, audio buffer |
 | Controls | Touchpad mode (touch screen or Minus / HOME), motion controls |
 | Online | Off, Pretendo or a private server (with its address), and whether each one's files are there |

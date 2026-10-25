@@ -110,6 +110,9 @@ set *Apply To* to *This Game*; the game keeps its own copy from then on.
 - **Render Resolution**: *75%* or *50%* draws the game smaller and scales it up to the TV: less GPU
   work, a softer picture (pair it with the *FSR 1* upscaling filter). A resolution graphic pack wins
   over it.
+- **Speed Preset**: *Fast* or *Fastest* turns on the speed-ups that cost picture quality or
+  accuracy in one go (Graphics Accuracy Fast, a lower Render Resolution and Texture Quality, FSR 1
+  upscaling; *Fastest* also native Quad Draws). Go back to *Off* for a game that looks wrong.
 - **Texture Quality**: *Reduced* or *Low* reads textures from their smaller mipmaps with simpler
   filtering: less GPU memory traffic, blurrier surfaces.
 - **Diagnostics**: keep everything *Off* for the best speed. Turn them on only to report a problem.

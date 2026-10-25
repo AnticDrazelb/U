@@ -3221,7 +3221,7 @@ index de677720..5b10c47e 100644
  		uint32 itHeaderType = (itHeader >> 30) & 3;
  		if (itHeaderType == 3)
 diff --git a/src/Cafe/HW/Latte/Core/LatteIndices.cpp b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
-index a2376443..80079858 100644
+index a2376443..a58d69e3 100644
 --- a/src/Cafe/HW/Latte/Core/LatteIndices.cpp
 +++ b/src/Cafe/HW/Latte/Core/LatteIndices.cpp
 @@ -10,6 +10,8 @@
@@ -3242,7 +3242,115 @@ index a2376443..80079858 100644
  	std::array<CacheEntry, 8> entry;
  	uint64 currentUsageCounter{0};
  }LatteIndexCache{};
-@@ -644,8 +648,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
+@@ -448,6 +452,107 @@ void LatteIndices_fastConvertU16_SSE41(const void* indexDataInput, void* indexDa
+ 	indexMax = std::max(indexMax, _maxIndex);
+ }
+ 
++// Crema: quad unpacking with SSSE3/SSE4.1 (the PS4's Jaguar has no AVX2): the scalar loops below
++// don't vectorize, and Cemu turns every quad draw into triangles this way on the GPU thread
++// quads (0,1,2,3) to triangles (0,1,2, 0,2,3), byte swapped: two quads per step
++ATTRIBUTE_SSE41
++void LatteIndices_fastUnpackQuadsU16_SSE41(const void* indexDataInput, void* indexDataOutput, uint32 count, uint32& indexMax)
++{
++	const uint16* src = (const uint16*)indexDataInput;
++	uint16* dst = (uint16*)indexDataOutput;
++	uint32 numQuads = count / 4;
++	uint32 numPairs = numQuads / 2;
++	if (numPairs)
++	{
++		__m128i mMax = _mm_setzero_si128();
++		// output indices 0-7: q0 0 1 2 0 2 3, q1 0 1 (input words 0 1 2 0 2 3 4 5), bytes swapped
++		const __m128i shufLo = _mm_set_epi8(10, 11, 8, 9, 6, 7, 4, 5, 0, 1, 4, 5, 2, 3, 0, 1);
++		// output indices 8-11: q1 2 0 2 3 (input words 6 4 6 7), bytes swapped
++		const __m128i shufHi = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 15, 12, 13, 8, 9, 12, 13);
++		const __m128i shufSwap = _mm_set_epi8(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
++		do
++		{
++			const __m128i mRaw = _mm_loadu_si128((const __m128i*)src);
++			src += 8;
++			mMax = _mm_max_epu16(mMax, _mm_shuffle_epi8(mRaw, shufSwap));
++			_mm_storeu_si128((__m128i*)dst, _mm_shuffle_epi8(mRaw, shufLo));
++			_mm_storel_epi64((__m128i*)(dst + 8), _mm_shuffle_epi8(mRaw, shufHi));
++			dst += 12;
++		} while (--numPairs);
++		mMax = _mm_max_epu16(mMax, _mm_shuffle_epi32(mMax, (2 << 0) | (3 << 2) | (0 << 4) | (1 << 6)));
++		mMax = _mm_max_epu16(mMax, _mm_shuffle_epi32(mMax, (1 << 0) | (0 << 2) | (3 << 4) | (2 << 6)));
++		mMax = _mm_max_epu16(mMax, _mm_srli_epi32(mMax, 16));
++		indexMax = std::max(indexMax, (uint32)(_mm_cvtsi128_si32(mMax) & 0xFFFF));
++	}
++	if (numQuads & 1)
++	{
++		const uint16 idx0 = _swapEndianU16(src[0]), idx1 = _swapEndianU16(src[1]), idx2 = _swapEndianU16(src[2]), idx3 = _swapEndianU16(src[3]);
++		indexMax = std::max({indexMax, (uint32)idx0, (uint32)idx1, (uint32)idx2, (uint32)idx3});
++		dst[0] = idx0;
++		dst[1] = idx1;
++		dst[2] = idx2;
++		dst[3] = idx0;
++		dst[4] = idx2;
++		dst[5] = idx3;
++	}
++}
++
++// quads drawn without an index buffer (count <= 0xFFFF): their triangles' indices, two quads per step
++ATTRIBUTE_SSE41
++void LatteIndices_fastGenerateAutoQuadIndicesU16_SSE41(void* indexDataOutput, uint32 count, uint32& indexMax)
++{
++	uint16* dst = (uint16*)indexDataOutput;
++	const uint32 numQuads = count / 4;
++	__m128i lo = _mm_setr_epi16(0, 1, 2, 0, 2, 3, 4, 5);
++	__m128i hi = _mm_setr_epi16(6, 4, 6, 7, 0, 0, 0, 0);
++	const __m128i step = _mm_set1_epi16(8);
++	for (uint32 pair = 0; pair < numQuads / 2; pair++)
++	{
++		_mm_storeu_si128((__m128i*)dst, lo);
++		_mm_storel_epi64((__m128i*)(dst + 8), hi);
++		lo = _mm_add_epi16(lo, step);
++		hi = _mm_add_epi16(hi, step);
++		dst += 12;
++	}
++	if (numQuads & 1)
++	{
++		const uint16 base = (uint16)((numQuads - 1) * 4);
++		dst[0] = base;
++		dst[1] = base + 1;
++		dst[2] = base + 2;
++		dst[3] = base;
++		dst[4] = base + 2;
++		dst[5] = base + 3;
++	}
++	indexMax = std::max(count, 1u) - 1;
++}
++
++// the same for 32-bit indices: one quad per step
++ATTRIBUTE_SSE41
++void LatteIndices_fastUnpackQuadsU32_SSE41(const void* indexDataInput, void* indexDataOutput, uint32 count, uint32& indexMax)
++{
++	const uint32* src = (const uint32*)indexDataInput;
++	uint32* dst = (uint32*)indexDataOutput;
++	uint32 numQuads = count / 4;
++	if (numQuads)
++	{
++		__m128i mMax = _mm_setzero_si128();
++		const __m128i shufSwap = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
++		do
++		{
++			const __m128i mQuad = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)src), shufSwap);
++			src += 4;
++			mMax = _mm_max_epu32(mMax, mQuad);
++			_mm_storeu_si128((__m128i*)dst, _mm_shuffle_epi32(mQuad, (0 << 0) | (1 << 2) | (2 << 4) | (0 << 6)));
++			_mm_storel_epi64((__m128i*)(dst + 4), _mm_shuffle_epi32(mQuad, (2 << 0) | (3 << 2) | (2 << 4) | (3 << 6)));
++			dst += 6;
++		} while (--numQuads);
++		mMax = _mm_max_epu32(mMax, _mm_shuffle_epi32(mMax, (2 << 0) | (3 << 2) | (0 << 4) | (1 << 6)));
++		mMax = _mm_max_epu32(mMax, _mm_shuffle_epi32(mMax, (1 << 0) | (0 << 2) | (3 << 4) | (2 << 6)));
++		indexMax = std::max(indexMax, (uint32)_mm_cvtsi128_si32(mMax));
++	}
++}
++
+ ATTRIBUTE_AVX2
+ void LatteIndices_fastConvertU32_AVX2(const void* indexDataInput, void* indexDataOutput, uint32 count, uint32& indexMax)
+ {
+@@ -644,8 +749,50 @@ void LatteIndices_alternativeCalculateIndexMax(const void* indexData, LatteIndex
  	}
  }
  
@@ -3293,7 +3401,7 @@ index a2376443..80079858 100644
  	// what this should do:
  	// [x] use fast SIMD-based index decoding
  	// [x] unpack QUAD indices to triangle indices
-@@ -658,6 +704,17 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -658,6 +805,17 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  	{
  		return entry.lastPtr == indexData && entry.lastCount == count && entry.lastPrimitiveMode == primitiveMode && entry.lastIndexType == indexType;
  	});
@@ -3311,7 +3419,7 @@ index a2376443..80079858 100644
  	if (cacheEntry != LatteIndexCache.entry.end())
  	{
  		indexMax = cacheEntry->indexMax;
-@@ -682,6 +739,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -682,6 +840,18 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  
  	// calculate index output size
  	uint32 indexOutputSize = LatteIndices_calculateIndexOutputSize(primitiveMode, indexType, count);
@@ -3330,7 +3438,7 @@ index a2376443..80079858 100644
  	if (indexOutputSize == 0)
  	{
  		outputCount = count;
-@@ -696,7 +765,14 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+@@ -696,14 +866,26 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  
  	// decode indices
  	indexMax = std::numeric_limits<uint32>::min();
@@ -3346,7 +3454,46 @@ index a2376443..80079858 100644
  	{
  		// unpack quads into triangles
  		if (indexType == LatteIndexType::AUTO)
-@@ -838,7 +914,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+ 		{
+ 			if (count <= 0xFFFF)
+ 			{
+-				LatteIndices_generateAutoQuadIndices<uint16>(indexData, indexOutputPtr, count, indexMax);
++#if defined(ARCH_X86_64)
++				if (g_CPUFeatures.x86.sse4_1)
++					LatteIndices_fastGenerateAutoQuadIndicesU16_SSE41(indexOutputPtr, count, indexMax);
++				else
++#endif
++					LatteIndices_generateAutoQuadIndices<uint16>(indexData, indexOutputPtr, count, indexMax);
+ 				renderIndexType = Renderer::INDEX_TYPE::U16;
+ 			}
+ 			else
+@@ -713,9 +895,23 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
+ 			}
+ 		}
+ 		else if (indexType == LatteIndexType::U16_BE)
+-			LatteIndices_unpackQuadsAndConvert<uint16>(indexData, indexOutputPtr, count, indexMax);
++		{
++#if defined(ARCH_X86_64)
++			if (g_CPUFeatures.x86.sse4_1 && g_CPUFeatures.x86.ssse3)
++				LatteIndices_fastUnpackQuadsU16_SSE41(indexData, indexOutputPtr, count, indexMax);
++			else
++#endif
++				LatteIndices_unpackQuadsAndConvert<uint16>(indexData, indexOutputPtr, count, indexMax);
++		}
+ 		else if (indexType == LatteIndexType::U32_BE)
+-			LatteIndices_unpackQuadsAndConvert<uint32>(indexData, indexOutputPtr, count, indexMax);
++		{
++#if defined(ARCH_X86_64)
++			if (g_CPUFeatures.x86.sse4_1 && g_CPUFeatures.x86.ssse3)
++				LatteIndices_fastUnpackQuadsU32_SSE41(indexData, indexOutputPtr, count, indexMax);
++			else
++#endif
++				LatteIndices_unpackQuadsAndConvert<uint32>(indexData, indexOutputPtr, count, indexMax);
++		}
+ 		else
+ 			cemu_assert_debug(false);
+ 		outputCount = count / 4 * 6;
+@@ -838,7 +1034,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
  	}
  	// the above algorithms use a fast approach to get indexMax which does not filter out indices matching primitiveRestartIndex
  	// here we use a fallback in case the determined index equals the primitive restart index
@@ -18303,10 +18450,10 @@ index 00000000..a6d4cc6e
 +};
 diff --git a/src/gui/ps4/launcher/CremaSettings.cpp b/src/gui/ps4/launcher/CremaSettings.cpp
 new file mode 100644
-index 00000000..c5d3be18
+index 00000000..3830e8bc
 --- /dev/null
 +++ b/src/gui/ps4/launcher/CremaSettings.cpp
-@@ -0,0 +1,758 @@
+@@ -0,0 +1,778 @@
 +#include "gui/ps4/launcher/CremaSettings.h"
 +
 +#include "audio/IAudioAPI.h"
@@ -18417,6 +18564,9 @@ index 00000000..c5d3be18
 +			"How the Wii U's quads (four-cornered shapes) are drawn. Cemu: each one becomes two triangles on the CPU, every draw. Native: the PS4 GPU draws quads itself, less work for the GPU thread (Sonic Lost World spends ~6% of it on quads). If a game's shapes look torn or missing, set Cemu."},
 +		{"shader_compat", "Shader Compatibility", "Emulation", {{"current", "Current"}, {"cemu26", "Cemu 2.6"}}, "current", false,
 +			"Current: Cemu's newest shader translation. Cemu 2.6: two older behaviors back (an out-of-range index register clamps, and every shader's buffer reads are bounds-checked), for a game that looks wrong here but right in Cemu 2.6 on a PC."},
++		{"speed_preset", "Speed Preset", "Emulation",
++			{{"off", "Off"}, {"fast", "Fast"}, {"fastest", "Fastest"}}, "off", false,
++			"One switch for the speed-ups that cost picture quality or accuracy, over the settings below them. Fast: Graphics Accuracy Fast, Render Resolution 75%, Texture Quality Reduced, FSR 1 upscaling. Fastest: also Render Resolution 50%, Texture Quality Low and native Quad Draws. If a game flickers, shows black parts or torn shapes, go back to Off (or Fast) for that game. Off: every setting as you set it."},
 +		{"recommended", "Recommended Settings", "Emulation", {{"on", "On"}, {"off", "Off"}}, "on", false,
 +			"On: each game tested on the PS4 starts with the settings found best for it (game-settings.ini, updated from GitHub when Crema opens; Triangle > Information shows them). A game set to its own settings keeps those. Off: every game uses your settings for all games."},
 +		{"language", "Language", "Emulation",
@@ -18932,7 +19082,24 @@ index 00000000..c5d3be18
 +
 +void Apply(const std::string& gameId)
 +{
-+	auto get = [&](const char* key) { return Get(key, gameId); };
++	// Speed Preset: its values win over the game's (and global) settings, here only - the menus
++	// keep showing the player's own choices
++	const std::string preset = Get("speed_preset", gameId);
++	std::map<std::string, std::string> presetValues;
++	if (preset == "fast" || preset == "fastest")
++	{
++		presetValues = {{"gpu_accuracy", "fast"}, {"render_scale", "75"}, {"texture_quality", "reduced"}, {"upscale_filter", "fsr"}};
++		if (preset == "fastest")
++		{
++			presetValues["render_scale"] = "50";
++			presetValues["texture_quality"] = "low";
++			presetValues["quad_draws"] = "native";
++		}
++	}
++	auto get = [&](const char* key) {
++		auto value = presetValues.find(key);
++		return value != presetValues.end() ? value->second : Get(key, gameId);
++	};
 +	auto& config = GetConfig();
 +
 +	if (g_current_game_profile)
@@ -19059,9 +19226,9 @@ index 00000000..c5d3be18
 +	Recommendation recommendation;
 +	const bool recommended = !gameId.empty() && !IsCustom(gameId) && Get("recommended") != "off" &&
 +		GetRecommendation(gameId, &recommendation) && !recommendation.values.empty();
-+	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, TV shows {}, touchpad {}, motion {}{}",
++	cemuLog_log(LogType::Force, "Crema settings for {}: cpu {}, quantum {}, shaders {}, graphics {}, rects {}, quads {}, driver checks {}, compares {}, psq indexed {}, shader compat {}, render resolution {}%, textures {}, speed preset {}, TV shows {}, touchpad {}, motion {}{}",
 +		gameId.empty() ? "(no title)" : gameId, get("cpu_mode"), get("thread_quantum"), get("shader_compile"),
-+		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), get("tv_shows"), get("touchpad"), get("motion"),
++		get("gpu_accuracy"), get("rect_draws"), get("quad_draws"), get("driver_debug"), get("compare_results"), get("psq_indexed"), get("shader_compat"), get("render_scale"), get("texture_quality"), preset, get("tv_shows"), get("touchpad"), get("motion"),
 +		recommended ? fmt::format(" (recommended settings, revision {})", RecommendedRevision()) : std::string());
 +}
 +} // namespace CremaSettings
