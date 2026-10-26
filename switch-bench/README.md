@@ -11,8 +11,10 @@ Eden, this answers the two questions that decide whether a port is worth doing:
 2. **Memory.** Can the PS4 give it what Eden needs? That means 4 GiB of Switch DRAM as one buffer,
    a page table for a 39-bit address space, and executable memory for the code caches.
 
-It is one app (`out/SwitchCpuBench.pkg`, title ID SWBN00001) that takes about 3 minutes and shows
-its results on screen. It writes nothing outside `/data/switch-bench/`.
+It is one app (`out/SwitchCpuBench.pkg`, title ID SWBN00001) that takes 3-5 minutes. A status
+line at the bottom of the screen shows what is running. The results stay on screen and go to
+`/data/switch-bench/results.txt`. It writes nothing outside `/data/switch-bench/`; if it crashes,
+Crema's runtime writes `crash.log` and `boot-trace.log` there.
 
 ## What it runs
 
@@ -47,11 +49,13 @@ once (Switch games use three), and the memory probes run.
   modules each have their own L2 cache.
 - **slow-path memory accesses** (if shown) count loads and stores that didn't go through the
   page table. Each one is a C++ call, roughly 10 to 100 times slower. There should be none.
-- **memory** lists what the system can still give:
+- **memory** lists what the system can still give, each pool asked directly:
   - direct memory, in all and free for the app
   - whether 4 GiB of it maps as one CPU buffer, the Switch's DRAM
-  - free flexible memory, and whether a 1 GiB page table can be allocated
-  - how much executable memory can be had for code caches
+  - free flexible memory (regular and system pools), and which pool can hold a 1 GiB page table
+  - executable memory for code caches, from the system pool and from direct memory, up to 1.5 GiB
+    each, and whether it really runs code: on some firmware (11.00) RWX mappings succeed but
+    don't execute, which Crema's runtime found the hard way
 
 ## An Eden bug this found (fixed in `patches/dynarmic-ps4.patch`)
 
@@ -109,5 +113,15 @@ Host test knobs:
 - `BENCH_LOW_HOST=1` gives negative page-table offsets.
 - `-DBENCH_HOST_RWX_ALLOCATOR=ON` uses the PS4 code allocator.
 
-Validated on the host under ASan, UBSan and LeakSanitizer: no reports, except one in Boost's
-`stable_vector` (dynarmic's IR blocks, upstream).
+Validated on the host:
+
+- Under ASan, UBSan and LeakSanitizer: no reports, except one in Boost's `stable_vector`
+  (dynarmic's IR blocks, upstream).
+- Built with `-march=btver2` (as for the PS4) and run under QEMU with the Jaguar's instruction
+  set (AVX and F16C; no FMA, AVX2 or BMI2), so dynarmic takes the code paths it will take on the
+  PS4: all checksums correct, the FMA fallback included.
+- The PS4 screen code, built against stand-ins for the video-out calls, rendered to an image.
+
+On the PS4 the benchmark runs on a 16 MiB-stack thread. Each recompiler core is created before
+its guest memory, so the code caches get the executable pool first. Out-of-memory and xbyak
+errors go on screen instead of crashing the app.

@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,6 +30,7 @@ int32_t sceKernelReserveVirtualRange(void** addr, size_t len, int32_t flags, siz
 int32_t sceKernelMunmap(void* addr, size_t len);
 int32_t sceKernelMapNamedSystemFlexibleMemory(void** addr, size_t len, int32_t prot, int32_t flags,
                                               const char* name);
+int32_t sceKernelMapNamedFlexibleMemory(void** addr, size_t len, int32_t prot, int32_t flags, const char* name);
 size_t sceKernelGetDirectMemorySize(void);
 int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int32_t type,
                                       off_t* physOut);
@@ -114,6 +116,12 @@ public:
         Draw();
     }
 
+    void SetStatus(const std::string& text)
+    {
+        status = text;
+        Draw();
+    }
+
     void Draw()
     {
         if (!open)
@@ -125,11 +133,17 @@ public:
         uint32_t* fb = buffers[current];
         std::fill(fb, fb + size_t(kWidth) * kHeight, 0xFF101418u);
         Fill(fb, 0, 0, kWidth, 6, 0xFF3A8EE6u);
-        const int rows = (kHeight - 2 * kMargin) / kLineHeight;
+        // the log, scrolled to its end, and below it the status line
+        const int rows = (kHeight - 2 * kMargin) / kLineHeight - 2;
         const size_t first = lines.size() > size_t(rows) ? lines.size() - rows : 0;
         int y = kMargin;
         for (size_t i = first; i < lines.size(); i++, y += kLineHeight)
             Text(fb, kMargin, y, lines[i], Color(lines[i], i));
+        if (!status.empty())
+        {
+            Fill(fb, 0, kHeight - kMargin - kLineHeight - 12, kWidth, kHeight - kMargin - kLineHeight - 10, 0xFF2A3445u);
+            Text(fb, kMargin, kHeight - kMargin - kLineHeight, status, 0xFF8FB4E8u);
+        }
         sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
         last_flip = Seconds();
         current ^= 1;
@@ -147,6 +161,7 @@ private:
     int current = 0;
     double last_flip = 0;
     std::vector<std::string> lines;
+    std::string status;
 
     static double Seconds()
     {
@@ -300,30 +315,130 @@ std::vector<std::string> ProbeFlexible()
     for (void* b : blocks)
         sceKernelMunmap(b, 64 * MB);
 
-    // Eden's page table for a 39-bit address space: 2^27 entries of 8 bytes
-    void* table = mmap(nullptr, GB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    // Eden's page table for a 39-bit address space: 2^27 entries of 8 bytes, from either pool
+    auto map1g = [](bool system_pool) {
+        void* at = nullptr;
+        if (sceKernelReserveVirtualRange(&at, GB, 0, 2 * MB) != 0)
+            return false;
+        const int32_t ret = system_pool
+                                ? sceKernelMapNamedSystemFlexibleMemory(&at, GB, kProtCpuRw, kMapFixed, "switch-bench probe")
+                                : sceKernelMapNamedFlexibleMemory(&at, GB, kProtCpuRw, kMapFixed, "switch-bench probe");
+        sceKernelMunmap(at, GB);
+        return ret == 0;
+    };
+    const bool table_system = map1g(true), table_regular = map1g(false);
     out.push_back(fmt::format("  Eden's page table (1 GiB for a 39-bit address space): {}",
-                              table == MAP_FAILED ? "can't be allocated" : "allocated"));
-    if (table != MAP_FAILED)
-        munmap(table, GB);
+                              table_system && table_regular ? "fits in either pool"
+                              : table_system               ? "fits in the system pool only"
+                              : table_regular              ? "fits in regular flexible memory only"
+                                                           : "DOESN'T FIT (Eden's 39-bit page table needs rework)"));
     return out;
 }
 
-// Executable memory for the recompilers' code caches (Eden: 512 MiB per core).
+// Whether code at `code` (mapped RWX) runs: a "ret" is called, and a fault on it is caught and
+// skipped. As port/ps4_runtime.cpp's runsCode, which found consoles (firmware 11.00) where RWX
+// mappings succeed but don't execute. FreeBSD's signal numbers and context layout.
+constexpr int kSigBusFreeBsd = 10, kSigSegvFreeBsd = 11, kSaSiginfoFreeBsd = 0x40;
+constexpr int kMcontextOffset = 0x40, kRipIndex = 20, kRspIndex = 23;
+volatile uintptr_t g_probeCode = 0;
+volatile int g_probeFaulted = 0;
+struct sigaction g_oldSegv, g_oldBus;
+
+void ExecProbeHandler(int, siginfo_t*, void* context)
+{
+    auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
+    if (g_probeCode && regs[kRipIndex] == g_probeCode)
+    {
+        // as if the ret ran: back to the caller
+        regs[kRipIndex] = *reinterpret_cast<const uint64_t*>(regs[kRspIndex]);
+        regs[kRspIndex] += 8;
+        g_probeFaulted = 1;
+        return;
+    }
+    // another fault: the previous handlers get it when the instruction runs again
+    sigaction(kSigSegvFreeBsd, &g_oldSegv, nullptr);
+    sigaction(kSigBusFreeBsd, &g_oldBus, nullptr);
+}
+
+bool RunsCode(void* code)
+{
+    static_cast<volatile uint8_t*>(code)[0] = 0xC3; // ret
+    struct sigaction action;
+    std::memset(&action, 0, sizeof(action));
+    void (*handler)(int, siginfo_t*, void*) = ExecProbeHandler;
+    std::memcpy(&action, &handler, sizeof(handler)); // the handler union is the first member
+    action.sa_flags = kSaSiginfoFreeBsd;
+    sigemptyset(&action.sa_mask);
+    g_probeFaulted = 0;
+    g_probeCode = reinterpret_cast<uintptr_t>(code);
+    sigaction(kSigSegvFreeBsd, &action, &g_oldSegv);
+    sigaction(kSigBusFreeBsd, &action, &g_oldBus);
+    void (*volatile function)() = reinterpret_cast<void (*)()>(code);
+    function();
+    sigaction(kSigSegvFreeBsd, &g_oldSegv, nullptr);
+    sigaction(kSigBusFreeBsd, &g_oldBus, nullptr);
+    g_probeCode = 0;
+    return !g_probeFaulted;
+}
+
+// Executable memory for the recompilers' code caches (Eden: 512 MiB per core), asked of each pool
+// directly (the runtime's mmap would fall back to memory that may not run code), up to 1.5 GiB.
 std::string ProbeExecutable()
 {
-    std::vector<void*> blocks;
-    for (int i = 0; i < 24; i++)
+    constexpr int32_t kProtCpuRwx = 0x7;
+    constexpr size_t kChunk = 64 * MB, kMaxChunks = 24;
+    auto runs = [](bool any, bool ok) { return !any ? "" : ok ? " (runs code)" : " (maps, but DOESN'T RUN CODE)"; };
+
+    std::vector<void*> system;
+    bool system_runs = false;
+    for (size_t i = 0; i < kMaxChunks; i++)
     {
-        void* p = mmap(nullptr, 64 * MB, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (p == MAP_FAILED)
+        void* at = nullptr;
+        if (sceKernelReserveVirtualRange(&at, kChunk, 0, 2 * MB) != 0)
             break;
-        blocks.push_back(p);
+        if (sceKernelMapNamedSystemFlexibleMemory(&at, kChunk, kProtCpuRwx, kMapFixed, "switch-bench code probe") != 0)
+        {
+            sceKernelMunmap(at, kChunk);
+            break;
+        }
+        if (system.empty())
+            system_runs = RunsCode(at);
+        system.push_back(at);
     }
-    for (void* b : blocks)
-        munmap(b, 64 * MB);
-    return fmt::format("executable memory: {} obtainable (asked for up to 1.5 GiB: Eden's 3 x 512 MiB code caches)",
-                       Mib(blocks.size() * 64 * MB));
+    for (void* b : system)
+        sceKernelMunmap(b, kChunk);
+
+    struct Chunk
+    {
+        void* at;
+        off_t phys;
+    };
+    std::vector<Chunk> direct;
+    bool direct_runs = false;
+    for (size_t i = 0; i < kMaxChunks; i++)
+    {
+        off_t phys = 0;
+        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kChunk, 2 * MB, 0, &phys) != 0)
+            break;
+        void* at = nullptr;
+        if (sceKernelMapDirectMemory(&at, kChunk, kProtCpuRwx, 0, phys, 2 * MB) != 0)
+        {
+            sceKernelReleaseDirectMemory(phys, kChunk);
+            break;
+        }
+        if (direct.empty())
+            direct_runs = RunsCode(at);
+        direct.push_back({at, phys});
+    }
+    for (const Chunk& c : direct)
+    {
+        sceKernelMunmap(c.at, kChunk);
+        sceKernelReleaseDirectMemory(c.phys, kChunk);
+    }
+    return fmt::format("executable memory (code caches; Eden asks 3 x 512 MiB): {}{} from the system pool, {}{} from "
+                       "direct memory (each probed up to 1.5 GiB)",
+                       Mib(system.size() * kChunk), runs(!system.empty(), system_runs), Mib(direct.size() * kChunk),
+                       runs(!direct.empty(), direct_runs));
 }
 
 } // namespace
@@ -359,6 +474,12 @@ void Notify(const std::string& message)
     SendNotification(message);
 }
 
+void Progress(const std::string& status)
+{
+    std::lock_guard lock{g_mutex};
+    g_screen.SetStatus(status);
+}
+
 std::string MemoryReport()
 {
     std::vector<std::string> lines = {"memory:"};
@@ -366,7 +487,7 @@ std::string MemoryReport()
         lines.push_back(l);
     for (auto& l : ProbeDirect())
         lines.push_back(l);
-    lines.push_back(ProbeExecutable()); // last: the runtime may not give all of it back
+    lines.push_back(ProbeExecutable());
     std::string report;
     for (auto& l : lines)
         report += (report.empty() ? "" : "\n") + l;
@@ -375,6 +496,7 @@ std::string MemoryReport()
 
 void Finish(const std::string& summary)
 {
+    Progress("finished");
     Log(fmt::format("Done. Saved to {}. Take a photo of this screen, then close the app (PS button).", kResultsFile));
     SendNotification(summary.substr(0, 1000));
     for (;;)

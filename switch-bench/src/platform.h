@@ -10,6 +10,8 @@ void Init();
 void Log(const std::string& line);
 // A short message the player sees now (a system notification on the PS4).
 void Notify(const std::string& message);
+// What is running now (a status line at the bottom of the screen on the PS4; not saved).
+void Progress(const std::string& status);
 // Probes how much of the memory a Switch emulator needs the platform can give: appends a report.
 std::string MemoryReport();
 void Finish(const std::string& summary);

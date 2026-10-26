@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,11 +55,11 @@ constexpr u64 kPageBits = 12;
 constexpr u64 kPageSize = 1ull << kPageBits;
 constexpr u32 kAddressBits = 32;          // guest addresses below 4 GiB (a 8 MiB page table)
 constexpr u64 kImageBase = 0x80000000;   // guest/link.ld
-constexpr u64 kImageSize = 1ull << 20;
+constexpr u64 kImageSize = 256ull << 10;
 constexpr u64 kStackBase = 0x90000000;
-constexpr u64 kStackSize = 1ull << 20;
-constexpr u64 kDataBase = 0xA0000000;    // the kernels' buffers
-constexpr u64 kDataSize = 32ull << 20;
+constexpr u64 kStackSize = 256ull << 10;
+constexpr u64 kDataBase = 0xA0000000;    // the kernels' buffers (the memory kernel's 4 MiB is the most)
+constexpr u64 kDataSize = 8ull << 20;
 constexpr u64 kHaltAddr = 0x7FFF0000;    // "svc #0xff": where kernels return to
 constexpr u32 kHaltSvc = 0xFF;
 // Eden's PageTable entry layout (src/common/page_table.h)
@@ -214,18 +215,7 @@ struct Core
 
     Core(Accuracy accuracy, bool count_instructions, u8 core_index)
     {
-        if (!LoadImage())
-            return;
-        data = mem.Map(kDataBase, kDataSize);
-        if (!mem.Map(kStackBase, kStackSize) || !data)
-        {
-            error = "out of memory for the guest";
-            return;
-        }
-        u8* halt = mem.Map(kHaltAddr, kPageSize);
-        const u32 svc = 0xD4000001u | (kHaltSvc << 5);
-        std::memcpy(halt, &svc, 4);
-
+        // The JIT first: its code cache is executable memory, the scarcest kind on the PS4.
         env = std::make_unique<Env>(mem);
         Dynarmic::A64::UserConfig config{};
         config.callbacks = env.get();
@@ -248,7 +238,7 @@ struct Core
         config.define_unpredictable_behaviour = true;
         config.wall_clock_cntpct = !count_instructions;
         config.enable_cycle_counting = count_instructions;
-        config.code_cache_size = 16u << 20; // Eden: 512 MiB; these kernels need little
+        config.code_cache_size = 8u << 20; // Eden: 512 MiB; these kernels compile to well under 1 MiB
         if (accuracy != Accuracy::Accurate)
         {
             config.unsafe_optimizations = true;
@@ -260,8 +250,28 @@ struct Core
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
         }
-        jit = std::make_unique<Dynarmic::A64::Jit>(config);
+        try
+        {
+            jit = std::make_unique<Dynarmic::A64::Jit>(config);
+        }
+        catch (const std::exception& e)
+        {
+            error = fmt::format("no executable memory for the recompiler's code ({})", e.what());
+            return;
+        }
         env->jit = jit.get();
+
+        if (!LoadImage())
+            return;
+        data = mem.Map(kDataBase, kDataSize);
+        u8* halt = mem.Map(kHaltAddr, kPageSize);
+        if (!data || !halt || !mem.Map(kStackBase, kStackSize))
+        {
+            error = "out of memory for the guest";
+            return;
+        }
+        const u32 svc = 0xD4000001u | (kHaltSvc << 5);
+        std::memcpy(halt, &svc, 4);
     }
 
     bool LoadImage()
@@ -349,9 +359,10 @@ constexpr u64 kEntities = 512, kWords = 1u << 20, kPairs = 1u << 17, kFloats = 1
 std::vector<Kernel> MakeKernels(double scale)
 {
     auto N = [&](u64 n) { return std::max<u64>(1, u64(double(n) * scale)); };
-    // sized for about 0.2 s natively on a desktop, about 0.5 s on the PS4
-    const u64 n_int = N(60000000), n_br = N(50000), n_calls = N(16000), n_mem = N(24), n_copy = N(2000),
-              n_float = N(5000), n_fma = N(8000000);
+    // 0.05-0.2 s natively on a desktop, a few times that on the PS4; the slowest recompiled kernels
+    // (float, calls) have the fewest iterations, to keep the whole run to a few minutes there
+    const u64 n_int = N(60000000), n_br = N(50000), n_calls = N(8000), n_mem = N(24), n_copy = N(1000),
+              n_float = N(2500), n_fma = N(8000000);
     const u64 d = kDataBase;
     return {
         {"int", "integer math", n_int, [=](u8*) { return native_bench_int(n_int); },
@@ -406,19 +417,38 @@ std::string HostCpu()
                        cpu.displayModel, std::thread::hardware_concurrency(), f);
 }
 
-int main()
+// What runs, for the progress line: "float (6/7): Auto, 1:23 so far".
+class Progress
 {
-    Platform::Init();
+public:
+    void Kernel(const char* name, size_t index, size_t count) { current = fmt::format("{} ({}/{})", name, index + 1, count); }
+    void Step(const char* step)
+    {
+        const int elapsed = int(Now() - start);
+        Platform::Progress(fmt::format("running {}: {}   {}:{:02} so far, about 3-5 minutes in all", current, step,
+                                       elapsed / 60, elapsed % 60));
+    }
+
+private:
+    double start = Now();
+    std::string current;
+};
+
+int Run()
+{
     // BENCH_SCALE (host builds): fewer iterations for quick checks
     double scale = 1.0;
     if (const char* s = std::getenv("BENCH_SCALE"))
         scale = std::atof(s);
+    Progress progress;
     Platform::Log("Switch CPU benchmark: Eden's dynarmic (AArch64 -> x86-64), page table, no fastmem");
     Platform::Log(HostCpu());
-    Platform::Notify("Switch CPU benchmark started: about 3 minutes, don't close it");
+    Platform::Notify("Switch CPU Bench started: about 3-5 minutes, results on screen");
 
     std::vector<Kernel> kernels = MakeKernels(scale);
     std::vector<u8> native_buf(kDataSize);
+    progress.Kernel("setup", 0, 1);
+    progress.Step("starting the recompilers");
     Core accurate(Accuracy::Accurate, false, 0), automatic(Accuracy::Auto, false, 0),
         unsafe(Accuracy::Unsafe, false, 0), counting(Accuracy::Auto, true, 0);
     for (Core* c : {&accurate, &automatic, &unsafe, &counting})
@@ -428,7 +458,8 @@ int main()
         if (!c->error.empty())
         {
             Platform::Log("setup failed: " + c->error);
-            Platform::Finish("Benchmark failed to start: " + c->error);
+            Platform::Log(Platform::MemoryReport());
+            Platform::Finish("Switch CPU Bench failed to start: " + c->error);
             return 1;
         }
     }
@@ -441,22 +472,31 @@ int main()
     struct Result
     {
         double native, automatic, unsafe, mips;
+        u64 checksum;
     };
     std::vector<Result> results;
     int problems = 0;
-    for (const Kernel& k : kernels)
+    for (size_t ki = 0; ki < kernels.size(); ki++)
     {
+        const Kernel& k = kernels[ki];
+        progress.Kernel(k.name, ki, kernels.size());
         Result r{};
         u64 want = 0, got_acc = 0, got_auto = 0, got_unsafe = 0;
+        progress.Step("native");
         r.native = BestOf(2, [&] { want = k.native(native_buf.data()); });
+        r.checksum = want;
+        progress.Step("recompiled, Accurate");
         const double t0 = Now();
         got_acc = k.guest(accurate);
         const double cold = Now() - t0;
         const double t_acc = BestOf(2, [&] { got_acc = k.guest(accurate); });
+        progress.Step("recompiled, Auto");
         automatic.env->slow_accesses = 0;
         r.automatic = BestOf(2, [&] { got_auto = k.guest(automatic); });
         const u64 slow = automatic.env->slow_accesses / 2;
+        progress.Step("recompiled, Unsafe");
         r.unsafe = BestOf(2, [&] { got_unsafe = k.guest(unsafe); });
+        progress.Step("counting instructions");
         counting.env->ticks = 0;
         k.guest(counting);
         r.mips = counting.env->ticks / r.automatic / 1e6;
@@ -482,7 +522,6 @@ int main()
                                   "{:7.3f}s  | {:6.0f}M{}",
                                   k.name, k.what, r.native, t_acc, t_acc / r.native, r.automatic,
                                   r.automatic / r.native, r.unsafe, r.unsafe / r.native, cold, r.mips, notes));
-        Platform::Notify(fmt::format("{}: {:.1f}x slower than native", k.name, r.automatic / r.native));
         results.push_back(r);
     }
     auto geomean = [&](auto f) {
@@ -500,14 +539,27 @@ int main()
     double scaling_sum = 0;
     int scaling_count = 0;
     Core core1(Accuracy::Auto, false, 1), core2(Accuracy::Auto, false, 2);
+    for (Core* c : {&core1, &core2})
+        if (!c->error.empty())
+        {
+            Platform::Log("  not run: " + c->error);
+            problems++;
+        }
     Core* cores[3] = {&automatic, &core1, &core2};
-    for (int ki : {0, 1, 3})
+    const int scaling_kernels[] = {0, 1, 3};
+    for (size_t si = 0; si < 3 && core1.error.empty() && core2.error.empty(); si++)
     {
+        const int ki = scaling_kernels[si];
         const Kernel& k = kernels[ki];
+        progress.Kernel(fmt::format("three cores, {}", k.name).c_str(), si, 3);
+        progress.Step("compiling");
         for (Core* c : cores)
-            k.guest(*c); // compile first
+            k.guest(*c);
+        progress.Step("one core");
         const double single = BestOf(2, [&] { k.guest(automatic); });
+        progress.Step("three cores");
         double times[3] = {}, worst = 1e30;
+        u64 got[3] = {};
         for (int round = 0; round < 2; round++)
         {
             double t[3] = {};
@@ -515,7 +567,7 @@ int main()
             for (int i = 0; i < 3; i++)
                 threads.emplace_back([&, i] {
                     const double t0 = Now();
-                    k.guest(*cores[i]);
+                    got[i] = k.guest(*cores[i]);
                     t[i] = Now() - t0;
                 });
             for (auto& thread : threads)
@@ -524,15 +576,25 @@ int main()
             if (w < worst)
                 worst = w, std::copy(t, t + 3, times);
         }
+        std::string notes;
+        for (int i = 0; i < 3; i++)
+            if (got[i] != results[ki].checksum || !cores[i]->error.empty())
+            {
+                notes += fmt::format(" [core {} CHECKSUM WRONG{}]", i,
+                                     cores[i]->error.empty() ? "" : ": " + cores[i]->error);
+                cores[i]->error.clear();
+                problems++;
+            }
         scaling_sum += single / worst;
         scaling_count++;
         Platform::Log(fmt::format("  {:<8} 1 core {:6.3f}s, 3 cores {:6.3f}/{:6.3f}/{:6.3f}s: each at {:3.0f}% of "
-                                  "single-core speed",
-                                  k.name, single, times[0], times[1], times[2], single / worst * 100.0));
+                                  "single-core speed{}",
+                                  k.name, single, times[0], times[1], times[2], single / worst * 100.0, notes));
     }
-    const double scaling = scaling_sum / scaling_count;
+    const double scaling = scaling_count ? scaling_sum / scaling_count : 0.0;
 
-    Platform::Notify("CPU part done, checking memory");
+    progress.Kernel("memory checks", 0, 1);
+    progress.Step("asking the system for memory");
     const std::string memory = Platform::MemoryReport();
     const std::string summary = fmt::format(
         "Switch code runs {:.1f}x slower than native (Auto; Unsafe {:.1f}x), {:.0f}M guest instructions/s per "
@@ -544,4 +606,38 @@ int main()
     Platform::Log(memory);
     Platform::Finish(summary);
     return problems == 0 ? 0 : 2;
+}
+
+int g_exit_code = 0;
+
+void* RunThread(void*)
+{
+    try
+    {
+        g_exit_code = Run();
+    }
+    catch (const std::exception& e)
+    {
+        Platform::Log(fmt::format("stopped by an error: {}", e.what()));
+        Platform::Finish(fmt::format("Switch CPU Bench stopped by an error: {}", e.what()));
+        g_exit_code = 3;
+    }
+    return nullptr;
+}
+
+int main()
+{
+    Platform::Init();
+    // On a thread with a known, generous stack: the PS4's main thread stack is small, and dynarmic
+    // compiles on the thread that runs it.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u << 20);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, RunThread, nullptr) != 0)
+        RunThread(nullptr);
+    else
+        pthread_join(thread, nullptr);
+    pthread_attr_destroy(&attr);
+    return g_exit_code;
 }
