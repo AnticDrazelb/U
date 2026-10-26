@@ -1,0 +1,113 @@
+# Switch CPU Bench: can a PS4 run Nintendo Switch code?
+
+Stage 1 of a feasibility study for running a Switch emulator on the PS4. Eden is the C++ successor
+of yuzu, with a FreeBSD port; ruzu is a Rust rewrite with no PS4 target. Before porting any of
+Eden, this answers the two questions that decide whether a port is worth doing:
+
+1. **CPU.** How fast does the PS4's Jaguar run Switch (AArch64) code through Eden's recompiler,
+   dynarmic? It is configured the way Eden configures it on a host without fastmem, which the PS4
+   can't have (it can't map the same memory twice): an absolute-offset page table, the
+   misalignment checks, and Eden's CPU accuracy settings.
+2. **Memory.** Can the PS4 give it what Eden needs? That means 4 GiB of Switch DRAM as one buffer,
+   a page table for a 39-bit address space, and executable memory for the code caches.
+
+It is one app (`out/SwitchCpuBench.pkg`, title ID SWBN00001) that takes about 3 minutes and shows
+its results on screen. It writes nothing outside `/data/switch-bench/`.
+
+## What it runs
+
+Seven small kernels (`guest/bench.c`), each built twice. One build is for AArch64 (Cortex-A57, the
+Switch's core); that code runs through dynarmic out of emulated memory. The other is native x86-64
+(Jaguar), as the reference:
+
+| kernel | stands for |
+|---|---|
+| int | integer math, multiplies, divides |
+| branchy | game logic: an entity state machine over an array |
+| calls | recursion and indirect calls through a table |
+| memory | pointer chasing over 4 MiB plus a sequential scan |
+| copy | 16-byte block copies |
+| float | vectorised float loops (NEON on the Switch) |
+| fma | fused multiply-adds (the Jaguar has no FMA instruction) |
+
+Each recompiled kernel runs under Eden's three CPU accuracy settings: Accurate, Auto (the
+default) and Unsafe. Its checksum must equal the native one. Auto and Unsafe may differ only on
+`fma`, on a CPU without FMA, where they compute multiply-adds unfused. Then three cores run at
+once (Switch games use three), and the memory probes run.
+
+## Reading the results
+
+- **x N** is how many times slower than native code on the same CPU. Auto is what Eden would
+  use. The summary line gives the geometric mean over the kernels.
+- **Auto MIPS** is millions of guest instructions per second. A Switch core runs at 1020 MHz, and
+  an A57 retires about one instruction per clock on code like this. So about 1000 MIPS keeps up
+  with one Switch core that is busy 100% of the time; games rarely keep all three that busy.
+- **first run** is the first Accurate run, including recompiling the kernel.
+- **three cores at once** is each core's speed relative to running alone. The PS4's two Jaguar
+  modules each have their own L2 cache.
+- **slow-path memory accesses** (if shown) count loads and stores that didn't go through the
+  page table. Each one is a C++ call, roughly 10 to 100 times slower. There should be none.
+- **memory** lists what the system can still give:
+  - direct memory, in all and free for the app
+  - whether 4 GiB of it maps as one CPU buffer, the Switch's DRAM
+  - free flexible memory, and whether a 1 GiB page table can be allocated
+  - how much executable memory can be had for code caches
+
+## An Eden bug this found (fixed in `patches/dynarmic-ps4.patch`)
+
+On FreeBSD, and so on the PS4, host memory sits below 2^39. There Eden enables dynarmic's
+`page_table_sign_extension` (`src/core/arm/dynarmic/arm_dynarmic_64.cpp`). The A64 x86-64 backend
+then emits `shl page, bit; sar page, bit` with bit = 57. That keeps only bits 0-6 of the entry,
+which the attribute mask has already cleared, so every lookup comes out 0. **Every load and store
+of the game then takes the slow path.** The A32 lookup and the arm64 backend shift by `63 - bit`.
+
+Measured on the host (Eden's settings vs fixed, slowdown against native):
+
+| kernel | Eden today | fixed |
+|---|---|---|
+| branchy | x31 | x5 |
+| calls | x51 | x8 |
+| copy | x65 | x8 |
+| float | x126 | x14 |
+
+The patch makes the A64 lookup shift by `63 - bit` too. The sign bit must also be 55, the top
+bit of the 44 pointer bits that `Common::PageTable::ATTRIBUTE_MASK` keeps. Eden passes
+`SIGN_BIT` = 57, which is a no-op after the mask, so negative offsets would point to the wrong
+memory. This benchmark passes 55; a port of Eden would change `SIGN_BIT`. Tested both ways on
+the host: `BENCH_LOW_HOST=1` places guest memory below the guest addresses, which makes every
+offset negative. All checksums match, with zero slow-path accesses.
+
+The patch also adds a code allocator for the PS4. The PS4 only makes memory executable if it is
+mapped executable to begin with: `mprotect` can't add `PROT_EXEC`, and Crema's runtime serves such
+mappings from a pool that can run code. xbyak instead maps code memory read/write and then
+re-protects it. The patch maps it read/write/execute once (`backend/x64/xbyak.h`).
+
+## Building
+
+Needs:
+
+- Eden: git.eden-emu.dev/eden-emu/eden (or its GitHub mirror eden-emulator/mirror), commit
+  `eb88a40`; only `src/` is used. Apply
+  `patches/dynarmic-ps4.patch` with `patch -p1` from Eden's root.
+- xbyak v7.40.1
+- Crema's PS4 sysroot and toolchain (`docs/BUILDING.md`), which supply the Boost and fmt headers
+  and the PS4 build; clang 21 builds the AArch64 guest.
+
+```
+EDEN_DIR=~/eden XBYAK_DIR=~/xbyak switch-bench/build.sh host   # desktop check: ~/sb-host/switch_bench
+EDEN_DIR=~/eden XBYAK_DIR=~/xbyak switch-bench/build.sh ps4    # out/SwitchCpuBench.pkg
+```
+
+The PS4 build reuses Crema's runtime: heap, mmap and thread wraps, crash log. It compiles its
+own copies of those files with the log folder moved to `/data/switch-bench`, so Crema's logs in
+`/data/Crema` are never touched.
+
+Host test knobs:
+
+- `BENCH_SCALE=0.1` makes a quick run.
+- `BENCH_SIGN_BIT=57` uses Eden's sign bit.
+- `BENCH_LOW_HOST=1` gives negative page-table offsets.
+- `-DBENCH_HOST_RWX_ALLOCATOR=ON` uses the PS4 code allocator.
+
+Validated on the host under ASan, UBSan and LeakSanitizer: no reports, except one in Boost's
+`stable_vector` (dynarmic's IR blocks, upstream).
