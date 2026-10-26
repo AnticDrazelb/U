@@ -148,6 +148,35 @@ Validated on the host:
   to an image: the results screen, and the start page with leftovers in the runtime's own
   `crash.log` and boot-trace formats.
 
+## Testing in shadPS4
+
+shadPS4 (github.com/shadps4-emu/shadPS4), a PS4 emulator that runs on Linux, catches ordinary
+bugs before a build goes to the console. It replaces Sony's libraries and the PS4 kernel with
+its own versions, so it can't show what the console does with memory pools, executable memory
+or firmware differences, and its timings mean nothing: there, the float and FMA kernels run tens
+to hundreds of times slower than native code even on the same CPU. On the console, crash.log
+decides.
+
+Build (Ubuntu 24.04):
+
+- GCC 14. Clang 21 and 23 can't compile its `std::ranges::to` against GCC 14.2's library.
+- `-DFETCHCONTENT_SOURCE_DIR_FMT=<shadPS4>/externals/fmt` when GitHub archive downloads are
+  blocked: spdlog would fetch fmt.
+
+Run it headless from a folder with a `user/` subfolder (portable mode: the app's `/data` is
+`user/data`):
+
+```
+SDL_AUDIODRIVER=dummy xvfb-run -a -s "-screen 0 1920x1080x24" shadps4 <game>/eboot.bin
+```
+
+Here `<game>` is the PKG's staging folder without `sce_module/`: shadPS4 tries to run the
+OpenOrbis stub modules in it and crashes. The first start may show a dialog about save
+locations; answer "Do nothing" (xdotool can click it).
+
+Version 01.01 ran to the end there: every CPU kernel in all three accuracy modes, three cores,
+and all memory checks, with all checksums correct.
+
 On the PS4 the benchmark runs on a 16 MiB-stack thread. Each recompiler core is created before
 its guest memory, so the code caches get the executable pool first. Out-of-memory and xbyak
 errors go on screen instead of crashing the app.
