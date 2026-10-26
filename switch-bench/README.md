@@ -11,10 +11,34 @@ Eden, this answers the two questions that decide whether a port is worth doing:
 2. **Memory.** Can the PS4 give it what Eden needs? That means 4 GiB of Switch DRAM as one buffer,
    a page table for a 39-bit address space, and executable memory for the code caches.
 
-It is one app (`out/SwitchCpuBench.pkg`, title ID SWBN00001) that takes 3-5 minutes. A status
+It is one app (`out/SwitchCpuBench.pkg`, title ID SWBN00001; version in `VERSION`) that takes 3-5
+minutes. A status
 line at the bottom of the screen shows what is running. The results stay on screen and go to
 `/data/switch-bench/results.txt`. It writes nothing outside `/data/switch-bench/`; if it crashes,
 Crema's runtime writes `crash.log` and `boot-trace.log` there.
+
+## The start page
+
+The app opens on a start page:
+
+- **X** runs everything (3-5 minutes).
+- **SQUARE** runs only the CPU tests.
+- **TRIANGLE** runs only the memory checks.
+
+If the last run didn't finish, the page first shows what that run left behind:
+
+- the end of its `results.txt`
+- its crash report from `crash.log`, compacted: the signal, `rip`, registers, code addresses
+  found on the stack and the threads
+- the last lines of its boot trace, where every step of a run is recorded before it starts
+
+With a controller connected, the page then waits for a button, so a photo of it can come first.
+That photo is enough to see where a run stopped. Stack addresses are ELF addresses: symbolize
+them with `llvm-symbolizer --obj=<that build's ELF> 0x...`, so keep the ELF of every build
+handed out. Without a controller, or after a run that finished, everything runs after a
+countdown.
+
+The last run's files are kept as `results-previous.txt` and `crash-previous.log`.
 
 ## What it runs
 
@@ -120,7 +144,9 @@ Validated on the host:
 - Built with `-march=btver2` (as for the PS4) and run under QEMU with the Jaguar's instruction
   set (AVX and F16C; no FMA, AVX2 or BMI2), so dynarmic takes the code paths it will take on the
   PS4: all checksums correct, the FMA fallback included.
-- The PS4 screen code, built against stand-ins for the video-out calls, rendered to an image.
+- The PS4 screen code, built against stand-ins for the video-out and controller calls, rendered
+  to an image: the results screen, and the start page with leftovers in the runtime's own
+  `crash.log` and boot-trace formats.
 
 On the PS4 the benchmark runs on a 16 MiB-stack thread. Each recompiler core is created before
 its guest memory, so the code caches get the executable pool first. Out-of-memory and xbyak

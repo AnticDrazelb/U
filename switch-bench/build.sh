@@ -28,7 +28,7 @@ ps4)
     cp "$HERE/sce_sys/icon0.png" "$stage/sce_sys/"
     mkdir -p "$HOME/sb-ps4/no-modules" "$HERE/../out"
     pkg="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR="$HOME/sb-ps4/no-modules" \
-        "$HERE/../scripts/make-pkg.sh" "$stage" SWBN00001 "Switch CPU Bench" 01.00 SWITCHCPUBENCH "$HOME/sb-ps4/out" |
+        "$HERE/../scripts/make-pkg.sh" "$stage" SWBN00001 "Switch CPU Bench" "$(cat "$HERE/VERSION")" SWITCHCPUBENCH "$HOME/sb-ps4/out" |
         tail -1)"
     cp "$pkg" "$HERE/../out/SwitchCpuBench.pkg"
     echo "$HERE/../out/SwitchCpuBench.pkg"

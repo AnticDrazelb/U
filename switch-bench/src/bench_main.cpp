@@ -434,15 +434,22 @@ private:
     std::string current;
 };
 
-int Run()
+int Run(Platform::Mode mode)
 {
     // BENCH_SCALE (host builds): fewer iterations for quick checks
     double scale = 1.0;
     if (const char* s = std::getenv("BENCH_SCALE"))
         scale = std::atof(s);
     Progress progress;
-    Platform::Log("Switch CPU benchmark: Eden's dynarmic (AArch64 -> x86-64), page table, no fastmem");
+    Platform::Log("Switch CPU Bench " BENCH_VERSION ": Eden's dynarmic (AArch64 -> x86-64), page table, no fastmem");
     Platform::Log(HostCpu());
+    if (mode == Platform::Mode::MemoryOnly)
+    {
+        progress.Kernel("memory checks", 0, 1);
+        Platform::MemoryChecks();
+        Platform::Finish("Switch CPU Bench: memory checks done");
+        return 0;
+    }
     Platform::Notify("Switch CPU Bench started: about 3-5 minutes, results on screen");
 
     std::vector<Kernel> kernels = MakeKernels(scale);
@@ -458,7 +465,7 @@ int Run()
         if (!c->error.empty())
         {
             Platform::Log("setup failed: " + c->error);
-            Platform::Log(Platform::MemoryReport());
+            Platform::MemoryChecks();
             Platform::Finish("Switch CPU Bench failed to start: " + c->error);
             return 1;
         }
@@ -593,9 +600,6 @@ int Run()
     }
     const double scaling = scaling_count ? scaling_sum / scaling_count : 0.0;
 
-    progress.Kernel("memory checks", 0, 1);
-    progress.Step("asking the system for memory");
-    const std::string memory = Platform::MemoryReport();
     const std::string summary = fmt::format(
         "Switch code runs {:.1f}x slower than native (Auto; Unsafe {:.1f}x), {:.0f}M guest instructions/s per "
         "core (a Switch core: 1020 MHz), 3 cores at once {:.0f}% each. Checksums: {}.",
@@ -603,18 +607,21 @@ int Run()
         problems == 0 ? "all correct" : fmt::format("{} PROBLEMS", problems));
     Platform::Log("");
     Platform::Log(summary);
-    Platform::Log(memory);
+    if (mode == Platform::Mode::All)
+        Platform::MemoryChecks();
     Platform::Finish(summary);
     return problems == 0 ? 0 : 2;
 }
 
 int g_exit_code = 0;
 
+Platform::Mode g_mode = Platform::Mode::All;
+
 void* RunThread(void*)
 {
     try
     {
-        g_exit_code = Run();
+        g_exit_code = Run(g_mode);
     }
     catch (const std::exception& e)
     {
@@ -627,7 +634,7 @@ void* RunThread(void*)
 
 int main()
 {
-    Platform::Init();
+    g_mode = Platform::Init();
     // On a thread with a known, generous stack: the PS4's main thread stack is small, and dynarmic
     // compiles on the thread that runs it.
     pthread_attr_t attr;

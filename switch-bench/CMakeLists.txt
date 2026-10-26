@@ -7,6 +7,8 @@ if (PS4)
     include(${CMAKE_CURRENT_SOURCE_DIR}/../toolchain/ps4-love-style.cmake)
 endif()
 
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION BENCH_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if (NOT CMAKE_BUILD_TYPE)
@@ -97,6 +99,7 @@ endif()
 add_executable(switch_bench src/bench_main.cpp ${PLATFORM_SOURCE} shim/common_shim.cpp ${GUEST_HEADER}
     $<TARGET_OBJECTS:native_kernels>)
 target_include_directories(switch_bench PRIVATE src ${CMAKE_BINARY_DIR})
+target_compile_definitions(switch_bench PRIVATE BENCH_VERSION="${BENCH_VERSION}")
 target_link_libraries(switch_bench PRIVATE dynarmic)
 if (PS4)
     # Crema's runtime, with its log folder moved: crash.log, boot-trace.log (which it rotates) and
@@ -115,7 +118,7 @@ if (PS4)
     endforeach()
     target_sources(switch_bench PRIVATE ${BENCH_RUNTIME_SOURCES} src/ps4_stubs.cpp)
     target_include_directories(switch_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../port)
-    target_link_libraries(switch_bench PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut SceNet
+    target_link_libraries(switch_bench PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut ScePad SceNet
         # the runtime's network file system wraps (port/ps4_netfs.cpp)
         ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a)
     # the runtime's __real_gethostbyname: LLD 12's --wrap doesn't fetch libc.a's gethostbyname for
