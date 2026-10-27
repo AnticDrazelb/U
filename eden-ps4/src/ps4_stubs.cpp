@@ -1,7 +1,7 @@
-// What the PS4 build defines besides the launcher: mprotect (below), and the emulator hooks
-// Crema's runtime calls when it writes crash.log and hang.log (weak references in
-// port/ps4_crashlog.cpp and port/ps4_sampler.cpp). create-fself turns an unresolved weak reference
-// into an import it can't place, so this program defines them, doing nothing.
+// What the PS4 build defines besides the launcher: mprotect (below), the emulator hooks Crema's
+// runtime calls when it writes crash.log and hang.log (weak references in port/ps4_crashlog.cpp
+// and port/ps4_sampler.cpp), and zstd's trace hooks. create-fself turns an unresolved weak
+// reference into an import it can't place, so this program defines them, doing nothing.
 #include <cstddef>
 #include <cstdint>
 
@@ -28,4 +28,17 @@ int ps4_jit_owner(uint64_t, uint32_t*, uint64_t*)
 void ps4_jit_dump_function(int, uint32_t, uint64_t, uint32_t) {}
 void ps4_recompiler_status(int) {}
 void ps4_hang_guest_threads(int) {}
+
+// zstd's trace hooks (weak references in Eden's zstd and zbic builds): 0 is "not tracing", so the
+// _end hooks are never called.
+unsigned long long ZSTD_trace_compress_begin(const void*)
+{
+    return 0;
+}
+void ZSTD_trace_compress_end(unsigned long long, const void*) {}
+unsigned long long ZSTD_trace_decompress_begin(const void*)
+{
+    return 0;
+}
+void ZSTD_trace_decompress_end(unsigned long long, const void*) {}
 }

@@ -52,7 +52,7 @@ ps4)
         -DYUZU_USE_EXTERNAL_FFMPEG=OFF -DYUZU_USE_BUNDLED_FFMPEG=OFF \
         -DFFMPEG_DIR="${FFMPEG_DIR:-$HOME/eden-ps4-ffmpeg}"
     ninja -C "$build" ${NINJA_FLAGS:-} eden-ps4_eboot
-    elf="$build/extra_frontend/eden-ps4"
+    elf="$build/bin/eden-ps4"
 
     # Every system function it imports must be one Crema imports (the consoles run those), as
     # switch-bench checks: see its README.

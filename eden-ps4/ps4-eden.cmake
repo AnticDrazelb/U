@@ -6,3 +6,4 @@ include(${CMAKE_CURRENT_LIST_DIR}/../toolchain/ps4-cemu.cmake)
 foreach(_lang C CXX)
     string(APPEND CMAKE_${_lang}_FLAGS_INIT " -DBOOST_ASIO_DISABLE_KQUEUE")
 endforeach()
+
