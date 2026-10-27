@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Tue, 27 Oct 2026 20:39:17 +0000
+Subject: [PATCH] page table: sign bit 55
+
+Where host memory sits below 2^39 (FreeBSD, the PS4) dynarmic sign-extends
+page table entries from SIGN_BIT. Entries keep 44 pointer bits (bits 12-55,
+ATTRIBUTE_MASK) and ExtractPointer sign-extends from bit 55; SIGN_BIT was
+57, which the mask has already cleared, so a negative offset (host memory
+below the guest address) would point to the wrong memory.
+---
+ src/common/page_table.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/page_table.h b/src/common/page_table.h
+index a21fe5311..46a04ff48 100644
+--- a/src/common/page_table.h
++++ b/src/common/page_table.h
+@@ -45,8 +45,10 @@ struct PageTable {
+     /// Masks out bits reserved for attribute tagging.
+     static constexpr u64 ATTRIBUTE_MASK = ((1ULL << 44) - 1) << 12;
+ 
+-    /// Specifies sign bit for page table entries.
+-    static constexpr u64 SIGN_BIT = 45 + 12; // 44 bits of data + page offset
++    /// Specifies sign bit for page table entries: the top bit that ATTRIBUTE_MASK keeps, as in
++    /// ExtractPointer (bit 57 is cleared by the mask, so a recompiler sign-extending from it
++    /// would turn negative offsets positive).
++    static constexpr u64 SIGN_BIT = 43 + 12; // 44 bits of data + page offset
+ 
+     /**
+      * Atomic tuple of host pointer, page type, and block id.

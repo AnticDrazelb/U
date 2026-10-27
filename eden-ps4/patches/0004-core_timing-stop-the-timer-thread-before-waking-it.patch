@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Tue, 27 Oct 2026 20:38:46 +0000
+Subject: [PATCH] core_timing: stop the timer thread before waking it
+
+CoreTiming::Reset set pause_event and event, then requested the stop. A
+timer thread woken in between saw no stop request, consumed both events,
+went back to waiting on pause_event, and the join hung: an intermittent hang
+at shutdown.
+---
+ src/core/core_timing.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index d2ee6769c..dbf2f9fb6 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -304,10 +304,14 @@ std::optional<s64> CoreTiming::Advance() {
+ 
+ void CoreTiming::Reset() {
+     paused = true;
++    // Ask the timer thread to stop before waking it: woken first, it can see no stop request,
++    // consume both events and go back to waiting on pause_event, and the join never returns.
++    if (timer_thread.joinable()) {
++        timer_thread.request_stop();
++    }
+     pause_event.Set();
+     event.Set();
+     if (timer_thread.joinable()) {
+-        timer_thread.request_stop();
+         timer_thread.join();
+     }
+     has_started = false;

@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Tue, 27 Oct 2026 20:38:30 +0000
+Subject: [PATCH] frontend hooks: a log callback, EDEN_EXTRA_FRONTEND_DIR
+
+Common::Log::SetCallback hands every message that passes the filter to the
+frontend (for a frontend without a console, such as the PS4's, which shows
+the log on screen). EDEN_EXTRA_FRONTEND_DIR builds a frontend kept outside
+the tree against Eden's targets.
+---
+ src/CMakeLists.txt     |  6 ++++++
+ src/common/logging.cpp | 21 +++++++++++++++++++++
+ src/common/logging.h   |  6 ++++++
+ 3 files changed, 33 insertions(+)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a2abc7d1b..3be35366e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -281,6 +281,12 @@ if (YUZU_CMD)
+     set_target_properties(yuzu-cmd PROPERTIES OUTPUT_NAME "eden-cli")
+ endif()
+ 
++# A frontend kept outside this tree (it builds against the targets above).
++set(EDEN_EXTRA_FRONTEND_DIR "" CACHE PATH "Directory of an out-of-tree frontend to build with Eden")
++if (EDEN_EXTRA_FRONTEND_DIR)
++    add_subdirectory(${EDEN_EXTRA_FRONTEND_DIR} ${CMAKE_BINARY_DIR}/extra_frontend)
++endif()
++
+ if (ENABLE_QT)
+     add_subdirectory(qt_common)
+     add_subdirectory(yuzu)
+diff --git a/src/common/logging.cpp b/src/common/logging.cpp
+index ed12d5253..de42a5143 100644
+--- a/src/common/logging.cpp
++++ b/src/common/logging.cpp
+@@ -311,6 +311,20 @@ struct DebuggerBackend final : public Backend {
+     void Flush() noexcept override {}
+ };
+ #endif
++/// @brief Backend that hands each message to the frontend's callback
++struct CallbackBackend final : public Backend {
++    void Write(const Entry& entry) noexcept override {
++        if (auto const cb = callback.load(std::memory_order_acquire)) {
++            auto line = FormatLogMessage(entry);
++            if (!line.empty() && line.back() == '\n')
++                line.pop_back();
++            cb(entry.log_class, entry.log_level, std::string_view{entry.message, entry.message_len}, line);
++        }
++    }
++    void Flush() noexcept override {}
++    std::atomic<Callback> callback{nullptr};
++};
++
+ #ifdef __ANDROID__
+ /// @brief Backend that writes to the Android logcat
+ struct LogcatBackend : public Backend {
+@@ -353,6 +367,7 @@ struct Impl {
+ #ifdef __ANDROID__
+         lambda(static_cast<Backend&>(lc_backend));
+ #endif
++        lambda(static_cast<Backend&>(callback_backend));
+     }
+ 
+     Filter filter;
+@@ -366,6 +381,7 @@ struct Impl {
+ #ifdef __ANDROID__
+     LogcatBackend lc_backend{};
+ #endif
++    CallbackBackend callback_backend{};
+     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+ };
+ } // Anonymous namespace
+@@ -423,6 +439,11 @@ void SetColorConsoleBackendEnabled(bool enabled) {
+         logging_instance->color_console_backend.enabled = enabled;
+ }
+ 
++void SetCallback(Callback callback) {
++    if (logging_instance)
++        logging_instance->callback_backend.callback.store(callback, std::memory_order_release);
++}
++
+ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {
+     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
+         auto const flush = ::Settings::values.log_flush_line.GetValue();
+diff --git a/src/common/logging.h b/src/common/logging.h
+index d273eb0c4..05b480991 100644
+--- a/src/common/logging.h
++++ b/src/common/logging.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <string_view>
+ #include <algorithm>
+ #include <type_traits>
+ #include <fmt/ranges.h>
+@@ -140,4 +141,9 @@ void Stop();
+ void SetGlobalFilter(const Filter& filter);
+ void SetColorConsoleBackendEnabled(bool enabled);
+ 
++/// A frontend's own log output. Called for every message that passes the filter, on the thread
++/// that logged it: `message` is the message alone, `line` the formatted log line (no newline).
++using Callback = void (*)(Class log_class, Level level, std::string_view message, std::string_view line);
++void SetCallback(Callback callback);
++
+ } // namespace Common::Log
