@@ -21,7 +21,8 @@ hello: all checks passed, exiting
 ```
 
 That is the output on a desktop (`build.sh host`), where it passed 30 runs in a row, each exiting
-cleanly. The checks:
+cleanly. The PS4 build prints the same in shadPS4 (below); it hasn't run on a console yet. The
+checks:
 
 - the kernel's memory info (`svcGetInfo`)
 - a 32 MiB heap (`svcSetHeapSize`), every word written and read back through the recompiler's page
@@ -34,7 +35,8 @@ cleanly. The checks:
 
 Around those lines the launcher shows Eden's own warnings and errors. A bare NRO always brings a
 few: no RomFS, no program ID or title (it has no NACP), and controller mappings for the Joy-Con
-driver, which this build leaves out with SDL.
+driver, which this build leaves out with SDL. The launcher sets no Cemuhook (UDP) controller
+servers, so that client opens no socket.
 
 ## The PS4 app
 
@@ -54,6 +56,22 @@ a button, so a photo of it can come first. Stack addresses are ELF addresses: sy
 The program's output and Eden's warnings and errors go on screen and to `/data/eden-ps4/log.txt`.
 Eden's data folders (NAND, SD card, keys) are in `/data/eden-ps4/user`. Nothing is written outside
 `/data/eden-ps4`.
+
+## Testing in shadPS4
+
+As for stage 1 (see [its README](../switch-bench/README.md#testing-in-shadps4) for building
+shadPS4 and running it headless): the PKG's staging folder `~/eden-ps4-build/stage` without
+`sce_module/`, run from a folder with a `user/` subfolder, so the app's `/data` is `user/data`.
+shadPS4 can't show what the console does with memory pools or executable memory, but the boot
+trace shows which pools the runtime and Eden got their memory from.
+
+With 01.00 (4 runs, all the same): the start page counts down, `hello.nro` boots, every check
+passes and the program exits. The boot trace shows the app heap taking 384 MiB of system flexible
+memory and the four 32 MiB code caches coming from the same pool, which runs code there; the 4
+GiB of emulated DRAM mapped from direct memory. At the end Eden reports that it couldn't write
+to its network interrupt pipe (`network.cpp:201`, logged, not fatal), which may be shadPS4's
+`pipe`. After a run that crashed, the start page showed its log, its compacted crash report and
+its last steps, and waited for a button.
 
 ## What the PS4 port changes in Eden
 

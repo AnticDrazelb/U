@@ -76,6 +76,9 @@ void ApplyLauncherSettings() {
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Null);
     Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
     Settings::values.use_disk_shader_cache.SetValue(false);
+    // No Cemuhook (UDP) controller servers: their client would open a host socket at start,
+    // for controllers this launcher doesn't use.
+    Settings::values.udp_input_servers.SetValue("");
 }
 
 const char* LoadError(Core::SystemResultStatus status) {
