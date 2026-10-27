@@ -15,7 +15,9 @@ About 1.5 hours, most of it the LLVM 12 linker.
 
 ## 2. The PS4 SDK: `/opt/pacbrew/ps4/openorbis`
 
-PacBrew's `ps4-openorbis` recipes (github.com/PacBrew/ps4-openorbis), at their pinned versions:
+PacBrew's `ps4-openorbis` recipes (github.com/PacBrew/ps4-openorbis), at their pinned versions.
+`toolchain/build-sdk.sh` builds all of this table (except libjpeg-turbo, which only Crema needs),
+from git clones and release downloads (about 30 minutes on 4 cores, most of it LLD):
 
 | Piece | Source | Notes |
 |---|---|---|

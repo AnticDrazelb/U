@@ -10,14 +10,18 @@ C library, which is musl, on the PS4's FreeBSD kernel):
 - Thread names and priorities are not set: those system calls aren't ones
   a homebrew app makes there.
 - zstd's dictionary builder without GNU qsort_r, as on Android.
+- The network layer takes Eden's generic paths (no LAN interface listing:
+  the PS4 has no routing sockets or sysctl tree; the common protocols only).
 - Only Boost.Process's headers: its compiled library calls FreeBSD
   functions the PS4 doesn't have.
 ---
- src/common/host_memory.cpp      | 6 +++---
- src/common/thread.cpp           | 9 ++++++++-
- src/common/zbic_compression.cpp | 3 ++-
- src/core/CMakeLists.txt         | 6 +++++-
- 4 files changed, 18 insertions(+), 6 deletions(-)
+ src/common/host_memory.cpp                      | 6 +++---
+ src/common/thread.cpp                           | 9 ++++++++-
+ src/common/zbic_compression.cpp                 | 3 ++-
+ src/core/CMakeLists.txt                         | 6 +++++-
+ src/core/internal_network/network.cpp           | 2 +-
+ src/core/internal_network/network_interface.cpp | 4 ++--
+ 6 files changed, 21 insertions(+), 9 deletions(-)
 
 diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
 index f084db191..19937d68c 100644
@@ -103,3 +107,38 @@ index 31f9931d3..c6115b0ec 100644
      target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
  else()
      target_link_libraries(core PUBLIC Boost::headers)
+diff --git a/src/core/internal_network/network.cpp b/src/core/internal_network/network.cpp
+index 01d37fb35..1e4ef1896 100644
+--- a/src/core/internal_network/network.cpp
++++ b/src/core/internal_network/network.cpp
+@@ -416,7 +416,7 @@ int TranslateTypeToNative(Type type) {
+ // Some of those protocols may not be supported on some platforms
+ // It doesn't really matter, except that some homebrew may not work correctly
+ // Official software uses TCP & UDP mainly, SCTP is used by some homebrew as well
+-#ifdef __FreeBSD__
++#if defined(__FreeBSD__) && !defined(__OPENORBIS__) // the PS4's headers have only the common ones
+ #define NETWORK_PROTOCOL_TRANSLATE_LIST \
+     NETWORK_PROTOCOL_TRANSLATE_ELEM(IP) \
+     NETWORK_PROTOCOL_TRANSLATE_ELEM(ICMP) \
+diff --git a/src/core/internal_network/network_interface.cpp b/src/core/internal_network/network_interface.cpp
+index f68d4617e..3dd87cbf9 100644
+--- a/src/core/internal_network/network_interface.cpp
++++ b/src/core/internal_network/network_interface.cpp
+@@ -17,7 +17,7 @@
+ #include <cerrno>
+ #include <ifaddrs.h>
+ #include <net/if.h>
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) && !defined(__OPENORBIS__) // the PS4 has no routing sockets or sysctl tree
+ #include <sys/types.h>
+ #include <sys/time.h>
+ #include <sys/socket.h>
+@@ -158,7 +158,7 @@ std::vector<Network::NetworkInterface> GetAvailableNetworkInterfaces() {
+     }
+     freeifaddrs(ifaddr);
+     return ifaces;
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) && !defined(__OPENORBIS__)
+     std::vector<Network::NetworkInterface> ifaces;
+     int fd = ::socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+     if (fd < 0) {
