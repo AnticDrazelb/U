@@ -150,12 +150,17 @@ Validated on the host:
 
 ## What the consoles allow
 
-On a console, 01.00 and 01.01 were ended inside the screen setup, before their first frame, with
-error CE-34878-0 and no crash.log: the boot trace stopped at `switch-bench: started`. The only
-call there that Crema never makes on the same consoles was `sceVideoOutSetFlipRate`. Since 01.02
-the program imports only functions that Crema imports: the screen is set up exactly as Crema's
+On a console, 01.00 to 01.02 were ended in their first `sceVideoOutOpen`, before their first
+frame, with error CE-34878-0 and no crash.log (the boot trace's last line was the step before
+it). Crema's frontend says why: "calling into a system library whose module isn't loaded kills
+the app silently". Since 01.03 the program loads the module of every system library it calls
+before anything else, as Crema's `LoadSystemModules` does: SystemService, UserService, VideoOut,
+Pad, Net. shadPS4 couldn't show this: it implements those libraries without loading anything.
+
+The program also imports only functions that Crema imports: the screen is set up as Crema's
 launcher does it (three linear A8B8G8R8 frames in write-combined direct memory, a flip event
-queue), there are no system notifications, and `mprotect` goes to `sceKernelMprotect` (Crema's).
+queue), there are no system notifications, and `mprotect` goes to `sceKernelMprotect`
+(Crema's).
 To check after a change:
 
 ```

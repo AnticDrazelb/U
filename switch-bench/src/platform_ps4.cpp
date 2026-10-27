@@ -47,6 +47,7 @@ int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count
 const char* ps4rt_heap_source(void);
 size_t ps4rt_heap_size(void);
 size_t ps4rt_heap_footprint(void);
+int32_t sceSysmoduleLoadModuleInternal(uint32_t id);
 // port/ps4_crashlog.cpp: a line in /data/switch-bench/boot-trace.log
 void ps4_boot_trace(const char* stage);
 }
@@ -282,6 +283,26 @@ FILE* g_file = nullptr;
 void Trace(const std::string& step)
 {
     ps4_boot_trace(("switch-bench: " + step).c_str());
+}
+
+// The system modules of every library this program calls, loaded before any call into them, as
+// Crema's frontend does (LoadSystemModules in patches/cemu-ps4.patch): "calling into a system
+// library whose module isn't loaded kills the app silently". 01.00 to 01.02 didn't, and were
+// ended in their first sceVideoOutOpen without a crash report. (Crema also loads AudioOut, which
+// this program doesn't use; Net is for the runtime's resolver, port/ps4_net.cpp.)
+void LoadSystemModules()
+{
+    const std::pair<const char*, uint32_t> modules[] = {{"SystemService", 0x80000010},
+                                                        {"UserService", 0x80000011},
+                                                        {"VideoOut", 0x80000022},
+                                                        {"Pad", 0x80000024},
+                                                        {"Net", 0x8000001C}};
+    for (const auto& [name, id] : modules)
+    {
+        const int32_t result = sceSysmoduleLoadModuleInternal(id);
+        Trace(fmt::format("system module {}: {}", name,
+                          result == 0 ? std::string("loaded") : fmt::format("FAILED ({:#x})", uint32_t(result))));
+    }
 }
 
 // ---- the start page: what the last run left behind, and what to run
@@ -724,6 +745,7 @@ Mode Init()
 {
     mkdir(kResultsDir, 0777);
     Trace("started");
+    LoadSystemModules();
     Trace(g_screen.Open() ? "screen open" : "no screen (video out failed)");
     const Mode mode = StartPage();
     g_file = std::fopen(kResultsFile, "w");
