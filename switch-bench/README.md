@@ -148,6 +148,24 @@ Validated on the host:
   to an image: the results screen, and the start page with leftovers in the runtime's own
   `crash.log` and boot-trace formats.
 
+## What the consoles allow
+
+On a console, 01.00 and 01.01 were ended inside the screen setup, before their first frame, with
+error CE-34878-0 and no crash.log: the boot trace stopped at `switch-bench: started`. The only
+call there that Crema never makes on the same consoles was `sceVideoOutSetFlipRate`. Since 01.02
+the program imports only functions that Crema imports: the screen is set up exactly as Crema's
+launcher does it (three linear A8B8G8R8 frames in write-combined direct memory, a flip event
+queue), there are no system notifications, and `mprotect` goes to `sceKernelMprotect` (Crema's).
+To check after a change:
+
+```
+llvm-nm -u <Crema ELF> | awk '{print $2}' | sort -u > crema.txt
+llvm-nm -u ~/sb-ps4/switch_bench | awk '{print $2}' | sort -u | comm -13 crema.txt -   # must print nothing
+```
+
+Every step of the startup (each video-out call, the controller) is in the boot trace, which
+PS4-Xplorer and similar file managers can open on the console.
+
 ## Testing in shadPS4
 
 shadPS4 (github.com/shadps4-emu/shadPS4), a PS4 emulator that runs on Linux, catches ordinary

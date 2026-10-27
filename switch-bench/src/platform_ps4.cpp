@@ -41,8 +41,8 @@ int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t
 int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
                                  size_t align);
 int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
-int32_t sceKernelSendNotificationRequest(int32_t device, void* request, size_t size, int32_t blocking);
-int32_t sceSystemServiceHideSplashScreen(void);
+int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
+int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 // port/ps4_runtime.cpp: the app heap behind malloc
 const char* ps4rt_heap_source(void);
 size_t ps4rt_heap_size(void);
@@ -63,15 +63,6 @@ constexpr const char* kCrashFile = "/data/switch-bench/crash.log";
 // The last run's boot trace: Crema's runtime renames boot-trace.log to this as the app starts.
 constexpr const char* kLastTraceFile = "/data/switch-bench/boot-trace-launcher.log";
 
-struct NotificationRequest
-{
-    int32_t type, reqId, priority, msgId, targetId, userId, unk1, unk2, appId, errorNum, unk3;
-    unsigned char useIconImageUri;
-    char message[1024];
-    char iconUri[1024];
-    char unk[1024];
-};
-
 double Seconds()
 {
     timespec ts;
@@ -87,26 +78,41 @@ public:
     static constexpr int kCell = 7; // stb_easy_font's widest advance: drawn as a fixed-width font
     static constexpr int kMargin = 48;
 
+    // Video out set up as Crema's launcher does it on the same consoles (patches/cemu-ps4.patch,
+    // Display::CreateFrames): the same calls in the same order, three linear A8B8G8R8 buffers in
+    // write-combined direct memory, and a flip event queue to wait on. Version 01.01 also called
+    // sceVideoOutSetFlipRate, which Crema never does, and the app was ended inside this function
+    // on a console, before its first frame, without a crash report. Each call is traced.
     bool Open()
     {
+        TraceStep("screen: sceVideoOutOpen");
         handle = sceVideoOutOpen(0xFF, ORBIS_VIDEO_OUT_BUS_MAIN, 0, nullptr);
         if (handle < 0)
-            return false;
+            return Failed("sceVideoOutOpen", handle);
+        TraceStep("screen: flip event queue");
+        sceKernelCreateEqueue(&flip_queue, "switch-bench flip");
+        sceVideoOutAddFlipEvent(flip_queue, handle, nullptr);
+        TraceStep("screen: direct memory for 3 frames");
         const size_t buffer_size = (size_t(kWidth) * kHeight * 4 + 2 * MB - 1) & ~(2 * MB - 1);
         off_t phys = 0;
-        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), buffer_size * 2, 2 * MB, 3, &phys) != 0)
-            return false;
+        int32_t ret = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), buffer_size * kFrames,
+                                                    2 * MB, 3 /* write-combined, as Crema's VRAM */, &phys);
+        if (ret != 0)
+            return Failed("sceKernelAllocateDirectMemory", ret);
+        TraceStep("screen: map it");
         void* base = nullptr;
-        if (sceKernelMapDirectMemory(&base, buffer_size * 2, kProtCpuGpuRw, 0, phys, 2 * MB) != 0)
-            return false;
-        buffers[0] = static_cast<uint32_t*>(base);
-        buffers[1] = reinterpret_cast<uint32_t*>(static_cast<char*>(base) + buffer_size);
+        ret = sceKernelMapDirectMemory(&base, buffer_size * kFrames, kProtCpuGpuRw, 0, phys, 2 * MB);
+        if (ret != 0)
+            return Failed("sceKernelMapDirectMemory", ret);
+        for (int i = 0; i < kFrames; i++)
+            buffers[i] = reinterpret_cast<uint32_t*>(static_cast<char*>(base) + buffer_size * i);
+        TraceStep("screen: register buffers");
         OrbisVideoOutBufferAttribute attr;
-        sceVideoOutSetBufferAttribute(&attr, 0x80000000 /* A8R8G8B8 sRGB */, 1 /* linear */, 0, kWidth, kHeight,
-                                      kWidth);
-        if (sceVideoOutRegisterBuffers(handle, 0, reinterpret_cast<void* const*>(buffers), 2, &attr) != 0)
-            return false;
-        sceVideoOutSetFlipRate(handle, 0);
+        sceVideoOutSetBufferAttribute(&attr, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB,
+                                      ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, kWidth, kHeight, kWidth);
+        ret = sceVideoOutRegisterBuffers(handle, 0, reinterpret_cast<void* const*>(buffers), kFrames, &attr);
+        if (ret < 0)
+            return Failed("sceVideoOutRegisterBuffers", ret);
         open = true;
         return true;
     }
@@ -154,12 +160,9 @@ public:
     {
         if (!open)
             return;
-        // the other buffer was on screen until the last flip: give that flip two frames to happen
-        const double now = Seconds();
-        if (now - last_flip < 0.034)
-            usleep(useconds_t((0.034 - (now - last_flip)) * 1e6));
+        WaitForImageOffScreen();
         uint32_t* fb = buffers[current];
-        std::fill(fb, fb + size_t(kWidth) * kHeight, 0xFF101418u);
+        std::fill(fb, fb + size_t(kWidth) * kHeight, Native(0xFF101418u));
         Fill(fb, 0, 0, kWidth, 6, 0xFF3A8EE6u);
         // the log, scrolled to its end, and below it the status line
         const int rows = (kHeight - 2 * kMargin) / line_height - 2;
@@ -172,27 +175,57 @@ public:
             Fill(fb, 0, kHeight - kMargin - line_height - 12, kWidth, kHeight - kMargin - line_height - 10, 0xFF2A3445u);
             Text(fb, kMargin, kHeight - kMargin - line_height, status, 0xFF8FB4E8u);
         }
-        sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
-        last_flip = Seconds();
-        current ^= 1;
-        if (!shown)
-        {
-            shown = true;
-            sceSystemServiceHideSplashScreen();
-        }
+        if (flips == 0)
+            TraceStep("screen: first flip");
+        sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, int64_t(++flips));
+        if (flips == 1)
+            TraceStep("screen: first flip submitted");
+        current = (current + 1) % kFrames;
     }
 
 private:
+    static constexpr int kFrames = 3;
     int handle = -1;
-    bool open = false, shown = false;
-    uint32_t* buffers[2] = {};
+    bool open = false;
+    OrbisKernelEqueue flip_queue = 0;
+    uint32_t* buffers[kFrames] = {};
     int current = 0;
-    double last_flip = 0;
+    uint64_t flips = 0;
     float scale = 2.0f;
     int line_height = 24;
     std::vector<std::string> lines;
     std::string status;
 
+    static void TraceStep(const char* step) { ps4_boot_trace((std::string("switch-bench: ") + step).c_str()); }
+    static bool Failed(const char* call, int32_t ret)
+    {
+        ps4_boot_trace(fmt::format("switch-bench: screen: {} failed ({:#x}); results go to the file only", call,
+                                   uint32_t(ret)).c_str());
+        return false;
+    }
+    // The image drawn next must be off screen: with 3 in rotation it was shown by flip n-2 and is
+    // replaced on screen by flip n-1 (n = flips submitted). As Crema's launcher waits.
+    void WaitForImageOffScreen()
+    {
+        if (flips < 2)
+            return;
+        const int64_t needed = int64_t(flips - 1);
+        for (int tries = 0; tries < 40; tries++)
+        {
+            OrbisVideoOutFlipStatus status = {};
+            if (sceVideoOutGetFlipStatus(handle, &status) < 0 || status.flipArg >= needed)
+                return;
+            unsigned char event[64];
+            int32_t count = 0;
+            uint32_t timeout = 5000;
+            sceKernelWaitEqueue(flip_queue, event, 1, &count, &timeout);
+        }
+    }
+    // Colors are written as 0xAARRGGBB; the buffers are A8B8G8R8 (bytes R, G, B, A), as Crema's.
+    static uint32_t Native(uint32_t argb)
+    {
+        return (argb & 0xFF00FF00u) | ((argb >> 16) & 0xFFu) | ((argb & 0xFFu) << 16);
+    }
     static uint32_t Color(const std::string& line, size_t index)
     {
         if (line.find("WRONG") != std::string::npos || line.find("PROBLEMS") != std::string::npos ||
@@ -207,8 +240,9 @@ private:
             return 0xFFF2CC60u;
         return 0xFFE6E6E6u;
     }
-    static void Fill(uint32_t* fb, int x0, int y0, int x1, int y1, uint32_t color)
+    static void Fill(uint32_t* fb, int x0, int y0, int x1, int y1, uint32_t argb)
     {
+        const uint32_t color = Native(argb);
         x0 = std::max(x0, 0), y0 = std::max(y0, 0), x1 = std::min(x1, kWidth), y1 = std::min(y1, kHeight);
         for (int y = y0; y < y1; y++)
             std::fill(fb + size_t(y) * kWidth + x0, fb + size_t(y) * kWidth + std::max(x0, x1), color);
@@ -248,18 +282,6 @@ FILE* g_file = nullptr;
 void Trace(const std::string& step)
 {
     ps4_boot_trace(("switch-bench: " + step).c_str());
-}
-
-void SendNotification(const std::string& message)
-{
-    static NotificationRequest request; // 3 KiB: not on the stack
-    std::memset(&request, 0, sizeof(request));
-    request.type = 0;
-    request.targetId = -1;
-    request.useIconImageUri = 1;
-    std::snprintf(request.message, sizeof(request.message), "%s", message.c_str());
-    std::snprintf(request.iconUri, sizeof(request.iconUri), "cxml://psnotification/tex_icon_system");
-    sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
 }
 
 // ---- the start page: what the last run left behind, and what to run
@@ -348,12 +370,15 @@ std::vector<std::string> LastCrash(const std::vector<std::string>& log)
 int g_pad = -1;
 void OpenPad()
 {
+    Trace("pad: sceUserServiceInitialize");
     sceUserServiceInitialize(nullptr);
     int32_t user = -1;
     if (sceUserServiceGetInitialUser(&user) != 0)
-        return;
+        return Trace("pad: no initial user");
+    Trace("pad: scePadInit");
     scePadInit();
     g_pad = scePadOpen(user, 0, 0, nullptr);
+    Trace(fmt::format("pad: scePadOpen = {:#x}", uint32_t(g_pad)));
 }
 uint32_t PadButtons()
 {
@@ -722,10 +747,9 @@ void Log(const std::string& text)
     } while (start < text.size());
 }
 
-void Notify(const std::string& message)
-{
-    SendNotification(message);
-}
+// No system notifications: sceKernelSendNotificationRequest is not among the calls Crema makes on
+// these consoles, and the screen shows the same.
+void Notify(const std::string&) {}
 
 void Progress(const std::string& status)
 {
@@ -742,11 +766,10 @@ void MemoryChecks()
     CheckExecutable();
 }
 
-void Finish(const std::string& summary)
+void Finish(const std::string&)
 {
     Progress("finished");
     Log(fmt::format("Done. Saved to {}. Take a photo of this screen, then close the app (PS button).", kResultsFile));
-    SendNotification(summary.substr(0, 1000));
     for (;;)
         sleep(1);
 }
