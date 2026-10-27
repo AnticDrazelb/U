@@ -11,6 +11,8 @@ Eden, this answers the two questions that decide whether a port is worth doing:
 2. **Memory.** Can the PS4 give it what Eden needs? That means 4 GiB of Switch DRAM as one buffer,
    a page table for a 39-bit address space, and executable memory for the code caches.
 
+**Results from a PS4: [RESULTS.md](RESULTS.md).**
+
 It is one app (`out/SwitchCpuBench.pkg`, title ID SWBN00001; version in `VERSION`) that takes 3-5
 minutes. A status
 line at the bottom of the screen shows what is running. The results stay on screen and go to
