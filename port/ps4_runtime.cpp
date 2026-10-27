@@ -78,6 +78,9 @@ const size_t MB = 1024 * 1024;
 const size_t PAGE = 16 * 1024;
 // Regular flexible memory left for Piglet (OpenGL ES) when the heap has to come from there.
 const size_t RESERVE_FOR_SYSTEM = 320 * MB;
+#ifndef PS4_SYSTEM_HEAP_MAX_MB
+#define PS4_SYSTEM_HEAP_MAX_MB 512  // the largest heap taken from the system flexible pool
+#endif
 const int32_t PROT_CPU_RW = 0x3;
 const int32_t MAP_FIXED_FLAG = 0x10;
 
@@ -196,8 +199,12 @@ mspace createHeap() {
     // Not all of it: the kernel's own objects ("ScePthread internal memory") and the system libc
     // heap that Sony modules (Piglet's shader compiler) grow on demand come from the same pool.
     // With a 1 GiB heap, compiling Dolphin's larger shaders ran the system out of memory.
+    // An app that needs that pool's executable memory too caps the heap lower (PS4_SYSTEM_HEAP_MAX_MB:
+    // Eden's code caches).
     const size_t systemSizes[] = {512 * MB, 384 * MB, 256 * MB, 192 * MB, 128 * MB};
     for (size_t size : systemSizes) {
+        if (size > PS4_SYSTEM_HEAP_MAX_MB * MB)
+            continue;
         if (mspace msp = mapAndCreate(true, size))
             return msp;
     }

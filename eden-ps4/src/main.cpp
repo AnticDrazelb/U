@@ -10,7 +10,6 @@
 #include <system_error>
 
 #include <fmt/format.h>
-#include <unistd.h>
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -25,6 +24,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "input_common/main.h"
 #include "launcher.h"
+#include "network/network.h"
 #include "video_core/gpu.h"
 
 namespace Launcher {
@@ -95,12 +95,13 @@ const char* LoadError(Core::SystemResultStatus status) {
 
 BootResult Boot(const std::filesystem::path& program, const std::filesystem::path& data_dir,
                 LineSink sink, std::chrono::milliseconds timeout) {
-    // Eden's portable mode: its data folders go in ./user.
+    // Eden's data folders (NAND, SD card, keys...) in data_dir/user.
     std::error_code ec;
     std::filesystem::create_directories(data_dir / "user", ec);
-    if (chdir(data_dir.c_str()) != 0)
-        return {BootResult::Status::LoadFailed, fmt::format("can't use {}", data_dir.string())};
-    Common::FS::SetAppDirectory("");
+    if (ec)
+        return {BootResult::Status::LoadFailed, fmt::format("can't use {}: {}", data_dir.string(), ec.message())};
+    Common::FS::SetAppDirectory((data_dir / "user").string());
+    Common::FS::CreateEdenPaths();
 
     g_sink = sink;
     g_log = std::fopen((data_dir / "log.txt").c_str(), "w");
@@ -110,6 +111,8 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
     Common::Log::SetCallback(OnLog);
     Common::Log::Start();
     ApplyLauncherSettings();
+    // ENet and the multiplayer room, which the BSD sockets service expects
+    Network::Init();
 
     BootResult result{BootResult::Status::TimedOut, {}};
     {
@@ -138,8 +141,10 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             });
 
             Output(LineKind::Status, fmt::format("booting {}", program.filename().string()));
-            const auto status = system.Load(window, program.string(),
-                                            {.applet_id = Service::AM::AppletId::Application});
+            Service::AM::FrontendAppletParameters load_parameters{
+                .applet_id = Service::AM::AppletId::Application,
+            };
+            const auto status = system.Load(window, program.string(), load_parameters);
             if (status != Core::SystemResultStatus::Success) {
                 result = {BootResult::Status::LoadFailed, LoadError(status)};
             } else {
@@ -156,6 +161,7 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
         }
         input.Shutdown();
     }
+    Network::Shutdown();
 
     switch (result.status) {
     case BootResult::Status::Exited:

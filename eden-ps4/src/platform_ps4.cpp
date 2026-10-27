@@ -1,0 +1,554 @@
+// The launcher on the PS4. A start page first: it shows what an unfinished last run left behind
+// (the end of its log.txt, its crash report and boot trace) so that a photo of it is enough to see
+// where it stopped, and lets the player pick a program:
+//   X       the test program in the package (hello.nro)
+//   SQUARE  /data/eden-ps4/boot.nro
+// Then the program runs, with its output and Eden's warnings and errors on screen (a text console
+// drawn into a video-out framebuffer) and in /data/eden-ps4/log.txt. Nothing is written outside
+// /data/eden-ps4; Eden's data folders are in /data/eden-ps4/user.
+//
+// The screen, controller and start page are switch-bench's (../../switch-bench/src/platform_ps4.cpp).
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <fmt/format.h>
+#include <orbis/Pad.h>
+#include <orbis/UserService.h>
+#include <orbis/VideoOut.h>
+#include <stb/stb_easy_font.h>
+
+#include "launcher.h"
+
+// Declared by hand: the toolchain headers give these the wrong (or no) prototypes
+// (as in port/ps4_runtime.cpp).
+extern "C" {
+size_t sceKernelGetDirectMemorySize(void);
+int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int32_t type,
+                                      off_t* physOut);
+int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
+                                 size_t align);
+int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
+int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
+int32_t sceSysmoduleLoadModuleInternal(uint32_t id);
+// port/ps4_crashlog.cpp: a line in /data/eden-ps4/boot-trace.log
+void ps4_boot_trace(const char* stage);
+}
+
+namespace {
+
+constexpr size_t MB = 1024 * 1024;
+constexpr int32_t kProtCpuGpuRw = 0x33;
+constexpr const char* kDataDir = "/data/eden-ps4";
+constexpr const char* kLogFile = "/data/eden-ps4/log.txt";
+constexpr const char* kCrashFile = "/data/eden-ps4/crash.log";
+// The last run's boot trace: Crema's runtime renames boot-trace.log to this as the app starts.
+constexpr const char* kLastTraceFile = "/data/eden-ps4/boot-trace-launcher.log";
+constexpr const char* kTestProgram = "/app0/hello.nro";
+constexpr const char* kUserProgram = "/data/eden-ps4/boot.nro";
+// The last line of log.txt after a run that finished.
+constexpr const char* kFinishedLine = "eden-ps4: run finished";
+
+void Trace(const std::string& step)
+{
+    ps4_boot_trace(("eden-ps4: " + step).c_str());
+}
+
+double Seconds()
+{
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+// The screen: 1920x1080 linear ARGB, three buffers, redrawn whenever a line is added.
+class Screen
+{
+public:
+    static constexpr int kWidth = 1920, kHeight = 1080;
+    static constexpr int kCell = 7; // stb_easy_font's widest advance: drawn as a fixed-width font
+    static constexpr int kMargin = 48;
+
+    // Video out set up as Crema's launcher does it: the same calls in the same order, three linear
+    // A8B8G8R8 buffers in write-combined direct memory, and a flip event queue to wait on.
+    bool Open()
+    {
+        Trace("screen: sceVideoOutOpen");
+        handle = sceVideoOutOpen(0xFF, ORBIS_VIDEO_OUT_BUS_MAIN, 0, nullptr);
+        if (handle < 0)
+            return Failed("sceVideoOutOpen", handle);
+        Trace("screen: flip event queue");
+        sceKernelCreateEqueue(&flip_queue, "eden-ps4 flip");
+        sceVideoOutAddFlipEvent(flip_queue, handle, nullptr);
+        Trace("screen: direct memory for 3 frames");
+        const size_t buffer_size = (size_t(kWidth) * kHeight * 4 + 2 * MB - 1) & ~(2 * MB - 1);
+        off_t phys = 0;
+        int32_t ret = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), buffer_size * kFrames,
+                                                    2 * MB, 3 /* write-combined, as Crema's VRAM */, &phys);
+        if (ret != 0)
+            return Failed("sceKernelAllocateDirectMemory", ret);
+        Trace("screen: map it");
+        void* base = nullptr;
+        ret = sceKernelMapDirectMemory(&base, buffer_size * kFrames, kProtCpuGpuRw, 0, phys, 2 * MB);
+        if (ret != 0)
+            return Failed("sceKernelMapDirectMemory", ret);
+        for (int i = 0; i < kFrames; i++)
+            buffers[i] = reinterpret_cast<uint32_t*>(static_cast<char*>(base) + buffer_size * i);
+        Trace("screen: register buffers");
+        OrbisVideoOutBufferAttribute attr;
+        sceVideoOutSetBufferAttribute(&attr, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB,
+                                      ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, kWidth, kHeight, kWidth);
+        ret = sceVideoOutRegisterBuffers(handle, 0, reinterpret_cast<void* const*>(buffers), kFrames, &attr);
+        if (ret < 0)
+            return Failed("sceVideoOutRegisterBuffers", ret);
+        open = true;
+        return true;
+    }
+
+    // Text size: 2 for the program's output (readable in a photo), 1.75 for the longer start page.
+    void SetScale(float s)
+    {
+        scale = s;
+        line_height = int(12 * s);
+    }
+    void Clear()
+    {
+        lines.clear();
+        status.clear();
+    }
+
+    void Add(const std::string& line, uint32_t color, bool draw = true)
+    {
+        // wrap at the screen's width (in columns), on spaces; continuation lines indented
+        const size_t columns = (kWidth - 2 * kMargin) / int(kCell * scale);
+        std::string rest = line;
+        do
+        {
+            size_t cut = rest.size();
+            if (cut > columns)
+            {
+                const size_t space = rest.rfind(' ', columns);
+                cut = space == std::string::npos || space < columns / 2 ? columns : space;
+            }
+            lines.push_back({rest.substr(0, cut), color});
+            const size_t next = rest.find_first_not_of(' ', cut);
+            rest = next == std::string::npos ? "" : "      " + rest.substr(next);
+        } while (!rest.empty());
+        if (draw)
+            Draw();
+    }
+
+    void SetStatus(const std::string& text)
+    {
+        status = text;
+        Draw();
+    }
+
+    void Draw()
+    {
+        if (!open)
+            return;
+        WaitForImageOffScreen();
+        uint32_t* fb = buffers[current];
+        std::fill(fb, fb + size_t(kWidth) * kHeight, Native(0xFF101418u));
+        Fill(fb, 0, 0, kWidth, 6, 0xFF3A8EE6u);
+        // the log, scrolled to its end, and below it the status line
+        const int rows = (kHeight - 2 * kMargin) / line_height - 2;
+        const size_t first = lines.size() > size_t(rows) ? lines.size() - rows : 0;
+        int y = kMargin;
+        for (size_t i = first; i < lines.size(); i++, y += line_height)
+            Text(fb, kMargin, y, lines[i].text, lines[i].color);
+        if (!status.empty())
+        {
+            Fill(fb, 0, kHeight - kMargin - line_height - 12, kWidth, kHeight - kMargin - line_height - 10, 0xFF2A3445u);
+            Text(fb, kMargin, kHeight - kMargin - line_height, status, 0xFF8FB4E8u);
+        }
+        if (flips == 0)
+            Trace("screen: first flip");
+        sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, int64_t(++flips));
+        current = (current + 1) % kFrames;
+    }
+
+private:
+    struct Line
+    {
+        std::string text;
+        uint32_t color;
+    };
+    static constexpr int kFrames = 3;
+    int handle = -1;
+    bool open = false;
+    OrbisKernelEqueue flip_queue = 0;
+    uint32_t* buffers[kFrames] = {};
+    int current = 0;
+    uint64_t flips = 0;
+    float scale = 2.0f;
+    int line_height = 24;
+    std::vector<Line> lines;
+    std::string status;
+
+    static bool Failed(const char* call, int32_t ret)
+    {
+        Trace(fmt::format("screen: {} failed ({:#x}); output goes to log.txt only", call, uint32_t(ret)));
+        return false;
+    }
+    // The image drawn next must be off screen: with 3 in rotation it was shown by flip n-2 and is
+    // replaced on screen by flip n-1 (n = flips submitted). As Crema's launcher waits.
+    void WaitForImageOffScreen()
+    {
+        if (flips < 2)
+            return;
+        const int64_t needed = int64_t(flips - 1);
+        for (int tries = 0; tries < 40; tries++)
+        {
+            OrbisVideoOutFlipStatus flip_status = {};
+            if (sceVideoOutGetFlipStatus(handle, &flip_status) < 0 || flip_status.flipArg >= needed)
+                return;
+            unsigned char event[64];
+            int32_t count = 0;
+            uint32_t timeout = 5000;
+            sceKernelWaitEqueue(flip_queue, event, 1, &count, &timeout);
+        }
+    }
+    // Colors are written as 0xAARRGGBB; the buffers are A8B8G8R8 (bytes R, G, B, A), as Crema's.
+    static uint32_t Native(uint32_t argb)
+    {
+        return (argb & 0xFF00FF00u) | ((argb >> 16) & 0xFFu) | ((argb & 0xFFu) << 16);
+    }
+    static void Fill(uint32_t* fb, int x0, int y0, int x1, int y1, uint32_t argb)
+    {
+        const uint32_t color = Native(argb);
+        x0 = std::max(x0, 0), y0 = std::max(y0, 0), x1 = std::min(x1, kWidth), y1 = std::min(y1, kHeight);
+        for (int y = y0; y < y1; y++)
+            std::fill(fb + size_t(y) * kWidth + x0, fb + size_t(y) * kWidth + std::max(x0, x1), color);
+    }
+    // stb_easy_font gives each character as quads; draw them as filled rectangles, scaled, one
+    // character per fixed-width cell.
+    void Text(uint32_t* fb, int x, int y, const std::string& text, uint32_t color) const
+    {
+        struct Vertex
+        {
+            float x, y, z;
+            unsigned char c[4];
+        };
+        Vertex quads[4 * 64];
+        for (size_t col = 0; col < text.size(); col++)
+        {
+            char ch[2] = {text[col], 0};
+            if (ch[0] == ' ' || ch[0] < 32 || ch[0] > 126)
+                continue;
+            const int advance = stb_easy_font_charinfo[ch[0] - 32].advance & 15;
+            const float cx = float(col * kCell) + float(kCell - advance) / 2.0f;
+            const int count = stb_easy_font_print(cx, 0, ch, nullptr, quads, sizeof(quads));
+            for (int q = 0; q < count; q++)
+            {
+                const Vertex* v = &quads[q * 4];
+                Fill(fb, x + int(v[0].x * scale + 0.5f), y + int(v[0].y * scale + 0.5f),
+                     x + int(v[2].x * scale + 0.5f), y + int(v[2].y * scale + 0.5f), color);
+            }
+        }
+    }
+};
+
+constexpr uint32_t kWhite = 0xFFE6E6E6u, kGreen = 0xFF7EE787u, kYellow = 0xFFF2CC60u, kRed = 0xFFFF6B6Bu,
+                   kGrey = 0xFF9AA4B2u;
+
+std::mutex g_mutex;
+Screen g_screen;
+
+// The system modules of every library this program calls, loaded before any call into them, as
+// Crema's frontend does (LoadSystemModules in patches/cemu-ps4.patch): "calling into a system
+// library whose module isn't loaded kills the app silently". (Net is for the runtime's resolver,
+// port/ps4_net.cpp.)
+void LoadSystemModules()
+{
+    const std::pair<const char*, uint32_t> modules[] = {{"SystemService", 0x80000010},
+                                                        {"UserService", 0x80000011},
+                                                        {"VideoOut", 0x80000022},
+                                                        {"Pad", 0x80000024},
+                                                        {"Net", 0x8000001C}};
+    for (const auto& [name, id] : modules)
+    {
+        const int32_t result = sceSysmoduleLoadModuleInternal(id);
+        Trace(fmt::format("system module {}: {}", name,
+                          result == 0 ? std::string("loaded") : fmt::format("FAILED ({:#x})", uint32_t(result))));
+    }
+}
+
+// ---- the start page: what the last run left behind, and what to run
+
+// The lines of a file, from at most its last `max_bytes`.
+std::vector<std::string> ReadLines(const char* path, long max_bytes = 64 * 1024)
+{
+    std::vector<std::string> lines;
+    FILE* f = std::fopen(path, "r");
+    if (!f)
+        return lines;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, size > max_bytes ? size - max_bytes : 0, SEEK_SET);
+    char line[1024];
+    bool first = size > max_bytes; // starts mid-line
+    while (std::fgets(line, sizeof(line), f))
+    {
+        line[std::strcspn(line, "\r\n")] = 0;
+        if (!first)
+            lines.push_back(line);
+        first = false;
+    }
+    std::fclose(f);
+    return lines;
+}
+
+std::vector<std::string> Last(const std::vector<std::string>& lines, size_t n)
+{
+    return std::vector<std::string>(lines.end() - std::min(n, lines.size()), lines.end());
+}
+
+// crash.log's last report, compacted: its header, rip and registers, the code addresses found on
+// the stack (several to a line), and the threads named in the dump that follows it.
+std::vector<std::string> LastCrash(const std::vector<std::string>& log)
+{
+    size_t start = log.size();
+    for (size_t i = log.size(); i-- > 0;)
+        if (log[i].rfind("=== ", 0) == 0)
+        {
+            start = i;
+            break;
+        }
+    std::vector<std::string> out;
+    std::string addresses;
+    int address_count = 0, threads = 0;
+    bool in_dump = false;
+    for (size_t i = start; i < log.size(); i++)
+    {
+        const std::string& l = log[i];
+        if (l.rfind("====", 0) == 0 && !in_dump)
+        {
+            in_dump = true;
+            if (!addresses.empty())
+                out.push_back("   stack: " + addresses);
+            addresses.clear();
+        }
+        if (in_dump)
+        {
+            if (l.rfind("-- ", 0) == 0 && threads++ < 8)
+                out.push_back("   thread " + l.substr(3));
+            continue;
+        }
+        if (l.empty() || l.rfind("code addresses", 0) == 0)
+            continue;
+        const size_t bracket = l.find("] 0x");
+        if (l.rfind("  [rsp+", 0) == 0 && bracket != std::string::npos)
+        {
+            if (address_count < 40)
+                addresses += (address_count % 10 ? " " : "") + l.substr(bracket + 2);
+            if (++address_count % 10 == 0 && address_count <= 40)
+            {
+                out.push_back("   stack: " + addresses);
+                addresses.clear();
+            }
+            continue;
+        }
+        out.push_back("   " + l);
+    }
+    if (!addresses.empty())
+        out.push_back("   stack: " + addresses);
+    return out;
+}
+
+// The pad of the user who started the app, or none.
+int g_pad = -1;
+void OpenPad()
+{
+    Trace("pad: sceUserServiceInitialize");
+    sceUserServiceInitialize(nullptr);
+    int32_t user = -1;
+    if (sceUserServiceGetInitialUser(&user) != 0)
+        return Trace("pad: no initial user");
+    Trace("pad: scePadInit");
+    scePadInit();
+    g_pad = scePadOpen(user, 0, 0, nullptr);
+    Trace(fmt::format("pad: scePadOpen = {:#x}", uint32_t(g_pad)));
+}
+uint32_t PadButtons()
+{
+    union {
+        OrbisPadData data;
+        unsigned char room[512]; // in case the system's structure is larger than the header's
+    } state{};
+    if (g_pad < 0 || scePadReadState(g_pad, &state.data) != 0 || !state.data.connected)
+        return 0;
+    return state.data.buttons;
+}
+
+bool Exists(const char* path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+// Shows the start page and waits for a choice. Without a controller, or after a finished run, the
+// test program boots after a countdown.
+std::string StartPage()
+{
+    const std::vector<std::string> log = ReadLines(kLogFile);
+    const std::vector<std::string> crash = ReadLines(kCrashFile);
+    const std::vector<std::string> trace = ReadLines(kLastTraceFile);
+    const bool unfinished = !crash.empty() || (!log.empty() && log.back() != kFinishedLine);
+    const bool have_user_program = Exists(kUserProgram);
+
+    g_screen.SetScale(1.75f);
+    g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": Eden's Switch core, booting a Switch program (text only: no GPU, no audio yet)",
+                 kGreen, false);
+    if (unfinished)
+    {
+        g_screen.Add("The last run didn't finish. What it left behind is below: take a photo of this screen first.",
+                     kRed, false);
+        g_screen.Add("", kWhite, false);
+        g_screen.Add("the end of its output (log.txt):", kYellow, false);
+        if (log.empty())
+            g_screen.Add("   (none: it stopped before its program printed anything)", kWhite, false);
+        for (const std::string& l : Last(log, 12))
+            g_screen.Add("   " + l, kWhite, false);
+        g_screen.Add("its crash report (crash.log):", kYellow, false);
+        const std::vector<std::string> report = LastCrash(crash);
+        if (report.empty())
+            g_screen.Add("   (none)", kWhite, false);
+        for (const std::string& l : report)
+            g_screen.Add(l, kRed, false);
+        g_screen.Add("its last steps (boot-trace):", kYellow, false);
+        if (trace.empty())
+            g_screen.Add("   (none)", kWhite, false);
+        for (const std::string& l : Last(trace, 12))
+            g_screen.Add("   " + l, kWhite, false);
+        g_screen.Add("", kWhite, false);
+    }
+    g_screen.Add(fmt::format("Press  X: the test program (hello.nro)    SQUARE: {}", have_user_program
+                                 ? "/data/eden-ps4/boot.nro"
+                                 : "/data/eden-ps4/boot.nro (there is none)"),
+                 kYellow, false);
+    OpenPad();
+    Trace(fmt::format("start page: last run {}, pad {}", unfinished ? "unfinished" : "finished or none", g_pad));
+
+    // with a controller after an unfinished run: wait for the choice (the photo comes first)
+    const bool wait = unfinished && g_pad >= 0;
+    const int countdown = g_pad < 0 ? 60 : 15;
+    const double start = Seconds();
+    uint32_t previous = PadButtons(); // a button still held from starting the app doesn't count
+    std::string program = kTestProgram;
+    for (int last_shown = -1;;)
+    {
+        const uint32_t buttons = PadButtons();
+        const uint32_t pressed = buttons & ~previous;
+        previous = buttons;
+        if (pressed & ORBIS_PAD_BUTTON_CROSS)
+            break;
+        if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && have_user_program)
+        {
+            program = kUserProgram;
+            break;
+        }
+        const int left = countdown - int(Seconds() - start);
+        if (!wait && left <= 0)
+            break;
+        if (!wait && left != last_shown)
+        {
+            last_shown = left;
+            g_screen.SetStatus(fmt::format("{}the test program boots in {} s", g_pad < 0 ? "no controller found: " : "",
+                                           left));
+        }
+        else if (wait && last_shown != 0)
+        {
+            last_shown = 0;
+            g_screen.SetStatus("waiting for a button");
+        }
+        usleep(50 * 1000);
+    }
+    Trace("start page: booting " + program);
+
+    // the last run's files are kept, under other names
+    rename(kLogFile, "/data/eden-ps4/log-previous.txt");
+    rename(kCrashFile, "/data/eden-ps4/crash-previous.log");
+    g_screen.Clear();
+    g_screen.SetScale(2.0f);
+    return program;
+}
+
+void ShowLine(Launcher::LineKind kind, std::string_view text)
+{
+    std::lock_guard lock{g_mutex};
+    uint32_t color = kWhite;
+    switch (kind)
+    {
+    case Launcher::LineKind::Program:
+        break;
+    case Launcher::LineKind::Warning:
+        color = kGrey;
+        break;
+    case Launcher::LineKind::Error:
+        color = kRed;
+        Trace(std::string(text));
+        break;
+    case Launcher::LineKind::Status:
+        color = kYellow;
+        Trace(std::string(text));
+        break;
+    }
+    g_screen.Add(std::string(text), color);
+}
+
+void* Run(void*)
+{
+    const std::string program = StartPage();
+    // Eden finds its data under $HOME when no folder is given, and a few paths it always takes
+    // from there: keep them in the app's folder.
+    setenv("HOME", kDataDir, 1);
+    g_screen.SetStatus(fmt::format("booting {}", program));
+    const auto result = Launcher::Boot(program, kDataDir, ShowLine, std::chrono::minutes(10));
+    Trace(fmt::format("boot returned: status {}", int(result.status)));
+    if (FILE* f = std::fopen(kLogFile, "a"))
+    {
+        std::fprintf(f, "%s\n", kFinishedLine);
+        std::fclose(f);
+    }
+    std::lock_guard lock{g_mutex};
+    g_screen.Add(fmt::format("Done. The output is in {}. Take a photo of this screen, then close the app (PS button).",
+                             kLogFile),
+                 kGreen);
+    g_screen.SetStatus("finished");
+    return nullptr;
+}
+
+} // namespace
+
+int main()
+{
+    mkdir(kDataDir, 0777);
+    Trace("started");
+    LoadSystemModules();
+    Trace(g_screen.Open() ? "screen open" : "no screen (video out failed)");
+
+    // Eden on a thread with a large stack (the main thread's is small).
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16 * MB);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, Run, nullptr) != 0)
+    {
+        Trace("could not start the launcher thread");
+        return 1;
+    }
+    for (;;)
+        sleep(1);
+}

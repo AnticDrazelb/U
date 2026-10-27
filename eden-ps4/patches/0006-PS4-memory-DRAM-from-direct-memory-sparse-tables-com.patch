@@ -1,0 +1,571 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Tue, 27 Oct 2026 21:04:21 +0000
+Subject: [PATCH] PS4 memory: DRAM from direct memory, sparse tables committed
+ on demand, small code caches
+
+What a PS4 app can get (measured by switch-bench): 4.5 GiB of direct memory
+(the GPU's pool), well under 1 GiB of flexible memory (behind mmap, all of
+it committed when mapped), and executable memory only from the system pool.
+
+- The emulated DRAM (4 GiB) comes from direct memory, in pieces mapped back
+  to back into one reserved range.
+- SparseLargeVector (the page table: 1 GiB for a 39-bit address space) only
+  reserves its range and maps 16 KiB pages as they are written, as on
+  Windows. A recompiled read of a page not written yet faults, and a
+  signal handler maps a page of zeros there.
+- Code caches are 32 MiB per core: they come from the system pool, which
+  the app heap shares.
+- No fastmem: the PS4 can't map the same memory twice for an app.
+---
+ src/common/CMakeLists.txt                 |   2 +
+ src/common/host_memory.cpp                |  19 +++-
+ src/common/orbis_memory.cpp               | 120 ++++++++++++++++++++++
+ src/common/orbis_memory.h                 |  37 +++++++
+ src/common/settings.cpp                   |   4 +
+ src/common/sparse_large_vector.cpp        | 120 ++++++++++++++++++++++
+ src/common/sparse_large_vector.h          |  41 +++++++-
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp |   5 +-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp |   5 +-
+ 9 files changed, 345 insertions(+), 8 deletions(-)
+ create mode 100644 src/common/orbis_memory.cpp
+ create mode 100644 src/common/orbis_memory.h
+
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 5d1b30a54..a858ff2e3 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -69,6 +69,8 @@ add_library(
+     hex_util.h
+     host_memory.cpp
+     host_memory.h
++    orbis_memory.cpp
++    orbis_memory.h
+     input.h
+     intrusive_red_black_tree.h
+     literals.h
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 75a9da80e..f084db191 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -33,7 +33,8 @@
+ #elif defined(__FreeBSD__)
+ #include <sys/shm.h>
+ #elif defined(__OPENORBIS__)
+-#include <orbis/libkernel.h>
++#include "common/literals.h"
++#include "common/orbis_memory.h"
+ #endif
+ 
+ // FreeBSD
+@@ -708,7 +709,15 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     : backing_size(backing_size_)
+     , virtual_size(virtual_size_)
+ {
+-#if defined(__OPENORBIS__) || defined(__managarm__)
++#if defined(__OPENORBIS__)
++    // No fastmem: the PS4 can't map the same memory twice for an app. The emulated DRAM comes
++    // from direct memory: flexible memory, behind mmap, has well under 1 GiB.
++    using namespace Common::Literals;
++    if (void* range = Orbis::ReserveRange(backing_size, 2_MiB); range && Orbis::MapDirectMemory(range, backing_size))
++        backing_base = static_cast<u8*>(range);
++    ASSERT_MSG(backing_base, "Can't map {} MiB of direct memory for the emulated DRAM", backing_size >> 20);
++    virtual_base = nullptr;
++#elif defined(__managarm__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
+     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+     virtual_base = nullptr;
+@@ -734,7 +743,11 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+ }
+ 
+ HostMemory::~HostMemory() {
+-#ifdef _WIN32
++#if defined(__OPENORBIS__)
++    if (backing_base) {
++        Orbis::UnmapDirectMemory(backing_base, backing_size);
++    }
++#elif defined(_WIN32)
+     if (fallback_buffer) {
+         VirtualFree(backing_base, backing_size, MEM_RELEASE);
+     }
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+new file mode 100644
+index 000000000..2ea633dfd
+--- /dev/null
++++ b/src/common/orbis_memory.cpp
+@@ -0,0 +1,120 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#ifdef __OPENORBIS__
++
++#include <mutex>
++#include <vector>
++
++#include <sys/types.h>
++
++#include "common/literals.h"
++#include "common/logging.h"
++#include "common/orbis_memory.h"
++
++// Declared here: the OpenOrbis headers give some of these other prototypes.
++extern "C" {
++int32_t sceKernelReserveVirtualRange(void** addr, size_t len, int32_t flags, size_t alignment);
++int32_t sceKernelMunmap(void* addr, size_t len);
++size_t sceKernelGetDirectMemorySize(void);
++int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t alignment,
++                                      int32_t memory_type, off_t* phys_out);
++int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
++                                 size_t alignment);
++int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
++int32_t sceKernelMapNamedFlexibleMemory(void** addr, size_t len, int32_t prot, int32_t flags,
++                                        const char* name);
++}
++
++namespace Common::Orbis {
++
++using namespace Common::Literals;
++
++namespace {
++
++constexpr int32_t ProtCpuReadWrite = 0x3;
++constexpr int32_t MapFixed = 0x10;
++constexpr int32_t MemoryTypeWriteBack = 0;
++constexpr size_t DirectAlignment = 2_MiB;
++
++struct DirectPiece {
++    void* base; // the range it was mapped for
++    off_t phys;
++    size_t size;
++};
++std::mutex direct_mutex;
++std::vector<DirectPiece> direct_pieces;
++
++void ReleasePieces(void* base) {
++    std::erase_if(direct_pieces, [base](const DirectPiece& piece) {
++        if (piece.base != base)
++            return false;
++        sceKernelReleaseDirectMemory(piece.phys, piece.size);
++        return true;
++    });
++}
++
++} // namespace
++
++void* ReserveRange(size_t size, size_t alignment) {
++    // Ranges the kernel places itself can land among the system libraries' objects, near
++    // 0x200000000: ask for higher addresses, as Crema's runtime does for its heap.
++    for (const uintptr_t hint : {0x1000000000ull, 0x800000000ull, 0x600000000ull}) {
++        void* address = reinterpret_cast<void*>(hint);
++        if (sceKernelReserveVirtualRange(&address, size, 0, alignment) != 0)
++            continue;
++        if (reinterpret_cast<uintptr_t>(address) >= 0x400000000ull)
++            return address;
++        sceKernelMunmap(address, size);
++    }
++    return nullptr;
++}
++
++void ReleaseRange(void* base, size_t size) {
++    sceKernelMunmap(base, size);
++}
++
++bool MapDirectMemory(void* base, size_t size) {
++    std::scoped_lock lock{direct_mutex};
++    size_t mapped = 0;
++    for (const size_t piece : {1_GiB, 256_MiB, 64_MiB, 16_MiB, 2_MiB}) {
++        while (size - mapped >= piece) {
++            off_t phys = 0;
++            if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), piece,
++                                              DirectAlignment, MemoryTypeWriteBack, &phys) != 0)
++                break;
++            void* at = static_cast<char*>(base) + mapped;
++            if (sceKernelMapDirectMemory(&at, piece, ProtCpuReadWrite, MapFixed, phys,
++                                         DirectAlignment) != 0 ||
++                at != static_cast<char*>(base) + mapped) {
++                sceKernelReleaseDirectMemory(phys, piece);
++                break;
++            }
++            direct_pieces.push_back({base, phys, piece});
++            mapped += piece;
++        }
++    }
++    if (mapped == size)
++        return true;
++    LOG_CRITICAL(HW_Memory, "Only {} MiB of the {} MiB of direct memory needed could be mapped",
++                 mapped >> 20, size >> 20);
++    sceKernelMunmap(base, size);
++    ReleasePieces(base);
++    return false;
++}
++
++void UnmapDirectMemory(void* base, size_t size) {
++    std::scoped_lock lock{direct_mutex};
++    sceKernelMunmap(base, size);
++    ReleasePieces(base);
++}
++
++bool MapFlexibleMemory(void* address, size_t size) {
++    void* at = address;
++    return sceKernelMapNamedFlexibleMemory(&at, size, ProtCpuReadWrite, MapFixed, "eden") == 0 &&
++           at == address;
++}
++
++} // namespace Common::Orbis
++
++#endif
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+new file mode 100644
+index 000000000..64c14f964
+--- /dev/null
++++ b/src/common/orbis_memory.h
+@@ -0,0 +1,37 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// The PS4's memory pools, for the emulated DRAM (HostMemory) and the large sparse tables
++// (SparseLargeVector). An app gets three kinds of memory there: direct memory (the GPU's pool,
++// 4.5 GiB on a retail console), flexible memory (behind mmap; well under 1 GiB, all of it
++// committed when mapped) and system flexible memory (the only memory that runs code).
++
++#ifdef __OPENORBIS__
++
++#include <cstddef>
++
++namespace Common::Orbis {
++
++/// Reserves an address range (no memory behind it), above where the kernel places the system
++/// libraries' objects. Returns nullptr if there is none.
++void* ReserveRange(std::size_t size, std::size_t alignment);
++
++/// Releases a range from ReserveRange, with anything mapped in it.
++void ReleaseRange(void* base, std::size_t size);
++
++/// Maps `size` bytes of direct memory, in as few pieces as possible, back to back at `base` (a
++/// range from ReserveRange). On failure nothing stays allocated, and the range is released.
++bool MapDirectMemory(void* base, std::size_t size);
++
++/// Unmaps and frees what MapDirectMemory mapped at `base`.
++void UnmapDirectMemory(void* base, std::size_t size);
++
++/// Maps zero-filled read/write flexible memory at `address`, inside a reserved range. Safe to
++/// call from a signal handler.
++bool MapFlexibleMemory(void* address, std::size_t size);
++
++} // namespace Common::Orbis
++
++#endif
+diff --git a/src/common/settings.cpp b/src/common/settings.cpp
+index 3f5154026..235d78a10 100644
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -179,6 +179,10 @@ bool IsGPUFenceBehaviorAccurate() {
+ }
+ 
+ bool IsFastmemEnabled() {
++#ifdef __OPENORBIS__
++    // The PS4 can't map the same memory twice for an app.
++    return false;
++#endif
+     if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
+         return bool(values.cpuopt_fastmem);
+     else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index eee8ff6d1..48f4b51a5 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -12,6 +12,12 @@
+ #else
+ #include <sys/mman.h>
+ #endif
++#ifdef __OPENORBIS__
++#include <csignal>
++#include <cstring>
++#include <mutex>
++#include "common/orbis_memory.h"
++#endif
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
+@@ -106,6 +112,113 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
+ }
+ #endif
+ 
++#ifdef __OPENORBIS__
++namespace {
++
++// The vectors' address ranges, for the fault handler: a fixed table it can read without locks.
++struct VectorRegion {
++    std::atomic<uintptr_t> base;
++    uintptr_t size;
++    std::atomic<u64>* committed;
++};
++constexpr size_t MaxVectorRegions = 64;
++VectorRegion vector_regions[MaxVectorRegions];
++// Taken by CommitVectorPage and the fault handler: a page is mapped once, and a page mapped and
++// written by one thread is never mapped over by another's fault.
++std::atomic_flag commit_lock = ATOMIC_FLAG_INIT;
++struct sigaction previous_segv, previous_bus;
++
++class CommitLock {
++public:
++    CommitLock() noexcept {
++        while (commit_lock.test_and_set(std::memory_order_acquire)) {
++        }
++    }
++    ~CommitLock() noexcept {
++        commit_lock.clear(std::memory_order_release);
++    }
++};
++
++bool CommitLocked(uintptr_t base, std::atomic<u64>* committed, uintptr_t page) noexcept {
++    const uintptr_t index = (page - base) >> HostPageBits;
++    auto& word = committed[index >> 6];
++    const u64 bit = 1ULL << (index & 63);
++    if (word.load(std::memory_order_acquire) & bit)
++        return true;
++    if (!Orbis::MapFlexibleMemory(reinterpret_cast<void*>(page), HostPageSize))
++        return false;
++    word.fetch_or(bit, std::memory_order_release);
++    return true;
++}
++
++void ChainSignal(const struct sigaction& previous, int sig, siginfo_t* info, void* context) {
++    if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction) {
++        previous.sa_sigaction(sig, info, context);
++    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN) {
++        previous.sa_handler(sig);
++    } else {
++        // the default action: on return the access faults again, without this handler
++        signal(sig, SIG_DFL);
++    }
++}
++
++void VectorFaultHandler(int sig, siginfo_t* info, void* context) {
++    // si_addr at FreeBSD's offset (the musl headers have Linux's siginfo layout)
++    const uintptr_t address = *reinterpret_cast<const uintptr_t*>(reinterpret_cast<char*>(info) + 24);
++    for (auto& region : vector_regions) {
++        const uintptr_t base = region.base.load(std::memory_order_acquire);
++        if (base && address >= base && address - base < region.size) {
++            CommitLock lock;
++            if (CommitLocked(base, region.committed, address & HostPageMask))
++                return; // the access is retried, now with a page of zeros there
++            break;
++        }
++    }
++    ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
++}
++
++void InstallVectorFaultHandler() {
++    struct sigaction action;
++    std::memset(&action, 0, sizeof(action));
++    action.sa_sigaction = VectorFaultHandler;
++    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
++    sigemptyset(&action.sa_mask);
++    sigaction(SIGSEGV, &action, &previous_segv);
++    sigaction(SIGBUS, &action, &previous_bus);
++}
++
++} // namespace
++
++void RegisterVectorRegion(void* base, std::size_t size, std::atomic<u64>* committed) noexcept {
++    static std::once_flag handler_once;
++    std::call_once(handler_once, InstallVectorFaultHandler);
++    CommitLock lock;
++    for (auto& region : vector_regions) {
++        if (region.base.load(std::memory_order_relaxed) == 0) {
++            region.size = size;
++            region.committed = committed;
++            region.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_release);
++            return;
++        }
++    }
++    LOG_CRITICAL(HW_Memory, "More than {} large vectors: reads of unwritten pages will crash", MaxVectorRegions);
++}
++
++void UnregisterVectorRegion(void* base) noexcept {
++    CommitLock lock;
++    for (auto& region : vector_regions) {
++        if (region.base.load(std::memory_order_relaxed) == reinterpret_cast<uintptr_t>(base)) {
++            region.base.store(0, std::memory_order_release);
++        }
++    }
++}
++
++bool CommitVectorPage(void* base, std::atomic<u64>* committed, uintptr_t page) noexcept {
++    CommitLock lock;
++    return CommitLocked(reinterpret_cast<uintptr_t>(base), committed, page);
++}
++#endif
++
+ #ifndef MAP_NOCORE
+ #define MAP_NOCORE 0
+ #endif
+@@ -116,6 +229,8 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
+ void DecommitVectorPage(uintptr_t base) noexcept {
+ #if defined(_WIN32)
+     VirtualFree(reinterpret_cast<LPVOID>(base), HostPageSize, MEM_DECOMMIT);
++#elif defined(__OPENORBIS__)
++    std::memset(reinterpret_cast<void*>(base), 0, HostPageSize);
+ #elif defined(__linux__)
+     // Linux's MADV_DONTNEED zeros out pages for us
+     madvise(reinterpret_cast<void*>(base), HostPageSize, MADV_DONTNEED);
+@@ -147,6 +262,9 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
+         base = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+     }
+     ASSERT_MSG(base, "Failed to reserve {:#x} sized region with error {}", size, GetLastError());
++#elif defined(__OPENORBIS__)
++    void* base = Orbis::ReserveRange(size, HostPageSize);
++    ASSERT_MSG(base, "Failed to reserve a {:#x} sized region", size);
+ #else
+     void* base = mmap(nullptr, size, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_NOCORE, -1, 0);
+     if (base == MAP_FAILED)
+@@ -166,6 +284,8 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
+     std::lock_guard lock(vector_regions_mutex);
+     std::erase_if(vector_regions, [base](const auto& r) {return r.first == reinterpret_cast<u64>(base); });
+     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
++#elif defined(__OPENORBIS__)
++    Orbis::ReleaseRange(base, size);
+ #else
+     ASSERT(munmap(base, size) == 0);
+ #endif
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 8496c28ce..7957718b8 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -37,6 +37,17 @@ void* AllocateMemoryPages(std::size_t size) noexcept;
+ void FreeMemoryPages(void* base, std::size_t size) noexcept;
+ void DecommitVectorPage(uintptr_t base) noexcept;
+ 
++#ifdef __OPENORBIS__
++// The PS4 commits flexible memory when it is mapped, and has well under 1 GiB of it: a vector
++// only reserves its address range, and gets memory one page at a time as it is written. A read
++// of a page not written yet (by recompiled code, which reads the page table directly) faults,
++// and a signal handler maps a page of zeros there.
++void RegisterVectorRegion(void* base, std::size_t size, std::atomic<u64>* committed) noexcept;
++void UnregisterVectorRegion(void* base) noexcept;
++/// Maps memory at `page` of the vector at `base`, unless it is there already (committed bit set).
++bool CommitVectorPage(void* base, std::atomic<u64>* committed, uintptr_t page) noexcept;
++#endif
++
+ /// A large page-aligned buffer that has optimized memory usage for zero-writes.
+ template <typename T>
+     // MSVC doesn't regard structs with atomics as trivially copyable
+@@ -53,9 +64,15 @@ public:
+         // each item in vector holds information for 64 pages
+         auto denom = HostPageSize * 64;
+         committed_pages = std::vector<std::atomic<u64>>((alloc_size + denom - 1) / denom);
++#ifdef __OPENORBIS__
++        RegisterVectorRegion(base_ptr, alloc_size, committed_pages.data());
++#endif
+     }
+ 
+     ~SparseLargeVector() noexcept {
++#ifdef __OPENORBIS__
++        UnregisterVectorRegion(base_ptr);
++#endif
+         FreeMemoryPages(base_ptr, alloc_size);
+     }
+ 
+@@ -66,12 +83,18 @@ public:
+ 
+     void ResizeAndClear(std::size_t count) noexcept {
+         if (auto const new_size = count * sizeof(T); new_size != alloc_size) {
++#ifdef __OPENORBIS__
++            UnregisterVectorRegion(base_ptr);
++#endif
+             FreeMemoryPages(base_ptr, alloc_size);
+             alloc_size = new_size;
+             base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size));
+ 
+             auto denom = HostPageSize * 64;
+             committed_pages = std::vector<std::atomic<u64>>((alloc_size + denom - 1) / denom);
++#ifdef __OPENORBIS__
++            RegisterVectorRegion(base_ptr, alloc_size, committed_pages.data());
++#endif
+         }
+     }
+ 
+@@ -89,7 +112,7 @@ public:
+ 
+     /// Returns a reference to the value of the requested index if initialized, or will otherwise return a zero-initialized object.
+     const T& GetOrDefault(std::size_t index) const {
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__OPENORBIS__)
+         if (!IsCommittedPage(index)) {
+             return *reinterpret_cast<const T*>(&default_val);
+         }
+@@ -183,6 +206,13 @@ private:
+         if (!CommitVectorPage(page, true)) {
+             return false;
+         }
++#elif defined(__OPENORBIS__)
++        // sets the committed bit itself, under the lock the fault handler takes
++        if (!CommitVectorPage(base_ptr, committed_pages.data(), page)) {
++            LOG_ERROR(Common_Memory, "Failed to commit large buffer region at index {}", index);
++            return false;
++        }
++        return true;
+ #else
+         if (mprotect(reinterpret_cast<void*>(page), HostPageSize, PROT_READ | PROT_WRITE) != 0) {
+             LOG_ERROR(Common_Memory, "Failed to commit large buffer region at index {}, error {}", index, strerror(errno));
+@@ -195,18 +225,23 @@ private:
+     }
+ 
+     constexpr void DecommitPage(std::size_t index) noexcept {
+-        auto page_index = (index * sizeof(T)) >> HostPageBits;
++        [[maybe_unused]] auto page_index = (index * sizeof(T)) >> HostPageBits;
+         auto page = reinterpret_cast<uintptr_t>(base_ptr + index) & HostPageMask;
+ 
++#ifdef __OPENORBIS__
++        // keeps the page (and its committed bit): mapping one again would cost as much
++        std::memset(reinterpret_cast<void*>(page), 0, HostPageSize);
++#else
+         committed_pages[page_index >> 6].fetch_and(~(1ULL << (page_index & 63)), std::memory_order_release);
+         DecommitVectorPage(page);
++#endif
+     }
+ 
+     std::size_t alloc_size{};
+     T* base_ptr{};
+ 
+     std::vector<std::atomic<u64>> committed_pages{};
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__OPENORBIS__)
+     const std::array<u8, sizeof(T)> default_val{};
+ #endif
+ };
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index a59aa3cac..94f4105df 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -190,7 +190,10 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
+     // Code cache size
+-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
++#if defined(__OPENORBIS__)
++    // The PS4 runs code only from its system memory pool, which the app's heap shares.
++    config.code_cache_size = std::uint32_t(32_MiB);
++#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+     config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 894857a86..cd37c3d20 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -244,7 +244,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
+     // Code cache size
+-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
++#if defined(__OPENORBIS__)
++    // The PS4 runs code only from its system memory pool, which the app's heap shares.
++    config.code_cache_size = std::uint32_t(32_MiB);
++#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+     config.code_cache_size = std::uint32_t(512_MiB);

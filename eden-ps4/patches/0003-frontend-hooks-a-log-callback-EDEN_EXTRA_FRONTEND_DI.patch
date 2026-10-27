@@ -1,17 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Eden PS4 <eden-ps4@localhost>
 Date: Tue, 27 Oct 2026 20:38:30 +0000
-Subject: [PATCH] frontend hooks: a log callback, EDEN_EXTRA_FRONTEND_DIR
+Subject: [PATCH] frontend hooks: a log callback, EDEN_EXTRA_FRONTEND_DIR,
+ SetAppDirectory
 
 Common::Log::SetCallback hands every message that passes the filter to the
 frontend (for a frontend without a console, such as the PS4's, which shows
 the log on screen). EDEN_EXTRA_FRONTEND_DIR builds a frontend kept outside
-the tree against Eden's targets.
+the tree against Eden's targets. Common::FS::SetAppDirectory, so far only
+honored on Android, sets Eden's data folder on other POSIX platforms too.
 ---
- src/CMakeLists.txt     |  6 ++++++
- src/common/logging.cpp | 21 +++++++++++++++++++++
- src/common/logging.h   |  6 ++++++
- 3 files changed, 33 insertions(+)
+ src/CMakeLists.txt          |  6 ++++++
+ src/common/fs/path_util.cpp |  7 +++++--
+ src/common/fs/path_util.h   |  2 +-
+ src/common/logging.cpp      | 21 +++++++++++++++++++++
+ src/common/logging.h        |  6 ++++++
+ 5 files changed, 39 insertions(+), 3 deletions(-)
 
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index a2abc7d1b..3be35366e 100644
@@ -30,6 +34,37 @@ index a2abc7d1b..3be35366e 100644
  if (ENABLE_QT)
      add_subdirectory(qt_common)
      add_subdirectory(yuzu)
+diff --git a/src/common/fs/path_util.cpp b/src/common/fs/path_util.cpp
+index 82ea8f6cb..80d3c5a81 100644
+--- a/src/common/fs/path_util.cpp
++++ b/src/common/fs/path_util.cpp
+@@ -132,8 +132,11 @@ public:
+         eden_path_cache = eden_path / CACHE_DIR;
+         eden_path_config = eden_path / CONFIG_DIR;
+ #else
+-        eden_path = GetCurrentDir() / PORTABLE_DIR;
+-        if (!Exists(eden_path) || !IsDir(eden_path)) {
++        // A frontend's own folder (SetAppDirectory), else portable mode, else the XDG folders
++        if (!eden_path.empty()) {
++            eden_path_cache = eden_path / CACHE_DIR;
++            eden_path_config = eden_path / CONFIG_DIR;
++        } else if (eden_path = GetCurrentDir() / PORTABLE_DIR; !Exists(eden_path) || !IsDir(eden_path)) {
+             eden_path = GetDataDirectory("XDG_DATA_HOME") / EDEN_DIR;
+             eden_path_cache = GetDataDirectory("XDG_CACHE_HOME") / EDEN_DIR;
+             eden_path_config = GetDataDirectory("XDG_CONFIG_HOME") / EDEN_DIR;
+diff --git a/src/common/fs/path_util.h b/src/common/fs/path_util.h
+index e8fa5614a..e69a9ab2d 100644
+--- a/src/common/fs/path_util.h
++++ b/src/common/fs/path_util.h
+@@ -215,7 +215,7 @@ template <typename Path>
+ 
+ /**
+  * Sets the directory used for application storage. Used on Android where we do not know internal
+- * storage until informed by the frontend.
++ * storage until informed by the frontend, and by frontends that keep it in a folder of their own.
+  *
+  * @param app_directory Directory to use for application storage.
+  */
 diff --git a/src/common/logging.cpp b/src/common/logging.cpp
 index ed12d5253..de42a5143 100644
 --- a/src/common/logging.cpp

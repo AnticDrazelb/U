@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Tue, 27 Oct 2026 21:26:19 +0000
+Subject: [PATCH] PS4 build
+
+Eden compiled for the PS4 (clang 21 for x86_64-pc-freebsd12, the OpenOrbis
+C library, which is musl, on the PS4's FreeBSD kernel):
+- The PS4's compiler defines __FreeBSD__: PS4 branches go before FreeBSD
+  ones, and FreeBSD-only headers (sys/cpuset.h, pthread_np.h) are skipped.
+- Thread names and priorities are not set: those system calls aren't ones
+  a homebrew app makes there.
+- zstd's dictionary builder without GNU qsort_r, as on Android.
+- Only Boost.Process's headers: its compiled library calls FreeBSD
+  functions the PS4 doesn't have.
+---
+ src/common/host_memory.cpp      | 6 +++---
+ src/common/thread.cpp           | 9 ++++++++-
+ src/common/zbic_compression.cpp | 3 ++-
+ src/core/CMakeLists.txt         | 6 +++++-
+ 4 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index f084db191..19937d68c 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -30,11 +30,11 @@
+ #include <sys/random.h>
+ #include <mach/vm_map.h>
+ #include <mach/mach.h>
+-#elif defined(__FreeBSD__)
+-#include <sys/shm.h>
+-#elif defined(__OPENORBIS__)
++#elif defined(__OPENORBIS__) // before __FreeBSD__, which the PS4's compiler defines too
+ #include "common/literals.h"
+ #include "common/orbis_memory.h"
++#elif defined(__FreeBSD__)
++#include <sys/shm.h>
+ #endif
+ 
+ // FreeBSD
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3dc..a1e3f7882 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -24,7 +24,7 @@
+ #include "common/string_util.h"
+ #include "common/windows/timer_resolution.h"
+ #else
+-#if defined(__FreeBSD__)
++#if defined(__FreeBSD__) && !defined(__OPENORBIS__) // the PS4 has neither header
+ #include <sys/cpuset.h>
+ #include <sys/_cpuset.h>
+ #include <pthread_np.h>
+@@ -475,6 +475,10 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
+         }
+     }();
+     set_thread_priority(find_thread(NULL), priority);
++#elif defined(__OPENORBIS__)
++    // The PS4: not among the system calls a homebrew app makes there (the musl headers' SCHED_OTHER
++    // isn't FreeBSD's either).
++    (void)new_priority;
+ #elif defined(__ANDROID__)
+     const int nice_value = NiceValueForPriority(new_priority);
+     const pid_t tid = gettid();
+@@ -514,6 +518,9 @@ void SetCurrentThreadName(const char* name) {
+     pthread_setname_np(name);
+ #elif defined(__HAIKU__)
+     rename_thread(find_thread(NULL), name);
++#elif defined(__OPENORBIS__)
++    // The PS4: pthread_rename_np isn't among the system calls a homebrew app makes there.
++    (void)name;
+ #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+     pthread_set_name_np(pthread_self(), name);
+ #elif defined(__NetBSD__)
+diff --git a/src/common/zbic_compression.cpp b/src/common/zbic_compression.cpp
+index 5e0e4d947..0486cc4ee 100644
+--- a/src/common/zbic_compression.cpp
++++ b/src/common/zbic_compression.cpp
+@@ -12,7 +12,8 @@
+ #define ZSTDERRORLIB_HIDDEN static
+ #undef ZSTD_MULTITHREAD
+ 
+-#if defined(__ANDROID__)
++#if defined(__ANDROID__) || defined(__OPENORBIS__)
++// no qsort_r (the GNU one zstd's dictionary builder uses with _GNU_SOURCE)
+ #undef _GNU_SOURCE
+ #endif
+ 
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 31f9931d3..c6115b0ec 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -1209,7 +1209,11 @@ if (MSVC)
+     target_link_libraries(core PRIVATE getopt)
+ endif()
+ 
+-if (BOOST_NO_HEADERS)
++if (BOOST_NO_HEADERS AND PS4)
++    # Only Boost.Process's headers are used (debugger.cpp); its compiled library calls into
++    # FreeBSD functions the PS4 doesn't have.
++    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio $<COMPILE_ONLY:Boost::process> Boost::crc)
++elseif (BOOST_NO_HEADERS)
+     target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
+ else()
+     target_link_libraries(core PUBLIC Boost::headers)

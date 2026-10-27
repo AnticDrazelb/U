@@ -37,7 +37,47 @@ case "${1:-}" in
 host)
     "$CMAKE" -S "$EDEN_DIR" -B "$HOME/eden-host" "${common[@]}" \
         -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21
-    ninja -C "$HOME/eden-host" eden-ps4
+    ninja -C "$HOME/eden-host" ${NINJA_FLAGS:-} eden-ps4
+    ;;
+ps4)
+    # shellcheck disable=SC1091
+    source "$HERE/../scripts/ps4-env.sh"
+    PATH="$(dirname "$CMAKE"):$PATH" # ps4_cmake runs the cmake on PATH
+    build="$HOME/eden-ps4-build"
+    # -march goes in the Release flags: CMAKE_<LANG>_FLAGS would replace the toolchain's own
+    jaguar="-O2 -DNDEBUG -march=btver2"
+    ps4_cmake -S "$EDEN_DIR" -B "$build" "${common[@]}" \
+        -DCMAKE_TOOLCHAIN_FILE="$HERE/ps4-eden.cmake" -DPS4_PAID=0x3800000000000035 \
+        -DCMAKE_C_FLAGS_RELEASE="$jaguar" -DCMAKE_CXX_FLAGS_RELEASE="$jaguar" \
+        -DYUZU_USE_EXTERNAL_FFMPEG=OFF -DYUZU_USE_BUNDLED_FFMPEG=OFF \
+        -DFFMPEG_DIR="${FFMPEG_DIR:-$HOME/eden-ps4-ffmpeg}"
+    ninja -C "$build" ${NINJA_FLAGS:-} eden-ps4_eboot
+    elf="$build/extra_frontend/eden-ps4"
+
+    # Every system function it imports must be one Crema imports (the consoles run those), as
+    # switch-bench checks: see its README.
+    if [ -n "${CREMA_ELF:-}" ]; then
+        missing="$(comm -13 <(llvm-nm-21 -u "$CREMA_ELF" | awk '{print $2}' | sort -u) \
+            <(llvm-nm-21 -u "$elf" | awk '{print $2}' | sort -u))"
+        [ -z "$missing" ] || { echo "imports Crema doesn't make:"; echo "$missing"; exit 1; }
+    fi
+
+    # The ELF of every build is kept, to symbolize the stack addresses in a crash report.
+    version="$(cat "$HERE/VERSION")"
+    mkdir -p "$HOME/eden-ps4-elves"
+    cp "$elf" "$HOME/eden-ps4-elves/eden-ps4-$version-$(date +%Y%m%d-%H%M%S).elf"
+
+    stage="$build/stage"
+    rm -rf "$stage" && mkdir -p "$stage/sce_sys"
+    cp "$build/extra_frontend/eden-ps4_eboot/eboot.bin" "$stage/"
+    cp "$HERE/sce_sys/icon0.png" "$stage/sce_sys/"
+    OUT="$stage" "$HERE/hello/build.sh" >/dev/null
+    mkdir -p "$build/no-modules" "$HERE/../out"
+    pkg="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR="$build/no-modules" \
+        "$HERE/../scripts/make-pkg.sh" "$stage" EDNP00001 "Eden for PS4" "$version" EDENPS4 "$build/out" |
+        tail -1)"
+    cp "$pkg" "$HERE/../out/EdenPS4.pkg"
+    echo "$HERE/../out/EdenPS4.pkg"
     ;;
 *)
     echo "usage: build.sh host|ps4" >&2
