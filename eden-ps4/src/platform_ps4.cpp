@@ -766,13 +766,45 @@ void ShowLine(Launcher::LineKind kind, std::string_view text)
     g_screen.Add(std::string(text), color, !g_drawing);
 }
 
+// Settings for the console, where there's no shell to set environment variables: each line of
+// /data/eden-ps4/settings.txt that reads NAME=value is set as one (EDEN_SW_THREADS=5, say).
+void ReadSettings()
+{
+    FILE* file = std::fopen((std::string(kDataDir) + "/settings.txt").c_str(), "r");
+    if (!file)
+    {
+        return;
+    }
+    char line[256];
+    while (std::fgets(line, sizeof(line), file))
+    {
+        std::string text{line};
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
+        {
+            text.pop_back();
+        }
+        const size_t equals = text.find('=');
+        if (text.empty() || text[0] == '#' || equals == std::string::npos || equals == 0)
+        {
+            continue;
+        }
+        setenv(text.substr(0, equals).c_str(), text.substr(equals + 1).c_str(), 1);
+        Trace(fmt::format("setting {}", text));
+    }
+    std::fclose(file);
+}
+
 void* Run(void*)
 {
     // Eden finds its data under $HOME when no folder is given, and a few paths it always takes
     // from there: keep them in the app's folder.
     setenv("HOME", kDataDir, 1);
-    // the null renderer's software draws log what they cost (every 2 seconds, in log.txt)
+    ReadSettings();
+    // the null renderer's software draws log what they cost (every 2 seconds, in log.txt), and
+    // rasterize on 4 threads (the GPU thread and 3 more) of the app's 6 cores, leaving the
+    // emulated CPU's thread one of its own
     setenv("EDEN_SW_STATS", "1", 0);
+    setenv("EDEN_SW_THREADS", "4", 0);
     Launcher::SetAudio(MakeAudioOutput);
     for (bool first = true;; first = false)
     {

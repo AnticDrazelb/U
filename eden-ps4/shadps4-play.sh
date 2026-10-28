@@ -12,6 +12,7 @@
 #   RUN      the folder shadPS4 runs in (default ~/shad-run): its user/data is the app's /data,
 #            cleared of eden-ps4 first; the game goes to RUN/game
 #   STAGE    the staging folder (default ~/eden-ps4-build/stage)
+#   SETTINGS the app's settings.txt, if set (NAME=value lines)
 # Example: start Breakout, let it draw, screenshot it:
 #   printf '%s\n' "0 waitfor start page" "0 tap n" "0 waitfor first frame" "2 shot /tmp/b.png" |
 #       eden-ps4/shadps4-play.sh
@@ -24,6 +25,10 @@ STAGE="${STAGE:-$HOME/eden-ps4-build/stage}"
 if [ -z "${EDEN_PS4_IN_XVFB:-}" ]; then
     rm -rf "$RUN/game" "$RUN/user/data/eden-ps4"
     mkdir -p "$RUN/game" "$RUN/user"
+    if [ -n "${SETTINGS:-}" ]; then
+        mkdir -p "$RUN/user/data/eden-ps4"
+        printf '%s\n' "$SETTINGS" >"$RUN/user/data/eden-ps4/settings.txt"
+    fi
     cp -r "$STAGE/." "$RUN/game/"
     rm -rf "$RUN/game/sce_module"
     EDEN_PS4_IN_XVFB=1 exec xvfb-run -a -s "-screen 0 1920x1080x24" "$0"

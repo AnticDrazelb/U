@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 22:39:23 +0000
+Subject: [PATCH] null renderer: multisampled render targets drawn at their
+ samples' resolution
+
+A multisampled render target's width and height registers count samples, its pixels a grid
+of them (2x2 for 4x). Software draws into one were drawn at the pixels' resolution, into the
+grid's top-left corner. Now the viewport, scissor, points and lines are scaled by the sample
+grid and each sample is shaded (gl_FragCoord still in pixels), so a resolve averages real
+samples; clears scale their scissor the same way.
+---
+ .../renderer_null/null_rasterizer.cpp         | 12 ++++---
+ .../renderer_null/software_draw.cpp           | 32 ++++++++++++-------
+ 2 files changed, 29 insertions(+), 15 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index 5615ad104..1a7c4d18a 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -13,6 +13,7 @@
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/renderer_null/null_rasterizer.h"
++#include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/renderer_null/software_draw.h"
+ 
+ namespace Null {
+@@ -194,11 +195,14 @@ void RasterizerNull::Clear(u32 layer_count) {
+     const auto clear_rect = [&](u32 width, u32 height, u32& x0, u32& y0, u32& x1, u32& y1) {
+         x0 = 0, y0 = 0, x1 = width, y1 = height;
+         if (regs.clear_control.use_scissor && regs.scissor_test[0].enable) {
++            // (in pixels; a multisampled target's width and height count samples)
++            const u32 sx = u32(VideoCommon::NumSamplesX(regs.anti_alias_samples_mode));
++            const u32 sy = u32(VideoCommon::NumSamplesY(regs.anti_alias_samples_mode));
+             const auto& scissor = regs.scissor_test[0];
+-            x0 = std::max<u32>(x0, scissor.min_x);
+-            y0 = std::max<u32>(y0, scissor.min_y);
+-            x1 = std::min<u32>(x1, scissor.max_x);
+-            y1 = std::min<u32>(y1, scissor.max_y);
++            x0 = std::max<u32>(x0, scissor.min_x * sx);
++            y0 = std::max<u32>(y0, scissor.min_y * sy);
++            x1 = std::min<u32>(x1, scissor.max_x * sx);
++            y1 = std::min<u32>(y1, scissor.max_y * sy);
+         }
+         return x0 < x1 && y0 < y1;
+     };
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 364330470..fbbfb7784 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -36,6 +36,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/renderer_null/software_draw.h"
+ #include "video_core/engines/kepler_compute.h"
++#include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/shader_environment.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/decode_bc.h"
+@@ -1547,6 +1548,7 @@ struct SoftwareDraw::Batch {
+     Maxwell::Regs::ComparisonOp alpha_func{};
+     f32 alpha_ref = 0.0f;
+     bool can_discard = false;  // the shader can discard pixels, or the alpha test
++    f32 frag_scale_x = 1.0f, frag_scale_y = 1.0f; // a sample's coordinates to a pixel's (multisampling)
+     Tegra::DepthFormat zeta_format{};
+     u32 zeta_bpp = 0;
+     Maxwell::Regs::ComparisonOp depth_func{};
+@@ -4007,8 +4009,8 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                 f32* const position_y = input(IR::Attribute::PositionY);
+                 f32* const position_z = input(IR::Attribute::PositionZ);
+                 for (u32 j = 0; j < LANES; ++j) {
+-                    position_x[j] = f32(lane_x(j)) + 0.5f;
+-                    position_y[j] = f32(lane_y(j)) + 0.5f;
++                    position_x[j] = (f32(lane_x(j)) + 0.5f) * b.frag_scale_x;
++                    position_y[j] = (f32(lane_y(j)) + 0.5f) * b.frag_scale_y;
+                     position_z[j] = w0[j] * t.z[0] + w1[j] * t.z[1] + w2[j] * t.z[2];
+                 }
+                 for (size_t k = 0; k < num_varyings; ++k) {
+@@ -4578,7 +4580,11 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     }
+     const size_t num_varyings = varyings.size();
+ 
+-    // Window coordinates (Vulkan's: the y axis down), as Eden's Vulkan renderer sets the viewport
++    // Window coordinates (Vulkan's: the y axis down), as Eden's Vulkan renderer sets the viewport.
++    // A multisampled render target is drawn at its samples' resolution (each sample shaded: its
++    // width and height registers count samples, its pixels a grid of them): a resolve averages them.
++    const s32 samples_x = VideoCommon::NumSamplesX(regs.anti_alias_samples_mode);
++    const s32 samples_y = VideoCommon::NumSamplesY(regs.anti_alias_samples_mode);
+     const auto& transform = regs.viewport_transform[0];
+     const bool lower_left = regs.window_origin.mode != Maxwell::Regs::WindowOrigin::Mode::UpperLeft;
+     const bool transform_on = regs.viewport_scale_offset_enabled != 0;
+@@ -4593,6 +4599,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         if (lower_left) {
+             s.y = f32(regs.surface_clip.height) - s.y;
+         }
++        s.x *= f32(samples_x), s.y *= f32(samples_y);
+         s.z = transform.translate_z + transform.scale_z * v.position[2] * inv_w;
+         s.inv_w = inv_w;
+         s.varyings = v.varyings.data();
+@@ -4606,10 +4613,10 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         clip_y1 = std::min(clip_y1, s32(tg.height));
+     }
+     if (regs.scissor_test[0].enable) {
+-        clip_x0 = std::max<s32>(clip_x0, regs.scissor_test[0].min_x);
+-        clip_y0 = std::max<s32>(clip_y0, regs.scissor_test[0].min_y);
+-        clip_x1 = std::min<s32>(clip_x1, regs.scissor_test[0].max_x);
+-        clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y);
++        clip_x0 = std::max<s32>(clip_x0, regs.scissor_test[0].min_x * samples_x);
++        clip_y0 = std::max<s32>(clip_y0, regs.scissor_test[0].min_y * samples_y);
++        clip_x1 = std::min<s32>(clip_x1, regs.scissor_test[0].max_x * samples_x);
++        clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y * samples_y);
+     }
+ 
+     // Depth and stencil: tested against the depth buffer before the fragment shader runs (after it,
+@@ -4820,15 +4827,16 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                 return;
+             }
+         }
+-        const f32 half = std::max(program_point_size ? v.point_size : regs.point_size, 1.0f) * 0.5f;
++        const f32 size = std::max(program_point_size ? v.point_size : regs.point_size, 1.0f);
++        const f32 half_x = size * 0.5f * f32(samples_x), half_y = size * 0.5f * f32(samples_y);
+         Vertex corners[4] = {v, v, v, v}; // (t down from the top, as Eden's Vulkan renderer has it)
+         ScreenVertex q[4];
+         for (u32 k = 0; k < 4; ++k) {
+             corners[k].varyings[POINT_COORD_SLOT] = f32(k & 1);
+             corners[k].varyings[POINT_COORD_SLOT + 1] = f32((k >> 1) & 1);
+             q[k] = to_screen(corners[k]);
+-            q[k].x += (k & 1) ? half : -half;
+-            q[k].y += (k & 2) ? half : -half;
++            q[k].x += (k & 1) ? half_x : -half_x;
++            q[k].y += (k & 2) ? half_y : -half_y;
+         }
+         add_triangle(q[0], q[1], q[2], false, bias_point);
+         add_triangle(q[2], q[1], q[3], false, bias_point);
+@@ -4848,7 +4856,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         }
+         const ScreenVertex s0 = to_screen(p), s1 = to_screen(q);
+         const bool x_major = std::fabs(s1.x - s0.x) >= std::fabs(s1.y - s0.y);
+-        const f32 ox = x_major ? 0.0f : line_width * 0.5f, oy = x_major ? line_width * 0.5f : 0.0f;
++        const f32 ox = x_major ? 0.0f : line_width * 0.5f * f32(samples_x);
++        const f32 oy = x_major ? line_width * 0.5f * f32(samples_y) : 0.0f;
+         ScreenVertex v[4] = {s0, s0, s1, s1};
+         v[0].x -= ox, v[0].y -= oy, v[1].x += ox, v[1].y += oy;
+         v[2].x -= ox, v[2].y -= oy, v[3].x += ox, v[3].y += oy;
+@@ -4946,6 +4955,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     batch->alpha_test = regs.alpha_test_enabled != 0;
+     batch->alpha_func = regs.alpha_test_func, batch->alpha_ref = regs.alpha_test_ref;
+     batch->can_discard = fs->can_discard || batch->alpha_test;
++    batch->frag_scale_x = 1.0f / f32(samples_x), batch->frag_scale_y = 1.0f / f32(samples_y);
+     batch->zeta_format = zeta_format, batch->zeta_bpp = zeta_bpp, batch->depth_func = depth_func;
+     batch->front_stencil = front_stencil, batch->back_stencil = back_stencil;
+     batch->zeta_address = zeta_address, batch->zeta_pitch_linear = zeta_pitch_linear;

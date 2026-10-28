@@ -266,6 +266,11 @@ Two ways it shows:
   two quads with a restart between them, and a point coloured by its coordinates; they match the
   Vulkan renderer. (A restart index other than all ones is drawn as the GPU would, but Eden's
   Vulkan renderer can't: Vulkan restarts only at all ones.)
+- **Multisampled render targets** (patch 0033): a multisampled target's width and height count
+  samples, its pixels a grid of them (2x2 for 4x), and software draws went into the grid's top-left
+  corner at the pixels' resolution. They're drawn at the samples' resolution now (the viewport,
+  scissor, points and lines scaled, each sample shaded, gl_FragCoord still in pixels), so a resolve
+  averages real samples.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -362,6 +367,10 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
+Settings: each line of `/data/eden-ps4/settings.txt` (copied by FTP) that reads `NAME=value` is
+set as an environment variable before Eden starts. `EDEN_SW_THREADS=5`, say, rasterizes on 5
+threads instead of 4 (the PS4 build's default; an app has 6 cores), to see which the console likes.
+
 After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnings and errors, and
 `boot-trace.log` the launcher's steps (the audio port it opened, the first frame, the frame rate).
 Stack addresses in a crash report are symbolized with that build's ELF (kept next to the package in
@@ -436,6 +445,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: RGBA8 writes and bilinear filtering in arrays, sRGB in the fast path, fragment shaders' own depth | above |
 | null renderer: compute shaders in software | above |
 | null renderer: primitive restart, the provoking vertex, polygon offset, the alpha test and point coordinates in software draws | above |
+| null renderer: multisampled render targets drawn at their samples' resolution | above |
 
 The PS4 memory changes, from what stage 1 measured:
 
