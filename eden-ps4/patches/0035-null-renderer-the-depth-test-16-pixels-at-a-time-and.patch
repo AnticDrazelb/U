@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 23:37:21 +0000
+Subject: [PATCH] null renderer: the depth test 16 pixels at a time, and only
+ the varying components a shader reads
+
+The commonest depth test (no stencil; a 4-byte, block-linear depth buffer) reads a block's
+depths as two runs of 32 bytes (4 columns by 2 rows), converts and compares them in loops
+with the format and the comparison outside, and writes the passing pixels' depths back as
+the same two runs. Each pixel was addressed, read, converted and compared on its own.
+
+A fragment shader's varyings are interpolated only for the components it reads (all four
+if it reads them by index).
+---
+ .../renderer_null/software_draw.cpp           | 106 +++++++++++++++++-
+ 1 file changed, 102 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 695e11e0f..effd338f9 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -1446,6 +1446,7 @@ struct SoftwareDraw::Program {
+     std::vector<Cell> cells;   // constants filled in; the rest are the program's values
+     std::array<Shader::Interpolation, 32> interpolation{};
+     std::array<bool, 32> generic_loaded{};
++    std::array<u8, 32> generic_components{}; // which of each one's components are read (bits xyzw)
+     bool loads_point_coord = false; // a fragment shader's gl_PointCoord
+     u32 local_words = 0;
+     std::vector<Shader::TextureDescriptor> textures;
+@@ -3584,6 +3585,10 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+         program->interpolation = ir.info.interpolation;
+         for (u32 i = 0; i < 32; ++i) {
+             program->generic_loaded[i] = ir.info.loads.Generic(i);
++            for (u32 c = 0; c < 4; ++c) { // (all of them if they're read by index)
++                const bool read = ir.info.loads.Generic(i, c) || (ir.info.loads_indexed_attributes && program->generic_loaded[i]);
++                program->generic_components[i] |= read ? 1u << c : 0u;
++            }
+         }
+         program->loads_point_coord = ir.info.loads[IR::Attribute::PointSpriteS] || ir.info.loads[IR::Attribute::PointSpriteT];
+         program->local_words = (ir.local_memory_size + 3) / 4;
+@@ -3925,6 +3930,11 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+     io.quads = true;
+     // a shader that writes depth: the depth test after it (the stencil test still before)
+     const bool late_depth = fs->writes_depth;
++    using DF = Tegra::DepthFormat;
++    const bool fast_depth = zs_test && depth_test && !stencil_test && !late_depth && !zeta_pitch_linear &&
++                            zeta_bpp == 4;
++    const bool zeta_float = zeta_format == DF::Z32_FLOAT;         // (its bits: in order for 0 and up)
++    const bool zeta_high = zeta_format == DF::Z24_UNORM_S8_UINT;  // depth above the stencil
+     alignas(64) std::array<f32, LANES> frag_depth{};
+     io.frag_depth = frag_depth.data();
+     for (const Triangle& t : triangles) {
+@@ -4068,7 +4078,74 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                         WriteStencil(zeta_format, zp, u8((value & ~face.write_mask) | (updated & face.write_mask)));
+                     }
+                 };
+-                if (zs_test) {
++                // (the fast depth test's runs, words and results, kept for its writes)
++                u8* runs[2] = {nullptr, nullptr};
++                alignas(32) u32 run_words[2][8]{};
++                alignas(64) u32 incoming[LANES];
++                u32 passed = 0;
++                if (fast_depth) {
++                    // the commonest: a depth test (no stencil), 4 bytes a pixel, block linear: the
++                    // block's depths are two runs of 32 bytes (4 columns by 2 rows), tested 16 at a
++                    // time with the format and comparison outside the loops
++                    for (u32 half = 0; half < 2; ++half) {
++                        const u32 lanes = ((live >> (4 * half)) & 0xF) | ((live >> (8 + 4 * half)) & 0xF);
++                        if (lanes == 0) {
++                            continue;
++                        }
++                        const u32 xb = u32(bx + s32(4 * half)) * 4, column = xb / 64;
++                        u8*& gob = st.zeta_gobs[column];
++                        if (!gob) {
++                            gob = gpu_memory.GetPointer(zeta_gob_row_address + u64{column} * zeta_block_bytes);
++                        }
++                        if (gob) {
++                            runs[half] = gob + (u32(y) % 8 / 2) * 64 + (xb % 64 / 32) * 256 + (xb % 32 / 16) * 32;
++                            std::memcpy(run_words[half], runs[half], 32);
++                        }
++                    }
++                    // lane j: run (j & 7) / 4, word (j / 8) * 4 + j % 4
++                    alignas(64) u32 stored[LANES];
++                    for (u32 j = 0; j < LANES; ++j) {
++                        const u32 half = (j & 7) >> 2, word = (j >> 3) * 4 + (j & 3);
++                        stored[j] = run_words[half][word];
++                        st.depth_pixel[j] = runs[half] ? runs[half] + word * 4 : nullptr;
++                    }
++                    if (zeta_float) {
++                        for (u32 j = 0; j < LANES; ++j) {
++                            const f32 z = position_z[j];
++                            incoming[j] = std::bit_cast<u32>(z == z ? std::clamp(z, 0.0f, 1.0f) : 0.0f);
++                        }
++                    } else {
++                        for (u32 j = 0; j < LANES; ++j) {
++                            const f32 z = position_z[j];
++                            incoming[j] = u32(f64(z == z ? std::clamp(z, 0.0f, 1.0f) : 0.0f) * 16777215.0 + 0.5);
++                            stored[j] = zeta_high ? stored[j] >> 8 : stored[j] & 0xFFFFFF;
++                        }
++                    }
++                    const auto test = [&](auto passes) {
++                        for (u32 j = 0; j < LANES; ++j) {
++                            passed |= u32(passes(incoming[j], stored[j])) << j;
++                        }
++                    };
++                    using C = Maxwell::Regs::ComparisonOp;
++                    switch (depth_func) {
++                    case C::Never_D3D: case C::Never_GL: break;
++                    case C::Less_D3D: case C::Less_GL: test([](u32 a, u32 b) { return a < b; }); break;
++                    case C::Equal_D3D: case C::Equal_GL: test([](u32 a, u32 b) { return a == b; }); break;
++                    case C::LessEqual_D3D: case C::LessEqual_GL: test([](u32 a, u32 b) { return a <= b; }); break;
++                    case C::Greater_D3D: case C::Greater_GL: test([](u32 a, u32 b) { return a > b; }); break;
++                    case C::NotEqual_D3D: case C::NotEqual_GL: test([](u32 a, u32 b) { return a != b; }); break;
++                    case C::GreaterEqual_D3D: case C::GreaterEqual_GL: test([](u32 a, u32 b) { return a >= b; }); break;
++                    default: passed = 0xFFFF; break;
++                    }
++                    u32 here = 0;
++                    for (u32 j = 0; j < LANES; ++j) {
++                        here |= u32(st.depth_pixel[j] != nullptr) << j;
++                    }
++                    passed &= here & live;
++                    if (passed == 0 && !b.can_discard) {
++                        continue;
++                    }
++                } else if (zs_test) {
+                     bool any = false;
+                     for (u32 m = live; m != 0; m &= m - 1) {
+                         const u32 j = u32(std::countr_zero(m));
+@@ -4122,7 +4199,28 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                     }
+                 }
+                 u32 written = 0; // the pixels whose colours are written
+-                for (u32 m = live; m != 0; m &= m - 1) {
++                if (fast_depth) {
++                    u32 discarded = 0;
++                    for (u32 j = 0; j < LANES; ++j) {
++                        discarded |= u32(st.discard[j]) << j;
++                    }
++                    written = passed & ~discarded;
++                    for (u32 half = 0; depth_write && half < 2; ++half) {
++                        const u32 lanes = ((written >> (4 * half)) & 0xF) | ((written >> (8 + 4 * half)) & 0xF) << 4;
++                        if (lanes == 0) {
++                            continue;
++                        }
++                        for (u32 k = 0; k < 8; ++k) {
++                            const u32 j = (k / 4) * 8 + 4 * half + k % 4, old = run_words[half][k];
++                            const u32 value = zeta_float  ? incoming[j]
++                                              : zeta_high ? (incoming[j] << 8) | (old & 0xFF)
++                                                          : (old & 0xFF000000u) | incoming[j];
++                            run_words[half][k] = ((lanes >> k) & 1) != 0 ? value : old;
++                        }
++                        std::memcpy(runs[half], run_words[half], 32);
++                    }
++                }
++                for (u32 m = fast_depth ? 0 : live; m != 0; m &= m - 1) {
+                     const u32 j = u32(std::countr_zero(m));
+                     if (st.discard[j]) {
+                         continue;
+@@ -4586,8 +4684,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     // The varyings the fragment shader reads, and how each is interpolated
+     std::vector<Varying> varyings;
+     for (u32 g = 0; g < 32; ++g) {
+-        if (fs->generic_loaded[g]) {
+-            for (u32 comp = 0; comp < 4; ++comp) {
++        for (u32 comp = 0; comp < 4; ++comp) {
++            if ((fs->generic_components[g] >> comp) & 1) {
+                 varyings.push_back({u16(32 + g * 4 + comp), u16(g * 4 + comp), fs->interpolation[g]});
+             }
+         }

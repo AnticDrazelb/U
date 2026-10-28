@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 23:44:09 +0000
+Subject: [PATCH] null renderer: software shaders' identities are their
+ arguments, and moves copy what a value takes
+
+Eden's IR keeps Identity (and ConditionRef) instructions, which the interpreter ran as
+moves of a whole cell (four words for each of 16 lanes, 256 bytes): a third of its time in
+a lit fragment shader. They now share their argument's cell (but for a phi's, which a
+loop's next round writes over, or one already referred to), and the moves left (phis')
+copy only the words their value's type takes.
+---
+ .../renderer_null/software_draw.cpp           | 47 +++++++++++++++----
+ 1 file changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index effd338f9..8c6e9611d 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -1703,6 +1703,23 @@ struct Io {
+     RunState* resume = nullptr;
+ };
+ 
++/// The words a value of a type takes in a cell (a move copies only those)
++u32 Words(IR::Type type) {
++    switch (type) {
++    case IR::Type::U64: case IR::Type::F64: case IR::Type::U32x2: case IR::Type::F32x2:
++    case IR::Type::F16x2: case IR::Type::F64x2:
++        return 2;
++    case IR::Type::U32x3: case IR::Type::F32x3: case IR::Type::F16x3:
++    case IR::Type::F64x3:
++        return 3;
++    case IR::Type::U32x4: case IR::Type::F32x4: case IR::Type::F16x4:
++    case IR::Type::F64x4: case IR::Type::Opaque:
++        return 4;
++    default:
++        return 1;
++    }
++}
++
+ class Flattener {
+ public:
+     explicit Flattener(SoftwareDraw::Program& out_, bool compute_) : out{out_}, compute{compute_} {}
+@@ -1863,9 +1880,18 @@ private:
+             case O::Join: case O::WorkgroupMemoryBarrier: case O::DeviceMemoryBarrier:
+                 continue;
+             case O::Identity:
+-            case O::ConditionRef:
+-                Emit({Kind::Move, {}, InstSlot(&inst), {Slot(inst.Arg(0))}, 0});
++            case O::ConditionRef: {
++                // the same value: its argument's cell, where nothing has used its own yet (and
++                // where the argument isn't a phi, whose cell a loop's next round writes over)
++                const IR::Value arg = inst.Arg(0);
++                const bool phi = !arg.IsImmediate() && arg.InstRecursive()->GetOpcode() == O::Phi;
++                if (!phi && !slots.contains(&inst)) {
++                    slots.emplace(&inst, Slot(arg));
++                    continue;
++                }
++                Emit({Kind::Move, {}, InstSlot(&inst), {Slot(arg)}, Words(arg.Type())});
+                 continue;
++            }
+             default:
+                 break;
+             }
+@@ -1927,7 +1953,7 @@ private:
+         if (!from || !to) {
+             return;
+         }
+-        std::vector<std::pair<u16, u16>> moves;
++        std::vector<std::tuple<u16, u16, u32>> moves;
+         for (const IR::Inst& inst : to->Instructions()) {
+             if (inst.GetOpcode() != IR::Opcode::Phi) {
+                 break;
+@@ -1935,13 +1961,14 @@ private:
+             for (size_t i = 0; i < inst.NumArgs(); ++i) {
+                 if (inst.PhiBlock(i) == from) {
+                     const u16 temp = NewCell();
+-                    Emit({Kind::Move, {}, temp, {Slot(inst.Arg(i))}, 0});
+-                    moves.emplace_back(InstSlot(&inst), temp);
++                    const u32 words = Words(inst.Type());
++                    Emit({Kind::Move, {}, temp, {Slot(inst.Arg(i))}, words});
++                    moves.emplace_back(InstSlot(&inst), temp, words);
+                 }
+             }
+         }
+-        for (const auto& [phi, temp] : moves) {
+-            Emit({Kind::Move, {}, phi, {temp}, 0});
++        for (const auto& [phi, temp, words] : moves) {
++            Emit({Kind::Move, {}, phi, {temp}, words});
+         }
+     }
+ 
+@@ -2551,15 +2578,15 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     for (;;) {
+         const Op& o = ops[pc];
+         switch (o.kind) {
+-        case Kind::Move:
++        case Kind::Move: // (the words the value takes: 'extra')
+             if (waiting) {
+                 EXEC_LOOP(exec) {
+-                    for (u32 k = 0; k < 4; ++k) {
++                    for (u32 k = 0; k < o.extra; ++k) {
+                         c[o.dest].w[k][i] = c[o.a[0]].w[k][i];
+                     }
+                 }
+             } else {
+-                for (u32 k = 0; k < 4; ++k) {
++                for (u32 k = 0; k < o.extra; ++k) {
+                     std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], lanes * sizeof(u32));
+                 }
+             }

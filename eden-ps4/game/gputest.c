@@ -24,7 +24,8 @@
 // texture shown on a square at the top. And on the right, the alpha test, primitive restart and a
 // point's coordinates.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
-// them (up and down change how many, by 100).
+// them (up and down change how many, by 100). B turns on another, as 3D games draw: 12 large
+// quads, lit per pixel, textured, depth-tested.
 
 #include <math.h>
 #include <stdbool.h>
@@ -176,6 +177,19 @@ static u64 fsetp_gt(u32 pred, u32 src, float value) {
 static u64 bra_if(u32 pred, s32 offset) {
     return 0xE24ull << 52 | ((u64)(u32)offset & 0xFFFFFF) << 20 | (u64)pred << 16 | 0xF /* always */;
 }
+// FMUL Rdest, Ra, Rb; FFMA Rdest, Ra, Rb, Rc (a * b + c)
+static u64 fmul(u32 dest, u32 a, u32 b) {
+    return 0x5C68ull << 48 | (u64)b << 20 | PT | (u64)a << 8 | dest;
+}
+static u64 ffma(u32 dest, u32 a, u32 b, u32 c) {
+    return 0x59ull << 56 | 1ull << 55 | (u64)c << 39 | (u64)b << 20 | PT | (u64)a << 8 | dest;
+}
+// FADD32I Rdest, Rsrc, value; FMUL32I.SAT (the product clamped to 0..1)
+static u64 fadd32i(u32 dest, u32 src, float value) {
+    u32 bits;
+    memcpy(&bits, &value, 4);
+    return 1ull << 59 | (u64)bits << 20 | PT | (u64)src << 8 | dest;
+}
 static u64 exit_(void) { // EXIT (condition: true)
     return 0xE30ull << 52 | PT | 0xF;
 }
@@ -237,6 +251,7 @@ static u64 stg(u32 addr, u32 src) {
 #define FS_COMPUTED_OFFSET 0xA10 // the texture the compute program fills (handle 4)
 #define CS_OFFSET 0x900       // the compute program (no header)
 #define FS_POINT_COORD_OFFSET 0xB10 // a point's coordinates (gl_PointCoord) as its colour
+#define FS_LIT_OFFSET 0xC10   // the 3D stress test's: perspective texture, a normal, light
 #define CS_CBUF 0x4800        // its constant buffer 0: the storage buffer it writes, at 0x110
 #define QMD_OFFSET 0x4A00     // its launch description (256-byte aligned)
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
@@ -416,6 +431,31 @@ static void write_programs(u8* heap) {
     fp[5] = mov32i(3, 1.0f);
     fp[6] = exit_();
     fp[7] = nop();
+
+    // the 3D stress test's, as a lit 3D scene's might be: the tile (perspective-correct), its
+    // normal (varying 1, perspective) normalized, a light from above left: tile * (0.3 + 0.7 *
+    // max(n . l, 0))
+    u32* fl_sph = (u32*)(heap + FS_LIT_OFFSET);
+    fl_sph[0] = 2 | 3 << 5 | 5 << 10;
+    ((u8*)fl_sph)[24] = 0x0A; // varying 0, xy, perspective
+    ((u8*)fl_sph)[25] = 0x2A; // varying 1, xyz, perspective
+    fl_sph[18] = 0xF;
+    const u64 lit[] = {
+        ipa(7, 0x7C), mufu(7, 7, 4), ipa_mul(4, 0x80, 7),                  // w; u
+        ipa_mul(5, 0x84, 7), ipa_mul(8, 0x90, 7), ipa_mul(9, 0x94, 7),    // v; the normal
+        ipa_mul(10, 0x98, 7), tex2d(0, 4, 4), fmul(11, 8, 8),             // the tile; n . n
+        ffma(11, 9, 9, 11), ffma(11, 10, 10, 11), mufu(11, 11, 5),        // 1 / |n|
+        fmul(8, 8, 11), fmul(9, 9, 11), fmul(10, 10, 11),                  // n normalized
+        mov32i(14, 0.48f), mov32i(15, -0.6f), mov32i(16, 0.64f),          // the light
+        fmul(12, 8, 14), ffma(12, 9, 15, 12), ffma(12, 10, 16, 12),       // n . l
+        fmul32i(12, 12, 1.0f) | 1ull << 55, fmul32i(12, 12, 0.7f), fadd32i(12, 12, 0.3f), // lit
+        fmul(0, 0, 12), fmul(1, 1, 12), fmul(2, 2, 12),
+        exit_(),
+    };
+    u64* fl = (u64*)(heap + FS_LIT_OFFSET + 0x50);
+    for (size_t i = 0, k = 0; i < sizeof(lit) / sizeof(lit[0]); k++) {
+        fl[k] = k % 4 == 0 ? SCHED : lit[i++];
+    }
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -807,6 +847,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     bool stress = false;
+    bool stress_3d = false; // B: 12 large lit, textured, depth-tested quads
     int stress_sprites = 400;
     {   // the storage buffer (a cyan), its address and size in the constant buffer
         const float colour[4] = {0.1f, 0.9f, 0.95f, 1.0f};
@@ -825,6 +866,7 @@ int main(int argc, char* argv[]) {
 #define SRGB_OFFSET(i) (0x4400 + (i) * 0x80)        // the sRGB square (4 vertices)
 #define COMPUTED_OFFSET(i) (0x4600 + (i) * 0x80)    // the compute program's image's square
 #define FIXED_OFFSET(i) (0x4C00 + (i) * 0x200)      // the alpha-tested square (4), the strip (9), the point (1)
+#define LIT_OFFSET(i) (0x5200 + (i) * 0xA00)        // the 3D stress test's quads (12 of 4, 48 bytes each)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -854,6 +896,10 @@ int main(int argc, char* argv[]) {
         if (down & HidNpadButton_A) {
             stress = !stress;
             fprintf(stderr, "gputest: stress test %s (%d sprites)\n", stress ? "on" : "off", stress_sprites);
+        }
+        if (down & HidNpadButton_B) {
+            stress_3d = !stress_3d;
+            fprintf(stderr, "gputest: 3D stress test %s\n", stress_3d ? "on" : "off");
         }
         if (down & (HidNpadButton_Up | HidNpadButton_Down)) {
             stress_sprites += (down & HidNpadButton_Up) ? 100 : -100;
@@ -1428,6 +1474,53 @@ int main(int argc, char* argv[]) {
             method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
             armDCacheFlush(base, (size_t)stress_sprites * 128);
         }
+        // the 3D stress test: 12 large quads, lit and textured (each a panel bent toward the eye,
+        // its far side twice as far), wandering over each other at their own depths, depth-tested
+        // over a cleared depth buffer
+        if (stress_3d) {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + LIT_OFFSET(index));
+            for (int q = 0; q < 12; q++) {
+                const float t = (float)frame * 0.01f + (float)q * 0.53f;
+                const float cx = 0.55f * sinf(t * 1.3f + q), cy = 0.45f * cosf(t * 0.9f + q * 2.1f);
+                const float depth = 0.2f + 0.05f * (float)q + 0.1f * sinf(t);
+                const float size = 0.45f + 0.1f * (float)(q % 3);
+                for (int k = 0; k < 4; k++) {
+                    float* p = v + (q * 4 + k) * 12;
+                    const float sx = (k & 1) ? 1.0f : -1.0f, sy = (k & 2) ? 1.0f : -1.0f;
+                    const float w = (k & 2) ? 2.0f : 1.0f; // the top edge twice as far
+                    p[0] = (cx + sx * size) * w, p[1] = (cy + sy * size * 0.8f) * w;
+                    p[2] = depth * w, p[3] = w;
+                    p[4] = (k & 1) ? 3.0f : 0.0f, p[5] = (k & 2) ? 3.0f : 0.0f, p[6] = 0.0f, p[7] = 1.0f;
+                    p[8] = sx * 0.6f, p[9] = sy * 0.4f - 0.3f, p[10] = 1.0f, p[11] = 0.0f;
+                }
+            }
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_CLEAR_BUFFERS, CLEAR_Z | CLEAR_S);
+            method1(M_DEPTH_TEST_ENABLE, 1);
+            method1(M_DEPTH_WRITE_ENABLE, 1);
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_DEPTH_OFFSET);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_LIT_OFFSET);
+            method1(M_VERTEX_ATTRIB + 2, ATTR_RGBA32F | 32 << 7);
+            const iova_t quads = heap_iova + LIT_OFFSET(index);
+            const u32 stream[4] = {48 | 1 << 12, (u32)(quads >> 32), (u32)quads, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = quads + 12 * 4 * 48 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            for (int q = 0; q < 12; q++) {
+                const u32 range[2] = {(u32)q * 4, 4};
+                method(M_VERTEX_FIRST, 2, range);
+                method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+                method1(M_DRAW_END, 0);
+            }
+            method1(M_VERTEX_ATTRIB + 2, 1 << 6);
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_OFFSET);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+            method1(M_DEPTH_TEST_ENABLE, 0);
+            method1(M_DEPTH_WRITE_ENABLE, 0);
+        }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
 
@@ -1459,9 +1552,9 @@ int main(int argc, char* argv[]) {
             fps = (int)fps_frames;
             fps_frames = 0;
             fps_tick = now;
-            if (frame < 200 || frame % 600 < 60 || stress)
-                fprintf(stderr, "gputest: %d fps, %u command words a frame%s\n", fps, g_cmd->used,
-                        stress ? " (stress test)" : "");
+            if (frame < 200 || frame % 600 < 60 || stress || stress_3d)
+                fprintf(stderr, "gputest: %d fps, %u command words a frame%s%s\n", fps, g_cmd->used,
+                        stress ? " (stress test)" : "", stress_3d ? " (3D stress test)" : "");
         }
     }
 

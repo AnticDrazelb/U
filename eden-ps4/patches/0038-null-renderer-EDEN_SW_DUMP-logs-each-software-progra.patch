@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 23:52:52 +0000
+Subject: [PATCH] null renderer: EDEN_SW_DUMP logs each software program's ops
+
+For working on the interpreter: what Eden's IR came to, op by op.
+---
+ src/video_core/renderer_null/software_draw.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 3bce22d30..cd351d290 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -3659,6 +3659,16 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+         program->can_discard = std::ranges::any_of(program->ops, [](const Op& op) {
+             return op.kind == Kind::Ir && op.op == IR::Opcode::DemoteToHelperInvocation;
+         });
++        if (std::getenv("EDEN_SW_DUMP")) { // what a program came to, for working on the interpreter
++            static constexpr const char* kinds[] = {"ir", "move", "jump", "jump if", "jump unless", "return", "barrier"};
++            std::string text = fmt::format("program ({} ops, {} cells):", program->ops.size(), program->cells.size());
++            for (const Op& op : program->ops) {
++                text += fmt::format("\n  {}{}{} -> {} ({} {} {} {}) {}", kinds[static_cast<u32>(op.kind)],
++                                    op.kind == Kind::Ir ? " " : "", op.kind == Kind::Ir ? fmt::format("{}", op.op) : "",
++                                    op.dest, op.a[0], op.a[1], op.a[2], op.a[3], op.extra);
++            }
++            LOG_WARNING(Render, "Software draw: {}", text);
++        }
+     } catch (const std::exception& exception) {
+         LogOnce(fmt::format("shader translation failed: {}", exception.what()));
+         program->ok = false;

@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 23:50:45 +0000
+Subject: [PATCH] null renderer: varyings interpolated in plane form,
+ constant-index extracts a word's copy
+
+A varying is a + (b - a) u + (c - a) v, u and v the vertices' weights corrected for
+perspective once for all of a block's varyings. And a composite's component at a constant
+index (Eden's are) is one word of every lane copied, not gathered lane by lane.
+---
+ .../renderer_null/software_draw.cpp           | 25 ++++++++++++++++---
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 8c6e9611d..3bce22d30 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -1925,6 +1925,12 @@ private:
+                 op.extra = inst.Flags<IR::TextureInstInfo>().raw;
+                 op.a = {Slot(inst.Arg(0)), Slot(inst.Arg(1)), Slot(inst.Arg(2)), Slot(inst.Arg(4))};
+                 break;
++            case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
++            case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
++                // its index (a constant) + 1 in 'extra': one word of every lane copied
++                op.a[0] = Slot(inst.Arg(0)), op.a[1] = Slot(inst.Arg(1));
++                op.extra = inst.Arg(1).IsImmediate() ? (inst.Arg(1).U32() & 3) + 1 : 0;
++                break;
+             case O::GetCbufU32: case O::GetCbufF32: case O::GetCbufU32x2:
+                 // a uniform: read once for every lane when its buffer and offset are constants
+                 op.a[0] = Slot(inst.Arg(0)), op.a[1] = Slot(inst.Arg(1));
+@@ -2857,6 +2863,10 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+             break;
+         case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
+         case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
++            if (o.extra) {
++                std::memcpy(d.w[0], a.w[o.extra - 1], lanes * sizeof(u32));
++                break;
++            }
+             LANE_LOOP d.w[0][i] = a.w[b.w[0][i] & 3][i];
+             break;
+         case O::CompositeInsertU32x2: case O::CompositeInsertU32x3: case O::CompositeInsertU32x4:
+@@ -4068,24 +4078,31 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                     position_y[j] = (f32(lane_y(j)) + 0.5f) * b.frag_scale_y;
+                     position_z[j] = w0[j] * t.z[0] + w1[j] * t.z[1] + w2[j] * t.z[2];
+                 }
++                // each varying in plane form: a + (b - a) u + (c - a) v, u and v the second and
++                // third vertices' weights (corrected for perspective once, for all of them)
++                alignas(64) f32 pu[LANES], pv[LANES];
++                for (u32 j = 0; j < LANES; ++j) {
++                    pu[j] = pw1[j] * inv_psum[j], pv[j] = pw2[j] * inv_psum[j];
++                }
+                 for (size_t k = 0; k < num_varyings; ++k) {
+-                    const f32 a = data[k], b = data[num_varyings + k], c = data[2 * num_varyings + k];
+-                    f32* const value = in + varyings[k].input * LANES;
++                    const f32 a = data[k], db = data[num_varyings + k] - a, dc = data[2 * num_varyings + k] - a;
++                    alignas(64) f32 value[LANES];
+                     switch (varyings[k].interpolation) {
+                     case Shader::Interpolation::Flat:
+                         std::fill_n(value, LANES, a);
+                         break;
+                     case Shader::Interpolation::NoPerspective:
+                         for (u32 j = 0; j < LANES; ++j) {
+-                            value[j] = w0[j] * a + w1[j] * b + w2[j] * c;
++                            value[j] = a + db * w1[j] + dc * w2[j];
+                         }
+                         break;
+                     default:
+                         for (u32 j = 0; j < LANES; ++j) {
+-                            value[j] = (pw0[j] * a + pw1[j] * b + pw2[j] * c) * inv_psum[j];
++                            value[j] = a + db * pu[j] + dc * pv[j];
+                         }
+                         break;
+                     }
++                    std::memcpy(in + varyings[k].input * LANES, value, sizeof(value));
+                 }
+                 for (const Target& tg : targets) {
+                     f32* const out = st.colors.data() + tg.attachment * 4 * LANES;

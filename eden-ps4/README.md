@@ -271,6 +271,18 @@ Two ways it shows:
   corner at the pixels' resolution. They're drawn at the samples' resolution now (the viewport,
   scissor, points and lines scaled, each sample shaded, gl_FragCoord still in pixels), so a resolve
   averages real samples.
+- **A 3D workload, and what it showed** (patches 0035-0038): the GPU test's B turns on a second
+  stress test, as a 3D game draws: 12 large quads over each other at their own depths, depth-tested,
+  each textured in perspective and lit per pixel (a normal normalized, a light: 33 interpreted
+  ops). Profiled, it pointed at four things, each fixed: the depth test, a pixel at a time (now 16:
+  a block's depths read, converted, compared and written back as two runs of 32 bytes, for the
+  commonest case, no stencil and a 4-byte block-linear buffer); varyings interpolated for every
+  component though shaders read fewer, and in a longer form than needed (now only those read, in
+  plane form); and the interpreter spending a third of its time copying Eden's Identity
+  instructions' values, 256 bytes each (now they share their argument's cell, and the moves left
+  copy only what a value takes). The 3D test went from 26 to 37 frames a second on one desktop
+  thread (12 ns a pixel of its triangles' bounding boxes, from 18), and the 2D scenes gained about
+  10%. `EDEN_SW_DUMP=1` logs each program's ops.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -363,7 +375,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
    the console's cores make of the software GPU. A turns on its stress test (400 more sprites, each a
    draw; up and down change how many): the frame rate it keeps says how many sprites a 2D game could
-   draw.
+   draw. B turns on the 3D stress test (12 large lit, textured, depth-tested quads): its frame rate
+   says what a simple 3D scene would get.
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
@@ -447,6 +460,10 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: primitive restart, the provoking vertex, polygon offset, the alpha test and point coordinates in software draws | above |
 | null renderer: multisampled render targets drawn at their samples' resolution | above |
 | null renderer: software shaders read a uniform once for every lane | a constant buffer read at a constant offset, read once, not 16 times |
+| null renderer: the depth test 16 pixels at a time, and only the varying components a shader reads | above |
+| null renderer: software shaders' identities are their arguments, and moves copy what a value takes | above |
+| null renderer: varyings interpolated in plane form, constant-index extracts a word's copy | above |
+| null renderer: EDEN_SW_DUMP logs each software program's ops | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

@@ -254,6 +254,11 @@ run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"
 check "exits on +" code gputest_stress 0
 check "draws its sprites" says gputest_stress "fps, [0-9]* command words a frame (stress test)"
 
+echo "gputest.nro's 3D stress test: 12 large lit, textured, depth-tested quads"
+run gputest_3d "$work/gputest.nro" 20 "2:B,2.3:,7:Plus,7.5:"
+check "exits on +" code gputest_3d 0
+check "draws them" says gputest_3d "fps, [0-9]* command words a frame (3D stress test)"
+
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
 check "Stop ends it (exit code 3)" code stop 3
