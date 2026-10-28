@@ -7,14 +7,15 @@ emulated CPU cores, the HLE services, the loader, with a Switch program that wri
 plays a game: a Switch homebrew game's picture on the screen, the PS4 controller as the Switch's,
 and its sound.
 
-## Stage 3: Breakout
+## Stage 3: games
 
 `game/breakout.c` is a small Switch game, written for this: Breakout at 640x360, drawn by the CPU
 into a libnx framebuffer (no GPU commands), with the controller read through HID and beeps played
 through `audout`. It's built with libnx, the Switch homebrew library, compiled with clang (below).
 In the package as `breakout.nro`, first on the start page's list. `game/blocks.c` is a second
 game, falling blocks with a ghost piece, a next-piece preview, levels, and a tune (Korobeiniki, a
-19th-century Russian folk song) under the beeps; the two share `game/nxgame.h` (drawing, the font,
+19th-century Russian folk song) under the beeps. Its best score is kept on the emulated SD card
+(`/data/eden-ps4/user/sdmc/blocks-best.txt` on the PS4), through Eden's file system services; the two share `game/nxgame.h` (drawing, the font,
 sound). And `game/padtest.c`, a controller test: every Switch button with the PS4 button it's mapped to, lit while held, and the
 sticks' positions, as text through libnx's console (also drawn by the CPU).
 
@@ -92,6 +93,24 @@ Around those lines the launcher shows Eden's own warnings and errors. A bare NRO
 few: no RomFS, no program ID or title (it has no NACP), and controller mappings for the Joy-Con
 driver, which this build leaves out with SDL. The launcher sets no Cemuhook (UDP) controller
 servers, so that client opens no socket.
+
+## What's next: the GPU
+
+What draws with the CPU runs now; what draws with the GPU (every commercial game, and homebrew
+built on deko3d, OpenGL or SDL's renderer) needs the Switch's GPU emulated. Eden turns the
+Maxwell GPU's commands and shaders into Vulkan or OpenGL, and a PS4 app has neither: its GPU
+speaks GNM, through Sony's libraries. The ways there, roughly by size:
+
+- **A CPU Vulkan.** SwiftShader (or Mesa's lavapipe) is a Vulkan driver that runs on the CPU, with
+  its shaders compiled by a JIT. Built for the PS4 (its JIT needs the system pool's executable
+  memory, as dynarmic does), it would run Eden's Vulkan renderer unchanged; its frames would reach
+  the screen as the null renderer's do now. Slow, but enough for 2D homebrew at 720p or below, and
+  the shortest way to a first GPU-drawn picture.
+- **A GNM backend for Eden's renderer.** Eden's Vulkan renderer rewritten against the PS4's GPU
+  library, and its shader recompiler (SPIR-V now) taught to emit PS4 shaders. Fast, and a much
+  larger project: the PS4's shader format isn't documented.
+- Either needs the console's keys and firmware for commercial games, which Eden takes from the
+  user's own Switch.
 
 ## The PS4 app
 

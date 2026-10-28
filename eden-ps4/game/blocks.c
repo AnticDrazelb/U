@@ -4,7 +4,8 @@
 //   left/right (D-pad or stick): move    down: drop faster    up or X: drop
 //   A: rotate clockwise    B: rotate the other way    -: music on/off    +: quit
 //
-// The tune is Korobeiniki, a Russian folk song of the 19th century.
+// The tune is Korobeiniki, a Russian folk song of the 19th century. The best score is kept on the
+// SD card (sdmc:/blocks-best.txt).
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -116,6 +117,29 @@ static const Note kTune[] = {
     {523, 1}, {494, 2}, {494, 1}, {523, 1}, {587, 2}, {659, 2}, {523, 2}, {440, 2}, {440, 2}, {0, 2},
 };
 
+// The best score, on the SD card (Eden's: its data folder's sdmc).
+#define BEST_PATH "sdmc:/blocks-best.txt"
+static int load_best(void) {
+    int best = 0;
+    FILE* f = fopen(BEST_PATH, "r");
+    if (f) {
+        if (fscanf(f, "%d", &best) != 1)
+            best = 0;
+        fclose(f);
+    }
+    return best;
+}
+static void save_best(int best) {
+    FILE* f = fopen(BEST_PATH, "w");
+    if (!f) {
+        fprintf(stderr, "blocks: can't write %s\n", BEST_PATH);
+        return;
+    }
+    fprintf(f, "%d\n", best);
+    fclose(f);
+    fprintf(stderr, "blocks: best score %d saved\n", best);
+}
+
 typedef enum { Playing, Over } State;
 
 int main(int argc, char* argv[]) {
@@ -137,7 +161,7 @@ int main(int argc, char* argv[]) {
     const double tick_freq = (double)armGetSystemTickFreq();
     g_seed = (u32)armGetSystemTick();
     State state = Playing;
-    int score = 0, lines = 0, level = 0, next = next_type();
+    int score = 0, lines = 0, level = 0, next = next_type(), best = load_best();
     Piece cur = {0};
     double fall_timer = 0, repeat_timer = 0;
     int repeat_dir = 0;
@@ -153,6 +177,8 @@ int main(int argc, char* argv[]) {
             state = Over;                                                                          \
             beep(110, 600);                                                                        \
             fprintf(stderr, "blocks: game over, score %d, lines %d\n", score, lines);              \
+            if (score > best)                                                                      \
+                save_best(best = score);                                                           \
         }                                                                                          \
     } while (0)
     SPAWN();
@@ -331,6 +357,9 @@ int main(int argc, char* argv[]) {
         text(panel_l, BOARD_Y + 128, 2, rgb(150, 170, 200), "LEVEL");
         snprintf(line, sizeof(line), "%d", level);
         text(panel_l, BOARD_Y + 148, 3, rgb(240, 240, 240), line);
+        text(panel_l, BOARD_Y + 192, 2, rgb(150, 170, 200), "BEST");
+        snprintf(line, sizeof(line), "%d", best > score ? best : score);
+        text(panel_l, BOARD_Y + 212, 3, rgb(240, 240, 240), line);
         snprintf(line, sizeof(line), "%d FPS", fps);
         text(panel_l, H - 24, 2, rgb(90, 100, 120), line);
         text(panel_r, H - 64, 1, rgb(110, 120, 140), "A B: ROTATE");
@@ -352,6 +381,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (score > best)
+        save_best(score);
     audio_exit();
     framebufferClose(&fb);
     fprintf(stderr, "blocks: quit, score %d, lines %d\n", score, lines);
