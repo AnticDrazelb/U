@@ -146,6 +146,16 @@ at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
 (lr, lg, lb), (pr, pg, pb) = at(566, 305), at(566, 325)
 sys.exit(0 if lr > 220 and lg > 200 and lb < 80 and min(pr, pg, pb) > 230 else 1)
 PY
+# its stencil test: an orange triangle (a square drawn where a triangle set the stencil), left
+check "its stencil test works (an orange triangle, left)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+(ir, ig, ib), (orr, og, ob) = at(56, 225), at(20, 190)
+sys.exit(0 if ir > 230 and 100 < ig < 180 and ib < 60 and not (orr > 230 and ob < 60) else 1)
+PY
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"

@@ -1,0 +1,581 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:23:04 +0000
+Subject: [PATCH] null renderer: stencil testing and several render targets in
+ software draws
+
+---
+ .../renderer_null/software_draw.cpp           | 417 ++++++++++++------
+ src/video_core/renderer_null/software_draw.h  |   5 +-
+ 2 files changed, 278 insertions(+), 144 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 55765ed56..ebd703535 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -337,6 +337,22 @@ void WriteDepth(Tegra::DepthFormat format, u8* pixel, u32 value) {
+     std::memcpy(pixel, &v, 4);
+ }
+ 
++bool HasStencil(Tegra::DepthFormat format) {
++    using D = Tegra::DepthFormat;
++    return format == D::Z24_UNORM_S8_UINT || format == D::S8Z24_UNORM ||
++           format == D::Z32_FLOAT_X24S8_UINT || format == D::S8_UINT;
++}
++
++u8 ReadStencil(Tegra::DepthFormat format, const u8* pixel) {
++    using D = Tegra::DepthFormat;
++    switch (format) {
++    case D::Z24_UNORM_S8_UINT: case D::S8_UINT: return pixel[0];
++    case D::S8Z24_UNORM: return pixel[3];
++    case D::Z32_FLOAT_X24S8_UINT: return pixel[4];
++    default: return 0;
++    }
++}
++
+ void WriteStencil(Tegra::DepthFormat format, u8* pixel, u8 stencil) {
+     using D = Tegra::DepthFormat;
+     switch (format) {
+@@ -1383,6 +1399,7 @@ struct SoftwareDraw::Program {
+     bool one_lane = false; // it branches (or uses local memory): run a pixel at a time
+     std::vector<Shader::StorageBufferDescriptor> storage;
+     bool writes_depth = false;
++    bool can_discard = false;
+ };
+ 
+ struct SoftwareDraw::Textures {
+@@ -1400,10 +1417,13 @@ struct SoftwareDraw::Raster {
+     std::array<f32, 256 * LANES> outputs{};
+     std::array<f32, 8 * 4 * LANES> colors{};
+     std::array<bool, LANES> discard{};
+-    std::vector<u8*> gobs; // the render target's GOBs in the row being drawn, as they're reached
+-    std::vector<u8*> zeta_gobs; // the depth buffer's
++    std::array<std::vector<u8*>, 8> gobs; // each render target's GOBs in the row being drawn, as
++                                          // they're reached
++    std::vector<u8*> zeta_gobs;           // the depth buffer's
+     std::array<u8*, LANES> depth_pixel{};
+     std::array<u32, LANES> depth_value{};
++    std::array<u8, LANES> stencil_value{};
++    std::array<bool, LANES> stencil_pass{};
+     std::array<bool, LANES> depth_pass{};
+     bool blend_ok = true;
+ };
+@@ -2699,6 +2719,9 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+             LogOnce("storage images aren't drawn");
+         }
+         program->ok = Flattener{*program}.Run(ir);
++        program->can_discard = std::ranges::any_of(program->ops, [](const Op& op) {
++            return op.kind == Kind::Ir && op.op == IR::Opcode::DemoteToHelperInvocation;
++        });
+         program->one_lane = program->local_words > 0 ||
+                             std::ranges::any_of(program->ops, [](const Op& op) {
+                                 return op.kind == Kind::Jump || op.kind == Kind::JumpIfTrue ||
+@@ -2764,31 +2787,93 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         LogOnce("only vertex and fragment shaders are drawn");
+         return;
+     }
+-    if (!regs.IsShaderConfigEnabled(Maxwell::Regs::ShaderType::Pixel) || regs.rt_control.count == 0) {
++    if (!regs.IsShaderConfigEnabled(Maxwell::Regs::ShaderType::Pixel)) {
+         return;
+     }
+-    if (regs.stencil_enable) {
+-        LogOnce("stencil testing isn't done: drawn without it");
+-    }
+     Program* const vs = GetProgram(maxwell3d, gpu_memory, 1);
+     Program* const fs = GetProgram(maxwell3d, gpu_memory, 5);
+     if (!vs || !fs || !vs->ok || !fs->ok) {
+         return;
+     }
+ 
+-    // Render target 0
+-    const u32 rt_index = regs.rt_control.Map(0);
+-    const auto& rt = regs.rt[rt_index];
+-    const GPUVAddr rt_address = rt.Address();
+-    std::array<u8, 16> probe{};
+-    u32 bpp = 0;
+-    if (rt_address == 0 || !EncodeColor(rt.format, {0, 0, 0, 0}, probe, bpp)) {
+-        LogOnce(fmt::format("render target format {:#x} not handled", static_cast<u32>(rt.format)));
+-        return;
++    // The render targets the fragment shader's outputs go to, each with its own format, layout
++    // (block linear: GOBs of 512 bytes, 8 rows of 64; or pitch), blending and colour mask
++    using Factor = Maxwell::Regs::Blend::Factor;
++    using Equation = Maxwell::Regs::Blend::Equation;
++    struct Target {
++        u32 attachment; // the fragment shader's output
++        Tegra::RenderTargetFormat format;
++        GPUVAddr address;
++        bool pitch_linear;
++        u32 pitch, bpp, width, height;
++        u32 block_rows, block_bytes, gobs_in_x;
++        u64 block_row_size;
++        bool blend, bgra, write_any, write_all, fast_write, alpha_by_one;
++        std::array<bool, 4> write_channel;
++        Equation color_op, alpha_op;
++        Factor color_src, color_dst, alpha_src, alpha_dst;
++    };
++    std::vector<Target> targets;
++    const std::array<f32, 4> blend_constant{regs.blend_color.r, regs.blend_color.g,
++                                            regs.blend_color.b, regs.blend_color.a};
++    const auto is = [](Factor f, Factor d3d, Factor gl) { return f == d3d || f == gl; };
++    const auto is_add = [](Equation e) { return e == Equation::Add_D3D || e == Equation::Add_GL; };
++    for (u32 attachment = 0; attachment < std::min<u32>(regs.rt_control.count, 8); ++attachment) {
++        const auto& rt = regs.rt[regs.rt_control.Map(attachment)];
++        Target tg{};
++        std::array<u8, 16> probe{};
++        if (rt.Address() == 0 || !EncodeColor(rt.format, {0, 0, 0, 0}, probe, tg.bpp)) {
++            if (rt.Address() != 0) {
++                LogOnce(fmt::format("render target format {:#x} not handled", static_cast<u32>(rt.format)));
++            }
++            continue;
++        }
++        tg.attachment = attachment;
++        tg.format = rt.format;
++        tg.address = rt.Address();
++        tg.pitch_linear = rt.tile_mode.is_pitch_linear != 0;
++        tg.pitch = rt.width; // a pitch render target's width is its pitch
++        tg.width = tg.pitch_linear ? rt.width / tg.bpp : rt.width;
++        tg.height = rt.height;
++        tg.block_rows = tg.pitch_linear ? 8 : 8u << rt.tile_mode.block_height;
++        tg.block_bytes = 512u << rt.tile_mode.block_height;
++        tg.gobs_in_x = (tg.width * tg.bpp + 63) / 64;
++        tg.block_row_size = u64{tg.gobs_in_x} * tg.block_bytes;
++        tg.blend = regs.blend.enable[attachment] != 0;
++        bool separate_alpha;
++        if (regs.blend_per_target_enabled) {
++            const auto& target = regs.blend_per_target[attachment];
++            tg.color_op = target.color_op, tg.color_src = target.color_source, tg.color_dst = target.color_dest;
++            tg.alpha_op = target.alpha_op, tg.alpha_src = target.alpha_source, tg.alpha_dst = target.alpha_dest;
++            separate_alpha = target.separate_alpha != 0;
++        } else {
++            tg.color_op = regs.blend.color_op, tg.color_src = regs.blend.color_source, tg.color_dst = regs.blend.color_dest;
++            tg.alpha_op = regs.blend.alpha_op, tg.alpha_src = regs.blend.alpha_source, tg.alpha_dst = regs.blend.alpha_dest;
++            separate_alpha = regs.blend.separate_alpha != 0;
++        }
++        if (!separate_alpha) {
++            tg.alpha_op = tg.color_op, tg.alpha_src = tg.color_src, tg.alpha_dst = tg.color_dst;
++        }
++        const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : attachment];
++        tg.write_channel = {mask.R != 0, mask.G != 0, mask.B != 0, mask.A != 0};
++        tg.write_any = tg.write_channel[0] || tg.write_channel[1] || tg.write_channel[2] || tg.write_channel[3];
++        tg.write_all = tg.write_channel[0] && tg.write_channel[1] && tg.write_channel[2] && tg.write_channel[3];
++        tg.bgra = rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM ||
++                  rt.format == Tegra::RenderTargetFormat::A8R8G8B8_SRGB;
++        // the commonest cases done in integers: RGBA8 targets written whole, opaque or blended by
++        // source alpha (alpha itself by source alpha, or one)
++        const bool rgba8 = tg.write_all && (rt.format == Tegra::RenderTargetFormat::A8B8G8R8_UNORM ||
++                                            rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM);
++        const bool source_alpha_blend =
++            tg.blend && is_add(tg.color_op) && is_add(tg.alpha_op) &&
++            is(tg.color_src, Factor::SourceAlpha_D3D, Factor::SourceAlpha_GL) &&
++            is(tg.color_dst, Factor::OneMinusSourceAlpha_D3D, Factor::OneMinusSourceAlpha_GL) &&
++            (is(tg.alpha_src, Factor::SourceAlpha_D3D, Factor::SourceAlpha_GL) || is(tg.alpha_src, Factor::One_D3D, Factor::One_GL)) &&
++            is(tg.alpha_dst, Factor::OneMinusSourceAlpha_D3D, Factor::OneMinusSourceAlpha_GL);
++        tg.alpha_by_one = is(tg.alpha_src, Factor::One_D3D, Factor::One_GL);
++        tg.fast_write = rgba8 && (!tg.blend || source_alpha_blend);
++        targets.push_back(tg);
+     }
+-    const bool pitch_linear = rt.tile_mode.is_pitch_linear != 0;
+-    const u32 rt_width = pitch_linear ? rt.width / bpp : rt.width;
+-    const u32 rt_height = rt.height;
+ 
+     // Constant buffers, read once for the draw
+     const auto read_cbufs = [&](u32 stage_index, std::array<std::vector<u32>, 18>& out) {
+@@ -2964,7 +3049,11 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     };
+ 
+     // Scissor and the render target's bounds
+-    s32 clip_x0 = 0, clip_y0 = 0, clip_x1 = s32(rt_width), clip_y1 = s32(rt_height);
++    s32 clip_x0 = 0, clip_y0 = 0, clip_x1 = 1 << 16, clip_y1 = 1 << 16;
++    for (const Target& tg : targets) {
++        clip_x1 = std::min(clip_x1, s32(tg.width));
++        clip_y1 = std::min(clip_y1, s32(tg.height));
++    }
+     if (regs.scissor_test[0].enable) {
+         clip_x0 = std::max<s32>(clip_x0, regs.scissor_test[0].min_x);
+         clip_y0 = std::max<s32>(clip_y0, regs.scissor_test[0].min_y);
+@@ -2972,25 +3061,62 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y);
+     }
+ 
+-    // Depth: tested against the depth buffer before the fragment shader runs (the shader's own
+-    // depth isn't used), and written, when the test is on
++    // Depth and stencil: tested against the depth buffer before the fragment shader runs (the
++    // shader's own depth isn't used), and written, when the tests are on
+     const auto zeta_format = regs.zeta.format;
+-    bool depth_test = regs.depth_test_enable != 0 && regs.zeta_enable != 0 && regs.zeta.Address() != 0;
+-    const u32 zeta_bpp = depth_test ? DepthBytes(zeta_format) : 0;
++    const bool zeta_on = regs.zeta_enable != 0 && regs.zeta.Address() != 0;
++    const u32 zeta_bpp = zeta_on ? DepthBytes(zeta_format) : 0;
++    bool depth_test = regs.depth_test_enable != 0 && zeta_on;
+     if (depth_test && (zeta_bpp == 0 || zeta_format == Tegra::DepthFormat::S8_UINT)) {
+         LogOnce(fmt::format("depth format {:#x} not handled: drawn without the depth test",
+                             static_cast<u32>(zeta_format)));
+         depth_test = false;
+     }
++    const bool stencil_test = regs.stencil_enable != 0 && zeta_on && zeta_bpp != 0 && HasStencil(zeta_format);
++    if (regs.stencil_enable != 0 && !stencil_test) {
++        LogOnce("a stencil test without a stencil buffer: drawn without it");
++    }
+     const bool depth_write = depth_test && regs.depth_write_enabled != 0;
+     const auto depth_func = regs.depth_test_func;
+-    if (depth_test) {
++    const bool zs_test = depth_test || stencil_test;
++    using StencilOpKind = Maxwell::Regs::StencilOp::Op;
++    struct StencilFace {
++        StencilOpKind fail, zfail, zpass;
++        Maxwell::Regs::ComparisonOp func;
++        u8 ref, func_mask, write_mask;
++    };
++    const StencilFace front_stencil{regs.stencil_front_op.fail, regs.stencil_front_op.zfail,
++                                    regs.stencil_front_op.zpass, regs.stencil_front_op.func,
++                                    u8(regs.stencil_front_ref), u8(regs.stencil_front_func_mask),
++                                    u8(regs.stencil_front_mask)};
++    const StencilFace back_stencil = regs.stencil_two_side_enable == 0
++                                         ? front_stencil
++                                         : StencilFace{regs.stencil_back_op.fail, regs.stencil_back_op.zfail,
++                                                       regs.stencil_back_op.zpass, regs.stencil_back_op.func,
++                                                       u8(regs.stencil_back_ref), u8(regs.stencil_back_func_mask),
++                                                       u8(regs.stencil_back_mask)};
++    const auto stencil_op = [](StencilOpKind op, u8 value, u8 ref) -> u8 {
++        switch (op) {
++        case StencilOpKind::Zero_D3D: case StencilOpKind::Zero_GL: return 0;
++        case StencilOpKind::Replace_D3D: case StencilOpKind::Replace_GL: return ref;
++        case StencilOpKind::IncrSaturate_D3D: case StencilOpKind::IncrSaturate_GL: return value == 0xFF ? value : u8(value + 1);
++        case StencilOpKind::DecrSaturate_D3D: case StencilOpKind::DecrSaturate_GL: return value == 0 ? value : u8(value - 1);
++        case StencilOpKind::Invert_D3D: case StencilOpKind::Invert_GL: return u8(~value);
++        case StencilOpKind::Incr_D3D: case StencilOpKind::Incr_GL: return u8(value + 1);
++        case StencilOpKind::Decr_D3D: case StencilOpKind::Decr_GL: return u8(value - 1);
++        default: return value; // keep
++        }
++    };
++    if (zs_test) {
+         clip_x1 = std::min<s32>(clip_x1, s32(regs.zeta_size.width));
+         clip_y1 = std::min<s32>(clip_y1, s32(regs.zeta_size.height));
+         if (fs->writes_depth) {
+             LogOnce("a fragment shader's own depth isn't used: the interpolated depth is");
+         }
+     }
++    if (targets.empty() && !zs_test) {
++        return;
++    }
+     if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) {
+         return;
+     }
+@@ -3235,54 +3361,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         return;
+     }
+ 
+-    // Blending of render target 0
+-    const bool blend = regs.blend.enable[0] != 0;
+-    Maxwell::Regs::Blend::Equation color_op, alpha_op;
+-    Maxwell::Regs::Blend::Factor color_src, color_dst, alpha_src, alpha_dst;
+-    bool separate_alpha;
+-    if (regs.blend_per_target_enabled) {
+-        const auto& target = regs.blend_per_target[0];
+-        color_op = target.color_op, color_src = target.color_source, color_dst = target.color_dest;
+-        alpha_op = target.alpha_op, alpha_src = target.alpha_source, alpha_dst = target.alpha_dest;
+-        separate_alpha = target.separate_alpha != 0;
+-    } else {
+-        color_op = regs.blend.color_op, color_src = regs.blend.color_source, color_dst = regs.blend.color_dest;
+-        alpha_op = regs.blend.alpha_op, alpha_src = regs.blend.alpha_source, alpha_dst = regs.blend.alpha_dest;
+-        separate_alpha = regs.blend.separate_alpha != 0;
+-    }
+-    if (!separate_alpha) {
+-        alpha_op = color_op, alpha_src = color_src, alpha_dst = color_dst;
+-    }
+-    const std::array<f32, 4> blend_constant{regs.blend_color.r, regs.blend_color.g,
+-                                            regs.blend_color.b, regs.blend_color.a};
+-    const auto& mask = regs.color_mask_common ? regs.color_mask[0] : regs.color_mask[rt_index];
+-    const bool write_channel[4] = {mask.R != 0, mask.G != 0, mask.B != 0, mask.A != 0};
+-    const bool write_all = write_channel[0] && write_channel[1] && write_channel[2] && write_channel[3];
+-    const bool bgra = rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM ||
+-                      rt.format == Tegra::RenderTargetFormat::A8R8G8B8_SRGB;
+-    // The commonest cases done in integers: RGBA8 targets written whole, opaque or blended by
+-    // source alpha (alpha itself by source alpha, or one)
+-    using Factor = Maxwell::Regs::Blend::Factor;
+-    using Equation = Maxwell::Regs::Blend::Equation;
+-    const auto is = [](Factor f, Factor d3d, Factor gl) { return f == d3d || f == gl; };
+-    const auto is_add = [](Equation e) { return e == Equation::Add_D3D || e == Equation::Add_GL; };
+-    const bool rgba8 = write_all && (rt.format == Tegra::RenderTargetFormat::A8B8G8R8_UNORM ||
+-                                     rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM);
+-    const bool source_alpha_blend =
+-        blend && is_add(color_op) && is_add(alpha_op) &&
+-        is(color_src, Factor::SourceAlpha_D3D, Factor::SourceAlpha_GL) &&
+-        is(color_dst, Factor::OneMinusSourceAlpha_D3D, Factor::OneMinusSourceAlpha_GL) &&
+-        (is(alpha_src, Factor::SourceAlpha_D3D, Factor::SourceAlpha_GL) || is(alpha_src, Factor::One_D3D, Factor::One_GL)) &&
+-        is(alpha_dst, Factor::OneMinusSourceAlpha_D3D, Factor::OneMinusSourceAlpha_GL);
+-    const bool alpha_by_one = is(alpha_src, Factor::One_D3D, Factor::One_GL);
+-    const bool fast_write = rgba8 && (!blend || source_alpha_blend);
+-
+-    // The render target in GOBs (512 bytes: 8 rows of 64 bytes), each reached directly; the work
+-    // split by GOB rows (8 pixel rows), which the rasterizing threads share
+-    const u32 block_rows = pitch_linear ? 8 : 8u << rt.tile_mode.block_height;
+-    const u32 block_bytes = 512u << rt.tile_mode.block_height;
+-    const u32 gobs_in_x = (rt_width * bpp + 63) / 64;
+-    const u64 block_row_size = u64{gobs_in_x} * block_bytes;
++    // The depth buffer's layout; the work split by GOB rows (8 pixel rows), which the rasterizing
++    // threads share
+     const GPUVAddr zeta_address = regs.zeta.Address();
+     const bool zeta_pitch_linear = regs.zeta.tile_mode.is_pitch_linear != 0;
+     const u32 zeta_block_rows = zeta_pitch_linear ? 8 : 8u << regs.zeta.tile_mode.block_height;
+@@ -3291,19 +3371,26 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     const u64 zeta_block_row_size = u64{zeta_gobs_in_x} * zeta_block_bytes;
+ 
+     const auto raster_rows = [&](Raster& st, s32 row_begin, s32 row_end) {
+-        st.gobs.assign(gobs_in_x, nullptr);
+-        const u32 gob_row_in_block = u32(row_begin) % block_rows / 8;
+-        const GPUVAddr gob_row_address = rt_address + u64(u32(row_begin) / block_rows) * block_row_size +
+-                                         u64{gob_row_in_block} * 512;
+-        const auto pixel = [&](s32 x, s32 y) -> u8* {
+-            if (pitch_linear) {
+-                return gpu_memory.GetPointer(rt_address + u64(y) * rt.width + u64(x) * bpp);
+-            }
+-            const u32 xb = u32(x) * bpp;
++        std::array<GPUVAddr, 8> gob_row_address{};
++        for (size_t ti = 0; ti < targets.size(); ++ti) {
++            const Target& tg = targets[ti];
++            st.gobs[ti].assign(tg.gobs_in_x, nullptr);
++            gob_row_address[ti] = tg.address + u64(u32(row_begin) / tg.block_rows) * tg.block_row_size +
++                                  u64{u32(row_begin) % tg.block_rows / 8} * 512;
++        }
++        const auto pixel = [&](size_t ti, s32 x, s32 y) -> u8* {
++            const Target& tg = targets[ti];
++            if (u32(x) >= tg.width || u32(y) >= tg.height) {
++                return nullptr;
++            }
++            if (tg.pitch_linear) {
++                return gpu_memory.GetPointer(tg.address + u64(y) * tg.pitch + u64(x) * tg.bpp);
++            }
++            const u32 xb = u32(x) * tg.bpp;
+             const u32 column = xb / 64;
+-            u8*& gob = st.gobs[column];
++            u8*& gob = st.gobs[ti][column];
+             if (!gob) {
+-                gob = gpu_memory.GetPointer(gob_row_address + u64{column} * block_bytes);
++                gob = gpu_memory.GetPointer(gob_row_address[ti] + u64{column} * tg.block_bytes);
+                 if (!gob) {
+                     return nullptr;
+                 }
+@@ -3311,7 +3398,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             const u32 row = u32(y) % 8, in_gob = xb % 64;
+             return gob + (row / 2) * 64 + (row % 2) * 16 + (in_gob / 32) * 256 + ((in_gob % 32) / 16) * 32 + in_gob % 16;
+         };
+-        if (depth_test) {
++        if (zs_test) {
+             st.zeta_gobs.assign(zeta_gobs_in_x, nullptr);
+         }
+         const GPUVAddr zeta_gob_row_address = zeta_address + u64(u32(row_begin) / zeta_block_rows) * zeta_block_row_size +
+@@ -3425,20 +3512,50 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                             break;
+                         }
+                     }
+-                    std::fill_n(st.colors.data(), 3 * LANES, 0.0f);
+-                    std::fill_n(st.colors.data() + 3 * LANES, LANES, 1.0f);
++                    for (const Target& tg : targets) {
++                        f32* const out = st.colors.data() + tg.attachment * 4 * LANES;
++                        std::fill_n(out, 3 * LANES, 0.0f);
++                        std::fill_n(out + 3 * LANES, LANES, 1.0f);
++                    }
+                     st.discard.fill(false);
+-                    // the depth test: a batch whose pixels all fail isn't shaded
+-                    if (depth_test) {
++                    // the stencil and depth tests: a batch whose pixels all fail isn't shaded (unless
++                    // the shader can discard, which keeps a pixel from the stencil's updates)
++                    const StencilFace& face = t.front ? front_stencil : back_stencil;
++                    const auto update_stencil = [&](u32 j) {
++                        u8* const zp = st.depth_pixel[j];
++                        const StencilOpKind op = !st.stencil_pass[j] ? face.fail : !st.depth_pass[j] ? face.zfail : face.zpass;
++                        const u8 value = st.stencil_value[j];
++                        const u8 updated = stencil_op(op, value, face.ref);
++                        if (updated != value) {
++                            WriteStencil(zeta_format, zp, u8((value & ~face.write_mask) | (updated & face.write_mask)));
++                        }
++                    };
++                    if (zs_test) {
+                         bool any = false;
+                         for (u32 j = 0; j < n; ++j) {
+                             u8* const zp = depth_pixel(bx + s32(j), y);
+                             st.depth_pixel[j] = zp;
+-                            st.depth_value[j] = DepthValue(zeta_format, position_z[j]);
+-                            st.depth_pass[j] = zp && DepthPasses(depth_func, st.depth_value[j], ReadDepth(zeta_format, zp));
+-                            any |= st.depth_pass[j];
++                            st.stencil_pass[j] = st.depth_pass[j] = zp != nullptr;
++                            if (!zp) {
++                                continue;
++                            }
++                            if (stencil_test) {
++                                st.stencil_value[j] = ReadStencil(zeta_format, zp);
++                                st.stencil_pass[j] = DepthPasses(face.func, face.ref & face.func_mask,
++                                                                 st.stencil_value[j] & face.func_mask);
++                            }
++                            if (depth_test && st.stencil_pass[j]) {
++                                st.depth_value[j] = DepthValue(zeta_format, position_z[j]);
++                                st.depth_pass[j] = DepthPasses(depth_func, st.depth_value[j], ReadDepth(zeta_format, zp));
++                            }
++                            any |= st.stencil_pass[j] && st.depth_pass[j];
+                         }
+-                        if (!any) {
++                        if (!any && !fs->can_discard) {
++                            for (u32 j = 0; stencil_test && j < n; ++j) {
++                                if (st.depth_pixel[j]) {
++                                    update_stencil(j);
++                                }
++                            }
+                             continue;
+                         }
+                     }
+@@ -3455,63 +3572,75 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                         if (st.discard[j]) {
+                             continue;
+                         }
+-                        if (depth_test) {
+-                            if (!st.depth_pass[j]) {
++                        if (zs_test) {
++                            if (!st.depth_pixel[j]) {
++                                continue;
++                            }
++                            if (stencil_test) {
++                                update_stencil(j);
++                            }
++                            if (!st.stencil_pass[j] || !st.depth_pass[j]) {
+                                 continue;
+                             }
+                             if (depth_write) {
+                                 WriteDepth(zeta_format, st.depth_pixel[j], st.depth_value[j]);
+                             }
+                         }
+-                        u8* const out = pixel(bx + s32(j), y);
+-                        if (!out) {
+-                            continue;
+-                        }
+-                        std::array<f32, 4> color{st.colors[0 * LANES + j], st.colors[1 * LANES + j],
+-                                                 st.colors[2 * LANES + j], st.colors[3 * LANES + j]};
+-                        if (fast_write) {
+-                            u32 r = Unorm(color[0], 8), g = Unorm(color[1], 8), b = Unorm(color[2], 8);
+-                            u32 a = Unorm(color[3], 8);
+-                            if (bgra) {
+-                                std::swap(r, b);
++                        for (size_t ti = 0; ti < targets.size(); ++ti) {
++                            const Target& tg = targets[ti];
++                            if (!tg.write_any) {
++                                continue;
+                             }
+-                            if (blend) {
+-                                u32 dst;
+-                                std::memcpy(&dst, out, 4);
+-                                const auto mix = [](u32 s, u32 d, u32 sa) { // (s*sa + d*(255-sa)) / 255
+-                                    const u32 x = s * sa + d * (255 - sa) + 128;
+-                                    return (x + (x >> 8)) >> 8;
+-                                };
+-                                const u32 da = dst >> 24;
+-                                const u32 out_a = alpha_by_one ? std::min(a + (da * (255 - a) + 127) / 255, 255u)
+-                                                               : mix(a, da, a);
+-                                r = mix(r, dst & 0xFF, a), g = mix(g, (dst >> 8) & 0xFF, a);
+-                                b = mix(b, (dst >> 16) & 0xFF, a), a = out_a;
++                            u8* const out = pixel(ti, bx + s32(j), y);
++                            if (!out) {
++                                continue;
+                             }
+-                            const u32 packed = r | g << 8 | b << 16 | a << 24;
+-                            std::memcpy(out, &packed, 4);
+-                            continue;
+-                        }
+-                        if (blend) {
+-                            std::array<f32, 4> dst{};
+-                            DecodeColor(rt.format, out, dst);
+-                            for (u32 ch = 0; ch < 4; ++ch) {
+-                                const bool alpha = ch == 3;
+-                                const f32 sf = BlendFactor(alpha ? alpha_src : color_src, color, dst, blend_constant, ch, st.blend_ok);
+-                                const f32 df = BlendFactor(alpha ? alpha_dst : color_dst, color, dst, blend_constant, ch, st.blend_ok);
+-                                color[ch] = BlendEquation(alpha ? alpha_op : color_op, color[ch] * sf, dst[ch] * df, st.blend_ok);
++                            const f32* const fragment = st.colors.data() + tg.attachment * 4 * LANES + j;
++                            std::array<f32, 4> color{fragment[0], fragment[LANES], fragment[2 * LANES], fragment[3 * LANES]};
++                            if (tg.fast_write) {
++                                u32 r = Unorm(color[0], 8), g = Unorm(color[1], 8), b = Unorm(color[2], 8);
++                                u32 a = Unorm(color[3], 8);
++                                if (tg.bgra) {
++                                    std::swap(r, b);
++                                }
++                                if (tg.blend) {
++                                    u32 dst;
++                                    std::memcpy(&dst, out, 4);
++                                    const auto mix = [](u32 s, u32 d, u32 sa) { // (s*sa + d*(255-sa)) / 255
++                                        const u32 x = s * sa + d * (255 - sa) + 128;
++                                        return (x + (x >> 8)) >> 8;
++                                    };
++                                    const u32 da = dst >> 24;
++                                    const u32 out_a = tg.alpha_by_one ? std::min(a + (da * (255 - a) + 127) / 255, 255u)
++                                                                      : mix(a, da, a);
++                                    r = mix(r, dst & 0xFF, a), g = mix(g, (dst >> 8) & 0xFF, a);
++                                    b = mix(b, (dst >> 16) & 0xFF, a), a = out_a;
++                                }
++                                const u32 packed = r | g << 8 | b << 16 | a << 24;
++                                std::memcpy(out, &packed, 4);
++                                continue;
+                             }
+-                        }
+-                        std::array<u8, 16> encoded{};
+-                        u32 bytes = 0;
+-                        EncodeColor(rt.format, color, encoded, bytes);
+-                        if (write_all) {
+-                            std::memcpy(out, encoded.data(), bytes);
+-                        } else if (bytes == 4) { // 8-bit channels: the masked ones kept
+-                            for (u32 ch = 0; ch < 4; ++ch) {
+-                                const u32 byte_index = bgra && ch < 3 ? 2 - ch : ch;
+-                                if (write_channel[ch]) {
+-                                    out[byte_index] = encoded[byte_index];
++                            if (tg.blend) {
++                                std::array<f32, 4> dst{};
++                                DecodeColor(tg.format, out, dst);
++                                for (u32 ch = 0; ch < 4; ++ch) {
++                                    const bool alpha = ch == 3;
++                                    const f32 sf = BlendFactor(alpha ? tg.alpha_src : tg.color_src, color, dst, blend_constant, ch, st.blend_ok);
++                                    const f32 df = BlendFactor(alpha ? tg.alpha_dst : tg.color_dst, color, dst, blend_constant, ch, st.blend_ok);
++                                    color[ch] = BlendEquation(alpha ? tg.alpha_op : tg.color_op, color[ch] * sf, dst[ch] * df, st.blend_ok);
++                                }
++                            }
++                            std::array<u8, 16> encoded{};
++                            u32 bytes = 0;
++                            EncodeColor(tg.format, color, encoded, bytes);
++                            if (tg.write_all) {
++                                std::memcpy(out, encoded.data(), bytes);
++                            } else if (bytes == 4) { // 8-bit channels: the masked ones kept
++                                for (u32 ch = 0; ch < 4; ++ch) {
++                                    const u32 byte_index = tg.bgra && ch < 3 ? 2 - ch : ch;
++                                    if (tg.write_channel[ch]) {
++                                        out[byte_index] = encoded[byte_index];
++                                    }
+                                 }
+                             }
+                         }
+@@ -3568,9 +3697,11 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         stats.Report();
+     }
+     // textures drawn to (render to texture) are checked again before they're next sampled
+-    MarkWritten(rt_address, pitch_linear ? u64{rt.width} * rt_height
+-                                         : block_row_size * ((rt_height + block_rows - 1) / block_rows));
+-    if (depth_write) {
++    for (const Target& tg : targets) {
++        MarkWritten(tg.address, tg.pitch_linear ? u64{tg.pitch} * tg.height
++                                                : tg.block_row_size * ((tg.height + tg.block_rows - 1) / tg.block_rows));
++    }
++    if (depth_write || stencil_test) {
+         MarkWritten(zeta_address, zeta_block_row_size * ((regs.zeta_size.height + zeta_block_rows - 1) / zeta_block_rows));
+     }
+ }
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index d03d9e6df..64e6bd5d9 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -39,7 +39,10 @@ u32 DepthValue(Tegra::DepthFormat format, f32 depth);
+ u32 ReadDepth(Tegra::DepthFormat format, const u8* pixel);
+ void WriteDepth(Tegra::DepthFormat format, u8* pixel, u32 value);
+ 
+-/// Writing a pixel's stencil (the depth bits kept), for the formats that have one.
++/// Whether a depth buffer format has a stencil, and reading and writing a pixel's (the depth bits
++/// kept).
++bool HasStencil(Tegra::DepthFormat format);
++u8 ReadStencil(Tegra::DepthFormat format, const u8* pixel);
+ void WriteStencil(Tegra::DepthFormat format, u8* pixel, u8 stencil);
+ 
+ /// Draws on the CPU what the 3D engine's registers describe, into the render target in emulated

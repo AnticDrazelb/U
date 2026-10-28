@@ -119,7 +119,9 @@ games upload their textures; it's filtered bilinearly and repeats. And a depth t
 across each other in depth, a red one drawn first and a green one, each in front on its own half.
 And a square coloured from a storage buffer: its fragment program loads 16 bytes from a GPU
 address it finds in the constant buffer (where NVN keeps storage buffers' addresses), which Eden's
-shader recompiler turns into a storage buffer read. And lines, 3 pixels wide, and a point.
+shader recompiler turns into a storage buffer read. And lines, 3 pixels wide, and a point. And a
+stencil test: a triangle drawn into the stencil only, then a square drawn where the stencil is
+set, which leaves an orange triangle.
 
 ![The GPU test in shadPS4: everything on it drawn by the null renderer's software GPU](screenshots/gputest-shadps4.png)
 
@@ -143,8 +145,8 @@ Two ways it shows:
   them, culled, and rasterized into render target 0 in emulated memory a block at a time, with the
   varyings interpolated as Vulkan interpolates them (perspective, linear, flat) and blended. The
   GPU test's first frame comes out the same as through the Vulkan renderer (below), and it draws at
-  60 frames a second on the desktop. Not done yet: stencil, more than one render target, storage
-  images, geometry and tessellation shaders; a draw that needs them is skipped (or drawn without
+  60 frames a second on the desktop. Not done yet: storage images, geometry and tessellation
+  shaders, a fragment shader's own depth; a draw that needs them is skipped (or drawn without
   them), and logged once.
 - **Textures, in software** (patch 0017): a texture is decoded from emulated memory the first
   time it's sampled, with Eden's own code for the GPU's layouts and compressed formats (its
@@ -179,6 +181,11 @@ Two ways it shows:
   same as through the Vulkan renderer, pixel for pixel. A line loop showed that Eden's Vulkan
   renderer draws line loops as triangles (its topology table maps them to a triangle list), so
   the test draws a strip back to its start instead.
+- **Stencil, and several render targets** (patch 0022): the stencil test with both faces' state
+  (Eden starts with two-sided stencil on, so back faces use their own: the test's triangle found
+  that), its updates on stencil fail, depth fail and pass, the write mask; a shader that can
+  discard runs before the updates are made, so a discarded pixel makes none. Up to eight render
+  targets, each with its own format, layout, blending and colour mask.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -328,6 +335,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: depth testing, depth and stencil clears | above |
 | null renderer: storage buffers, global memory and subgroup ops in software shaders | above |
 | null renderer: points, lines, quad strips and polygons in software draws | above |
+| null renderer: stencil testing and several render targets in software draws | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

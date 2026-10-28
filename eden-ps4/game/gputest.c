@@ -13,7 +13,8 @@
 // games upload textures) and filtered bilinearly. It waits for each frame's GPU work through a
 // fence the command stream signals, and quits on +. And a depth test: two bars across each other
 // in depth, each in front on its own half. And a square coloured from a storage buffer, lines and a
-// point.
+// point, and a stencil test: a triangle drawn only into the stencil, then a square drawn where it
+// is.
 
 #include <math.h>
 #include <stdbool.h>
@@ -79,9 +80,20 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M_DEPTH_WRITE_ENABLE 0x4BA
 #define M_DEPTH_FUNC 0x4C3
 #define M_CLEAR_DEPTH 0x364
-#define ZETA_Z32F 0x0A
+#define ZETA_Z24S8 0x14
+#define M_STENCIL_ENABLE 0x4E0
+#define M_STENCIL_FRONT_OP 0x4E1   // fail, depth fail, pass, function
+#define M_STENCIL_FRONT_REF 0x4E5  // reference, function mask, write mask
+#define M_CLEAR_STENCIL 0x368
+#define M_STENCIL_TWO_SIDE 0x565   // on by default: back faces with their own stencil state
+#define STENCIL_KEEP 0x1E00
+#define STENCIL_REPLACE 0x1E01
+#define FUNC_EQUAL 0x202
+#define FUNC_ALWAYS 0x207
+#define CLEAR_S 2u
 #define DEPTH_LESS_EQUAL 0x203
 #define CLEAR_Z 1u
+#define STENCIL_OFFSET(i) (0x3800 + (i) * 0x100) // the stencil triangle (3 vertices), then its square (4)
 #define M_LINE_WIDTH 0x4ED         // aliased lines
 #define M_POINT_SIZE 0x546
 #define TOPOLOGY_POINTS 0
@@ -571,13 +583,14 @@ int main(int argc, char* argv[]) {
             const u32 screen[2] = {(u32)W << 16, (u32)H << 16};
             method(M_SCREEN_SCISSOR, 2, screen);
             // the depth buffer, its test off but for the depth bars
-            const u32 zeta[5] = {(u32)(depth_iova >> 32), (u32)depth_iova, ZETA_Z32F, 4 << 4, 0};
+            const u32 zeta[5] = {(u32)(depth_iova >> 32), (u32)depth_iova, ZETA_Z24S8, 4 << 4, 0};
             method(M_ZETA, 5, zeta);
             const u32 zeta_size[3] = {W, H, 1 | 1 << 16};
             method(M_ZETA_SIZE, 3, zeta_size);
             method1(M_ZETA_ENABLE, 1);
             method1(M_DEPTH_FUNC, DEPTH_LESS_EQUAL);
             method1(M_CLEAR_DEPTH, f32bits(1.0f));
+            method1(M_CLEAR_STENCIL, 0);
             first = false;
         }
         const iova_t target = fb_iova + (iova_t)slot * fb.fb_size;
@@ -700,7 +713,7 @@ int main(int argc, char* argv[]) {
         {
             const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
             method(M_SCISSOR, 3, scissor);
-            method1(M_CLEAR_BUFFERS, CLEAR_Z);
+            method1(M_CLEAR_BUFFERS, CLEAR_Z | CLEAR_S);
             const int index = (int)(g_cmd - cmds);
             float* v = (float*)(heap + DEPTH_OFFSET(index));
             static const float xs[2] = {0.45f, 0.95f}, ys[2] = {-0.85f, -0.55f};
@@ -787,6 +800,44 @@ int main(int argc, char* argv[]) {
             method(M_VERTEX_FIRST, 2, point);
             method1(M_DRAW_BEGIN, TOPOLOGY_POINTS);
             method1(M_DRAW_END, 0);
+        }
+        // the stencil test: a triangle drawn into the stencil only (1 where it is), then an orange
+        // square drawn where the stencil is 1, left of the middle
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + STENCIL_OFFSET(index));
+            static const float points[7][2] = {{-0.95f, 0.30f}, {-0.70f, 0.30f}, {-0.825f, 0.0f},
+                                               {-0.95f, 0.0f}, {-0.70f, 0.0f}, {-0.95f, 0.30f}, {-0.70f, 0.30f}};
+            for (int k = 0; k < 7; k++) {
+                v[k * 8 + 0] = points[k][0], v[k * 8 + 1] = points[k][1];
+                v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = 1.0f, v[k * 8 + 5] = 0.55f, v[k * 8 + 6] = 0.1f, v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t shapes = heap_iova + STENCIL_OFFSET(index);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(shapes >> 32), (u32)shapes, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = shapes + 7 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            method1(M_STENCIL_ENABLE, 1);
+            method1(M_STENCIL_TWO_SIDE, 0); // the triangle faces away: the same state for it
+            const u32 write_op[4] = {STENCIL_KEEP, STENCIL_KEEP, STENCIL_REPLACE, FUNC_ALWAYS};
+            method(M_STENCIL_FRONT_OP, 4, write_op);
+            const u32 ref[3] = {1, 0xFF, 0xFF};
+            method(M_STENCIL_FRONT_REF, 3, ref);
+            method1(M_COLOR_MASK, 0); // the stencil only
+            const u32 triangle[2] = {0, 3};
+            method(M_VERTEX_FIRST, 2, triangle);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLES);
+            method1(M_DRAW_END, 0);
+            method1(M_COLOR_MASK, 0x1111);
+            const u32 test_op[4] = {STENCIL_KEEP, STENCIL_KEEP, STENCIL_KEEP, FUNC_EQUAL};
+            method(M_STENCIL_FRONT_OP, 4, test_op);
+            const u32 square[2] = {3, 4};
+            method(M_VERTEX_FIRST, 2, square);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_STENCIL_ENABLE, 0);
         }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
