@@ -1,0 +1,1239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 11:15:18 +0000
+Subject: [PATCH] null renderer: textures in software draws
+
+---
+ .../renderer_null/null_rasterizer.cpp         |   25 +-
+ .../renderer_null/software_draw.cpp           | 1008 ++++++++++++++++-
+ src/video_core/renderer_null/software_draw.h  |   19 +-
+ 3 files changed, 1043 insertions(+), 9 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index 01c159f2c..b48098f9b 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -56,6 +56,10 @@ void RasterizerNull::Clear(u32 layer_count) {
+     if (address == 0 || rt.width == 0 || rt.height == 0) {
+         return;
+     }
++    // textures cleared (render to texture) are checked again before they're next sampled; the
++    // range generous (a layer's size isn't worked out here)
++    m_software.MarkWritten(address, std::max<u64>(u64{rt.array_pitch} << 2, u64{rt.width} * rt.height * 16) *
++                                        (surface.layer + std::max(layer_count, 1u)));
+     std::array<u8, 16> pixel{};
+     u32 bpp = 0;
+     if (!EncodeColor(rt.format, regs.clear_color, pixel, bpp)) {
+@@ -180,7 +184,11 @@ void RasterizerNull::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+ bool RasterizerNull::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+     return false;
+ }
+-void RasterizerNull::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {}
++// A write the memory manager reports (by device address): the software draws' textures are
++// checked again before they're next sampled.
++void RasterizerNull::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
++    m_software.MarkAllWritten();
++}
+ bool RasterizerNull::OnCPUWrite(PAddr addr, u64 size) {
+     return false;
+ }
+@@ -214,17 +222,28 @@ void RasterizerNull::WaitForIdle() {}
+ void RasterizerNull::FragmentBarrier() {}
+ void RasterizerNull::TiledCacheBarrier() {}
+ void RasterizerNull::FlushCommands() {}
+-void RasterizerNull::TickFrame() {}
++void RasterizerNull::TickFrame() {
++    m_software.TickFrame();
++}
+ Tegra::Engines::AccelerateDMAInterface& RasterizerNull::AccessAccelerateDMA() {
++    m_software.MarkAllWritten(); // the DMA engine is about to copy (texture uploads among them)
+     return m_accelerate_dma;
+ }
+ bool RasterizerNull::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
+                                            const Tegra::Engines::Fermi2D::Surface& dst,
+                                            const Tegra::Engines::Fermi2D::Config& copy_config) {
++    m_software.MarkAllWritten();
+     return false; // the 2D engine's software blitter copies it
+ }
++// Inline uploads (the upload engine's linear ones come here) written to emulated memory
+ void RasterizerNull::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
+-                                              std::span<const u8> memory) {}
++                                              std::span<const u8> memory) {
++    if (!gpu_memory) {
++        return;
++    }
++    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
++    m_software.MarkWritten(address, copy_size);
++}
+ void RasterizerNull::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                        const VideoCore::DiskResourceLoadCallback& callback) {}
+ void RasterizerNull::InitializeChannel(Tegra::Control::ChannelState& channel) {
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index ccbe1e061..e166be5b5 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -10,11 +10,13 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "common/cityhash.h"
+ #include "common/logging.h"
+ #include "shader_recompiler/environment.h"
+ #include "shader_recompiler/exception.h"
+ #include "shader_recompiler/frontend/ir/attribute.h"
+ #include "shader_recompiler/frontend/ir/basic_block.h"
++#include "shader_recompiler/frontend/ir/modifiers.h"
+ #include "shader_recompiler/frontend/ir/program.h"
+ #include "shader_recompiler/frontend/ir/value.h"
+ #include "shader_recompiler/frontend/maxwell/control_flow.h"
+@@ -27,6 +29,13 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/renderer_null/software_draw.h"
+ #include "video_core/shader_environment.h"
++#include "video_core/surface.h"
++#include "video_core/texture_cache/decode_bc.h"
++#include "video_core/texture_cache/image_info.h"
++#include "video_core/texture_cache/image_view_info.h"
++#include "video_core/texture_cache/util.h"
++#include "video_core/textures/astc.h"
++#include "video_core/textures/texture.h"
+ 
+ namespace Null {
+ 
+@@ -334,6 +343,10 @@ bool IsSupported(IR::Opcode op) {
+     case O::ConvertU8U32: case O::ConvertU32U8: case O::ConvertS32S8: case O::ConvertS32S16:
+     case O::ConvertS16F32: case O::ConvertU16F32:
+     case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
++    case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod:
++    case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod: case O::ImageGather:
++    case O::ImageGatherDref: case O::ImageFetch: case O::ImageQueryDimensions:
++    case O::ImageQueryLod: case O::ImageGradient: case O::GetSparseFromOp:
+         return true;
+     default:
+         return false;
+@@ -386,6 +399,757 @@ u32 ToU32(f32 v) {
+ 
+ } // Anonymous namespace
+ 
++// ---- textures: each decoded from emulated memory when first sampled, and kept; checked again
++// (its bytes hashed) after anything that might have written to it, and once a frame
++
++namespace {
++
++using VideoCore::Surface::PixelFormat;
++using Tegra::Texture::SwizzleSource;
++
++struct Level {
++    u32 width = 0, height = 0, depth = 0; // depth: a 3D level's slices
++    std::vector<u32> rgba8;                // the texels, for formats that fit 8-bit RGBA
++    std::vector<std::array<f32, 4>> rgba;  // the texels as floats, for the rest
++};
++
++struct Texture {
++    std::array<u64, 4> tic{};
++    GPUVAddr address = 0; // the guest bytes it's decoded from
++    u64 size = 0;
++    u64 hash = 0;
++    bool decoded = false;
++    bool checked = false; // since anything that might have written to it
++    u32 idle_frames = 0;
++    bool ok = false;
++    bool compact = false; // texels in 'rgba8'
++    bool srgb = false;
++    bool integer = false;
++    u32 base_level = 0, num_levels = 0; // the view's
++    u32 base_layer = 0, num_layers = 0;
++    std::array<SwizzleSource, 4> swizzle{};
++    std::vector<Level> levels; // every level of the image, its texels [layer][z][y][x]
++};
++
++struct Binding {
++    const Texture* texture = nullptr;
++    Tegra::Texture::TSCEntry sampler{};
++};
++
++float FromSnorm(s32 value, u32 bits) {
++    return std::max(float(value) / float((1 << (bits - 1)) - 1), -1.0f);
++}
++
++/// The unsigned 11- and 10-bit floats of B10G11R11
++float FromUfloat(u32 value, u32 mantissa_bits) {
++    const u32 exponent = value >> mantissa_bits;
++    const u32 mantissa = value & ((1u << mantissa_bits) - 1);
++    if (exponent == 0) {
++        return std::ldexp(float(mantissa), -14 - s32(mantissa_bits));
++    }
++    if (exponent == 31) {
++        return mantissa ? std::numeric_limits<f32>::quiet_NaN()
++                        : std::numeric_limits<f32>::infinity();
++    }
++    return std::ldexp(1.0f + float(mantissa) / float(1u << mantissa_bits), s32(exponent) - 15);
++}
++
++/// A texel of an uncompressed format as four floats (integer formats: the integers' bits).
++/// Eden's packed formats are named from the most significant bits down.
++bool DecodeTexel(PixelFormat format, const u8* p, std::array<f32, 4>& out) {
++    const auto u16_at = [&](u32 i) {
++        u16 v;
++        std::memcpy(&v, p + i * 2, 2);
++        return v;
++    };
++    const auto u32_at = [&](u32 i) {
++        u32 v;
++        std::memcpy(&v, p + i * 4, 4);
++        return v;
++    };
++    const auto f32_at = [&](u32 i) { return std::bit_cast<f32>(u32_at(i)); };
++    const auto bits = [](u32 v) { return std::bit_cast<f32>(v); };
++    const auto sbits = [](s32 v) { return std::bit_cast<f32>(static_cast<u32>(v)); };
++    const f32 one_int = std::bit_cast<f32>(1u);
++    const auto unorm8 = [&](u32 i) { return FromUnorm(p[i], 8); };
++    const auto snorm8 = [&](u32 i) { return FromSnorm(s8(p[i]), 8); };
++    using P = PixelFormat;
++    switch (format) {
++    case P::A8B8G8R8_UNORM: case P::A8B8G8R8_SRGB:
++        out = {unorm8(0), unorm8(1), unorm8(2), unorm8(3)};
++        return true;
++    case P::B8G8R8A8_UNORM: case P::B8G8R8A8_SRGB:
++        out = {unorm8(2), unorm8(1), unorm8(0), unorm8(3)};
++        return true;
++    case P::A8B8G8R8_SNORM:
++        out = {snorm8(0), snorm8(1), snorm8(2), snorm8(3)};
++        return true;
++    case P::A8B8G8R8_UINT:
++        out = {bits(p[0]), bits(p[1]), bits(p[2]), bits(p[3])};
++        return true;
++    case P::A8B8G8R8_SINT:
++        out = {sbits(s8(p[0])), sbits(s8(p[1])), sbits(s8(p[2])), sbits(s8(p[3]))};
++        return true;
++    case P::R5G6B5_UNORM: {
++        const u16 v = u16_at(0);
++        out = {FromUnorm(v >> 11, 5), FromUnorm((v >> 5) & 63, 6), FromUnorm(v & 31, 5), 1.0f};
++        return true;
++    }
++    case P::B5G6R5_UNORM: {
++        const u16 v = u16_at(0);
++        out = {FromUnorm(v & 31, 5), FromUnorm((v >> 5) & 63, 6), FromUnorm(v >> 11, 5), 1.0f};
++        return true;
++    }
++    case P::A1R5G5B5_UNORM: {
++        const u16 v = u16_at(0);
++        out = {FromUnorm((v >> 10) & 31, 5), FromUnorm((v >> 5) & 31, 5), FromUnorm(v & 31, 5),
++               float(v >> 15)};
++        return true;
++    }
++    case P::A1B5G5R5_UNORM: {
++        const u16 v = u16_at(0);
++        out = {FromUnorm(v & 31, 5), FromUnorm((v >> 5) & 31, 5), FromUnorm((v >> 10) & 31, 5),
++               float(v >> 15)};
++        return true;
++    }
++    case P::A5B5G5R1_UNORM: {
++        const u16 v = u16_at(0);
++        out = {float(v & 1), FromUnorm((v >> 1) & 31, 5), FromUnorm((v >> 6) & 31, 5),
++               FromUnorm(v >> 11, 5)};
++        return true;
++    }
++    case P::A4B4G4R4_UNORM: {
++        const u16 v = u16_at(0);
++        out = {FromUnorm(v & 15, 4), FromUnorm((v >> 4) & 15, 4), FromUnorm((v >> 8) & 15, 4),
++               FromUnorm(v >> 12, 4)};
++        return true;
++    }
++    case P::G4R4_UNORM:
++        out = {FromUnorm(p[0] & 15, 4), FromUnorm(p[0] >> 4, 4), 0.0f, 1.0f};
++        return true;
++    case P::A2B10G10R10_UNORM: {
++        const u32 v = u32_at(0);
++        out = {FromUnorm(v & 1023, 10), FromUnorm((v >> 10) & 1023, 10),
++               FromUnorm((v >> 20) & 1023, 10), FromUnorm(v >> 30, 2)};
++        return true;
++    }
++    case P::A2B10G10R10_UINT: {
++        const u32 v = u32_at(0);
++        out = {bits(v & 1023), bits((v >> 10) & 1023), bits((v >> 20) & 1023), bits(v >> 30)};
++        return true;
++    }
++    case P::A2R10G10B10_UNORM: {
++        const u32 v = u32_at(0);
++        out = {FromUnorm((v >> 20) & 1023, 10), FromUnorm((v >> 10) & 1023, 10),
++               FromUnorm(v & 1023, 10), FromUnorm(v >> 30, 2)};
++        return true;
++    }
++    case P::R8_UNORM:
++        out = {unorm8(0), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::R8_SNORM:
++        out = {snorm8(0), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::R8_UINT: case P::S8_UINT:
++        out = {bits(p[0]), 0.0f, 0.0f, one_int};
++        return true;
++    case P::R8_SINT:
++        out = {sbits(s8(p[0])), 0.0f, 0.0f, one_int};
++        return true;
++    case P::R8G8_UNORM:
++        out = {unorm8(0), unorm8(1), 0.0f, 1.0f};
++        return true;
++    case P::R8G8_SNORM:
++        out = {snorm8(0), snorm8(1), 0.0f, 1.0f};
++        return true;
++    case P::R8G8_UINT:
++        out = {bits(p[0]), bits(p[1]), 0.0f, one_int};
++        return true;
++    case P::R8G8_SINT:
++        out = {sbits(s8(p[0])), sbits(s8(p[1])), 0.0f, one_int};
++        return true;
++    case P::R16G16B16A16_FLOAT:
++        out = {FromHalf(u16_at(0)), FromHalf(u16_at(1)), FromHalf(u16_at(2)), FromHalf(u16_at(3))};
++        return true;
++    case P::R16G16B16X16_FLOAT:
++        out = {FromHalf(u16_at(0)), FromHalf(u16_at(1)), FromHalf(u16_at(2)), 1.0f};
++        return true;
++    case P::R16G16B16A16_UNORM:
++        out = {FromUnorm(u16_at(0), 16), FromUnorm(u16_at(1), 16), FromUnorm(u16_at(2), 16),
++               FromUnorm(u16_at(3), 16)};
++        return true;
++    case P::R16G16B16A16_SNORM:
++        out = {FromSnorm(s16(u16_at(0)), 16), FromSnorm(s16(u16_at(1)), 16),
++               FromSnorm(s16(u16_at(2)), 16), FromSnorm(s16(u16_at(3)), 16)};
++        return true;
++    case P::R16G16B16A16_UINT:
++        out = {bits(u16_at(0)), bits(u16_at(1)), bits(u16_at(2)), bits(u16_at(3))};
++        return true;
++    case P::R16G16B16A16_SINT:
++        out = {sbits(s16(u16_at(0))), sbits(s16(u16_at(1))), sbits(s16(u16_at(2))),
++               sbits(s16(u16_at(3)))};
++        return true;
++    case P::B10G11R11_FLOAT: {
++        const u32 v = u32_at(0);
++        out = {FromUfloat(v & 0x7FF, 6), FromUfloat((v >> 11) & 0x7FF, 6), FromUfloat(v >> 22, 5),
++               1.0f};
++        return true;
++    }
++    case P::E5B9G9R9_FLOAT: {
++        const u32 v = u32_at(0);
++        const float scale = std::ldexp(1.0f, s32(v >> 27) - 24);
++        out = {float(v & 511) * scale, float((v >> 9) & 511) * scale,
++               float((v >> 18) & 511) * scale, 1.0f};
++        return true;
++    }
++    case P::R32G32B32A32_FLOAT: case P::R32G32B32A32_UINT: case P::R32G32B32A32_SINT:
++        std::memcpy(out.data(), p, 16);
++        return true;
++    case P::R32G32B32_FLOAT:
++        out = {f32_at(0), f32_at(1), f32_at(2), 1.0f};
++        return true;
++    case P::R32G32_FLOAT:
++        out = {f32_at(0), f32_at(1), 0.0f, 1.0f};
++        return true;
++    case P::R32G32_UINT: case P::R32G32_SINT:
++        out = {f32_at(0), f32_at(1), 0.0f, one_int};
++        return true;
++    case P::R32_FLOAT: case P::D32_FLOAT: case P::D32_FLOAT_S8_UINT:
++        out = {f32_at(0), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::R32_UINT: case P::R32_SINT:
++        out = {f32_at(0), 0.0f, 0.0f, one_int};
++        return true;
++    case P::R16_FLOAT:
++        out = {FromHalf(u16_at(0)), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::R16_UNORM: case P::D16_UNORM:
++        out = {FromUnorm(u16_at(0), 16), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::R16_SNORM:
++        out = {FromSnorm(s16(u16_at(0)), 16), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::R16_UINT:
++        out = {bits(u16_at(0)), 0.0f, 0.0f, one_int};
++        return true;
++    case P::R16_SINT:
++        out = {sbits(s16(u16_at(0))), 0.0f, 0.0f, one_int};
++        return true;
++    case P::R16G16_UNORM:
++        out = {FromUnorm(u16_at(0), 16), FromUnorm(u16_at(1), 16), 0.0f, 1.0f};
++        return true;
++    case P::R16G16_SNORM:
++        out = {FromSnorm(s16(u16_at(0)), 16), FromSnorm(s16(u16_at(1)), 16), 0.0f, 1.0f};
++        return true;
++    case P::R16G16_FLOAT:
++        out = {FromHalf(u16_at(0)), FromHalf(u16_at(1)), 0.0f, 1.0f};
++        return true;
++    case P::R16G16_UINT:
++        out = {bits(u16_at(0)), bits(u16_at(1)), 0.0f, one_int};
++        return true;
++    case P::R16G16_SINT:
++        out = {sbits(s16(u16_at(0))), sbits(s16(u16_at(1))), 0.0f, one_int};
++        return true;
++    case P::X8_D24_UNORM: case P::S8_UINT_D24_UNORM:
++        out = {FromUnorm(u32_at(0) & 0xFFFFFF, 24), 0.0f, 0.0f, 1.0f};
++        return true;
++    case P::D24_UNORM_S8_UINT:
++        out = {FromUnorm(u32_at(0) >> 8, 24), 0.0f, 0.0f, 1.0f};
++        return true;
++    default:
++        return false;
++    }
++}
++
++/// Formats whose texels fit 8-bit RGBA without loss that matters: kept that way, a quarter of
++/// the size of floats.
++bool FitsRgba8(PixelFormat format) {
++    using P = PixelFormat;
++    switch (format) {
++    case P::A8B8G8R8_UNORM: case P::A8B8G8R8_SRGB: case P::B8G8R8A8_UNORM: case P::B8G8R8A8_SRGB:
++    case P::R5G6B5_UNORM: case P::B5G6R5_UNORM: case P::A1R5G5B5_UNORM: case P::A1B5G5R5_UNORM:
++    case P::A5B5G5R1_UNORM: case P::A4B4G4R4_UNORM: case P::G4R4_UNORM: case P::R8_UNORM:
++    case P::R8G8_UNORM:
++        return true;
++    default:
++        return false;
++    }
++}
++
++const std::array<f32, 256>& UnormTable() {
++    static const std::array<f32, 256> table = [] {
++        std::array<f32, 256> t;
++        for (u32 i = 0; i < 256; ++i) {
++            t[i] = FromUnorm(i, 8);
++        }
++        return t;
++    }();
++    return table;
++}
++
++const std::array<f32, 256>& SrgbTable() {
++    static const std::array<f32, 256> table = [] {
++        std::array<f32, 256> t;
++        for (u32 i = 0; i < 256; ++i) {
++            t[i] = FromSrgb(FromUnorm(i, 8));
++        }
++        return t;
++    }();
++    return table;
++}
++
++/// One level's rows of one layer, uncompressed texels of 'format', into the level's texels
++void DecodeRows(PixelFormat format, const u8* data, size_t row_bytes, u32 rows_per_slice,
++                bool compact, Level& level, size_t first) {
++    const u32 bpp = VideoCore::Surface::BytesPerBlock(format);
++    const bool direct = compact && (format == PixelFormat::A8B8G8R8_UNORM ||
++                                    format == PixelFormat::A8B8G8R8_SRGB);
++    for (u32 z = 0; z < level.depth; ++z) {
++        for (u32 y = 0; y < level.height; ++y) {
++            const u8* row = data + (size_t(z) * rows_per_slice + y) * row_bytes;
++            size_t index = first + (size_t(z) * level.height + y) * level.width;
++            if (direct) {
++                std::memcpy(&level.rgba8[index], row, size_t(level.width) * 4);
++                continue;
++            }
++            for (u32 x = 0; x < level.width; ++x, ++index) {
++                std::array<f32, 4> texel{};
++                DecodeTexel(format, row + size_t(x) * bpp, texel);
++                if (compact) {
++                    level.rgba8[index] = Unorm(texel[0], 8) | Unorm(texel[1], 8) << 8 |
++                                         Unorm(texel[2], 8) << 16 | Unorm(texel[3], 8) << 24;
++                } else {
++                    level.rgba[index] = texel;
++                }
++            }
++        }
++    }
++}
++
++/// Every level and layer of the image a texture header describes, from its guest bytes
++bool DecodeTexture(Tegra::MemoryManager& gpu_memory, const Tegra::Texture::TICEntry& tic,
++                   std::span<const u8> guest, Texture& texture,
++                   Common::ScratchBuffer<u8>& unswizzled, Common::ScratchBuffer<u8>& converted) {
++    using namespace VideoCore::Surface;
++    const VideoCommon::ImageInfo info{tic};
++    const VideoCommon::ImageViewInfo view{tic, s32(tic.BaseLayer())};
++    const PixelFormat format = info.format;
++    if (info.type == VideoCommon::ImageType::Buffer) {
++        LogOnce("texture buffers aren't sampled");
++        return false;
++    }
++    if (info.num_samples > 1) {
++        LogOnce("multisampled textures aren't sampled");
++        return false;
++    }
++    if (format == PixelFormat::Invalid || IsPixelFormatETC2(format) ||
++        format == PixelFormat::EAC_R11_UNORM || format == PixelFormat::EAC_R11_SNORM ||
++        format == PixelFormat::EAC_R11G11_UNORM || format == PixelFormat::EAC_R11G11_SNORM) {
++        LogOnce(fmt::format("texture format {} not handled", static_cast<u32>(format)));
++        return false;
++    }
++    const bool astc = IsPixelFormatASTC(format);
++    const bool bcn = IsPixelFormatBCn(format);
++    PixelFormat texel_format = format; // what the texels are decoded from, after decompression
++    if (astc) {
++        texel_format = PixelFormat::A8B8G8R8_UNORM;
++    } else if (bcn) {
++        switch (format) {
++        case PixelFormat::BC4_UNORM: texel_format = PixelFormat::R8_UNORM; break;
++        case PixelFormat::BC4_SNORM: texel_format = PixelFormat::R8_SNORM; break;
++        case PixelFormat::BC5_UNORM: texel_format = PixelFormat::R8G8_UNORM; break;
++        case PixelFormat::BC5_SNORM: texel_format = PixelFormat::R8G8_SNORM; break;
++        case PixelFormat::BC6H_UFLOAT: case PixelFormat::BC6H_SFLOAT:
++            texel_format = PixelFormat::R16G16B16A16_FLOAT;
++            break;
++        default: texel_format = PixelFormat::A8B8G8R8_UNORM; break;
++        }
++    } else {
++        std::array<f32, 4> probe;
++        const std::array<u8, 16> zeros{};
++        if (!DecodeTexel(format, zeros.data(), probe)) {
++            LogOnce(fmt::format("texture format {} not handled", static_cast<u32>(format)));
++            return false;
++        }
++    }
++    texture.compact = FitsRgba8(texel_format);
++    texture.srgb = IsPixelFormatSRGB(format);
++    texture.integer = IsPixelFormatInteger(format);
++    texture.swizzle = view.Swizzle();
++
++    unswizzled.resize_destructive(VideoCommon::CalculateUnswizzledSizeBytes(info));
++    const std::span<u8> unswizzled_span{unswizzled.data(), unswizzled.size()};
++    auto copies = VideoCommon::UnswizzleImage(gpu_memory, texture.address, info, guest,
++                                              unswizzled_span);
++    texture.levels.assign(copies.size(), Level{});
++    for (const VideoCommon::BufferImageCopy& copy : copies) {
++        const u32 level_index = copy.image_subresource.base_level;
++        if (level_index >= texture.levels.size()) {
++            continue;
++        }
++        Level& level = texture.levels[level_index];
++        level.width = std::max(copy.image_extent.width, 1u);
++        level.height = std::max(copy.image_extent.height, 1u);
++        level.depth = std::max(copy.image_extent.depth, 1u);
++        const u32 layers = std::max<u32>(copy.image_subresource.num_layers, 1);
++        const size_t texels = size_t(level.width) * level.height * level.depth;
++        if (texture.compact) {
++            level.rgba8.assign(texels * layers, 0);
++        } else {
++            level.rgba.assign(texels * layers, {});
++        }
++        const size_t layer_bytes = copy.buffer_size / layers;
++        for (u32 layer = 0; layer < layers; ++layer) {
++            const size_t offset = copy.buffer_offset + layer * layer_bytes;
++            if (offset + layer_bytes > unswizzled_span.size()) {
++                break;
++            }
++            const std::span<const u8> input = unswizzled_span.subspan(offset, layer_bytes);
++            const size_t first = layer * texels;
++            if (astc) {
++                converted.resize_destructive(texels * 4);
++                Tegra::Texture::ASTC::Decompress(input, level.width, level.height, level.depth,
++                                                 DefaultBlockWidth(format),
++                                                 DefaultBlockHeight(format),
++                                                 std::span<u8>{converted.data(), converted.size()});
++                DecodeRows(texel_format, converted.data(), size_t(level.width) * 4, level.height,
++                           texture.compact, level, first);
++            } else if (bcn) {
++                const u32 out_bpp = VideoCommon::ConvertedBytesPerBlock(format);
++                converted.resize_destructive(texels * out_bpp);
++                VideoCommon::BufferImageCopy layer_copy = copy;
++                layer_copy.image_subresource.num_layers = 1;
++                VideoCommon::DecompressBCn(input, std::span<u8>{converted.data(), converted.size()},
++                                           layer_copy, format);
++                DecodeRows(texel_format, converted.data(), size_t(level.width) * out_bpp,
++                           level.height, texture.compact, level, first);
++            } else {
++                DecodeRows(format, input.data(), size_t(copy.buffer_row_length) * BytesPerBlock(format),
++                           copy.buffer_image_height, texture.compact, level, first);
++            }
++        }
++    }
++    const u32 image_levels = u32(texture.levels.size());
++    const u32 image_layers = std::max(info.resources.layers, 1);
++    texture.base_level = std::min<u32>(view.range.base.level, image_levels - 1);
++    texture.num_levels = std::clamp<u32>(view.range.extent.levels, 1, image_levels - texture.base_level);
++    texture.base_layer = std::min<u32>(view.range.base.layer, image_layers - 1);
++    texture.num_layers = std::clamp<u32>(view.range.extent.layers, 1, image_layers - texture.base_layer);
++    return image_levels > 0;
++}
++
++s32 WrapCoordinate(s32 i, s32 size, Tegra::Texture::WrapMode mode, bool& border) {
++    using W = Tegra::Texture::WrapMode;
++    switch (mode) {
++    case W::Wrap: {
++        const s32 m = i % size;
++        return m < 0 ? m + size : m;
++    }
++    case W::Mirror: {
++        const s32 period = size * 2;
++        s32 m = i % period;
++        if (m < 0) {
++            m += period;
++        }
++        return m < size ? m : period - 1 - m;
++    }
++    case W::MirrorOnceClampToEdge: case W::MirrorOnceClampOGL:
++        return std::min(i < 0 ? -1 - i : i, size - 1);
++    case W::MirrorOnceBorder:
++        i = i < 0 ? -1 - i : i;
++        border = border || i >= size;
++        return std::min(i, size - 1);
++    case W::Border:
++        border = border || i < 0 || i >= size;
++        return std::clamp(i, 0, size - 1);
++    default: // ClampToEdge, Clamp
++        return std::clamp(i, 0, size - 1);
++    }
++}
++
++f32 CompareDepth(Tegra::Texture::DepthCompareFunc func, f32 reference, f32 depth) {
++    using C = Tegra::Texture::DepthCompareFunc;
++    bool pass;
++    switch (func) {
++    case C::Never: pass = false; break;
++    case C::Less: pass = reference < depth; break;
++    case C::Equal: pass = reference == depth; break;
++    case C::LessEqual: pass = reference <= depth; break;
++    case C::Greater: pass = reference > depth; break;
++    case C::NotEqual: pass = reference != depth; break;
++    case C::GreaterEqual: pass = reference >= depth; break;
++    default: pass = true; break;
++    }
++    return pass ? 1.0f : 0.0f;
++}
++
++std::array<f32, 4> Lerp(const std::array<f32, 4>& a, const std::array<f32, 4>& b, f32 t) {
++    return {a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t,
++            a[3] + (b[3] - a[3]) * t};
++}
++
++/// A sample's texture, sampler, layer and offset: texels fetched and filtered
++struct Sampling {
++    const Texture& texture;
++    const Tegra::Texture::TSCEntry& sampler;
++    u32 dims;      // 1, 2 or 3
++    u32 layer;     // of the image
++    std::array<s32, 3> offset;
++    const f32* reference; // for depth comparisons, or null
++
++    std::array<f32, 4> Fetch(const Level& level, s32 x, s32 y, s32 z) const {
++        bool border = false;
++        x = WrapCoordinate(x, s32(level.width), sampler.wrap_u, border);
++        y = dims >= 2 ? WrapCoordinate(y, s32(level.height), sampler.wrap_v, border) : 0;
++        z = dims >= 3 ? WrapCoordinate(z, s32(level.depth), sampler.wrap_p, border) : 0;
++        std::array<f32, 4> texel;
++        if (border) {
++            texel = sampler.BorderColor();
++        } else {
++            const size_t index = ((size_t(layer) * level.depth + size_t(z)) * level.height + size_t(y)) *
++                                     level.width + size_t(x);
++            if (texture.compact) {
++                const u32 v = index < level.rgba8.size() ? level.rgba8[index] : 0;
++                const auto& table = texture.srgb ? SrgbTable() : UnormTable();
++                texel = {table[v & 0xFF], table[(v >> 8) & 0xFF], table[(v >> 16) & 0xFF],
++                         UnormTable()[v >> 24]};
++            } else {
++                texel = index < level.rgba.size() ? level.rgba[index] : std::array<f32, 4>{};
++            }
++        }
++        if (reference) {
++            const f32 result = CompareDepth(sampler.depth_compare_func, *reference, texel[0]);
++            texel = {result, result, result, result};
++        }
++        return texel;
++    }
++
++    /// The texel coordinates of a sample and the fractions between them, for bilinear filtering
++    static void Footprint(f32 coordinate, u32 size, s32 offset, s32& i, f32& fraction) {
++        const f32 t = std::clamp(coordinate * f32(size) - 0.5f, -1e6f, 1e6f);
++        const f32 floor = std::floor(t);
++        i = s32(floor) + offset;
++        fraction = t - floor;
++    }
++
++    std::array<f32, 4> Filter(u32 level_index, f32 u, f32 v, f32 w, bool linear) const {
++        const Level& level = texture.levels[level_index];
++        if (!linear) {
++            const auto texel_at = [](f32 coordinate, u32 size, s32 offset) {
++                return s32(std::floor(std::clamp(coordinate * f32(size), -1e6f, 1e6f))) + offset;
++            };
++            return Fetch(level, texel_at(u, level.width, offset[0]),
++                         texel_at(v, level.height, offset[1]), texel_at(w, level.depth, offset[2]));
++        }
++        s32 x0, y0 = 0, z0 = 0;
++        f32 fx, fy = 0.0f, fz = 0.0f;
++        Footprint(u, level.width, offset[0], x0, fx);
++        if (dims >= 2) {
++            Footprint(v, level.height, offset[1], y0, fy);
++        }
++        if (dims >= 3) {
++            Footprint(w, level.depth, offset[2], z0, fz);
++        }
++        const auto bilinear = [&](s32 z) {
++            const auto row0 = Lerp(Fetch(level, x0, y0, z), Fetch(level, x0 + 1, y0, z), fx);
++            if (dims < 2) {
++                return row0;
++            }
++            return Lerp(row0, Lerp(Fetch(level, x0, y0 + 1, z), Fetch(level, x0 + 1, y0 + 1, z), fx), fy);
++        };
++        if (dims < 3) {
++            return bilinear(0);
++        }
++        return Lerp(bilinear(z0), bilinear(z0 + 1), fz);
++    }
++};
++
++f32 Swizzled(const std::array<f32, 4>& texel, SwizzleSource source, bool integer) {
++    switch (source) {
++    case SwizzleSource::Zero: return 0.0f;
++    case SwizzleSource::R: return texel[0];
++    case SwizzleSource::G: return texel[1];
++    case SwizzleSource::B: return texel[2];
++    case SwizzleSource::A: return texel[3];
++    default: return integer ? std::bit_cast<f32>(1u) : 1.0f;
++    }
++}
++
++std::array<f32, 4> Swizzle(const Texture& texture, const std::array<f32, 4>& texel) {
++    return {Swizzled(texel, texture.swizzle[0], texture.integer),
++            Swizzled(texel, texture.swizzle[1], texture.integer),
++            Swizzled(texel, texture.swizzle[2], texture.integer),
++            Swizzled(texel, texture.swizzle[3], texture.integer)};
++}
++
++/// A cube map direction: the face and the coordinates on it (Vulkan's table)
++void CubeFace(f32 x, f32 y, f32 z, f32& u, f32& v, u32& face) {
++    const f32 ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
++    f32 sc, tc, ma;
++    if (ax >= ay && ax >= az) {
++        face = x >= 0.0f ? 0 : 1;
++        sc = x >= 0.0f ? -z : z, tc = -y, ma = ax;
++    } else if (ay >= az) {
++        face = y >= 0.0f ? 2 : 3;
++        sc = x, tc = y >= 0.0f ? z : -z, ma = ay;
++    } else {
++        face = z >= 0.0f ? 4 : 5;
++        sc = z >= 0.0f ? x : -x, tc = -y, ma = az;
++    }
++    const f32 inv = ma != 0.0f ? 0.5f / ma : 0.0f;
++    u = sc * inv + 0.5f;
++    v = tc * inv + 0.5f;
++}
++
++/// Where a sample's coordinates point: normalized u, v, w, the image layer, the dimensions
++struct SampleCoords {
++    f32 u = 0.0f, v = 0.0f, w = 0.0f;
++    u32 layer = 0;
++    u32 dims = 2;
++};
++
++bool ToSampleCoords(const Texture& texture, Shader::TextureType type, const Cell& coords,
++                    SampleCoords& out) {
++    using T = Shader::TextureType;
++    f32 layer = 0.0f;
++    switch (type) {
++    case T::Color1D:
++        out.dims = 1, out.u = F(coords, 0);
++        break;
++    case T::ColorArray1D:
++        out.dims = 1, out.u = F(coords, 0), layer = F(coords, 1);
++        break;
++    case T::Color2D:
++        out.u = F(coords, 0), out.v = F(coords, 1);
++        break;
++    case T::Color2DRect: {
++        const Level& level = texture.levels[texture.base_level];
++        out.u = F(coords, 0) / f32(level.width), out.v = F(coords, 1) / f32(level.height);
++        break;
++    }
++    case T::ColorArray2D:
++        out.u = F(coords, 0), out.v = F(coords, 1), layer = F(coords, 2);
++        break;
++    case T::Color3D:
++        out.dims = 3, out.u = F(coords, 0), out.v = F(coords, 1), out.w = F(coords, 2);
++        break;
++    case T::ColorCube:
++    case T::ColorArrayCube: {
++        u32 face;
++        CubeFace(F(coords, 0), F(coords, 1), F(coords, 2), out.u, out.v, face);
++        layer = f32(face) + (type == T::ColorArrayCube ? 6.0f * std::round(F(coords, 3)) : 0.0f);
++        break;
++    }
++    default:
++        return false;
++    }
++    if (std::isnan(out.u)) out.u = 0.0f;
++    if (std::isnan(out.v)) out.v = 0.0f;
++    if (std::isnan(out.w)) out.w = 0.0f;
++    const s32 rounded = std::isnan(layer) ? 0 : s32(std::clamp(std::round(layer), 0.0f, 65535.0f));
++    out.layer = texture.base_layer + std::min<u32>(u32(rounded), texture.num_layers - 1);
++    return true;
++}
++
++std::array<s32, 3> Offsets(const Cell& offset) {
++    return {s32(offset.w[0]), s32(offset.w[1]), s32(offset.w[2])};
++}
++
++/// A filtered sample, at a level of detail (implicit ones are 0: there are no derivatives here)
++std::array<f32, 4> SampleTexture(const Binding& binding, IR::TextureInstInfo info,
++                                 const Cell& coords, const Cell& offset, f32 lod,
++                                 const f32* reference) {
++    if (!binding.texture || !binding.texture->ok) {
++        return {};
++    }
++    const Texture& texture = *binding.texture;
++    const auto& sampler = binding.sampler;
++    SampleCoords c;
++    if (!ToSampleCoords(texture, info.type, coords, c)) {
++        return {};
++    }
++    const Sampling sampling{texture, sampler, c.dims, c.layer, Offsets(offset), reference};
++    lod = std::clamp(lod + sampler.LodBias(), sampler.MinLod(), std::max(sampler.MinLod(), sampler.MaxLod()));
++    const bool magnify = !(lod > 0.0f);
++    const auto filter = magnify ? sampler.mag_filter.Value() : sampler.min_filter.Value();
++    const bool linear = !texture.integer && filter == Tegra::Texture::TextureFilter::Linear;
++    const u32 max_level = texture.num_levels - 1;
++    const auto at = [&](u32 level) {
++        return sampling.Filter(texture.base_level + level, c.u, c.v, c.w, linear);
++    };
++    std::array<f32, 4> texel;
++    using M = Tegra::Texture::TextureMipmapFilter;
++    if (magnify || max_level == 0 || sampler.mipmap_filter == M::None) {
++        texel = at(0);
++    } else if (sampler.mipmap_filter == M::Nearest) {
++        texel = at(std::min(u32(lod + 0.5f), max_level));
++    } else {
++        const f32 level = std::min(lod, f32(max_level));
++        const u32 level0 = u32(level);
++        const f32 fraction = level - f32(level0);
++        texel = at(level0);
++        if (fraction > 0.0f && level0 < max_level) {
++            texel = Lerp(texel, at(level0 + 1), fraction);
++        }
++    }
++    return reference ? texel : Swizzle(texture, texel);
++}
++
++/// The four texels a bilinear sample would use, one component of each
++std::array<f32, 4> GatherTexture(const Binding& binding, IR::TextureInstInfo info,
++                                 const Cell& coords, const Cell& offset, const f32* reference) {
++    if (!binding.texture || !binding.texture->ok) {
++        return {};
++    }
++    const Texture& texture = *binding.texture;
++    SampleCoords c;
++    if (!ToSampleCoords(texture, info.type, coords, c)) {
++        return {};
++    }
++    const Sampling sampling{texture, binding.sampler, std::max(c.dims, 2u), c.layer, Offsets(offset), reference};
++    const Level& level = texture.levels[texture.base_level];
++    s32 x0, y0;
++    f32 fx, fy;
++    Sampling::Footprint(c.u, level.width, sampling.offset[0], x0, fx);
++    Sampling::Footprint(c.v, level.height, sampling.offset[1], y0, fy);
++    const u32 component = info.gather_component;
++    const auto get = [&](s32 x, s32 y) {
++        const auto texel = sampling.Fetch(level, x, y, 0);
++        return reference ? texel[0] : Swizzled(texel, texture.swizzle[component], texture.integer);
++    };
++    return {get(x0, y0 + 1), get(x0 + 1, y0 + 1), get(x0 + 1, y0), get(x0, y0)};
++}
++
++/// A texel by its integer coordinates, unfiltered; zero outside the image
++std::array<f32, 4> FetchTexture(const Binding& binding, IR::TextureInstInfo info,
++                                const Cell& coords, const Cell& offset, u32 lod) {
++    if (!binding.texture || !binding.texture->ok || lod >= binding.texture->num_levels) {
++        return {};
++    }
++    const Texture& texture = *binding.texture;
++    const Level& level = texture.levels[texture.base_level + lod];
++    const auto off = Offsets(offset);
++    s32 x = s32(coords.w[0]) + off[0], y = 0, z = 0, layer = 0;
++    using T = Shader::TextureType;
++    switch (info.type) {
++    case T::Color1D: break;
++    case T::ColorArray1D: layer = s32(coords.w[1]); break;
++    case T::Color2D: case T::Color2DRect: y = s32(coords.w[1]) + off[1]; break;
++    case T::ColorArray2D: y = s32(coords.w[1]) + off[1], layer = s32(coords.w[2]); break;
++    case T::Color3D: y = s32(coords.w[1]) + off[1], z = s32(coords.w[2]) + off[2]; break;
++    default: return {};
++    }
++    if (x < 0 || y < 0 || z < 0 || layer < 0 || u32(x) >= level.width || u32(y) >= level.height ||
++        u32(z) >= level.depth || u32(layer) >= texture.num_layers) {
++        return {};
++    }
++    const Tegra::Texture::TSCEntry no_sampler{};
++    const Sampling sampling{texture, no_sampler, 3, texture.base_layer + u32(layer), {}, nullptr};
++    return Swizzle(texture, sampling.Fetch(level, x, y, z));
++}
++
++} // Anonymous namespace
++
+ struct SoftwareDraw::Program {
+     bool ok = false;
+     std::vector<Op> ops;
+@@ -393,6 +1157,15 @@ struct SoftwareDraw::Program {
+     std::array<Shader::Interpolation, 32> interpolation{};
+     std::array<bool, 32> generic_loaded{};
+     u32 local_words = 0;
++    std::vector<Shader::TextureDescriptor> textures;
++    std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
++};
++
++struct SoftwareDraw::Textures {
++    std::unordered_map<u64, Texture> entries; // by the hash of their texture headers
++    Common::ScratchBuffer<u8> guest, unswizzled, converted;
++
++    const Texture* Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address);
+ };
+ 
+ namespace {
+@@ -406,6 +1179,7 @@ struct Io {
+     const std::array<std::vector<u32>, 18>* cbufs;
+     u32* local;
+     u32 local_words;
++    const std::vector<Binding>* textures;
+ };
+ 
+ class Flattener {
+@@ -585,6 +1359,29 @@ private:
+                 op.extra = inst.Arg(0).U32() * 4 + inst.Arg(1).U32();
+                 op.a[2] = Slot(inst.Arg(2));
+                 break;
++            case O::ImageSampleDrefImplicitLod: // handle, coords, reference, bias, offset
++                op.extra = inst.Flags<IR::TextureInstInfo>().raw;
++                op.a = {Slot(inst.Arg(0)), Slot(inst.Arg(1)), Slot(inst.Arg(2)), Slot(inst.Arg(4))};
++                break;
++            case O::ImageSampleDrefExplicitLod: { // handle, coords, reference, lod, offset
++                op.extra = inst.Flags<IR::TextureInstInfo>().raw;
++                const u16 pair = NewCell(); // the reference and the lod in one cell
++                Emit({Kind::Ir, O::CompositeConstructF32x2, pair, {Slot(inst.Arg(2)), Slot(inst.Arg(3))}, 0});
++                op.a = {Slot(inst.Arg(0)), Slot(inst.Arg(1)), pair, Slot(inst.Arg(4))};
++                break;
++            }
++            case O::ImageGatherDref: // handle, coords, offset, offset2, reference
++                op.extra = inst.Flags<IR::TextureInstInfo>().raw;
++                op.a = {Slot(inst.Arg(0)), Slot(inst.Arg(1)), Slot(inst.Arg(2)), Slot(inst.Arg(4))};
++                break;
++            case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGather:
++            case O::ImageFetch: case O::ImageQueryDimensions: case O::ImageQueryLod:
++            case O::ImageGradient: // the handle, then what's used of the rest in its first four
++                op.extra = inst.Flags<IR::TextureInstInfo>().raw;
++                for (size_t i = 0; i < num_args; ++i) {
++                    op.a[i] = Slot(inst.Arg(i));
++                }
++                break;
+             default:
+                 for (size_t i = 0; i < num_args; ++i) {
+                     op.a[i] = Slot(inst.Arg(i));
+@@ -643,6 +1440,17 @@ u32 ReadCbuf(const Io& io, const Cell& binding, const Cell& offset, u32 bytes) {
+     return bytes == 1 ? (value >> shift) & 0xFF : (value >> (shift & 16)) & 0xFFFF;
+ }
+ 
++/// The texture a texture instruction samples: its descriptor's, the element of an array
++const Binding* GetBinding(const SoftwareDraw::Program& program, const Io& io, u32 descriptor,
++                          u32 element) {
++    if (descriptor >= program.textures.size() || !io.textures) {
++        return nullptr;
++    }
++    const u32 count = std::max(program.textures[descriptor].count, 1u);
++    const size_t index = program.texture_bindings[descriptor] + std::min(element, count - 1);
++    return index < io.textures->size() ? &(*io.textures)[index] : nullptr;
++}
++
+ void Run(const SoftwareDraw::Program& program, std::vector<Cell>& cells, Io& io) {
+     using O = IR::Opcode;
+     const Op* const ops = program.ops.data();
+@@ -901,6 +1709,87 @@ void Run(const SoftwareDraw::Program& program, std::vector<Cell>& cells, Io& io)
+         case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
+             d.w[0] = 0; // no 2x2 quads here: derivatives are zero
+             break;
++        case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGradient:
++        case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod:
++        case O::ImageGather: case O::ImageGatherDref: case O::ImageFetch:
++        case O::ImageQueryDimensions: case O::ImageQueryLod: {
++            IR::TextureInstInfo info{};
++            info.raw = o.extra;
++            const Binding* const binding = GetBinding(program, io, info.descriptor_index, a.w[0]);
++            const Cell& f = c[o.a[3]];
++            std::array<f32, 4> result{};
++            if (!binding || info.type == Shader::TextureType::Buffer) {
++                d = {};
++                break;
++            }
++            switch (o.op) {
++            case O::ImageSampleImplicitLod: // coords, bias, offset
++                result = SampleTexture(*binding, info, b, f, info.has_bias ? F(e) : 0.0f, nullptr);
++                break;
++            case O::ImageSampleExplicitLod: // coords, lod, offset
++                result = SampleTexture(*binding, info, b, f, F(e), nullptr);
++                break;
++            case O::ImageGradient: { // coords, derivatives, offset: the lod from the derivatives
++                f32 lod = 0.0f;
++                const Texture* const texture = binding->texture;
++                if (texture && texture->ok) {
++                    const Level& level = texture->levels[texture->base_level];
++                    const f32 dx_u = F(e, 0) * f32(level.width), dx_v = F(e, 2) * f32(level.height);
++                    const f32 dy_u = F(e, 1) * f32(level.width), dy_v = F(e, 3) * f32(level.height);
++                    const f32 rho2 = std::max(dx_u * dx_u + dx_v * dx_v, dy_u * dy_u + dy_v * dy_v);
++                    lod = rho2 > 0.0f ? 0.5f * std::log2(rho2) : 0.0f;
++                }
++                result = SampleTexture(*binding, info, b, f, lod, nullptr);
++                break;
++            }
++            case O::ImageSampleDrefImplicitLod: { // coords, reference, offset
++                const f32 reference = F(e);
++                d.w[0] = std::bit_cast<u32>(SampleTexture(*binding, info, b, f, 0.0f, &reference)[0]);
++                continue;
++            }
++            case O::ImageSampleDrefExplicitLod: { // coords, (reference, lod), offset
++                const f32 reference = F(e, 0);
++                d.w[0] = std::bit_cast<u32>(SampleTexture(*binding, info, b, f, F(e, 1), &reference)[0]);
++                continue;
++            }
++            case O::ImageGather: // coords, offset
++                result = GatherTexture(*binding, info, b, e, nullptr);
++                break;
++            case O::ImageGatherDref: { // coords, offset, reference
++                const f32 reference = F(f);
++                result = GatherTexture(*binding, info, b, e, &reference);
++                break;
++            }
++            case O::ImageFetch: // coords, offset, lod
++                result = FetchTexture(*binding, info, b, e, f.w[0]);
++                break;
++            case O::ImageQueryDimensions: { // lod
++                const Texture* const texture = binding->texture;
++                if (!texture || !texture->ok) {
++                    d = {};
++                    continue;
++                }
++                const u32 level_index = std::min(texture->base_level + b.w[0], u32(texture->levels.size()) - 1);
++                const Level& level = texture->levels[level_index];
++                using T = Shader::TextureType;
++                const T type = info.type;
++                const bool array = type == T::ColorArray1D || type == T::ColorArray2D || type == T::ColorArrayCube;
++                const u32 layers = type == T::ColorArrayCube ? texture->num_layers / 6 : texture->num_layers;
++                d.w[0] = level.width;
++                d.w[1] = type == T::ColorArray1D ? layers : level.height;
++                d.w[2] = type == T::Color3D ? level.depth : array && type != T::ColorArray1D ? layers : 0;
++                d.w[3] = texture->num_levels;
++                continue;
++            }
++            default: // ImageQueryLod
++                break;
++            }
++            std::memcpy(d.w, result.data(), sizeof(d.w));
++            break;
++        }
++        case O::GetSparseFromOp:
++            d.w[0] = 1; // every texel is resident
++            break;
+         default:
+             break;
+         }
+@@ -1048,10 +1937,75 @@ struct SoftwareDraw::Pools {
+     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
+ };
+ 
+-SoftwareDraw::SoftwareDraw() : pools{std::make_unique<Pools>()} {}
++SoftwareDraw::SoftwareDraw()
++    : pools{std::make_unique<Pools>()}, textures{std::make_unique<Textures>()} {}
+ 
+ SoftwareDraw::~SoftwareDraw() = default;
+ 
++const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address) {
++    Tegra::Texture::TICEntry tic{};
++    gpu_memory.ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
++    const u64 key = Common::CityHash64(reinterpret_cast<const char*>(tic.raw.data()), sizeof(tic.raw));
++    Texture& texture = entries[key];
++    texture.idle_frames = 0;
++    if (texture.checked && texture.tic == tic.raw) {
++        return &texture;
++    }
++    if (texture.tic != tic.raw || !texture.decoded) {
++        texture = Texture{};
++        texture.tic = tic.raw;
++        if (!VideoCommon::IsValidEntry(gpu_memory, tic)) {
++            texture.checked = true;
++            return &texture;
++        }
++        const VideoCommon::ImageInfo info{tic};
++        texture.address = tic.Address() - u64{tic.BaseLayer()} * info.layer_stride;
++        texture.size = VideoCommon::CalculateGuestSizeInBytes(info);
++    }
++    texture.checked = true;
++    if (texture.size == 0 || texture.size > (256u << 20)) {
++        LogOnce(fmt::format("a texture of {} bytes not sampled", texture.size));
++        return &texture;
++    }
++    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> bytes(
++        gpu_memory, texture.address, texture.size, &guest);
++    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++    if (texture.decoded && hash == texture.hash) {
++        return &texture;
++    }
++    texture.hash = hash;
++    texture.decoded = true;
++    texture.ok = DecodeTexture(gpu_memory, tic, std::span<const u8>{bytes.data(), bytes.size()},
++                               texture, unswizzled, converted);
++    return &texture;
++}
++
++void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
++    for (auto& [key, texture] : textures->entries) {
++        if (address < texture.address + texture.size && texture.address < address + size) {
++            texture.checked = false;
++        }
++    }
++}
++
++void SoftwareDraw::MarkAllWritten() {
++    for (auto& [key, texture] : textures->entries) {
++        texture.checked = false;
++    }
++}
++
++void SoftwareDraw::TickFrame() {
++    constexpr u32 idle_frames_kept = 300;
++    for (auto it = textures->entries.begin(); it != textures->entries.end();) {
++        it->second.checked = false;
++        if (++it->second.idle_frames > idle_frames_kept) {
++            it = textures->entries.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
+ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+                                                 Tegra::MemoryManager& gpu_memory, u32 stage) {
+     const auto& regs = maxwell3d.regs;
+@@ -1084,6 +2038,15 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+             program->generic_loaded[i] = ir.info.loads.Generic(i);
+         }
+         program->local_words = (ir.local_memory_size + 3) / 4;
++        program->textures.assign(ir.info.texture_descriptors.begin(), ir.info.texture_descriptors.end());
++        u32 bindings = 0;
++        for (const auto& descriptor : program->textures) {
++            program->texture_bindings.push_back(bindings);
++            bindings += std::max(descriptor.count, 1u);
++        }
++        if (!ir.info.image_descriptors.empty() || !ir.info.image_buffer_descriptors.empty()) {
++            LogOnce("storage images aren't drawn");
++        }
+         program->ok = Flattener{*program}.Run(ir);
+     } catch (const std::exception& exception) {
+         LogOnce(fmt::format("shader translation failed: {}", exception.what()));
+@@ -1151,6 +2114,42 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     read_cbufs(0, vs_cbufs);
+     read_cbufs(4, fs_cbufs);
+ 
++    // Textures: each one's handle read from the stage's constant buffers, as Eden's Vulkan
++    // renderer reads them
++    const bool via_header_index = regs.sampler_binding == Maxwell::Regs::SamplerBinding::ViaHeaderBinding;
++    const auto bind_textures = [&](const Program& program, const std::array<std::vector<u32>, 18>& cbufs,
++                                   std::vector<Binding>& out) {
++        const auto word = [&](u32 cbuf, u32 offset) -> u32 {
++            return cbuf < cbufs.size() && offset / 4 < cbufs[cbuf].size() ? cbufs[cbuf][offset / 4] : 0;
++        };
++        for (const Shader::TextureDescriptor& desc : program.textures) {
++            for (u32 element = 0; element < std::max(desc.count, 1u); ++element) {
++                const u32 element_offset = element << desc.size_shift;
++                u32 raw = word(desc.cbuf_index, desc.cbuf_offset + element_offset);
++                if (desc.has_secondary) {
++                    raw = (raw << desc.shift_left) |
++                          (word(desc.secondary_cbuf_index, desc.secondary_cbuf_offset + element_offset)
++                           << desc.secondary_shift_left);
++                }
++                const auto [tic_index, tsc_index] = Tegra::Texture::TexturePair(raw, via_header_index);
++                Binding binding;
++                if (tic_index <= regs.tex_header.limit) {
++                    binding.texture = textures->Get(
++                        gpu_memory, regs.tex_header.Address() + u64{tic_index} * sizeof(Tegra::Texture::TICEntry));
++                }
++                if (tsc_index <= regs.tex_sampler.limit) {
++                    gpu_memory.ReadBlockUnsafe(
++                        regs.tex_sampler.Address() + u64{tsc_index} * sizeof(Tegra::Texture::TSCEntry),
++                        &binding.sampler, sizeof(binding.sampler));
++                }
++                out.push_back(binding);
++            }
++        }
++    };
++    std::vector<Binding> vs_textures, fs_textures;
++    bind_textures(*vs, vs_cbufs, vs_textures);
++    bind_textures(*fs, fs_cbufs, fs_textures);
++
+     // The vertices the draw uses
+     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+     std::vector<u32> indices(count);
+@@ -1203,7 +2202,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         inputs[static_cast<u32>(IR::Attribute::InstanceId)] = std::bit_cast<f32>(instance);
+         outputs.fill(0.0f);
+         outputs[static_cast<u32>(IR::Attribute::PositionW)] = 1.0f;
+-        Io io{inputs.data(), outputs.data(), &colors, false, &vs_cbufs, local.data(), vs->local_words};
++        Io io{inputs.data(), outputs.data(), &colors, false, &vs_cbufs, local.data(), vs->local_words, &vs_textures};
+         Run(*vs, vs_cells, io);
+         std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+         std::memcpy(out.varyings.data(), &outputs[32], sizeof(out.varyings));
+@@ -1367,7 +2366,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                             }
+                         }
+                         colors[0] = {0.0f, 0.0f, 0.0f, 1.0f};
+-                        Io io{inputs.data(), outputs.data(), &colors, false, &fs_cbufs, local.data(), fs->local_words};
++                        Io io{inputs.data(), outputs.data(), &colors, false, &fs_cbufs, local.data(), fs->local_words, &fs_textures};
+                         Run(*fs, fs_cells, io);
+                         if (io.discard) {
+                             continue;
+@@ -1479,6 +2478,9 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     if (!blend_ok) {
+         LogOnce("a blend factor or equation not handled");
+     }
++    // textures drawn to (render to texture) are checked again before they're next sampled
++    MarkWritten(rt_address, pitch_linear ? u64{rt.width} * rt_height
++                                         : block_row_size * ((rt_height + block_rows - 1) / block_rows));
+ }
+ 
+ } // namespace Null
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index c92057f35..3153e65f5 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -29,9 +29,9 @@ bool DecodeColor(Tegra::RenderTargetFormat format, const u8* in, std::array<f32,
+ 
+ /// Draws on the CPU what the 3D engine's registers describe, into the render target in emulated
+ /// memory: the shaders translated by Eden's shader recompiler and interpreted, triangles
+-/// rasterized and their fragments blended into render target 0. For the null renderer, which has
+-/// no GPU to draw with. What it can't do (a shader it can't interpret, a format, depth testing,
+-/// textures) it skips, and logs once.
++/// rasterized and their fragments blended into render target 0, sampling textures decoded from
++/// emulated memory. For the null renderer, which has no GPU to draw with. What it can't do (a
++/// shader it can't interpret, a format, depth testing) it skips, and logs once.
+ class SoftwareDraw {
+ public:
+     SoftwareDraw();
+@@ -40,6 +40,17 @@ public:
+     void Draw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+               bool is_indexed, u32 instance_count);
+ 
++    /// Something wrote to emulated memory there: textures decoded from it are checked again
++    /// before they're next sampled.
++    void MarkWritten(GPUVAddr address, u64 size);
++
++    /// The same, for every texture (a write whose range isn't known).
++    void MarkAllWritten();
++
++    /// A frame has been shown: every texture is checked again (the CPU may have written to it),
++    /// and those not used for a while are dropped.
++    void TickFrame();
++
+     struct Program;
+ 
+ private:
+@@ -48,6 +59,8 @@ private:
+ 
+     struct Pools;
+     std::unique_ptr<Pools> pools;
++    struct Textures;
++    std::unique_ptr<Textures> textures;
+     std::unordered_map<u64, std::unique_ptr<Program>> programs;
+     Common::ScratchBuffer<u8> scratch;
+ };

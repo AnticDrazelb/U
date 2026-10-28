@@ -98,6 +98,15 @@ pixels = data[data.index(b'255\n') + 4:]
 r, g, b = pixels[(180 * width + 395) * 3:(180 * width + 395) * 3 + 3]
 sys.exit(0 if r > g + 60 and r > b + 60 else 1)
 PY
+# its textured square (the sprite sampled by the texture unit): the sprite's orange at its centre
+check "its textured square is drawn (software texture sampling)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+r, g, b = pixels[(261 * width + 144) * 3:(261 * width + 144) * 3 + 3]
+sys.exit(0 if r > 200 and 120 < g < 240 and b < 140 else 1)
+PY
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"

@@ -55,7 +55,14 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M_VERTEX_STREAM 0x700      // config (stride | enable << 12), address (2), frequency
 #define M_VERTEX_STREAM_LIMIT 0x7C0 // last address (2)
 #define M_PIPELINE 0x800           // 0x10 apart: config (enable | type << 4), offset, -, registers
+#define M_SAMPLER_BINDING 0x48D    // 1: a texture's sampler is the one with its index
+#define M_TEX_SAMPLER_POOL 0x557   // address (2), last index
+#define M_TEX_HEADER_POOL 0x55D    // address (2), last index
+#define M_CONST_BUFFER 0x8E0       // size, address (2): the buffer the next bind binds
+#define M_BIND_FRAGMENT_CBUF 0x924 // valid | slot << 4, for the fragment stage (bind group 4)
+#define M_TEXTURE_CBUF_SLOT 0x982  // the constant buffer holding texture handles
 #define TOPOLOGY_TRIANGLES 4
+#define TOPOLOGY_TRIANGLE_STRIP 5
 #define ATTR_RGBA32F (0x01u << 21 | 7u << 27) // R32G32B32A32, float, buffer 0 (offset << 7)
 
 // Maxwell instructions (64-bit), with the guard predicate PT (always) in bits 16..19
@@ -75,6 +82,12 @@ static u64 mov32i(u32 dest, float value) { // MOV32I Rdest, value
 static u64 ipa(u32 dest, u32 attribute) { // IPA.PASS Rdest, a[attribute] (an interpolated input)
     return 0xE0ull << 56 | (u64)(attribute / 4) << 30 | RZ << 20 | PT | RZ << 8 | dest;
 }
+// TEX Rdest..Rdest+3, Rcoord (s, t), a 2D texture whose handle is at 'handle_offset' in the bound
+// texture constant buffer
+static u64 tex2d(u32 dest, u32 coord, u32 handle_offset) {
+    return 0x18ull << 59 | 7ull << 51 /* no sparse predicate */ | (u64)(handle_offset / 4) << 36 |
+           0xFull << 31 /* rgba */ | 2ull << 28 /* 2D */ | RZ << 20 | PT | (u64)coord << 8 | dest;
+}
 static u64 exit_(void) { // EXIT (condition: true)
     return 0xE30ull << 52 | PT | 0xF;
 }
@@ -87,6 +100,10 @@ static u64 nop(void) {
 // that the code starts on 32 bytes (the scheduling words sit at multiples of 32).
 #define VS_OFFSET 0x10
 #define FS_OFFSET 0x110
+#define FS_TEX_OFFSET 0x210
+#define TIC_POOL 0x2000 // texture headers (32 bytes each)
+#define TSC_POOL 0x2100 // samplers (32 bytes each)
+#define FS_CBUF 0x2200  // the fragment stage's constant buffer 0: texture handles
 static void write_programs(u8* heap) {
     u32* vs_sph = (u32*)(heap + VS_OFFSET);
     vs_sph[0] = 1 /* vertex, geometry etc. */ | 3 << 5 /* version */ | 1 << 10 /* vertex */;
@@ -117,6 +134,38 @@ static void write_programs(u8* heap) {
     fs[6] = exit_();
     fs[7] = nop();
     (void)mov32i;
+
+    // the textured one: varying 0's x, y are texture coordinates
+    u32* ft_sph = (u32*)(heap + FS_TEX_OFFSET);
+    ft_sph[0] = 2 | 3 << 5 | 5 << 10;
+    ((u8*)ft_sph)[24] = 0x0F; // varying 0, xy, linear in screen space
+    ft_sph[18] = 0xF;
+    u64* ft = (u64*)(heap + FS_TEX_OFFSET + 0x50);
+    ft[0] = SCHED;
+    ft[1] = ipa(4, 0x80);
+    ft[2] = ipa(5, 0x84);
+    ft[3] = tex2d(0, 4, 0);
+    ft[4] = SCHED;
+    ft[5] = exit_();
+    ft[6] = nop();
+    ft[7] = nop();
+}
+
+// A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
+// sampler (TSC).
+static void write_texture(u8* heap, iova_t image, u32 width, u32 height, u32 pitch) {
+    u32* tic = (u32*)(heap + TIC_POOL);
+    tic[0] = 0x08 /* A8B8G8R8 */ | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 /* unorm */ |
+             2 << 19 | 3 << 22 | 4 << 25 | 5 << 28 /* r, g, b, a */;
+    tic[1] = (u32)image;
+    tic[2] = (u32)(image >> 32) | 2 << 21 /* pitch */;
+    tic[3] = pitch >> 5;
+    tic[4] = (width - 1) | 1 << 23 /* 2D */;
+    tic[5] = (height - 1) | 1u << 31 /* normalized coordinates */;
+    u32* tsc = (u32*)(heap + TSC_POOL);
+    tsc[0] = 2 | 2 << 3 | 2 << 6; // clamp to edge
+    tsc[1] = 1 | 1 << 4 | 1 << 6; // nearest, nearest, no mipmaps
+    *(u32*)(heap + FS_CBUF) = 0;  // handle: texture header 0 (its sampler with it)
 }
 #define M_FENCE_VALUE 0x1C // GPFIFO (puller) methods
 #define M_FENCE_ACTION 0x1D
@@ -309,7 +358,9 @@ int main(int argc, char* argv[]) {
     }
     memset(heap, 0, 0x10000);
     write_programs(heap);
+    write_texture(heap, sprite_iova, SPRITE, SPRITE, SPRITE * 4);
 #define VERTICES_OFFSET(i) (0x1000 + (i) * 0x100)
+#define QUAD_OFFSET(i) (0x1800 + (i) * 0x100)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -384,6 +435,16 @@ int main(int argc, char* argv[]) {
             const u32 viewport[4] = {(u32)W << 16, (u32)H << 16, f32bits(0.0f), f32bits(1.0f)};
             method(M_VIEWPORT, 4, viewport);
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
+            // textures: the pools, the handles' constant buffer
+            method1(M_SAMPLER_BINDING, 1);
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 0};
+            method(M_TEX_HEADER_POOL, 3, headers);
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 0};
+            method(M_TEX_SAMPLER_POOL, 3, samplers);
+            method1(M_TEXTURE_CBUF_SLOT, 0);
+            const u32 cbuf[3] = {0x100, (u32)((heap_iova + FS_CBUF) >> 32), (u32)(heap_iova + FS_CBUF)};
+            method(M_CONST_BUFFER, 3, cbuf);
+            method1(M_BIND_FRAGMENT_CBUF, 1 | 0 << 4);
             const u32 screen[2] = {(u32)W << 16, (u32)H << 16};
             method(M_SCREEN_SCISSOR, 2, screen);
             first = false;
@@ -439,6 +500,36 @@ int main(int argc, char* argv[]) {
             method(M_VERTEX_FIRST, 2, range);
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLES);
             method1(M_DRAW_END, 0);
+        }
+        // a textured square (the sprite, by the texture unit), turning the other way
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + QUAD_OFFSET(index));
+            static const float corners[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+            const float a = -(float)frame * 0.015f, size = 0.22f;
+            for (int k = 0; k < 4; k++) {
+                const float cx = corners[k][0] * size, cy = corners[k][1] * size;
+                v[k * 8 + 0] = (cx * cosf(a) - cy * sinf(a)) * H / W - 0.55f;
+                v[k * 8 + 1] = cx * sinf(a) + cy * cosf(a) + 0.45f;
+                v[k * 8 + 2] = 0.5f;
+                v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = (corners[k][0] + 1) / 2; // s
+                v[k * 8 + 5] = (corners[k][1] + 1) / 2; // t
+                v[k * 8 + 6] = 0.0f;
+                v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t quad = heap_iova + QUAD_OFFSET(index);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_TEX_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(quad >> 32), (u32)quad, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = quad + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
