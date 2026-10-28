@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 06:01:51 +0000
+Subject: [PATCH] host memory: clear large regions on Linux by dropping their
+ pages
+
+A homebrew program's heap is all the memory there is (libnx asks for it
+at start), about 3.2 GiB, which the kernel clears: written with memset,
+every page of it faults in first, about 30 s on a slow machine. Zeros
+come from dropping the pages instead (MADV_REMOVE on the shared backing
+memory), which then read as zeros.
+---
+ src/common/host_memory.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 19937d68c..3bcab8dcc 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -804,6 +804,16 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission
+ }
+ 
+ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
++#if defined(__linux__)
++    // Zeros by dropping the pages, which then read as zeros, rather than by writing them: a
++    // program's new heap of a few GiB (libnx's takes all the memory there is) would otherwise
++    // fault in every page of it.
++    constexpr size_t PageSize = 4096;
++    if (fill_value == 0 && length >= 64 * PageSize && (physical_offset | length) % PageSize == 0 &&
++        madvise(backing_base + physical_offset, length, MADV_REMOVE) == 0) {
++        return;
++    }
++#endif
+     std::memset(backing_base + physical_offset, fill_value, length);
+ }
+ 

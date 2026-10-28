@@ -1,9 +1,7 @@
 // The launcher on the PS4. A start page first: it shows what an unfinished last run left behind
 // (the end of its log.txt, its crash report and boot trace) so that a photo of it is enough to see
-// where it stopped, and lets the player pick a program:
-//   X         Breakout, a game in the package (breakout.nro)
-//   TRIANGLE  the test program in the package (hello.nro)
-//   SQUARE    /data/eden-ps4/boot.nro
+// where it stopped, and lets the player pick a program from a list (D-pad, X): the package's
+// (Breakout, a controller test, the test program hello.nro) and every .nro in /data/eden-ps4.
 // Then the program runs. What it draws (with the CPU: there's no GPU emulation yet) fills the
 // screen; otherwise its text output and Eden's warnings and errors are shown, and they always go
 // to /data/eden-ps4/log.txt. The controller is player 1's Pro Controller. When the program ends,
@@ -18,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <mutex>
 #include <span>
 #include <string>
@@ -64,8 +63,6 @@ constexpr const char* kCrashFile = "/data/eden-ps4/crash.log";
 // The last run's boot trace: Crema's runtime renames boot-trace.log to this as the app starts.
 constexpr const char* kLastTraceFile = "/data/eden-ps4/boot-trace-launcher.log";
 constexpr const char* kTestProgram = "/app0/hello.nro";
-constexpr const char* kGame = "/app0/breakout.nro";
-constexpr const char* kUserProgram = "/data/eden-ps4/boot.nro";
 // The last line of log.txt after a run that finished.
 constexpr const char* kFinishedLine = "eden-ps4: run finished";
 
@@ -439,12 +436,6 @@ uint32_t PadButtons()
     return state.data.buttons;
 }
 
-bool Exists(const char* path)
-{
-    struct stat st;
-    return stat(path, &st) == 0;
-}
-
 // Player 1's controller from the PS4 pad, by the PS4's conventions: Cross is A (confirm),
 // Circle B, Square Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -.
 Launcher::PadState ToSwitchPad(const OrbisPadData& pad)
@@ -551,6 +542,29 @@ void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height
     g_screen.DrawFrame(pixels, width, height);
 }
 
+// The programs on the start page: the package's, then every .nro in the data folder.
+struct Program {
+    std::string path;
+    std::string label;
+};
+std::vector<Program> ListPrograms()
+{
+    std::vector<Program> programs = {
+        {"/app0/breakout.nro", "Breakout (a game: stick or D-pad to move, X to launch, OPTIONS to quit)"},
+        {"/app0/padtest.nro", "Controller test (OPTIONS + touchpad click to quit)"},
+        {kTestProgram, "The test program (hello.nro: text only)"},
+    };
+    std::vector<std::string> found;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(kDataDir, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().extension() == ".nro" && it->is_regular_file(ec))
+            found.push_back(it->path().string());
+    std::sort(found.begin(), found.end());
+    for (const std::string& path : found)
+        programs.push_back({path, path});
+    return programs;
+}
+
 // Shows the start page and waits for a choice. On the first one, without a controller or after a
 // finished run, the test program boots after a countdown; later ones wait for a button.
 std::string StartPage(bool first)
@@ -559,53 +573,58 @@ std::string StartPage(bool first)
     const std::vector<std::string> crash = ReadLines(kCrashFile);
     const std::vector<std::string> trace = ReadLines(kLastTraceFile);
     const bool unfinished = first && (!crash.empty() || (!log.empty() && log.back() != kFinishedLine));
-    const bool have_user_program = Exists(kUserProgram);
+    const std::vector<Program> programs = ListPrograms();
+    static size_t selected = 0; // kept between runs
+    if (selected >= programs.size())
+        selected = 0;
 
     std::lock_guard lock{g_mutex};
-    g_screen.Clear();
-    g_screen.SetScale(1.75f);
-    g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": Eden's Switch core, booting Switch homebrew (drawn with the CPU: no GPU emulation yet)",
-                 kGreen, false);
-    if (unfinished)
-    {
-        g_screen.Add("The last run didn't finish. What it left behind is below: take a photo of this screen first.",
-                     kRed, false);
-        g_screen.Add("", kWhite, false);
-        g_screen.Add("the end of its output (log.txt):", kYellow, false);
-        if (log.empty())
-            g_screen.Add("   (none: it stopped before its program printed anything)", kWhite, false);
-        for (const std::string& l : Last(log, 12))
-            g_screen.Add("   " + l, kWhite, false);
-        g_screen.Add("its crash report (crash.log):", kYellow, false);
-        const std::vector<std::string> report = LastCrash(crash);
-        if (report.empty())
-            g_screen.Add("   (none)", kWhite, false);
-        for (const std::string& l : report)
-            g_screen.Add(l, kRed, false);
-        g_screen.Add("its last steps (boot-trace):", kYellow, false);
-        if (trace.empty())
-            g_screen.Add("   (none)", kWhite, false);
-        for (const std::string& l : Last(trace, 12))
-            g_screen.Add("   " + l, kWhite, false);
-        g_screen.Add("", kWhite, false);
-    }
-    else if (!first)
-    {
-        g_screen.Add("The program ended; its output is in /data/eden-ps4/log.txt.", kWhite, false);
-    }
-    g_screen.Add("", kWhite, false);
-    g_screen.Add("Press  X: Breakout (a game)    TRIANGLE: the test program (hello.nro)", kYellow, false);
-    g_screen.Add(fmt::format("       SQUARE: {}", have_user_program ? "/data/eden-ps4/boot.nro"
-                                                                    : "/data/eden-ps4/boot.nro (there is none)"),
-                 kYellow, false);
-    g_screen.Add("In Breakout: left stick or D-pad to move, X to launch the ball, OPTIONS to quit.", kGrey, false);
     if (first)
         OpenPad();
-    Trace(fmt::format("start page: last run {}, pad {}", unfinished ? "unfinished" : "finished or none", g_pad));
+    const auto page = [&] {
+        g_screen.Clear();
+        g_screen.SetScale(1.75f);
+        g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": Eden's Switch core, booting Switch homebrew (drawn with the CPU: no GPU emulation yet)",
+                     kGreen, false);
+        if (unfinished)
+        {
+            g_screen.Add("The last run didn't finish. What it left behind is below: take a photo of this screen first.",
+                         kRed, false);
+            g_screen.Add("", kWhite, false);
+            g_screen.Add("the end of its output (log.txt):", kYellow, false);
+            if (log.empty())
+                g_screen.Add("   (none: it stopped before its program printed anything)", kWhite, false);
+            for (const std::string& l : Last(log, 12))
+                g_screen.Add("   " + l, kWhite, false);
+            g_screen.Add("its crash report (crash.log):", kYellow, false);
+            const std::vector<std::string> report = LastCrash(crash);
+            if (report.empty())
+                g_screen.Add("   (none)", kWhite, false);
+            for (const std::string& l : report)
+                g_screen.Add(l, kRed, false);
+            g_screen.Add("its last steps (boot-trace):", kYellow, false);
+            if (trace.empty())
+                g_screen.Add("   (none)", kWhite, false);
+            for (const std::string& l : Last(trace, 12))
+                g_screen.Add("   " + l, kWhite, false);
+        }
+        else if (!first)
+        {
+            g_screen.Add("The program ended; its output is in /data/eden-ps4/log.txt.", kWhite, false);
+        }
+        g_screen.Add("", kWhite, false);
+        g_screen.Add("Choose a program with the D-pad, X to boot it. Put more (.nro) in /data/eden-ps4.", kYellow, false);
+        for (size_t i = 0; i < programs.size(); i++)
+            g_screen.Add((i == selected ? "  >  " : "      ") + programs[i].label, i == selected ? kGreen : kWhite,
+                         false);
+    };
+    page();
+    Trace(fmt::format("start page: last run {}, pad {}, {} programs", unfinished ? "unfinished" : "finished or none",
+                      g_pad, programs.size()));
 
     // with a controller after an unfinished run, or after this session's first run: wait for the
     // choice (the photo comes first)
-    const bool wait = g_pad >= 0 && (unfinished || !first);
+    bool wait = g_pad >= 0 && (unfinished || !first);
     if (!first && g_pad < 0)
     {
         g_screen.SetStatus("no controller: close the app (PS button)");
@@ -623,15 +642,15 @@ std::string StartPage(bool first)
         previous = buttons;
         if (pressed & ORBIS_PAD_BUTTON_CROSS)
         {
-            program = kGame;
+            program = programs[selected].path;
             break;
         }
-        if (pressed & ORBIS_PAD_BUTTON_TRIANGLE)
-            break;
-        if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && have_user_program)
+        if (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))
         {
-            program = kUserProgram;
-            break;
+            selected = (selected + (pressed & ORBIS_PAD_BUTTON_UP ? programs.size() - 1 : 1)) % programs.size();
+            wait = true; // a choice is being made: no countdown
+            last_shown = -1;
+            page();
         }
         const int left = countdown - int(Seconds() - start);
         if (!wait && left <= 0)

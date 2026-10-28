@@ -12,7 +12,11 @@ and its sound.
 `game/breakout.c` is a small Switch game, written for this: Breakout at 640x360, drawn by the CPU
 into a libnx framebuffer (no GPU commands), with the controller read through HID and beeps played
 through `audout`. It's built with libnx, the Switch homebrew library, compiled with clang (below).
-In the package as `breakout.nro`: X on the start page.
+In the package as `breakout.nro`, first on the start page's list. Next to it, `game/padtest.c`, a
+controller test: every Switch button with the PS4 button it's mapped to, lit while held, and the
+sticks' positions, as text through libnx's console (also drawn by the CPU).
+
+![The controller test in shadPS4, Cross held and the left stick right](screenshots/padtest-shadps4.png)
 
 ![Breakout in shadPS4](screenshots/breakout-shadps4.png)
 
@@ -40,7 +44,14 @@ In shadPS4, Breakout runs at 28 to 30 frames per second (61 on the desktop build
 X, the game; the pad's X launches the ball, the stick moves the paddle, OPTIONS quits back to the
 start page. It hasn't run on a console yet.
 
-The test program from stage 2 (`hello.nro`) is still in the package: TRIANGLE.
+The test program from stage 2 (`hello.nro`) is still in the package.
+
+Most homebrew programs built with libnx ask for all the memory there is as their heap at start,
+about 3.2 GiB, which Eden's kernel clears. On the desktop that took about 30 s, every page of the
+emulated DRAM faulting in to be written; patch 0011 drops the pages instead, and they read as zeros
+(Linux only). On the PS4 the emulated DRAM is direct memory, committed from the start, so clearing
+it is a plain write of 3.2 GiB, a second or so; Breakout and the controller test ask for 64 MiB
+anyway.
 
 The first program is `hello/`, a small Switch homebrew program built by hand (no libnx). It checks
 what a game needs first and prints the results through the Switch kernel's debug output call
@@ -76,16 +87,20 @@ servers, so that client opens no socket.
 
 ## The PS4 app
 
-`out/EdenPS4.pkg` (title ID EDNP00001, version in `VERSION`). It opens on a start page:
+`out/EdenPS4.pkg` (title ID EDNP00001, version in `VERSION`). It opens on a start page with a list
+of programs: the D-pad chooses, X boots.
 
-- **X** boots Breakout (`breakout.nro`, in the package). In the game: left stick or D-pad to move,
-  X to launch the ball, OPTIONS to quit.
-- **TRIANGLE** boots the test program (`hello.nro`, in the package).
-- **SQUARE** boots `/data/eden-ps4/boot.nro`, if there is one. A homebrew program that draws with
-  the CPU (libnx's framebuffer, as Breakout) can work; one that draws with the GPU shows nothing.
+- **Breakout** (`breakout.nro`, in the package). Left stick or D-pad to move, X to launch the
+  ball, OPTIONS to quit.
+- **Controller test** (`padtest.nro`, in the package). OPTIONS and the touchpad's click together
+  quit.
+- **The test program** (`hello.nro`, in the package): stage 2's checks, text only.
+- **Every `.nro` in `/data/eden-ps4`.** A homebrew program that draws with the CPU (libnx's
+  framebuffer or console, as the two above) can work; one that draws with the GPU (deko3d, OpenGL,
+  SDL's renderer) shows nothing.
 
 When the program ends, the start page comes back. Without a controller, the test program boots
-after a countdown. If the last run didn't finish, the
+after a countdown; pressing up or down stops it. If the last run didn't finish, the
 page first shows what that run left behind: the end of its output (`log.txt`), its crash report
 (`crash.log`) and the last steps of its boot trace. With a controller connected, it then waits for
 a button, so a photo of it can come first. Stack addresses are ELF addresses: symbolize them with
@@ -99,8 +114,12 @@ Eden's data folders (NAND, SD card, keys) are in `/data/eden-ps4/user`. Nothing 
 
 ## Testing in shadPS4
 
-With 02.00 (Breakout): the start page, X (shadPS4's keyboard: N), the game's first frame 4 s later;
-X launched the ball, the paddle followed the stick (D), OPTIONS (Enter) quit to the start page.
+With 02.00: the start page lists the package's three programs and an `.nro` put in
+`/data/eden-ps4`. Breakout: X (shadPS4's keyboard: N), the game's first frame 1.6 s later, an
+AudioOut port opened for its sound; X launched the ball, the paddle followed the stick (D), OPTIONS
+(Enter) quit to the start page. The controller test showed Cross (N) as A and the stick (D) at
+full right, and quit with OPTIONS and the touchpad (Enter and Space). A keyboard tap of a few
+milliseconds can fall between two of a game's reads of the controller; a held key always counts.
 shadPS4 has no sound here (no audio device), so the sound is tested on the desktop: there the WAV
 file has Breakout's beeps, each at its pitch and length (the ball's launch 660 Hz for 60 ms, a
 brick about 1 kHz, a wall 330 Hz, a lost ball 160 Hz for 250 ms), in real time.
@@ -135,6 +154,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: frames for frontends without a GPU renderer | stage 3's picture, above |
 | audio: a frontend sink | stage 3's sound, above |
 | null renderer: one layer at its own size | a frame with one layer (the usual case) isn't scaled to 1280x720 on its way to the frontend, which scales it anyway |
+| host memory: clear large regions on Linux by dropping their pages | a homebrew program's 3.2 GiB heap, cleared in no time on the desktop (above) |
 
 The PS4 memory changes, from what stage 1 measured:
 
@@ -175,7 +195,7 @@ EDEN_DIR=~/eden eden-ps4/build.sh host    # desktop: ~/eden-host/bin/eden-ps4 <p
 EDEN_DIR=~/eden eden-ps4/build.sh ps4     # out/EdenPS4.pkg
 eden-ps4/hello/build.sh               # hello.nro on its own
 eden-ps4/nx/build.sh                  # libnx and its toolchain, with clang, into ~/nx/devkitpro
-eden-ps4/game/build.sh                # breakout.nro on its own (build.sh ps4 builds it too)
+eden-ps4/game/build.sh                # breakout.nro and padtest.nro (build.sh ps4 builds them too)
 ```
 
 `nx/build.sh` builds what devkitPro's packages would give (their servers are blocked in some build
