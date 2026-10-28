@@ -5,9 +5,9 @@ Subject: [PATCH] null renderer: faster software draws, on several threads
 
 ---
  .../renderer_null/null_rasterizer.cpp         |    8 +-
- .../renderer_null/software_draw.cpp           | 1535 ++++++++++++-----
+ .../renderer_null/software_draw.cpp           | 1615 ++++++++++++-----
  src/video_core/renderer_null/software_draw.h  |    7 +
- 3 files changed, 1083 insertions(+), 467 deletions(-)
+ 3 files changed, 1163 insertions(+), 467 deletions(-)
 
 diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
 index b48098f9b..2e4559558 100644
@@ -43,7 +43,7 @@ index b48098f9b..2e4559558 100644
                            block_bytes, &m_scratch);
                  for (u32 y = ys; y < ye; ++y) {
 diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
-index e166be5b5..50406d2f1 100644
+index e166be5b5..c7bd160ad 100644
 --- a/src/video_core/renderer_null/software_draw.cpp
 +++ b/src/video_core/renderer_null/software_draw.cpp
 @@ -2,8 +2,15 @@
@@ -540,7 +540,7 @@ index e166be5b5..50406d2f1 100644
      const u32 word = byte_offset / 4;
      if (word >= words.size()) {
          return 0;
-@@ -1451,26 +1679,168 @@ const Binding* GetBinding(const SoftwareDraw::Program& program, const Io& io, u3
+@@ -1451,26 +1679,221 @@ const Binding* GetBinding(const SoftwareDraw::Program& program, const Io& io, u3
      return index < io.textures->size() ? &(*io.textures)[index] : nullptr;
  }
  
@@ -589,6 +589,54 @@ index e166be5b5..50406d2f1 100644
 +            const f32 scale_u = type == T::Color2DRect ? 1.0f / f32(s32(level.width)) : 1.0f;
 +            const f32 scale_v = type == T::Color2DRect ? 1.0f / f32(s32(level.height)) : 1.0f;
 +            const bool linear = binding->mag_linear;
++            // All lanes at once in arrays (the compiler vectorizes all but the texel loads), when
++            // the texels are linear 8-bit (not sRGB), the offsets the same in every lane, and every
++            // footprint inside the texture; otherwise lane by lane
++            const bool uniform_offset =
++                std::all_of(offsets.w[0] + 1, offsets.w[0] + n, [&](u32 v) { return v == offsets.w[0][0]; }) &&
++                std::all_of(offsets.w[1] + 1, offsets.w[1] + n, [&](u32 v) { return v == offsets.w[1][0]; });
++            if (linear && !texture->srgb && uniform_offset && texture->identity_swizzle) {
++                const s32 width = s32(level.width), height = s32(level.height);
++                const s32 offset_x = s32(offsets.w[0][0]), offset_y = s32(offsets.w[1][0]);
++                alignas(64) s32 x0[LANES], y0[LANES];
++                alignas(64) u32 wx[LANES], wy[LANES];
++                bool inside = true;
++                for (u32 i = 0; i < LANES; ++i) {
++                    f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
++                    u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
++                    const f32 tx = std::clamp(u * f32(width) - 0.5f, -1e6f, 1e6f);
++                    const f32 ty = std::clamp(v * f32(height) - 0.5f, -1e6f, 1e6f);
++                    const s32 ix = FloorToInt(tx), iy = FloorToInt(ty);
++                    x0[i] = ix + offset_x, y0[i] = iy + offset_y;
++                    wx[i] = u32(s32((tx - f32(ix)) * 256.0f + 0.5f));
++                    wy[i] = u32(s32((ty - f32(iy)) * 256.0f + 0.5f));
++                }
++                for (u32 i = 0; i < n; ++i) {
++                    inside &= x0[i] >= 0 && y0[i] >= 0 && x0[i] + 1 < width && y0[i] + 1 < height;
++                }
++                if (inside) {
++                    const u32* const texels = level.rgba8.data() + size_t(texture->base_layer) * level.height * level.depth * level.width;
++                    alignas(64) u32 t00[LANES], t10[LANES], t01[LANES], t11[LANES];
++                    for (u32 i = 0; i < n; ++i) {
++                        const u32* const p = texels + size_t(y0[i]) * level.width + size_t(x0[i]);
++                        t00[i] = p[0], t10[i] = p[1], t01[i] = p[level.width], t11[i] = p[level.width + 1];
++                    }
++                    for (u32 i = n; i < LANES; ++i) {
++                        t00[i] = t10[i] = t01[i] = t11[i] = 0;
++                    }
++                    for (u32 ch = 0; ch < 4; ++ch) {
++                        const u32 shift = ch * 8;
++                        for (u32 i = 0; i < LANES; ++i) {
++                            const u32 w00 = (256 - wx[i]) * (256 - wy[i]), w10 = wx[i] * (256 - wy[i]);
++                            const u32 w01 = (256 - wx[i]) * wy[i], w11 = wx[i] * wy[i];
++                            const u32 sum = ((t00[i] >> shift) & 0xFF) * w00 + ((t10[i] >> shift) & 0xFF) * w10 +
++                                            ((t01[i] >> shift) & 0xFF) * w01 + ((t11[i] >> shift) & 0xFF) * w11;
++                            SetFl(d, i, f32((sum + 32768) >> 16) * (1.0f / 255.0f), ch);
++                        }
++                    }
++                    return;
++                }
++            }
 +            for (u32 i = 0; i < n; ++i) {
 +                const Sampling sampling{*texture, *binding, 2, texture->base_layer,
 +                                        {s32(offsets.w[0][i]), s32(offsets.w[1][i]), 0}, nullptr};
@@ -684,19 +732,24 @@ index e166be5b5..50406d2f1 100644
 +}
 +
 +/// A program for 'n' lanes (pixels) at once from 'io.lane'. Programs that branch run one lane at a
-+/// time: a branch goes by lane 0.
-+void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
++/// time: a branch goes by lane 0. Wide: arithmetic is done for all LANES lanes (those past 'n'
++/// unused), in loops of a fixed count the compiler vectorizes; what reads or writes outside the
++/// program's values, for the 'n' only.
++template <bool Wide>
++void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
      using O = IR::Opcode;
      const Op* const ops = program.ops.data();
 -    Cell* const c = cells.data();
-+#define LANE_LOOP for (u32 i = 0; i < n; ++i)
++    constexpr u32 lanes = Wide ? LANES : 1;
++#define LANE_LOOP for (u32 i = 0; i < lanes; ++i)
++#define IO_LOOP for (u32 i = 0; i < n; ++i)
      for (u32 pc = 0;;) {
          const Op& o = ops[pc++];
          switch (o.kind) {
          case Kind::Move:
 -            c[o.dest] = c[o.a[0]];
 +            for (u32 k = 0; k < 4; ++k) {
-+                std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], n * sizeof(u32));
++                std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], lanes * sizeof(u32));
 +            }
              continue;
          case Kind::Jump:
@@ -714,7 +767,7 @@ index e166be5b5..50406d2f1 100644
                  pc = o.extra;
              }
              continue;
-@@ -1479,321 +1849,276 @@ void Run(const SoftwareDraw::Program& program, std::vector<Cell>& cells, Io& io)
+@@ -1479,321 +1902,285 @@ void Run(const SoftwareDraw::Program& program, std::vector<Cell>& cells, Io& io)
          case Kind::Ir:
              break;
          }
@@ -730,28 +783,28 @@ index e166be5b5..50406d2f1 100644
          switch (o.op) {
          case O::DemoteToHelperInvocation:
 -            io.discard = true;
-+            LANE_LOOP io.discard[io.lane + i] = true;
++            IO_LOOP io.discard[io.lane + i] = true;
              return;
          case O::GetCbufU8:
 -            d.w[0] = ReadCbuf(io, a, b, 1);
-+            LANE_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 1);
++            IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 1);
              break;
          case O::GetCbufS8:
 -            d.w[0] = u32(s32(s8(ReadCbuf(io, a, b, 1))));
-+            LANE_LOOP d.w[0][i] = u32(s32(s8(ReadCbuf(io, a.w[0][i], b.w[0][i], 1))));
++            IO_LOOP d.w[0][i] = u32(s32(s8(ReadCbuf(io, a.w[0][i], b.w[0][i], 1))));
              break;
          case O::GetCbufU16:
 -            d.w[0] = ReadCbuf(io, a, b, 2);
-+            LANE_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 2);
++            IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 2);
              break;
          case O::GetCbufS16:
 -            d.w[0] = u32(s32(s16(ReadCbuf(io, a, b, 2))));
-+            LANE_LOOP d.w[0][i] = u32(s32(s16(ReadCbuf(io, a.w[0][i], b.w[0][i], 2))));
++            IO_LOOP d.w[0][i] = u32(s32(s16(ReadCbuf(io, a.w[0][i], b.w[0][i], 2))));
              break;
          case O::GetCbufU32:
          case O::GetCbufF32:
 -            d.w[0] = ReadCbuf(io, a, b, 4);
-+            LANE_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
++            IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
              break;
 -        case O::GetCbufU32x2: {
 -            Cell next = b;
@@ -759,7 +812,7 @@ index e166be5b5..50406d2f1 100644
 -            d.w[0] = ReadCbuf(io, a, b, 4);
 -            d.w[1] = ReadCbuf(io, a, next, 4);
 +        case O::GetCbufU32x2:
-+            LANE_LOOP {
++            IO_LOOP {
 +                d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
 +                d.w[1][i] = ReadCbuf(io, a.w[0][i], b.w[0][i] + 4, 4);
 +            }
@@ -772,15 +825,15 @@ index e166be5b5..50406d2f1 100644
              break;
          case O::GetAttributeIndexed:
 -            d.w[0] = std::bit_cast<u32>(io.inputs[(a.w[0] / 4) & 0xFF]);
-+            LANE_LOOP d.w[0][i] = std::bit_cast<u32>(io.inputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i]);
++            IO_LOOP d.w[0][i] = std::bit_cast<u32>(io.inputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i]);
              break;
          case O::SetAttribute:
 -            io.outputs[o.extra & 0xFF] = F(b);
-+            LANE_LOOP io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
++            IO_LOOP io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
              break;
          case O::SetAttributeIndexed:
 -            io.outputs[(a.w[0] / 4) & 0xFF] = F(b);
-+            LANE_LOOP io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
++            IO_LOOP io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
              break;
 -        case O::SetFragColor:
 -            (*io.colors)[(o.extra / 4) & 7][o.extra % 4] = F(e);
@@ -812,17 +865,17 @@ index e166be5b5..50406d2f1 100644
          case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
 -            d = {};
 +            for (u32 k = 0; k < 4; ++k) {
-+                std::memset(d.w[k], 0, n * sizeof(u32));
++                std::memset(d.w[k], 0, lanes * sizeof(u32));
 +            }
              break;
          case O::LoadLocal:
 -            d.w[0] = a.w[0] / 4 < io.local_words ? io.local[a.w[0] / 4] : 0;
-+            LANE_LOOP d.w[0][i] = a.w[0][i] / 4 < io.local_words ? io.local[a.w[0][i] / 4] : 0;
++            IO_LOOP d.w[0][i] = a.w[0][i] / 4 < io.local_words ? io.local[a.w[0][i] / 4] : 0;
              break;
          case O::WriteLocal:
 -            if (a.w[0] / 4 < io.local_words) {
 -                io.local[a.w[0] / 4] = b.w[0];
-+            LANE_LOOP {
++            IO_LOOP {
 +                if (a.w[0][i] / 4 < io.local_words) {
 +                    io.local[a.w[0][i] / 4] = b.w[0][i];
 +                }
@@ -830,21 +883,21 @@ index e166be5b5..50406d2f1 100644
              break;
          case O::CompositeConstructU32x2: case O::CompositeConstructF32x2:
 -            d.w[0] = a.w[0], d.w[1] = b.w[0];
-+            std::memcpy(d.w[0], a.w[0], n * 4);
-+            std::memcpy(d.w[1], b.w[0], n * 4);
++            std::memcpy(d.w[0], a.w[0], lanes * 4);
++            std::memcpy(d.w[1], b.w[0], lanes * 4);
              break;
          case O::CompositeConstructU32x3: case O::CompositeConstructF32x3:
 -            d.w[0] = a.w[0], d.w[1] = b.w[0], d.w[2] = e.w[0];
-+            std::memcpy(d.w[0], a.w[0], n * 4);
-+            std::memcpy(d.w[1], b.w[0], n * 4);
-+            std::memcpy(d.w[2], e.w[0], n * 4);
++            std::memcpy(d.w[0], a.w[0], lanes * 4);
++            std::memcpy(d.w[1], b.w[0], lanes * 4);
++            std::memcpy(d.w[2], e.w[0], lanes * 4);
              break;
          case O::CompositeConstructU32x4: case O::CompositeConstructF32x4:
 -            d.w[0] = a.w[0], d.w[1] = b.w[0], d.w[2] = e.w[0], d.w[3] = c[o.a[3]].w[0];
-+            std::memcpy(d.w[0], a.w[0], n * 4);
-+            std::memcpy(d.w[1], b.w[0], n * 4);
-+            std::memcpy(d.w[2], e.w[0], n * 4);
-+            std::memcpy(d.w[3], f.w[0], n * 4);
++            std::memcpy(d.w[0], a.w[0], lanes * 4);
++            std::memcpy(d.w[1], b.w[0], lanes * 4);
++            std::memcpy(d.w[2], e.w[0], lanes * 4);
++            std::memcpy(d.w[3], f.w[0], lanes * 4);
              break;
          case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
          case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
@@ -878,13 +931,13 @@ index e166be5b5..50406d2f1 100644
              break;
          case O::BitCastU32F32: case O::BitCastF32U32:
 -            d.w[0] = a.w[0];
-+            std::memcpy(d.w[0], a.w[0], n * 4);
++            std::memcpy(d.w[0], a.w[0], lanes * 4);
              break;
          case O::BitCastU64F64: case O::BitCastF64U64: case O::PackUint2x32: case O::UnpackUint2x32:
          case O::PackDouble2x32: case O::UnpackDouble2x32:
 -            d.w[0] = a.w[0], d.w[1] = a.w[1];
-+            std::memcpy(d.w[0], a.w[0], n * 4);
-+            std::memcpy(d.w[1], a.w[1], n * 4);
++            std::memcpy(d.w[0], a.w[0], lanes * 4);
++            std::memcpy(d.w[1], a.w[1], lanes * 4);
              break;
          case O::PackHalf2x16:
 -            d.w[0] = u32(ToHalf(F(a, 0))) | (u32(ToHalf(F(a, 1))) << 16);
@@ -936,7 +989,7 @@ index e166be5b5..50406d2f1 100644
 -        case O::IMul32: d.w[0] = a.w[0] * b.w[0]; break;
 +        case O::FPAbs32: LANE_LOOP SetFl(d, i, std::fabs(Fl(a, i))); break;
 +        case O::FPAdd32: LANE_LOOP SetFl(d, i, Fl(a, i) + Fl(b, i)); break;
-+        case O::FPFma32: LANE_LOOP SetFl(d, i, std::fma(Fl(a, i), Fl(b, i), Fl(e, i))); break;
++        case O::FPFma32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i) + Fl(e, i)); break; // unfused: the PS4 has no FMA
 +        case O::FPMax32: LANE_LOOP SetFl(d, i, std::fmax(Fl(a, i), Fl(b, i))); break;
 +        case O::FPMin32: LANE_LOOP SetFl(d, i, std::fmin(Fl(a, i), Fl(b, i))); break;
 +        case O::FPMul32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i)); break;
@@ -1217,11 +1270,20 @@ index e166be5b5..50406d2f1 100644
              break;
          }
      }
++#undef IO_LOOP
 +#undef LANE_LOOP
++}
++
++void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
++    if (n == 1) {
++        RunLanes<false>(program, c, io, 1);
++    } else {
++        RunLanes<true>(program, c, io, n);
++    }
  }
  
  // ---- the draw
-@@ -1942,6 +2267,23 @@ SoftwareDraw::SoftwareDraw()
+@@ -1942,6 +2329,23 @@ SoftwareDraw::SoftwareDraw()
  
  SoftwareDraw::~SoftwareDraw() = default;
  
@@ -1245,7 +1307,7 @@ index e166be5b5..50406d2f1 100644
  const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address) {
      Tegra::Texture::TICEntry tic{};
      gpu_memory.ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
-@@ -2048,6 +2390,11 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2048,6 +2452,11 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
              LogOnce("storage images aren't drawn");
          }
          program->ok = Flattener{*program}.Run(ir);
@@ -1257,7 +1319,7 @@ index e166be5b5..50406d2f1 100644
      } catch (const std::exception& exception) {
          LogOnce(fmt::format("shader translation failed: {}", exception.what()));
          program->ok = false;
-@@ -2058,8 +2405,45 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2058,8 +2467,45 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
      return programs.emplace(key, std::move(program)).first->second.get();
  }
  
@@ -1303,7 +1365,7 @@ index e166be5b5..50406d2f1 100644
      const auto& regs = maxwell3d.regs;
      const auto& draw_state = maxwell3d.draw_manager.draw_state;
      using Topology = Maxwell::Regs::PrimitiveTopology;
-@@ -2142,6 +2526,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+@@ -2142,6 +2588,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
                          regs.tex_sampler.Address() + u64{tsc_index} * sizeof(Tegra::Texture::TSCEntry),
                          &binding.sampler, sizeof(binding.sampler));
                  }
@@ -1311,7 +1373,7 @@ index e166be5b5..50406d2f1 100644
                  out.push_back(binding);
              }
          }
-@@ -2170,12 +2555,13 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+@@ -2170,12 +2617,13 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
      }
  
      // Vertex shader: once per vertex (and instance)
@@ -1329,7 +1391,7 @@ index e166be5b5..50406d2f1 100644
      const auto shade_vertex = [&](u32 index, u32 instance, Vertex& out) {
          inputs.fill(0.0f);
          for (u32 attr = 0; attr < 32; ++attr) {
-@@ -2202,21 +2588,38 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+@@ -2202,21 +2650,38 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
          inputs[static_cast<u32>(IR::Attribute::InstanceId)] = std::bit_cast<f32>(instance);
          outputs.fill(0.0f);
          outputs[static_cast<u32>(IR::Attribute::PositionW)] = 1.0f;
@@ -1371,7 +1433,7 @@ index e166be5b5..50406d2f1 100644
          ScreenVertex s;
          s.x = transform_on ? transform.translate_x + transform.scale_x * x : x;
          s.y = transform_on ? transform.translate_y + transform.scale_y * y : y;
-@@ -2237,207 +2640,147 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+@@ -2237,207 +2702,147 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
          clip_x1 = std::min<s32>(clip_x1, regs.scissor_test[0].max_x);
          clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y);
      }
@@ -1690,7 +1752,7 @@ index e166be5b5..50406d2f1 100644
          }
      };
  
-@@ -2454,29 +2797,295 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+@@ -2454,29 +2859,313 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
          }
          switch (topology) {
          case Topology::Triangles:
@@ -1837,44 +1899,62 @@ index e166be5b5..50406d2f1 100644
 +                }
 +                for (s32 bx = xs; bx < xe; bx += s32(LANES)) {
 +                    const u32 n = u32(std::min<s32>(xe - bx, s32(LANES)));
-+                    for (u32 j = 0; j < n; ++j) {
-+                        const s64 dx = s64(bx + j - t.x0);
-+                        const f32 w0 = f32(e[0] + step_x[0] * dx - bias[0]) * t.inv_area;
-+                        const f32 w1 = f32(e[1] + step_x[1] * dx - bias[1]) * t.inv_area;
-+                        const f32 w2 = f32(e[2] + step_x[2] * dx - bias[2]) * t.inv_area;
-+                        // perspective: the weights over w, normalized (the same weights when affine)
-+                        f32 pw0 = w0, pw1 = w1, pw2 = w2, psum = t.inv_w[0], inv_psum = 1.0f;
-+                        if (!t.affine) {
-+                            pw0 = w0 * t.inv_w[0], pw1 = w1 * t.inv_w[1], pw2 = w2 * t.inv_w[2];
-+                            psum = pw0 + pw1 + pw2;
-+                            inv_psum = psum != 0.0f ? 1.0f / psum : 0.0f;
-+                        }
-+                        input(IR::Attribute::PositionX)[j] = f32(bx + s32(j)) + 0.5f;
-+                        input(IR::Attribute::PositionY)[j] = f32(y) + 0.5f;
-+                        input(IR::Attribute::PositionZ)[j] = w0 * t.z[0] + w1 * t.z[1] + w2 * t.z[2];
-+                        input(IR::Attribute::PositionW)[j] = psum;
-+                        for (size_t k = 0; k < num_varyings; ++k) {
-+                            const f32 a = data[k], b = data[num_varyings + k], c = data[2 * num_varyings + k];
-+                            f32 value;
-+                            switch (varyings[k].interpolation) {
-+                            case Shader::Interpolation::Flat:
-+                                value = a;
-+                                break;
-+                            case Shader::Interpolation::NoPerspective:
-+                                value = w0 * a + w1 * b + w2 * c;
-+                                break;
-+                            default:
-+                                value = (pw0 * a + pw1 * b + pw2 * c) * inv_psum;
-+                                break;
-+                            }
-+                            in[varyings[k].input * LANES + j] = value;
-+                        }
-+                        st.colors[0 * LANES + j] = 0.0f;
-+                        st.colors[1 * LANES + j] = 0.0f;
-+                        st.colors[2 * LANES + j] = 0.0f;
-+                        st.colors[3 * LANES + j] = 1.0f;
-+                        st.discard[j] = false;
++                    // the weights at the batch's first pixel, exactly; stepped from there
++                    const s64 dx = s64(bx - t.x0);
++                    const f32 w0s = f32(e[0] + step_x[0] * dx - bias[0]) * t.inv_area;
++                    const f32 w1s = f32(e[1] + step_x[1] * dx - bias[1]) * t.inv_area;
++                    const f32 w2s = f32(e[2] + step_x[2] * dx - bias[2]) * t.inv_area;
++                    const f32 dw0 = f32(step_x[0]) * t.inv_area, dw1 = f32(step_x[1]) * t.inv_area,
++                              dw2 = f32(step_x[2]) * t.inv_area;
++                    alignas(64) f32 w0[LANES], w1[LANES], w2[LANES];
++                    alignas(64) f32 pw0[LANES], pw1[LANES], pw2[LANES], inv_psum[LANES];
++                    for (u32 j = 0; j < LANES; ++j) {
++                        w0[j] = w0s + dw0 * f32(j), w1[j] = w1s + dw1 * f32(j), w2[j] = w2s + dw2 * f32(j);
 +                    }
++                    f32* const position_w = input(IR::Attribute::PositionW);
++                    if (t.affine) { // the same weights: no perspective correction
++                        for (u32 j = 0; j < LANES; ++j) {
++                            pw0[j] = w0[j], pw1[j] = w1[j], pw2[j] = w2[j], inv_psum[j] = 1.0f;
++                            position_w[j] = t.inv_w[0];
++                        }
++                    } else { // perspective: the weights over w, normalized
++                        for (u32 j = 0; j < LANES; ++j) {
++                            pw0[j] = w0[j] * t.inv_w[0], pw1[j] = w1[j] * t.inv_w[1], pw2[j] = w2[j] * t.inv_w[2];
++                            const f32 psum = pw0[j] + pw1[j] + pw2[j];
++                            position_w[j] = psum;
++                            inv_psum[j] = psum != 0.0f ? 1.0f / psum : 0.0f;
++                        }
++                    }
++                    f32* const position_x = input(IR::Attribute::PositionX);
++                    f32* const position_y = input(IR::Attribute::PositionY);
++                    f32* const position_z = input(IR::Attribute::PositionZ);
++                    for (u32 j = 0; j < LANES; ++j) {
++                        position_x[j] = f32(bx) + f32(j) + 0.5f;
++                        position_y[j] = f32(y) + 0.5f;
++                        position_z[j] = w0[j] * t.z[0] + w1[j] * t.z[1] + w2[j] * t.z[2];
++                    }
++                    for (size_t k = 0; k < num_varyings; ++k) {
++                        const f32 a = data[k], b = data[num_varyings + k], c = data[2 * num_varyings + k];
++                        f32* const value = in + varyings[k].input * LANES;
++                        switch (varyings[k].interpolation) {
++                        case Shader::Interpolation::Flat:
++                            std::fill_n(value, LANES, a);
++                            break;
++                        case Shader::Interpolation::NoPerspective:
++                            for (u32 j = 0; j < LANES; ++j) {
++                                value[j] = w0[j] * a + w1[j] * b + w2[j] * c;
++                            }
++                            break;
++                        default:
++                            for (u32 j = 0; j < LANES; ++j) {
++                                value[j] = (pw0[j] * a + pw1[j] * b + pw2[j] * c) * inv_psum[j];
++                            }
++                            break;
++                        }
++                    }
++                    std::fill_n(st.colors.data(), 3 * LANES, 0.0f);
++                    std::fill_n(st.colors.data() + 3 * LANES, LANES, 1.0f);
++                    st.discard.fill(false);
 +                    if (fs->one_lane) {
 +                        for (u32 j = 0; j < n; ++j) {
 +                            io.lane = j;
