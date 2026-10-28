@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:50:21 +0000
+Subject: [PATCH] null renderer: software draws find their programs without
+ hashing the code at every draw
+
+---
+ .../renderer_null/null_rasterizer.cpp         | 22 ++++++++----
+ .../renderer_null/software_draw.cpp           | 35 +++++++++++++++++--
+ src/video_core/renderer_null/software_draw.h  | 10 ++++++
+ 3 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index e41faa0d6..4b85fd4b2 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -108,6 +108,19 @@ struct Fill {
+     std::array<bool, 16> mask;
+ };
+ 
++/// The bytes a surface's layers take, from the first to the last one cleared
++u64 FillBytes(const Fill& fill, u32 height, u32 first_layer, u32 layers) {
++    u64 layer_bytes;
++    if (fill.pitch_linear) {
++        layer_bytes = u64{fill.pitch} * height;
++    } else {
++        const u32 block_rows = 8u << fill.block_height;
++        layer_bytes = u64{(fill.width * fill.bpp + 63) / 64} * (512u << fill.block_height) *
++                      ((height + block_rows - 1) / block_rows);
++    }
++    return u64{first_layer + layers - 1} * fill.layer_stride + layer_bytes;
++}
++
+ void FillRect(Tegra::MemoryManager& gpu_memory, Common::ScratchBuffer<u8>& scratch, const Fill& fill,
+               u32 x0, u32 y0, u32 x1, u32 y1, u32 first_layer, u32 layers) {
+     const u32 bpp = fill.bpp;
+@@ -223,8 +236,7 @@ void RasterizerNull::Clear(u32 layer_count) {
+             for (u32 b = 0; b < bpp; ++b) {
+                 fill.mask[b] = zeros[b] != 0 || ones[b] != 0xFF;
+             }
+-            m_software.MarkWritten(fill.address, std::max<u64>(fill.layer_stride, u64{fill.width} * regs.zeta_size.height * 16) *
+-                                                     (surface.layer + layers));
++            m_software.MarkWritten(fill.address, FillBytes(fill, regs.zeta_size.height, surface.layer, layers));
+             FillRect(*gpu_memory, m_scratch, fill, x0, y0, x1, y1, surface.layer, layers);
+         }
+     }
+@@ -275,10 +287,8 @@ void RasterizerNull::Clear(u32 layer_count) {
+     if (!clear_rect(fill.width, rt.height, x0, y0, x1, y1)) {
+         return;
+     }
+-    // textures cleared (render to texture) are checked again before they're next sampled; the
+-    // range generous (a layer's size isn't worked out here)
+-    m_software.MarkWritten(address, std::max<u64>(fill.layer_stride, u64{rt.width} * rt.height * 16) *
+-                                        (surface.layer + layers));
++    // textures cleared (render to texture) are checked again before they're next sampled
++    m_software.MarkWritten(address, FillBytes(fill, rt.height, surface.layer, layers));
+     FillRect(*gpu_memory, m_scratch, fill, x0, y0, x1, y1, surface.layer, layers);
+ }
+ void RasterizerNull::DispatchCompute() {}
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 8e28f9a86..fa2726a81 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -2732,6 +2732,11 @@ void SoftwareDraw::DrawTexture(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_mem
+ }
+ 
+ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
++    for (auto& [key, recent] : recent_programs) {
++        if (address < recent.address + recent.size && recent.address < address + size) {
++            recent.program = nullptr;
++        }
++    }
+     textures->marks++;
+     for (auto& [key, texture] : textures->entries) {
+         if (address < texture.address + texture.size && texture.address < address + size) {
+@@ -2741,6 +2746,12 @@ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
+ }
+ 
+ void SoftwareDraw::MarkDeviceWritten(DAddr address, u64 size) {
++    for (auto& [key, recent] : recent_programs) {
++        if (!recent.device_range ||
++            (address < recent.device_address + recent.size && recent.device_address < address + size)) {
++            recent.program = nullptr;
++        }
++    }
+     textures->marks++;
+     for (auto& [key, texture] : textures->entries) {
+         if (!texture.device_range ||
+@@ -2751,6 +2762,7 @@ void SoftwareDraw::MarkDeviceWritten(DAddr address, u64 size) {
+ }
+ 
+ void SoftwareDraw::MarkAllWritten() {
++    recent_programs.clear();
+     textures->marks++;
+     for (auto& [key, texture] : textures->entries) {
+         texture.checked = false;
+@@ -2779,6 +2791,13 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+     const auto& regs = maxwell3d.regs;
+     const GPUVAddr base = regs.program_region.Address();
+     const u32 offset = regs.pipelines[stage].offset;
++    // the program found here before, this frame, and nothing written over its code since: the
++    // same one (the code is hashed at most once a frame, not at every draw)
++    const u64 recent_key = (base + offset) ^ (u64{stage} << 60);
++    RecentProgram& recent = recent_programs[recent_key];
++    if (recent.program && recent.frame == frame_count) {
++        return recent.program;
++    }
+     VideoCommon::GraphicsEnvironment env{maxwell3d, gpu_memory,
+                                          static_cast<Maxwell::Regs::ShaderType>(stage), base,
+                                          offset};
+@@ -2788,8 +2807,19 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+         return nullptr;
+     }
+     const u64 key = *hash ^ (u64{stage} << 60) ^ (u64{offset} << 32);
++    recent.frame = frame_count;
++    recent.address = base + offset;
++    recent.size = env.CachedSizeBytes();
++    recent.device_range = false;
++    if (gpu_memory.IsContinuousRange(recent.address, recent.size)) {
++        if (const auto device = gpu_memory.GpuToCpuAddress(recent.address)) {
++            recent.device_address = *device;
++            recent.device_range = true;
++        }
++    }
+     if (const auto it = programs.find(key); it != programs.end()) {
+-        return it->second.get();
++        recent.program = it->second.get();
++        return recent.program;
+     }
+     auto program = std::make_unique<Program>();
+     try {
+@@ -2833,7 +2863,8 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+     pools->inst.ReleaseContents();
+     pools->block.ReleaseContents();
+     pools->flow_block.ReleaseContents();
+-    return programs.emplace(key, std::move(program)).first->second.get();
++    recent.program = programs.emplace(key, std::move(program)).first->second.get();
++    return recent.program;
+ }
+ 
+ namespace {
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index a21886184..55a71b427 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -94,6 +94,16 @@ private:
+     u64 frame_count = 0;
+     u32 RasterThreads();
+     std::unordered_map<u64, std::unique_ptr<Program>> programs;
++    /// The program last found at a stage's address, and when, and where its code is
++    struct RecentProgram {
++        Program* program = nullptr;
++        u64 frame = 0;
++        GPUVAddr address = 0;
++        u64 size = 0;
++        DAddr device_address = 0;
++        bool device_range = false;
++    };
++    std::unordered_map<u64, RecentProgram> recent_programs;
+     Common::ScratchBuffer<u8> scratch;
+ };
+ 

@@ -204,6 +204,11 @@ Two ways it shows:
   buffer (each read, with their count, and drawn), indices sent in the command stream (the storage
   buffer's square is drawn with them; they were read from memory before), and the 3D engine's
   textured rectangle (NVN's DrawTexture).
+- **Less work per draw** (patch 0026): finding a draw's shaders meant Eden's shader environment
+  hashing their code, about 60 microseconds a draw (a game drawing a sprite a draw, a thousand a
+  frame, would have spent 60 ms on it); a stage's program is now remembered by its address and
+  hashed again once a frame, or when something writes over its code. Clears mark the bytes they
+  write, not a generous range.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -359,6 +364,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: tick the rasterizer each frame, so CPU-written textures are seen | above |
 | null renderer: report gathered writes before draws and clears | above |
 | null renderer: indirect draws, inline index buffers and DrawTexture in software | above |
+| null renderer: software draws find their programs without hashing the code at every draw | above |
 
 The PS4 memory changes, from what stage 1 measured:
 
