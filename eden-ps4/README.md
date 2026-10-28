@@ -43,9 +43,11 @@ What runs it:
   sound work: `audout` (Breakout) and the audio renderer `audren` (switchbrew's audren-simple
   example, recorded on the desktop).
 
-In shadPS4, Breakout runs at 28 to 30 frames per second (61 on the desktop build): the start page,
+In shadPS4, Breakout runs at 26 to 30 frames per second (61 on the desktop build): the start page,
 X, the game; the pad's X launches the ball, the stick moves the paddle, OPTIONS quits back to the
-start page. It hasn't run on a console yet.
+start page. That rate is shadPS4's display here, which draws with a software Vulkan device: each
+frame waits 28 to 30 ms for a buffer to come off the screen, and scaling it onto the screen takes
+2.2 to 2.4 ms (the boot trace's numbers). A console flips in hardware. It hasn't run on one yet.
 
 The test program from stage 2 (`hello.nro`) is still in the package.
 
@@ -114,6 +116,26 @@ Until the program draws, its output and Eden's warnings and errors are on screen
 `/data/eden-ps4/log.txt`.
 Eden's data folders (NAND, SD card, keys) are in `/data/eden-ps4/user`. Nothing is written outside
 `/data/eden-ps4`.
+
+## Testing on a console
+
+Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells the most:
+
+1. Install `out/EdenPS4.pkg` and start it. The start page should list three programs. If the app
+   closes or freezes before that, `/data/eden-ps4/boot-trace.log` has its last steps and
+   `crash.log` its crash report (next start, the start page shows both: a photo is enough).
+2. **The test program** (stage 2's checks): every line should end with "passed" or a result, and
+   the start page come back.
+3. **Breakout**: the picture, the paddle on the stick and D-pad, X to launch, the beeps. The game
+   shows its frame rate at the top. `boot-trace.log` gets a line every 10 s with the frames a
+   second and how long the launcher takes to draw each onto the screen.
+4. **Controller test**: each PS4 button should light its Switch button.
+5. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list.
+
+After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnings and errors, and
+`boot-trace.log` the launcher's steps (the audio port it opened, the first frame, the frame rate).
+Stack addresses in a crash report are symbolized with that build's ELF (kept next to the package in
+`out/` when it's sent, and in `~/eden-ps4-elves`).
 
 ## Testing in shadPS4
 

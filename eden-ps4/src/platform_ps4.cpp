@@ -178,7 +178,9 @@ public:
             map_width = width;
             map_height = height;
         }
+        const double wait_start = Seconds();
         WaitForImageOffScreen();
+        last_wait = Seconds() - wait_start;
         uint32_t* fb = buffers[current];
         for (int y = 0; y < kHeight; y++)
         {
@@ -241,6 +243,10 @@ private:
     std::vector<uint32_t> x_map, y_map;
     uint32_t map_width = 0, map_height = 0;
 
+public:
+    double last_wait = 0; // how long DrawFrame waited for a buffer off the screen, in seconds
+
+private:
     static bool Failed(const char* call, int32_t ret)
     {
         Trace(fmt::format("screen: {} failed ({:#x}); output goes to log.txt only", call, uint32_t(ret)));
@@ -532,14 +538,36 @@ void* PadThread(void*)
     return nullptr;
 }
 
-// Frames from the program: once it draws, the screen shows its frames instead of the text.
+// Frames from the program: once it draws, the screen shows its frames instead of the text. The
+// boot trace gets their rate every 10 s, how long the launcher waited for a buffer off the screen
+// (the display's pace) and how long scaling a frame onto it took.
 std::atomic<bool> g_drawing{false};
 void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
 {
+    static double period_start = 0, drawing = 0, waiting = 0;
+    static unsigned frames = 0;
     std::lock_guard lock{g_mutex};
+    const double start = Seconds();
     if (!g_drawing.exchange(true))
-        Trace("first frame from the program");
+    {
+        Trace(fmt::format("first frame from the program: {}x{}", width, height));
+        period_start = start;
+        drawing = waiting = 0;
+        frames = 0;
+    }
     g_screen.DrawFrame(pixels, width, height);
+    const double end = Seconds();
+    drawing += end - start - g_screen.last_wait;
+    waiting += g_screen.last_wait;
+    frames++;
+    if (end - period_start >= 10)
+    {
+        Trace(fmt::format("frames: {:.1f} a second; each waited {:.1f} ms for a buffer, took {:.1f} ms to scale",
+                          frames / (end - period_start), waiting * 1000 / frames, drawing * 1000 / frames));
+        period_start = end;
+        drawing = waiting = 0;
+        frames = 0;
+    }
 }
 
 // The programs on the start page: the package's, then every .nro in the data folder.
