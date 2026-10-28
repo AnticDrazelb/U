@@ -179,6 +179,11 @@ sys.exit(0 if all(abs(c - 77) < 6 for c in (r, g, b)) else 1)
 PY
 check "its macro is interpreted (no macro JIT)" bash -c "! grep -q 'Macro JIT' '$work/gputest.log'"
 
+echo "gputest.nro's stress test: 400 more sprites, a draw each (queued, rasterized together)"
+run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"
+check "exits on +" code gputest_stress 0
+check "draws its sprites" says gputest_stress "fps, [0-9]* command words a frame (stress test)"
+
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
 check "Stop ends it (exit code 3)" code stop 3

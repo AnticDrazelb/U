@@ -5,10 +5,10 @@ Subject: [PATCH] null renderer: software draws find their programs without
  hashing the code at every draw
 
 ---
- .../renderer_null/null_rasterizer.cpp         | 22 ++++++++----
- .../renderer_null/software_draw.cpp           | 35 +++++++++++++++++--
- src/video_core/renderer_null/software_draw.h  | 10 ++++++
- 3 files changed, 59 insertions(+), 8 deletions(-)
+ .../renderer_null/null_rasterizer.cpp         | 22 +++++--
+ .../renderer_null/software_draw.cpp           | 64 ++++++++++++++++++-
+ src/video_core/renderer_null/software_draw.h  | 10 +++
+ 3 files changed, 88 insertions(+), 8 deletions(-)
 
 diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
 index e41faa0d6..4b85fd4b2 100644
@@ -58,10 +58,46 @@ index e41faa0d6..4b85fd4b2 100644
  }
  void RasterizerNull::DispatchCompute() {}
 diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
-index 8e28f9a86..fa2726a81 100644
+index 8e28f9a86..0d4743d94 100644
 --- a/src/video_core/renderer_null/software_draw.cpp
 +++ b/src/video_core/renderer_null/software_draw.cpp
-@@ -2732,6 +2732,11 @@ void SoftwareDraw::DrawTexture(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_mem
+@@ -1910,6 +1910,35 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+             const bool uniform_offset =
+                 std::all_of(offsets.w[0] + 1, offsets.w[0] + n, [&](u32 v) { return v == offsets.w[0][0]; }) &&
+                 std::all_of(offsets.w[1] + 1, offsets.w[1] + n, [&](u32 v) { return v == offsets.w[1][0]; });
++            if (!linear && uniform_offset && texture->identity_swizzle) {
++                // nearest: the texel under each lane's coordinates, when every one is inside
++                const s32 width = s32(level.width), height = s32(level.height);
++                const s32 offset_x = s32(offsets.w[0][0]), offset_y = s32(offsets.w[1][0]);
++                alignas(64) s32 tx[LANES], ty[LANES];
++                for (u32 i = 0; i < LANES; ++i) {
++                    f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
++                    u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
++                    tx[i] = FloorToInt(std::clamp(u * f32(width), -1e6f, 1e6f)) + offset_x;
++                    ty[i] = FloorToInt(std::clamp(v * f32(height), -1e6f, 1e6f)) + offset_y;
++                }
++                bool inside = true;
++                for (u32 i = 0; i < n; ++i) {
++                    inside &= tx[i] >= 0 && ty[i] >= 0 && tx[i] < width && ty[i] < height;
++                }
++                if (inside) {
++                    const u32* const texels = level.rgba8.data() + size_t(texture->base_layer) * level.height * level.depth * level.width;
++                    const f32* const rgb = texture->rgb_table;
++                    const f32* const unorm = UnormTable().data();
++                    for (u32 i = 0; i < n; ++i) {
++                        const u32 t = texels[size_t(ty[i]) * level.width + size_t(tx[i])];
++                        SetFl(d, i, rgb[t & 0xFF], 0);
++                        SetFl(d, i, rgb[(t >> 8) & 0xFF], 1);
++                        SetFl(d, i, rgb[(t >> 16) & 0xFF], 2);
++                        SetFl(d, i, unorm[t >> 24], 3);
++                    }
++                    return;
++                }
++            }
+             if (linear && !texture->srgb && uniform_offset && texture->identity_swizzle) {
+                 const s32 width = s32(level.width), height = s32(level.height);
+                 const s32 offset_x = s32(offsets.w[0][0]), offset_y = s32(offsets.w[1][0]);
+@@ -2732,6 +2761,11 @@ void SoftwareDraw::DrawTexture(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_mem
  }
  
  void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
@@ -73,7 +109,7 @@ index 8e28f9a86..fa2726a81 100644
      textures->marks++;
      for (auto& [key, texture] : textures->entries) {
          if (address < texture.address + texture.size && texture.address < address + size) {
-@@ -2741,6 +2746,12 @@ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
+@@ -2741,6 +2775,12 @@ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
  }
  
  void SoftwareDraw::MarkDeviceWritten(DAddr address, u64 size) {
@@ -86,7 +122,7 @@ index 8e28f9a86..fa2726a81 100644
      textures->marks++;
      for (auto& [key, texture] : textures->entries) {
          if (!texture.device_range ||
-@@ -2751,6 +2762,7 @@ void SoftwareDraw::MarkDeviceWritten(DAddr address, u64 size) {
+@@ -2751,6 +2791,7 @@ void SoftwareDraw::MarkDeviceWritten(DAddr address, u64 size) {
  }
  
  void SoftwareDraw::MarkAllWritten() {
@@ -94,7 +130,7 @@ index 8e28f9a86..fa2726a81 100644
      textures->marks++;
      for (auto& [key, texture] : textures->entries) {
          texture.checked = false;
-@@ -2779,6 +2791,13 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2779,6 +2820,13 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
      const auto& regs = maxwell3d.regs;
      const GPUVAddr base = regs.program_region.Address();
      const u32 offset = regs.pipelines[stage].offset;
@@ -108,7 +144,7 @@ index 8e28f9a86..fa2726a81 100644
      VideoCommon::GraphicsEnvironment env{maxwell3d, gpu_memory,
                                           static_cast<Maxwell::Regs::ShaderType>(stage), base,
                                           offset};
-@@ -2788,8 +2807,19 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2788,8 +2836,19 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
          return nullptr;
      }
      const u64 key = *hash ^ (u64{stage} << 60) ^ (u64{offset} << 32);
@@ -129,7 +165,7 @@ index 8e28f9a86..fa2726a81 100644
      }
      auto program = std::make_unique<Program>();
      try {
-@@ -2833,7 +2863,8 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2833,7 +2892,8 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
      pools->inst.ReleaseContents();
      pools->block.ReleaseContents();
      pools->flow_block.ReleaseContents();

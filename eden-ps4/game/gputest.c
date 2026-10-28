@@ -17,6 +17,8 @@
 // is (the storage square is drawn with its indices in the command stream). From frame 30 the CPU
 // paints the sprite's middle blue, which the turning square shows. The
 // bouncing squares are cleared by a GPU macro (MME, as deko3d and Mesa draw through macros).
+// A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
+// them (up and down change how many, by 100).
 
 #include <math.h>
 #include <stdbool.h>
@@ -517,6 +519,20 @@ int main(int argc, char* argv[]) {
     write_programs(heap);
     write_texture(heap, sprite_iova, SPRITE, SPRITE, SPRITE * 4);
     write_tile_texture(heap, tile_image);
+    // The stress test's sprites' vertices: 4 for each, for each command buffer
+#define MAX_SPRITES 2000
+#define SPRITE_VERTEX_BYTES ((CMD_BUFS * MAX_SPRITES * 128 + 0xFFF) & ~0xFFF) // whole pages
+    float* sprite_vertices = aligned_alloc(0x1000, SPRITE_VERTEX_BYTES);
+    NvMap sprite_vertex_map;
+    iova_t sprite_vertices_iova = 0;
+    if (!sprite_vertices ||
+        R_FAILED(rc = nvMapCreate(&sprite_vertex_map, sprite_vertices, SPRITE_VERTEX_BYTES, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(rc = nvAddressSpaceMap(&as, nvMapGetHandle(&sprite_vertex_map), true, NvKind_Pitch, &sprite_vertices_iova))) {
+        fprintf(stderr, "gputest: sprite vertices: %#x\n", rc);
+        return 1;
+    }
+    bool stress = false;
+    int stress_sprites = 400;
     {   // the storage buffer (a cyan), its address and size in the constant buffer
         const float colour[4] = {0.1f, 0.9f, 0.95f, 1.0f};
         memcpy(heap + STORAGE_OFFSET, colour, sizeof(colour));
@@ -552,8 +568,18 @@ int main(int argc, char* argv[]) {
     int next_cmd = 0;
     while (appletMainLoop()) {
         padUpdate(&pad);
-        if (padGetButtonsDown(&pad) & HidNpadButton_Plus)
+        const u64 down = padGetButtonsDown(&pad);
+        if (down & HidNpadButton_Plus)
             break;
+        if (down & HidNpadButton_A) {
+            stress = !stress;
+            fprintf(stderr, "gputest: stress test %s (%d sprites)\n", stress ? "on" : "off", stress_sprites);
+        }
+        if (down & (HidNpadButton_Up | HidNpadButton_Down)) {
+            stress_sprites += (down & HidNpadButton_Up) ? 100 : -100;
+            stress_sprites = stress_sprites < 100 ? 100 : stress_sprites > MAX_SPRITES ? MAX_SPRITES : stress_sprites;
+            fprintf(stderr, "gputest: stress test: %d sprites\n", stress_sprites);
+        }
 
         // a buffer the display is done with
         s32 slot = -1;
@@ -897,6 +923,40 @@ int main(int argc, char* argv[]) {
             method1(M_DRAW_END, 0);
             method1(M_STENCIL_ENABLE, 0);
         }
+        // the stress test: sprites (the sprite texture on 24x24 squares) wandering, a draw each
+        if (stress) {
+            const int index = (int)(g_cmd - cmds);
+            float* base = sprite_vertices + (size_t)index * MAX_SPRITES * 32;
+            const iova_t base_iova = sprite_vertices_iova + (iova_t)index * MAX_SPRITES * 128;
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_TEX_OFFSET);
+            for (int i = 0; i < stress_sprites; i++) {
+                const float t = (float)frame * 0.02f + (float)i * 0.37f;
+                const float cx = 0.9f * sinf(t * 0.7f + i), cy = 0.85f * cosf(t * 0.5f + i * 1.3f);
+                const float hw = 12.0f * 2 / W, hh = 12.0f * 2 / H;
+                float* v = base + i * 32;
+                for (int k = 0; k < 4; k++) {
+                    v[k * 8 + 0] = cx + ((k & 1) ? hw : -hw);
+                    v[k * 8 + 1] = cy + ((k & 2) ? hh : -hh);
+                    v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                    v[k * 8 + 4] = (float)(k & 1), v[k * 8 + 5] = (float)((k >> 1) & 1);
+                    v[k * 8 + 6] = 0.0f, v[k * 8 + 7] = 1.0f;
+                }
+                const iova_t quad = base_iova + (iova_t)i * 128;
+                const u32 stream[4] = {32 | 1 << 12, (u32)(quad >> 32), (u32)quad, 0};
+                method(M_VERTEX_STREAM, 4, stream);
+                const iova_t last = quad + 4 * 32 - 1;
+                const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+                method(M_VERTEX_STREAM_LIMIT, 2, limit);
+                const u32 range[2] = {0, 4};
+                method(M_VERTEX_FIRST, 2, range);
+                method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+                method1(M_DRAW_END, 0);
+            }
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+            armDCacheFlush(base, (size_t)stress_sprites * 128);
+        }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
 
@@ -928,8 +988,9 @@ int main(int argc, char* argv[]) {
             fps = (int)fps_frames;
             fps_frames = 0;
             fps_tick = now;
-            if (frame < 200 || frame % 600 < 60)
-                fprintf(stderr, "gputest: %d fps, %u command words a frame\n", fps, g_cmd->used);
+            if (frame < 200 || frame % 600 < 60 || stress)
+                fprintf(stderr, "gputest: %d fps, %u command words a frame%s\n", fps, g_cmd->used,
+                        stress ? " (stress test)" : "");
         }
     }
 

@@ -209,6 +209,14 @@ Two ways it shows:
   frame, would have spent 60 ms on it); a stage's program is now remembered by its address and
   hashed again once a frame, or when something writes over its code. Clears mark the bytes they
   write, not a generous range.
+- **Small draws on every thread** (patch 0027): a sprite is a draw too small to share between
+  threads, so 2D games' draws ran on one. Draws are now set up and queued, and the queue is
+  rasterized together, a GOB row at a time across the threads, each row in draw order (the pixels
+  come out as if drawn one by one). It's rasterized before anything that could see or change what
+  it draws: a clear, a DMA copy, a 2D blit, an upload, a fence or semaphore, the frame being shown,
+  a texture it draws to being read, a shader that writes memory. The GPU test's stress test (A:
+  400 more sprites, each a draw; up and down change how many) went from 29 frames a second to 55
+  on four desktop threads.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -293,7 +301,9 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    triangle on the left (stencil), a yellow rectangle of lines with a white point in it, bottom
    right, all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
-   the console's cores make of the software GPU.
+   the console's cores make of the software GPU. A turns on its stress test (400 more sprites, each a
+   draw; up and down change how many): the frame rate it keeps says how many sprites a 2D game could
+   draw.
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
@@ -365,6 +375,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: report gathered writes before draws and clears | above |
 | null renderer: indirect draws, inline index buffers and DrawTexture in software | above |
 | null renderer: software draws find their programs without hashing the code at every draw | above |
+| null renderer: small software draws queued and rasterized together on the rasterizing threads | above |
 
 The PS4 memory changes, from what stage 1 measured:
 
