@@ -178,6 +178,23 @@ r, g, b = pixels[(74 * width + 53) * 3:(74 * width + 53) * 3 + 3]
 sys.exit(0 if all(abs(c - 77) < 6 for c in (r, g, b)) else 1)
 PY
 check "its macro is interpreted (no macro JIT)" bash -c "! grep -q 'Macro JIT' '$work/gputest.log'"
+# its floor in perspective, mipmapped (a colour a level), striped by a branch in its shader: near,
+# level 0's grey checkerboard blended toward level 1's red; halfway, orange (levels 1 and 2); far,
+# blue (level 5); a darkened stripe between two bright ones
+check "its floor picks its texture's levels from derivatives, and its shader branches per pixel" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+near, middle, far = at(384, 350), at(384, 315), at(384, 285)
+bright, dark = at(384, 333), at(384, 339)
+ok = near[0] > 200 and near[1] > 150 and near[2] > 150
+ok &= middle[0] > 200 and middle[1] < 150 and middle[2] < 100
+ok &= far[2] > 200 and far[0] < 130 and far[1] < 130
+ok &= dark[0] < bright[0] * 0.75 and dark[1] < bright[1] * 0.75
+sys.exit(0 if ok else 1)
+PY
 
 echo "gputest.nro's stress test: 400 more sprites, a draw each (queued, rasterized together)"
 run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"

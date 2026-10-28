@@ -154,16 +154,15 @@ Two ways it shows:
   the rest, every mip level and layer, and kept. It's checked again (its bytes hashed) after
   anything that might have written to it (a draw or clear into it, a DMA copy, a 2D blit, an
   inline upload) and once a frame, for the CPU's writes. Sampling follows the texture header and
-  the sampler: nearest or bilinear filtering, mipmaps (explicit levels; an implicit one is the base
-  level, as there are no derivatives here), every wrap mode and border colours, swizzles, sRGB,
+  the sampler: nearest or bilinear filtering, mipmaps (explicit levels, and implicit ones from
+  the pixel's quad: patch 0028), every wrap mode and border colours, swizzles, sRGB,
   depth compares, gathers, texel fetches, size queries; 1D, 2D, 3D, cube maps and arrays. Linear
   inline uploads, which the null renderer dropped, are written to memory now.
 - **Faster, on several threads** (patch 0018): each draw's triangles are set up first (24.8 fixed
   point edge functions, so the edge two triangles share is drawn once, by the top-left rule;
   clipped to a guard band), then rasterized 8 rows at a time (a row of the render target's GOBs,
   reached directly) by a few threads: `EDEN_SW_THREADS`, by default half the processors, up to 4.
-  The fragment shader runs on 16 pixels at a time (a program that branches, a pixel at a time),
-  with fast paths for the commonest work: 2D 8-bit textures filtered with 8-bit weights, blending
+  The fragment shader runs on 16 pixels at a time, with fast paths for the commonest work: 2D 8-bit textures filtered with 8-bit weights, blending
   by source alpha into RGBA8, and 2D triangles (no perspective correction). A pixel of the GPU
   test's blended, filtered backdrop costs about 70 ns on one desktop thread, against 200 before:
   the test draws at 40-48 frames a second on one thread, 60 on four. `EDEN_SW_STATS` (always on
@@ -174,7 +173,8 @@ Two ways it shows:
 - **Storage buffers and global memory** (patch 0020): shaders' storage buffer reads and writes
   (their addresses and sizes read from the constant buffers, as Eden's buffer cache reads them),
   and global memory accesses the recompiler couldn't tie to a buffer, go to emulated memory. The
-  subgroup operations (votes, ballots, shuffles, the quad swizzle) work as for subgroups of one.
+  subgroup operations (votes, ballots, shuffles, the quad swizzle) work over a fragment shader's
+  16 pixels (patch 0028).
 - **Points and lines** (patch 0021): points as squares of the point size (fixed or the vertex
   program's), lines widened along their minor axis to the line width, as aliased lines are drawn;
   line strips and loops, quad strips and polygons too. The GPU test's lines and point come out the
@@ -217,6 +217,26 @@ Two ways it shows:
   a texture it draws to being read, a shader that writes memory. The GPU test's stress test (A:
   400 more sprites, each a draw; up and down change how many) went from 29 frames a second to 55
   on four desktop threads.
+- **Quads, mipmaps, branches** (patch 0028): a fragment shader's 16 pixels are now 8 columns by 2
+  rows, four 2x2 quads as the GPU shades them, with helper pixels where a quad sticks out of the
+  triangle. The Switch's GPU has no derivative instruction: NVN's code works derivatives out with
+  shuffles between a quad's pixels and its swizzled add (FSWZADD), and the texture unit picks an
+  implicit level of detail from the quad. Both see the quads now, so mipmaps work. A program that
+  branches ran a pixel at a time; now its pixels each go their own way, the ones at the earliest
+  instruction running it while the rest wait, rejoining where they meet (results kept only for the
+  pixels that ran an instruction), and local memory is per pixel. The texture fast paths now take
+  repeating (power-of-two) and clamped coordinates, which sent every lane of the tiled backdrop
+  down the slow path before, and mipmapped textures a level at a time with trilinear blending: a
+  pixel of the GPU test costs 25-28 ns on one desktop thread, from 38. The test has a floor in
+  perspective now (bottom middle): its texture's levels are a colour each, so where each is
+  sampled shows, and its shader branches per pixel for its stripes. It matches the Vulkan renderer
+  on lavapipe to within a few levels of each colour channel.
+- **Setting draws up** (patch 0029): a program remembered at an address was checked again each
+  frame through Eden's shader environment, whose reads of the code (the memory manager's safe
+  reads) each ask the rasterizer to flush that region, which rasterized the queued draws halfway
+  through a draw's setup. The program's bytes are kept and compared instead, and a read of memory
+  rasterizes the queue only if a queued draw draws there. A draw's setup went from 157 to 31
+  microseconds on the desktop; the GPU test draws at 53 frames a second on one desktop thread.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -299,7 +319,10 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    scrolling backdrop of diamond tiles over the bands (textures), a red and a green bar at the top
    right, each in front on its half (depth), a cyan square top left (a storage buffer), an orange
    triangle on the left (stencil), a yellow rectangle of lines with a white point in it, bottom
-   right, all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
+   right, a floor in perspective at the bottom (a grey checkerboard near, then red, orange, green,
+   cyan and blue bands into the distance: mipmaps; darker stripes across it: a shader's branch),
+   all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame
+   a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
    the console's cores make of the software GPU. A turns on its stress test (400 more sprites, each a
    draw; up and down change how many): the frame rate it keeps says how many sprites a 2D game could
@@ -376,6 +399,8 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: indirect draws, inline index buffers and DrawTexture in software | above |
 | null renderer: software draws find their programs without hashing the code at every draw | above |
 | null renderer: small software draws queued and rasterized together on the rasterizing threads | above |
+| null renderer: software fragment shaders run in 2x2 quads, branching per lane | above |
+| null renderer: software draws recheck shaders by their code, and flush for reads only where they draw | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

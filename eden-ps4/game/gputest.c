@@ -17,6 +17,8 @@
 // is (the storage square is drawn with its indices in the command stream). From frame 30 the CPU
 // paints the sprite's middle blue, which the turning square shows. The
 // bouncing squares are cleared by a GPU macro (MME, as deko3d and Mesa draw through macros).
+// And a floor in perspective (bottom middle) with a mipmapped texture: each level a colour of its
+// own, sampled where the floor's derivatives choose, the shader branching per pixel for stripes.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100).
 
@@ -138,6 +140,31 @@ static u64 mov_cbuf(u32 dest, u32 bank, u32 offset) {
 static u64 ldg128(u32 dest, u32 addr) {
     return 0xEED0ull << 48 | 6ull << 48 /* 128 bits */ | 1ull << 45 /* 64-bit address */ | PT | (u64)addr << 8 | dest;
 }
+// IPA.MUL Rdest, a[attribute], Rmultiplier (a perspective varying: interpolated over w, times w)
+static u64 ipa_mul(u32 dest, u32 attribute, u32 multiplier) {
+    return 0xE0ull << 56 | 1ull << 54 | (u64)(attribute / 4) << 30 | (u64)multiplier << 20 | PT | RZ << 8 | dest;
+}
+// MUFU Rdest, Rsrc: 1 sine, 4 reciprocal
+static u64 mufu(u32 dest, u32 src, u32 operation) {
+    return 0x5080ull << 48 | (u64)operation << 20 | PT | (u64)src << 8 | dest;
+}
+// FMUL32I Rdest, Rsrc, value
+static u64 fmul32i(u32 dest, u32 src, float value) {
+    u32 bits;
+    memcpy(&bits, &value, 4);
+    return 0x1Eull << 56 | (u64)bits << 20 | PT | (u64)src << 8 | dest;
+}
+// FSETP.GT.AND Ppred, PT, Rsrc, value, PT (the value's top 19 bits)
+static u64 fsetp_gt(u32 pred, u32 src, float value) {
+    u32 bits;
+    memcpy(&bits, &value, 4);
+    return 0x36Bull << 52 | 4ull << 48 /* GT */ | (u64)(bits >> 31) << 56 | 7ull << 39 /* and PT */ |
+           (u64)((bits >> 12) & 0x7FFFF) << 20 | PT | (u64)src << 8 | (u64)pred << 3 | 7 /* PT */;
+}
+// @Ppred BRA: a jump 'offset' bytes from the next instruction, taken where the predicate is true
+static u64 bra_if(u32 pred, s32 offset) {
+    return 0xE24ull << 52 | ((u64)(u32)offset & 0xFFFFFF) << 20 | (u64)pred << 16 | 0xF /* always */;
+}
 static u64 exit_(void) { // EXIT (condition: true)
     return 0xE30ull << 52 | PT | 0xF;
 }
@@ -153,6 +180,7 @@ static u64 nop(void) {
 #define FS_TEX_OFFSET 0x210
 #define FS_TILES_OFFSET 0x310
 #define FS_STORAGE_OFFSET 0x410
+#define FS_FLOOR_OFFSET 0x510
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -224,6 +252,34 @@ static void write_programs(u8* heap) {
     fbuf[5] = exit_();
     fbuf[6] = nop();
     fbuf[7] = nop();
+
+    // the floor's: a perspective-correct varying (u, v), the mipmapped texture sampled at the level
+    // its derivatives choose, and stripes darkened where sin(pi v) isn't positive (a branch)
+    u32* ff_sph = (u32*)(heap + FS_FLOOR_OFFSET);
+    ff_sph[0] = 2 | 3 << 5 | 5 << 10;
+    ((u8*)ff_sph)[24] = 0x0A; // varying 0, xy, perspective
+    ff_sph[18] = 0xF;
+    u64* ff = (u64*)(heap + FS_FLOOR_OFFSET + 0x50);
+    ff[0] = SCHED;
+    ff[1] = ipa(7, 0x7C);        // R7 = 1/w
+    ff[2] = mufu(7, 7, 4);       // R7 = w
+    ff[3] = ipa_mul(4, 0x80, 7); // R4 = u
+    ff[4] = SCHED;
+    ff[5] = ipa_mul(5, 0x84, 7); // R5 = v
+    ff[6] = tex2d(0, 4, 8);      // R0..R3 = the floor's texture
+    ff[7] = fmul32i(6, 5, 3.14159265f);
+    ff[8] = SCHED;
+    ff[9] = mufu(6, 6, 1);       // R6 = sin(pi v)
+    ff[10] = fsetp_gt(0, 6, 0.0f);
+    ff[11] = bra_if(0, 0x20);    // positive: on to the exit
+    ff[12] = SCHED;
+    ff[13] = fmul32i(0, 0, 0.6f);
+    ff[14] = fmul32i(1, 1, 0.6f);
+    ff[15] = fmul32i(2, 2, 0.6f);
+    ff[16] = SCHED;
+    ff[17] = exit_();
+    ff[18] = nop();
+    ff[19] = nop();
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -269,6 +325,52 @@ static void write_tile_texture(u8* heap, iova_t image) {
     tsc[0] = 0;                   // repeat
     tsc[1] = 2 | 2 << 4 | 1 << 6; // linear, linear, no mipmaps
     *(u32*)(heap + FS_CBUF + 4) = 1;
+}
+// The floor's texture: 64x64 and its 6 smaller levels, block linear, written by the CPU. Level 0
+// a grey checkerboard, the rest a colour each (red, orange, green, cyan, blue, purple), so where
+// each is sampled shows; header and sampler 2: trilinear, repeating.
+#define MIP_LEVELS 7
+static const u32 mip_colours[MIP_LEVELS] = {0, 0xFF3C46E6, 0xFF28A0F0, 0xFF3CDC96, 0xFFDCC83C,
+                                            0xFFF05A46, 0xFFDC46AA};
+// a block-linear image's byte for byte column xb, row y (GOBs of 64 bytes by 8 rows, blocks of
+// 8 << block_height rows)
+static u32 block_linear(u32 xb, u32 y, u32 width_bytes, u32 block_height) {
+    const u32 gobs_x = (width_bytes + 63) / 64, block_rows = 8u << block_height;
+    const u32 block_bytes = 512u << block_height, x = xb % 64, r = y % 8;
+    return (y / block_rows) * gobs_x * block_bytes + (xb / 64) * block_bytes + (y % block_rows / 8) * 512 +
+           (x / 32) * 256 + (r / 2) * 64 + ((x % 32) / 16) * 32 + (r % 2) * 16 + x % 16;
+}
+static void write_mip_texture(u8* heap, u8* image_mem, iova_t image) {
+    u32 offset = 0;
+    for (u32 level = 0; level < MIP_LEVELS; level++) {
+        const u32 size = 64 >> level, gobs_y = (size + 7) / 8;
+        u32 block_height = 3; // as the GPU shrinks a level's blocks to fit it
+        while (block_height > 0 && gobs_y <= (1u << block_height) / 2)
+            block_height--;
+        const u32 bytes = ((size * 4 + 63) / 64) * ((gobs_y + (1u << block_height) - 1) >> block_height) *
+                          (512u << block_height);
+        for (u32 y = 0; y < size; y++)
+            for (u32 x = 0; x < size; x++) {
+                const u32 grey = ((x / 8 + y / 8) % 2) ? 0xFF3C3C3C : 0xFFEBEBEB;
+                const u32 texel = level == 0 ? grey : mip_colours[level];
+                memcpy(image_mem + offset + block_linear(x * 4, y, size * 4, block_height), &texel, 4);
+            }
+        offset += bytes;
+    }
+    armDCacheFlush(image_mem, offset);
+    u32* tic = (u32*)(heap + TIC_POOL + 64);
+    tic[0] = 0x08 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    tic[1] = (u32)image;
+    tic[2] = (u32)(image >> 32) | 3 << 21 /* block linear */;
+    tic[3] = 3 << 3 /* blocks 8 GOBs high */ | (MIP_LEVELS - 1) << 28 /* levels */;
+    tic[4] = 63 | 1 << 23;
+    tic[5] = 63 | 1u << 31;
+    tic[7] = (MIP_LEVELS - 1) << 4; // the view's levels: all
+    u32* tsc = (u32*)(heap + TSC_POOL + 64);
+    tsc[0] = 0;                               // repeat
+    tsc[1] = 2 | 2 << 4 | 3 << 6;             // linear, linear, linear between levels
+    tsc[2] = ((MIP_LEVELS - 1) * 256) << 12;  // levels of detail 0 to 6
+    *(u32*)(heap + FS_CBUF + 8) = 2;
 }
 #define M_FENCE_VALUE 0x1C // GPFIFO (puller) methods
 #define M_FENCE_ACTION 0x1D
@@ -519,6 +621,16 @@ int main(int argc, char* argv[]) {
     write_programs(heap);
     write_texture(heap, sprite_iova, SPRITE, SPRITE, SPRITE * 4);
     write_tile_texture(heap, tile_image);
+    u8* mip_mem = aligned_alloc(0x1000, 0x8000);
+    NvMap mip_map;
+    iova_t mip_iova = 0;
+    if (!mip_mem || R_FAILED(rc = nvMapCreate(&mip_map, mip_mem, 0x8000, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(rc = nvAddressSpaceMap(&as, nvMapGetHandle(&mip_map), true, NvKind_Pitch, &mip_iova))) {
+        fprintf(stderr, "gputest: floor texture: %#x\n", rc);
+        return 1;
+    }
+    memset(mip_mem, 0, 0x8000);
+    write_mip_texture(heap, mip_mem, mip_iova);
     // The stress test's sprites' vertices: 4 for each, for each command buffer
 #define MAX_SPRITES 2000
 #define SPRITE_VERTEX_BYTES ((CMD_BUFS * MAX_SPRITES * 128 + 0xFFF) & ~0xFFF) // whole pages
@@ -545,6 +657,7 @@ int main(int argc, char* argv[]) {
 #define TILES_OFFSET(i) (0x1C00 + (i) * 0x80)
 #define DEPTH_OFFSET(i) (0x2400 + (i) * 0x200) // the depth bars (8 vertices), then the storage square (4)
 #define LINES_OFFSET(i) (0x3200 + (i) * 0x200)  // the lines (5 vertices), then the point (1)
+#define FLOOR_OFFSET(i) (0x3C00 + (i) * 0x80)   // the floor (4 vertices)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -641,9 +754,9 @@ int main(int argc, char* argv[]) {
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             // textures: the pools, the handles' constant buffer
             method1(M_SAMPLER_BINDING, 1);
-            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 1};
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 2};
             method(M_TEX_HEADER_POOL, 3, headers);
-            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 1};
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 2};
             // blending (for the tiles): source alpha over the frame
             const u32 blend[8] = {0, BLEND_ADD, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA,
                                   BLEND_ADD, BLEND_SRC_ALPHA, 0, BLEND_ONE_MINUS_SRC_ALPHA};
@@ -782,6 +895,36 @@ int main(int argc, char* argv[]) {
             const u32 stream[4] = {32 | 1 << 12, (u32)(quad >> 32), (u32)quad, 0};
             method(M_VERTEX_STREAM, 4, stream);
             const iova_t last = quad + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+        }
+        // a floor in perspective, bottom middle: its far end 8 times as far as its near one, its
+        // texture repeated 4 times across and 6 along, mipmapped (the levels' colours show where each
+        // is sampled), striped by its shader
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + FLOOR_OFFSET(index));
+            for (int k = 0; k < 4; k++) {
+                const int right = k & 1, far = k >> 1;
+                const float w = far ? 8.0f : 1.0f;                // depth
+                const float x = 0.2f + (right ? 0.36f : -0.36f) / w; // where it's seen
+                const float y = 0.52f + 0.45f / w;
+                v[k * 8 + 0] = x * w, v[k * 8 + 1] = y * w, v[k * 8 + 2] = 0.5f * w, v[k * 8 + 3] = w;
+                v[k * 8 + 4] = right ? 4.0f : 0.0f, v[k * 8 + 5] = far ? 6.0f : 0.0f;
+                v[k * 8 + 6] = 0.0f, v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t floor_vertices = heap_iova + FLOOR_OFFSET(index);
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_FLOOR_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(floor_vertices >> 32), (u32)floor_vertices, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = floor_vertices + 4 * 32 - 1;
             const u32 limit[2] = {(u32)(last >> 32), (u32)last};
             method(M_VERTEX_STREAM_LIMIT, 2, limit);
             const u32 range[2] = {0, 4};

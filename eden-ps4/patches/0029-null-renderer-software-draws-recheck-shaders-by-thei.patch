@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 17:15:01 +0000
+Subject: [PATCH] null renderer: software draws recheck shaders by their code,
+ and flush for reads only where they draw
+
+A program remembered at an address was checked again each frame through Eden's shader
+environment, which reads the code with the memory manager's safe reads: each of those
+asks the rasterizer to flush the region, which rasterized the queued draws in the middle
+of a draw's setup. The program's bytes are kept and compared instead.
+
+And a read of memory (FlushRegion) rasterizes the queued draws only when one of them draws
+to it (their render targets and depth buffer, kept by device address).
+---
+ .../renderer_null/null_rasterizer.cpp         |  2 +-
+ .../renderer_null/software_draw.cpp           | 48 +++++++++++++++++--
+ src/video_core/renderer_null/software_draw.h  | 12 +++++
+ 3 files changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index 19b901d80..a3d496c09 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -317,7 +317,7 @@ void RasterizerNull::FlushAll() {
+     m_software.Flush();
+ }
+ void RasterizerNull::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+-    m_software.Flush();
++    m_software.FlushRegion(addr, size);
+ }
+ bool RasterizerNull::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+     return false;
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 1dc81fd60..17dfc884a 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -3284,6 +3284,16 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+     if (recent.program && recent.frame == frame_count) {
+         return recent.program;
+     }
++    // found here in an earlier frame: the same if its code is (compared directly: Eden's shader
++    // environment reads it in a way that rasterizes the queued draws, and hashes it)
++    if (recent.program && !recent.code.empty()) {
++        code_scratch.resize(recent.code.size());
++        gpu_memory.ReadBlockUnsafe(recent.address, code_scratch.data(), code_scratch.size());
++        if (code_scratch == recent.code) {
++            recent.frame = frame_count;
++            return recent.program;
++        }
++    }
+     VideoCommon::GraphicsEnvironment env{maxwell3d, gpu_memory,
+                                          static_cast<Maxwell::Regs::ShaderType>(stage), base,
+                                          offset};
+@@ -3296,6 +3306,8 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+     recent.frame = frame_count;
+     recent.address = base + offset;
+     recent.size = env.CachedSizeBytes();
++    recent.code.resize(recent.size);
++    gpu_memory.ReadBlockUnsafe(recent.address, recent.code.data(), recent.code.size());
+     recent.device_range = false;
+     if (gpu_memory.IsContinuousRange(recent.address, recent.size)) {
+         if (const auto device = gpu_memory.GpuToCpuAddress(recent.address)) {
+@@ -3731,6 +3743,18 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+     }
+ }
+ 
++void SoftwareDraw::FlushRegion(DAddr address, u64 size) {
++    if (queue.empty()) {
++        return;
++    }
++    const bool drawn = queued_writes_unknown || std::ranges::any_of(queued_writes, [&](const QueuedWrite& write) {
++                           return address < write.device_end && write.device_begin < address + size;
++                       });
++    if (drawn) {
++        Flush();
++    }
++}
++
+ /// Rasterizes the queued draws: a GOB row (8 pixel rows) at a time, on the rasterizing threads when
+ /// there's enough to share, otherwise on this one
+ void SoftwareDraw::Flush() {
+@@ -3786,6 +3810,8 @@ void SoftwareDraw::Flush() {
+     queue.clear();
+     queued_pixels = 0;
+     pending_texture_writes = false;
++    queued_writes.clear();
++    queued_writes_unknown = false;
+     if (stats.enabled) {
+         stats.raster += Stats::Clock::now() - raster_start;
+         stats.threads = std::max(stats.threads, threads);
+@@ -4386,12 +4412,28 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     }
+     // textures drawn to (render to texture) are checked again before they're next sampled (and
+     // the queue rasterized first)
++    // (and what they draw to kept, by device address, for reads of it)
++    const auto mark_drawn = [&](GPUVAddr address, u64 size) {
++        MarkWritten(address, size);
++        for (const QueuedWrite& write : queued_writes) {
++            if (write.address == address && write.size == size) {
++                return;
++            }
++        }
++        const auto device = gpu_memory.IsContinuousRange(address, size) ? gpu_memory.GpuToCpuAddress(address)
++                                                                         : std::nullopt;
++        if (device) {
++            queued_writes.push_back({address, size, *device, *device + size});
++        } else {
++            queued_writes_unknown = true;
++        }
++    };
+     for (const Target& tg : batch->targets) {
+-        MarkWritten(tg.address, tg.pitch_linear ? u64{tg.pitch} * tg.height
+-                                                : tg.block_row_size * ((tg.height + tg.block_rows - 1) / tg.block_rows));
++        mark_drawn(tg.address, tg.pitch_linear ? u64{tg.pitch} * tg.height
++                                               : tg.block_row_size * ((tg.height + tg.block_rows - 1) / tg.block_rows));
+     }
+     if (depth_write || stencil_test) {
+-        MarkWritten(zeta_address, zeta_block_row_size * ((regs.zeta_size.height + zeta_block_rows - 1) / zeta_block_rows));
++        mark_drawn(zeta_address, zeta_block_row_size * ((regs.zeta_size.height + zeta_block_rows - 1) / zeta_block_rows));
+     }
+     const u64 pixels = batch->pixels;
+     const size_t triangle_count = batch->triangles.size();
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index a99cb4fce..79dd0b51f 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -79,6 +79,9 @@ public:
+     /// Rasterizes the queued draws: before anything that reads or writes what they draw to.
+     void Flush();
+ 
++    /// The same, for a read of these bytes (by device address): only if a queued draw draws there.
++    void FlushRegion(DAddr address, u64 size);
++
+     struct Program;
+ 
+ private:
+@@ -93,6 +96,13 @@ private:
+     std::vector<std::unique_ptr<Batch>> queue; // draws set up, waiting to be rasterized
+     u64 queued_pixels = 0;
+     bool pending_texture_writes = false; // queued draws write to textures in the cache
++    struct QueuedWrite { // what the queued draws draw to
++        GPUVAddr address;
++        u64 size;
++        DAddr device_begin, device_end;
++    };
++    std::vector<QueuedWrite> queued_writes;
++    bool queued_writes_unknown = false; // one of them isn't one range of device memory
+     struct Raster;
+     std::vector<Raster> raster; // the rasterizing threads' state
+     void RasterRows(Batch& batch, Raster& st, s32 row_begin, s32 row_end);
+@@ -110,9 +120,11 @@ private:
+         u64 size = 0;
+         DAddr device_address = 0;
+         bool device_range = false;
++        std::vector<u8> code; // its bytes when they were hashed
+     };
+     std::unordered_map<u64, RecentProgram> recent_programs;
+     Common::ScratchBuffer<u8> scratch;
++    std::vector<u8> code_scratch;
+ };
+ 
+ } // namespace Null

@@ -1,0 +1,1110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 17:06:43 +0000
+Subject: [PATCH] null renderer: software fragment shaders run in 2x2 quads,
+ branching per lane
+
+A fragment shader's 16 lanes are now 8 columns by 2 rows of pixels: four quads, with
+helper lanes where a quad is partly outside the triangle. Shuffles, FSWZADD, votes and
+derivatives see the quads as a subgroup, so the derivatives NVN's code works out are
+right, and textures sampled with an implicit level of detail pick their level from the
+quad: mipmaps work.
+
+Programs that branch no longer run a pixel at a time: lanes that branch apart each go
+their own way, the earliest instruction first, rejoining where they meet; results are
+kept only for the lanes that ran an instruction. Local memory is per lane.
+
+The texture fast paths take repeating (power-of-two) and clamped coordinates, do each
+mip level a group of lanes at a time with trilinear blending, and fall back to one lane
+at a time only for the lanes they can't do.
+---
+ .../renderer_null/software_draw.cpp           | 793 +++++++++++++-----
+ 1 file changed, 588 insertions(+), 205 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 8ebc3bff9..1dc81fd60 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -379,6 +379,28 @@ struct Lanes {
+     u32 w[4][LANES];
+ };
+ 
++/// A fragment shader's lanes are 8 columns by 2 rows of pixels: four 2x2 quads. Each lane's
++/// invocation id, as the guest's warp numbers them (a quad's four together: top left, top right,
++/// bottom left, bottom right), and each id's lane
++constexpr std::array<u32, LANES> INVOCATION_ID = [] {
++    std::array<u32, LANES> ids{};
++    for (u32 i = 0; i < LANES; ++i) {
++        ids[i] = (i & 7) / 2 * 4 + (i & 1) + (i / 8) * 2;
++    }
++    return ids;
++}();
++constexpr std::array<u32, LANES> INVOCATION_LANE = [] {
++    std::array<u32, LANES> lanes{};
++    for (u32 i = 0; i < LANES; ++i) {
++        lanes[INVOCATION_ID[i]] = i;
++    }
++    return lanes;
++}();
++/// The top-left lane of a lane's quad (the one to its right is | 1, the one below | 8)
++constexpr u32 QuadTopLeft(u32 lane) {
++    return lane & ~9u;
++}
++
+ enum class Kind : u8 { Ir, Move, Jump, JumpIfTrue, JumpIfFalse, Return };
+ 
+ struct Op {
+@@ -1289,7 +1311,7 @@ std::array<s32, 3> Offsets(const Cell& offset) {
+     return {s32(offset.w[0]), s32(offset.w[1]), s32(offset.w[2])};
+ }
+ 
+-/// A filtered sample, at a level of detail (implicit ones are 0: there are no derivatives here)
++/// A filtered sample, at a level of detail (before the sampler's bias)
+ std::array<f32, 4> SampleTexture(const Binding& binding, IR::TextureInstInfo info,
+                                  const Cell& coords, const Cell& offset, f32 lod,
+                                  const f32* reference) {
+@@ -1408,7 +1430,6 @@ struct SoftwareDraw::Program {
+     u32 local_words = 0;
+     std::vector<Shader::TextureDescriptor> textures;
+     std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
+-    bool one_lane = false; // it branches (or uses local memory): run a pixel at a time
+     std::vector<Shader::StorageBufferDescriptor> storage;
+     bool writes_depth = false;
+     bool can_discard = false;
+@@ -1619,7 +1640,9 @@ private:
+ namespace {
+ 
+ /// What an invocation reads and writes. Inputs, outputs and colours are kept 'stride' lanes to an
+-/// attribute (or colour component), 'n' lanes run from 'lane'.
++/// attribute (or colour component), 'n' lanes run from 'lane'. Of those, 'run' are run: the quads
++/// with pixels in them; 'live' are the pixels (the rest are helpers, run for their quads'
++/// derivatives, writing nothing).
+ struct Io {
+     const f32* inputs;  // by attribute (256)
+     f32* outputs;       // by attribute (256), for the vertex shader
+@@ -1633,6 +1656,8 @@ struct Io {
+     const std::vector<Binding>* textures;
+     const std::vector<StorageBuffer>* storage;
+     Tegra::MemoryManager* memory;
++    u32 run = 1, live = 1;
++    bool quads = false; // the lanes are 2x2 quads (see INVOCATION_ID): a fragment shader's
+ };
+ 
+ class Flattener {
+@@ -1972,121 +1997,265 @@ u32 AccessBytes(IR::Opcode op) {
+     }
+ }
+ 
+-/// The texture instructions, a lane at a time
+-void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io, u32 n) {
++/// How the fast paths take a texel coordinate outside the texture along an axis: repeated (a
++/// power-of-two size), clamped to the edge, or not at all (the lane done one at a time)
++struct AxisWrap {
++    bool repeat, clamp;
++    s32 size;
++
++    AxisWrap(Tegra::Texture::WrapMode mode, s32 size_)
++        : repeat{mode == Tegra::Texture::WrapMode::Wrap && (size_ & (size_ - 1)) == 0},
++          clamp{mode == Tegra::Texture::WrapMode::ClampToEdge}, size{size_} {}
++
++    /// The coordinate wrapped or clamped; 'inside' cleared when it can't be
++    s32 operator()(s32 i, bool& inside) const {
++        if (repeat) {
++            return i & (size - 1);
++        }
++        if (clamp) {
++            return std::clamp(i, 0, size - 1);
++        }
++        inside &= i >= 0 && i < size;
++        return i;
++    }
++};
++
++/// A lane's implicit level of detail, before the sampler's bias: from its quad's coordinates, as
++/// the hardware does it, once a quad (the differences across its top row and down its left
++/// column), in texels of the base level
++f32 QuadLod(const Texture& texture, Shader::TextureType type, const Lanes& coords, u32 lane) {
++    using T = Shader::TextureType;
++    const u32 q = QuadTopLeft(lane), qx = q | 1, qy = q | 8;
++    const Level& level = texture.levels[texture.base_level];
++    std::array<f32, 3> size{f32(level.width), f32(level.height), f32(level.depth)};
++    u32 dims = 2;
++    switch (type) {
++    case T::Color1D:
++    case T::ColorArray1D:
++        dims = 1;
++        break;
++    case T::Color2DRect:
++        size = {1.0f, 1.0f, 1.0f};
++        break;
++    case T::Color3D:
++        dims = 3;
++        break;
++    case T::ColorCube:
++    case T::ColorArrayCube: {
++        // the direction's change over its major axis, on a face the base level's size
++        const f32 major = std::max({std::fabs(Fl(coords, q, 0)), std::fabs(Fl(coords, q, 1)),
++                                    std::fabs(Fl(coords, q, 2))});
++        const f32 scale = major > 0.0f ? 0.5f * size[0] / major : 0.0f;
++        size = {scale, scale, scale};
++        dims = 3;
++        break;
++    }
++    default:
++        break;
++    }
++    f32 across = 0.0f, down = 0.0f;
++    for (u32 k = 0; k < dims; ++k) {
++        const f32 dx = (Fl(coords, qx, k) - Fl(coords, q, k)) * size[k];
++        const f32 dy = (Fl(coords, qy, k) - Fl(coords, q, k)) * size[k];
++        across += dx * dx, down += dy * dy;
++    }
++    const f32 rho2 = std::max(across, down);
++    return rho2 > 0.0f ? 0.5f * std::log2(rho2) : -128.0f;
++}
++
++/// Each running lane's implicit level of detail, before the sampler's bias: its quad's (see
++/// QuadLod) in fragment shaders, the base level elsewhere
++void ImplicitLods(const Io& io, const Texture& texture, Shader::TextureType type, const Lanes& coords,
++                  u32 exec, f32* lods) {
++    std::fill_n(lods, LANES, 0.0f);
++    if (!io.quads) {
++        return;
++    }
++    for (u32 top_left = 0; top_left < LANES / 2; top_left += 2) {
++        if (exec & (0x303u << top_left)) {
++            const f32 lod = QuadLod(texture, type, coords, top_left);
++            lods[top_left] = lods[top_left + 1] = lods[top_left + 8] = lods[top_left + 9] = lod;
++        }
++    }
++}
++
++/// The fast paths' samples of a level of a 2D texture of 8-bit texels (an identity swizzle; for
++/// bilinear ones, not sRGB), for the lanes in 'exec': all lanes at once in arrays (the compiler
++/// vectorizes all but the texel loads), each lane's texel or footprint wrapped or clamped as the
++/// sampler says. Into 'd' for those lanes; returned, the lanes it can't do (a footprint outside the
++/// texture, neither wrapped nor clamped), for one at a time.
++u32 SampleLevelFast(const Texture& texture, const Binding& binding, const Level& level, bool linear,
++                    const Lanes& coords, f32 scale_u, f32 scale_v, s32 offset_x, s32 offset_y, u32 exec,
++                    Lanes& d) {
++    const s32 width = s32(level.width), height = s32(level.height);
++    const AxisWrap wrap_x{binding.wrap[0], width}, wrap_y{binding.wrap[1], height};
++    const u32* const texels = level.rgba8.data() + size_t(texture.base_layer) * level.height * level.depth * level.width;
++    alignas(64) f32 out[4][LANES];
++    u32 slow = 0;
++    if (!linear) { // the texel under each lane's coordinates
++        alignas(64) u32 index[LANES];
++        for (u32 i = 0; i < LANES; ++i) {
++            f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
++            u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
++            bool inside = true;
++            const s32 x = wrap_x(FloorToInt(std::clamp(u * f32(width), -1e6f, 1e6f)) + offset_x, inside);
++            const s32 y = wrap_y(FloorToInt(std::clamp(v * f32(height), -1e6f, 1e6f)) + offset_y, inside);
++            index[i] = inside ? u32(y) * level.width + u32(x) : 0; // (done again one at a time if not)
++            slow |= u32(!inside) << i;
++        }
++        slow &= exec;
++        if (slow == exec) {
++            return slow;
++        }
++        const f32* const rgb = texture.rgb_table;
++        const f32* const unorm = UnormTable().data();
++        for (u32 i = 0; i < LANES; ++i) {
++            const u32 t = texels[index[i]];
++            out[0][i] = rgb[t & 0xFF], out[1][i] = rgb[(t >> 8) & 0xFF], out[2][i] = rgb[(t >> 16) & 0xFF];
++            out[3][i] = unorm[t >> 24];
++        }
++    } else { // the four texels around each lane's coordinates, weighted in 8 bits
++        alignas(64) u32 wx[LANES], wy[LANES], left[LANES], right[LANES], top[LANES], bottom[LANES];
++        for (u32 i = 0; i < LANES; ++i) {
++            f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
++            u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
++            const f32 tx = std::clamp(u * f32(width) - 0.5f, -1e6f, 1e6f);
++            const f32 ty = std::clamp(v * f32(height) - 0.5f, -1e6f, 1e6f);
++            const s32 ix = FloorToInt(tx), iy = FloorToInt(ty);
++            wx[i] = u32(s32((tx - f32(ix)) * 256.0f + 0.5f));
++            wy[i] = u32(s32((ty - f32(iy)) * 256.0f + 0.5f));
++            bool inside = true;
++            const s32 xa = wrap_x(ix + offset_x, inside), xb = wrap_x(ix + offset_x + 1, inside);
++            const s32 ya = wrap_y(iy + offset_y, inside), yb = wrap_y(iy + offset_y + 1, inside);
++            left[i] = inside ? u32(xa) : 0, right[i] = inside ? u32(xb) : 0;
++            top[i] = inside ? u32(ya) * level.width : 0, bottom[i] = inside ? u32(yb) * level.width : 0;
++            slow |= u32(!inside) << i;
++        }
++        slow &= exec;
++        if (slow == exec) {
++            return slow;
++        }
++        alignas(64) u32 t00[LANES], t10[LANES], t01[LANES], t11[LANES];
++        for (u32 i = 0; i < LANES; ++i) {
++            t00[i] = texels[top[i] + left[i]], t10[i] = texels[top[i] + right[i]];
++            t01[i] = texels[bottom[i] + left[i]], t11[i] = texels[bottom[i] + right[i]];
++        }
++        for (u32 ch = 0; ch < 4; ++ch) {
++            const u32 shift = ch * 8;
++            for (u32 i = 0; i < LANES; ++i) {
++                const u32 w00 = (256 - wx[i]) * (256 - wy[i]), w10 = wx[i] * (256 - wy[i]);
++                const u32 w01 = (256 - wx[i]) * wy[i], w11 = wx[i] * wy[i];
++                const u32 sum = ((t00[i] >> shift) & 0xFF) * w00 + ((t10[i] >> shift) & 0xFF) * w10 +
++                                ((t01[i] >> shift) & 0xFF) * w01 + ((t11[i] >> shift) & 0xFF) * w11;
++                out[ch][i] = f32((sum + 32768) >> 16) * (1.0f / 255.0f);
++            }
++        }
++    }
++    for (u32 ch = 0; ch < 4; ++ch) {
++        for (u32 i = 0; i < LANES; ++i) {
++            d.w[ch][i] = ((exec >> i) & 1) != 0 ? std::bit_cast<u32>(out[ch][i]) : d.w[ch][i];
++        }
++    }
++    return slow;
++}
++
++/// The texture instructions, for the lanes in 'exec'
++void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io, u32 exec) {
+     using O = IR::Opcode;
+     IR::TextureInstInfo info{};
+     info.raw = o.extra;
+     Lanes& d = c[o.dest];
+-    // the commonest, all lanes at once: a 2D texture of 8-bit texels, sampled at its base level
+-    // with the same handle in every lane
+     const Lanes& handle = c[o.a[0]];
+-    if ((o.op == O::ImageSampleImplicitLod && !info.has_bias) &&
+-        std::all_of(handle.w[0] + 1, handle.w[0] + n, [&](u32 h) { return h == handle.w[0][0]; })) {
+-        const Binding* const binding = GetBinding(program, io, info.descriptor_index, handle.w[0][0]);
++    const u32 first = u32(std::countr_zero(exec));
++    // (the lanes' masks tested in loops of a fixed count, which the compiler vectorizes)
++    bool uniform_handle = true;
++    for (u32 i = 0; i < LANES; ++i) {
++        uniform_handle &= ((exec >> i) & 1) == 0 || handle.w[0][i] == handle.w[0][first];
++    }
++    // the commonest, all lanes at once: a 2D texture of 8-bit texels with the same handle (and
++    // offsets) in every lane, each lane at the level its level of detail chooses
++    if (o.op == O::ImageSampleImplicitLod && !info.has_bias && uniform_handle) {
++        const Binding* const binding = GetBinding(program, io, info.descriptor_index, handle.w[0][first]);
+         const Texture* const texture = binding ? binding->texture : nullptr;
+         using T = Shader::TextureType;
+         const T type = info.type;
+-        const f32 lod = binding ? std::clamp(binding->lod_bias, binding->min_lod, binding->max_lod) : 0.0f;
+-        if (texture && texture->ok && texture->compact && (type == T::Color2D || type == T::Color2DRect) &&
+-            !(lod > 0.0f)) {
+-            const Level& level = texture->levels[texture->base_level];
+-            const Lanes& coords = c[o.a[1]];
+-            const Lanes& offsets = c[o.a[3]];
+-            const f32 scale_u = type == T::Color2DRect ? 1.0f / f32(s32(level.width)) : 1.0f;
+-            const f32 scale_v = type == T::Color2DRect ? 1.0f / f32(s32(level.height)) : 1.0f;
+-            const bool linear = binding->mag_linear;
+-            // All lanes at once in arrays (the compiler vectorizes all but the texel loads), when
+-            // the texels are linear 8-bit (not sRGB), the offsets the same in every lane, and every
+-            // footprint inside the texture; otherwise lane by lane
+-            const bool uniform_offset =
+-                std::all_of(offsets.w[0] + 1, offsets.w[0] + n, [&](u32 v) { return v == offsets.w[0][0]; }) &&
+-                std::all_of(offsets.w[1] + 1, offsets.w[1] + n, [&](u32 v) { return v == offsets.w[1][0]; });
+-            if (!linear && uniform_offset && texture->identity_swizzle) {
+-                // nearest: the texel under each lane's coordinates, when every one is inside
+-                const s32 width = s32(level.width), height = s32(level.height);
+-                const s32 offset_x = s32(offsets.w[0][0]), offset_y = s32(offsets.w[1][0]);
+-                alignas(64) s32 tx[LANES], ty[LANES];
++        const Lanes& coords = c[o.a[1]];
++        const Lanes& offsets = c[o.a[3]];
++        bool uniform_offset = true;
++        for (u32 i = 0; i < LANES; ++i) {
++            uniform_offset &= ((exec >> i) & 1) == 0 ||
++                              (offsets.w[0][i] == offsets.w[0][first] && offsets.w[1][i] == offsets.w[1][first]);
++        }
++        if (texture && texture->ok && texture->compact && texture->identity_swizzle && uniform_offset &&
++            (type == T::Color2D || type == T::Color2DRect)) {
++            using M = Tegra::Texture::TextureMipmapFilter;
++            const u32 max_level = texture->num_levels - 1;
++            const bool mipmapped = max_level > 0 && binding->mipmap != M::None;
++            alignas(64) f32 lods[LANES];     // each lane's, before the sampler's bias
++            alignas(64) u32 level_of[LANES]; // and the level it chooses (0x100: minified)
++            alignas(64) f32 fraction[LANES]; // toward the next (linear between levels)
++            if (!mipmapped && binding->min_linear == binding->mag_linear) {
++                // the level of detail changes nothing
++                std::fill_n(lods, LANES, 0.0f);
++                std::fill_n(level_of, LANES, 0u);
++                std::fill_n(fraction, LANES, 0.0f);
++            } else {
++                ImplicitLods(io, *texture, type, coords, exec, lods);
+                 for (u32 i = 0; i < LANES; ++i) {
+-                    f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
+-                    u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
+-                    tx[i] = FloorToInt(std::clamp(u * f32(width), -1e6f, 1e6f)) + offset_x;
+-                    ty[i] = FloorToInt(std::clamp(v * f32(height), -1e6f, 1e6f)) + offset_y;
+-                }
+-                bool inside = true;
+-                for (u32 i = 0; i < n; ++i) {
+-                    inside &= tx[i] >= 0 && ty[i] >= 0 && tx[i] < width && ty[i] < height;
+-                }
+-                if (inside) {
+-                    const u32* const texels = level.rgba8.data() + size_t(texture->base_layer) * level.height * level.depth * level.width;
+-                    const f32* const rgb = texture->rgb_table;
+-                    const f32* const unorm = UnormTable().data();
+-                    for (u32 i = 0; i < n; ++i) {
+-                        const u32 t = texels[size_t(ty[i]) * level.width + size_t(tx[i])];
+-                        SetFl(d, i, rgb[t & 0xFF], 0);
+-                        SetFl(d, i, rgb[(t >> 8) & 0xFF], 1);
+-                        SetFl(d, i, rgb[(t >> 16) & 0xFF], 2);
+-                        SetFl(d, i, unorm[t >> 24], 3);
+-                    }
+-                    return;
++                    const f32 lod = std::clamp(lods[i] + binding->lod_bias, binding->min_lod, binding->max_lod);
++                    const bool minified = lod > 0.0f;
++                    const f32 level = mipmapped && minified ? std::min(lod, f32(max_level)) : 0.0f;
++                    const u32 index = binding->mipmap == M::Nearest ? std::min(u32(level + 0.5f), max_level) : u32(level);
++                    fraction[i] = binding->mipmap == M::Linear ? level - f32(index) : 0.0f;
++                    level_of[i] = index | (minified ? 0x100u : 0u);
+                 }
+             }
+-            if (linear && !texture->srgb && uniform_offset && texture->identity_swizzle) {
+-                const s32 width = s32(level.width), height = s32(level.height);
+-                const s32 offset_x = s32(offsets.w[0][0]), offset_y = s32(offsets.w[1][0]);
+-                alignas(64) s32 x0[LANES], y0[LANES];
+-                alignas(64) u32 wx[LANES], wy[LANES];
+-                bool inside = true;
++            const Level& base = texture->levels[texture->base_level];
++            const f32 scale_u = type == T::Color2DRect ? 1.0f / f32(s32(base.width)) : 1.0f;
++            const f32 scale_v = type == T::Color2DRect ? 1.0f / f32(s32(base.height)) : 1.0f;
++            const s32 offset_x = s32(offsets.w[0][first]), offset_y = s32(offsets.w[1][first]);
++            // the lanes a level (and filter) at a time; those left over one at a time
++            u32 slow = 0;
++            for (u32 remaining = exec; remaining != 0;) {
++                const u32 key = level_of[std::countr_zero(remaining)];
++                u32 group = 0;
+                 for (u32 i = 0; i < LANES; ++i) {
+-                    f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
+-                    u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
+-                    const f32 tx = std::clamp(u * f32(width) - 0.5f, -1e6f, 1e6f);
+-                    const f32 ty = std::clamp(v * f32(height) - 0.5f, -1e6f, 1e6f);
+-                    const s32 ix = FloorToInt(tx), iy = FloorToInt(ty);
+-                    x0[i] = ix + offset_x, y0[i] = iy + offset_y;
+-                    wx[i] = u32(s32((tx - f32(ix)) * 256.0f + 0.5f));
+-                    wy[i] = u32(s32((ty - f32(iy)) * 256.0f + 0.5f));
++                    group |= u32(level_of[i] == key) << i;
+                 }
+-                for (u32 i = 0; i < n; ++i) {
+-                    inside &= x0[i] >= 0 && y0[i] >= 0 && x0[i] + 1 < width && y0[i] + 1 < height;
++                group &= remaining;
++                remaining &= ~group;
++                const bool linear = (key & 0x100) != 0 ? binding->min_linear : binding->mag_linear;
++                if (linear && texture->srgb) { // (filtered in 8 bits: not for sRGB)
++                    slow |= group;
++                    continue;
+                 }
+-                if (inside) {
+-                    const u32* const texels = level.rgba8.data() + size_t(texture->base_layer) * level.height * level.depth * level.width;
+-                    alignas(64) u32 t00[LANES], t10[LANES], t01[LANES], t11[LANES];
+-                    for (u32 i = 0; i < n; ++i) {
+-                        const u32* const p = texels + size_t(y0[i]) * level.width + size_t(x0[i]);
+-                        t00[i] = p[0], t10[i] = p[1], t01[i] = p[level.width], t11[i] = p[level.width + 1];
+-                    }
+-                    for (u32 i = n; i < LANES; ++i) {
+-                        t00[i] = t10[i] = t01[i] = t11[i] = 0;
+-                    }
++                const u32 index = key & 0xFF;
++                slow |= SampleLevelFast(*texture, *binding, texture->levels[texture->base_level + index], linear,
++                                        coords, scale_u, scale_v, offset_x, offset_y, group, d);
++                u32 blend = 0;
++                for (u32 i = 0; i < LANES; ++i) {
++                    blend |= u32(fraction[i] > 0.0f) << i;
++                }
++                blend &= group & ~slow;
++                if (blend != 0 && index < max_level) { // and the next level, mixed in
++                    Lanes next;
++                    const u32 next_slow =
++                        SampleLevelFast(*texture, *binding, texture->levels[texture->base_level + index + 1], linear,
++                                        coords, scale_u, scale_v, offset_x, offset_y, blend, next);
++                    slow |= next_slow;
++                    blend &= ~next_slow;
+                     for (u32 ch = 0; ch < 4; ++ch) {
+-                        const u32 shift = ch * 8;
+                         for (u32 i = 0; i < LANES; ++i) {
+-                            const u32 w00 = (256 - wx[i]) * (256 - wy[i]), w10 = wx[i] * (256 - wy[i]);
+-                            const u32 w01 = (256 - wx[i]) * wy[i], w11 = wx[i] * wy[i];
+-                            const u32 sum = ((t00[i] >> shift) & 0xFF) * w00 + ((t10[i] >> shift) & 0xFF) * w10 +
+-                                            ((t01[i] >> shift) & 0xFF) * w01 + ((t11[i] >> shift) & 0xFF) * w11;
+-                            SetFl(d, i, f32((sum + 32768) >> 16) * (1.0f / 255.0f), ch);
++                            const f32 a = Fl(d, i, ch), mixed = a + (Fl(next, i, ch) - a) * fraction[i];
++                            d.w[ch][i] = ((blend >> i) & 1) != 0 ? std::bit_cast<u32>(mixed) : d.w[ch][i];
+                         }
+                     }
+-                    return;
+                 }
+             }
+-            for (u32 i = 0; i < n; ++i) {
+-                const Sampling sampling{*texture, *binding, 2, texture->base_layer,
+-                                        {s32(offsets.w[0][i]), s32(offsets.w[1][i]), 0}, nullptr};
+-                f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
+-                u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
+-                std::array<f32, 4> texel;
+-                if (!(linear ? sampling.BilinearRgba8(level, u, v, texel) : sampling.NearestRgba8(level, u, v, texel))) {
+-                    texel = SampleTexture(*binding, info, LaneCell(coords, i), LaneCell(offsets, i), 0.0f, nullptr);
+-                    for (u32 k = 0; k < 4; ++k) {
+-                        d.w[k][i] = std::bit_cast<u32>(texel[k]);
+-                    }
+-                    continue;
+-                }
+-                texel = Swizzle(*texture, texel);
++            for (u32 m = slow; m != 0; m &= m - 1) {
++                const u32 i = u32(std::countr_zero(m));
++                const std::array<f32, 4> texel =
++                    SampleTexture(*binding, info, LaneCell(coords, i), LaneCell(offsets, i), lods[i], nullptr);
+                 for (u32 k = 0; k < 4; ++k) {
+                     d.w[k][i] = std::bit_cast<u32>(texel[k]);
+                 }
+@@ -2094,34 +2263,38 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+             return;
+         }
+     }
+-    for (u32 i = 0; i < n; ++i) {
++    const bool implicit = io.quads && (o.op == O::ImageSampleImplicitLod || o.op == O::ImageSampleDrefImplicitLod ||
++                                       o.op == O::ImageQueryLod);
++    for (u32 m = exec; m != 0; m &= m - 1) {
++        const u32 i = u32(std::countr_zero(m));
+         const Binding* const binding = GetBinding(program, io, info.descriptor_index, c[o.a[0]].w[0][i]);
+         const Cell b = LaneCell(c[o.a[1]], i), e = LaneCell(c[o.a[2]], i), f = LaneCell(c[o.a[3]], i);
+         std::array<f32, 4> result{};
+         if (binding && info.type != Shader::TextureType::Buffer) {
++            const Texture* const texture = binding->texture;
++            const f32 lod = implicit && texture && texture->ok ? QuadLod(*texture, info.type, c[o.a[1]], i) : 0.0f;
+             switch (o.op) {
+             case O::ImageSampleImplicitLod: // coords, bias, offset
+-                result = SampleTexture(*binding, info, b, f, info.has_bias ? F(e) : 0.0f, nullptr);
++                result = SampleTexture(*binding, info, b, f, lod + (info.has_bias ? F(e) : 0.0f), nullptr);
+                 break;
+             case O::ImageSampleExplicitLod: // coords, lod, offset
+                 result = SampleTexture(*binding, info, b, f, F(e), nullptr);
+                 break;
+             case O::ImageGradient: { // coords, derivatives, offset: the lod from the derivatives
+-                f32 lod = 0.0f;
+-                const Texture* const texture = binding->texture;
++                f32 gradient_lod = 0.0f;
+                 if (texture && texture->ok) {
+                     const Level& level = texture->levels[texture->base_level];
+                     const f32 dx_u = F(e, 0) * f32(level.width), dx_v = F(e, 2) * f32(level.height);
+                     const f32 dy_u = F(e, 1) * f32(level.width), dy_v = F(e, 3) * f32(level.height);
+                     const f32 rho2 = std::max(dx_u * dx_u + dx_v * dx_v, dy_u * dy_u + dy_v * dy_v);
+-                    lod = rho2 > 0.0f ? 0.5f * std::log2(rho2) : 0.0f;
++                    gradient_lod = rho2 > 0.0f ? 0.5f * std::log2(rho2) : 0.0f;
+                 }
+-                result = SampleTexture(*binding, info, b, f, lod, nullptr);
++                result = SampleTexture(*binding, info, b, f, gradient_lod, nullptr);
+                 break;
+             }
+             case O::ImageSampleDrefImplicitLod: { // coords, reference, offset
+                 const f32 reference = F(e);
+-                result[0] = SampleTexture(*binding, info, b, f, 0.0f, &reference)[0];
++                result[0] = SampleTexture(*binding, info, b, f, lod, &reference)[0];
+                 break;
+             }
+             case O::ImageSampleDrefExplicitLod: { // coords, (reference, lod), offset
+@@ -2141,7 +2314,6 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+                 result = FetchTexture(*binding, info, b, e, f.w[0]);
+                 break;
+             case O::ImageQueryDimensions: { // lod
+-                const Texture* const texture = binding->texture;
+                 if (!texture || !texture->ok) {
+                     break;
+                 }
+@@ -2157,9 +2329,19 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+                 std::memcpy(result.data(), dims, sizeof(dims));
+                 break;
+             }
+-            default: // ImageQueryLod
++            default: { // ImageQueryLod: the level sampled, and the level of detail (from the base level's)
++                if (!texture || !texture->ok) {
++                    break;
++                }
++                const f32 lambda = lod + binding->lod_bias;
++                const f32 clamped = std::clamp(lambda, binding->min_lod, binding->max_lod);
++                result[0] = binding->mipmap == Tegra::Texture::TextureMipmapFilter::None
++                                ? 0.0f
++                                : std::clamp(clamped, 0.0f, f32(texture->num_levels - 1));
++                result[1] = lambda;
+                 break;
+             }
++            }
+         }
+         for (u32 k = 0; k < 4; ++k) {
+             d.w[k][i] = std::bit_cast<u32>(result[k]);
+@@ -2167,10 +2349,53 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+     }
+ }
+ 
+-/// A program for 'n' lanes (pixels) at once from 'io.lane'. Programs that branch run one lane at a
+-/// time: a branch goes by lane 0. Wide: arithmetic is done for all LANES lanes (those past 'n'
+-/// unused), in loops of a fixed count the compiler vectorizes; what reads or writes outside the
+-/// program's values, for the 'n' only.
++/// Lanes that have branched apart: where each waits, and which run next
++struct Branches {
++    struct State {
++        u32 pc, exec, waiting, next_join;
++    };
++    std::array<u32, LANES> lane_pc{};
++
++    /// The lanes in 'mask' wait at 'target' (and are added to the waiting ones by the caller)
++    void Park(u32 mask, u32 target) {
++        for (u32 m = mask; m != 0; m &= m - 1) {
++            lane_pc[std::countr_zero(m)] = target;
++        }
++    }
++
++    /// The waiting lanes at pc run with those there
++    State Join(State s) const {
++        s.next_join = ~0u;
++        for (u32 m = s.waiting; m != 0; m &= m - 1) {
++            const u32 i = u32(std::countr_zero(m));
++            if (lane_pc[i] == s.pc) {
++                s.exec |= 1u << i;
++            } else {
++                s.next_join = std::min(s.next_join, lane_pc[i]);
++            }
++        }
++        s.waiting &= ~s.exec;
++        return s;
++    }
++
++    /// The waiting lanes at the earliest instruction run next
++    State Pick(u32 waiting) const {
++        u32 pc = ~0u;
++        for (u32 m = waiting; m != 0; m &= m - 1) {
++            pc = std::min(pc, lane_pc[std::countr_zero(m)]);
++        }
++        return Join({pc, 0, waiting, ~0u});
++    }
++};
++
++/// A program for 'n' lanes (pixels) at once from 'io.lane'. Wide: arithmetic is done for all LANES
++/// lanes (those not run unused), in loops of a fixed count the compiler vectorizes; what reads or
++/// writes outside the program's values, for the lanes run.
++///
++/// Lanes that branch apart each go their own way: those at the earliest instruction run it while
++/// the others wait, each at its own, and join them when they get there (the earliest first keeps
++/// an if's lanes apart until its end, and a loop's until all have left it). While some wait, an
++/// instruction's result is kept only for the lanes that ran it.
+ template <bool Wide>
+ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     using O = IR::Opcode;
+@@ -2178,29 +2403,75 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     constexpr u32 lanes = Wide ? LANES : 1;
+ #define LANE_LOOP for (u32 i = 0; i < lanes; ++i)
+ #define IO_LOOP for (u32 i = 0; i < n; ++i)
+-    for (u32 pc = 0;;) {
+-        const Op& o = ops[pc++];
++#define EXEC_LOOP(mask) for (u32 m_ = (mask), i = 0; m_ != 0 && ((i = u32(std::countr_zero(m_))), true); m_ &= m_ - 1)
++    // (plain values, never referred to: the compiler would reload what's referred to after every
++    // write to the lanes)
++    u32 pc = 0;
++    u32 exec = Wide ? io.run : 1; // the lanes running the instruction at pc
++    u32 waiting = 0;              // the lanes waiting, each at its own instruction (all after pc)
++    u32 next_join = ~0u;          // the earliest of those
++    Branches branches;
++    Lanes saved;
++#define SET_STATE(state)                                                                          \
++    do {                                                                                          \
++        const Branches::State s_ = (state);                                                       \
++        pc = s_.pc, exec = s_.exec, waiting = s_.waiting, next_join = s_.next_join;                \
++    } while (false)
++#define JOIN() SET_STATE(branches.Join({pc, exec, waiting, next_join}))
++#define PICK() SET_STATE(branches.Pick(waiting))
++    for (;;) {
++        const Op& o = ops[pc];
+         switch (o.kind) {
+         case Kind::Move:
+-            for (u32 k = 0; k < 4; ++k) {
+-                std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], lanes * sizeof(u32));
++            if (waiting) {
++                EXEC_LOOP(exec) {
++                    for (u32 k = 0; k < 4; ++k) {
++                        c[o.dest].w[k][i] = c[o.a[0]].w[k][i];
++                    }
++                }
++            } else {
++                for (u32 k = 0; k < 4; ++k) {
++                    std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], lanes * sizeof(u32));
++                }
++            }
++            if (++pc == next_join) {
++                JOIN();
+             }
+             continue;
+         case Kind::Jump:
+-            pc = o.extra;
+-            continue;
+-        case Kind::JumpIfTrue:
+-            if (c[o.a[0]].w[0][0] != 0) {
++            if (waiting) {
++                branches.Park(exec, o.extra);
++                waiting |= exec;
++                PICK();
++            } else {
+                 pc = o.extra;
+             }
+             continue;
+-        case Kind::JumpIfFalse:
+-            if (c[o.a[0]].w[0][0] == 0) {
+-                pc = o.extra;
++        case Kind::JumpIfTrue:
++        case Kind::JumpIfFalse: {
++            const u32 want = o.kind == Kind::JumpIfTrue ? 1 : 0;
++            u32 taken = 0;
++            EXEC_LOOP(exec) {
++                if (u32(c[o.a[0]].w[0][i] != 0) == want) {
++                    taken |= 1u << i;
++                }
++            }
++            if (!waiting && (taken == exec || taken == 0)) {
++                pc = taken != 0 ? o.extra : pc + 1;
++            } else {
++                branches.Park(taken, o.extra);
++                branches.Park(exec & ~taken, pc + 1);
++                waiting |= exec;
++                PICK();
+             }
+             continue;
++        }
+         case Kind::Return:
+-            return;
++            if (!waiting) {
++                return;
++            }
++            PICK();
++            continue;
+         case Kind::Ir:
+             break;
+         }
+@@ -2209,10 +2480,17 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+         const Lanes& b = c[o.a[1]];
+         const Lanes& e = c[o.a[2]];
+         const Lanes& f = c[o.a[3]];
++        if (waiting) {
++            saved = d;
++        }
+         switch (o.op) {
+-        case O::DemoteToHelperInvocation:
+-            IO_LOOP io.discard[io.lane + i] = true;
+-            return;
++        case O::DemoteToHelperInvocation: // the lanes that ran it are done
++            EXEC_LOOP(exec) io.discard[io.lane + i] = true;
++            if (!waiting) {
++                return;
++            }
++            PICK();
++            continue;
+         case O::GetCbufU8:
+             IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 1);
+             break;
+@@ -2243,21 +2521,25 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+             IO_LOOP d.w[0][i] = std::bit_cast<u32>(io.inputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i]);
+             break;
+         case O::SetAttribute:
+-            IO_LOOP io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
++            EXEC_LOOP(exec) io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
+             break;
+         case O::SetAttributeIndexed:
+-            IO_LOOP io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
++            EXEC_LOOP(exec) io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
+             break;
+         case O::SetFragColor: {
+             f32* const out = io.colors + (((o.extra / 4) & 7) * 4 + o.extra % 4) * io.stride + io.lane;
+-            std::memcpy(out, e.w[0], n * sizeof(u32));
++            if (waiting) {
++                EXEC_LOOP(exec) out[i] = Fl(e, i);
++            } else {
++                std::memcpy(out, e.w[0], n * sizeof(u32));
++            }
+             break;
+         }
+         case O::SetSampleMask:
+         case O::SetFragDepth:
+             break;
+         case O::IsHelperInvocation:
+-            LANE_LOOP d.w[0][i] = 0;
++            LANE_LOOP d.w[0][i] = ((io.live >> i) & 1) ^ 1;
+             break;
+         case O::YDirection:
+         case O::ResolutionDownFactor:
+@@ -2275,13 +2557,17 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+                 std::memset(d.w[k], 0, lanes * sizeof(u32));
+             }
+             break;
+-        case O::LoadLocal:
+-            IO_LOOP d.w[0][i] = a.w[0][i] / 4 < io.local_words ? io.local[a.w[0][i] / 4] : 0;
++        case O::LoadLocal: // each lane's own: a word's lanes together
++            IO_LOOP {
++                const u32 word = a.w[0][i] / 4;
++                d.w[0][i] = word < io.local_words ? io.local[word * io.stride + io.lane + i] : 0;
++            }
+             break;
+         case O::WriteLocal:
+-            IO_LOOP {
+-                if (a.w[0][i] / 4 < io.local_words) {
+-                    io.local[a.w[0][i] / 4] = b.w[0][i];
++            EXEC_LOOP(exec) {
++                const u32 word = a.w[0][i] / 4;
++                if (word < io.local_words) {
++                    io.local[word * io.stride + io.lane + i] = b.w[0][i];
+                 }
+             }
+             break;
+@@ -2458,49 +2744,104 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+         case O::ConvertS32S8: LANE_LOOP d.w[0][i] = u32(s32(s8(a.w[0][i]))); break;
+         case O::ConvertS32S16: LANE_LOOP d.w[0][i] = u32(s32(s16(a.w[0][i]))); break;
+         case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
+-            LANE_LOOP d.w[0][i] = 0; // no 2x2 quads here: derivatives are zero
++            // between a quad's lanes (fine: in the lane's row or column; coarse: the top-left's)
++            LANE_LOOP {
++                if (!io.quads) {
++                    d.w[0][i] = 0;
++                    continue;
++                }
++                const u32 from = o.op == O::DPdxFine ? i & ~1u : o.op == O::DPdyFine ? i & ~8u : QuadTopLeft(i);
++                const u32 to = o.op == O::DPdxFine || o.op == O::DPdxCoarse ? from | 1 : from | 8;
++                SetFl(d, i, Fl(a, to) - Fl(a, from));
++            }
+             break;
+         case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGradient:
+         case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod:
+         case O::ImageGather: case O::ImageGatherDref: case O::ImageFetch:
+         case O::ImageQueryDimensions: case O::ImageQueryLod:
+-            RunTexture(program, o, c, io, n);
++            RunTexture(program, o, c, io, exec);
+             break;
+         case O::GetSparseFromOp:
++            LANE_LOOP d.w[0][i] = 1; // every texel is resident
++            break;
+         case O::GetInBoundsFromOp:
+-            LANE_LOOP d.w[0][i] = 1; // every texel is resident; every shuffle in bounds
++            LANE_LOOP d.w[0][i] = a.w[1][i]; // kept by the shuffle
++            break;
++        case O::LaneId:
++            LANE_LOOP d.w[0][i] = io.quads ? INVOCATION_ID[i] : 0;
+             break;
+         case O::IsTextureScaled:
+         case O::IsImageScaled:
+-        case O::LaneId:
+         case O::InvocationInfo:
+-        case O::SubgroupLtMask:
+-        case O::SubgroupGtMask:
+             LANE_LOOP d.w[0][i] = 0;
+             break;
+-        // each lane is an invocation of its own (a subgroup of one)
+-        case O::VoteAll:
+-        case O::VoteAny:
+-            LANE_LOOP d.w[0][i] = a.w[0][i] != 0;
+-            break;
+-        case O::VoteEqual:
+-        case O::SubgroupEqMask:
+-        case O::SubgroupLeMask:
+-        case O::SubgroupGeMask:
+-            LANE_LOOP d.w[0][i] = 1;
++        // A fragment shader's lanes are a subgroup (their ids: INVOCATION_ID), the running ones
++        // active; elsewhere each lane is a subgroup of its own
++        case O::VoteAll: case O::VoteAny: case O::VoteEqual: case O::SubgroupBallot: {
++            u32 ballot = 0, active = 0;
++            EXEC_LOOP(exec) {
++                const u32 bit = 1u << (io.quads ? INVOCATION_ID[i] : 0);
++                active |= bit;
++                ballot |= a.w[0][i] != 0 ? bit : 0;
++            }
++            const u32 result = o.op == O::VoteAll   ? ballot == active
++                               : o.op == O::VoteAny ? ballot != 0
++                               : o.op == O::VoteEqual ? ballot == 0 || ballot == active
++                                                      : ballot;
++            LANE_LOOP d.w[0][i] = result;
+             break;
+-        case O::SubgroupBallot:
+-            LANE_LOOP d.w[0][i] = a.w[0][i] != 0 ? 1 : 0;
++        }
++        case O::SubgroupEqMask: case O::SubgroupLtMask: case O::SubgroupLeMask:
++        case O::SubgroupGtMask: case O::SubgroupGeMask:
++            LANE_LOOP {
++                const u32 id = io.quads ? INVOCATION_ID[i] : 0, size = io.quads ? 0xFFFFu : 1u;
++                const u32 lt = (1u << id) - 1, le = (2u << id) - 1;
++                d.w[0][i] = o.op == O::SubgroupEqMask   ? 1u << id
++                            : o.op == O::SubgroupLtMask ? lt
++                            : o.op == O::SubgroupLeMask ? le
++                            : o.op == O::SubgroupGtMask ? ~le & size
++                                                        : ~lt & size;
++            }
+             break;
+         case O::ShuffleIndex: case O::ShuffleUp: case O::ShuffleDown: case O::ShuffleButterfly:
+-        case O::QuadBroadcast: case O::QuadSwap:
+-            LANE_LOOP d.w[0][i] = a.w[0][i];
++            // the source lane's value when it's in bounds (value, index, clamp, segment mask), as
++            // Eden's backends work it out; the in-bounds flag kept in the result's second word
++            LANE_LOOP {
++                const u32 id = io.quads ? INVOCATION_ID[i] : 0, index = b.w[0][i];
++                const u32 min_id = id & f.w[0][i], max_id = min_id | (e.w[0][i] & ~f.w[0][i]);
++                u32 source;
++                bool in_bounds;
++                if (o.op == O::ShuffleIndex) {
++                    source = (index & ~f.w[0][i]) | min_id, in_bounds = s32(source) <= s32(max_id);
++                } else if (o.op == O::ShuffleUp) {
++                    source = id - index, in_bounds = s32(source) >= s32(max_id);
++                } else if (o.op == O::ShuffleDown) {
++                    source = id + index, in_bounds = s32(source) <= s32(max_id);
++                } else {
++                    source = id ^ index, in_bounds = s32(source) <= s32(max_id);
++                }
++                const bool exists = io.quads ? source < LANES : source == 0;
++                d.w[0][i] = in_bounds && exists ? a.w[0][io.quads ? INVOCATION_LANE[source] : i] : a.w[0][i];
++                d.w[1][i] = in_bounds ? 1 : 0;
++            }
++            break;
++        case O::QuadBroadcast: case O::QuadSwap: // value, the quad's lane; value, direction
++            LANE_LOOP {
++                if (!io.quads) {
++                    d.w[0][i] = a.w[0][i];
++                    continue;
++                }
++                const u32 id = INVOCATION_ID[i];
++                const u32 source = o.op == O::QuadBroadcast ? (id & ~3u) | (b.w[0][i] & 3) : id ^ ((b.w[0][i] + 1) & 3);
++                d.w[0][i] = a.w[0][INVOCATION_LANE[source]];
++            }
+             break;
+-        case O::FSwizzleAdd: { // as the quad's first invocation does it
++        case O::FSwizzleAdd: { // each lane's mode by its place in its quad
+             static constexpr f32 modifier_a[4] = {1.0f, -1.0f, 1.0f, 0.0f};
+             static constexpr f32 modifier_b[4] = {1.0f, 1.0f, -1.0f, 1.0f};
+             LANE_LOOP {
+-                const u32 mode = e.w[0][i] & 3;
++                const u32 id = io.quads ? INVOCATION_ID[i] : 0;
++                const u32 mode = (e.w[0][i] >> ((id & 3) * 2)) & 3;
+                 SetFl(d, i, Fl(a, i) * modifier_a[mode] + Fl(b, i) * modifier_b[mode]);
+             }
+             break;
+@@ -2523,7 +2864,7 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+         case O::WriteStorageU8: case O::WriteStorageS8: case O::WriteStorageU16: case O::WriteStorageS16:
+         case O::WriteStorage32: case O::WriteStorage64: case O::WriteStorage128: {
+             const u32 bytes = AccessBytes(o.op);
+-            IO_LOOP {
++            EXEC_LOOP(exec & io.live) {
+                 GPUVAddr address;
+                 if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
+                     WriteMemory(io, address, bytes, e, i);
+@@ -2535,19 +2876,35 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+         case O::LoadGlobal32: case O::LoadGlobal64: case O::LoadGlobal128: {
+             const u32 bytes = AccessBytes(o.op);
+             const bool sign = o.op == O::LoadGlobalS8 || o.op == O::LoadGlobalS16;
+-            IO_LOOP ReadMemory(io, U64l(a, i), bytes, sign, d, i);
++            EXEC_LOOP(exec) ReadMemory(io, U64l(a, i), bytes, sign, d, i);
+             break;
+         }
+         case O::WriteGlobalU8: case O::WriteGlobalS8: case O::WriteGlobalU16: case O::WriteGlobalS16:
+         case O::WriteGlobal32: case O::WriteGlobal64: case O::WriteGlobal128: {
+             const u32 bytes = AccessBytes(o.op);
+-            IO_LOOP WriteMemory(io, U64l(a, i), bytes, b, i);
++            EXEC_LOOP(exec & io.live) WriteMemory(io, U64l(a, i), bytes, b, i);
+             break;
+         }
+         default:
+             break;
+         }
++        if (waiting) { // the waiting lanes' values kept
++            LANE_LOOP {
++                if (((exec >> i) & 1) == 0) {
++                    for (u32 k = 0; k < 4; ++k) {
++                        d.w[k][i] = saved.w[k][i];
++                    }
++                }
++            }
++        }
++        if (++pc == next_join) {
++            JOIN();
++        }
+     }
++#undef PICK
++#undef JOIN
++#undef SET_STATE
++#undef EXEC_LOOP
+ #undef IO_LOOP
+ #undef LANE_LOOP
+ }
+@@ -2990,11 +3347,6 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+         program->can_discard = std::ranges::any_of(program->ops, [](const Op& op) {
+             return op.kind == Kind::Ir && op.op == IR::Opcode::DemoteToHelperInvocation;
+         });
+-        program->one_lane = program->local_words > 0 ||
+-                            std::ranges::any_of(program->ops, [](const Op& op) {
+-                                return op.kind == Kind::Jump || op.kind == Kind::JumpIfTrue ||
+-                                       op.kind == Kind::JumpIfFalse;
+-                            });
+     } catch (const std::exception& exception) {
+         LogOnce(fmt::format("shader translation failed: {}", exception.what()));
+         program->ok = false;
+@@ -3121,6 +3473,7 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+     const auto input = [&](IR::Attribute attribute) { return in + static_cast<u32>(attribute) * LANES; };
+     Io io{in, st.outputs.data(), st.colors.data(), st.discard.data(), LANES, 0,
+           &fs_cbufs, st.local.data(), fs->local_words, &fs_textures, &fs_storage, &gpu_memory};
++    io.quads = true;
+     for (const Triangle& t : triangles) {
+         const s32 ys = std::max(t.y0, row_begin), ye = std::min(t.y1, row_end);
+         if (ys >= ye) {
+@@ -3137,37 +3490,71 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+         }
+         const f32* const data = varying_data.data() + t.varyings;
+         std::fill_n(input(IR::Attribute::FrontFace), LANES, std::bit_cast<f32>(t.front ? 0xFFFFFFFFu : 0u));
+-        for (s32 y = ys; y < ye; ++y) {
+-            // the row's span: where all three edge functions are positive
+-            const s64 py = s64(y) * 256 + 128, px = s64(t.x0) * 256 + 128;
+-            s64 e[3];
+-            s32 xs = t.x0, xe = t.x1;
+-            for (u32 i = 0; i < 3; ++i) {
+-                const u32 a = (i + 1) % 3;
+-                e[i] = step_x[i] / 256 * (px - t.x[a]) + step_y[i] * (py - t.y[a]) + bias[i];
+-                if (step_x[i] > 0) {
+-                    if (e[i] < 0) {
+-                        xs = std::max<s64>(xs, t.x0 + (-e[i] + step_x[i] - 1) / step_x[i]);
++        // Rows two at a time, in blocks of 8 columns: a block's lanes are four 2x2 quads (see
++        // INVOCATION_ID), its pixels the live lanes, the rest helpers for their quads' derivatives
++        for (s32 y = ys & ~1; y < ye; y += 2) {
++            // each row's span: where all three edge functions are positive (none for a row outside
++            // the triangle's, or this job's)
++            s64 e[2][3];
++            s32 xs[2], xe[2];
++            for (u32 r = 0; r < 2; ++r) {
++                const s64 py = s64(y + s32(r)) * 256 + 128, px = s64(t.x0) * 256 + 128;
++                xs[r] = t.x0, xe[r] = t.x1;
++                for (u32 i = 0; i < 3; ++i) {
++                    const u32 a = (i + 1) % 3;
++                    e[r][i] = step_x[i] / 256 * (px - t.x[a]) + step_y[i] * (py - t.y[a]) + bias[i];
++                    if (step_x[i] > 0) {
++                        if (e[r][i] < 0) {
++                            xs[r] = std::max<s64>(xs[r], t.x0 + (-e[r][i] + step_x[i] - 1) / step_x[i]);
++                        }
++                    } else if (step_x[i] < 0) {
++                        xe[r] = e[r][i] < 0 ? xs[r] : std::min<s64>(xe[r], t.x0 + e[r][i] / -step_x[i] + 1);
++                    } else if (e[r][i] < 0) {
++                        xe[r] = xs[r];
+                     }
+-                } else if (step_x[i] < 0) {
+-                    xe = e[i] < 0 ? xs : std::min<s64>(xe, t.x0 + e[i] / -step_x[i] + 1);
+-                } else if (e[i] < 0) {
+-                    xe = xs;
+                 }
++                if (y + s32(r) < ys || y + s32(r) >= ye) {
++                    xe[r] = xs[r];
++                }
++            }
++            const bool top = xs[0] < xe[0], bottom = xs[1] < xe[1];
++            if (!top && !bottom) {
++                continue;
+             }
+-            for (s32 bx = xs; bx < xe; bx += s32(LANES)) {
+-                const u32 n = u32(std::min<s32>(xe - bx, s32(LANES)));
+-                // the weights at the batch's first pixel, exactly; stepped from there
++            const s32 left = (top && bottom ? std::min(xs[0], xs[1]) : top ? xs[0] : xs[1]) & ~1;
++            const s32 right = top && bottom ? std::max(xe[0], xe[1]) : top ? xe[0] : xe[1];
++            for (s32 bx = left; bx < right; bx += 8) {
++                u32 live = 0;
++                for (u32 r = 0; r < 2; ++r) {
++                    const s32 from = std::max(xs[r] - bx, 0), to = std::min(xe[r] - bx, 8);
++                    if (from < to) {
++                        live |= ((1u << to) - (1u << from)) << (8 * r);
++                    }
++                }
++                if (live == 0) {
++                    continue;
++                }
++                u32 run = 0;
++                for (u32 top_left = 0; top_left < 8; top_left += 2) {
++                    const u32 quad = 0x303u << top_left;
++                    run |= (live & quad) != 0 ? quad : 0;
++                }
++                const auto lane_x = [&](u32 j) { return bx + s32(j & 7); };
++                const auto lane_y = [&](u32 j) { return y + s32(j >> 3); };
++                // the weights at each row's first pixel, exactly; stepped from there
+                 const s64 dx = s64(bx - t.x0);
+-                const f32 w0s = f32(e[0] + step_x[0] * dx - bias[0]) * t.inv_area;
+-                const f32 w1s = f32(e[1] + step_x[1] * dx - bias[1]) * t.inv_area;
+-                const f32 w2s = f32(e[2] + step_x[2] * dx - bias[2]) * t.inv_area;
+                 const f32 dw0 = f32(step_x[0]) * t.inv_area, dw1 = f32(step_x[1]) * t.inv_area,
+                           dw2 = f32(step_x[2]) * t.inv_area;
+                 alignas(64) f32 w0[LANES], w1[LANES], w2[LANES];
+                 alignas(64) f32 pw0[LANES], pw1[LANES], pw2[LANES], inv_psum[LANES];
+-                for (u32 j = 0; j < LANES; ++j) {
+-                    w0[j] = w0s + dw0 * f32(j), w1[j] = w1s + dw1 * f32(j), w2[j] = w2s + dw2 * f32(j);
++                for (u32 r = 0; r < 2; ++r) {
++                    const f32 w0s = f32(e[r][0] + step_x[0] * dx - bias[0]) * t.inv_area;
++                    const f32 w1s = f32(e[r][1] + step_x[1] * dx - bias[1]) * t.inv_area;
++                    const f32 w2s = f32(e[r][2] + step_x[2] * dx - bias[2]) * t.inv_area;
++                    for (u32 j = 0; j < 8; ++j) {
++                        w0[r * 8 + j] = w0s + dw0 * f32(j), w1[r * 8 + j] = w1s + dw1 * f32(j);
++                        w2[r * 8 + j] = w2s + dw2 * f32(j);
++                    }
+                 }
+                 f32* const position_w = input(IR::Attribute::PositionW);
+                 if (t.affine) { // the same weights: no perspective correction
+@@ -3187,8 +3574,8 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                 f32* const position_y = input(IR::Attribute::PositionY);
+                 f32* const position_z = input(IR::Attribute::PositionZ);
+                 for (u32 j = 0; j < LANES; ++j) {
+-                    position_x[j] = f32(bx) + f32(j) + 0.5f;
+-                    position_y[j] = f32(y) + 0.5f;
++                    position_x[j] = f32(lane_x(j)) + 0.5f;
++                    position_y[j] = f32(lane_y(j)) + 0.5f;
+                     position_z[j] = w0[j] * t.z[0] + w1[j] * t.z[1] + w2[j] * t.z[2];
+                 }
+                 for (size_t k = 0; k < num_varyings; ++k) {
+@@ -3230,8 +3617,9 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                 };
+                 if (zs_test) {
+                     bool any = false;
+-                    for (u32 j = 0; j < n; ++j) {
+-                        u8* const zp = depth_pixel(bx + s32(j), y);
++                    for (u32 m = live; m != 0; m &= m - 1) {
++                        const u32 j = u32(std::countr_zero(m));
++                        u8* const zp = depth_pixel(lane_x(j), lane_y(j));
+                         st.depth_pixel[j] = zp;
+                         st.stencil_pass[j] = st.depth_pass[j] = zp != nullptr;
+                         if (!zp) {
+@@ -3249,7 +3637,8 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                         any |= st.stencil_pass[j] && st.depth_pass[j];
+                     }
+                     if (!any && !fs->can_discard) {
+-                        for (u32 j = 0; stencil_test && j < n; ++j) {
++                        for (u32 m = stencil_test ? live : 0; m != 0; m &= m - 1) {
++                            const u32 j = u32(std::countr_zero(m));
+                             if (st.depth_pixel[j]) {
+                                 update_stencil(j);
+                             }
+@@ -3257,16 +3646,10 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                         continue;
+                     }
+                 }
+-                if (fs->one_lane) {
+-                    for (u32 j = 0; j < n; ++j) {
+-                        io.lane = j;
+-                        Run(*fs, st.cells.data(), io, 1);
+-                    }
+-                    io.lane = 0;
+-                } else {
+-                    Run(*fs, st.cells.data(), io, n);
+-                }
+-                for (u32 j = 0; j < n; ++j) {
++                io.run = run, io.live = live;
++                Run(*fs, st.cells.data(), io, LANES);
++                for (u32 m = live; m != 0; m &= m - 1) {
++                    const u32 j = u32(std::countr_zero(m));
+                     if (st.discard[j]) {
+                         continue;
+                     }
+@@ -3289,7 +3672,7 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                         if (!tg.write_any) {
+                             continue;
+                         }
+-                        u8* const out = pixel(ti, bx + s32(j), y);
++                        u8* const out = pixel(ti, lane_x(j), lane_y(j));
+                         if (!out) {
+                             continue;
+                         }
+@@ -3375,7 +3758,7 @@ void SoftwareDraw::Flush() {
+             }
+             if (st.program != batch->fs) {
+                 Broadcast(batch->fs->cells, st.cells);
+-                st.local.assign(batch->fs->local_words + 1, 0);
++                st.local.assign(size_t(batch->fs->local_words + 1) * LANES, 0);
+                 st.program = batch->fs;
+             }
+             RasterRows(*batch, st, std::max(row_begin, batch->rows_begin), std::min(row_end, batch->rows_end));
