@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 06:23:25 +0000
+Subject: [PATCH] audio: frontend sink streams play silently when the output
+ can't open
+
+A stream without an output never consumed its buffers, so a program
+waiting for them to be released could stall. It now plays them to a
+silent output that keeps an output's pace.
+---
+ src/audio_core/sink/frontend_sink.cpp | 31 +++++++++++++++++++++------
+ 1 file changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/src/audio_core/sink/frontend_sink.cpp b/src/audio_core/sink/frontend_sink.cpp
+index 45a92cc50..299b73257 100644
+--- a/src/audio_core/sink/frontend_sink.cpp
++++ b/src/audio_core/sink/frontend_sink.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <chrono>
+ #include <condition_variable>
+ #include <mutex>
+ #include <thread>
+@@ -18,6 +19,25 @@ namespace {
+ std::mutex factory_mutex;
+ FrontendAudioFactory frontend_factory;
+ 
++/// Where a stream plays when the frontend's output can't open: nowhere, at the pace an output
++/// would take the samples, so that the program's buffers are still consumed and released.
++class SilentOutput final : public FrontendAudioOutput {
++public:
++    bool Open(u32 frames_, u32) override {
++        frames = frames_;
++        next = std::chrono::steady_clock::now();
++        return true;
++    }
++    void Output(std::span<const s16>) override {
++        next += std::chrono::microseconds(u64{frames} * 1'000'000 / TargetSampleRate);
++        std::this_thread::sleep_until(next);
++    }
++
++private:
++    u32 frames{};
++    std::chrono::steady_clock::time_point next;
++};
++
+ class FrontendSinkStream final : public SinkStream {
+ public:
+     FrontendSinkStream(u32 device_channels_, u32 system_channels_, const std::string& name_,
+@@ -35,13 +55,12 @@ public:
+                 output = frontend_factory();
+             }
+         }
+-        if (output && !output->Open(FrontendFramesPerBuffer, device_channels)) {
+-            LOG_ERROR(Audio_Sink, "the frontend's audio output didn't open for stream {}", name);
+-            output.reset();
+-        }
+-        if (output) {
+-            thread = std::jthread([this](std::stop_token token) { Play(token); });
++        if (!output || !output->Open(FrontendFramesPerBuffer, device_channels)) {
++            LOG_ERROR(Audio_Sink, "no audio output for stream {}: it plays silently", name);
++            output = std::make_unique<SilentOutput>();
++            output->Open(FrontendFramesPerBuffer, device_channels);
+         }
++        thread = std::jthread([this](std::stop_token token) { Play(token); });
+     }
+ 
+     ~FrontendSinkStream() override {

@@ -38,7 +38,10 @@ What runs it:
   stream a program opens (`audout`, `audren`) plays through an output the frontend gives it, from a
   thread of its own, in 512-frame buffers. On the PS4 that's an AudioOut port (the system user's
   main port, 48 kHz stereo, as Crema's audio), on a thread raised above the emulation's priority.
-  On the desktop, `EDEN_PS4_AUDIO=<file.wav>` records it.
+  On the desktop, `EDEN_PS4_AUDIO=<file.wav>` records it. If an output can't open, its stream plays
+  silently at an output's pace, so the program doesn't wait on it. Both of libnx's ways to play
+  sound work: `audout` (Breakout) and the audio renderer `audren` (switchbrew's audren-simple
+  example, recorded on the desktop).
 
 In shadPS4, Breakout runs at 28 to 30 frames per second (61 on the desktop build): the start page,
 X, the game; the pad's X launches the ball, the stick moves the paddle, OPTIONS quits back to the
@@ -155,6 +158,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | audio: a frontend sink | stage 3's sound, above |
 | null renderer: one layer at its own size | a frame with one layer (the usual case) isn't scaled to 1280x720 on its way to the frontend, which scales it anyway |
 | host memory: clear large regions on Linux by dropping their pages | a homebrew program's 3.2 GiB heap, cleared in no time on the desktop (above) |
+| audio: frontend sink streams play silently when the output can't open | a stream without an output still consumes its buffers at an output's pace, so a program waiting for them doesn't stall |
 
 The PS4 memory changes, from what stage 1 measured:
 
