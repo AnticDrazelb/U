@@ -1,0 +1,2020 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 11:29:17 +0000
+Subject: [PATCH] null renderer: faster software draws, on several threads
+
+---
+ .../renderer_null/null_rasterizer.cpp         |    8 +-
+ .../renderer_null/software_draw.cpp           | 1534 ++++++++++++-----
+ src/video_core/renderer_null/software_draw.h  |    7 +
+ 3 files changed, 1082 insertions(+), 467 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index b48098f9b..2e4559558 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -39,8 +39,8 @@ void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {
+ void RasterizerNull::DrawTexture() {}
+ 
+ // Colour clears, done in emulated memory: what a program draws with clears (and the DMA and 2D
+-// engines, also in software) shows in the null renderer's frames. Depth and stencil clears and
+-// anything drawn with shaders still do nothing.
++// engines, and the software draws) shows in the null renderer's frames. Depth and stencil clears
++// still do nothing.
+ void RasterizerNull::Clear(u32 layer_count) {
+     if (!maxwell3d || !gpu_memory) {
+         return;
+@@ -105,7 +105,7 @@ void RasterizerNull::Clear(u32 layer_count) {
+ 
+     if (pitch_linear) {
+         for (u32 y = y0; y < y1; ++y) {
+-            Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
++            Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+                 row(*gpu_memory, address + u64{y} * pitch + u64{x0} * bpp, extent_x * bpp, &m_scratch);
+             for (u32 x = 0; x < extent_x; ++x) {
+                 for (u32 i = 0; i < bpp; ++i) {
+@@ -135,7 +135,7 @@ void RasterizerNull::Clear(u32 layer_count) {
+             for (u32 gx = x0 / pixels_per_gob; gx <= (x1 - 1) / pixels_per_gob; ++gx) {
+                 const u32 xs = std::max(x0, gx * pixels_per_gob);
+                 const u32 xe = std::min(x1, (gx + 1) * pixels_per_gob);
+-                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
++                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+                     block(*gpu_memory, layer_address + by * block_row_size + u64{gx} * block_bytes,
+                           block_bytes, &m_scratch);
+                 for (u32 y = ys; y < ye; ++y) {
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index e166be5b5..db9f8f495 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -2,8 +2,15 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <functional>
++#include <mutex>
++#include <thread>
+ #include <bit>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <set>
+@@ -271,6 +278,14 @@ struct Cell {
+     u32 w[4];
+ };
+ 
++/// Up to this many pixels shaded at once
++constexpr u32 LANES = 16;
++
++/// A value for each of LANES pixels: up to four words
++struct Lanes {
++    u32 w[4][LANES];
++};
++
+ enum class Kind : u8 { Ir, Move, Jump, JumpIfTrue, JumpIfFalse, Return };
+ 
+ struct Op {
+@@ -282,7 +297,9 @@ struct Op {
+ };
+ 
+ void LogOnce(const std::string& message) {
++    static std::mutex mutex;
+     static std::set<std::string> logged;
++    std::scoped_lock lock{mutex};
+     if (logged.insert(message).second) {
+         LOG_WARNING(Render, "Software draw: {}", message);
+     }
+@@ -356,19 +373,6 @@ bool IsSupported(IR::Opcode op) {
+ f32 F(const Cell& c, int i = 0) {
+     return std::bit_cast<f32>(c.w[i]);
+ }
+-void SetF(Cell& c, f32 v, int i = 0) {
+-    c.w[i] = std::bit_cast<u32>(v);
+-}
+-s32 S(const Cell& c) {
+-    return static_cast<s32>(c.w[0]);
+-}
+-u64 U64(const Cell& c) {
+-    return u64{c.w[0]} | (u64{c.w[1]} << 32);
+-}
+-void SetU64(Cell& c, u64 v) {
+-    c.w[0] = u32(v);
+-    c.w[1] = u32(v >> 32);
+-}
+ 
+ u32 BitFieldExtract(u32 base, u32 offset, u32 count, bool sign) {
+     offset &= 31;
+@@ -428,12 +432,33 @@ struct Texture {
+     u32 base_level = 0, num_levels = 0; // the view's
+     u32 base_layer = 0, num_layers = 0;
+     std::array<SwizzleSource, 4> swizzle{};
++    bool identity_swizzle = false;
++    const f32* rgb_table = nullptr; // 8-bit colour channels to floats (sRGB decoded, or not)
+     std::vector<Level> levels; // every level of the image, its texels [layer][z][y][x]
+ };
+ 
++/// A texture and the sampler it's sampled with, the sampler's state decoded once per draw
+ struct Binding {
+     const Texture* texture = nullptr;
+     Tegra::Texture::TSCEntry sampler{};
++    std::array<Tegra::Texture::WrapMode, 3> wrap{};
++    bool mag_linear = false, min_linear = false;
++    Tegra::Texture::TextureMipmapFilter mipmap = Tegra::Texture::TextureMipmapFilter::None;
++    f32 lod_bias = 0.0f, min_lod = 0.0f, max_lod = 0.0f;
++    std::array<f32, 4> border{};
++    Tegra::Texture::DepthCompareFunc compare = Tegra::Texture::DepthCompareFunc::Always;
++
++    void Prepare() {
++        wrap = {sampler.wrap_u, sampler.wrap_v, sampler.wrap_p};
++        mag_linear = sampler.mag_filter == Tegra::Texture::TextureFilter::Linear;
++        min_linear = sampler.min_filter == Tegra::Texture::TextureFilter::Linear;
++        mipmap = sampler.mipmap_filter;
++        lod_bias = sampler.LodBias();
++        min_lod = sampler.MinLod();
++        max_lod = std::max(min_lod, sampler.MaxLod());
++        border = sampler.BorderColor();
++        compare = sampler.depth_compare_func;
++    }
+ };
+ 
+ float FromSnorm(s32 value, u32 bits) {
+@@ -776,6 +801,9 @@ bool DecodeTexture(Tegra::MemoryManager& gpu_memory, const Tegra::Texture::TICEn
+     texture.srgb = IsPixelFormatSRGB(format);
+     texture.integer = IsPixelFormatInteger(format);
+     texture.swizzle = view.Swizzle();
++    texture.identity_swizzle = texture.swizzle[0] == SwizzleSource::R && texture.swizzle[1] == SwizzleSource::G &&
++                               texture.swizzle[2] == SwizzleSource::B && texture.swizzle[3] == SwizzleSource::A;
++    texture.rgb_table = (texture.srgb ? SrgbTable() : UnormTable()).data();
+ 
+     unswizzled.resize_destructive(VideoCommon::CalculateUnswizzledSizeBytes(info));
+     const std::span<u8> unswizzled_span{unswizzled.data(), unswizzled.size()};
+@@ -839,6 +867,9 @@ bool DecodeTexture(Tegra::MemoryManager& gpu_memory, const Tegra::Texture::TICEn
+ }
+ 
+ s32 WrapCoordinate(s32 i, s32 size, Tegra::Texture::WrapMode mode, bool& border) {
++    if (u32(i) < u32(size)) [[likely]] { // inside: every mode leaves it
++        return i;
++    }
+     using W = Tegra::Texture::WrapMode;
+     switch (mode) {
+     case W::Wrap: {
+@@ -883,6 +914,12 @@ f32 CompareDepth(Tegra::Texture::DepthCompareFunc func, f32 reference, f32 depth
+     return pass ? 1.0f : 0.0f;
+ }
+ 
++/// floor for values well within s32 (without SSE4.1, std::floor is a library call)
++s32 FloorToInt(f32 value) {
++    const s32 i = s32(value);
++    return f32(i) > value ? i - 1 : i;
++}
++
+ std::array<f32, 4> Lerp(const std::array<f32, 4>& a, const std::array<f32, 4>& b, f32 t) {
+     return {a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t,
+             a[3] + (b[3] - a[3]) * t};
+@@ -891,7 +928,7 @@ std::array<f32, 4> Lerp(const std::array<f32, 4>& a, const std::array<f32, 4>& b
+ /// A sample's texture, sampler, layer and offset: texels fetched and filtered
+ struct Sampling {
+     const Texture& texture;
+-    const Tegra::Texture::TSCEntry& sampler;
++    const Binding& sampler;
+     u32 dims;      // 1, 2 or 3
+     u32 layer;     // of the image
+     std::array<s32, 3> offset;
+@@ -899,26 +936,26 @@ struct Sampling {
+ 
+     std::array<f32, 4> Fetch(const Level& level, s32 x, s32 y, s32 z) const {
+         bool border = false;
+-        x = WrapCoordinate(x, s32(level.width), sampler.wrap_u, border);
+-        y = dims >= 2 ? WrapCoordinate(y, s32(level.height), sampler.wrap_v, border) : 0;
+-        z = dims >= 3 ? WrapCoordinate(z, s32(level.depth), sampler.wrap_p, border) : 0;
++        x = WrapCoordinate(x, s32(level.width), sampler.wrap[0], border);
++        y = dims >= 2 ? WrapCoordinate(y, s32(level.height), sampler.wrap[1], border) : 0;
++        z = dims >= 3 ? WrapCoordinate(z, s32(level.depth), sampler.wrap[2], border) : 0;
+         std::array<f32, 4> texel;
+         if (border) {
+-            texel = sampler.BorderColor();
++            texel = sampler.border;
+         } else {
+             const size_t index = ((size_t(layer) * level.depth + size_t(z)) * level.height + size_t(y)) *
+                                      level.width + size_t(x);
+             if (texture.compact) {
+                 const u32 v = index < level.rgba8.size() ? level.rgba8[index] : 0;
+-                const auto& table = texture.srgb ? SrgbTable() : UnormTable();
+-                texel = {table[v & 0xFF], table[(v >> 8) & 0xFF], table[(v >> 16) & 0xFF],
+-                         UnormTable()[v >> 24]};
++                const f32* const table = texture.rgb_table;
++                static const f32* const alpha = UnormTable().data();
++                texel = {table[v & 0xFF], table[(v >> 8) & 0xFF], table[(v >> 16) & 0xFF], alpha[v >> 24]};
+             } else {
+                 texel = index < level.rgba.size() ? level.rgba[index] : std::array<f32, 4>{};
+             }
+         }
+         if (reference) {
+-            const f32 result = CompareDepth(sampler.depth_compare_func, *reference, texel[0]);
++            const f32 result = CompareDepth(sampler.compare, *reference, texel[0]);
+             texel = {result, result, result, result};
+         }
+         return texel;
+@@ -927,16 +964,91 @@ struct Sampling {
+     /// The texel coordinates of a sample and the fractions between them, for bilinear filtering
+     static void Footprint(f32 coordinate, u32 size, s32 offset, s32& i, f32& fraction) {
+         const f32 t = std::clamp(coordinate * f32(size) - 0.5f, -1e6f, 1e6f);
+-        const f32 floor = std::floor(t);
+-        i = s32(floor) + offset;
+-        fraction = t - floor;
++        const s32 floor = FloorToInt(t);
++        i = floor + offset;
++        fraction = t - f32(floor);
++    }
++
++    /// The nearest 8-bit texel in 2D; false at a border
++    bool NearestRgba8(const Level& level, f32 u, f32 v, std::array<f32, 4>& out) const {
++        bool border = false;
++        const s32 x = WrapCoordinate(FloorToInt(std::clamp(u * f32(level.width), -1e6f, 1e6f)) + offset[0],
++                                     s32(level.width), sampler.wrap[0], border);
++        const s32 y = WrapCoordinate(FloorToInt(std::clamp(v * f32(level.height), -1e6f, 1e6f)) + offset[1],
++                                     s32(level.height), sampler.wrap[1], border);
++        if (border) {
++            return false;
++        }
++        const u32 t = level.rgba8[(size_t(layer) * level.height * level.depth + size_t(y)) * level.width + size_t(x)];
++        const f32* const unorm = UnormTable().data();
++        out = {texture.rgb_table[t & 0xFF], texture.rgb_table[(t >> 8) & 0xFF],
++               texture.rgb_table[(t >> 16) & 0xFF], unorm[t >> 24]};
++        return true;
++    }
++
++    /// Bilinear filtering of 8-bit texels in 2D, with 8-bit weights (as GPUs filter); false at a
++    /// border, which the general path handles
++    bool BilinearRgba8(const Level& level, f32 u, f32 v, std::array<f32, 4>& out) const {
++        s32 x0, y0;
++        f32 fx, fy;
++        Footprint(u, level.width, offset[0], x0, fx);
++        Footprint(v, level.height, offset[1], y0, fy);
++        if (x0 >= 0 && y0 >= 0 && u32(x0) + 1 < level.width && u32(y0) + 1 < level.height) [[likely]] { // all inside
++            const size_t base = (size_t(layer) * level.height * level.depth + size_t(y0)) * level.width + size_t(x0);
++            return Bilinear(level.rgba8.data() + base, level.rgba8.data() + base + level.width, 0, 1, fx, fy, out);
++        }
++        bool border = false;
++        const s32 xa = WrapCoordinate(x0, s32(level.width), sampler.wrap[0], border);
++        const s32 xb = WrapCoordinate(x0 + 1, s32(level.width), sampler.wrap[0], border);
++        const s32 ya = WrapCoordinate(y0, s32(level.height), sampler.wrap[1], border);
++        const s32 yb = WrapCoordinate(y0 + 1, s32(level.height), sampler.wrap[1], border);
++        if (border) {
++            return false;
++        }
++        const size_t layer_base = size_t(layer) * level.height * level.depth;
++        return Bilinear(level.rgba8.data() + (layer_base + size_t(ya)) * level.width,
++                        level.rgba8.data() + (layer_base + size_t(yb)) * level.width, xa, xb, fx, fy, out);
++    }
++
++    /// Four 8-bit texels, two from each row, filtered
++    bool Bilinear(const u32* row_a, const u32* row_b, s32 xa, s32 xb, f32 fx, f32 fy,
++                  std::array<f32, 4>& out) const {
++        const u32 t00 = row_a[xa], t10 = row_a[xb], t01 = row_b[xa], t11 = row_b[xb];
++        const u32 wx = u32(s32(fx * 256.0f + 0.5f)), wy = u32(s32(fy * 256.0f + 0.5f));
++        const u32 w00 = (256 - wx) * (256 - wy), w10 = wx * (256 - wy), w01 = (256 - wx) * wy, w11 = wx * wy;
++        const f32* const unorm = UnormTable().data();
++        if (!texture.srgb) {
++            for (u32 ch = 0; ch < 4; ++ch) {
++                const u32 shift = ch * 8;
++                const u32 sum = ((t00 >> shift) & 0xFF) * w00 + ((t10 >> shift) & 0xFF) * w10 +
++                                ((t01 >> shift) & 0xFF) * w01 + ((t11 >> shift) & 0xFF) * w11;
++                out[ch] = unorm[(sum + 32768) >> 16];
++            }
++            return true;
++        }
++        const f32* const table = texture.rgb_table; // sRGB: filtered after decoding
++        const f32 f00 = f32(w00) / 65536.0f, f10 = f32(w10) / 65536.0f, f01 = f32(w01) / 65536.0f,
++                  f11 = f32(w11) / 65536.0f;
++        for (u32 ch = 0; ch < 4; ++ch) {
++            const u32 shift = ch * 8;
++            const f32* const t = ch == 3 ? unorm : table;
++            out[ch] = t[(t00 >> shift) & 0xFF] * f00 + t[(t10 >> shift) & 0xFF] * f10 +
++                      t[(t01 >> shift) & 0xFF] * f01 + t[(t11 >> shift) & 0xFF] * f11;
++        }
++        return true;
+     }
+ 
+     std::array<f32, 4> Filter(u32 level_index, f32 u, f32 v, f32 w, bool linear) const {
+         const Level& level = texture.levels[level_index];
++        if (linear && dims == 2 && texture.compact && !reference) {
++            std::array<f32, 4> texel;
++            if (BilinearRgba8(level, u, v, texel)) {
++                return texel;
++            }
++        }
+         if (!linear) {
+             const auto texel_at = [](f32 coordinate, u32 size, s32 offset) {
+-                return s32(std::floor(std::clamp(coordinate * f32(size), -1e6f, 1e6f))) + offset;
++                return FloorToInt(std::clamp(coordinate * f32(size), -1e6f, 1e6f)) + offset;
+             };
+             return Fetch(level, texel_at(u, level.width, offset[0]),
+                          texel_at(v, level.height, offset[1]), texel_at(w, level.depth, offset[2]));
+@@ -976,6 +1088,9 @@ f32 Swizzled(const std::array<f32, 4>& texel, SwizzleSource source, bool integer
+ }
+ 
+ std::array<f32, 4> Swizzle(const Texture& texture, const std::array<f32, 4>& texel) {
++    if (texture.identity_swizzle) {
++        return texel;
++    }
+     return {Swizzled(texel, texture.swizzle[0], texture.integer),
+             Swizzled(texel, texture.swizzle[1], texture.integer),
+             Swizzled(texel, texture.swizzle[2], texture.integer),
+@@ -1046,7 +1161,7 @@ bool ToSampleCoords(const Texture& texture, Shader::TextureType type, const Cell
+     if (std::isnan(out.u)) out.u = 0.0f;
+     if (std::isnan(out.v)) out.v = 0.0f;
+     if (std::isnan(out.w)) out.w = 0.0f;
+-    const s32 rounded = std::isnan(layer) ? 0 : s32(std::clamp(std::round(layer), 0.0f, 65535.0f));
++    const s32 rounded = layer == 0.0f || std::isnan(layer) ? 0 : s32(std::clamp(std::round(layer), 0.0f, 65535.0f));
+     out.layer = texture.base_layer + std::min<u32>(u32(rounded), texture.num_layers - 1);
+     return true;
+ }
+@@ -1063,25 +1178,41 @@ std::array<f32, 4> SampleTexture(const Binding& binding, IR::TextureInstInfo inf
+         return {};
+     }
+     const Texture& texture = *binding.texture;
+-    const auto& sampler = binding.sampler;
++    lod = std::clamp(lod + binding.lod_bias, binding.min_lod, binding.max_lod);
++    // the commonest: 2D, 8-bit texels, the base level
++    using T = Shader::TextureType;
++    const T type = info.type;
++    if (!reference && texture.compact && (type == T::Color2D || type == T::Color2DRect) &&
++        (!(lod > 0.0f) || texture.num_levels == 1 || binding.mipmap == Tegra::Texture::TextureMipmapFilter::None)) {
++        const Level& level = texture.levels[texture.base_level];
++        f32 u = F(coords, 0), v = F(coords, 1);
++        if (type == T::Color2DRect) {
++            u /= f32(level.width), v /= f32(level.height);
++        }
++        u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
++        const Sampling sampling{texture, binding, 2, texture.base_layer, Offsets(offset), nullptr};
++        std::array<f32, 4> texel;
++        if ((!(lod > 0.0f) ? binding.mag_linear : binding.min_linear) ? sampling.BilinearRgba8(level, u, v, texel)
++                                                                     : sampling.NearestRgba8(level, u, v, texel)) {
++            return Swizzle(texture, texel);
++        }
++    }
+     SampleCoords c;
+     if (!ToSampleCoords(texture, info.type, coords, c)) {
+         return {};
+     }
+-    const Sampling sampling{texture, sampler, c.dims, c.layer, Offsets(offset), reference};
+-    lod = std::clamp(lod + sampler.LodBias(), sampler.MinLod(), std::max(sampler.MinLod(), sampler.MaxLod()));
++    const Sampling sampling{texture, binding, c.dims, c.layer, Offsets(offset), reference};
+     const bool magnify = !(lod > 0.0f);
+-    const auto filter = magnify ? sampler.mag_filter.Value() : sampler.min_filter.Value();
+-    const bool linear = !texture.integer && filter == Tegra::Texture::TextureFilter::Linear;
++    const bool linear = !texture.integer && (magnify ? binding.mag_linear : binding.min_linear);
+     const u32 max_level = texture.num_levels - 1;
+     const auto at = [&](u32 level) {
+         return sampling.Filter(texture.base_level + level, c.u, c.v, c.w, linear);
+     };
+     std::array<f32, 4> texel;
+     using M = Tegra::Texture::TextureMipmapFilter;
+-    if (magnify || max_level == 0 || sampler.mipmap_filter == M::None) {
++    if (magnify || max_level == 0 || binding.mipmap == M::None) {
+         texel = at(0);
+-    } else if (sampler.mipmap_filter == M::Nearest) {
++    } else if (binding.mipmap == M::Nearest) {
+         texel = at(std::min(u32(lod + 0.5f), max_level));
+     } else {
+         const f32 level = std::min(lod, f32(max_level));
+@@ -1106,7 +1237,7 @@ std::array<f32, 4> GatherTexture(const Binding& binding, IR::TextureInstInfo inf
+     if (!ToSampleCoords(texture, info.type, coords, c)) {
+         return {};
+     }
+-    const Sampling sampling{texture, binding.sampler, std::max(c.dims, 2u), c.layer, Offsets(offset), reference};
++    const Sampling sampling{texture, binding, std::max(c.dims, 2u), c.layer, Offsets(offset), reference};
+     const Level& level = texture.levels[texture.base_level];
+     s32 x0, y0;
+     f32 fx, fy;
+@@ -1143,8 +1274,7 @@ std::array<f32, 4> FetchTexture(const Binding& binding, IR::TextureInstInfo info
+         u32(z) >= level.depth || u32(layer) >= texture.num_layers) {
+         return {};
+     }
+-    const Tegra::Texture::TSCEntry no_sampler{};
+-    const Sampling sampling{texture, no_sampler, 3, texture.base_layer + u32(layer), {}, nullptr};
++    const Sampling sampling{texture, binding, 3, texture.base_layer + u32(layer), {}, nullptr};
+     return Swizzle(texture, sampling.Fetch(level, x, y, z));
+ }
+ 
+@@ -1159,6 +1289,7 @@ struct SoftwareDraw::Program {
+     u32 local_words = 0;
+     std::vector<Shader::TextureDescriptor> textures;
+     std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
++    bool one_lane = false; // it branches (or uses local memory): run a pixel at a time
+ };
+ 
+ struct SoftwareDraw::Textures {
+@@ -1168,14 +1299,113 @@ struct SoftwareDraw::Textures {
+     const Texture* Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address);
+ };
+ 
++/// A rasterizing thread's state: the fragment shader's values and its inputs and outputs
++struct SoftwareDraw::Raster {
++    std::vector<Lanes> cells;
++    std::vector<u32> local;
++    std::array<f32, 256 * LANES> inputs{};
++    std::array<f32, 256 * LANES> outputs{};
++    std::array<f32, 8 * 4 * LANES> colors{};
++    std::array<bool, LANES> discard{};
++    std::vector<u8*> gobs; // the render target's GOBs in the row being drawn, as they're reached
++    bool blend_ok = true;
++};
++
++/// A program's values for every lane, its constants filled in
++void Broadcast(const std::vector<Cell>& cells, std::vector<Lanes>& out) {
++    out.resize(cells.size());
++    for (size_t c = 0; c < cells.size(); ++c) {
++        for (u32 k = 0; k < 4; ++k) {
++            std::fill_n(out[c].w[k], LANES, cells[c].w[k]);
++        }
++    }
++}
++
++/// Threads that rasterize along with the one drawing, jobs handed out by a counter
++struct SoftwareDraw::Workers {
++    explicit Workers(u32 count) {
++        for (u32 i = 0; i < count; ++i) {
++            threads.emplace_back([this, i] { Loop(i + 1); });
++        }
++    }
++
++    ~Workers() {
++        {
++            std::scoped_lock lock{mutex};
++            quit = true;
++        }
++        wake.notify_all();
++        for (std::thread& thread : threads) {
++            thread.join();
++        }
++    }
++
++    /// job(index, thread) for each index below 'jobs', on these threads and this one (thread 0)
++    void Run(u32 jobs, const std::function<void(u32, u32)>& job) {
++        {
++            std::scoped_lock lock{mutex};
++            current = &job;
++            total = jobs;
++            next.store(0);
++            busy = u32(threads.size());
++            ++generation;
++        }
++        wake.notify_all();
++        Work(0);
++        std::unique_lock lock{mutex};
++        done.wait(lock, [this] { return busy == 0; });
++        current = nullptr;
++    }
++
++private:
++    void Work(u32 thread) {
++        for (u32 index; (index = next.fetch_add(1)) < total;) {
++            (*current)(index, thread);
++        }
++    }
++
++    void Loop(u32 thread) {
++        u64 seen = 0;
++        for (;;) {
++            {
++                std::unique_lock lock{mutex};
++                wake.wait(lock, [&] { return quit || generation != seen; });
++                if (quit) {
++                    return;
++                }
++                seen = generation;
++            }
++            Work(thread);
++            std::scoped_lock lock{mutex};
++            if (--busy == 0) {
++                done.notify_one();
++            }
++        }
++    }
++
++    std::vector<std::thread> threads;
++    std::mutex mutex;
++    std::condition_variable wake, done;
++    const std::function<void(u32, u32)>* current = nullptr;
++    u32 total = 0;
++    std::atomic<u32> next{0};
++    u32 busy = 0;
++    u64 generation = 0;
++    bool quit = false;
++};
++
+ namespace {
+ 
+ /// What an invocation reads and writes.
++/// What an invocation reads and writes. Inputs, outputs and colours are kept 'stride' lanes to an
++/// attribute (or colour component), 'n' lanes run from 'lane'.
+ struct Io {
+     const f32* inputs;  // by attribute (256)
+     f32* outputs;       // by attribute (256), for the vertex shader
+-    std::array<std::array<f32, 4>, 8>* colors; // fragment outputs
+-    bool discard;
++    f32* colors;        // fragment outputs: render target, component
++    bool* discard;      // by lane
++    u32 stride;
++    u32 lane;
+     const std::array<std::vector<u32>, 18>* cbufs;
+     u32* local;
+     u32 local_words;
+@@ -1421,13 +1651,11 @@ private:
+     std::vector<std::pair<u32, const IR::Block*>> fixups;
+ };
+ 
+-u32 ReadCbuf(const Io& io, const Cell& binding, const Cell& offset, u32 bytes) {
+-    const u32 index = binding.w[0];
++u32 ReadCbuf(const Io& io, u32 index, u32 byte_offset, u32 bytes) {
+     if (index >= io.cbufs->size()) {
+         return 0;
+     }
+     const auto& words = (*io.cbufs)[index];
+-    const u32 byte_offset = offset.w[0];
+     const u32 word = byte_offset / 4;
+     if (word >= words.size()) {
+         return 0;
+@@ -1451,26 +1679,168 @@ const Binding* GetBinding(const SoftwareDraw::Program& program, const Io& io, u3
+     return index < io.textures->size() ? &(*io.textures)[index] : nullptr;
+ }
+ 
+-void Run(const SoftwareDraw::Program& program, std::vector<Cell>& cells, Io& io) {
++f32 Fl(const Lanes& x, u32 i, u32 k = 0) {
++    return std::bit_cast<f32>(x.w[k][i]);
++}
++void SetFl(Lanes& x, u32 i, f32 v, u32 k = 0) {
++    x.w[k][i] = std::bit_cast<u32>(v);
++}
++s32 Sl(const Lanes& x, u32 i) {
++    return static_cast<s32>(x.w[0][i]);
++}
++u64 U64l(const Lanes& x, u32 i) {
++    return u64{x.w[0][i]} | (u64{x.w[1][i]} << 32);
++}
++void SetU64l(Lanes& x, u32 i, u64 v) {
++    x.w[0][i] = u32(v);
++    x.w[1][i] = u32(v >> 32);
++}
++Cell LaneCell(const Lanes& x, u32 i) {
++    return {{x.w[0][i], x.w[1][i], x.w[2][i], x.w[3][i]}};
++}
++
++/// The texture instructions, a lane at a time
++void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io, u32 n) {
++    using O = IR::Opcode;
++    IR::TextureInstInfo info{};
++    info.raw = o.extra;
++    Lanes& d = c[o.dest];
++    // the commonest, all lanes at once: a 2D texture of 8-bit texels, sampled at its base level
++    // with the same handle in every lane
++    const Lanes& handle = c[o.a[0]];
++    if ((o.op == O::ImageSampleImplicitLod && !info.has_bias) &&
++        std::all_of(handle.w[0] + 1, handle.w[0] + n, [&](u32 h) { return h == handle.w[0][0]; })) {
++        const Binding* const binding = GetBinding(program, io, info.descriptor_index, handle.w[0][0]);
++        const Texture* const texture = binding ? binding->texture : nullptr;
++        using T = Shader::TextureType;
++        const T type = info.type;
++        const f32 lod = binding ? std::clamp(binding->lod_bias, binding->min_lod, binding->max_lod) : 0.0f;
++        if (texture && texture->ok && texture->compact && (type == T::Color2D || type == T::Color2DRect) &&
++            !(lod > 0.0f)) {
++            const Level& level = texture->levels[texture->base_level];
++            const Lanes& coords = c[o.a[1]];
++            const Lanes& offsets = c[o.a[3]];
++            const f32 scale_u = type == T::Color2DRect ? 1.0f / f32(s32(level.width)) : 1.0f;
++            const f32 scale_v = type == T::Color2DRect ? 1.0f / f32(s32(level.height)) : 1.0f;
++            const bool linear = binding->mag_linear;
++            for (u32 i = 0; i < n; ++i) {
++                const Sampling sampling{*texture, *binding, 2, texture->base_layer,
++                                        {s32(offsets.w[0][i]), s32(offsets.w[1][i]), 0}, nullptr};
++                f32 u = Fl(coords, i, 0) * scale_u, v = Fl(coords, i, 1) * scale_v;
++                u = u == u ? u : 0.0f, v = v == v ? v : 0.0f;
++                std::array<f32, 4> texel;
++                if (!(linear ? sampling.BilinearRgba8(level, u, v, texel) : sampling.NearestRgba8(level, u, v, texel))) {
++                    texel = SampleTexture(*binding, info, LaneCell(coords, i), LaneCell(offsets, i), 0.0f, nullptr);
++                    for (u32 k = 0; k < 4; ++k) {
++                        d.w[k][i] = std::bit_cast<u32>(texel[k]);
++                    }
++                    continue;
++                }
++                texel = Swizzle(*texture, texel);
++                for (u32 k = 0; k < 4; ++k) {
++                    d.w[k][i] = std::bit_cast<u32>(texel[k]);
++                }
++            }
++            return;
++        }
++    }
++    for (u32 i = 0; i < n; ++i) {
++        const Binding* const binding = GetBinding(program, io, info.descriptor_index, c[o.a[0]].w[0][i]);
++        const Cell b = LaneCell(c[o.a[1]], i), e = LaneCell(c[o.a[2]], i), f = LaneCell(c[o.a[3]], i);
++        std::array<f32, 4> result{};
++        if (binding && info.type != Shader::TextureType::Buffer) {
++            switch (o.op) {
++            case O::ImageSampleImplicitLod: // coords, bias, offset
++                result = SampleTexture(*binding, info, b, f, info.has_bias ? F(e) : 0.0f, nullptr);
++                break;
++            case O::ImageSampleExplicitLod: // coords, lod, offset
++                result = SampleTexture(*binding, info, b, f, F(e), nullptr);
++                break;
++            case O::ImageGradient: { // coords, derivatives, offset: the lod from the derivatives
++                f32 lod = 0.0f;
++                const Texture* const texture = binding->texture;
++                if (texture && texture->ok) {
++                    const Level& level = texture->levels[texture->base_level];
++                    const f32 dx_u = F(e, 0) * f32(level.width), dx_v = F(e, 2) * f32(level.height);
++                    const f32 dy_u = F(e, 1) * f32(level.width), dy_v = F(e, 3) * f32(level.height);
++                    const f32 rho2 = std::max(dx_u * dx_u + dx_v * dx_v, dy_u * dy_u + dy_v * dy_v);
++                    lod = rho2 > 0.0f ? 0.5f * std::log2(rho2) : 0.0f;
++                }
++                result = SampleTexture(*binding, info, b, f, lod, nullptr);
++                break;
++            }
++            case O::ImageSampleDrefImplicitLod: { // coords, reference, offset
++                const f32 reference = F(e);
++                result[0] = SampleTexture(*binding, info, b, f, 0.0f, &reference)[0];
++                break;
++            }
++            case O::ImageSampleDrefExplicitLod: { // coords, (reference, lod), offset
++                const f32 reference = F(e, 0);
++                result[0] = SampleTexture(*binding, info, b, f, F(e, 1), &reference)[0];
++                break;
++            }
++            case O::ImageGather: // coords, offset
++                result = GatherTexture(*binding, info, b, e, nullptr);
++                break;
++            case O::ImageGatherDref: { // coords, offset, reference
++                const f32 reference = F(f);
++                result = GatherTexture(*binding, info, b, e, &reference);
++                break;
++            }
++            case O::ImageFetch: // coords, offset, lod
++                result = FetchTexture(*binding, info, b, e, f.w[0]);
++                break;
++            case O::ImageQueryDimensions: { // lod
++                const Texture* const texture = binding->texture;
++                if (!texture || !texture->ok) {
++                    break;
++                }
++                const u32 level_index = std::min(texture->base_level + b.w[0], u32(texture->levels.size()) - 1);
++                const Level& level = texture->levels[level_index];
++                using T = Shader::TextureType;
++                const T type = info.type;
++                const bool array = type == T::ColorArray1D || type == T::ColorArray2D || type == T::ColorArrayCube;
++                const u32 layers = type == T::ColorArrayCube ? texture->num_layers / 6 : texture->num_layers;
++                const u32 dims[4] = {level.width, type == T::ColorArray1D ? layers : level.height,
++                                     type == T::Color3D ? level.depth : array && type != T::ColorArray1D ? layers : 0,
++                                     texture->num_levels};
++                std::memcpy(result.data(), dims, sizeof(dims));
++                break;
++            }
++            default: // ImageQueryLod
++                break;
++            }
++        }
++        for (u32 k = 0; k < 4; ++k) {
++            d.w[k][i] = std::bit_cast<u32>(result[k]);
++        }
++    }
++}
++
++/// A program for 'n' lanes (pixels) at once from 'io.lane'. Programs that branch run one lane at a
++/// time: a branch goes by lane 0.
++void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     using O = IR::Opcode;
+     const Op* const ops = program.ops.data();
+-    Cell* const c = cells.data();
++#define LANE_LOOP for (u32 i = 0; i < n; ++i)
+     for (u32 pc = 0;;) {
+         const Op& o = ops[pc++];
+         switch (o.kind) {
+         case Kind::Move:
+-            c[o.dest] = c[o.a[0]];
++            for (u32 k = 0; k < 4; ++k) {
++                std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], n * sizeof(u32));
++            }
+             continue;
+         case Kind::Jump:
+             pc = o.extra;
+             continue;
+         case Kind::JumpIfTrue:
+-            if (c[o.a[0]].w[0] != 0) {
++            if (c[o.a[0]].w[0][0] != 0) {
+                 pc = o.extra;
+             }
+             continue;
+         case Kind::JumpIfFalse:
+-            if (c[o.a[0]].w[0] == 0) {
++            if (c[o.a[0]].w[0][0] == 0) {
+                 pc = o.extra;
+             }
+             continue;
+@@ -1479,321 +1849,276 @@ void Run(const SoftwareDraw::Program& program, std::vector<Cell>& cells, Io& io)
+         case Kind::Ir:
+             break;
+         }
+-        Cell& d = c[o.dest];
+-        const Cell& a = c[o.a[0]];
+-        const Cell& b = c[o.a[1]];
+-        const Cell& e = c[o.a[2]];
++        Lanes& d = c[o.dest];
++        const Lanes& a = c[o.a[0]];
++        const Lanes& b = c[o.a[1]];
++        const Lanes& e = c[o.a[2]];
++        const Lanes& f = c[o.a[3]];
+         switch (o.op) {
+         case O::DemoteToHelperInvocation:
+-            io.discard = true;
++            LANE_LOOP io.discard[io.lane + i] = true;
+             return;
+         case O::GetCbufU8:
+-            d.w[0] = ReadCbuf(io, a, b, 1);
++            LANE_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 1);
+             break;
+         case O::GetCbufS8:
+-            d.w[0] = u32(s32(s8(ReadCbuf(io, a, b, 1))));
++            LANE_LOOP d.w[0][i] = u32(s32(s8(ReadCbuf(io, a.w[0][i], b.w[0][i], 1))));
+             break;
+         case O::GetCbufU16:
+-            d.w[0] = ReadCbuf(io, a, b, 2);
++            LANE_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 2);
+             break;
+         case O::GetCbufS16:
+-            d.w[0] = u32(s32(s16(ReadCbuf(io, a, b, 2))));
++            LANE_LOOP d.w[0][i] = u32(s32(s16(ReadCbuf(io, a.w[0][i], b.w[0][i], 2))));
+             break;
+         case O::GetCbufU32:
+         case O::GetCbufF32:
+-            d.w[0] = ReadCbuf(io, a, b, 4);
++            LANE_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
+             break;
+-        case O::GetCbufU32x2: {
+-            Cell next = b;
+-            next.w[0] += 4;
+-            d.w[0] = ReadCbuf(io, a, b, 4);
+-            d.w[1] = ReadCbuf(io, a, next, 4);
++        case O::GetCbufU32x2:
++            LANE_LOOP {
++                d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
++                d.w[1][i] = ReadCbuf(io, a.w[0][i], b.w[0][i] + 4, 4);
++            }
+             break;
+-        }
+         case O::GetAttribute:
+         case O::GetAttributeU32:
+-            d.w[0] = std::bit_cast<u32>(io.inputs[o.extra & 0xFF]);
++            std::memcpy(d.w[0], io.inputs + (o.extra & 0xFF) * io.stride + io.lane, n * sizeof(u32));
+             break;
+         case O::GetAttributeIndexed:
+-            d.w[0] = std::bit_cast<u32>(io.inputs[(a.w[0] / 4) & 0xFF]);
++            LANE_LOOP d.w[0][i] = std::bit_cast<u32>(io.inputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i]);
+             break;
+         case O::SetAttribute:
+-            io.outputs[o.extra & 0xFF] = F(b);
++            LANE_LOOP io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
+             break;
+         case O::SetAttributeIndexed:
+-            io.outputs[(a.w[0] / 4) & 0xFF] = F(b);
++            LANE_LOOP io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
+             break;
+-        case O::SetFragColor:
+-            (*io.colors)[(o.extra / 4) & 7][o.extra % 4] = F(e);
++        case O::SetFragColor: {
++            f32* const out = io.colors + (((o.extra / 4) & 7) * 4 + o.extra % 4) * io.stride + io.lane;
++            std::memcpy(out, e.w[0], n * sizeof(u32));
+             break;
++        }
+         case O::SetSampleMask:
+         case O::SetFragDepth:
+             break;
+         case O::IsHelperInvocation:
+-            d.w[0] = 0;
++            LANE_LOOP d.w[0][i] = 0;
+             break;
+         case O::YDirection:
+         case O::ResolutionDownFactor:
+         case O::SR_WScaleFactorXY:
+         case O::SR_WScaleFactorZ:
+-            SetF(d, 1.0f);
+-            SetF(d, 1.0f, 1);
++            LANE_LOOP {
++                SetFl(d, i, 1.0f);
++                SetFl(d, i, 1.0f, 1);
++            }
+             break;
+         case O::InvocationId:
+         case O::SampleId:
+         case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
+-            d = {};
++            for (u32 k = 0; k < 4; ++k) {
++                std::memset(d.w[k], 0, n * sizeof(u32));
++            }
+             break;
+         case O::LoadLocal:
+-            d.w[0] = a.w[0] / 4 < io.local_words ? io.local[a.w[0] / 4] : 0;
++            LANE_LOOP d.w[0][i] = a.w[0][i] / 4 < io.local_words ? io.local[a.w[0][i] / 4] : 0;
+             break;
+         case O::WriteLocal:
+-            if (a.w[0] / 4 < io.local_words) {
+-                io.local[a.w[0] / 4] = b.w[0];
++            LANE_LOOP {
++                if (a.w[0][i] / 4 < io.local_words) {
++                    io.local[a.w[0][i] / 4] = b.w[0][i];
++                }
+             }
+             break;
+         case O::CompositeConstructU32x2: case O::CompositeConstructF32x2:
+-            d.w[0] = a.w[0], d.w[1] = b.w[0];
++            std::memcpy(d.w[0], a.w[0], n * 4);
++            std::memcpy(d.w[1], b.w[0], n * 4);
+             break;
+         case O::CompositeConstructU32x3: case O::CompositeConstructF32x3:
+-            d.w[0] = a.w[0], d.w[1] = b.w[0], d.w[2] = e.w[0];
++            std::memcpy(d.w[0], a.w[0], n * 4);
++            std::memcpy(d.w[1], b.w[0], n * 4);
++            std::memcpy(d.w[2], e.w[0], n * 4);
+             break;
+         case O::CompositeConstructU32x4: case O::CompositeConstructF32x4:
+-            d.w[0] = a.w[0], d.w[1] = b.w[0], d.w[2] = e.w[0], d.w[3] = c[o.a[3]].w[0];
++            std::memcpy(d.w[0], a.w[0], n * 4);
++            std::memcpy(d.w[1], b.w[0], n * 4);
++            std::memcpy(d.w[2], e.w[0], n * 4);
++            std::memcpy(d.w[3], f.w[0], n * 4);
+             break;
+         case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
+         case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
+-            d.w[0] = a.w[b.w[0] & 3];
++            LANE_LOOP d.w[0][i] = a.w[b.w[0][i] & 3][i];
+             break;
+         case O::CompositeInsertU32x2: case O::CompositeInsertU32x3: case O::CompositeInsertU32x4:
+-        case O::CompositeInsertF32x2: case O::CompositeInsertF32x3: case O::CompositeInsertF32x4: {
+-            Cell result = a;
+-            result.w[e.w[0] & 3] = b.w[0];
+-            d = result;
++        case O::CompositeInsertF32x2: case O::CompositeInsertF32x3: case O::CompositeInsertF32x4:
++            LANE_LOOP {
++                u32 result[4] = {a.w[0][i], a.w[1][i], a.w[2][i], a.w[3][i]};
++                result[e.w[0][i] & 3] = b.w[0][i];
++                for (u32 k = 0; k < 4; ++k) {
++                    d.w[k][i] = result[k];
++                }
++            }
+             break;
+-        }
+         case O::SelectU1: case O::SelectU8: case O::SelectU16: case O::SelectU32: case O::SelectF32:
+         case O::SelectU64:
+-            d = a.w[0] != 0 ? b : e;
++            LANE_LOOP {
++                const Lanes& source = a.w[0][i] != 0 ? b : e;
++                for (u32 k = 0; k < 4; ++k) {
++                    d.w[k][i] = source.w[k][i];
++                }
++            }
+             break;
+         case O::BitCastU32F32: case O::BitCastF32U32:
+-            d.w[0] = a.w[0];
++            std::memcpy(d.w[0], a.w[0], n * 4);
+             break;
+         case O::BitCastU64F64: case O::BitCastF64U64: case O::PackUint2x32: case O::UnpackUint2x32:
+         case O::PackDouble2x32: case O::UnpackDouble2x32:
+-            d.w[0] = a.w[0], d.w[1] = a.w[1];
++            std::memcpy(d.w[0], a.w[0], n * 4);
++            std::memcpy(d.w[1], a.w[1], n * 4);
+             break;
+         case O::PackHalf2x16:
+-            d.w[0] = u32(ToHalf(F(a, 0))) | (u32(ToHalf(F(a, 1))) << 16);
++            LANE_LOOP d.w[0][i] = u32(ToHalf(Fl(a, i, 0))) | (u32(ToHalf(Fl(a, i, 1))) << 16);
+             break;
+         case O::UnpackHalf2x16:
+-            SetF(d, FromHalf(u16(a.w[0])), 0);
+-            SetF(d, FromHalf(u16(a.w[0] >> 16)), 1);
++            LANE_LOOP {
++                SetFl(d, i, FromHalf(u16(a.w[0][i])), 0);
++                SetFl(d, i, FromHalf(u16(a.w[0][i] >> 16)), 1);
++            }
+             break;
+-        case O::FPAbs32: SetF(d, std::fabs(F(a))); break;
+-        case O::FPAdd32: SetF(d, F(a) + F(b)); break;
+-        case O::FPFma32: SetF(d, std::fma(F(a), F(b), F(e))); break;
+-        case O::FPMax32: SetF(d, std::fmax(F(a), F(b))); break;
+-        case O::FPMin32: SetF(d, std::fmin(F(a), F(b))); break;
+-        case O::FPMul32: SetF(d, F(a) * F(b)); break;
+-        case O::FPNeg32: SetF(d, -F(a)); break;
+-        case O::FPRecip32: SetF(d, 1.0f / F(a)); break;
+-        case O::FPRecipSqrt32: SetF(d, 1.0f / std::sqrt(F(a))); break;
+-        case O::FPSqrt: SetF(d, std::sqrt(F(a))); break;
+-        case O::FPSin: SetF(d, std::sin(F(a))); break;
+-        case O::FPCos: SetF(d, std::cos(F(a))); break;
+-        case O::FPExp2: SetF(d, std::exp2(F(a))); break;
+-        case O::FPLog2: SetF(d, std::log2(F(a))); break;
+-        case O::FPSaturate32: SetF(d, std::isnan(F(a)) ? 0.0f : std::clamp(F(a), 0.0f, 1.0f)); break;
+-        case O::FPClamp32: SetF(d, std::fmin(std::fmax(F(a), F(b)), F(e))); break;
+-        case O::FPRoundEven32: SetF(d, std::nearbyint(F(a))); break;
+-        case O::FPFloor32: SetF(d, std::floor(F(a))); break;
+-        case O::FPCeil32: SetF(d, std::ceil(F(a))); break;
+-        case O::FPTrunc32: SetF(d, std::trunc(F(a))); break;
+-        case O::FPOrdEqual32: d.w[0] = F(a) == F(b); break;
+-        case O::FPUnordEqual32: d.w[0] = !(F(a) != F(b)) || std::isnan(F(a)) || std::isnan(F(b)); break;
+-        case O::FPOrdNotEqual32: d.w[0] = F(a) != F(b) && !std::isnan(F(a)) && !std::isnan(F(b)); break;
+-        case O::FPUnordNotEqual32: d.w[0] = F(a) != F(b); break;
+-        case O::FPOrdLessThan32: d.w[0] = F(a) < F(b); break;
+-        case O::FPUnordLessThan32: d.w[0] = !(F(a) >= F(b)); break;
+-        case O::FPOrdGreaterThan32: d.w[0] = F(a) > F(b); break;
+-        case O::FPUnordGreaterThan32: d.w[0] = !(F(a) <= F(b)); break;
+-        case O::FPOrdLessThanEqual32: d.w[0] = F(a) <= F(b); break;
+-        case O::FPUnordLessThanEqual32: d.w[0] = !(F(a) > F(b)); break;
+-        case O::FPOrdGreaterThanEqual32: d.w[0] = F(a) >= F(b); break;
+-        case O::FPUnordGreaterThanEqual32: d.w[0] = !(F(a) < F(b)); break;
+-        case O::FPIsNan32: d.w[0] = std::isnan(F(a)); break;
+-        case O::IAdd32: d.w[0] = a.w[0] + b.w[0]; break;
+-        case O::ISub32: d.w[0] = a.w[0] - b.w[0]; break;
+-        case O::IMul32: d.w[0] = a.w[0] * b.w[0]; break;
++        case O::FPAbs32: LANE_LOOP SetFl(d, i, std::fabs(Fl(a, i))); break;
++        case O::FPAdd32: LANE_LOOP SetFl(d, i, Fl(a, i) + Fl(b, i)); break;
++        case O::FPFma32: LANE_LOOP SetFl(d, i, std::fma(Fl(a, i), Fl(b, i), Fl(e, i))); break;
++        case O::FPMax32: LANE_LOOP SetFl(d, i, std::fmax(Fl(a, i), Fl(b, i))); break;
++        case O::FPMin32: LANE_LOOP SetFl(d, i, std::fmin(Fl(a, i), Fl(b, i))); break;
++        case O::FPMul32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i)); break;
++        case O::FPNeg32: LANE_LOOP SetFl(d, i, -Fl(a, i)); break;
++        case O::FPRecip32: LANE_LOOP SetFl(d, i, 1.0f / Fl(a, i)); break;
++        case O::FPRecipSqrt32: LANE_LOOP SetFl(d, i, 1.0f / std::sqrt(Fl(a, i))); break;
++        case O::FPSqrt: LANE_LOOP SetFl(d, i, std::sqrt(Fl(a, i))); break;
++        case O::FPSin: LANE_LOOP SetFl(d, i, std::sin(Fl(a, i))); break;
++        case O::FPCos: LANE_LOOP SetFl(d, i, std::cos(Fl(a, i))); break;
++        case O::FPExp2: LANE_LOOP SetFl(d, i, std::exp2(Fl(a, i))); break;
++        case O::FPLog2: LANE_LOOP SetFl(d, i, std::log2(Fl(a, i))); break;
++        case O::FPSaturate32: LANE_LOOP SetFl(d, i, std::isnan(Fl(a, i)) ? 0.0f : std::clamp(Fl(a, i), 0.0f, 1.0f)); break;
++        case O::FPClamp32: LANE_LOOP SetFl(d, i, std::fmin(std::fmax(Fl(a, i), Fl(b, i)), Fl(e, i))); break;
++        case O::FPRoundEven32: LANE_LOOP SetFl(d, i, std::nearbyint(Fl(a, i))); break;
++        case O::FPFloor32: LANE_LOOP SetFl(d, i, std::floor(Fl(a, i))); break;
++        case O::FPCeil32: LANE_LOOP SetFl(d, i, std::ceil(Fl(a, i))); break;
++        case O::FPTrunc32: LANE_LOOP SetFl(d, i, std::trunc(Fl(a, i))); break;
++        case O::FPOrdEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) == Fl(b, i); break;
++        case O::FPUnordEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) != Fl(b, i)) || std::isnan(Fl(a, i)) || std::isnan(Fl(b, i)); break;
++        case O::FPOrdNotEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) != Fl(b, i) && !std::isnan(Fl(a, i)) && !std::isnan(Fl(b, i)); break;
++        case O::FPUnordNotEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) != Fl(b, i); break;
++        case O::FPOrdLessThan32: LANE_LOOP d.w[0][i] = Fl(a, i) < Fl(b, i); break;
++        case O::FPUnordLessThan32: LANE_LOOP d.w[0][i] = !(Fl(a, i) >= Fl(b, i)); break;
++        case O::FPOrdGreaterThan32: LANE_LOOP d.w[0][i] = Fl(a, i) > Fl(b, i); break;
++        case O::FPUnordGreaterThan32: LANE_LOOP d.w[0][i] = !(Fl(a, i) <= Fl(b, i)); break;
++        case O::FPOrdLessThanEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) <= Fl(b, i); break;
++        case O::FPUnordLessThanEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) > Fl(b, i)); break;
++        case O::FPOrdGreaterThanEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) >= Fl(b, i); break;
++        case O::FPUnordGreaterThanEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) < Fl(b, i)); break;
++        case O::FPIsNan32: LANE_LOOP d.w[0][i] = std::isnan(Fl(a, i)); break;
++        case O::IAdd32: LANE_LOOP d.w[0][i] = a.w[0][i] + b.w[0][i]; break;
++        case O::ISub32: LANE_LOOP d.w[0][i] = a.w[0][i] - b.w[0][i]; break;
++        case O::IMul32: LANE_LOOP d.w[0][i] = a.w[0][i] * b.w[0][i]; break;
+         case O::SDiv32:
+-            d.w[0] = S(b) == 0 ? 0 : (S(a) == std::numeric_limits<s32>::min() && S(b) == -1) ? a.w[0] : u32(S(a) / S(b));
++            LANE_LOOP d.w[0][i] = Sl(b, i) == 0 ? 0 : (Sl(a, i) == std::numeric_limits<s32>::min() && Sl(b, i) == -1) ? a.w[0][i] : u32(Sl(a, i) / Sl(b, i));
+             break;
+-        case O::UDiv32: d.w[0] = b.w[0] == 0 ? 0 : a.w[0] / b.w[0]; break;
+-        case O::INeg32: d.w[0] = 0u - a.w[0]; break;
+-        case O::IAbs32: d.w[0] = S(a) < 0 ? 0u - a.w[0] : a.w[0]; break;
+-        case O::IAdd64: SetU64(d, U64(a) + U64(b)); break;
+-        case O::ISub64: SetU64(d, U64(a) - U64(b)); break;
+-        case O::INeg64: SetU64(d, 0 - U64(a)); break;
+-        case O::ShiftLeftLogical32: d.w[0] = b.w[0] >= 32 ? 0 : a.w[0] << b.w[0]; break;
+-        case O::ShiftRightLogical32: d.w[0] = b.w[0] >= 32 ? 0 : a.w[0] >> b.w[0]; break;
+-        case O::ShiftRightArithmetic32: d.w[0] = u32(S(a) >> std::min<u32>(b.w[0], 31)); break;
+-        case O::ShiftLeftLogical64: SetU64(d, b.w[0] >= 64 ? 0 : U64(a) << b.w[0]); break;
+-        case O::ShiftRightLogical64: SetU64(d, b.w[0] >= 64 ? 0 : U64(a) >> b.w[0]); break;
+-        case O::ShiftRightArithmetic64: SetU64(d, u64(s64(U64(a)) >> std::min<u32>(b.w[0], 63))); break;
+-        case O::BitwiseAnd32: d.w[0] = a.w[0] & b.w[0]; break;
+-        case O::BitwiseOr32: d.w[0] = a.w[0] | b.w[0]; break;
+-        case O::BitwiseXor32: d.w[0] = a.w[0] ^ b.w[0]; break;
+-        case O::BitFieldInsert: {
+-            const u32 offset = e.w[0] & 31, count = std::min(c[o.a[3]].w[0], 32 - offset);
+-            const u32 mask = (count == 32 ? 0xFFFFFFFFu : (1u << count) - 1) << offset;
+-            d.w[0] = count == 0 ? a.w[0] : (a.w[0] & ~mask) | ((b.w[0] << offset) & mask);
++        case O::UDiv32: LANE_LOOP d.w[0][i] = b.w[0][i] == 0 ? 0 : a.w[0][i] / b.w[0][i]; break;
++        case O::INeg32: LANE_LOOP d.w[0][i] = 0u - a.w[0][i]; break;
++        case O::IAbs32: LANE_LOOP d.w[0][i] = Sl(a, i) < 0 ? 0u - a.w[0][i] : a.w[0][i]; break;
++        case O::IAdd64: LANE_LOOP SetU64l(d, i, U64l(a, i) + U64l(b, i)); break;
++        case O::ISub64: LANE_LOOP SetU64l(d, i, U64l(a, i) - U64l(b, i)); break;
++        case O::INeg64: LANE_LOOP SetU64l(d, i, 0 - U64l(a, i)); break;
++        case O::ShiftLeftLogical32: LANE_LOOP d.w[0][i] = b.w[0][i] >= 32 ? 0 : a.w[0][i] << b.w[0][i]; break;
++        case O::ShiftRightLogical32: LANE_LOOP d.w[0][i] = b.w[0][i] >= 32 ? 0 : a.w[0][i] >> b.w[0][i]; break;
++        case O::ShiftRightArithmetic32: LANE_LOOP d.w[0][i] = u32(Sl(a, i) >> std::min<u32>(b.w[0][i], 31)); break;
++        case O::ShiftLeftLogical64: LANE_LOOP SetU64l(d, i, b.w[0][i] >= 64 ? 0 : U64l(a, i) << b.w[0][i]); break;
++        case O::ShiftRightLogical64: LANE_LOOP SetU64l(d, i, b.w[0][i] >= 64 ? 0 : U64l(a, i) >> b.w[0][i]); break;
++        case O::ShiftRightArithmetic64: LANE_LOOP SetU64l(d, i, u64(s64(U64l(a, i)) >> std::min<u32>(b.w[0][i], 63))); break;
++        case O::BitwiseAnd32: LANE_LOOP d.w[0][i] = a.w[0][i] & b.w[0][i]; break;
++        case O::BitwiseOr32: LANE_LOOP d.w[0][i] = a.w[0][i] | b.w[0][i]; break;
++        case O::BitwiseXor32: LANE_LOOP d.w[0][i] = a.w[0][i] ^ b.w[0][i]; break;
++        case O::BitFieldInsert:
++            LANE_LOOP {
++                const u32 offset = e.w[0][i] & 31, count = std::min(f.w[0][i], 32 - offset);
++                const u32 field = (count == 32 ? 0xFFFFFFFFu : (1u << count) - 1) << offset;
++                d.w[0][i] = count == 0 ? a.w[0][i] : (a.w[0][i] & ~field) | ((b.w[0][i] << offset) & field);
++            }
+             break;
+-        }
+-        case O::BitFieldSExtract: d.w[0] = BitFieldExtract(a.w[0], b.w[0], e.w[0], true); break;
+-        case O::BitFieldUExtract: d.w[0] = BitFieldExtract(a.w[0], b.w[0], e.w[0], false); break;
+-        case O::BitReverse32: {
+-            u32 v = a.w[0], r = 0;
+-            for (int i = 0; i < 32; ++i, v >>= 1) {
+-                r = (r << 1) | (v & 1);
++        case O::BitFieldSExtract: LANE_LOOP d.w[0][i] = BitFieldExtract(a.w[0][i], b.w[0][i], e.w[0][i], true); break;
++        case O::BitFieldUExtract: LANE_LOOP d.w[0][i] = BitFieldExtract(a.w[0][i], b.w[0][i], e.w[0][i], false); break;
++        case O::BitReverse32:
++            LANE_LOOP {
++                u32 v = a.w[0][i], r = 0;
++                for (int bit = 0; bit < 32; ++bit, v >>= 1) {
++                    r = (r << 1) | (v & 1);
++                }
++                d.w[0][i] = r;
+             }
+-            d.w[0] = r;
+             break;
+-        }
+-        case O::BitCount32: d.w[0] = std::popcount(a.w[0]); break;
+-        case O::BitwiseNot32: d.w[0] = ~a.w[0]; break;
+-        case O::FindUMsb32: d.w[0] = a.w[0] == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(a.w[0]); break;
+-        case O::FindSMsb32: {
+-            const u32 v = S(a) < 0 ? ~a.w[0] : a.w[0];
+-            d.w[0] = v == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(v);
++        case O::BitCount32: LANE_LOOP d.w[0][i] = std::popcount(a.w[0][i]); break;
++        case O::BitwiseNot32: LANE_LOOP d.w[0][i] = ~a.w[0][i]; break;
++        case O::FindUMsb32: LANE_LOOP d.w[0][i] = a.w[0][i] == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(a.w[0][i]); break;
++        case O::FindSMsb32:
++            LANE_LOOP {
++                const u32 v = Sl(a, i) < 0 ? ~a.w[0][i] : a.w[0][i];
++                d.w[0][i] = v == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(v);
++            }
+             break;
+-        }
+-        case O::SMin32: d.w[0] = u32(std::min(S(a), S(b))); break;
+-        case O::UMin32: d.w[0] = std::min(a.w[0], b.w[0]); break;
+-        case O::SMax32: d.w[0] = u32(std::max(S(a), S(b))); break;
+-        case O::UMax32: d.w[0] = std::max(a.w[0], b.w[0]); break;
+-        case O::SClamp32: d.w[0] = u32(std::min(std::max(S(a), S(b)), S(e))); break;
+-        case O::UClamp32: d.w[0] = std::min(std::max(a.w[0], b.w[0]), e.w[0]); break;
+-        case O::SLessThan: d.w[0] = S(a) < S(b); break;
+-        case O::ULessThan: d.w[0] = a.w[0] < b.w[0]; break;
+-        case O::IEqual: d.w[0] = a.w[0] == b.w[0]; break;
+-        case O::SLessThanEqual: d.w[0] = S(a) <= S(b); break;
+-        case O::ULessThanEqual: d.w[0] = a.w[0] <= b.w[0]; break;
+-        case O::SGreaterThan: d.w[0] = S(a) > S(b); break;
+-        case O::UGreaterThan: d.w[0] = a.w[0] > b.w[0]; break;
+-        case O::INotEqual: d.w[0] = a.w[0] != b.w[0]; break;
+-        case O::SGreaterThanEqual: d.w[0] = S(a) >= S(b); break;
+-        case O::UGreaterThanEqual: d.w[0] = a.w[0] >= b.w[0]; break;
+-        case O::LogicalOr: d.w[0] = (a.w[0] | b.w[0]) != 0; break;
+-        case O::LogicalAnd: d.w[0] = (a.w[0] != 0) && (b.w[0] != 0); break;
+-        case O::LogicalXor: d.w[0] = (a.w[0] != 0) != (b.w[0] != 0); break;
+-        case O::LogicalNot: d.w[0] = a.w[0] == 0; break;
+-        case O::ConvertS32F32: d.w[0] = u32(ToS32(F(a))); break;
+-        case O::ConvertU32F32: d.w[0] = ToU32(F(a)); break;
+-        case O::ConvertS16F32: d.w[0] = u32(std::clamp(ToS32(F(a)), -32768, 32767)); break;
+-        case O::ConvertU16F32: d.w[0] = std::min(ToU32(F(a)), 65535u); break;
+-        case O::ConvertF32S32: SetF(d, float(S(a))); break;
+-        case O::ConvertF32U32: SetF(d, float(a.w[0])); break;
+-        case O::ConvertF32S8: SetF(d, float(s8(a.w[0]))); break;
+-        case O::ConvertF32S16: SetF(d, float(s16(a.w[0]))); break;
+-        case O::ConvertF32U8: SetF(d, float(u8(a.w[0]))); break;
+-        case O::ConvertF32U16: SetF(d, float(u16(a.w[0]))); break;
+-        case O::ConvertU64U32: SetU64(d, a.w[0]); break;
+-        case O::ConvertU32U64: d.w[0] = a.w[0]; break;
+-        case O::ConvertU16U32: d.w[0] = a.w[0] & 0xFFFF; break;
+-        case O::ConvertU32U16: d.w[0] = a.w[0] & 0xFFFF; break;
+-        case O::ConvertU8U32: d.w[0] = a.w[0] & 0xFF; break;
+-        case O::ConvertU32U8: d.w[0] = a.w[0] & 0xFF; break;
+-        case O::ConvertS32S8: d.w[0] = u32(s32(s8(a.w[0]))); break;
+-        case O::ConvertS32S16: d.w[0] = u32(s32(s16(a.w[0]))); break;
++        case O::SMin32: LANE_LOOP d.w[0][i] = u32(std::min(Sl(a, i), Sl(b, i))); break;
++        case O::UMin32: LANE_LOOP d.w[0][i] = std::min(a.w[0][i], b.w[0][i]); break;
++        case O::SMax32: LANE_LOOP d.w[0][i] = u32(std::max(Sl(a, i), Sl(b, i))); break;
++        case O::UMax32: LANE_LOOP d.w[0][i] = std::max(a.w[0][i], b.w[0][i]); break;
++        case O::SClamp32: LANE_LOOP d.w[0][i] = u32(std::min(std::max(Sl(a, i), Sl(b, i)), Sl(e, i))); break;
++        case O::UClamp32: LANE_LOOP d.w[0][i] = std::min(std::max(a.w[0][i], b.w[0][i]), e.w[0][i]); break;
++        case O::SLessThan: LANE_LOOP d.w[0][i] = Sl(a, i) < Sl(b, i); break;
++        case O::ULessThan: LANE_LOOP d.w[0][i] = a.w[0][i] < b.w[0][i]; break;
++        case O::IEqual: LANE_LOOP d.w[0][i] = a.w[0][i] == b.w[0][i]; break;
++        case O::SLessThanEqual: LANE_LOOP d.w[0][i] = Sl(a, i) <= Sl(b, i); break;
++        case O::ULessThanEqual: LANE_LOOP d.w[0][i] = a.w[0][i] <= b.w[0][i]; break;
++        case O::SGreaterThan: LANE_LOOP d.w[0][i] = Sl(a, i) > Sl(b, i); break;
++        case O::UGreaterThan: LANE_LOOP d.w[0][i] = a.w[0][i] > b.w[0][i]; break;
++        case O::INotEqual: LANE_LOOP d.w[0][i] = a.w[0][i] != b.w[0][i]; break;
++        case O::SGreaterThanEqual: LANE_LOOP d.w[0][i] = Sl(a, i) >= Sl(b, i); break;
++        case O::UGreaterThanEqual: LANE_LOOP d.w[0][i] = a.w[0][i] >= b.w[0][i]; break;
++        case O::LogicalOr: LANE_LOOP d.w[0][i] = (a.w[0][i] | b.w[0][i]) != 0; break;
++        case O::LogicalAnd: LANE_LOOP d.w[0][i] = (a.w[0][i] != 0) && (b.w[0][i] != 0); break;
++        case O::LogicalXor: LANE_LOOP d.w[0][i] = (a.w[0][i] != 0) != (b.w[0][i] != 0); break;
++        case O::LogicalNot: LANE_LOOP d.w[0][i] = a.w[0][i] == 0; break;
++        case O::ConvertS32F32: LANE_LOOP d.w[0][i] = u32(ToS32(Fl(a, i))); break;
++        case O::ConvertU32F32: LANE_LOOP d.w[0][i] = ToU32(Fl(a, i)); break;
++        case O::ConvertS16F32: LANE_LOOP d.w[0][i] = u32(std::clamp(ToS32(Fl(a, i)), -32768, 32767)); break;
++        case O::ConvertU16F32: LANE_LOOP d.w[0][i] = std::min(ToU32(Fl(a, i)), 65535u); break;
++        case O::ConvertF32S32: LANE_LOOP SetFl(d, i, float(Sl(a, i))); break;
++        case O::ConvertF32U32: LANE_LOOP SetFl(d, i, float(a.w[0][i])); break;
++        case O::ConvertF32S8: LANE_LOOP SetFl(d, i, float(s8(a.w[0][i]))); break;
++        case O::ConvertF32S16: LANE_LOOP SetFl(d, i, float(s16(a.w[0][i]))); break;
++        case O::ConvertF32U8: LANE_LOOP SetFl(d, i, float(u8(a.w[0][i]))); break;
++        case O::ConvertF32U16: LANE_LOOP SetFl(d, i, float(u16(a.w[0][i]))); break;
++        case O::ConvertU64U32: LANE_LOOP SetU64l(d, i, a.w[0][i]); break;
++        case O::ConvertU32U64: LANE_LOOP d.w[0][i] = a.w[0][i]; break;
++        case O::ConvertU16U32: case O::ConvertU32U16: LANE_LOOP d.w[0][i] = a.w[0][i] & 0xFFFF; break;
++        case O::ConvertU8U32: case O::ConvertU32U8: LANE_LOOP d.w[0][i] = a.w[0][i] & 0xFF; break;
++        case O::ConvertS32S8: LANE_LOOP d.w[0][i] = u32(s32(s8(a.w[0][i]))); break;
++        case O::ConvertS32S16: LANE_LOOP d.w[0][i] = u32(s32(s16(a.w[0][i]))); break;
+         case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
+-            d.w[0] = 0; // no 2x2 quads here: derivatives are zero
++            LANE_LOOP d.w[0][i] = 0; // no 2x2 quads here: derivatives are zero
+             break;
+         case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGradient:
+         case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod:
+         case O::ImageGather: case O::ImageGatherDref: case O::ImageFetch:
+-        case O::ImageQueryDimensions: case O::ImageQueryLod: {
+-            IR::TextureInstInfo info{};
+-            info.raw = o.extra;
+-            const Binding* const binding = GetBinding(program, io, info.descriptor_index, a.w[0]);
+-            const Cell& f = c[o.a[3]];
+-            std::array<f32, 4> result{};
+-            if (!binding || info.type == Shader::TextureType::Buffer) {
+-                d = {};
+-                break;
+-            }
+-            switch (o.op) {
+-            case O::ImageSampleImplicitLod: // coords, bias, offset
+-                result = SampleTexture(*binding, info, b, f, info.has_bias ? F(e) : 0.0f, nullptr);
+-                break;
+-            case O::ImageSampleExplicitLod: // coords, lod, offset
+-                result = SampleTexture(*binding, info, b, f, F(e), nullptr);
+-                break;
+-            case O::ImageGradient: { // coords, derivatives, offset: the lod from the derivatives
+-                f32 lod = 0.0f;
+-                const Texture* const texture = binding->texture;
+-                if (texture && texture->ok) {
+-                    const Level& level = texture->levels[texture->base_level];
+-                    const f32 dx_u = F(e, 0) * f32(level.width), dx_v = F(e, 2) * f32(level.height);
+-                    const f32 dy_u = F(e, 1) * f32(level.width), dy_v = F(e, 3) * f32(level.height);
+-                    const f32 rho2 = std::max(dx_u * dx_u + dx_v * dx_v, dy_u * dy_u + dy_v * dy_v);
+-                    lod = rho2 > 0.0f ? 0.5f * std::log2(rho2) : 0.0f;
+-                }
+-                result = SampleTexture(*binding, info, b, f, lod, nullptr);
+-                break;
+-            }
+-            case O::ImageSampleDrefImplicitLod: { // coords, reference, offset
+-                const f32 reference = F(e);
+-                d.w[0] = std::bit_cast<u32>(SampleTexture(*binding, info, b, f, 0.0f, &reference)[0]);
+-                continue;
+-            }
+-            case O::ImageSampleDrefExplicitLod: { // coords, (reference, lod), offset
+-                const f32 reference = F(e, 0);
+-                d.w[0] = std::bit_cast<u32>(SampleTexture(*binding, info, b, f, F(e, 1), &reference)[0]);
+-                continue;
+-            }
+-            case O::ImageGather: // coords, offset
+-                result = GatherTexture(*binding, info, b, e, nullptr);
+-                break;
+-            case O::ImageGatherDref: { // coords, offset, reference
+-                const f32 reference = F(f);
+-                result = GatherTexture(*binding, info, b, e, &reference);
+-                break;
+-            }
+-            case O::ImageFetch: // coords, offset, lod
+-                result = FetchTexture(*binding, info, b, e, f.w[0]);
+-                break;
+-            case O::ImageQueryDimensions: { // lod
+-                const Texture* const texture = binding->texture;
+-                if (!texture || !texture->ok) {
+-                    d = {};
+-                    continue;
+-                }
+-                const u32 level_index = std::min(texture->base_level + b.w[0], u32(texture->levels.size()) - 1);
+-                const Level& level = texture->levels[level_index];
+-                using T = Shader::TextureType;
+-                const T type = info.type;
+-                const bool array = type == T::ColorArray1D || type == T::ColorArray2D || type == T::ColorArrayCube;
+-                const u32 layers = type == T::ColorArrayCube ? texture->num_layers / 6 : texture->num_layers;
+-                d.w[0] = level.width;
+-                d.w[1] = type == T::ColorArray1D ? layers : level.height;
+-                d.w[2] = type == T::Color3D ? level.depth : array && type != T::ColorArray1D ? layers : 0;
+-                d.w[3] = texture->num_levels;
+-                continue;
+-            }
+-            default: // ImageQueryLod
+-                break;
+-            }
+-            std::memcpy(d.w, result.data(), sizeof(d.w));
++        case O::ImageQueryDimensions: case O::ImageQueryLod:
++            RunTexture(program, o, c, io, n);
+             break;
+-        }
+         case O::GetSparseFromOp:
+-            d.w[0] = 1; // every texel is resident
++            LANE_LOOP d.w[0][i] = 1; // every texel is resident
+             break;
+         default:
+             break;
+         }
+     }
++#undef LANE_LOOP
+ }
+ 
+ // ---- the draw
+@@ -1942,6 +2267,24 @@ SoftwareDraw::SoftwareDraw()
+ 
+ SoftwareDraw::~SoftwareDraw() = default;
+ 
++/// How many threads rasterize: EDEN_SW_THREADS, or half the processors (up to 4)
++u32 SoftwareDraw::RasterThreads() {
++    if (!workers) {
++        u32 count = 0;
++        if (const char* env = std::getenv("EDEN_SW_THREADS")) {
++            count = u32(std::strtoul(env, nullptr, 10));
++        }
++        if (count == 0) {
++            const u32 processors = std::thread::hardware_concurrency();
++            count = processors ? std::clamp(processors / 2, 1u, 4u) : 3;
++        }
++        workers = std::make_unique<Workers>(std::clamp(count, 1u, 16u) - 1);
++        LOG_INFO(Render, "Software draw: rasterizing on {} threads", count);
++        worker_count = std::clamp(count, 1u, 16u);
++    }
++    return worker_count;
++}
++
+ const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address) {
+     Tegra::Texture::TICEntry tic{};
+     gpu_memory.ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
+@@ -2048,6 +2391,11 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+             LogOnce("storage images aren't drawn");
+         }
+         program->ok = Flattener{*program}.Run(ir);
++        program->one_lane = program->local_words > 0 ||
++                            std::ranges::any_of(program->ops, [](const Op& op) {
++                                return op.kind == Kind::Jump || op.kind == Kind::JumpIfTrue ||
++                                       op.kind == Kind::JumpIfFalse;
++                            });
+     } catch (const std::exception& exception) {
+         LogOnce(fmt::format("shader translation failed: {}", exception.what()));
+         program->ok = false;
+@@ -2058,8 +2406,44 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+     return programs.emplace(key, std::move(program)).first->second.get();
+ }
+ 
++namespace {
++
++/// With EDEN_SW_STATS set: what the software draws did and how long they took, every 2 seconds
++struct Stats {
++    using Clock = std::chrono::steady_clock;
++    bool enabled = std::getenv("EDEN_SW_STATS") != nullptr;
++    Clock::time_point last = Clock::now();
++    u64 draws = 0, triangles = 0, fragments = 0;
++    Clock::duration setup{}, raster{};
++
++    void Report() {
++        const auto now = Clock::now();
++        if (now - last < std::chrono::seconds(2)) {
++            return;
++        }
++        const f64 seconds = std::chrono::duration<f64>(now - last).count();
++        const auto ms = [&](Clock::duration d) { return std::chrono::duration<f64, std::milli>(d).count() / seconds; };
++        LOG_WARNING(Render, "Software draw: a second: {:.0f} draws, {:.0f} triangles, {:.0f} k fragments; "
++                            "{:.1f} ms setting up, {:.1f} ms rasterizing",
++                    f64(draws) / seconds, f64(triangles) / seconds, f64(fragments) / seconds / 1000.0,
++                    ms(setup), ms(raster));
++        last = now;
++        draws = triangles = fragments = 0;
++        setup = raster = {};
++    }
++};
++
++Stats& GetStats() {
++    static Stats stats;
++    return stats;
++}
++
++} // Anonymous namespace
++
+ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bool is_indexed,
+                         u32 instance_count) {
++    Stats& stats = GetStats();
++    const auto start = Stats::Clock::now();
+     const auto& regs = maxwell3d.regs;
+     const auto& draw_state = maxwell3d.draw_manager.draw_state;
+     using Topology = Maxwell::Regs::PrimitiveTopology;
+@@ -2142,6 +2526,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                         regs.tex_sampler.Address() + u64{tsc_index} * sizeof(Tegra::Texture::TSCEntry),
+                         &binding.sampler, sizeof(binding.sampler));
+                 }
++                binding.Prepare();
+                 out.push_back(binding);
+             }
+         }
+@@ -2170,12 +2555,13 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     }
+ 
+     // Vertex shader: once per vertex (and instance)
+-    std::vector<Cell> vs_cells = vs->cells;
+-    std::vector<Cell> fs_cells = fs->cells;
+-    std::vector<u32> local(std::max(vs->local_words, fs->local_words) + 1);
++    std::vector<Lanes> vs_cells;
++    Broadcast(vs->cells, vs_cells);
++    std::vector<u32> vs_local(vs->local_words + 1);
+     std::array<f32, 256> inputs{};
+     std::array<f32, 256> outputs{};
+-    std::array<std::array<f32, 4>, 8> colors{};
++    std::array<f32, 8 * 4> vs_colors{};
++    bool vs_discard = false;
+     const auto shade_vertex = [&](u32 index, u32 instance, Vertex& out) {
+         inputs.fill(0.0f);
+         for (u32 attr = 0; attr < 32; ++attr) {
+@@ -2202,21 +2588,38 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         inputs[static_cast<u32>(IR::Attribute::InstanceId)] = std::bit_cast<f32>(instance);
+         outputs.fill(0.0f);
+         outputs[static_cast<u32>(IR::Attribute::PositionW)] = 1.0f;
+-        Io io{inputs.data(), outputs.data(), &colors, false, &vs_cbufs, local.data(), vs->local_words, &vs_textures};
+-        Run(*vs, vs_cells, io);
++        Io io{inputs.data(), outputs.data(), vs_colors.data(), &vs_discard, 1, 0,
++              &vs_cbufs, vs_local.data(), vs->local_words, &vs_textures};
++        Run(*vs, vs_cells.data(), io, 1);
+         std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+         std::memcpy(out.varyings.data(), &outputs[32], sizeof(out.varyings));
+     };
+ 
++    // The varyings the fragment shader reads, and how each is interpolated
++    struct Varying {
++        u16 input;  // its attribute
++        u16 vertex; // its place in a vertex's varyings
++        Shader::Interpolation interpolation;
++    };
++    std::vector<Varying> varyings;
++    for (u32 g = 0; g < 32; ++g) {
++        if (fs->generic_loaded[g]) {
++            for (u32 comp = 0; comp < 4; ++comp) {
++                varyings.push_back({u16(32 + g * 4 + comp), u16(g * 4 + comp), fs->interpolation[g]});
++            }
++        }
++    }
++    const size_t num_varyings = varyings.size();
++
+     // Window coordinates (Vulkan's: the y axis down), as Eden's Vulkan renderer sets the viewport
+     const auto& transform = regs.viewport_transform[0];
+     const bool lower_left = regs.window_origin.mode != Maxwell::Regs::WindowOrigin::Mode::UpperLeft;
++    const bool transform_on = regs.viewport_scale_offset_enabled != 0;
+     const auto to_screen = [&](const Vertex& v) {
+         const f32 inv_w = v.position[3] != 0.0f ? 1.0f / v.position[3] : 0.0f;
+         f32 x = v.position[0] * inv_w, y = v.position[1] * inv_w;
+         if (transform.swizzle.x == Maxwell::Regs::ViewportSwizzle::NegativeX) x = -x;
+         if (transform.swizzle.y == Maxwell::Regs::ViewportSwizzle::NegativeY) y = -y;
+-        const bool transform_on = regs.viewport_scale_offset_enabled != 0;
+         ScreenVertex s;
+         s.x = transform_on ? transform.translate_x + transform.scale_x * x : x;
+         s.y = transform_on ? transform.translate_y + transform.scale_y * y : y;
+@@ -2237,207 +2640,147 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         clip_x1 = std::min<s32>(clip_x1, regs.scissor_test[0].max_x);
+         clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y);
+     }
+-
+-    // Blending of render target 0
+-    const bool blend = regs.blend.enable[0] != 0;
+-    const auto& blend_state = regs.blend_per_target_enabled ? regs.blend_per_target[0]
+-                                                            : reinterpret_cast<const Maxwell::Regs::BlendPerTarget&>(regs.blend);
+-    Maxwell::Regs::Blend::Equation color_op, alpha_op;
+-    Maxwell::Regs::Blend::Factor color_src, color_dst, alpha_src, alpha_dst;
+-    if (regs.blend_per_target_enabled) {
+-        color_op = blend_state.color_op, color_src = blend_state.color_source;
+-        color_dst = blend_state.color_dest, alpha_op = blend_state.alpha_op;
+-        alpha_src = blend_state.alpha_source, alpha_dst = blend_state.alpha_dest;
+-    } else {
+-        color_op = regs.blend.color_op, color_src = regs.blend.color_source;
+-        color_dst = regs.blend.color_dest, alpha_op = regs.blend.alpha_op;
+-        alpha_src = regs.blend.alpha_source, alpha_dst = regs.blend.alpha_dest;
+-    }
+-    if (!(regs.blend_per_target_enabled ? blend_state.separate_alpha : regs.blend.separate_alpha)) {
+-        alpha_op = color_op, alpha_src = color_src, alpha_dst = color_dst;
++    if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) {
++        return;
+     }
+-    const std::array<f32, 4> blend_constant{regs.blend_color.r, regs.blend_color.g,
+-                                            regs.blend_color.b, regs.blend_color.a};
+-    const auto& mask = regs.color_mask_common ? regs.color_mask[0] : regs.color_mask[rt_index];
+-    const bool write_channel[4] = {mask.R != 0, mask.G != 0, mask.B != 0, mask.A != 0};
+ 
+-    // Culling (Vulkan's rule: counter-clockwise has a positive area with y down)
++    // Culling (Vulkan's rule: counter-clockwise has a negative area with y down)
+     const bool cull = regs.gl_cull_test_enabled != 0;
+     bool front_ccw = regs.gl_front_face == Maxwell::Regs::FrontFace::CounterClockWise;
+     if (regs.window_origin.flip_y != 0) {
+         front_ccw = !front_ccw;
+     }
+ 
+-    // The render target, a block at a time
+-    const u32 block_height_log2 = rt.tile_mode.block_height;
+-    const u32 block_rows = pitch_linear ? 1 : 8u << block_height_log2;
+-    const u32 block_bytes = pitch_linear ? rt.width : 512u << block_height_log2;
+-    const u32 gobs_in_x = (rt_width * bpp + 63) / 64;
+-    const u64 block_row_size = pitch_linear ? rt.width : u64{gobs_in_x} * block_bytes;
+-    const u32 pixels_per_block_x = pitch_linear ? rt_width : 64 / bpp;
+-    const auto pixel_offset = [&](u32 x, u32 y) -> u32 { // within its block
+-        if (pitch_linear) {
+-            return x * bpp;
+-        }
+-        const u32 in_block = y % block_rows, row = in_block % 8, xb = (x * bpp) % 64;
+-        return (in_block / 8) * 512 + (row / 2) * 64 + (row % 2) * 16 + (xb / 32) * 256 +
+-               ((xb % 32) / 16) * 32 + (xb % 16);
++    // The draw's triangles, set up for rasterizing: window coordinates in 24.8 fixed point (edge
++    // functions exact, edges shared by two triangles drawn once by the top-left rule), the
++    // varyings the fragment shader reads after them in 'varying_data'
++    struct Triangle {
++        std::array<s32, 3> x, y;
++        std::array<f32, 3> z, inv_w;
++        f32 inv_area;
++        bool front;
++        bool affine; // its vertices' w the same (2D): no perspective correction to do
++        s32 x0, y0, x1, y1; // the pixels it may cover
++        size_t varyings;
+     };
+-
+-    bool blend_ok = true;
+-    const auto draw_triangle = [&](const ScreenVertex& v0, const ScreenVertex& v1,
+-                                   const ScreenVertex& v2) {
+-        const f32 area = (v1.x - v0.x) * (v2.y - v0.y) - (v2.x - v0.x) * (v1.y - v0.y);
+-        if (area == 0.0f || !std::isfinite(area)) {
++    std::vector<Triangle> triangles;
++    std::vector<f32> varying_data;
++    const auto add_triangle = [&](const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c) {
++        const ScreenVertex* v[3] = {&a, &b, &c};
++        Triangle t;
++        for (u32 i = 0; i < 3; ++i) {
++            if (!std::isfinite(v[i]->x) || !std::isfinite(v[i]->y)) {
++                return;
++            }
++            t.x[i] = s32(std::lround(v[i]->x * 256.0f));
++            t.y[i] = s32(std::lround(v[i]->y * 256.0f));
++            t.z[i] = v[i]->z;
++            t.inv_w[i] = v[i]->inv_w;
++        }
++        s64 area = s64(t.x[1] - t.x[0]) * (t.y[2] - t.y[0]) - s64(t.x[2] - t.x[0]) * (t.y[1] - t.y[0]);
++        if (area == 0) {
+             return;
+         }
++        t.front = (area < 0) == front_ccw;
+         if (cull) {
+-            const bool ccw = area < 0.0f; // Vulkan's sign convention, y down
+-            const bool front = ccw == front_ccw;
+             const auto face = regs.gl_cull_face;
+             if (face == Maxwell::Regs::CullFace::FrontAndBack ||
+-                (face == Maxwell::Regs::CullFace::Front && front) ||
+-                (face == Maxwell::Regs::CullFace::Back && !front)) {
++                (face == Maxwell::Regs::CullFace::Front && t.front) ||
++                (face == Maxwell::Regs::CullFace::Back && !t.front)) {
+                 return;
+             }
+         }
+-        const s32 x0 = std::max(clip_x0, s32(std::floor(std::min({v0.x, v1.x, v2.x}))));
+-        const s32 y0 = std::max(clip_y0, s32(std::floor(std::min({v0.y, v1.y, v2.y}))));
+-        const s32 x1 = std::min(clip_x1, s32(std::ceil(std::max({v0.x, v1.x, v2.x}))));
+-        const s32 y1 = std::min(clip_y1, s32(std::ceil(std::max({v0.y, v1.y, v2.y}))));
+-        if (x0 >= x1 || y0 >= y1) {
++        u32 order[3] = {0, 1, 2};
++        if (area < 0) { // counter-clockwise from here on: inside, the edge functions are positive
++            std::swap(order[1], order[2]);
++            std::swap(t.x[1], t.x[2]);
++            std::swap(t.y[1], t.y[2]);
++            std::swap(t.z[1], t.z[2]);
++            std::swap(t.inv_w[1], t.inv_w[2]);
++            area = -area;
++        }
++        t.inv_area = 1.0f / f32(area);
++        t.affine = t.inv_w[0] == t.inv_w[1] && t.inv_w[1] == t.inv_w[2];
++        const s32 min_x = std::min({t.x[0], t.x[1], t.x[2]}), max_x = std::max({t.x[0], t.x[1], t.x[2]});
++        const s32 min_y = std::min({t.y[0], t.y[1], t.y[2]}), max_y = std::max({t.y[0], t.y[1], t.y[2]});
++        t.x0 = std::max(clip_x0, (min_x - 128) >> 8);
++        t.x1 = std::min(clip_x1, ((max_x - 128) >> 8) + 1);
++        t.y0 = std::max(clip_y0, (min_y - 128) >> 8);
++        t.y1 = std::min(clip_y1, ((max_y - 128) >> 8) + 1);
++        if (t.x0 >= t.x1 || t.y0 >= t.y1) {
+             return;
+         }
+-        const f32 inv_area = 1.0f / area;
+-        // top-left rule: an edge's pixels count when the edge is a top or left one
+-        const auto edge = [](const ScreenVertex& a, const ScreenVertex& b, f32 px, f32 py) {
+-            return (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+-        };
+-        for (u32 by = u32(y0) / block_rows; by <= u32(y1 - 1) / block_rows; ++by) {
+-            const s32 ys = std::max<s32>(y0, by * block_rows), ye = std::min<s32>(y1, (by + 1) * block_rows);
+-            for (u32 bx = u32(x0) / pixels_per_block_x; bx <= u32(x1 - 1) / pixels_per_block_x; ++bx) {
+-                const s32 xs = std::max<s32>(x0, bx * pixels_per_block_x);
+-                const s32 xe = std::min<s32>(x1, (bx + 1) * pixels_per_block_x);
+-                const GPUVAddr block_address =
+-                    pitch_linear ? rt_address + u64(ys) * rt.width
+-                                 : rt_address + by * block_row_size + u64{bx} * block_bytes;
+-                const u32 span = pitch_linear ? u32(ye - ys) * rt.width : block_bytes;
+-                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
+-                    block(gpu_memory, block_address, span, &scratch);
+-                for (s32 y = ys; y < ye; ++y) {
+-                    for (s32 x = xs; x < xe; ++x) {
+-                        const f32 px = f32(x) + 0.5f, py = f32(y) + 0.5f;
+-                        f32 w0 = edge(v1, v2, px, py) * inv_area;
+-                        f32 w1 = edge(v2, v0, px, py) * inv_area;
+-                        f32 w2 = edge(v0, v1, px, py) * inv_area;
+-                        if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+-                            continue;
+-                        }
+-                        // perspective: the weights over w, normalized
+-                        const f32 pw0 = w0 * v0.inv_w, pw1 = w1 * v1.inv_w, pw2 = w2 * v2.inv_w;
+-                        const f32 psum = pw0 + pw1 + pw2;
+-                        const f32 inv_psum = psum != 0.0f ? 1.0f / psum : 0.0f;
+-                        inputs[static_cast<u32>(IR::Attribute::PositionX)] = px;
+-                        inputs[static_cast<u32>(IR::Attribute::PositionY)] = py;
+-                        inputs[static_cast<u32>(IR::Attribute::PositionZ)] = w0 * v0.z + w1 * v1.z + w2 * v2.z;
+-                        inputs[static_cast<u32>(IR::Attribute::PositionW)] = psum;
+-                        inputs[static_cast<u32>(IR::Attribute::FrontFace)] =
+-                            std::bit_cast<f32>((area < 0.0f) == front_ccw ? 0xFFFFFFFFu : 0u);
+-                        for (u32 g = 0; g < 32; ++g) {
+-                            if (!fs->generic_loaded[g]) {
+-                                continue;
+-                            }
+-                            for (u32 comp = 0; comp < 4; ++comp) {
+-                                const u32 k = g * 4 + comp;
+-                                f32 value;
+-                                switch (fs->interpolation[g]) {
+-                                case Shader::Interpolation::Flat:
+-                                    value = v2.varyings[k];
+-                                    break;
+-                                case Shader::Interpolation::NoPerspective:
+-                                    value = w0 * v0.varyings[k] + w1 * v1.varyings[k] + w2 * v2.varyings[k];
+-                                    break;
+-                                default:
+-                                    value = (pw0 * v0.varyings[k] + pw1 * v1.varyings[k] +
+-                                             pw2 * v2.varyings[k]) * inv_psum;
+-                                    break;
+-                                }
+-                                inputs[32 + k] = value;
+-                            }
+-                        }
+-                        colors[0] = {0.0f, 0.0f, 0.0f, 1.0f};
+-                        Io io{inputs.data(), outputs.data(), &colors, false, &fs_cbufs, local.data(), fs->local_words, &fs_textures};
+-                        Run(*fs, fs_cells, io);
+-                        if (io.discard) {
+-                            continue;
+-                        }
+-                        u8* const out = block.data() + pixel_offset(u32(x), u32(y)) +
+-                                        (pitch_linear ? u32(y - ys) * rt.width : 0);
+-                        std::array<f32, 4> color = colors[0];
+-                        if (blend) {
+-                            std::array<f32, 4> dst{};
+-                            DecodeColor(rt.format, out, dst);
+-                            for (u32 ch = 0; ch < 4; ++ch) {
+-                                const bool alpha = ch == 3;
+-                                const f32 sf = BlendFactor(alpha ? alpha_src : color_src, color, dst, blend_constant, ch, blend_ok);
+-                                const f32 df = BlendFactor(alpha ? alpha_dst : color_dst, color, dst, blend_constant, ch, blend_ok);
+-                                color[ch] = BlendEquation(alpha ? alpha_op : color_op, color[ch] * sf, dst[ch] * df, blend_ok);
+-                            }
+-                        }
+-                        std::array<u8, 16> encoded{};
+-                        u32 bytes = 0;
+-                        EncodeColor(rt.format, color, encoded, bytes);
+-                        if (write_channel[0] && write_channel[1] && write_channel[2] && write_channel[3]) {
+-                            std::memcpy(out, encoded.data(), bytes);
+-                        } else if (bytes == 4) { // 8-bit channels: the masked ones kept
+-                            const bool bgra = rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM ||
+-                                              rt.format == Tegra::RenderTargetFormat::A8R8G8B8_SRGB;
+-                            for (u32 ch = 0; ch < 4; ++ch) {
+-                                const u32 byte_index = bgra && ch < 3 ? 2 - ch : ch;
+-                                if (write_channel[ch]) {
+-                                    out[byte_index] = encoded[byte_index];
+-                                }
+-                            }
+-                        }
+-                    }
+-                }
++        t.varyings = varying_data.size();
++        for (u32 i = 0; i < 3; ++i) {
++            for (const Varying& varying : varyings) {
++                // flat: the provoking vertex's value (the last, as on Maxwell) everywhere
++                const ScreenVertex* source = varying.interpolation == Shader::Interpolation::Flat ? v[2] : v[order[i]];
++                varying_data.push_back(source->varyings[varying.vertex]);
+             }
+         }
++        triangles.push_back(t);
+     };
+ 
+-    // Clipping against the near plane (w > 0): the triangle as a polygon, cut, then a fan
+-    const auto clip_and_draw = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
+-        constexpr f32 epsilon = 1e-5f;
+-        if (a.position[3] > epsilon && b.position[3] > epsilon && c.position[3] > epsilon) {
+-            draw_triangle(to_screen(a), to_screen(b), to_screen(c));
++    // Clipping: in front of the eye (w > 0), and within a guard band around the screen that keeps
++    // window coordinates small for the fixed-point edge functions; the polygon cut, then a fan
++    constexpr f32 epsilon = 1e-5f;
++    constexpr f32 guard_pixels = 8192.0f;
++    const f32 guard_x = transform_on ? guard_pixels / std::max(std::fabs(transform.scale_x), 1.0f) : guard_pixels;
++    const f32 guard_y = transform_on ? guard_pixels / std::max(std::fabs(transform.scale_y), 1.0f) : guard_pixels;
++    const auto distance = [&](const Vertex& v, u32 plane) {
++        const auto& p = v.position;
++        switch (plane) {
++        case 0: return p[3] - epsilon;
++        case 1: return guard_x * p[3] - p[0];
++        case 2: return guard_x * p[3] + p[0];
++        case 3: return guard_y * p[3] - p[1];
++        default: return guard_y * p[3] + p[1];
++        }
++    };
++    std::vector<Vertex> polygon, clipped;
++    const auto clip_and_add = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
++        u32 outside = 0;
++        for (u32 plane = 0; plane < 5; ++plane) {
++            if (distance(a, plane) < 0.0f || distance(b, plane) < 0.0f || distance(c, plane) < 0.0f) {
++                outside |= 1u << plane;
++            }
++        }
++        if (outside == 0) {
++            add_triangle(to_screen(a), to_screen(b), to_screen(c));
+             return;
+         }
+-        std::vector<Vertex> polygon{a, b, c}, clipped;
+-        for (size_t i = 0; i < polygon.size(); ++i) {
+-            const Vertex& p = polygon[i];
+-            const Vertex& q = polygon[(i + 1) % polygon.size()];
+-            const bool p_in = p.position[3] > epsilon, q_in = q.position[3] > epsilon;
+-            if (p_in) {
+-                clipped.push_back(p);
++        polygon.assign({a, b, c});
++        for (u32 plane = 0; plane < 5 && polygon.size() >= 3; ++plane) {
++            if (!(outside & (1u << plane))) {
++                continue;
+             }
+-            if (p_in != q_in) {
+-                const f32 t = (epsilon - p.position[3]) / (q.position[3] - p.position[3]);
+-                Vertex v;
+-                for (u32 k = 0; k < 4; ++k) v.position[k] = p.position[k] + t * (q.position[k] - p.position[k]);
+-                for (u32 k = 0; k < v.varyings.size(); ++k) v.varyings[k] = p.varyings[k] + t * (q.varyings[k] - p.varyings[k]);
+-                clipped.push_back(v);
++            clipped.clear();
++            for (size_t i = 0; i < polygon.size(); ++i) {
++                const Vertex& p = polygon[i];
++                const Vertex& q = polygon[(i + 1) % polygon.size()];
++                const f32 dp = distance(p, plane), dq = distance(q, plane);
++                if (dp >= 0.0f) {
++                    clipped.push_back(p);
++                }
++                if ((dp >= 0.0f) != (dq >= 0.0f)) {
++                    const f32 t = dp / (dp - dq);
++                    Vertex v;
++                    for (u32 k = 0; k < 4; ++k) v.position[k] = p.position[k] + t * (q.position[k] - p.position[k]);
++                    for (const Varying& varying : varyings) {
++                        const u32 k = varying.vertex;
++                        v.varyings[k] = p.varyings[k] + t * (q.varyings[k] - p.varyings[k]);
++                    }
++                    clipped.push_back(v);
++                }
+             }
++            std::swap(polygon, clipped);
+         }
+-        if (clipped.size() < 3) {
++        if (polygon.size() < 3) {
+             return;
+         }
+-        std::vector<ScreenVertex> screen;
+-        for (const Vertex& v : clipped) {
+-            screen.push_back(to_screen(v));
+-        }
+-        // the clipped vertices' varyings live in 'clipped' until the fan is drawn
+-        for (size_t i = 1; i + 1 < screen.size(); ++i) {
+-            draw_triangle(screen[0], screen[i], screen[i + 1]);
++        const ScreenVertex first = to_screen(polygon[0]);
++        for (size_t i = 1; i + 1 < polygon.size(); ++i) {
++            add_triangle(first, to_screen(polygon[i]), to_screen(polygon[i + 1]));
+         }
+     };
+ 
+@@ -2454,29 +2797,294 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         }
+         switch (topology) {
+         case Topology::Triangles:
+-            for (u32 i = 0; i + 2 < count; i += 3) clip_and_draw(vertices[i], vertices[i + 1], vertices[i + 2]);
++            for (u32 i = 0; i + 2 < count; i += 3) clip_and_add(vertices[i], vertices[i + 1], vertices[i + 2]);
+             break;
+         case Topology::TriangleStrip:
+             for (u32 i = 0; i + 2 < count; ++i) {
+-                if (i % 2 == 0) clip_and_draw(vertices[i], vertices[i + 1], vertices[i + 2]);
+-                else clip_and_draw(vertices[i + 1], vertices[i], vertices[i + 2]);
++                if (i % 2 == 0) clip_and_add(vertices[i], vertices[i + 1], vertices[i + 2]);
++                else clip_and_add(vertices[i + 1], vertices[i], vertices[i + 2]);
+             }
+             break;
+         case Topology::TriangleFan:
+-            for (u32 i = 1; i + 1 < count; ++i) clip_and_draw(vertices[0], vertices[i], vertices[i + 1]);
++            for (u32 i = 1; i + 1 < count; ++i) clip_and_add(vertices[0], vertices[i], vertices[i + 1]);
+             break;
+         case Topology::Quads:
+             for (u32 i = 0; i + 3 < count; i += 4) {
+-                clip_and_draw(vertices[i], vertices[i + 1], vertices[i + 2]);
+-                clip_and_draw(vertices[i], vertices[i + 2], vertices[i + 3]);
++                clip_and_add(vertices[i], vertices[i + 1], vertices[i + 2]);
++                clip_and_add(vertices[i], vertices[i + 2], vertices[i + 3]);
+             }
+             break;
+         default:
+             break;
+         }
+     }
+-    if (!blend_ok) {
+-        LogOnce("a blend factor or equation not handled");
++    if (triangles.empty()) {
++        return;
++    }
++
++    // Blending of render target 0
++    const bool blend = regs.blend.enable[0] != 0;
++    Maxwell::Regs::Blend::Equation color_op, alpha_op;
++    Maxwell::Regs::Blend::Factor color_src, color_dst, alpha_src, alpha_dst;
++    bool separate_alpha;
++    if (regs.blend_per_target_enabled) {
++        const auto& target = regs.blend_per_target[0];
++        color_op = target.color_op, color_src = target.color_source, color_dst = target.color_dest;
++        alpha_op = target.alpha_op, alpha_src = target.alpha_source, alpha_dst = target.alpha_dest;
++        separate_alpha = target.separate_alpha != 0;
++    } else {
++        color_op = regs.blend.color_op, color_src = regs.blend.color_source, color_dst = regs.blend.color_dest;
++        alpha_op = regs.blend.alpha_op, alpha_src = regs.blend.alpha_source, alpha_dst = regs.blend.alpha_dest;
++        separate_alpha = regs.blend.separate_alpha != 0;
++    }
++    if (!separate_alpha) {
++        alpha_op = color_op, alpha_src = color_src, alpha_dst = color_dst;
++    }
++    const std::array<f32, 4> blend_constant{regs.blend_color.r, regs.blend_color.g,
++                                            regs.blend_color.b, regs.blend_color.a};
++    const auto& mask = regs.color_mask_common ? regs.color_mask[0] : regs.color_mask[rt_index];
++    const bool write_channel[4] = {mask.R != 0, mask.G != 0, mask.B != 0, mask.A != 0};
++    const bool write_all = write_channel[0] && write_channel[1] && write_channel[2] && write_channel[3];
++    const bool bgra = rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM ||
++                      rt.format == Tegra::RenderTargetFormat::A8R8G8B8_SRGB;
++    // The commonest cases done in integers: RGBA8 targets written whole, opaque or blended by
++    // source alpha (alpha itself by source alpha, or one)
++    using Factor = Maxwell::Regs::Blend::Factor;
++    using Equation = Maxwell::Regs::Blend::Equation;
++    const auto is = [](Factor f, Factor d3d, Factor gl) { return f == d3d || f == gl; };
++    const auto is_add = [](Equation e) { return e == Equation::Add_D3D || e == Equation::Add_GL; };
++    const bool rgba8 = write_all && (rt.format == Tegra::RenderTargetFormat::A8B8G8R8_UNORM ||
++                                     rt.format == Tegra::RenderTargetFormat::A8R8G8B8_UNORM);
++    const bool source_alpha_blend =
++        blend && is_add(color_op) && is_add(alpha_op) &&
++        is(color_src, Factor::SourceAlpha_D3D, Factor::SourceAlpha_GL) &&
++        is(color_dst, Factor::OneMinusSourceAlpha_D3D, Factor::OneMinusSourceAlpha_GL) &&
++        (is(alpha_src, Factor::SourceAlpha_D3D, Factor::SourceAlpha_GL) || is(alpha_src, Factor::One_D3D, Factor::One_GL)) &&
++        is(alpha_dst, Factor::OneMinusSourceAlpha_D3D, Factor::OneMinusSourceAlpha_GL);
++    const bool alpha_by_one = is(alpha_src, Factor::One_D3D, Factor::One_GL);
++    const bool fast_write = rgba8 && (!blend || source_alpha_blend);
++
++    // The render target in GOBs (512 bytes: 8 rows of 64 bytes), each reached directly; the work
++    // split by GOB rows (8 pixel rows), which the rasterizing threads share
++    const u32 block_rows = pitch_linear ? 8 : 8u << rt.tile_mode.block_height;
++    const u32 block_bytes = 512u << rt.tile_mode.block_height;
++    const u32 gobs_in_x = (rt_width * bpp + 63) / 64;
++    const u64 block_row_size = u64{gobs_in_x} * block_bytes;
++
++    const auto raster_rows = [&](Raster& st, s32 row_begin, s32 row_end) {
++        st.gobs.assign(gobs_in_x, nullptr);
++        const u32 gob_row_in_block = u32(row_begin) % block_rows / 8;
++        const GPUVAddr gob_row_address = rt_address + u64(u32(row_begin) / block_rows) * block_row_size +
++                                         u64{gob_row_in_block} * 512;
++        const auto pixel = [&](s32 x, s32 y) -> u8* {
++            if (pitch_linear) {
++                return gpu_memory.GetPointer(rt_address + u64(y) * rt.width + u64(x) * bpp);
++            }
++            const u32 xb = u32(x) * bpp;
++            const u32 column = xb / 64;
++            u8*& gob = st.gobs[column];
++            if (!gob) {
++                gob = gpu_memory.GetPointer(gob_row_address + u64{column} * block_bytes);
++                if (!gob) {
++                    return nullptr;
++                }
++            }
++            const u32 row = u32(y) % 8, in_gob = xb % 64;
++            return gob + (row / 2) * 64 + (row % 2) * 16 + (in_gob / 32) * 256 + ((in_gob % 32) / 16) * 32 + in_gob % 16;
++        };
++        f32* const in = st.inputs.data();
++        const auto input = [&](IR::Attribute attribute) { return in + static_cast<u32>(attribute) * LANES; };
++        Io io{in, st.outputs.data(), st.colors.data(), st.discard.data(), LANES, 0,
++              &fs_cbufs, st.local.data(), fs->local_words, &fs_textures};
++        for (const Triangle& t : triangles) {
++            const s32 ys = std::max(t.y0, row_begin), ye = std::min(t.y1, row_end);
++            if (ys >= ye) {
++                continue;
++            }
++            // edge i: from vertex i+1 to i+2; steps per pixel, and the top-left rule's bias
++            s64 step_x[3], step_y[3], bias[3];
++            for (u32 i = 0; i < 3; ++i) {
++                const u32 a = (i + 1) % 3, b = (i + 2) % 3;
++                step_x[i] = -s64(t.y[b] - t.y[a]) * 256;
++                step_y[i] = s64(t.x[b] - t.x[a]);
++                const bool top_left = t.y[a] > t.y[b] || (t.y[a] == t.y[b] && t.x[b] > t.x[a]);
++                bias[i] = top_left ? 0 : -1;
++            }
++            const f32* const data = varying_data.data() + t.varyings;
++            std::fill_n(input(IR::Attribute::FrontFace), LANES, std::bit_cast<f32>(t.front ? 0xFFFFFFFFu : 0u));
++            for (s32 y = ys; y < ye; ++y) {
++                // the row's span: where all three edge functions are positive
++                const s64 py = s64(y) * 256 + 128, px = s64(t.x0) * 256 + 128;
++                s64 e[3];
++                s32 xs = t.x0, xe = t.x1;
++                for (u32 i = 0; i < 3; ++i) {
++                    const u32 a = (i + 1) % 3;
++                    e[i] = step_x[i] / 256 * (px - t.x[a]) + step_y[i] * (py - t.y[a]) + bias[i];
++                    if (step_x[i] > 0) {
++                        if (e[i] < 0) {
++                            xs = std::max<s64>(xs, t.x0 + (-e[i] + step_x[i] - 1) / step_x[i]);
++                        }
++                    } else if (step_x[i] < 0) {
++                        xe = e[i] < 0 ? xs : std::min<s64>(xe, t.x0 + e[i] / -step_x[i] + 1);
++                    } else if (e[i] < 0) {
++                        xe = xs;
++                    }
++                }
++                for (s32 bx = xs; bx < xe; bx += s32(LANES)) {
++                    const u32 n = u32(std::min<s32>(xe - bx, s32(LANES)));
++                    for (u32 j = 0; j < n; ++j) {
++                        const s64 dx = s64(bx + j - t.x0);
++                        const f32 w0 = f32(e[0] + step_x[0] * dx - bias[0]) * t.inv_area;
++                        const f32 w1 = f32(e[1] + step_x[1] * dx - bias[1]) * t.inv_area;
++                        const f32 w2 = f32(e[2] + step_x[2] * dx - bias[2]) * t.inv_area;
++                        // perspective: the weights over w, normalized (the same weights when affine)
++                        f32 pw0 = w0, pw1 = w1, pw2 = w2, psum = t.inv_w[0], inv_psum = 1.0f;
++                        if (!t.affine) {
++                            pw0 = w0 * t.inv_w[0], pw1 = w1 * t.inv_w[1], pw2 = w2 * t.inv_w[2];
++                            psum = pw0 + pw1 + pw2;
++                            inv_psum = psum != 0.0f ? 1.0f / psum : 0.0f;
++                        }
++                        input(IR::Attribute::PositionX)[j] = f32(bx + s32(j)) + 0.5f;
++                        input(IR::Attribute::PositionY)[j] = f32(y) + 0.5f;
++                        input(IR::Attribute::PositionZ)[j] = w0 * t.z[0] + w1 * t.z[1] + w2 * t.z[2];
++                        input(IR::Attribute::PositionW)[j] = psum;
++                        for (size_t k = 0; k < num_varyings; ++k) {
++                            const f32 a = data[k], b = data[num_varyings + k], c = data[2 * num_varyings + k];
++                            f32 value;
++                            switch (varyings[k].interpolation) {
++                            case Shader::Interpolation::Flat:
++                                value = a;
++                                break;
++                            case Shader::Interpolation::NoPerspective:
++                                value = w0 * a + w1 * b + w2 * c;
++                                break;
++                            default:
++                                value = (pw0 * a + pw1 * b + pw2 * c) * inv_psum;
++                                break;
++                            }
++                            in[varyings[k].input * LANES + j] = value;
++                        }
++                        st.colors[0 * LANES + j] = 0.0f;
++                        st.colors[1 * LANES + j] = 0.0f;
++                        st.colors[2 * LANES + j] = 0.0f;
++                        st.colors[3 * LANES + j] = 1.0f;
++                        st.discard[j] = false;
++                    }
++                    if (fs->one_lane) {
++                        for (u32 j = 0; j < n; ++j) {
++                            io.lane = j;
++                            Run(*fs, st.cells.data(), io, 1);
++                        }
++                        io.lane = 0;
++                    } else {
++                        Run(*fs, st.cells.data(), io, n);
++                    }
++                    for (u32 j = 0; j < n; ++j) {
++                        if (st.discard[j]) {
++                            continue;
++                        }
++                        u8* const out = pixel(bx + s32(j), y);
++                        if (!out) {
++                            continue;
++                        }
++                        std::array<f32, 4> color{st.colors[0 * LANES + j], st.colors[1 * LANES + j],
++                                                 st.colors[2 * LANES + j], st.colors[3 * LANES + j]};
++                        if (fast_write) {
++                            u32 r = Unorm(color[0], 8), g = Unorm(color[1], 8), b = Unorm(color[2], 8);
++                            u32 a = Unorm(color[3], 8);
++                            if (bgra) {
++                                std::swap(r, b);
++                            }
++                            if (blend) {
++                                u32 dst;
++                                std::memcpy(&dst, out, 4);
++                                const auto mix = [](u32 s, u32 d, u32 sa) { // (s*sa + d*(255-sa)) / 255
++                                    const u32 x = s * sa + d * (255 - sa) + 128;
++                                    return (x + (x >> 8)) >> 8;
++                                };
++                                const u32 da = dst >> 24;
++                                const u32 out_a = alpha_by_one ? std::min(a + (da * (255 - a) + 127) / 255, 255u)
++                                                               : mix(a, da, a);
++                                r = mix(r, dst & 0xFF, a), g = mix(g, (dst >> 8) & 0xFF, a);
++                                b = mix(b, (dst >> 16) & 0xFF, a), a = out_a;
++                            }
++                            const u32 packed = r | g << 8 | b << 16 | a << 24;
++                            std::memcpy(out, &packed, 4);
++                            continue;
++                        }
++                        if (blend) {
++                            std::array<f32, 4> dst{};
++                            DecodeColor(rt.format, out, dst);
++                            for (u32 ch = 0; ch < 4; ++ch) {
++                                const bool alpha = ch == 3;
++                                const f32 sf = BlendFactor(alpha ? alpha_src : color_src, color, dst, blend_constant, ch, st.blend_ok);
++                                const f32 df = BlendFactor(alpha ? alpha_dst : color_dst, color, dst, blend_constant, ch, st.blend_ok);
++                                color[ch] = BlendEquation(alpha ? alpha_op : color_op, color[ch] * sf, dst[ch] * df, st.blend_ok);
++                            }
++                        }
++                        std::array<u8, 16> encoded{};
++                        u32 bytes = 0;
++                        EncodeColor(rt.format, color, encoded, bytes);
++                        if (write_all) {
++                            std::memcpy(out, encoded.data(), bytes);
++                        } else if (bytes == 4) { // 8-bit channels: the masked ones kept
++                            for (u32 ch = 0; ch < 4; ++ch) {
++                                const u32 byte_index = bgra && ch < 3 ? 2 - ch : ch;
++                                if (write_channel[ch]) {
++                                    out[byte_index] = encoded[byte_index];
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    };
++
++    // Rasterized a GOB row (8 pixel rows) at a time: on the rasterizing threads when there's
++    // enough to share, otherwise on this one
++    s32 rows_begin = clip_y1, rows_end = clip_y0;
++    u64 pixels = 0;
++    for (const Triangle& t : triangles) {
++        rows_begin = std::min(rows_begin, t.y0);
++        rows_end = std::max(rows_end, t.y1);
++        pixels += u64(t.x1 - t.x0) * u64(t.y1 - t.y0);
++    }
++    const s32 first_gob_row = rows_begin / 8;
++    const u32 jobs = u32((rows_end + 7) / 8 - first_gob_row);
++    const auto job = [&](u32 index, u32 thread) {
++        const s32 begin = (first_gob_row + s32(index)) * 8;
++        raster_rows(raster[thread], std::max(begin, rows_begin), std::min(begin + 8, rows_end));
++    };
++    const auto raster_start = Stats::Clock::now();
++    constexpr u64 shared_pixels = 8192;
++    const u32 threads = pixels >= shared_pixels && jobs > 1 ? RasterThreads() : 1;
++    raster.resize(std::max<size_t>(raster.size(), threads));
++    for (u32 i = 0; i < threads; ++i) {
++        Broadcast(fs->cells, raster[i].cells);
++        raster[i].local.assign(fs->local_words + 1, 0);
++        raster[i].blend_ok = true;
++    }
++    if (threads > 1) {
++        workers->Run(jobs, job);
++    } else {
++        for (u32 index = 0; index < jobs; ++index) {
++            job(index, 0);
++        }
++    }
++    for (u32 i = 0; i < threads; ++i) {
++        if (!raster[i].blend_ok) {
++            LogOnce("a blend factor or equation not handled");
++        }
++    }
++    if (stats.enabled) {
++        const auto end = Stats::Clock::now();
++        stats.draws++;
++        stats.triangles += triangles.size();
++        stats.fragments += pixels;
++        stats.setup += raster_start - start;
++        stats.raster += end - raster_start;
++        stats.Report();
+     }
+     // textures drawn to (render to texture) are checked again before they're next sampled
+     MarkWritten(rt_address, pitch_linear ? u64{rt.width} * rt_height
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index 3153e65f5..2c4092ba7 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <memory>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "common/common_types.h"
+ #include "common/scratch_buffer.h"
+@@ -61,6 +62,12 @@ private:
+     std::unique_ptr<Pools> pools;
+     struct Textures;
+     std::unique_ptr<Textures> textures;
++    struct Raster;
++    std::vector<Raster> raster; // the rasterizing threads' state
++    struct Workers;
++    std::unique_ptr<Workers> workers;
++    u32 worker_count = 1;
++    u32 RasterThreads();
+     std::unordered_map<u64, std::unique_ptr<Program>> programs;
+     Common::ScratchBuffer<u8> scratch;
+ };

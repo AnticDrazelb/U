@@ -7,8 +7,11 @@
 // It draws a backdrop, bouncing squares and the word GPU with the 3D engine's clears, and sprites
 // with the 2D engine: a 32x32 image drawn by the CPU, copied once by the DMA engine, then blitted
 // and scaled onto the frame. And a triangle drawn with shaders: a vertex and a fragment program in
-// Maxwell machine code, assembled by hand below (there's no shader compiler here). It waits for each
-// frame's GPU work through a fence the command stream signals, and quits on +.
+// Maxwell machine code, assembled by hand below (there's no shader compiler here). And textured
+// shapes: a square with the sprite on it, turning, and a backdrop of tiles blended over the bands,
+// scrolling: a tile drawn by the CPU, copied by the DMA engine into a block-linear image (how
+// games upload textures) and filtered bilinearly. It waits for each frame's GPU work through a
+// fence the command stream signals, and quits on +.
 
 #include <math.h>
 #include <stdbool.h>
@@ -43,6 +46,7 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M2D_BLIT 0x22C // dst x, y, width, height, du/dx (frac, int), dv/dy, src x, src y (32.32)
 #define MDMA_LAUNCH 0x0C0
 #define MDMA_OFFSET_IN 0x100 // in (2), out (2), pitch in, pitch out, line length, line count
+#define MDMA_DST_PARAMS 0x1C3 // block size, width, height, depth, layer, origin
 #define SPRITE 32
 #define M_VIEWPORT_TRANSFORM 0x280 // scale x, y, z, translate x, y, z, swizzle, snap
 #define M_VIEWPORT 0x300           // x | width << 16, y | height << 16, near, far
@@ -61,6 +65,11 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M_CONST_BUFFER 0x8E0       // size, address (2): the buffer the next bind binds
 #define M_BIND_FRAGMENT_CBUF 0x924 // valid | slot << 4, for the fragment stage (bind group 4)
 #define M_TEXTURE_CBUF_SLOT 0x982  // the constant buffer holding texture handles
+#define M_BLEND 0x4CF              // separate alpha, colour op, source, dest, alpha op, source, -, dest
+#define M_BLEND_ENABLE 0x4D8       // one word per render target
+#define BLEND_ADD 0x8006
+#define BLEND_SRC_ALPHA 0x4302
+#define BLEND_ONE_MINUS_SRC_ALPHA 0x4303
 #define TOPOLOGY_TRIANGLES 4
 #define TOPOLOGY_TRIANGLE_STRIP 5
 #define ATTR_RGBA32F (0x01u << 21 | 7u << 27) // R32G32B32A32, float, buffer 0 (offset << 7)
@@ -101,6 +110,7 @@ static u64 nop(void) {
 #define VS_OFFSET 0x10
 #define FS_OFFSET 0x110
 #define FS_TEX_OFFSET 0x210
+#define FS_TILES_OFFSET 0x310
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
 #define FS_CBUF 0x2200  // the fragment stage's constant buffer 0: texture handles
@@ -149,6 +159,13 @@ static void write_programs(u8* heap) {
     ft[5] = exit_();
     ft[6] = nop();
     ft[7] = nop();
+
+    // the tiles: the same, with the texture whose handle is the constant buffer's second word
+    u32* tt_sph = (u32*)(heap + FS_TILES_OFFSET);
+    memcpy(tt_sph, ft_sph, 0x50);
+    u64* tt = (u64*)(heap + FS_TILES_OFFSET + 0x50);
+    memcpy(tt, ft, 8 * sizeof(u64));
+    tt[3] = tex2d(0, 4, 4);
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -166,6 +183,34 @@ static void write_texture(u8* heap, iova_t image, u32 width, u32 height, u32 pit
     tsc[0] = 2 | 2 << 3 | 2 << 6; // clamp to edge
     tsc[1] = 1 | 1 << 4 | 1 << 6; // nearest, nearest, no mipmaps
     *(u32*)(heap + FS_CBUF) = 0;  // handle: texture header 0 (its sampler with it)
+}
+
+// The tile: 64x64, drawn by the CPU (pitch linear), then copied by the DMA engine into a
+// block-linear image (one block: 8 GOBs high), sampled with header and sampler 1: bilinear,
+// repeating.
+#define TILE 64
+static void draw_tile(u32* pixels) {
+    for (int y = 0; y < TILE; y++)
+        for (int x = 0; x < TILE; x++) {
+            const int dx = abs(2 * x + 1 - TILE), dy = abs(2 * y + 1 - TILE);
+            const int ring = (dx + dy) / 8; // diamonds
+            const u32 r = (u32)(40 + (ring % 4) * 50), g = (u32)(120 + (x * 2) % 90), b = (u32)(220 - ring * 9);
+            const u32 a = (ring % 2) ? 110 : 60;
+            pixels[y * TILE + x] = r | g << 8 | b << 16 | a << 24;
+        }
+}
+static void write_tile_texture(u8* heap, iova_t image) {
+    u32* tic = (u32*)(heap + TIC_POOL + 32);
+    tic[0] = 0x08 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    tic[1] = (u32)image;
+    tic[2] = (u32)(image >> 32) | 3 << 21 /* block linear */;
+    tic[3] = 3 << 3; // blocks 8 GOBs high
+    tic[4] = (TILE - 1) | 1 << 23;
+    tic[5] = (TILE - 1) | 1u << 31;
+    u32* tsc = (u32*)(heap + TSC_POOL + 32);
+    tsc[0] = 0;                   // repeat
+    tsc[1] = 2 | 2 << 4 | 1 << 6; // linear, linear, no mipmaps
+    *(u32*)(heap + FS_CBUF + 4) = 1;
 }
 #define M_FENCE_VALUE 0x1C // GPFIFO (puller) methods
 #define M_FENCE_ACTION 0x1D
@@ -346,6 +391,9 @@ int main(int argc, char* argv[]) {
     memset(sprite_mem, 0, 0x10000);
     draw_sprite(sprite_mem);
     const iova_t sprite_copy = sprite_iova + 0x8000;
+    // the tile, drawn at 0x2000, copied by the DMA engine to 0xC000 (block linear)
+    draw_tile(sprite_mem + 0x2000 / 4);
+    const iova_t tile_image = sprite_iova + 0xC000;
 
     // The shader programs and, for each command buffer, the triangle's vertices.
     u8* heap = aligned_alloc(0x1000, 0x10000);
@@ -359,8 +407,10 @@ int main(int argc, char* argv[]) {
     memset(heap, 0, 0x10000);
     write_programs(heap);
     write_texture(heap, sprite_iova, SPRITE, SPRITE, SPRITE * 4);
+    write_tile_texture(heap, tile_image);
 #define VERTICES_OFFSET(i) (0x1000 + (i) * 0x100)
 #define QUAD_OFFSET(i) (0x1800 + (i) * 0x100)
+#define TILES_OFFSET(i) (0x1C00 + (i) * 0x80)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -417,6 +467,16 @@ int main(int argc, char* argv[]) {
             method_on(SUBCH_DMA, MDMA_OFFSET_IN, 8, dma);
             const u32 launch = 2 /* non-pipelined */ | 1 << 2 /* flush */ | 1 << 7 | 1 << 8 /* pitch */;
             method_on(SUBCH_DMA, MDMA_LAUNCH, 1, &launch);
+            // the tile's copy: 64 lines, pitch to block linear
+            const iova_t tile_src = sprite_iova + 0x2000;
+            const u32 tile_dma[8] = {(u32)(tile_src >> 32), (u32)tile_src, (u32)(tile_image >> 32),
+                                     (u32)tile_image, TILE * 4, 0, TILE * 4, TILE};
+            method_on(SUBCH_DMA, MDMA_OFFSET_IN, 8, tile_dma);
+            const u32 tile_dst[6] = {3 << 4 /* 8 GOBs high */, TILE * 4, TILE, 1, 0, 0};
+            method_on(SUBCH_DMA, MDMA_DST_PARAMS, 6, tile_dst);
+            const u32 tile_launch = 2 | 1 << 2 | 1 << 7 /* from pitch */ | 0 << 8 /* to block linear */ |
+                                    1 << 9 /* multi-line */;
+            method_on(SUBCH_DMA, MDMA_LAUNCH, 1, &tile_launch);
             method1(M_RT_CONTROL, 1 | (076543210 << 4)); // one render target, mapped to itself
             method1(M_COLOR_MASK, 0x1111);
             method1(M_CLEAR_FLAGS, CLEAR_FLAGS_SCISSOR);
@@ -437,9 +497,13 @@ int main(int argc, char* argv[]) {
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             // textures: the pools, the handles' constant buffer
             method1(M_SAMPLER_BINDING, 1);
-            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 0};
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 1};
             method(M_TEX_HEADER_POOL, 3, headers);
-            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 0};
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 1};
+            // blending (for the tiles): source alpha over the frame
+            const u32 blend[8] = {0, BLEND_ADD, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA,
+                                  BLEND_ADD, BLEND_SRC_ALPHA, 0, BLEND_ONE_MINUS_SRC_ALPHA};
+            method(M_BLEND, 8, blend);
             method(M_TEX_SAMPLER_POOL, 3, samplers);
             method1(M_TEXTURE_CBUF_SLOT, 0);
             const u32 cbuf[3] = {0x100, (u32)((heap_iova + FS_CBUF) >> 32), (u32)(heap_iova + FS_CBUF)};
@@ -459,6 +523,39 @@ int main(int argc, char* argv[]) {
             const float t = (float)band / 11.0f;
             const float pulse = 0.08f * sinf((float)frame * 0.05f + band * 0.5f);
             rect(0, band * (H / 12), W, H / 12 + 1, 0.10f + 0.25f * t + pulse, 0.08f + pulse, 0.30f + 0.2f * (1 - t));
+        }
+        // tiles over them, blended, scrolling: the whole frame in one quad, each tile 128 pixels
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + TILES_OFFSET(index));
+            static const float corners[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+            const float scroll_s = (float)frame * 0.004f, scroll_t = (float)frame * 0.0025f;
+            for (int k = 0; k < 4; k++) {
+                v[k * 8 + 0] = corners[k][0];
+                v[k * 8 + 1] = corners[k][1];
+                v[k * 8 + 2] = 0.5f;
+                v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = (corners[k][0] + 1) / 2 * (W / 128.0f) + scroll_s;
+                v[k * 8 + 5] = (corners[k][1] + 1) / 2 * (H / 128.0f) + scroll_t;
+                v[k * 8 + 6] = 0.0f;
+                v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t tiles = heap_iova + TILES_OFFSET(index);
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16}; // the whole frame
+            method(M_SCISSOR, 3, scissor);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_TILES_OFFSET);
+            method1(M_BLEND_ENABLE, 1);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(tiles >> 32), (u32)tiles, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = tiles + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_BLEND_ENABLE, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
         for (int i = 0; i < 12; i++) {
             squares[i].x += squares[i].vx;

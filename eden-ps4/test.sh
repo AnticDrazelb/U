@@ -107,6 +107,16 @@ pixels = data[data.index(b'255\n') + 4:]
 r, g, b = pixels[(261 * width + 144) * 3:(261 * width + 144) * 3 + 3]
 sys.exit(0 if r > 200 and 120 < g < 240 and b < 140 else 1)
 PY
+# its backdrop of tiles (a texture the DMA engine made block linear, filtered bilinearly, blended):
+# along a row, colours vary where the bands alone are flat
+check "its tiled backdrop is drawn (block-linear texture, bilinear, blended)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+row = {pixels[(20 * width + x) * 3:(20 * width + x) * 3 + 3] for x in range(width)}
+sys.exit(0 if len(row) > 20 else 1)
+PY
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
