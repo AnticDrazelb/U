@@ -115,7 +115,8 @@ code written by hand, as there's no shader compiler in this build environment. A
 drawn as games draw sprites and backgrounds: a turning square with the sprite on it (point
 sampled), and a backdrop of tiles over the bands, scrolling, blended by its alpha. The tile is
 drawn by the CPU and copied by the DMA engine into a block-linear image, the GPU's own layout, as
-games upload their textures; it's filtered bilinearly and repeats.
+games upload their textures; it's filtered bilinearly and repeats. And a depth test: two bars
+across each other in depth, a red one drawn first and a green one, each in front on its own half.
 
 ![The GPU test in shadPS4: everything on it drawn by the null renderer's software GPU](screenshots/gputest-shadps4.png)
 
@@ -139,9 +140,9 @@ Two ways it shows:
   them, culled, and rasterized into render target 0 in emulated memory a block at a time, with the
   varyings interpolated as Vulkan interpolates them (perspective, linear, flat) and blended. The
   GPU test's first frame comes out the same as through the Vulkan renderer (below), and it draws at
-  60 frames a second on the desktop. Not done yet: depth and stencil, more than one render target,
-  points and lines, storage images; a draw that needs them is skipped (or drawn without them), and
-  logged once.
+  60 frames a second on the desktop. Not done yet: stencil, more than one render target, points
+  and lines, storage images; a draw that needs them is skipped (or drawn without them), and logged
+  once.
 - **Textures, in software** (patch 0017): a texture is decoded from emulated memory the first
   time it's sampled, with Eden's own code for the GPU's layouts and compressed formats (its
   unswizzle, its BC1-7 and ASTC decoders), into 8-bit RGBA for the formats that fit and floats for
@@ -162,6 +163,9 @@ Two ways it shows:
   test's blended, filtered backdrop costs about 70 ns on one desktop thread, against 200 before:
   the test draws at 40-48 frames a second on one thread, 60 on four. `EDEN_SW_STATS` (always on
   in the PS4 build) logs what the draws cost every 2 seconds.
+- **Depth** (patch 0019): the depth test against the depth buffer (every depth format, as the
+  buffer keeps it, so the test is exact), before the fragment shader runs, so pixels behind skip
+  it; depth writes; and depth and stencil clears.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -241,8 +245,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
 4. **Controller test**: each PS4 button should light its Switch button.
 5. **GPU test**: the bands, the squares and GPU (clears), three circling sprites (2D blits of a
    DMA copy), a turning RGB triangle (shaders), a turning square with the sprite on it and a
-   scrolling backdrop of diamond tiles over the bands (textures), all drawn by the GPU emulation in
-   software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
+   scrolling backdrop of diamond tiles over the bands (textures), a red and a green bar at the top
+   right, each in front on its half (depth), all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
    the console's cores make of the software GPU.
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
@@ -308,6 +312,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: shader draws in software | stage 4's software renderer, above |
 | null renderer: textures in software draws | above |
 | null renderer: faster software draws, on several threads | above |
+| null renderer: depth testing, depth and stencil clears | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

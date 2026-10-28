@@ -11,7 +11,8 @@
 // shapes: a square with the sprite on it, turning, and a backdrop of tiles blended over the bands,
 // scrolling: a tile drawn by the CPU, copied by the DMA engine into a block-linear image (how
 // games upload textures) and filtered bilinearly. It waits for each frame's GPU work through a
-// fence the command stream signals, and quits on +.
+// fence the command stream signals, and quits on +. And a depth test: two bars across each other
+// in depth, each in front on its own half.
 
 #include <math.h>
 #include <stdbool.h>
@@ -70,6 +71,16 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define BLEND_ADD 0x8006
 #define BLEND_SRC_ALPHA 0x4302
 #define BLEND_ONE_MINUS_SRC_ALPHA 0x4303
+#define M_ZETA 0x3F8               // address (2), format, tile mode, array pitch
+#define M_ZETA_SIZE 0x48A          // width, height, depth | dimension control << 16
+#define M_ZETA_ENABLE 0x54E
+#define M_DEPTH_TEST_ENABLE 0x4B3
+#define M_DEPTH_WRITE_ENABLE 0x4BA
+#define M_DEPTH_FUNC 0x4C3
+#define M_CLEAR_DEPTH 0x364
+#define ZETA_Z32F 0x0A
+#define DEPTH_LESS_EQUAL 0x203
+#define CLEAR_Z 1u
 #define TOPOLOGY_TRIANGLES 4
 #define TOPOLOGY_TRIANGLE_STRIP 5
 #define ATTR_RGBA32F (0x01u << 21 | 7u << 27) // R32G32B32A32, float, buffer 0 (offset << 7)
@@ -405,12 +416,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     memset(heap, 0, 0x10000);
+    // The depth buffer: 32-bit float, block linear like the framebuffers
+    void* depth_mem = aligned_alloc(0x1000, 0x100000);
+    NvMap depth_map;
+    iova_t depth_iova = 0;
+    if (!depth_mem || R_FAILED(rc = nvMapCreate(&depth_map, depth_mem, 0x100000, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(rc = nvAddressSpaceMap(&as, nvMapGetHandle(&depth_map), true, NvKind_Pitch, &depth_iova))) {
+        fprintf(stderr, "gputest: depth buffer: %#x\n", rc);
+        return 1;
+    }
     write_programs(heap);
     write_texture(heap, sprite_iova, SPRITE, SPRITE, SPRITE * 4);
     write_tile_texture(heap, tile_image);
 #define VERTICES_OFFSET(i) (0x1000 + (i) * 0x100)
 #define QUAD_OFFSET(i) (0x1800 + (i) * 0x100)
 #define TILES_OFFSET(i) (0x1C00 + (i) * 0x80)
+#define DEPTH_OFFSET(i) (0x2400 + (i) * 0x100)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -511,6 +532,14 @@ int main(int argc, char* argv[]) {
             method1(M_BIND_FRAGMENT_CBUF, 1 | 0 << 4);
             const u32 screen[2] = {(u32)W << 16, (u32)H << 16};
             method(M_SCREEN_SCISSOR, 2, screen);
+            // the depth buffer, its test off but for the depth bars
+            const u32 zeta[5] = {(u32)(depth_iova >> 32), (u32)depth_iova, ZETA_Z32F, 4 << 4, 0};
+            method(M_ZETA, 5, zeta);
+            const u32 zeta_size[3] = {W, H, 1 | 1 << 16};
+            method(M_ZETA_SIZE, 3, zeta_size);
+            method1(M_ZETA_ENABLE, 1);
+            method1(M_DEPTH_FUNC, DEPTH_LESS_EQUAL);
+            method1(M_CLEAR_DEPTH, f32bits(1.0f));
             first = false;
         }
         const iova_t target = fb_iova + (iova_t)slot * fb.fb_size;
@@ -627,6 +656,46 @@ int main(int argc, char* argv[]) {
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
             method1(M_DRAW_END, 0);
             method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+        }
+        // the depth test: two bars across each other in depth (a red one, then a green one), each
+        // in front on its own half; the depth buffer cleared first
+        {
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_CLEAR_BUFFERS, CLEAR_Z);
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + DEPTH_OFFSET(index));
+            static const float xs[2] = {0.45f, 0.95f}, ys[2] = {-0.85f, -0.55f};
+            for (int bar = 0; bar < 2; bar++) {
+                for (int k = 0; k < 4; k++) {
+                    float* p = v + (bar * 4 + k) * 8;
+                    const int right = k & 1;
+                    p[0] = xs[right];
+                    p[1] = ys[k >> 1];
+                    p[2] = (right ^ bar) ? 0.6f : -0.6f; // red: far on the right; green: far on the left
+                    p[3] = 1.0f;
+                    p[4] = bar ? 0.2f : 1.0f;
+                    p[5] = bar ? 0.9f : 0.15f;
+                    p[6] = 0.15f;
+                    p[7] = 1.0f;
+                }
+            }
+            method1(M_DEPTH_TEST_ENABLE, 1);
+            method1(M_DEPTH_WRITE_ENABLE, 1);
+            const iova_t bars = heap_iova + DEPTH_OFFSET(index);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(bars >> 32), (u32)bars, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = bars + 8 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            for (int bar = 0; bar < 2; bar++) {
+                const u32 range[2] = {(u32)bar * 4, 4};
+                method(M_VERTEX_FIRST, 2, range);
+                method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+                method1(M_DRAW_END, 0);
+            }
+            method1(M_DEPTH_TEST_ENABLE, 0);
+            method1(M_DEPTH_WRITE_ENABLE, 0);
         }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);

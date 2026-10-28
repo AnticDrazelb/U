@@ -1,0 +1,574 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:07:21 +0000
+Subject: [PATCH] null renderer: depth testing, depth and stencil clears
+
+---
+ .../renderer_null/null_rasterizer.cpp         | 234 +++++++++++-------
+ .../renderer_null/software_draw.cpp           | 174 ++++++++++++-
+ src/video_core/renderer_null/software_draw.h  |  14 ++
+ 3 files changed, 336 insertions(+), 86 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index 2e4559558..319d7ca24 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -38,15 +38,144 @@ void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {
+ }
+ void RasterizerNull::DrawTexture() {}
+ 
+-// Colour clears, done in emulated memory: what a program draws with clears (and the DMA and 2D
+-// engines, and the software draws) shows in the null renderer's frames. Depth and stencil clears
+-// still do nothing.
++namespace {
++
++/// A rectangle of a surface (a render target or depth buffer) in emulated memory, 'pixel' written
++/// to each of its pixels where 'mask' is set, a GOB column of a block at a time (block linear)
++/// or a row at a time (pitch)
++struct Fill {
++    GPUVAddr address;
++    bool pitch_linear;
++    u32 pitch;        // pitch surfaces
++    u32 width;        // in pixels
++    u32 bpp;
++    u32 block_height; // block linear surfaces: log2 of GOBs a block is high
++    u64 layer_stride;
++    std::array<u8, 16> pixel;
++    std::array<bool, 16> mask;
++};
++
++void FillRect(Tegra::MemoryManager& gpu_memory, Common::ScratchBuffer<u8>& scratch, const Fill& fill,
++              u32 x0, u32 y0, u32 x1, u32 y1, u32 first_layer, u32 layers) {
++    const u32 bpp = fill.bpp;
++    const bool all = std::all_of(fill.mask.begin(), fill.mask.begin() + bpp, [](bool b) { return b; });
++    const auto put = [&](u8* out) {
++        if (all) {
++            std::memcpy(out, fill.pixel.data(), bpp);
++            return;
++        }
++        for (u32 b = 0; b < bpp; ++b) {
++            if (fill.mask[b]) {
++                out[b] = fill.pixel[b];
++            }
++        }
++    };
++    if (fill.pitch_linear) {
++        for (u32 y = y0; y < y1; ++y) {
++            Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
++                row(gpu_memory, fill.address + u64{y} * fill.pitch + u64{x0} * bpp, (x1 - x0) * bpp, &scratch);
++            for (u32 x = 0; x < x1 - x0; ++x) {
++                put(row.data() + x * bpp);
++            }
++        }
++        return;
++    }
++    // Block linear: a block (one GOB wide, 1 << block_height GOBs high) is contiguous, so each
++    // block the rectangle touches is read, written and written back on its own.
++    const u32 block_rows = 8u << fill.block_height;
++    const u32 block_bytes = 512u << fill.block_height;
++    const u32 gobs_in_x = (fill.width * bpp + 63) / 64;
++    const u64 block_row_size = u64{gobs_in_x} * block_bytes;
++    const u32 pixels_per_gob = 64 / bpp;
++    for (u32 layer = 0; layer < layers; ++layer) {
++        const GPUVAddr layer_address = fill.address + u64{first_layer + layer} * fill.layer_stride;
++        for (u32 by = y0 / block_rows; by <= (y1 - 1) / block_rows; ++by) {
++            const u32 ys = std::max(y0, by * block_rows), ye = std::min(y1, (by + 1) * block_rows);
++            for (u32 gx = x0 / pixels_per_gob; gx <= (x1 - 1) / pixels_per_gob; ++gx) {
++                const u32 xs = std::max(x0, gx * pixels_per_gob);
++                const u32 xe = std::min(x1, (gx + 1) * pixels_per_gob);
++                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
++                    block(gpu_memory, layer_address + by * block_row_size + u64{gx} * block_bytes,
++                          block_bytes, &scratch);
++                for (u32 y = ys; y < ye; ++y) {
++                    const u32 in_block = y - by * block_rows;
++                    const u32 row = in_block % 8;
++                    const u32 row_offset = (in_block / 8) * 512 + (row / 2) * 64 + (row % 2) * 16;
++                    for (u32 x = xs; x < xe; ++x) {
++                        const u32 xb = (x * bpp) % 64;
++                        put(block.data() + row_offset + (xb / 32) * 256 + ((xb % 32) / 16) * 32 + (xb % 16));
++                    }
++                }
++            }
++        }
++    }
++}
++
++} // Anonymous namespace
++
++// Clears, done in emulated memory: what a program draws with clears (and the DMA and 2D engines,
++// and the software draws) shows in the null renderer's frames. Colour (render target), depth and
++// stencil (the depth buffer).
+ void RasterizerNull::Clear(u32 layer_count) {
+     if (!maxwell3d || !gpu_memory) {
+         return;
+     }
+     const auto& regs = maxwell3d->regs;
+     const auto& surface = regs.clear_surface;
++    const u32 layers = std::max<u32>(layer_count, 1);
++    const auto clear_rect = [&](u32 width, u32 height, u32& x0, u32& y0, u32& x1, u32& y1) {
++        x0 = 0, y0 = 0, x1 = width, y1 = height;
++        if (regs.clear_control.use_scissor && regs.scissor_test[0].enable) {
++            const auto& scissor = regs.scissor_test[0];
++            x0 = std::max<u32>(x0, scissor.min_x);
++            y0 = std::max<u32>(y0, scissor.min_y);
++            x1 = std::min<u32>(x1, scissor.max_x);
++            y1 = std::min<u32>(y1, scissor.max_y);
++        }
++        return x0 < x1 && y0 < y1;
++    };
++
++    // Depth and stencil
++    if ((surface.Z || surface.S) && regs.zeta_enable && regs.zeta.Address() != 0) {
++        const auto format = regs.zeta.format;
++        const u32 bpp = DepthBytes(format);
++        u32 x0, y0, x1, y1;
++        if (bpp == 0) {
++            LOG_WARNING(Render, "Software clear: depth format {:#x} not handled", static_cast<u32>(format));
++        } else if (clear_rect(regs.zeta_size.width, regs.zeta_size.height, x0, y0, x1, y1)) {
++            Fill fill{};
++            fill.address = regs.zeta.Address();
++            fill.pitch_linear = regs.zeta.tile_mode.is_pitch_linear != 0;
++            fill.width = regs.zeta_size.width;
++            fill.pitch = fill.width * bpp;
++            fill.bpp = bpp;
++            fill.block_height = regs.zeta.tile_mode.block_height;
++            fill.layer_stride = u64{regs.zeta.array_pitch} << 2;
++            // the bytes the depth and the stencil take: written to a zero pixel and to a full one
++            std::array<u8, 16> zeros{}, ones;
++            ones.fill(0xFF);
++            if (surface.Z) {
++                const u32 depth = DepthValue(format, regs.clear_depth);
++                WriteDepth(format, fill.pixel.data(), depth);
++                WriteDepth(format, zeros.data(), 0xFFFFFFFFu);
++                WriteDepth(format, ones.data(), 0);
++            }
++            if (surface.S) {
++                const u8 stencil = u8(regs.clear_stencil) & u8(regs.stencil_front_mask);
++                WriteStencil(format, fill.pixel.data(), stencil);
++                WriteStencil(format, zeros.data(), 0xFF);
++                WriteStencil(format, ones.data(), 0);
++            }
++            for (u32 b = 0; b < bpp; ++b) {
++                fill.mask[b] = zeros[b] != 0 || ones[b] != 0xFF;
++            }
++            m_software.MarkWritten(fill.address, std::max<u64>(fill.layer_stride, u64{fill.width} * regs.zeta_size.height * 16) *
++                                                     (surface.layer + layers));
++            FillRect(*gpu_memory, m_scratch, fill, x0, y0, x1, y1, surface.layer, layers);
++        }
++    }
++
++    // Colour
+     if (!(surface.R || surface.G || surface.B || surface.A)) {
+         return;
+     }
+@@ -56,13 +185,9 @@ void RasterizerNull::Clear(u32 layer_count) {
+     if (address == 0 || rt.width == 0 || rt.height == 0) {
+         return;
+     }
+-    // textures cleared (render to texture) are checked again before they're next sampled; the
+-    // range generous (a layer's size isn't worked out here)
+-    m_software.MarkWritten(address, std::max<u64>(u64{rt.array_pitch} << 2, u64{rt.width} * rt.height * 16) *
+-                                        (surface.layer + std::max(layer_count, 1u)));
+-    std::array<u8, 16> pixel{};
++    Fill fill{};
+     u32 bpp = 0;
+-    if (!EncodeColor(rt.format, regs.clear_color, pixel, bpp)) {
++    if (!EncodeColor(rt.format, regs.clear_color, fill.pixel, bpp)) {
+         LOG_WARNING(Render, "Software clear: render target format {:#x} not handled",
+                     static_cast<u32>(rt.format));
+         return;
+@@ -73,7 +198,7 @@ void RasterizerNull::Clear(u32 layer_count) {
+     const bool channels[4] = {surface.R && mask.R, surface.G && mask.G, surface.B && mask.B,
+                               surface.A && mask.A};
+     const bool all = channels[0] && channels[1] && channels[2] && channels[3];
+-    std::array<bool, 4> byte_mask{true, true, true, true};
++    fill.mask.fill(true);
+     if (!all) {
+         using F = Tegra::RenderTargetFormat;
+         const bool bgra = rt.format == F::A8R8G8B8_UNORM || rt.format == F::A8R8G8B8_SRGB ||
+@@ -83,83 +208,24 @@ void RasterizerNull::Clear(u32 layer_count) {
+         if (!rgba && !bgra) {
+             return;
+         }
+-        byte_mask = {channels[bgra ? 2 : 0], channels[1], channels[bgra ? 0 : 2], channels[3]};
++        fill.mask = {channels[bgra ? 2 : 0], channels[1], channels[bgra ? 0 : 2], channels[3]};
+     }
+-
+-    const bool pitch_linear = rt.tile_mode.is_pitch_linear != 0;
+-    const u32 pitch = pitch_linear ? rt.width : 0; // a pitch render target's width is its pitch
+-    const u32 width = pitch_linear ? rt.width / bpp : rt.width;
+-    const u32 height = rt.height;
+-    u32 x0 = 0, y0 = 0, x1 = width, y1 = height;
+-    if (regs.clear_control.use_scissor && regs.scissor_test[0].enable) {
+-        const auto& scissor = regs.scissor_test[0];
+-        x0 = std::max<u32>(x0, scissor.min_x);
+-        y0 = std::max<u32>(y0, scissor.min_y);
+-        x1 = std::min<u32>(x1, scissor.max_x);
+-        y1 = std::min<u32>(y1, scissor.max_y);
+-    }
+-    if (x0 >= x1 || y0 >= y1) {
+-        return;
+-    }
+-    const u32 extent_x = x1 - x0;
+-
+-    if (pitch_linear) {
+-        for (u32 y = y0; y < y1; ++y) {
+-            Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+-                row(*gpu_memory, address + u64{y} * pitch + u64{x0} * bpp, extent_x * bpp, &m_scratch);
+-            for (u32 x = 0; x < extent_x; ++x) {
+-                for (u32 i = 0; i < bpp; ++i) {
+-                    if (bpp != 4 || byte_mask[i]) {
+-                        row[x * bpp + i] = pixel[i];
+-                    }
+-                }
+-            }
+-        }
++    fill.address = address;
++    fill.pitch_linear = rt.tile_mode.is_pitch_linear != 0;
++    fill.pitch = fill.pitch_linear ? rt.width : 0; // a pitch render target's width is its pitch
++    fill.width = fill.pitch_linear ? rt.width / bpp : rt.width;
++    fill.bpp = bpp;
++    fill.block_height = rt.tile_mode.block_height;
++    fill.layer_stride = u64{rt.array_pitch} << 2;
++    u32 x0, y0, x1, y1;
++    if (!clear_rect(fill.width, rt.height, x0, y0, x1, y1)) {
+         return;
+     }
+-
+-    // Block linear: a block (one GOB wide, 1 << block_height GOBs high) is contiguous, so each
+-    // block the rectangle touches is read, written and written back on its own.
+-    const u32 block_height = rt.tile_mode.block_height;
+-    const u32 block_rows = 8u << block_height;
+-    const u32 block_bytes = 512u << block_height;
+-    const u32 gobs_in_x = (width * bpp + 63) / 64;
+-    const u64 block_row_size = u64{gobs_in_x} * block_bytes;
+-    const u32 pixels_per_gob = 64 / bpp;
+-    const u32 layers = std::max<u32>(layer_count, 1);
+-    for (u32 layer = 0; layer < layers; ++layer) {
+-        const GPUVAddr layer_address =
+-            address + u64{surface.layer + layer} * (u64{rt.array_pitch} << 2);
+-        for (u32 by = y0 / block_rows; by <= (y1 - 1) / block_rows; ++by) {
+-            const u32 ys = std::max(y0, by * block_rows), ye = std::min(y1, (by + 1) * block_rows);
+-            for (u32 gx = x0 / pixels_per_gob; gx <= (x1 - 1) / pixels_per_gob; ++gx) {
+-                const u32 xs = std::max(x0, gx * pixels_per_gob);
+-                const u32 xe = std::min(x1, (gx + 1) * pixels_per_gob);
+-                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+-                    block(*gpu_memory, layer_address + by * block_row_size + u64{gx} * block_bytes,
+-                          block_bytes, &m_scratch);
+-                for (u32 y = ys; y < ye; ++y) {
+-                    const u32 in_block = y - by * block_rows;
+-                    const u32 row = in_block % 8;
+-                    const u32 row_offset = (in_block / 8) * 512 + (row / 2) * 64 + (row % 2) * 16;
+-                    for (u32 x = xs; x < xe; ++x) {
+-                        const u32 xb = (x * bpp) % 64;
+-                        u8* out = block.data() + row_offset + (xb / 32) * 256 + ((xb % 32) / 16) * 32 +
+-                                  (xb % 16);
+-                        if (all) {
+-                            std::memcpy(out, pixel.data(), bpp);
+-                        } else {
+-                            for (u32 b = 0; b < bpp; ++b) {
+-                                if (byte_mask[b]) {
+-                                    out[b] = pixel[b];
+-                                }
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-    }
++    // textures cleared (render to texture) are checked again before they're next sampled; the
++    // range generous (a layer's size isn't worked out here)
++    m_software.MarkWritten(address, std::max<u64>(fill.layer_stride, u64{rt.width} * rt.height * 16) *
++                                        (surface.layer + layers));
++    FillRect(*gpu_memory, m_scratch, fill, x0, y0, x1, y1, surface.layer, layers);
+ }
+ void RasterizerNull::DispatchCompute() {}
+ void RasterizerNull::ResetCounter(VideoCommon::QueryType type) {}
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index c7bd160ad..6ca4d0c11 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -270,6 +270,83 @@ bool DecodeColor(Tegra::RenderTargetFormat format, const u8* in, std::array<f32,
+     }
+ }
+ 
++u32 DepthBytes(Tegra::DepthFormat format) {
++    using D = Tegra::DepthFormat;
++    switch (format) {
++    case D::Z16_UNORM: return 2;
++    case D::Z32_FLOAT: case D::Z24_UNORM_S8_UINT: case D::X8Z24_UNORM: case D::S8Z24_UNORM:
++    case D::V8Z24_UNORM: return 4;
++    case D::Z32_FLOAT_X24S8_UINT: return 8;
++    case D::S8_UINT: return 1;
++    default: return 0;
++    }
++}
++
++u32 DepthValue(Tegra::DepthFormat format, f32 depth) {
++    depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
++    using D = Tegra::DepthFormat;
++    switch (format) {
++    case D::Z16_UNORM: return u32(depth * 65535.0f + 0.5f);
++    case D::Z32_FLOAT: case D::Z32_FLOAT_X24S8_UINT: return std::bit_cast<u32>(depth);
++    case D::S8_UINT: return 0;
++    default: return u32(f64(depth) * 16777215.0 + 0.5); // the 24-bit formats
++    }
++}
++
++u32 ReadDepth(Tegra::DepthFormat format, const u8* pixel) {
++    u32 v = 0;
++    using D = Tegra::DepthFormat;
++    switch (format) {
++    case D::Z16_UNORM: {
++        u16 h;
++        std::memcpy(&h, pixel, 2);
++        return h;
++    }
++    case D::S8_UINT: return 0;
++    default: std::memcpy(&v, pixel, 4); break;
++    }
++    switch (format) {
++    case D::Z24_UNORM_S8_UINT: return v >> 8;     // depth above, stencil below
++    case D::X8Z24_UNORM: case D::S8Z24_UNORM: case D::V8Z24_UNORM: return v & 0xFFFFFF;
++    default: return v;                            // the float formats
++    }
++}
++
++void WriteDepth(Tegra::DepthFormat format, u8* pixel, u32 value) {
++    using D = Tegra::DepthFormat;
++    u32 v;
++    switch (format) {
++    case D::Z16_UNORM: {
++        const u16 h = u16(value);
++        std::memcpy(pixel, &h, 2);
++        return;
++    }
++    case D::S8_UINT: return;
++    case D::Z32_FLOAT: case D::Z32_FLOAT_X24S8_UINT:
++        std::memcpy(pixel, &value, 4);
++        return;
++    case D::Z24_UNORM_S8_UINT:
++        std::memcpy(&v, pixel, 4);
++        v = (v & 0xFF) | (value << 8);
++        break;
++    default:
++        std::memcpy(&v, pixel, 4);
++        v = (v & 0xFF000000u) | (value & 0xFFFFFF);
++        break;
++    }
++    std::memcpy(pixel, &v, 4);
++}
++
++void WriteStencil(Tegra::DepthFormat format, u8* pixel, u8 stencil) {
++    using D = Tegra::DepthFormat;
++    switch (format) {
++    case D::Z24_UNORM_S8_UINT: case D::S8_UINT: pixel[0] = stencil; break;
++    case D::S8Z24_UNORM: pixel[3] = stencil; break;
++    case D::Z32_FLOAT_X24S8_UINT: pixel[4] = stencil; break;
++    default: break;
++    }
++}
++
+ // ---- shaders: Eden's IR, flattened into a list of operations on numbered cells, interpreted
+ 
+ namespace {
+@@ -1290,6 +1367,7 @@ struct SoftwareDraw::Program {
+     std::vector<Shader::TextureDescriptor> textures;
+     std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
+     bool one_lane = false; // it branches (or uses local memory): run a pixel at a time
++    bool writes_depth = false;
+ };
+ 
+ struct SoftwareDraw::Textures {
+@@ -1308,6 +1386,10 @@ struct SoftwareDraw::Raster {
+     std::array<f32, 8 * 4 * LANES> colors{};
+     std::array<bool, LANES> discard{};
+     std::vector<u8*> gobs; // the render target's GOBs in the row being drawn, as they're reached
++    std::vector<u8*> zeta_gobs; // the depth buffer's
++    std::array<u8*, LANES> depth_pixel{};
++    std::array<u32, LANES> depth_value{};
++    std::array<bool, LANES> depth_pass{};
+     bool blend_ok = true;
+ };
+ 
+@@ -2183,6 +2265,21 @@ void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     }
+ }
+ 
++/// The depth test: the incoming depth against the buffer's, both as the buffer keeps them
++bool DepthPasses(Maxwell::Regs::ComparisonOp op, u32 incoming, u32 stored) {
++    using C = Maxwell::Regs::ComparisonOp;
++    switch (op) {
++    case C::Never_D3D: case C::Never_GL: return false;
++    case C::Less_D3D: case C::Less_GL: return incoming < stored;
++    case C::Equal_D3D: case C::Equal_GL: return incoming == stored;
++    case C::LessEqual_D3D: case C::LessEqual_GL: return incoming <= stored;
++    case C::Greater_D3D: case C::Greater_GL: return incoming > stored;
++    case C::NotEqual_D3D: case C::NotEqual_GL: return incoming != stored;
++    case C::GreaterEqual_D3D: case C::GreaterEqual_GL: return incoming >= stored;
++    default: return true;
++    }
++}
++
+ // ---- the draw
+ 
+ struct Vertex {
+@@ -2442,6 +2539,7 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+             program->generic_loaded[i] = ir.info.loads.Generic(i);
+         }
+         program->local_words = (ir.local_memory_size + 3) / 4;
++        program->writes_depth = ir.info.stores_frag_depth;
+         program->textures.assign(ir.info.texture_descriptors.begin(), ir.info.texture_descriptors.end());
+         u32 bindings = 0;
+         for (const auto& descriptor : program->textures) {
+@@ -2520,8 +2618,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     if (!regs.IsShaderConfigEnabled(Maxwell::Regs::ShaderType::Pixel) || regs.rt_control.count == 0) {
+         return;
+     }
+-    if (regs.depth_test_enable) {
+-        LogOnce("depth testing isn't done: drawn without it");
++    if (regs.stencil_enable) {
++        LogOnce("stencil testing isn't done: drawn without it");
+     }
+     Program* const vs = GetProgram(maxwell3d, gpu_memory, 1);
+     Program* const fs = GetProgram(maxwell3d, gpu_memory, 5);
+@@ -2702,6 +2800,26 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         clip_x1 = std::min<s32>(clip_x1, regs.scissor_test[0].max_x);
+         clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y);
+     }
++
++    // Depth: tested against the depth buffer before the fragment shader runs (the shader's own
++    // depth isn't used), and written, when the test is on
++    const auto zeta_format = regs.zeta.format;
++    bool depth_test = regs.depth_test_enable != 0 && regs.zeta_enable != 0 && regs.zeta.Address() != 0;
++    const u32 zeta_bpp = depth_test ? DepthBytes(zeta_format) : 0;
++    if (depth_test && (zeta_bpp == 0 || zeta_format == Tegra::DepthFormat::S8_UINT)) {
++        LogOnce(fmt::format("depth format {:#x} not handled: drawn without the depth test",
++                            static_cast<u32>(zeta_format)));
++        depth_test = false;
++    }
++    const bool depth_write = depth_test && regs.depth_write_enabled != 0;
++    const auto depth_func = regs.depth_test_func;
++    if (depth_test) {
++        clip_x1 = std::min<s32>(clip_x1, s32(regs.zeta_size.width));
++        clip_y1 = std::min<s32>(clip_y1, s32(regs.zeta_size.height));
++        if (fs->writes_depth) {
++            LogOnce("a fragment shader's own depth isn't used: the interpolated depth is");
++        }
++    }
+     if (clip_x0 >= clip_x1 || clip_y0 >= clip_y1) {
+         return;
+     }
+@@ -2932,6 +3050,12 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     const u32 block_bytes = 512u << rt.tile_mode.block_height;
+     const u32 gobs_in_x = (rt_width * bpp + 63) / 64;
+     const u64 block_row_size = u64{gobs_in_x} * block_bytes;
++    const GPUVAddr zeta_address = regs.zeta.Address();
++    const bool zeta_pitch_linear = regs.zeta.tile_mode.is_pitch_linear != 0;
++    const u32 zeta_block_rows = zeta_pitch_linear ? 8 : 8u << regs.zeta.tile_mode.block_height;
++    const u32 zeta_block_bytes = 512u << regs.zeta.tile_mode.block_height;
++    const u32 zeta_gobs_in_x = (regs.zeta_size.width * std::max(zeta_bpp, 1u) + 63) / 64;
++    const u64 zeta_block_row_size = u64{zeta_gobs_in_x} * zeta_block_bytes;
+ 
+     const auto raster_rows = [&](Raster& st, s32 row_begin, s32 row_end) {
+         st.gobs.assign(gobs_in_x, nullptr);
+@@ -2954,6 +3078,27 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             const u32 row = u32(y) % 8, in_gob = xb % 64;
+             return gob + (row / 2) * 64 + (row % 2) * 16 + (in_gob / 32) * 256 + ((in_gob % 32) / 16) * 32 + in_gob % 16;
+         };
++        if (depth_test) {
++            st.zeta_gobs.assign(zeta_gobs_in_x, nullptr);
++        }
++        const GPUVAddr zeta_gob_row_address = zeta_address + u64(u32(row_begin) / zeta_block_rows) * zeta_block_row_size +
++                                              u64{u32(row_begin) % zeta_block_rows / 8} * 512;
++        const auto depth_pixel = [&](s32 x, s32 y) -> u8* {
++            if (zeta_pitch_linear) {
++                return gpu_memory.GetPointer(zeta_address + (u64(y) * regs.zeta_size.width + u64(x)) * zeta_bpp);
++            }
++            const u32 xb = u32(x) * zeta_bpp;
++            const u32 column = xb / 64;
++            u8*& gob = st.zeta_gobs[column];
++            if (!gob) {
++                gob = gpu_memory.GetPointer(zeta_gob_row_address + u64{column} * zeta_block_bytes);
++                if (!gob) {
++                    return nullptr;
++                }
++            }
++            const u32 row = u32(y) % 8, in_gob = xb % 64;
++            return gob + (row / 2) * 64 + (row % 2) * 16 + (in_gob / 32) * 256 + ((in_gob % 32) / 16) * 32 + in_gob % 16;
++        };
+         f32* const in = st.inputs.data();
+         const auto input = [&](IR::Attribute attribute) { return in + static_cast<u32>(attribute) * LANES; };
+         Io io{in, st.outputs.data(), st.colors.data(), st.discard.data(), LANES, 0,
+@@ -3050,6 +3195,20 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                     std::fill_n(st.colors.data(), 3 * LANES, 0.0f);
+                     std::fill_n(st.colors.data() + 3 * LANES, LANES, 1.0f);
+                     st.discard.fill(false);
++                    // the depth test: a batch whose pixels all fail isn't shaded
++                    if (depth_test) {
++                        bool any = false;
++                        for (u32 j = 0; j < n; ++j) {
++                            u8* const zp = depth_pixel(bx + s32(j), y);
++                            st.depth_pixel[j] = zp;
++                            st.depth_value[j] = DepthValue(zeta_format, position_z[j]);
++                            st.depth_pass[j] = zp && DepthPasses(depth_func, st.depth_value[j], ReadDepth(zeta_format, zp));
++                            any |= st.depth_pass[j];
++                        }
++                        if (!any) {
++                            continue;
++                        }
++                    }
+                     if (fs->one_lane) {
+                         for (u32 j = 0; j < n; ++j) {
+                             io.lane = j;
+@@ -3063,6 +3222,14 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                         if (st.discard[j]) {
+                             continue;
+                         }
++                        if (depth_test) {
++                            if (!st.depth_pass[j]) {
++                                continue;
++                            }
++                            if (depth_write) {
++                                WriteDepth(zeta_format, st.depth_pixel[j], st.depth_value[j]);
++                            }
++                        }
+                         u8* const out = pixel(bx + s32(j), y);
+                         if (!out) {
+                             continue;
+@@ -3170,6 +3337,9 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     // textures drawn to (render to texture) are checked again before they're next sampled
+     MarkWritten(rt_address, pitch_linear ? u64{rt.width} * rt_height
+                                          : block_row_size * ((rt_height + block_rows - 1) / block_rows));
++    if (depth_write) {
++        MarkWritten(zeta_address, zeta_block_row_size * ((regs.zeta_size.height + zeta_block_rows - 1) / zeta_block_rows));
++    }
+ }
+ 
+ } // namespace Null
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index 2c4092ba7..d03d9e6df 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -28,6 +28,20 @@ bool EncodeColor(Tegra::RenderTargetFormat format, const std::array<f32, 4>& col
+ /// A colour read back from a render target format (for blending). False for formats not handled.
+ bool DecodeColor(Tegra::RenderTargetFormat format, const u8* in, std::array<f32, 4>& color);
+ 
++/// Bytes a depth buffer format takes a pixel, 0 for formats not handled.
++u32 DepthBytes(Tegra::DepthFormat format);
++
++/// A depth (0 to 1) as the buffer keeps it: unorm formats' integer, float formats' bits (in order
++/// for depths of 0 and more), so depths compare as integers.
++u32 DepthValue(Tegra::DepthFormat format, f32 depth);
++
++/// The depth value of a pixel in the buffer, and writing it (the stencil bits kept).
++u32 ReadDepth(Tegra::DepthFormat format, const u8* pixel);
++void WriteDepth(Tegra::DepthFormat format, u8* pixel, u32 value);
++
++/// Writing a pixel's stencil (the depth bits kept), for the formats that have one.
++void WriteStencil(Tegra::DepthFormat format, u8* pixel, u8 stencil);
++
+ /// Draws on the CPU what the 3D engine's registers describe, into the render target in emulated
+ /// memory: the shaders translated by Eden's shader recompiler and interpreted, triangles
+ /// rasterized and their fragments blended into render target 0, sampling textures decoded from

@@ -117,6 +117,16 @@ pixels = data[data.index(b'255\n') + 4:]
 row = {pixels[(20 * width + x) * 3:(20 * width + x) * 3 + 3] for x in range(width)}
 sys.exit(0 if len(row) > 20 else 1)
 PY
+# its depth test: two bars across each other in depth, red in front on the left, green on the right
+check "its depth test works (red bar in front on the left, green on the right)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+(lr, lg, lb), (rr, rg, rb) = at(480, 54), at(608, 54)
+sys.exit(0 if lr > 200 and lg < 100 and rg > 200 and rr < 100 else 1)
+PY
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
