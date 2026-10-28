@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 10:13:54 +0000
+Subject: [PATCH] vulkan: headless rendering for frontends that take frames
+
+With a headless window, the Vulkan instance asks for VK_EXT_headless_surface
+where the driver has it and the renderer makes a surface that shows
+nothing, so it runs as with a window. A frontend that asks for software
+frames gets each one rendered into a buffer and read back (R, G, B, A at
+the handheld screen's size) instead of presented.
+---
+ .../renderer_vulkan/renderer_vulkan.cpp       | 25 +++++++++++++++++++
+ .../renderer_vulkan/renderer_vulkan.h         |  2 ++
+ .../vulkan_common/vulkan_instance.cpp         |  6 +++++
+ .../vulkan_common/vulkan_surface.cpp          | 13 ++++++++++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index 27ca53118..e074ca3d7 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -208,6 +208,14 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+ 
+     RenderAppletCaptureLayer(framebuffers);
+ 
++    // A frontend without a window takes the frame as pixels instead (as from the null renderer).
++    if (render_window.WantsSoftwareFrames()) {
++        RenderSoftwareFrame(framebuffers);
++        gpu.RendererFrameEndNotify();
++        rasterizer.TickFrame();
++        return;
++    }
++
+     if (!render_window.IsShown()) {
+         return;
+     }
+@@ -296,6 +304,23 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
+     return dst_buffer;
+ }
+ 
++void RendererVulkan::RenderSoftwareFrame(std::span<const Tegra::FramebufferConfig> framebuffers) {
++    const auto layers = Tegra::FilterLayerStack(
++        framebuffers, Service::Nvnflinger::LayerStackId::Default, software_frame_layers);
++    if (layers.empty()) {
++        return;
++    }
++    // The Switch's screen (handheld), R, G, B, A bytes
++    const auto layout = Layout::DefaultFrameLayout(Layout::ScreenUndocked::Width,
++                                                   Layout::ScreenUndocked::Height);
++    const auto buffer = RenderToBuffer(layers, layout, VK_FORMAT_R8G8B8A8_UNORM,
++                                       VkDeviceSize{layout.width} * layout.height * 4);
++    const auto mapped = buffer.Mapped();
++    render_window.OnSoftwareFrame(
++        std::span(reinterpret_cast<const u32*>(mapped.data()), mapped.size() / 4), layout.width,
++        layout.height);
++}
++
+ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers) {
+     if (!renderer_settings.screenshot_requested) {
+         return;
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.h b/src/video_core/renderer_vulkan/renderer_vulkan.h
+index 87422dd93..001afbb08 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.h
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.h
+@@ -72,11 +72,13 @@ private:
+     vk::Buffer RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
+                               const Layout::FramebufferLayout& layout, VkFormat format,
+                               VkDeviceSize buffer_size);
++    void RenderSoftwareFrame(std::span<const Tegra::FramebufferConfig> framebuffers);
+     void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
+     void RenderAppletCaptureLayer(std::span<const Tegra::FramebufferConfig> framebuffers);
+ 
+     std::vector<Tegra::FramebufferConfig> applet_capture_layers;
+     std::vector<Tegra::FramebufferConfig> screenshot_layer_scratch;
++    std::vector<Tegra::FramebufferConfig> software_frame_layers;
+ 
+     Tegra::MaxwellDeviceMemoryManager& device_memory;
+     Tegra::GPU& gpu;
+diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
+index 7f3d8ed41..31fbfafbb 100644
+--- a/src/video_core/vulkan_common/vulkan_instance.cpp
++++ b/src/video_core/vulkan_common/vulkan_instance.cpp
+@@ -42,6 +42,12 @@ namespace {
+     extensions.reserve(6);
+     switch (window_type) {
+     case Core::Frontend::WindowSystemType::Headless:
++        // A surface that shows nothing, where the driver has one: the renderer then works as with
++        // a window, and a frontend that takes frames reads them back.
++        if (AreExtensionsSupported(dld, properties, std::array{VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME})) {
++            extensions.push_back(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
++            extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
++        }
+         break;
+ #ifdef _WIN32
+     case Core::Frontend::WindowSystemType::Windows:
+diff --git a/src/video_core/vulkan_common/vulkan_surface.cpp b/src/video_core/vulkan_common/vulkan_surface.cpp
+index 8b9dcb4d4..d938fdf27 100644
+--- a/src/video_core/vulkan_common/vulkan_surface.cpp
++++ b/src/video_core/vulkan_common/vulkan_surface.cpp
+@@ -106,6 +106,19 @@ vk::SurfaceKHR CreateSurface(
+     }
+ #endif
+ 
++    if (window_info.type == Core::Frontend::WindowSystemType::Headless) {
++        const VkHeadlessSurfaceCreateInfoEXT headless_ci{
++            VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT, nullptr, 0};
++        const auto vkCreateHeadlessSurfaceEXT = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
++            dld.vkGetInstanceProcAddr(*instance, "vkCreateHeadlessSurfaceEXT"));
++        if (!vkCreateHeadlessSurfaceEXT ||
++            vkCreateHeadlessSurfaceEXT(*instance, &headless_ci, nullptr, &unsafe_surface) !=
++                VK_SUCCESS) {
++            LOG_ERROR(Render_Vulkan, "Failed to initialize a headless surface");
++            throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
++        }
++    }
++
+     if (!unsafe_surface) {
+         LOG_ERROR(Render_Vulkan, "Presentation not supported on this platform");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);

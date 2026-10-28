@@ -101,7 +101,12 @@ void ApplyLauncherSettings() {
     // Eden's log filter (e.g. "*:Info Service.VI:Debug"); by default warnings and errors only
     const char* filter = std::getenv("EDEN_PS4_LOG");
     Settings::values.log_filter = filter ? filter : "*:Warning Debug.Emulated:Info";
-    Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Null);
+    // The null renderer composes frames on the CPU and drops GPU work; EDEN_PS4_RENDERER=vulkan
+    // runs Eden's Vulkan renderer without a window (its frames read back), for GPU-drawn programs.
+    const char* renderer = std::getenv("EDEN_PS4_RENDERER");
+    const bool vulkan = renderer && std::string_view{renderer} == "vulkan";
+    Settings::values.renderer_backend.SetValue(vulkan ? Settings::RendererBackend::Vulkan
+                                                      : Settings::RendererBackend::Null);
     Settings::values.sink_id.SetValue(AudioCore::Sink::HasFrontendAudio() ? Settings::AudioEngine::Frontend
                                                                            : Settings::AudioEngine::Null);
     Settings::values.use_disk_shader_cache.SetValue(false);
