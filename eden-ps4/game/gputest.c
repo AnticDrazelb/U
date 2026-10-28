@@ -12,7 +12,8 @@
 // scrolling: a tile drawn by the CPU, copied by the DMA engine into a block-linear image (how
 // games upload textures) and filtered bilinearly. It waits for each frame's GPU work through a
 // fence the command stream signals, and quits on +. And a depth test: two bars across each other
-// in depth, each in front on its own half.
+// in depth, each in front on its own half. And a square coloured from a storage buffer, lines and a
+// point.
 
 #include <math.h>
 #include <stdbool.h>
@@ -81,6 +82,10 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define ZETA_Z32F 0x0A
 #define DEPTH_LESS_EQUAL 0x203
 #define CLEAR_Z 1u
+#define M_LINE_WIDTH 0x4ED         // aliased lines
+#define M_POINT_SIZE 0x546
+#define TOPOLOGY_POINTS 0
+#define TOPOLOGY_LINE_STRIP 3
 #define TOPOLOGY_TRIANGLES 4
 #define TOPOLOGY_TRIANGLE_STRIP 5
 #define ATTR_RGBA32F (0x01u << 21 | 7u << 27) // R32G32B32A32, float, buffer 0 (offset << 7)
@@ -464,6 +469,7 @@ int main(int argc, char* argv[]) {
 #define QUAD_OFFSET(i) (0x1800 + (i) * 0x100)
 #define TILES_OFFSET(i) (0x1C00 + (i) * 0x80)
 #define DEPTH_OFFSET(i) (0x2400 + (i) * 0x200) // the depth bars (8 vertices), then the storage square (4)
+#define LINES_OFFSET(i) (0x3200 + (i) * 0x200)  // the lines (5 vertices), then the point (1)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -751,6 +757,36 @@ int main(int argc, char* argv[]) {
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
             method1(M_DRAW_END, 0);
             method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+        }
+        // lines (a yellow rectangle, 3 pixels wide: a line strip back to its start; Eden's Vulkan
+        // renderer draws line loops as triangles) and a point (white, 6 pixels), bottom right
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + LINES_OFFSET(index));
+            static const float corners[6][2] = {{0.62f, 0.70f}, {0.92f, 0.70f}, {0.92f, 0.92f},
+                                                {0.62f, 0.92f}, {0.62f, 0.70f}, {0.77f, 0.81f}};
+            for (int k = 0; k < 6; k++) {
+                v[k * 8 + 0] = corners[k][0], v[k * 8 + 1] = corners[k][1];
+                v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = 1.0f, v[k * 8 + 5] = k < 5 ? 0.9f : 1.0f, v[k * 8 + 6] = k < 5 ? 0.1f : 1.0f;
+                v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t lines = heap_iova + LINES_OFFSET(index);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(lines >> 32), (u32)lines, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = lines + 6 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            method1(M_LINE_WIDTH, f32bits(3.0f));
+            method1(M_POINT_SIZE, f32bits(6.0f));
+            const u32 strip[2] = {0, 5};
+            method(M_VERTEX_FIRST, 2, strip);
+            method1(M_DRAW_BEGIN, TOPOLOGY_LINE_STRIP);
+            method1(M_DRAW_END, 0);
+            const u32 point[2] = {5, 1};
+            method(M_VERTEX_FIRST, 2, point);
+            method1(M_DRAW_BEGIN, TOPOLOGY_POINTS);
+            method1(M_DRAW_END, 0);
         }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);

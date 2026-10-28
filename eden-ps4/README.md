@@ -119,7 +119,7 @@ games upload their textures; it's filtered bilinearly and repeats. And a depth t
 across each other in depth, a red one drawn first and a green one, each in front on its own half.
 And a square coloured from a storage buffer: its fragment program loads 16 bytes from a GPU
 address it finds in the constant buffer (where NVN keeps storage buffers' addresses), which Eden's
-shader recompiler turns into a storage buffer read.
+shader recompiler turns into a storage buffer read. And lines, 3 pixels wide, and a point.
 
 ![The GPU test in shadPS4: everything on it drawn by the null renderer's software GPU](screenshots/gputest-shadps4.png)
 
@@ -143,9 +143,9 @@ Two ways it shows:
   them, culled, and rasterized into render target 0 in emulated memory a block at a time, with the
   varyings interpolated as Vulkan interpolates them (perspective, linear, flat) and blended. The
   GPU test's first frame comes out the same as through the Vulkan renderer (below), and it draws at
-  60 frames a second on the desktop. Not done yet: stencil, more than one render target, points
-  and lines, storage images; a draw that needs them is skipped (or drawn without them), and logged
-  once.
+  60 frames a second on the desktop. Not done yet: stencil, more than one render target, storage
+  images, geometry and tessellation shaders; a draw that needs them is skipped (or drawn without
+  them), and logged once.
 - **Textures, in software** (patch 0017): a texture is decoded from emulated memory the first
   time it's sampled, with Eden's own code for the GPU's layouts and compressed formats (its
   unswizzle, its BC1-7 and ASTC decoders), into 8-bit RGBA for the formats that fit and floats for
@@ -173,6 +173,12 @@ Two ways it shows:
   (their addresses and sizes read from the constant buffers, as Eden's buffer cache reads them),
   and global memory accesses the recompiler couldn't tie to a buffer, go to emulated memory. The
   subgroup operations (votes, ballots, shuffles, the quad swizzle) work as for subgroups of one.
+- **Points and lines** (patch 0021): points as squares of the point size (fixed or the vertex
+  program's), lines widened along their minor axis to the line width, as aliased lines are drawn;
+  line strips and loops, quad strips and polygons too. The GPU test's lines and point come out the
+  same as through the Vulkan renderer, pixel for pixel. A line loop showed that Eden's Vulkan
+  renderer draws line loops as triangles (its topology table maps them to a triangle list), so
+  the test draws a strip back to its start instead.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -321,6 +327,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: faster software draws, on several threads | above |
 | null renderer: depth testing, depth and stencil clears | above |
 | null renderer: storage buffers, global memory and subgroup ops in software shaders | above |
+| null renderer: points, lines, quad strips and polygons in software draws | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

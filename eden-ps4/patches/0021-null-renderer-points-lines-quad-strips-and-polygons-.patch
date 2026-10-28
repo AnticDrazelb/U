@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:17:35 +0000
+Subject: [PATCH] null renderer: points, lines, quad strips and polygons in
+ software draws
+
+---
+ .../renderer_null/software_draw.cpp           | 90 ++++++++++++++++---
+ 1 file changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 479331c35..55765ed56 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -2432,6 +2432,7 @@ bool DepthPasses(Maxwell::Regs::ComparisonOp op, u32 incoming, u32 stored) {
+ struct Vertex {
+     std::array<f32, 4> position; // clip space
+     std::array<f32, 128> varyings; // generic 0..31, xyzw
++    f32 point_size;
+ };
+ 
+ struct ScreenVertex {
+@@ -2922,6 +2923,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         Run(*vs, vs_cells.data(), io, 1);
+         std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+         std::memcpy(out.varyings.data(), &outputs[32], sizeof(out.varyings));
++        out.point_size = outputs[static_cast<u32>(IR::Attribute::PointSize)];
+     };
+ 
+     // The varyings the fragment shader reads, and how each is interpolated
+@@ -3014,7 +3016,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     };
+     std::vector<Triangle> triangles;
+     std::vector<f32> varying_data;
+-    const auto add_triangle = [&](const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c) {
++    const auto add_triangle = [&](const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c,
++                                  bool cullable = true) {
+         const ScreenVertex* v[3] = {&a, &b, &c};
+         Triangle t;
+         for (u32 i = 0; i < 3; ++i) {
+@@ -3030,8 +3033,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         if (area == 0) {
+             return;
+         }
+-        t.front = (area < 0) == front_ccw;
+-        if (cull) {
++        t.front = !cullable || (area < 0) == front_ccw;
++        if (cull && cullable) {
+             const auto face = regs.gl_cull_face;
+             if (face == Maxwell::Regs::CullFace::FrontAndBack ||
+                 (face == Maxwell::Regs::CullFace::Front && t.front) ||
+@@ -3086,6 +3089,16 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         default: return guard_y * p[3] + p[1];
+         }
+     };
++    const auto lerp_vertex = [&](const Vertex& p, const Vertex& q, f32 t) {
++        Vertex v;
++        for (u32 k = 0; k < 4; ++k) v.position[k] = p.position[k] + t * (q.position[k] - p.position[k]);
++        for (const Varying& varying : varyings) {
++            const u32 k = varying.vertex;
++            v.varyings[k] = p.varyings[k] + t * (q.varyings[k] - p.varyings[k]);
++        }
++        v.point_size = p.point_size + t * (q.point_size - p.point_size);
++        return v;
++    };
+     std::vector<Vertex> polygon, clipped;
+     const auto clip_and_add = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
+         u32 outside = 0;
+@@ -3112,14 +3125,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                     clipped.push_back(p);
+                 }
+                 if ((dp >= 0.0f) != (dq >= 0.0f)) {
+-                    const f32 t = dp / (dp - dq);
+-                    Vertex v;
+-                    for (u32 k = 0; k < 4; ++k) v.position[k] = p.position[k] + t * (q.position[k] - p.position[k]);
+-                    for (const Varying& varying : varyings) {
+-                        const u32 k = varying.vertex;
+-                        v.varyings[k] = p.varyings[k] + t * (q.varyings[k] - p.varyings[k]);
+-                    }
+-                    clipped.push_back(v);
++                    clipped.push_back(lerp_vertex(p, q, dp / (dp - dq)));
+                 }
+             }
+             std::swap(polygon, clipped);
+@@ -3133,9 +3139,49 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         }
+     };
+ 
++    // Points: squares of the point size; lines: the line widened along its minor axis, as
++    // aliased lines are drawn; both rasterized as two triangles, never culled
++    const bool program_point_size = regs.point_size_attribute.enabled != 0;
++    const f32 line_width = std::max(regs.line_anti_alias_enable ? regs.line_width_smooth : regs.line_width_aliased, 1.0f);
++    const auto add_point = [&](const Vertex& v) {
++        for (u32 plane = 0; plane < 5; ++plane) {
++            if (distance(v, plane) < 0.0f) {
++                return;
++            }
++        }
++        const ScreenVertex c = to_screen(v);
++        const f32 half = std::max(program_point_size ? v.point_size : regs.point_size, 1.0f) * 0.5f;
++        ScreenVertex q[4] = {c, c, c, c};
++        q[0].x -= half, q[0].y -= half, q[1].x += half, q[1].y -= half;
++        q[2].x -= half, q[2].y += half, q[3].x += half, q[3].y += half;
++        add_triangle(q[0], q[1], q[2], false);
++        add_triangle(q[2], q[1], q[3], false);
++    };
++    const auto add_line = [&](const Vertex& a, const Vertex& b) {
++        Vertex p = a, q = b;
++        for (u32 plane = 0; plane < 5; ++plane) {
++            const f32 dp = distance(p, plane), dq = distance(q, plane);
++            if (dp < 0.0f && dq < 0.0f) {
++                return;
++            }
++            if (dp < 0.0f) {
++                p = lerp_vertex(p, q, dp / (dp - dq));
++            } else if (dq < 0.0f) {
++                q = lerp_vertex(q, p, dq / (dq - dp));
++            }
++        }
++        const ScreenVertex s0 = to_screen(p), s1 = to_screen(q);
++        const bool x_major = std::fabs(s1.x - s0.x) >= std::fabs(s1.y - s0.y);
++        const f32 ox = x_major ? 0.0f : line_width * 0.5f, oy = x_major ? line_width * 0.5f : 0.0f;
++        ScreenVertex v[4] = {s0, s0, s1, s1};
++        v[0].x -= ox, v[0].y -= oy, v[1].x += ox, v[1].y += oy;
++        v[2].x -= ox, v[2].y -= oy, v[3].x += ox, v[3].y += oy;
++        add_triangle(v[0], v[1], v[2], false); // the last vertex provoking, as Maxwell's lines have it
++        add_triangle(v[2], v[1], v[3], false);
++    };
++
+     const auto topology = draw_state.topology;
+-    if (topology != Topology::Triangles && topology != Topology::TriangleStrip &&
+-        topology != Topology::TriangleFan && topology != Topology::Quads) {
++    if (topology >= Topology::LinesAdjacency) {
+         LogOnce(fmt::format("primitive topology {} not drawn", static_cast<u32>(topology)));
+         return;
+     }
+@@ -3155,8 +3201,26 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             }
+             break;
+         case Topology::TriangleFan:
++        case Topology::Polygon:
+             for (u32 i = 1; i + 1 < count; ++i) clip_and_add(vertices[0], vertices[i], vertices[i + 1]);
+             break;
++        case Topology::QuadStrip:
++            for (u32 i = 0; i + 3 < count; i += 2) {
++                clip_and_add(vertices[i], vertices[i + 1], vertices[i + 3]);
++                clip_and_add(vertices[i], vertices[i + 3], vertices[i + 2]);
++            }
++            break;
++        case Topology::Points:
++            for (u32 i = 0; i < count; ++i) add_point(vertices[i]);
++            break;
++        case Topology::Lines:
++            for (u32 i = 0; i + 1 < count; i += 2) add_line(vertices[i], vertices[i + 1]);
++            break;
++        case Topology::LineStrip:
++        case Topology::LineLoop:
++            for (u32 i = 0; i + 1 < count; ++i) add_line(vertices[i], vertices[i + 1]);
++            if (topology == Topology::LineLoop && count > 2) add_line(vertices[count - 1], vertices[0]);
++            break;
+         case Topology::Quads:
+             for (u32 i = 0; i + 3 < count; i += 4) {
+                 clip_and_add(vertices[i], vertices[i + 1], vertices[i + 2]);

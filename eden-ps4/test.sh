@@ -136,6 +136,16 @@ pixels = data[data.index(b'255\n') + 4:]
 r, g, b = pixels[(22 * width + 48) * 3:(22 * width + 48) * 3 + 3]
 sys.exit(0 if r < 60 and g > 200 and b > 200 else 1)
 PY
+# its lines (a yellow rectangle, 3 pixels wide) and point (white, 6 pixels), bottom right
+check "its lines and point are drawn" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+(lr, lg, lb), (pr, pg, pb) = at(566, 305), at(566, 325)
+sys.exit(0 if lr > 220 and lg > 200 and lb < 80 and min(pr, pg, pb) > 230 else 1)
+PY
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
