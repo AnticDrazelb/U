@@ -266,7 +266,9 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
 5. **GPU test**: the bands, the squares and GPU (clears), three circling sprites (2D blits of a
    DMA copy), a turning RGB triangle (shaders), a turning square with the sprite on it and a
    scrolling backdrop of diamond tiles over the bands (textures), a red and a green bar at the top
-   right, each in front on its half (depth), all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
+   right, each in front on its half (depth), a cyan square top left (a storage buffer), an orange
+   triangle on the left (stencil), a yellow rectangle of lines with a white point in it, bottom
+   right, all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
    the console's cores make of the software GPU.
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
