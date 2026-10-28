@@ -12,10 +12,13 @@ and its sound.
 `game/breakout.c` is a small Switch game, written for this: Breakout at 640x360, drawn by the CPU
 into a libnx framebuffer (no GPU commands), with the controller read through HID and beeps played
 through `audout`. It's built with libnx, the Switch homebrew library, compiled with clang (below).
-In the package as `breakout.nro`, first on the start page's list. Next to it, `game/padtest.c`, a
-controller test: every Switch button with the PS4 button it's mapped to, lit while held, and the
+In the package as `breakout.nro`, first on the start page's list. `game/blocks.c` is a second
+game, falling blocks with a ghost piece, a next-piece preview, levels, and a tune (Korobeiniki, a
+19th-century Russian folk song) under the beeps; the two share `game/nxgame.h` (drawing, the font,
+sound). And `game/padtest.c`, a controller test: every Switch button with the PS4 button it's mapped to, lit while held, and the
 sticks' positions, as text through libnx's console (also drawn by the CPU).
 
+![Blocks in shadPS4](screenshots/blocks-shadps4.png)
 ![The controller test in shadPS4, Cross held and the left stick right](screenshots/padtest-shadps4.png)
 
 ![Breakout in shadPS4](screenshots/breakout-shadps4.png)
@@ -97,6 +100,8 @@ of programs: the D-pad chooses, X boots.
 
 - **Breakout** (`breakout.nro`, in the package). Left stick or D-pad to move, X to launch the
   ball, OPTIONS to quit.
+- **Blocks** (`blocks.nro`, in the package). D-pad or stick to move and to drop faster, Cross and
+  Circle to rotate, up or Triangle to drop, the touchpad's click for the music, OPTIONS to quit.
 - **Controller test** (`padtest.nro`, in the package). OPTIONS and the touchpad's click together
   quit.
 - **The test program** (`hello.nro`, in the package): stage 2's checks, text only.
@@ -128,8 +133,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    `crash.log` its crash report (next start, the start page shows both: a photo is enough).
 2. **The test program** (stage 2's checks): every line should end with "passed" or a result, and
    the start page come back.
-3. **Breakout**: the picture, the paddle on the stick and D-pad, X to launch, the beeps. The game
-   shows its frame rate at the top. `boot-trace.log` gets a line every 10 s with the frames a
+3. **Breakout** and **Blocks**: the picture, the controls, the beeps (and Blocks' tune). Both
+   show their frame rate. `boot-trace.log` gets a line every 10 s with the frames a
    second and how long the launcher takes to draw each onto the screen.
 4. **Controller test**: each PS4 button should light its Switch button.
 5. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
@@ -224,7 +229,7 @@ EDEN_DIR=~/eden eden-ps4/build.sh host    # desktop: ~/eden-host/bin/eden-ps4 <p
 EDEN_DIR=~/eden eden-ps4/build.sh ps4     # out/EdenPS4.pkg
 eden-ps4/hello/build.sh               # hello.nro on its own
 eden-ps4/nx/build.sh                  # libnx and its toolchain, with clang, into ~/nx/devkitpro
-eden-ps4/game/build.sh                # breakout.nro and padtest.nro (build.sh ps4 builds them too)
+eden-ps4/game/build.sh                # the games and the controller test (build.sh ps4 builds them too)
 ```
 
 `nx/build.sh` builds what devkitPro's packages would give (their servers are blocked in some build
