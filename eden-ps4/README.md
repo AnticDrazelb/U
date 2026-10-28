@@ -446,6 +446,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: compute shaders in software | above |
 | null renderer: primitive restart, the provoking vertex, polygon offset, the alpha test and point coordinates in software draws | above |
 | null renderer: multisampled render targets drawn at their samples' resolution | above |
+| null renderer: software shaders read a uniform once for every lane | a constant buffer read at a constant offset, read once, not 16 times |
 
 The PS4 memory changes, from what stage 1 measured:
 

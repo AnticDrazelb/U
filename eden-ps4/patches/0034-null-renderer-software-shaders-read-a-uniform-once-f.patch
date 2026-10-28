@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 22:44:28 +0000
+Subject: [PATCH] null renderer: software shaders read a uniform once for every
+ lane
+
+A constant buffer read whose buffer and offset are constants (a uniform, the commonest) is
+read once and given to every lane, where each lane read it on its own.
+---
+ src/video_core/renderer_null/software_draw.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index fbbfb7784..695e11e0f 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -1898,6 +1898,11 @@ private:
+                 op.extra = inst.Flags<IR::TextureInstInfo>().raw;
+                 op.a = {Slot(inst.Arg(0)), Slot(inst.Arg(1)), Slot(inst.Arg(2)), Slot(inst.Arg(4))};
+                 break;
++            case O::GetCbufU32: case O::GetCbufF32: case O::GetCbufU32x2:
++                // a uniform: read once for every lane when its buffer and offset are constants
++                op.a[0] = Slot(inst.Arg(0)), op.a[1] = Slot(inst.Arg(1));
++                op.extra = inst.Arg(0).IsImmediate() && inst.Arg(1).IsImmediate() ? 1 : 0;
++                break;
+             case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGather:
+             case O::ImageFetch: case O::ImageQueryDimensions: case O::ImageQueryLod:
+             case O::ImageGradient: // the handle, then what's used of the rest in its first four
+@@ -2637,9 +2642,22 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+             break;
+         case O::GetCbufU32:
+         case O::GetCbufF32:
++            if (o.extra) {
++                const u32 value = ReadCbuf(io, a.w[0][0], b.w[0][0], 4);
++                LANE_LOOP d.w[0][i] = value;
++                break;
++            }
+             IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
+             break;
+         case O::GetCbufU32x2:
++            if (o.extra) {
++                const u32 low = ReadCbuf(io, a.w[0][0], b.w[0][0], 4);
++                const u32 high = ReadCbuf(io, a.w[0][0], b.w[0][0] + 4, 4);
++                LANE_LOOP {
++                    d.w[0][i] = low, d.w[1][i] = high;
++                }
++                break;
++            }
+             IO_LOOP {
+                 d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
+                 d.w[1][i] = ReadCbuf(io, a.w[0][i], b.w[0][i] + 4, 4);
