@@ -14,7 +14,8 @@
 // fence the command stream signals, and quits on +. And a depth test: two bars across each other
 // in depth, each in front on its own half. And a square coloured from a storage buffer, lines and a
 // point, and a stencil test: a triangle drawn only into the stencil, then a square drawn where it
-// is. From frame 30 the CPU paints the sprite's middle blue, which the turning square shows.
+// is. From frame 30 the CPU paints the sprite's middle blue, which the turning square shows. The
+// bouncing squares are cleared by a GPU macro (MME, as deko3d and Mesa draw through macros).
 
 #include <math.h>
 #include <stdbool.h>
@@ -284,6 +285,8 @@ static u32 header(u32 mode, u32 count, u32 subch, u32 method) {
     return method | (subch << 13) | (count << 16) | (mode << 29);
 }
 #define INCREASING 1
+#define NONINCREASING 3 // every word to the same method
+#define INCREASE_ONCE 5 // the first word to the method, the rest to the next (a macro's parameters)
 #define INLINE 4
 
 typedef struct {
@@ -360,6 +363,48 @@ static u32 f32bits(float f) {
 }
 
 // A rectangle: a clear of render target 0, limited to the scissor.
+// A GPU macro (Maxwell's MME), uploaded once: it takes a colour and clear flags, sets the clear
+// colour from the first four and clears with the fifth. Each instruction an add of an immediate,
+// its result sent to a method, or the method set, or the next parameter fetched.
+#define M_MME_INSTRUCTION_PTR 0x45 // where uploaded instructions go, then the instructions
+#define M_MME_START_PTR 0x47       // a macro's number, then its first instruction
+#define M_MACRO_CALL 0xE00         // macro n: its first parameter at 0xE00 + 2n, the rest at + 1
+enum { MME_MOVE = 1, MME_MOVE_SET_METHOD = 2, MME_FETCH_SEND = 3, MME_MOVE_SEND = 4 };
+static u32 mme_addi(u32 result, u32 dst, u32 src, s32 imm, int exit) {
+    return 1 /* add immediate */ | result << 4 | (exit ? 1u << 7 : 0) | dst << 8 | src << 11 | ((u32)imm & 0x3FFFF) << 14;
+}
+static void upload_macro(void) {
+    u32 code[8];
+    code[0] = mme_addi(MME_MOVE_SET_METHOD, 0, 0, M_CLEAR_COLOR | 1 << 12, 0); // the clear colour, ...
+    for (int i = 1; i <= 4; i++)
+        code[i] = mme_addi(MME_FETCH_SEND, 1, 1, 0, 0); // r1 (the first parameter) sent, the next fetched
+    code[5] = mme_addi(MME_MOVE_SET_METHOD, 0, 0, M_CLEAR_BUFFERS, 0);
+    code[6] = mme_addi(MME_MOVE_SEND, 0, 1, 0, 1); // the flags sent: the clear; and the end
+    code[7] = mme_addi(MME_MOVE, 0, 0, 0, 0);      // the end's delay slot: nothing
+    method1(M_MME_INSTRUCTION_PTR, 0);
+    emit(header(NONINCREASING, 8, SUBCH_3D, M_MME_INSTRUCTION_PTR + 1)); // all to one method
+    for (int i = 0; i < 8; i++)
+        emit(code[i]);
+    const u32 bind[2] = {0 /* macro 0 */, 0 /* its first instruction */};
+    method(M_MME_START_PTR, 2, bind);
+}
+// A rectangle cleared by the macro
+static void rect_by_macro(int x, int y, int w, int h, float r, float g, float b) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w <= 0 || h <= 0)
+        return;
+    const u32 scissor[3] = {1, (u32)x | (u32)(x + w) << 16, (u32)y | (u32)(y + h) << 16};
+    method(M_SCISSOR, 3, scissor);
+    // the parameters in one go: the macro runs when the call's last one has come
+    const u32 parameters[5] = {f32bits(r), f32bits(g), f32bits(b), f32bits(1.0f), CLEAR_RGBA};
+    emit(header(INCREASE_ONCE, 5, SUBCH_3D, M_MACRO_CALL));
+    for (int i = 0; i < 5; i++)
+        emit(parameters[i]);
+}
+
 static void rect(int x, int y, int w, int h, float r, float g, float b) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
@@ -591,6 +636,7 @@ int main(int argc, char* argv[]) {
             method1(M_DEPTH_FUNC, DEPTH_LESS_EQUAL);
             method1(M_CLEAR_DEPTH, f32bits(1.0f));
             method1(M_CLEAR_STENCIL, 0);
+            upload_macro();
             first = false;
         }
         const iova_t target = fb_iova + (iova_t)slot * fb.fb_size;
@@ -650,7 +696,7 @@ int main(int argc, char* argv[]) {
             squares[i].y += squares[i].vy;
             if (squares[i].x < 0 || squares[i].x > W - 32) squares[i].vx = -squares[i].vx;
             if (squares[i].y < 0 || squares[i].y > H - 32) squares[i].vy = -squares[i].vy;
-            rect((int)squares[i].x, (int)squares[i].y, 32, 32, squares[i].r, squares[i].g, squares[i].b);
+            rect_by_macro((int)squares[i].x, (int)squares[i].y, 32, 32, squares[i].r, squares[i].g, squares[i].b);
         }
         word_gpu(W / 2 - 3 * 6 * 12 / 2, H / 2 - 7 * 12 / 2, 12, 1.0f, 1.0f, 1.0f);
         // sprites from the DMA engine's copy, circling at three sizes

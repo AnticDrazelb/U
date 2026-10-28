@@ -166,6 +166,17 @@ pixels = data[data.index(b'255\n') + 4:]
 r, g, b = pixels[(261 * width + 144) * 3:(261 * width + 144) * 3 + 3]
 sys.exit(0 if b > 200 and r < 80 and g < 120 else 1)
 PY
+# its bouncing squares, cleared by a GPU macro (MME, run by Eden's macro interpreter): the first
+# is grey, top left
+check "its squares are drawn by a GPU macro" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+r, g, b = pixels[(74 * width + 53) * 3:(74 * width + 53) * 3 + 3]
+sys.exit(0 if all(abs(c - 77) < 6 for c in (r, g, b)) else 1)
+PY
+check "its macro is interpreted (no macro JIT)" bash -c "! grep -q 'Macro JIT' '$work/gputest.log'"
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"

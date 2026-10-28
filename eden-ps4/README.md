@@ -193,6 +193,13 @@ Two ways it shows:
   command buffers it reads, thousands of times a second, which marked every texture before. The
   GPU test's CPU paints the sprite's middle blue at frame 30, and the turning square shows it.
   The stats line counts the textures checked and decoded, and the bytes hashed.
+- **GPU macros** (launcher; patch 0024): deko3d and Mesa draw through the 3D engine's macros
+  (MME), and Eden's macro JIT writes x86 code into memory it makes executable itself, which a PS4
+  app can't do: the launcher has Eden interpret macros instead (`EDEN_PS4_MACRO_JIT=1` for the
+  JIT). The GPU test's bouncing squares are cleared by a macro of its own (it sets the clear colour
+  and clears, from its parameters). And the null rasterizer reports the writes the memory manager
+  gathers (constant buffer updates among them) before each draw and clear, as the Vulkan one does:
+  they gathered without end.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -346,6 +353,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: points, lines, quad strips and polygons in software draws | above |
 | null renderer: stencil testing and several render targets in software draws | above |
 | null renderer: tick the rasterizer each frame, so CPU-written textures are seen | above |
+| null renderer: report gathered writes before draws and clears | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

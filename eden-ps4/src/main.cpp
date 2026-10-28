@@ -110,6 +110,10 @@ void ApplyLauncherSettings() {
     Settings::values.sink_id.SetValue(AudioCore::Sink::HasFrontendAudio() ? Settings::AudioEngine::Frontend
                                                                            : Settings::AudioEngine::Null);
     Settings::values.use_disk_shader_cache.SetValue(false);
+    // GPU macros (MME: deko3d's and Mesa's draws use them) interpreted: the macro JIT writes x86 code
+    // into memory it makes executable itself, which a PS4 app can't (EDEN_PS4_MACRO_JIT=1 for it)
+    const char* macro_jit = std::getenv("EDEN_PS4_MACRO_JIT");
+    Settings::values.disable_macro_jit.SetValue(!(macro_jit && std::string_view{macro_jit} == "1"));
     // No Cemuhook (UDP) controller servers: their client would open a host socket at start,
     // for controllers this launcher doesn't use.
     Settings::values.udp_input_servers.SetValue("");
