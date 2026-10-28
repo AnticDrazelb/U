@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 05:49:53 +0000
+Subject: [PATCH] audio: a frontend sink, for frontends that bring their own
+ audio output
+
+AudioEngine::Frontend plays each stream through an output the frontend
+registers (SetFrontendAudio): a thread per stream pulls 512-frame buffers
+and hands them to the output, which blocks until it takes them. Without a
+registered output it's the null sink.
+---
+ src/audio_core/CMakeLists.txt         |   2 +
+ src/audio_core/sink/frontend_sink.cpp | 156 ++++++++++++++++++++++++++
+ src/audio_core/sink/frontend_sink.h   |  56 +++++++++
+ src/audio_core/sink/sink_details.cpp  |  12 ++
+ src/common/settings_enums.h           |   5 +-
+ 5 files changed, 229 insertions(+), 2 deletions(-)
+ create mode 100644 src/audio_core/sink/frontend_sink.cpp
+ create mode 100644 src/audio_core/sink/frontend_sink.h
+
+diff --git a/src/audio_core/CMakeLists.txt b/src/audio_core/CMakeLists.txt
+index 1393bd94a..9d8e21578 100644
+--- a/src/audio_core/CMakeLists.txt
++++ b/src/audio_core/CMakeLists.txt
+@@ -204,6 +204,8 @@ add_library(audio_core STATIC
+     renderer/voice/voice_info.cpp
+     renderer/voice/voice_info.h
+     renderer/voice/voice_state.h
++    sink/frontend_sink.cpp
++    sink/frontend_sink.h
+     sink/null_sink.h
+     sink/sink.h
+     sink/sink_details.cpp
+diff --git a/src/audio_core/sink/frontend_sink.cpp b/src/audio_core/sink/frontend_sink.cpp
+new file mode 100644
+index 000000000..45a92cc50
+--- /dev/null
++++ b/src/audio_core/sink/frontend_sink.cpp
+@@ -0,0 +1,156 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++
++#include "audio_core/common/common.h"
++#include "audio_core/sink/frontend_sink.h"
++#include "audio_core/sink/sink_stream.h"
++#include "common/logging.h"
++#include "common/thread.h"
++
++namespace AudioCore::Sink {
++
++namespace {
++
++std::mutex factory_mutex;
++FrontendAudioFactory frontend_factory;
++
++class FrontendSinkStream final : public SinkStream {
++public:
++    FrontendSinkStream(u32 device_channels_, u32 system_channels_, const std::string& name_,
++                       StreamType type_, Core::System& system_)
++        : SinkStream{system_, type_} {
++        device_channels = device_channels_;
++        system_channels = system_channels_;
++        name = name_;
++        if (type == StreamType::In) {
++            return; // no audio input
++        }
++        {
++            std::scoped_lock lk{factory_mutex};
++            if (frontend_factory) {
++                output = frontend_factory();
++            }
++        }
++        if (output && !output->Open(FrontendFramesPerBuffer, device_channels)) {
++            LOG_ERROR(Audio_Sink, "the frontend's audio output didn't open for stream {}", name);
++            output.reset();
++        }
++        if (output) {
++            thread = std::jthread([this](std::stop_token token) { Play(token); });
++        }
++    }
++
++    ~FrontendSinkStream() override {
++        Finalize();
++    }
++
++    void Finalize() override {
++        if (thread.joinable()) {
++            thread.request_stop();
++            start_cv.notify_all();
++            thread.join();
++        }
++        output.reset();
++    }
++
++    void Start(bool resume = false) override {
++        if (!paused) {
++            return;
++        }
++        {
++            std::scoped_lock lk{start_mutex};
++            paused = false;
++        }
++        start_cv.notify_all();
++    }
++
++    void Stop() override {
++        if (paused) {
++            return;
++        }
++        SignalPause();
++    }
++
++private:
++    void Play(std::stop_token token) {
++        Common::SetCurrentThreadName("FrontendAudio");
++        std::vector<s16> buffer(FrontendFramesPerBuffer * device_channels);
++        while (!token.stop_requested()) {
++            if (paused) {
++                std::unique_lock lk{start_mutex};
++                start_cv.wait(lk, token, [this] { return !paused.load(); });
++                continue;
++            }
++            ProcessAudioOutAndRender(buffer, FrontendFramesPerBuffer);
++            output->Output(buffer);
++        }
++    }
++
++    std::unique_ptr<FrontendAudioOutput> output;
++    std::mutex start_mutex;
++    std::condition_variable_any start_cv;
++    std::jthread thread;
++};
++
++} // Anonymous namespace
++
++void SetFrontendAudio(FrontendAudioFactory factory) {
++    std::scoped_lock lk{factory_mutex};
++    frontend_factory = std::move(factory);
++}
++
++bool HasFrontendAudio() {
++    std::scoped_lock lk{factory_mutex};
++    return static_cast<bool>(frontend_factory);
++}
++
++FrontendSink::FrontendSink(std::string_view) {
++    device_channels = 2;
++}
++
++FrontendSink::~FrontendSink() = default;
++
++SinkStream* FrontendSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
++                                            const std::string& name, StreamType type) {
++    system_channels = system_channels_;
++    SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<FrontendSinkStream>(
++        device_channels, system_channels, name, type, system));
++    stream->SetDeviceVolume(device_volume);
++    return stream.get();
++}
++
++void FrontendSink::CloseStream(SinkStream* stream) {
++    for (size_t i = 0; i < sink_streams.size(); i++) {
++        if (sink_streams[i].get() == stream) {
++            sink_streams.erase(sink_streams.begin() + i);
++            break;
++        }
++    }
++}
++
++void FrontendSink::CloseStreams() {
++    sink_streams.clear();
++}
++
++f32 FrontendSink::GetDeviceVolume() const {
++    return device_volume;
++}
++
++void FrontendSink::SetDeviceVolume(f32 volume) {
++    device_volume = volume;
++    for (auto& stream : sink_streams) {
++        stream->SetDeviceVolume(volume);
++    }
++}
++
++void FrontendSink::SetSystemVolume(f32 volume) {
++    for (auto& stream : sink_streams) {
++        stream->SetSystemVolume(volume);
++    }
++}
++
++} // namespace AudioCore::Sink
+diff --git a/src/audio_core/sink/frontend_sink.h b/src/audio_core/sink/frontend_sink.h
+new file mode 100644
+index 000000000..ee900befd
+--- /dev/null
++++ b/src/audio_core/sink/frontend_sink.h
+@@ -0,0 +1,56 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <functional>
++#include <memory>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "audio_core/sink/sink.h"
++#include "common/common_types.h"
++
++namespace AudioCore::Sink {
++
++/// An audio output a frontend provides, for platforms without cubeb or SDL: 48 kHz, signed 16-bit
++/// samples, channels interleaved.
++class FrontendAudioOutput {
++public:
++    virtual ~FrontendAudioOutput() = default;
++    /// Opens the output for buffers of `frames` frames of `channels` channels. False if it can't.
++    virtual bool Open(u32 frames, u32 channels) = 0;
++    /// Plays one buffer, blocking until the output takes it.
++    virtual void Output(std::span<const s16> samples) = 0;
++};
++
++/// Frames per buffer the frontend sink hands to an output: about 10 ms.
++constexpr u32 FrontendFramesPerBuffer = 512;
++
++using FrontendAudioFactory = std::function<std::unique_ptr<FrontendAudioOutput>()>;
++
++/// Sets what the frontend sink (AudioEngine::Frontend) plays through: one output per stream.
++void SetFrontendAudio(FrontendAudioFactory factory);
++bool HasFrontendAudio();
++
++/// A sink whose streams each play through a frontend's output, from a thread of their own.
++class FrontendSink final : public Sink {
++public:
++    explicit FrontendSink(std::string_view device_id);
++    ~FrontendSink() override;
++
++    SinkStream* AcquireSinkStream(Core::System& system, u32 system_channels,
++                                  const std::string& name, StreamType type) override;
++    void CloseStream(SinkStream* stream) override;
++    void CloseStreams() override;
++    f32 GetDeviceVolume() const override;
++    void SetDeviceVolume(f32 volume) override;
++    void SetSystemVolume(f32 volume) override;
++
++private:
++    std::vector<SinkStreamPtr> sink_streams;
++};
++
++} // namespace AudioCore::Sink
+diff --git a/src/audio_core/sink/sink_details.cpp b/src/audio_core/sink/sink_details.cpp
+index efd8fceb3..499a72d2e 100644
+--- a/src/audio_core/sink/sink_details.cpp
++++ b/src/audio_core/sink/sink_details.cpp
+@@ -16,6 +16,7 @@
+ #ifdef HAVE_SDL3
+ #include "audio_core/sink/sdl3_sink.h"
+ #endif
++#include "audio_core/sink/frontend_sink.h"
+ #include "audio_core/sink/null_sink.h"
+ #include "common/logging.h"
+ #include "common/settings_enums.h"
+@@ -62,6 +63,17 @@ constexpr SinkDetails sink_details[] = {
+         &GetSDLLatency,
+     },
+ #endif
++    SinkDetails{
++        Settings::AudioEngine::Frontend,
++        [](std::string_view device_id) -> std::unique_ptr<Sink> {
++            if (!HasFrontendAudio()) {
++                return std::make_unique<NullSink>(device_id);
++            }
++            return std::make_unique<FrontendSink>(device_id);
++        },
++        [](bool capture) { return std::vector<std::string>{"frontend"}; },
++        []() { return FrontendFramesPerBuffer; },
++    },
+     SinkDetails{
+         Settings::AudioEngine::Null,
+         [](std::string_view device_id) -> std::unique_ptr<Sink> {
+diff --git a/src/common/settings_enums.h b/src/common/settings_enums.h
+index eaf3ec541..f38cca532 100644
+--- a/src/common/settings_enums.h
++++ b/src/common/settings_enums.h
+@@ -92,7 +92,7 @@ struct EnumMetadata {
+ // AudioEngine must be specified discretely due to having existing but slightly different
+ // canonicalizations
+ // TODO (lat9nq): Remove explicit definition of AudioEngine/sink_id
+-enum class AudioEngine : u32 { Auto, Cubeb, Sdl3, Null, };
++enum class AudioEngine : u32 { Auto, Cubeb, Sdl3, Null, Frontend, };
+ template<>
+ inline std::vector<std::pair<std::string_view, AudioEngine>> EnumMetadata<AudioEngine>::Canonicalizations() {
+     return {
+@@ -100,6 +100,7 @@ inline std::vector<std::pair<std::string_view, AudioEngine>> EnumMetadata<AudioE
+         {"cubeb", AudioEngine::Cubeb},
+         {"sdl3", AudioEngine::Sdl3},
+         {"null", AudioEngine::Null},
++        {"frontend", AudioEngine::Frontend},
+     };
+ }
+ /// @brief This is just a sufficiently large number that is more than the number of other enums declared here
+@@ -113,7 +114,7 @@ inline AudioEngine EnumMetadata<AudioEngine>::GetFirst() {
+ }
+ template<>
+ inline AudioEngine EnumMetadata<AudioEngine>::GetLast() {
+-    return AudioEngine::Null;
++    return AudioEngine::Frontend;
+ }
+ 
+ ENUM(AudioMode, Mono, Stereo, Surround);

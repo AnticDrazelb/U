@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 05:55:39 +0000
+Subject: [PATCH] null renderer: one layer at its own size
+
+A frame with one layer, the usual case, goes to the frontend at the
+layer's size, without scaling it to 1280x720 first: the frontend scales it
+to its screen anyway, and on a slow CPU (the PS4's) scaling twice costs a
+few milliseconds a frame. With more layers, the source column of each
+pixel is computed once per layer instead of once per pixel.
+---
+ .../renderer_null/renderer_null.cpp           | 117 ++++++++++++------
+ src/video_core/renderer_null/renderer_null.h  |   4 +
+ 2 files changed, 86 insertions(+), 35 deletions(-)
+
+diff --git a/src/video_core/renderer_null/renderer_null.cpp b/src/video_core/renderer_null/renderer_null.cpp
+index 98dba975a..9ed87de13 100644
+--- a/src/video_core/renderer_null/renderer_null.cpp
++++ b/src/video_core/renderer_null/renderer_null.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <utility>
++#include <vector>
+ 
+ #include "core/frontend/emu_window.h"
+ #include "core/frontend/framebuffer_layout.h"
+@@ -74,43 +76,59 @@ void RendererNull::Composite(std::span<const Tegra::FramebufferConfig> framebuff
+ }
+ 
+ void RendererNull::ComposeSoftwareFrame(std::span<const Tegra::FramebufferConfig> framebuffers) {
+-    // The Switch's screen (handheld): layers are scaled to it, in order, bottom to top.
++    // The layers on the screen's stack, bottom to top.
++    std::vector<const Tegra::FramebufferConfig*> layers;
++    for (const auto& layer : framebuffers) {
++        if (layer.layer_stack_mask &
++            Service::Nvnflinger::LayerStackBit(Service::Nvnflinger::LayerStackId::Default)) {
++            layers.push_back(&layer);
++        }
++    }
++
++    // One layer, the usual case: its pixels at its own size (the frontend scales them to its
++    // screen, as the Switch's compositor scales a layer to the Switch's).
++    if (layers.size() == 1) {
++        Common::Rectangle<int> crop;
++        u32 bpp;
++        if (!ReadLayer(*layers[0], crop, bpp)) {
++            return;
++        }
++        const auto& layer = *layers[0];
++        const u32 width = u32(crop.GetWidth()), height = u32(crop.GetHeight());
++        const auto [flip_h, flip_v] = Flips(layer);
++        m_frame.resize(size_t(width) * height);
++        for (u32 y = 0; y < height; y++) {
++            const int sy = flip_v ? crop.bottom - 1 - int(y) : crop.top + int(y);
++            const u8* row = m_linear.data() + size_t(sy) * layer.width * bpp;
++            u32* out = m_frame.data() + size_t(y) * width;
++            for (u32 x = 0; x < width; x++) {
++                const int sx = flip_h ? crop.right - 1 - int(x) : crop.left + int(x);
++                out[x] = Blend(0xFF000000u, ToRgba(row + size_t(sx) * bpp, layer.pixel_format),
++                               layer.blending);
++            }
++        }
++        render_window.OnSoftwareFrame(m_frame, width, height);
++        return;
++    }
++
++    // More: each scaled to the Switch's screen (handheld) and blended over the ones below.
+     constexpr u32 width = Layout::ScreenUndocked::Width;
+     constexpr u32 height = Layout::ScreenUndocked::Height;
+     m_frame.assign(size_t(width) * height, 0xFF000000u);
+-
+-    for (const auto& layer : framebuffers) {
+-        if (!(layer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
+-                                           Service::Nvnflinger::LayerStackId::Default))) {
++    std::vector<u32> x_map(width);
++    for (const auto* layer_ptr : layers) {
++        Common::Rectangle<int> crop;
++        u32 bpp;
++        if (!ReadLayer(*layer_ptr, crop, bpp)) {
+             continue;
+         }
+-        using namespace VideoCore::Surface;
+-        const u32 bpp = BytesPerBlock(PixelFormatFromGPUPixelFormat(layer.pixel_format));
+-        const u8* const tiled = m_device_memory.GetPointer<u8>(layer.address + layer.offset);
+-        if (!tiled || layer.width == 0 || layer.height == 0 || bpp == 0) {
+-            continue;
+-        }
+-        // Block linear, as the Vulkan presenter reads it (block height 16 GOBs).
+-        constexpr u32 block_height_log2 = 4;
+-        const u64 tiled_size = Tegra::Texture::CalculateSize(true, bpp, layer.stride, layer.height,
+-                                                             1, block_height_log2, 0);
+-        m_linear.resize(size_t(layer.width) * layer.height * bpp);
+-        Tegra::Texture::UnswizzleTexture(m_linear, std::span(tiled, tiled_size), bpp, layer.width,
+-                                         layer.height, 1, block_height_log2, 0);
+-
+-        Common::Rectangle<int> crop = layer.crop_rect;
+-        if (crop.GetWidth() <= 0 || crop.GetHeight() <= 0) {
+-            crop = {0, 0, int(layer.width), int(layer.height)};
+-        }
+-        crop.right = std::min<int>(crop.right, int(layer.width));
+-        crop.bottom = std::min<int>(crop.bottom, int(layer.height));
++        const auto& layer = *layer_ptr;
+         const int crop_w = crop.GetWidth(), crop_h = crop.GetHeight();
+-        if (crop_w <= 0 || crop_h <= 0) {
+-            continue;
++        const auto [flip_h, flip_v] = Flips(layer);
++        for (u32 x = 0; x < width; x++) {
++            const int sx = crop.left + int(u64(x) * crop_w / width);
++            x_map[x] = u32(flip_h ? crop.right - 1 - (sx - crop.left) : sx) * bpp;
+         }
+-        const auto flags = static_cast<u32>(layer.transform_flags);
+-        const bool flip_h = flags & static_cast<u32>(Service::android::BufferTransformFlags::FlipH);
+-        const bool flip_v = flags & static_cast<u32>(Service::android::BufferTransformFlags::FlipV);
+         for (u32 y = 0; y < height; y++) {
+             int sy = crop.top + int(u64(y) * crop_h / height);
+             if (flip_v) {
+@@ -119,17 +137,46 @@ void RendererNull::ComposeSoftwareFrame(std::span<const Tegra::FramebufferConfig
+             const u8* row = m_linear.data() + size_t(sy) * layer.width * bpp;
+             u32* out = m_frame.data() + size_t(y) * width;
+             for (u32 x = 0; x < width; x++) {
+-                int sx = crop.left + int(u64(x) * crop_w / width);
+-                if (flip_h) {
+-                    sx = crop.right - 1 - (sx - crop.left);
+-                }
+-                out[x] = Blend(out[x], ToRgba(row + size_t(sx) * bpp, layer.pixel_format), layer.blending);
++                out[x] = Blend(out[x], ToRgba(row + x_map[x], layer.pixel_format), layer.blending);
+             }
+         }
+     }
+     render_window.OnSoftwareFrame(m_frame, width, height);
+ }
+ 
++bool RendererNull::ReadLayer(const Tegra::FramebufferConfig& layer, Common::Rectangle<int>& crop,
++                             u32& bpp) {
++    using namespace VideoCore::Surface;
++    bpp = BytesPerBlock(PixelFormatFromGPUPixelFormat(layer.pixel_format));
++    const u8* const tiled = m_device_memory.GetPointer<u8>(layer.address + layer.offset);
++    if (!tiled || layer.width == 0 || layer.height == 0 || bpp == 0) {
++        return false;
++    }
++    // Block linear, as the Vulkan presenter reads it (block height 16 GOBs).
++    constexpr u32 block_height_log2 = 4;
++    const u64 tiled_size = Tegra::Texture::CalculateSize(true, bpp, layer.stride, layer.height, 1,
++                                                         block_height_log2, 0);
++    m_linear.resize(size_t(layer.width) * layer.height * bpp);
++    Tegra::Texture::UnswizzleTexture(m_linear, std::span(tiled, tiled_size), bpp, layer.width,
++                                     layer.height, 1, block_height_log2, 0);
++
++    crop = layer.crop_rect;
++    if (crop.GetWidth() <= 0 || crop.GetHeight() <= 0) {
++        crop = {0, 0, int(layer.width), int(layer.height)};
++    }
++    crop.left = std::max(crop.left, 0);
++    crop.top = std::max(crop.top, 0);
++    crop.right = std::min<int>(crop.right, int(layer.width));
++    crop.bottom = std::min<int>(crop.bottom, int(layer.height));
++    return crop.GetWidth() > 0 && crop.GetHeight() > 0;
++}
++
++std::pair<bool, bool> RendererNull::Flips(const Tegra::FramebufferConfig& layer) {
++    const auto flags = static_cast<u32>(layer.transform_flags);
++    return {(flags & static_cast<u32>(Service::android::BufferTransformFlags::FlipH)) != 0,
++            (flags & static_cast<u32>(Service::android::BufferTransformFlags::FlipV)) != 0};
++}
++
+ std::vector<u8> RendererNull::GetAppletCaptureBuffer() {
+     return std::vector<u8>(VideoCore::Capture::TiledSize);
+ }
+diff --git a/src/video_core/renderer_null/renderer_null.h b/src/video_core/renderer_null/renderer_null.h
+index ef1705554..e36e241b7 100644
+--- a/src/video_core/renderer_null/renderer_null.h
++++ b/src/video_core/renderer_null/renderer_null.h
+@@ -5,6 +5,7 @@
+ 
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+@@ -36,6 +37,9 @@ private:
+     /// Composes the layers on the CPU (as the Vulkan presenter's fallback reads framebuffers
+     /// drawn by the CPU) and hands the frame to the window.
+     void ComposeSoftwareFrame(std::span<const Tegra::FramebufferConfig> framebuffers);
++    /// Unswizzles a layer's buffer into m_linear; its crop, within the buffer, and bytes per pixel.
++    bool ReadLayer(const Tegra::FramebufferConfig& layer, Common::Rectangle<int>& crop, u32& bpp);
++    static std::pair<bool, bool> Flips(const Tegra::FramebufferConfig& layer); // H, V
+ 
+     Tegra::MaxwellDeviceMemoryManager& m_device_memory;
+     Tegra::GPU& m_gpu;

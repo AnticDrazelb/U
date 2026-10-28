@@ -30,7 +30,7 @@ if (PS4)
     add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp ${EDEN_PS4_RUNTIME_SOURCES})
     target_compile_definitions(eden-ps4 PRIVATE EDEN_PS4_VERSION="${EDEN_PS4_VERSION}")
     target_link_libraries(eden-ps4 PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut
-        ScePad SceNet
+        SceAudioOut ScePad SceNet
         # the runtime's network file system wraps (port/ps4_netfs.cpp)
         ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a)
     # the runtime's __real_gethostbyname: LLD 12's --wrap doesn't fetch libc.a's gethostbyname for

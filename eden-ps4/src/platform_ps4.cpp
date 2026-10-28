@@ -12,12 +12,12 @@
 //
 // The screen, controller and start page are switch-bench's (../../switch-bench/src/platform_ps4.cpp).
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <atomic>
 #include <mutex>
 #include <span>
 #include <string>
@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <fmt/format.h>
+#include <orbis/AudioOut.h>
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
 #include <orbis/VideoOut.h>
@@ -46,6 +47,9 @@ int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t 
 int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
 int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 int32_t sceSysmoduleLoadModuleInternal(uint32_t id);
+void* scePthreadSelf(void);
+int32_t scePthreadSetaffinity(void* thread, uint64_t cpus);
+int32_t scePthreadSetprio(void* thread, int32_t priority);
 // port/ps4_crashlog.cpp: a line in /data/eden-ps4/boot-trace.log
 void ps4_boot_trace(const char* stage);
 }
@@ -466,6 +470,60 @@ Launcher::PadState ToSwitchPad(const OrbisPadData& pad)
     return state;
 }
 
+// Sound: an AudioOut port for each stream Eden opens, the system user's main port (as Crema's).
+class Ps4AudioOutput final : public Launcher::AudioOutput {
+public:
+    ~Ps4AudioOutput() override
+    {
+        if (port >= 0)
+        {
+            sceAudioOutOutput(port, nullptr); // the last buffer plays out
+            sceAudioOutClose(port);
+        }
+    }
+
+    bool Open(uint32_t frames, uint32_t channels) override
+    {
+        if (channels != 2)
+            return false;
+        // 0x8026000E: already initialized
+        static const int32_t init = sceAudioOutInit();
+        if (init != 0 && init != int32_t(0x8026000E))
+        {
+            Trace(fmt::format("audio: sceAudioOutInit = {:#x}", uint32_t(init)));
+            return false;
+        }
+        port = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, frames, 48000,
+                               ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        Trace(fmt::format("audio: sceAudioOutOpen({} frames) = {:#x}", frames, uint32_t(port)));
+        return port >= 0;
+    }
+
+    void Output(std::span<const int16_t> samples) override
+    {
+        if (!thread_set)
+        {
+            // Eden's audio thread was made by one of its own, whose cores and priority it has: any
+            // of the app's cores, and a priority above the emulation's so that a busy frame doesn't
+            // make the sound crackle (as Crema's audio thread).
+            thread_set = true;
+            void* self = scePthreadSelf();
+            scePthreadSetaffinity(self, 0x3F);
+            scePthreadSetprio(self, 400);
+        }
+        sceAudioOutOutput(port, samples.data()); // blocks until the previous buffer plays: the pace
+    }
+
+private:
+    int32_t port = -1;
+    bool thread_set = false;
+};
+
+std::unique_ptr<Launcher::AudioOutput> MakeAudioOutput()
+{
+    return std::make_unique<Ps4AudioOutput>();
+}
+
 // While a program runs: the pad, read every 4 ms, as player 1's controller.
 std::atomic<bool> g_running{false};
 void* PadThread(void*)
@@ -634,6 +692,7 @@ void* Run(void*)
     // Eden finds its data under $HOME when no folder is given, and a few paths it always takes
     // from there: keep them in the app's folder.
     setenv("HOME", kDataDir, 1);
+    Launcher::SetAudio(MakeAudioOutput);
     for (bool first = true;; first = false)
     {
         const std::string program = StartPage(first);

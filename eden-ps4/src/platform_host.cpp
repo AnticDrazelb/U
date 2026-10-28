@@ -9,9 +9,13 @@
 //   EDEN_PS4_INPUT=<script> player 1's buttons over time: "<seconds>:<buttons>,..." with the
 //                           buttons joined by '+' (A B X Y L R ZL ZR Plus Minus Left Up Right
 //                           Down LStick RStick) or none, e.g. "3:A,3.2:,5:Right+B,6:"
+//   EDEN_PS4_AUDIO=<file>   records the sound to a WAV file, in real time (a second stream Eden
+//                           opens goes to <file>.2.wav, and so on)
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
@@ -126,6 +130,73 @@ void PlayInput(std::string script, std::atomic<bool>* done) {
     }
 }
 
+// EDEN_PS4_AUDIO: a WAV file per output, written at the pace a sound card would take it.
+std::string g_audio_path;
+std::atomic<int> g_audio_outputs{0};
+
+class WavOutput final : public Launcher::AudioOutput {
+public:
+    ~WavOutput() override {
+        if (file) {
+            WriteHeader();
+            std::fclose(file);
+        }
+    }
+    bool Open(uint32_t frames_, uint32_t channels_) override {
+        const int n = ++g_audio_outputs;
+        const std::string path = n == 1 ? g_audio_path : g_audio_path + "." + std::to_string(n) + ".wav";
+        file = std::fopen(path.c_str(), "wb");
+        if (!file) {
+            return false;
+        }
+        frames = frames_;
+        channels = channels_;
+        WriteHeader();
+        next = std::chrono::steady_clock::now();
+        return true;
+    }
+    void Output(std::span<const int16_t> samples) override {
+        std::fwrite(samples.data(), sizeof(int16_t), samples.size(), file);
+        data_bytes += uint32_t(samples.size() * sizeof(int16_t));
+        if (++buffers % 100 == 0) {
+            WriteHeader(); // a file that's complete so far, should the run be cut short
+        }
+        next += std::chrono::microseconds(uint64_t(frames) * 1'000'000 / 48'000);
+        std::this_thread::sleep_until(next);
+    }
+
+private:
+    void WriteHeader() {
+        const long at = std::ftell(file);
+        std::fseek(file, 0, SEEK_SET);
+        unsigned char h[44];
+        const auto put32 = [&](int o, uint32_t v) { std::memcpy(h + o, &v, 4); };
+        const auto put16 = [&](int o, uint16_t v) { std::memcpy(h + o, &v, 2); };
+        std::memcpy(h, "RIFF", 4);
+        put32(4, 36 + data_bytes);
+        std::memcpy(h + 8, "WAVEfmt ", 8);
+        put32(16, 16);
+        put16(20, 1); // PCM
+        put16(22, uint16_t(channels));
+        put32(24, 48'000);
+        put32(28, 48'000 * channels * 2);
+        put16(32, uint16_t(channels * 2));
+        put16(34, 16);
+        std::memcpy(h + 36, "data", 4);
+        put32(40, data_bytes);
+        std::fwrite(h, 1, sizeof(h), file);
+        std::fseek(file, at > 44 ? at : 44, SEEK_SET);
+    }
+
+    FILE* file = nullptr;
+    uint32_t frames = 0, channels = 2, data_bytes = 0, buffers = 0;
+    std::chrono::steady_clock::time_point next;
+};
+
+std::unique_ptr<Launcher::AudioOutput> MakeWavOutput() {
+    return std::make_unique<WavOutput>();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -154,6 +225,10 @@ int main(int argc, char** argv) {
         g_frames_dir = env;
         std::filesystem::create_directories(g_frames_dir);
         frames = SaveFrame;
+    }
+    if (const char* env = std::getenv("EDEN_PS4_AUDIO")) {
+        g_audio_path = env;
+        Launcher::SetAudio(MakeWavOutput);
     }
     std::atomic<bool> done{false};
     std::thread input;

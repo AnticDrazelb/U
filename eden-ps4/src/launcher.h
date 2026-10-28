@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -53,6 +54,20 @@ struct PadState {
 };
 /// Sets player 1's controller state. Any thread; ignored while no program runs.
 void SetPad(const PadState& state);
+
+/// A sound output: 48 kHz, signed 16-bit samples, channels interleaved.
+class AudioOutput {
+public:
+    virtual ~AudioOutput() = default;
+    /// Opens the output for buffers of `frames` frames of `channels` channels. False if it can't.
+    virtual bool Open(uint32_t frames, uint32_t channels) = 0;
+    /// Plays one buffer, blocking until the output takes it. Always called from the same thread.
+    virtual void Output(std::span<const int16_t> samples) = 0;
+};
+using AudioFactory = std::unique_ptr<AudioOutput> (*)();
+/// Where programs' sound goes: one output for each stream Eden opens (null: no sound). Set it
+/// before Boot.
+void SetAudio(AudioFactory factory);
 
 struct BootResult {
     enum class Status {

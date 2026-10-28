@@ -1,10 +1,46 @@
-# Eden for PS4: stage 2, Eden's core booting a Switch program
+# Eden for PS4: stage 3, a Switch game playable
 
 Stage 1 ([switch-bench](../switch-bench/README.md), results in
 [RESULTS.md](../switch-bench/RESULTS.md)) measured Eden's recompiler and the memory a PS4 can give
-it. Stage 2 runs Eden's actual Switch core on the PS4: the kernel, the scheduler and the four
-emulated CPU cores, the HLE services, the loader. It runs a Switch program that writes text, with no
-graphics or audio yet.
+it. Stage 2 ran Eden's actual Switch core on the PS4: the kernel, the scheduler and the four
+emulated CPU cores, the HLE services, the loader, with a Switch program that writes text. Stage 3
+plays a game: a Switch homebrew game's picture on the screen, the PS4 controller as the Switch's,
+and its sound.
+
+## Stage 3: Breakout
+
+`game/breakout.c` is a small Switch game, written for this: Breakout at 640x360, drawn by the CPU
+into a libnx framebuffer (no GPU commands), with the controller read through HID and beeps played
+through `audout`. It's built with libnx, the Switch homebrew library, compiled with clang (below).
+In the package as `breakout.nro`: X on the start page.
+
+![Breakout in shadPS4](screenshots/breakout-shadps4.png)
+
+What runs it:
+
+- **Picture.** A Switch program shows a frame by queueing a buffer to the display service (VI),
+  whose compositor (nvnflinger) hands its layers to the renderer. Eden's null renderer threw them
+  away; patch 0008 has it compose them on the CPU instead, for a frontend that asks for frames
+  (`EmuWindow::WantsSoftwareFrames`): each layer's buffer read from emulated memory,
+  unswizzled from the GPU's block-linear layout, converted to RGBA (RGBA8, RGBX8, BGRA8 and RGB565),
+  cropped, flipped and blended as the compositor asks. A frame of one layer, the usual case, goes
+  to the launcher at its own size (Breakout's: 640x360), more layers scaled to 1280x720 and
+  blended. The launcher scales it to 1920x1080 into the video-out buffers. A game that draws with the GPU (NVN, Vulkan, OpenGL)
+  shows nothing: its buffers hold whatever the GPU would have drawn, and there's no GPU emulation.
+- **Controller.** The PS4 pad, read every 4 ms, is player 1's Pro Controller, through Eden's virtual
+  gamepad input engine (`Launcher::SetPad`). By the PS4's conventions: Cross is A, Circle B, Square
+  Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -, and both sticks.
+- **Sound.** Patch 0009 adds a frontend sink to Eden's audio (`AudioEngine::Frontend`): each audio
+  stream a program opens (`audout`, `audren`) plays through an output the frontend gives it, from a
+  thread of its own, in 512-frame buffers. On the PS4 that's an AudioOut port (the system user's
+  main port, 48 kHz stereo, as Crema's audio), on a thread raised above the emulation's priority.
+  On the desktop, `EDEN_PS4_AUDIO=<file.wav>` records it.
+
+In shadPS4, Breakout runs at 28 to 30 frames per second (61 on the desktop build): the start page,
+X, the game; the pad's X launches the ball, the stick moves the paddle, OPTIONS quits back to the
+start page. It hasn't run on a console yet.
+
+The test program from stage 2 (`hello.nro`) is still in the package: TRIANGLE.
 
 The first program is `hello/`, a small Switch homebrew program built by hand (no libnx). It checks
 what a game needs first and prints the results through the Switch kernel's debug output call
@@ -42,22 +78,32 @@ servers, so that client opens no socket.
 
 `out/EdenPS4.pkg` (title ID EDNP00001, version in `VERSION`). It opens on a start page:
 
-- **X** boots the test program (`hello.nro`, in the package).
-- **SQUARE** boots `/data/eden-ps4/boot.nro`, if there is one. A text-only program might work; one
-  that draws won't, as there's no GPU yet.
+- **X** boots Breakout (`breakout.nro`, in the package). In the game: left stick or D-pad to move,
+  X to launch the ball, OPTIONS to quit.
+- **TRIANGLE** boots the test program (`hello.nro`, in the package).
+- **SQUARE** boots `/data/eden-ps4/boot.nro`, if there is one. A homebrew program that draws with
+  the CPU (libnx's framebuffer, as Breakout) can work; one that draws with the GPU shows nothing.
 
-Without a controller, the test program boots after a countdown. If the last run didn't finish, the
+When the program ends, the start page comes back. Without a controller, the test program boots
+after a countdown. If the last run didn't finish, the
 page first shows what that run left behind: the end of its output (`log.txt`), its crash report
 (`crash.log`) and the last steps of its boot trace. With a controller connected, it then waits for
 a button, so a photo of it can come first. Stack addresses are ELF addresses: symbolize them with
 `llvm-symbolizer --obj=<that build's ELF> 0x...`. `build.sh ps4` keeps every build's ELF in
 `~/eden-ps4-elves`.
 
-The program's output and Eden's warnings and errors go on screen and to `/data/eden-ps4/log.txt`.
+Until the program draws, its output and Eden's warnings and errors are on screen; they always go to
+`/data/eden-ps4/log.txt`.
 Eden's data folders (NAND, SD card, keys) are in `/data/eden-ps4/user`. Nothing is written outside
 `/data/eden-ps4`.
 
 ## Testing in shadPS4
+
+With 02.00 (Breakout): the start page, X (shadPS4's keyboard: N), the game's first frame 4 s later;
+X launched the ball, the paddle followed the stick (D), OPTIONS (Enter) quit to the start page.
+shadPS4 has no sound here (no audio device), so the sound is tested on the desktop: there the WAV
+file has Breakout's beeps, each at its pitch and length (the ball's launch 660 Hz for 60 ms, a
+brick about 1 kHz, a wall 330 Hz, a lost ball 160 Hz for 250 ms), in real time.
 
 As for stage 1 (see [its README](../switch-bench/README.md#testing-in-shadps4) for building
 shadPS4 and running it headless): the PKG's staging folder `~/eden-ps4-build/stage` without
@@ -86,6 +132,9 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | page table sign bit 55 | stage 1's finding: Eden's 57 is cleared by its own mask |
 | PS4 memory | below |
 | PS4 build | compile fixes: the PS4's compiler defines `__FreeBSD__`, but it lacks some FreeBSD headers and calls |
+| null renderer: frames for frontends without a GPU renderer | stage 3's picture, above |
+| audio: a frontend sink | stage 3's sound, above |
+| null renderer: one layer at its own size | a frame with one layer (the usual case) isn't scaled to 1280x720 on its way to the frontend, which scales it anyway |
 
 The PS4 memory changes, from what stage 1 measured:
 
@@ -116,7 +165,8 @@ Needs:
 - CMake 3.31 or newer (`CMAKE=/path/to/cmake` if it isn't the one on `PATH`)
 - Crema's PS4 toolchain and sysroot (`docs/BUILDING.md`; `toolchain/build-sdk.sh` builds its
   section 2) for the PS4 build
-- clang 21 and lld for the test program
+- clang 21 and lld for the test program and the game, and for the game libnx built with clang
+  (`nx/build.sh`)
 
 ```
 eden-ps4/fetch-deps.sh                # Eden's dependencies, as git clones, into ~/eden-deps
@@ -124,7 +174,20 @@ eden-ps4/build-ffmpeg.sh              # FFmpeg for the PS4 (the PS4 build only)
 EDEN_DIR=~/eden eden-ps4/build.sh host    # desktop: ~/eden-host/bin/eden-ps4 <program.nro>
 EDEN_DIR=~/eden eden-ps4/build.sh ps4     # out/EdenPS4.pkg
 eden-ps4/hello/build.sh               # hello.nro on its own
+eden-ps4/nx/build.sh                  # libnx and its toolchain, with clang, into ~/nx/devkitpro
+eden-ps4/game/build.sh                # breakout.nro on its own (build.sh ps4 builds it too)
 ```
+
+`nx/build.sh` builds what devkitPro's packages would give (their servers are blocked in some build
+environments; GitHub's git isn't): devkitPro's newlib, libnx, compiler-rt's builtins (libgcc's
+part), and elf2nro and nacptool, at pinned commits. clang stands in for devkitA64's gcc, under its
+names. libnx needs a few changes for clang (`nx/libnx-clang.patch`): the thread pointer is
+`tpidr_el0` written directly (clang has no `-mtp=soft`), the C11 atomics on plain variables go
+through `__atomic` builtins (`clang_atomics.h`, force-included), three structures that end in
+variable-length arrays (a GCC extension) are a fixed array or left out (the GPU channel submits,
+which a CPU-drawn program doesn't use), and a weak symbol isn't also made global. lld needs the
+linker script to give TLS a program header (`switch_clang.ld`). Its steps are the ones that built
+this machine's toolchain, by hand; the script as a whole hasn't been run from scratch.
 
 `fetch-deps.sh` clones what Eden's CPM would download as GitHub archives (blocked in some build
 environments), at the versions Eden pins, and applies Eden's patches for them. Boost and the time
@@ -140,4 +203,10 @@ at a Crema build's ELF: the consoles run Crema's, so every import must be one of
 checks; see its README).
 
 On the desktop, `EDEN_PS4_DATA` sets the data folder (default: a new temporary folder) and
-`EDEN_PS4_TIMEOUT` how long a program may run (default 60 s).
+`EDEN_PS4_TIMEOUT` how long a program may run (default 60 s). For a program that draws, plays sound
+and reads the controller, without a screen, speakers or a controller:
+
+- `EDEN_PS4_FRAMES=<dir>` saves its frames as PPM images: the first, one a second, and the last
+- `EDEN_PS4_AUDIO=<file.wav>` records its sound
+- `EDEN_PS4_INPUT="<seconds>:<buttons>,..."` presses player 1's buttons, e.g. `"3:A,3.2:,5:Right,6:"`
+- `EDEN_PS4_LOG=<filter>` sets Eden's log filter, e.g. `"*:Info Service.VI:Debug"`

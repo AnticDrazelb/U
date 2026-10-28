@@ -1,5 +1,6 @@
 // The Eden PS4 launcher's core: boots a Switch program in Eden's core (kernel, scheduler, CPU
-// cores, HLE services, loader) with no GPU or audio: the null renderer and the null audio sink.
+// cores, HLE services, loader) with no GPU: the null renderer, whose frames (composed on the CPU)
+// go to the platform. Sound goes to the platform's output through Eden's frontend sink.
 // What the program prints, and Eden's warnings and errors, go to the platform's sink and to
 // log.txt.
 
@@ -12,6 +13,7 @@
 
 #include <fmt/format.h>
 
+#include "audio_core/sink/frontend_sink.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -100,7 +102,8 @@ void ApplyLauncherSettings() {
     const char* filter = std::getenv("EDEN_PS4_LOG");
     Settings::values.log_filter = filter ? filter : "*:Warning Debug.Emulated:Info";
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Null);
-    Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
+    Settings::values.sink_id.SetValue(AudioCore::Sink::HasFrontendAudio() ? Settings::AudioEngine::Frontend
+                                                                           : Settings::AudioEngine::Null);
     Settings::values.use_disk_shader_cache.SetValue(false);
     // No Cemuhook (UDP) controller servers: their client would open a host socket at start,
     // for controllers this launcher doesn't use.
@@ -162,6 +165,36 @@ void SetPad(const PadState& state) {
         g_gamepad->SetStickPosition(0, Stick::Right, state.rx, state.ry);
     }
     g_pad_state = state;
+}
+
+namespace {
+class AudioAdapter final : public AudioCore::Sink::FrontendAudioOutput {
+public:
+    explicit AudioAdapter(std::unique_ptr<AudioOutput> output_) : output{std::move(output_)} {}
+    bool Open(u32 frames, u32 channels) override {
+        return output->Open(frames, channels);
+    }
+    void Output(std::span<const s16> samples) override {
+        output->Output(samples);
+    }
+
+private:
+    std::unique_ptr<AudioOutput> output;
+};
+} // namespace
+
+void SetAudio(AudioFactory factory) {
+    if (!factory) {
+        AudioCore::Sink::SetFrontendAudio(nullptr);
+        return;
+    }
+    AudioCore::Sink::SetFrontendAudio([factory]() -> std::unique_ptr<AudioCore::Sink::FrontendAudioOutput> {
+        std::unique_ptr<AudioOutput> output = factory();
+        if (!output) {
+            return nullptr;
+        }
+        return std::make_unique<AudioAdapter>(std::move(output));
+    });
 }
 
 BootResult Boot(const std::filesystem::path& program, const std::filesystem::path& data_dir,

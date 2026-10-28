@@ -1,0 +1,242 @@
+diff --git a/nx/source/display/buffer_producer.c b/nx/source/display/buffer_producer.c
+index c74458e..4188065 100644
+--- a/nx/source/display/buffer_producer.c
++++ b/nx/source/display/buffer_producer.c
+@@ -254,37 +254,27 @@ Result bqSetPreallocatedBuffer(Binder *b, s32 buf, const BqGraphicBuffer *input)
+ 
+     parcelWriteInt32(&parcel, hasInput);
+     if (hasInput) {
+-        struct {
+-            u32 magic;
+-            u32 width;
+-            u32 height;
+-            u32 stride;
+-            u32 format;
+-            u32 usage;
+-
+-            u32 pid;
+-            u32 refcount;
+-
+-            u32 numFds;
+-            u32 numInts;
+-
+-            u32 ints[input->native_handle->num_ints];
+-        } buf;
+-
+-        // Serialize the buffer
+-        buf.magic = 0x47424652; // GBFR (Graphic Buffer)
+-        buf.width = input->width;
+-        buf.height = input->height;
+-        buf.stride = input->stride;
+-        buf.format = input->format;
+-        buf.usage = input->usage;
+-        buf.pid = 42; // Official sw sets this to the value of getpid(), which is hardcoded to return 42.
+-        buf.refcount = 0; // Official sw sets this to the output of android_atomic_inc(). We instead don't care and set it to zero since it is ignored during marshalling.
+-        buf.numFds = 0;
+-        buf.numInts = input->native_handle->num_ints;
+-        memcpy(buf.ints, input->native_handle+1, sizeof(buf.ints));
+-
+-        parcelWriteFlattenedObject(&parcel, &buf, sizeof(buf));
++        // The flattened GraphicBuffer: a header of 10 words, then the native handle's ints. (A
++        // fixed array rather than a structure ending in a variable-length array, which only GCC
++        // accepts.)
++        enum { HeaderWords = 10, MaxInts = 0x100 };
++        const u32 num_ints = input->native_handle->num_ints;
++        if (num_ints > MaxInts)
++            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
++        u32 buf[HeaderWords + MaxInts];
++        buf[0] = 0x47424652; // GBFR (Graphic Buffer)
++        buf[1] = input->width;
++        buf[2] = input->height;
++        buf[3] = input->stride;
++        buf[4] = input->format;
++        buf[5] = input->usage;
++        buf[6] = 42; // pid: official sw sets this to the value of getpid(), which is hardcoded to return 42.
++        buf[7] = 0; // refcount: official sw sets this to the output of android_atomic_inc(); ignored during marshalling.
++        buf[8] = 0; // numFds
++        buf[9] = num_ints;
++        memcpy(&buf[HeaderWords], input->native_handle+1, num_ints * sizeof(u32));
++
++        parcelWriteFlattenedObject(&parcel, buf, (HeaderWords + num_ints) * sizeof(u32));
+     }
+ 
+     rc = parcelTransact(b, SET_PREALLOCATED_BUFFER, &parcel, &parcel_reply);
+diff --git a/nx/source/kernel/thread.c b/nx/source/kernel/thread.c
+index e35879c..70b9885 100644
+--- a/nx/source/kernel/thread.c
++++ b/nx/source/kernel/thread.c
+@@ -41,6 +41,10 @@ static void _EntryWrap(ThreadEntryArgs* args) {
+     tv->thread_ptr = args->t;
+     tv->reent      = args->reent;
+     tv->tls_tp     = (u8*)args->tls-getTlsStartOffset();
++#ifdef __clang__
++    // clang has no -mtp=soft (__aarch64_read_tp): its TLS accesses read tpidr_el0
++    __asm__ volatile("msr tpidr_el0, %0" :: "r"(tv->tls_tp));
++#endif
+     tv->handle     = args->t->handle;
+ 
+     // Initialize thread info
+diff --git a/nx/source/nvidia/ioctl/nvchannel.c b/nx/source/nvidia/ioctl/nvchannel.c
+index e29358e..623d2bd 100644
+--- a/nx/source/nvidia/ioctl/nvchannel.c
++++ b/nx/source/nvidia/ioctl/nvchannel.c
+@@ -17,6 +17,10 @@ Result nvioctlChannel_SetNvmapFd(u32 fd, u32 nvmap_fd) {
+ }
+ 
+ Result nvioctlChannel_SubmitGpfifo(u32 fd, nvioctl_gpfifo_entry *entries, u32 num_entries, u32 flags, nvioctl_fence *fence_inout) {
++#ifdef __clang__
++    // libnx built with clang: no variable-length arrays in structures (a GCC extension)
++    return MAKERESULT(Module_Kernel, KernelError_NotImplemented);
++#else
+     Result rc=0;
+ 
+     // Make sure stack data doesn't get very large.
+@@ -45,6 +49,7 @@ Result nvioctlChannel_SubmitGpfifo(u32 fd, nvioctl_gpfifo_entry *entries, u32 nu
+     }
+ 
+     return rc;
++#endif
+ }
+ 
+ Result nvioctlChannel_KickoffPb(u32 fd, nvioctl_gpfifo_entry *entries, u32 num_entries, u32 flags, nvioctl_fence *fence_inout) {
+@@ -199,6 +204,10 @@ Result nvioctlChannel_SetUserData(u32 fd, void* addr) {
+ 
+ Result nvioctlChannel_Submit(u32 fd, const nvioctl_cmdbuf *cmdbufs, u32 num_cmdbufs, const nvioctl_reloc *relocs, const nvioctl_reloc_shift *reloc_shifts, u32 num_relocs,
+         const nvioctl_syncpt_incr *syncpt_incrs, u32 num_syncpt_incrs, nvioctl_fence *fences, u32 num_fences) {
++#ifdef __clang__
++    // libnx built with clang: no variable-length arrays in structures (a GCC extension)
++    return MAKERESULT(Module_Kernel, KernelError_NotImplemented);
++#else
+     // Make sure stack data doesn't get very large
+     if (num_cmdbufs + num_relocs + num_syncpt_incrs + num_fences > 0x200)
+         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+@@ -237,6 +246,7 @@ Result nvioctlChannel_Submit(u32 fd, const nvioctl_cmdbuf *cmdbufs, u32 num_cmdb
+     }
+ 
+     return rc;
++#endif
+ }
+ 
+ Result nvioctlChannel_GetSyncpt(u32 fd, u32 id, u32 *syncpt) {
+@@ -289,6 +299,10 @@ Result nvioctlChannel_SetSubmitTimeout(u32 fd, u32 timeout) {
+ }
+ 
+ Result nvioctlChannel_MapCommandBuffer(u32 fd, nvioctl_command_buffer_map *maps, u32 num_maps, bool compressed) {
++#ifdef __clang__
++    // libnx built with clang: no variable-length arrays in structures (a GCC extension)
++    return MAKERESULT(Module_Kernel, KernelError_NotImplemented);
++#else
+     if (num_maps > 0x200)
+         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+ 
+@@ -310,9 +324,14 @@ Result nvioctlChannel_MapCommandBuffer(u32 fd, nvioctl_command_buffer_map *maps,
+         memcpy(maps, data.maps, num_maps * sizeof(nvioctl_command_buffer_map));
+ 
+     return rc;
++#endif
+ }
+ 
+ Result nvioctlChannel_UnmapCommandBuffer(u32 fd, const nvioctl_command_buffer_map *maps, u32 num_maps, bool compressed) {
++#ifdef __clang__
++    // libnx built with clang: no variable-length arrays in structures (a GCC extension)
++    return MAKERESULT(Module_Kernel, KernelError_NotImplemented);
++#else
+     if (num_maps > 0x200)
+         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+ 
+@@ -329,4 +348,5 @@ Result nvioctlChannel_UnmapCommandBuffer(u32 fd, const nvioctl_command_buffer_ma
+     memcpy(data.maps, maps, sizeof(data.maps));
+ 
+     return nvIoctl(fd, _NV_IOWR(0, 0x0a, data), &data);
++#endif
+ }
+diff --git a/nx/source/runtime/exception.s b/nx/source/runtime/exception.s
+index 54cc4d0..81fe1dd 100644
+--- a/nx/source/runtime/exception.s
++++ b/nx/source/runtime/exception.s
+@@ -15,8 +15,14 @@
+ 
+ .weak __libnx_exception_handler
+ 
+-.weak __libnx_exception_entry
+-CODE_BEGIN __libnx_exception_entry
++// Weak, so a program can replace it: CODE_BEGIN's .global would override that (an error in LLVM's
++// assembler, silently ignored by GNU as).
++    .section .text.__libnx_exception_entry, "ax", %progbits
++    .weak __libnx_exception_entry
++    .type __libnx_exception_entry, %function
++    .align 2
++    .cfi_startproc
++__libnx_exception_entry:
+     cmp x1, #0
+     beq __libnx_exception_entry_abort
+ 
+diff --git a/nx/source/runtime/newlib.c b/nx/source/runtime/newlib.c
+index 2215c88..dcfd21b 100644
+--- a/nx/source/runtime/newlib.c
++++ b/nx/source/runtime/newlib.c
+@@ -432,6 +432,10 @@ void newlibSetup(void)
+ #pragma GCC diagnostic ignored "-Warray-bounds"
+     tv->tls_tp     = __tls_start-getTlsStartOffset();
+ #pragma GCC diagnostic pop
++#ifdef __clang__
++    // clang has no -mtp=soft (__aarch64_read_tp): its TLS accesses read tpidr_el0
++    __asm__ volatile("msr tpidr_el0, %0" :: "r"(tv->tls_tp));
++#endif
+     tv->handle     = envGetMainThreadHandle();
+ 
+     u32 tls_size = __tdata_lma_end - __tdata_lma;
+diff --git a/nx/source/services/btdrv.c b/nx/source/services/btdrv.c
+index 53b981b..e8129a9 100644
+--- a/nx/source/services/btdrv.c
++++ b/nx/source/services/btdrv.c
+@@ -1460,8 +1460,8 @@ void* btdrvCircularBufferRead(BtdrvCircularBuffer *c) {
+     if (c==NULL || !c->initialized) return NULL;
+ 
+     do {
+-        s32 read_offset = atomic_load_explicit(&c->read_offset, memory_order_acquire);
+-        s32 write_offset = atomic_load_explicit(&c->write_offset, memory_order_acquire);
++        s32 read_offset = __atomic_load_n(&c->read_offset, __ATOMIC_ACQUIRE);
++        s32 write_offset = __atomic_load_n(&c->write_offset, __ATOMIC_ACQUIRE);
+         if (read_offset == write_offset) return NULL;
+ 
+         u8 *data_ptr = &c->data[read_offset];
+@@ -1470,15 +1470,15 @@ void* btdrvCircularBufferRead(BtdrvCircularBuffer *c) {
+         if (*data_ptr != 0xFF) return data_ptr;
+         else {
+             if (!c->initialized) return NULL;
+-            read_offset = atomic_load_explicit(&c->read_offset, memory_order_acquire);
+-            write_offset = atomic_load_explicit(&c->write_offset, memory_order_acquire);
++            read_offset = __atomic_load_n(&c->read_offset, __ATOMIC_ACQUIRE);
++            write_offset = __atomic_load_n(&c->write_offset, __ATOMIC_ACQUIRE);
+             if (read_offset == write_offset) continue;
+ 
+             data_ptr = &c->data[read_offset];
+             u64 tmpsize = read_offset + 0x18;
+             if (tmpsize < sizeof(c->data)) tmpsize += *((u64*)&data_ptr[0x10]);
+             if (tmpsize >= sizeof(c->data)) tmpsize = 0;
+-            atomic_store_explicit(&c->read_offset, tmpsize, memory_order_release);
++            __atomic_store_n(&c->read_offset, tmpsize, __ATOMIC_RELEASE);
+         }
+     } while (c->initialized);
+ 
+@@ -1488,8 +1488,8 @@ void* btdrvCircularBufferRead(BtdrvCircularBuffer *c) {
+ bool btdrvCircularBufferFree(BtdrvCircularBuffer *c) {
+     if (c==NULL || !c->initialized) return false;
+ 
+-    s32 read_offset = atomic_load_explicit(&c->read_offset, memory_order_acquire);
+-    s32 write_offset = atomic_load_explicit(&c->write_offset, memory_order_acquire);
++    s32 read_offset = __atomic_load_n(&c->read_offset, __ATOMIC_ACQUIRE);
++    s32 write_offset = __atomic_load_n(&c->write_offset, __ATOMIC_ACQUIRE);
+     if (read_offset == write_offset) return false;
+ 
+     u8 *data_ptr = &c->data[read_offset];
+@@ -1498,7 +1498,7 @@ bool btdrvCircularBufferFree(BtdrvCircularBuffer *c) {
+     u64 tmpsize = read_offset + 0x18;
+     if (tmpsize < sizeof(c->data)) tmpsize += *((u64*)&data_ptr[0x10]);
+     if (tmpsize >= sizeof(c->data)) tmpsize = 0;
+-    atomic_store_explicit(&c->read_offset, tmpsize, memory_order_release);
++    __atomic_store_n(&c->read_offset, tmpsize, __ATOMIC_RELEASE);
+ 
+     return true;
+ }
