@@ -4,8 +4,10 @@
 // and every rectangle a clear limited to a scissor rectangle. A program that draws this way shows
 // a picture only where the GPU is emulated; with Eden's null renderer its frames stay empty.
 //
-// It draws a backdrop, bouncing squares and the word GPU, waits for each frame's GPU work through
-// a fence the command stream signals, and quits on +.
+// It draws a backdrop, bouncing squares and the word GPU with the 3D engine's clears, and sprites
+// with the 2D engine: a 32x32 image drawn by the CPU, copied once by the DMA engine, then blitted
+// and scaled onto the frame. It waits for each frame's GPU work through a fence the command stream
+// signals, and quits on +.
 
 #include <math.h>
 #include <stdbool.h>
@@ -26,7 +28,21 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 
 // Maxwell: classes, methods (32-bit register indices) and values
 #define CLASS_3D 0xB197 // Maxwell B
+#define CLASS_2D 0x902D // Fermi 2D
+#define CLASS_DMA 0xB0B5 // Maxwell DMA copy
 #define SUBCH_3D 0
+#define SUBCH_2D 2
+#define SUBCH_DMA 4
+#define M2D_DST_FORMAT 0x080 // format, layout, block size, depth, layer
+#define M2D_DST_WIDTH 0x086  // width, height, address (2)
+#define M2D_SRC_FORMAT 0x08C // format, layout
+#define M2D_SRC_PITCH 0x091  // pitch, width, height, address (2)
+#define M2D_OPERATION 0x0AB
+#define M2D_SAMPLE_MODE 0x223
+#define M2D_BLIT 0x22C // dst x, y, width, height, du/dx (frac, int), dv/dy, src x, src y (32.32)
+#define MDMA_LAUNCH 0x0C0
+#define MDMA_OFFSET_IN 0x100 // in (2), out (2), pitch in, pitch out, line length, line count
+#define SPRITE 32
 #define M_FENCE_VALUE 0x1C // GPFIFO (puller) methods
 #define M_FENCE_ACTION 0x1D
 #define M_RENDER_TARGET 0x200 // 8 words each, 0x10 apart: address (2), width, height, format,
@@ -68,6 +84,52 @@ static void method(u32 m, u32 count, const u32* args) {
 }
 static void method1(u32 m, u32 arg) {
     method(m, 1, &arg);
+}
+static void method_on(u32 subch, u32 m, u32 count, const u32* args) {
+    emit(header(INCREASING, count, subch, m));
+    for (u32 i = 0; i < count; i++)
+        emit(args[i]);
+}
+
+// A sprite blitted by the 2D engine from the pitch-linear image at 'src' onto the frame, scaled.
+static void sprite(iova_t src, iova_t frame, int x, int y, int scale) {
+    if (x < 0 || y < 0 || x + SPRITE * scale > W || y + SPRITE * scale > H)
+        return;
+    const u32 src_format[2] = {RT_FORMAT_RGBA8, 1 /* pitch */};
+    method_on(SUBCH_2D, M2D_SRC_FORMAT, 2, src_format);
+    const u32 src_surface[5] = {SPRITE * 4, SPRITE, SPRITE, (u32)(src >> 32), (u32)src};
+    method_on(SUBCH_2D, M2D_SRC_PITCH, 5, src_surface);
+    const u32 dst_format[5] = {RT_FORMAT_RGBA8, 0 /* block linear */, 4 << 4 /* 16 GOBs */, 1, 0};
+    method_on(SUBCH_2D, M2D_DST_FORMAT, 5, dst_format);
+    const u32 dst_surface[4] = {W, H, (u32)(frame >> 32), (u32)frame};
+    method_on(SUBCH_2D, M2D_DST_WIDTH, 4, dst_surface);
+    const u32 copy = 3; // SrcCopy
+    method_on(SUBCH_2D, M2D_OPERATION, 1, &copy);
+    const u32 corner = 1; // pixel corners, point sampling
+    method_on(SUBCH_2D, M2D_SAMPLE_MODE, 1, &corner);
+    // the step through the source for a screen pixel: 1/scale, in 32.32
+    const u64 step = (1ull << 32) / (u64)scale;
+    const u32 blit[12] = {(u32)x, (u32)y, SPRITE * (u32)scale, SPRITE * (u32)scale, (u32)step,
+                          (u32)(step >> 32), (u32)step, (u32)(step >> 32), 0, 0, 0, 0};
+    method_on(SUBCH_2D, M2D_BLIT, 12, blit); // the last word starts it
+}
+
+// The sprite: a chip with a glowing core, drawn by the CPU.
+static void draw_sprite(u32* pixels) {
+    for (int y = 0; y < SPRITE; y++)
+        for (int x = 0; x < SPRITE; x++) {
+            const float dx = x - 15.5f, dy = y - 15.5f, d = sqrtf(dx * dx + dy * dy);
+            u32 r = 34, g = 36, b = 48;
+            if (x < 2 || y < 2 || x >= SPRITE - 2 || y >= SPRITE - 2) {
+                r = 190, g = 196, b = 220;
+            } else if (d < 9) {
+                const float t = d / 9;
+                r = 255, g = (u32)(220 - 120 * t), b = (u32)(90 - 90 * t);
+            } else if ((x % 6 == 3) && (y < 6 || y > 25)) {
+                r = g = b = 150; // pins
+            }
+            pixels[y * SPRITE + x] = r | g << 8 | b << 16 | 0xFFu << 24;
+        }
 }
 static u32 f32bits(float f) {
     u32 u;
@@ -148,6 +210,19 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    // The sprite (drawn by the CPU) and its copy (made by the DMA engine), in one GPU buffer.
+    u32* sprite_mem = aligned_alloc(0x1000, 0x10000);
+    NvMap sprite_map;
+    iova_t sprite_iova = 0;
+    if (!sprite_mem || R_FAILED(rc = nvMapCreate(&sprite_map, sprite_mem, 0x10000, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(rc = nvAddressSpaceMap(&as, nvMapGetHandle(&sprite_map), true, NvKind_Pitch, &sprite_iova))) {
+        fprintf(stderr, "gputest: sprite buffer: %#x\n", rc);
+        return 1;
+    }
+    memset(sprite_mem, 0, 0x10000);
+    draw_sprite(sprite_mem);
+    const iova_t sprite_copy = sprite_iova + 0x8000;
+
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
 
@@ -190,8 +265,19 @@ int main(int argc, char* argv[]) {
         g_cmd->used = 0;
 
         if (first) {
-            emit(header(INCREASING, 1, SUBCH_3D, 0)); // bind the 3D engine to the subchannel
+            emit(header(INCREASING, 1, SUBCH_3D, 0)); // bind the engines to their subchannels
             emit(CLASS_3D);
+            emit(header(INCREASING, 1, SUBCH_2D, 0));
+            emit(CLASS_2D);
+            emit(header(INCREASING, 1, SUBCH_DMA, 0));
+            emit(CLASS_DMA);
+            // the sprite's copy, by the DMA engine: one line of its bytes, pitch to pitch
+            const u32 dma[8] = {(u32)(sprite_iova >> 32), (u32)sprite_iova, (u32)(sprite_copy >> 32),
+                                (u32)sprite_copy, SPRITE * SPRITE * 4, SPRITE * SPRITE * 4,
+                                SPRITE * SPRITE * 4, 1};
+            method_on(SUBCH_DMA, MDMA_OFFSET_IN, 8, dma);
+            const u32 launch = 2 /* non-pipelined */ | 1 << 2 /* flush */ | 1 << 7 | 1 << 8 /* pitch */;
+            method_on(SUBCH_DMA, MDMA_LAUNCH, 1, &launch);
             method1(M_RT_CONTROL, 1 | (076543210 << 4)); // one render target, mapped to itself
             method1(M_COLOR_MASK, 0x1111);
             method1(M_CLEAR_FLAGS, CLEAR_FLAGS_SCISSOR);
@@ -218,6 +304,13 @@ int main(int argc, char* argv[]) {
             rect((int)squares[i].x, (int)squares[i].y, 32, 32, squares[i].r, squares[i].g, squares[i].b);
         }
         word_gpu(W / 2 - 3 * 6 * 12 / 2, H / 2 - 7 * 12 / 2, 12, 1.0f, 1.0f, 1.0f);
+        // sprites from the DMA engine's copy, circling at three sizes
+        for (int i = 0; i < 3; i++) {
+            const float angle = (float)frame * 0.03f + i * 2.094f;
+            const int scale = i + 1;
+            const int cx = W / 2 + (int)(200 * cosf(angle)), cy = H / 2 + (int)(110 * sinf(angle));
+            sprite(sprite_copy, target, cx - SPRITE * scale / 2, cy - SPRITE * scale / 2, scale);
+        }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
 

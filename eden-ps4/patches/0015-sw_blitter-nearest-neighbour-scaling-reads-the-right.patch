@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 10:33:12 +0000
+Subject: [PATCH] sw_blitter: nearest-neighbour scaling reads the right source
+ pixel
+
+The source position is 32.32 fixed point, and the row's fractional part
+was multiplied by the source width before the shift, so a scaled blit
+whose rows fall between source rows read from the wrong column (scaling
+a 32x32 sprite to 64x64 gave interleaved garbage). The whole parts of y
+and x index the source now.
+---
+ src/video_core/engines/sw_blitter/blitter.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/engines/sw_blitter/blitter.cpp b/src/video_core/engines/sw_blitter/blitter.cpp
+index 8bcc2f7a7..518a1c94a 100644
+--- a/src/video_core/engines/sw_blitter/blitter.cpp
++++ b/src/video_core/engines/sw_blitter/blitter.cpp
+@@ -36,7 +36,8 @@ void NearestNeighbor(std::span<const u8> input, std::span<u8> output, u32 src_wi
+     for (u32 y = 0; y < dst_height; y++) {
+         size_t src_x = 0;
+         for (u32 x = 0; x < dst_width; x++) {
+-            const size_t read_from = ((src_y * src_width + src_x) >> 32) * bpp;
++            // src_x and src_y are 32.32 fixed point: their whole parts index the source
++            const size_t read_from = ((src_y >> 32) * src_width + (src_x >> 32)) * bpp;
+             const size_t write_to = (y * dst_width + x) * bpp;
+ 
+             std::memcpy(&output[write_to], &input[read_from], bpp);
+@@ -54,7 +55,7 @@ void NearestNeighborFast(std::span<const f32> input, std::span<f32> output, u32
+     for (u32 y = 0; y < dst_height; y++) {
+         size_t src_x = 0;
+         for (u32 x = 0; x < dst_width; x++) {
+-            const size_t read_from = ((src_y * src_width + src_x) >> 32) * ir_components;
++            const size_t read_from = ((src_y >> 32) * src_width + (src_x >> 32)) * ir_components;
+             const size_t write_to = (y * dst_width + x) * ir_components;
+ 
+             std::memcpy(&output[write_to], &input[read_from], sizeof(f32) * ir_components);

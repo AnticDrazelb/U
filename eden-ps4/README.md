@@ -107,7 +107,8 @@ libnx's nvidia services (no deko3d, no shaders): a GPU channel bound to the Maxw
 window's framebuffers mapped into the GPU's address space as its render target, every rectangle a
 clear limited to a scissor rectangle, and a fence that the command stream signals (a syncpoint
 increment) before the frame is queued. It draws a backdrop, bouncing squares and the word GPU,
-about 80 clears a frame.
+about 80 clears a frame, and sprites with the 2D engine: a 32x32 image the CPU draws, copied once
+by the DMA engine, then blitted onto the frame at 1x, 2x and 3x.
 
 ![The GPU test in shadPS4, drawn by the null renderer's software clears](screenshots/gputest-shadps4.png)
 
@@ -116,7 +117,10 @@ Two ways it shows:
 - **The null renderer, in software** (patch 0014; the PS4 build): colour clears are written to
   emulated memory (block linear or pitch, scissored, the common colour formats, channel masks for
   the 8-bit ones), a block of the surface at a time, and DMA copies and 2D engine blits go to their
-  engines' software paths instead of being claimed as done. So a program that draws with clears,
+  engines' software paths instead of being claimed as done. The sprites found a bug in Eden's
+  software blitter (from yuzu): its nearest-neighbour scaling mixed the source row's fraction into
+  the column, so a 2x blit came out as interleaved stripes (patch 0015 fixes it; the Vulkan
+  renderer's blit was right, and the two now draw the same). So a program that draws with clears,
   copies and blits shows in the CPU-composed frames, on the PS4 now: the GPU test runs at 60 frames
   a second on the desktop and 34 in shadPS4 (its display's pace again). Anything drawn with shaders
   still shows nothing.
@@ -195,8 +199,9 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    long each waited for a buffer off the screen (the display's pace) and how long scaling it took
    (the launcher's cost).
 4. **Controller test**: each PS4 button should light its Switch button.
-5. **GPU test**: the backdrop, the squares and GPU, drawn by the GPU emulation (software clears),
-   and its frame rate as a green bar (6 pixels a frame a second).
+5. **GPU test**: the backdrop, the squares and GPU (clears), three circling sprites (2D blits of
+   a DMA copy), all drawn by the GPU emulation in software, and its frame rate as a green bar
+   (6 pixels a frame a second).
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
@@ -256,6 +261,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | audio: frontend sink streams play silently when the output can't open | a stream without an output still consumes its buffers at an output's pace, so a program waiting for them doesn't stall |
 | vulkan: headless rendering for frontends that take frames | stage 4's Vulkan renderer without a window, above |
 | null renderer: colour clears, DMA copies and 2D blits in software | stage 4's GPU test on the PS4, above |
+| sw_blitter: nearest-neighbour scaling reads the right source pixel | an upstream bug the GPU test's sprites found, above |
 
 The PS4 memory changes, from what stage 1 measured:
 
