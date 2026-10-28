@@ -32,13 +32,15 @@ What runs it:
 - **Picture.** A Switch program shows a frame by queueing a buffer to the display service (VI),
   whose compositor (nvnflinger) hands its layers to the renderer. Eden's null renderer threw them
   away; patch 0008 has it compose them on the CPU instead, for a frontend that asks for frames
-  (`EmuWindow::WantsSoftwareFrames`): each layer's buffer read from emulated memory,
-  unswizzled from the GPU's block-linear layout, converted to RGBA (RGBA8, RGBX8, BGRA8 and RGB565),
-  cropped, flipped and blended as the compositor asks. A frame of one layer, the usual case, goes
-  to the launcher at its own size (Breakout's: 640x360), more layers scaled to 1280x720 and
-  blended. The launcher scales it to 1920x1080 into the video-out buffers. A game that draws with
-  the GPU (NVN, Vulkan, OpenGL) shows nothing: its buffers hold whatever the GPU would have drawn,
-  and there's no GPU emulation.
+  (`EmuWindow::WantsSoftwareFrames`): each layer's buffer read from emulated memory, unswizzled from
+  the GPU's block-linear layout, converted to RGBA (RGBA8, RGBX8, BGRA8 and RGB565), cropped,
+  flipped and blended as the compositor asks. A frame of one layer, the usual case, goes to the
+  launcher at its own size (Breakout's: 640x360), more layers scaled to 1280x720 and blended. The
+  launcher scales it to 1920x1080 into the video-out buffers, a row at a time from a row buffer:
+  those buffers are write-combined memory, which the CPU reads uncached (shadPS4 backs them with
+  ordinary memory, so it wouldn't show the cost of reading them). A game that draws with the GPU
+  (NVN, Vulkan, OpenGL) shows nothing: its buffers hold whatever the GPU would have drawn, and
+  there's no GPU emulation.
 - **Controller.** The PS4 pad, read every 4 ms, is player 1's Pro Controller, through Eden's virtual
   gamepad input engine (`Launcher::SetPad`). By the PS4's conventions: Cross is A, Circle B, Square
   Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -, and both sticks.
