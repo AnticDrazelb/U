@@ -162,7 +162,9 @@ public:
     }
 
     // A frame the program drew, scaled to fill the screen (nearest pixel). Its pixels are R, G, B,
-    // A bytes: the buffers' own order.
+    // A bytes: the buffers' own order. Each row is scaled into a row buffer first and copied from
+    // there to the screen rows that show it: the frame buffers are write-combined memory, quick to
+    // write in order but very slow for the CPU to read.
     void DrawFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
     {
         if (!open || width == 0 || height == 0)
@@ -171,10 +173,13 @@ public:
         {
             x_map.resize(kWidth);
             y_map.resize(kHeight);
+            row.resize(kWidth);
             for (int x = 0; x < kWidth; x++)
                 x_map[x] = uint32_t(uint64_t(x) * width / kWidth);
             for (int y = 0; y < kHeight; y++)
                 y_map[y] = uint32_t(uint64_t(y) * height / kHeight);
+            // a whole number of screen pixels for each of the frame's (640 wide: 3)
+            x_factor = kWidth % width == 0 ? kWidth / width : 0;
             map_width = width;
             map_height = height;
         }
@@ -184,15 +189,23 @@ public:
         uint32_t* fb = buffers[current];
         for (int y = 0; y < kHeight; y++)
         {
-            uint32_t* dst = fb + size_t(y) * kWidth;
-            if (y > 0 && y_map[y] == y_map[y - 1])
+            if (y == 0 || y_map[y] != y_map[y - 1])
             {
-                std::memcpy(dst, dst - kWidth, kWidth * sizeof(uint32_t));
-                continue;
+                const uint32_t* src = pixels.data() + size_t(y_map[y]) * width;
+                uint32_t* out = row.data();
+                if (x_factor)
+                {
+                    for (uint32_t x = 0; x < width; x++)
+                        for (uint32_t k = 0; k < x_factor; k++)
+                            *out++ = src[x];
+                }
+                else
+                {
+                    for (int x = 0; x < kWidth; x++)
+                        out[x] = src[x_map[x]];
+                }
             }
-            const uint32_t* src = pixels.data() + size_t(y_map[y]) * width;
-            for (int x = 0; x < kWidth; x++)
-                dst[x] = src[x_map[x]];
+            std::memcpy(fb + size_t(y) * kWidth, row.data(), kWidth * sizeof(uint32_t));
         }
         sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, int64_t(++flips));
         current = (current + 1) % kFrames;
@@ -240,8 +253,8 @@ private:
     int line_height = 24;
     std::vector<Line> lines;
     std::string status;
-    std::vector<uint32_t> x_map, y_map;
-    uint32_t map_width = 0, map_height = 0;
+    std::vector<uint32_t> x_map, y_map, row;
+    uint32_t map_width = 0, map_height = 0, x_factor = 0;
 
 public:
     double last_wait = 0; // how long DrawFrame waited for a buffer off the screen, in seconds
