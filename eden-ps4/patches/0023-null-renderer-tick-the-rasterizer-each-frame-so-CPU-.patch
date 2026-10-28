@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:34:18 +0000
+Subject: [PATCH] null renderer: tick the rasterizer each frame, so CPU-written
+ textures are seen
+
+---
+ .../renderer_null/null_rasterizer.cpp         |  4 +-
+ .../renderer_null/renderer_null.cpp           |  3 ++
+ .../renderer_null/software_draw.cpp           | 46 +++++++++++++++++--
+ src/video_core/renderer_null/software_draw.h  |  4 ++
+ 4 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index 319d7ca24..f726f329c 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -250,10 +250,10 @@ void RasterizerNull::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+ bool RasterizerNull::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+     return false;
+ }
+-// A write the memory manager reports (by device address): the software draws' textures are
++// A write the memory manager reports (by device address): the software draws' textures there are
+ // checked again before they're next sampled.
+ void RasterizerNull::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+-    m_software.MarkAllWritten();
++    m_software.MarkDeviceWritten(addr, size);
+ }
+ bool RasterizerNull::OnCPUWrite(PAddr addr, u64 size) {
+     return false;
+diff --git a/src/video_core/renderer_null/renderer_null.cpp b/src/video_core/renderer_null/renderer_null.cpp
+index 9ed87de13..8fa289632 100644
+--- a/src/video_core/renderer_null/renderer_null.cpp
++++ b/src/video_core/renderer_null/renderer_null.cpp
+@@ -71,6 +71,9 @@ void RendererNull::Composite(std::span<const Tegra::FramebufferConfig> framebuff
+         ComposeSoftwareFrame(framebuffers);
+     }
+ 
++    // a frame shown: the software draws' textures are checked again (the CPU may have written to
++    // them) before they're next sampled
++    m_rasterizer.TickFrame();
+     m_gpu.RendererFrameEndNotify();
+     render_window.OnFrameDisplayed();
+ }
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index ebd703535..f623852ef 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -528,7 +528,10 @@ struct Texture {
+     std::array<u64, 4> tic{};
+     GPUVAddr address = 0; // the guest bytes it's decoded from
+     u64 size = 0;
++    DAddr device_address = 0; // and where they are in device memory, when that's one range
++    bool device_range = false;
+     u64 hash = 0;
++    u32 unchanged_checks = 0; // how many checks in a row found it the same
+     bool decoded = false;
+     bool checked = false; // since anything that might have written to it
+     u32 idle_frames = 0;
+@@ -1405,6 +1408,7 @@ struct SoftwareDraw::Program {
+ struct SoftwareDraw::Textures {
+     std::unordered_map<u64, Texture> entries; // by the hash of their texture headers
+     Common::ScratchBuffer<u8> guest, unswizzled, converted;
++    u64 marks = 0, hashed = 0, bytes_hashed = 0, decoded = 0; // for the stats
+ 
+     const Texture* Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address);
+ };
+@@ -2630,6 +2634,12 @@ const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPU
+         const VideoCommon::ImageInfo info{tic};
+         texture.address = tic.Address() - u64{tic.BaseLayer()} * info.layer_stride;
+         texture.size = VideoCommon::CalculateGuestSizeInBytes(info);
++        if (texture.size != 0 && gpu_memory.IsContinuousRange(texture.address, texture.size)) {
++            if (const auto device = gpu_memory.GpuToCpuAddress(texture.address)) {
++                texture.device_address = *device;
++                texture.device_range = true;
++            }
++        }
+     }
+     texture.checked = true;
+     if (texture.size == 0 || texture.size > (256u << 20)) {
+@@ -2639,9 +2649,14 @@ const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPU
+     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> bytes(
+         gpu_memory, texture.address, texture.size, &guest);
+     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++    hashed++;
++    bytes_hashed += bytes.size();
+     if (texture.decoded && hash == texture.hash) {
++        texture.unchanged_checks++;
+         return &texture;
+     }
++    texture.unchanged_checks = 0;
++    decoded++;
+     texture.hash = hash;
+     texture.decoded = true;
+     texture.ok = DecodeTexture(gpu_memory, tic, std::span<const u8>{bytes.data(), bytes.size()},
+@@ -2650,6 +2665,7 @@ const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPU
+ }
+ 
+ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
++    textures->marks++;
+     for (auto& [key, texture] : textures->entries) {
+         if (address < texture.address + texture.size && texture.address < address + size) {
+             texture.checked = false;
+@@ -2657,16 +2673,32 @@ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
+     }
+ }
+ 
++void SoftwareDraw::MarkDeviceWritten(DAddr address, u64 size) {
++    textures->marks++;
++    for (auto& [key, texture] : textures->entries) {
++        if (!texture.device_range ||
++            (address < texture.device_address + texture.size && texture.device_address < address + size)) {
++            texture.checked = false;
++        }
++    }
++}
++
+ void SoftwareDraw::MarkAllWritten() {
++    textures->marks++;
+     for (auto& [key, texture] : textures->entries) {
+         texture.checked = false;
+     }
+ }
+ 
+ void SoftwareDraw::TickFrame() {
++    // checked for the CPU's writes: every frame, or every 4th once a texture has stayed the same
++    // through 8 checks in a row
+     constexpr u32 idle_frames_kept = 300;
++    const bool every_texture = ++frame_count % 4 == 0;
+     for (auto it = textures->entries.begin(); it != textures->entries.end();) {
+-        it->second.checked = false;
++        if (every_texture || it->second.unchanged_checks < 8) {
++            it->second.checked = false;
++        }
+         if (++it->second.idle_frames > idle_frames_kept) {
+             it = textures->entries.erase(it);
+         } else {
+@@ -2745,6 +2777,7 @@ struct Stats {
+     bool enabled = std::getenv("EDEN_SW_STATS") != nullptr;
+     Clock::time_point last = Clock::now();
+     u64 draws = 0, triangles = 0, fragments = 0;
++    u64 marks = 0, textures_hashed = 0, bytes_hashed = 0, textures_decoded = 0;
+     u32 threads = 1;
+     Clock::duration setup{}, raster{};
+ 
+@@ -2756,11 +2789,14 @@ struct Stats {
+         const f64 seconds = std::chrono::duration<f64>(now - last).count();
+         const auto ms = [&](Clock::duration d) { return std::chrono::duration<f64, std::milli>(d).count() / seconds; };
+         LOG_WARNING(Render, "Software draw: a second: {:.0f} draws, {:.0f} triangles, {:.0f} k fragments; "
+-                            "{:.1f} ms setting up, {:.1f} ms rasterizing (on up to {} threads)",
++                            "{:.1f} ms setting up, {:.1f} ms rasterizing (on up to {} threads); "
++                            "textures: {:.0f} writes marked, {:.0f} checked ({:.1f} MB hashed), {:.0f} decoded",
+                     f64(draws) / seconds, f64(triangles) / seconds, f64(fragments) / seconds / 1000.0,
+-                    ms(setup), ms(raster), threads);
++                    ms(setup), ms(raster), threads, f64(marks) / seconds, f64(textures_hashed) / seconds,
++                    f64(bytes_hashed) / seconds / 1048576.0, f64(textures_decoded) / seconds);
+         last = now;
+         draws = triangles = fragments = 0;
++        marks = textures_hashed = bytes_hashed = textures_decoded = 0;
+         setup = raster = {};
+     }
+ };
+@@ -3694,6 +3730,10 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         stats.setup += raster_start - start;
+         stats.raster += end - raster_start;
+         stats.threads = std::max(stats.threads, threads);
++        stats.marks += std::exchange(textures->marks, 0);
++        stats.textures_hashed += std::exchange(textures->hashed, 0);
++        stats.bytes_hashed += std::exchange(textures->bytes_hashed, 0);
++        stats.textures_decoded += std::exchange(textures->decoded, 0);
+         stats.Report();
+     }
+     // textures drawn to (render to texture) are checked again before they're next sampled
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index 64e6bd5d9..2d68a8836 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -62,6 +62,9 @@ public:
+     /// before they're next sampled.
+     void MarkWritten(GPUVAddr address, u64 size);
+ 
++    /// The same, for a write the memory manager reports by device address.
++    void MarkDeviceWritten(DAddr address, u64 size);
++
+     /// The same, for every texture (a write whose range isn't known).
+     void MarkAllWritten();
+ 
+@@ -84,6 +87,7 @@ private:
+     struct Workers;
+     std::unique_ptr<Workers> workers;
+     u32 worker_count = 1;
++    u64 frame_count = 0;
+     u32 RasterThreads();
+     std::unordered_map<u64, std::unique_ptr<Program>> programs;
+     Common::ScratchBuffer<u8> scratch;

@@ -186,6 +186,13 @@ Two ways it shows:
   that), its updates on stencil fail, depth fail and pass, the write mask; a shader that can
   discard runs before the updates are made, so a discarded pixel makes none. Up to eight render
   targets, each with its own format, layout, blending and colour mask.
+- **Textures the CPU writes** (patch 0023): the null renderer didn't tell its rasterizer a frame
+  had been shown (the Vulkan and OpenGL renderers do), so the once-a-frame check for the CPU's
+  writes never came; it does now (every 4th frame for a texture unchanged through 8 checks).
+  And a write the memory manager reports marks only the textures where it landed: it reports the
+  command buffers it reads, thousands of times a second, which marked every texture before. The
+  GPU test's CPU paints the sprite's middle blue at frame 30, and the turning square shows it.
+  The stats line counts the textures checked and decoded, and the bytes hashed.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -338,6 +345,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: storage buffers, global memory and subgroup ops in software shaders | above |
 | null renderer: points, lines, quad strips and polygons in software draws | above |
 | null renderer: stencil testing and several render targets in software draws | above |
+| null renderer: tick the rasterizer each frame, so CPU-written textures are seen | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

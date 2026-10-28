@@ -14,7 +14,7 @@
 // fence the command stream signals, and quits on +. And a depth test: two bars across each other
 // in depth, each in front on its own half. And a square coloured from a storage buffer, lines and a
 // point, and a stencil test: a triangle drawn only into the stencil, then a square drawn where it
-// is.
+// is. From frame 30 the CPU paints the sprite's middle blue, which the turning square shows.
 
 #include <math.h>
 #include <stdbool.h>
@@ -636,6 +636,14 @@ int main(int argc, char* argv[]) {
             method1(M_DRAW_END, 0);
             method1(M_BLEND_ENABLE, 0);
             method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+        }
+        // from frame 30, the CPU paints the sprite's middle blue: the turning square, which samples
+        // the sprite itself (the circling ones are blits of its copy), shows it
+        if (frame == 30) {
+            for (int y = 12; y < 20; y++)
+                for (int x = 12; x < 20; x++)
+                    sprite_mem[y * SPRITE + x] = 0xFFFF4010; // blue
+            armDCacheFlush(sprite_mem, SPRITE * SPRITE * 4);
         }
         for (int i = 0; i < 12; i++) {
             squares[i].x += squares[i].vx;

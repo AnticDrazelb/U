@@ -156,6 +156,16 @@ at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
 (ir, ig, ib), (orr, og, ob) = at(56, 225), at(20, 190)
 sys.exit(0 if ir > 230 and 100 < ig < 180 and ib < 60 and not (orr > 230 and ob < 60) else 1)
 PY
+# a texture the CPU writes to: from frame 30 the sprite's middle is blue, and the turning square
+# (which samples the sprite) shows it in the last frame
+check "a texture the CPU rewrites is drawn as rewritten" python3 - "$work/gputest-frames/last.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+r, g, b = pixels[(261 * width + 144) * 3:(261 * width + 144) * 3 + 3]
+sys.exit(0 if b > 200 and r < 80 and g < 120 else 1)
+PY
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
