@@ -108,7 +108,10 @@ window's framebuffers mapped into the GPU's address space as its render target, 
 clear limited to a scissor rectangle, and a fence that the command stream signals (a syncpoint
 increment) before the frame is queued. It draws a backdrop, bouncing squares and the word GPU,
 about 80 clears a frame, and sprites with the 2D engine: a 32x32 image the CPU draws, copied once
-by the DMA engine, then blitted onto the frame at 1x, 2x and 3x.
+by the DMA engine, then blitted onto the frame at 1x, 2x and 3x. And a triangle drawn with shaders:
+a vertex program (two attribute loads and stores: position and colour) and a fragment program (the
+colour interpolated, into the render target), with their shader program headers, in Maxwell machine
+code written by hand, as there's no shader compiler in this build environment.
 
 ![The GPU test in shadPS4, drawn by the null renderer's software clears](screenshots/gputest-shadps4.png)
 
@@ -122,8 +125,20 @@ Two ways it shows:
   the column, so a 2x blit came out as interleaved stripes (patch 0015 fixes it; the Vulkan
   renderer's blit was right, and the two now draw the same). So a program that draws with clears,
   copies and blits shows in the CPU-composed frames, on the PS4 now: the GPU test runs at 60 frames
-  a second on the desktop and 34 in shadPS4 (its display's pace again). Anything drawn with shaders
-  still shows nothing.
+  a second on the desktop and 34 in shadPS4 (its display's pace again).
+- **Shader draws, in software** (patch 0016; the PS4 build): the null renderer's draws go to a
+  software renderer. The vertex and fragment programs are translated by Eden's shader recompiler,
+  and their IR flattened into operations on numbered cells (phis become moves on each edge of the
+  structured control flow), which an interpreter runs: no JIT, so nothing needs executable memory.
+  Vertices are fetched from the vertex streams (float, unorm, snorm, integer, scaled; indexed or
+  not; instanced), shaded, clipped against w > 0, mapped to the window as the Vulkan renderer maps
+  them, culled, and rasterized into render target 0 in emulated memory a block at a time, with the
+  varyings interpolated as Vulkan interpolates them (perspective, linear, flat) and blended. The
+  GPU test's first frame comes out the same as through the Vulkan renderer (below), and it draws at
+  60 frames a second on the desktop. Not done yet: textures, depth and stencil, more than one
+  render target, points and lines; a draw that needs them is skipped, and logged once.
+
+![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
   renderer makes a surface that shows nothing (`VK_EXT_headless_surface`) and reads each frame back
   for the launcher instead of presenting it. With lavapipe, Mesa's Vulkan driver that runs on the
@@ -200,8 +215,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    (the launcher's cost).
 4. **Controller test**: each PS4 button should light its Switch button.
 5. **GPU test**: the backdrop, the squares and GPU (clears), three circling sprites (2D blits of
-   a DMA copy), all drawn by the GPU emulation in software, and its frame rate as a green bar
-   (6 pixels a frame a second).
+   a DMA copy), a turning RGB triangle (shaders), all drawn by the GPU emulation in software, and
+   its frame rate as a green bar (6 pixels a frame a second).
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
@@ -262,6 +277,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | vulkan: headless rendering for frontends that take frames | stage 4's Vulkan renderer without a window, above |
 | null renderer: colour clears, DMA copies and 2D blits in software | stage 4's GPU test on the PS4, above |
 | sw_blitter: nearest-neighbour scaling reads the right source pixel | an upstream bug the GPU test's sprites found, above |
+| null renderer: shader draws in software | stage 4's software renderer, above |
 
 The PS4 memory changes, from what stage 1 measured:
 
@@ -289,8 +305,8 @@ consoles), and FFmpeg is built without its Linux-only calls (below).
 `test.sh` runs each program in the desktop build with scripted controller input and checks what it
 printed, drew and played: the test program's checks, Breakout's frames and beeps, Blocks' frames,
 tune and best score (saved by one run, read by the next), the controller test, stopping a program,
-the GPU test (its fences, and its frames having the picture), and that a program with libnx's
-full-memory heap starts at once. 20 checks, about 30 s.
+the GPU test (its fences, its frames having the picture, its shader triangle), and that a program
+with libnx's full-memory heap starts at once. 21 checks, about 30 s.
 
 ## Building
 
