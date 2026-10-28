@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 10:20:02 +0000
+Subject: [PATCH] null renderer: colour clears, DMA copies and 2D blits in
+ software
+
+The null rasterizer did nothing for clears and claimed DMA copies and 2D
+blits as done. Colour clears are now written to emulated memory (block
+linear or pitch, scissored, the common colour formats, channel masks for
+8-bit formats), and DMA copies and 2D blits go to their engines' software
+paths. What a program draws that way then shows in the null renderer's
+CPU-composed frames. Depth and stencil clears and shader draws still do
+nothing.
+---
+ .../renderer_null/null_rasterizer.cpp         | 253 +++++++++++++++++-
+ .../renderer_null/null_rasterizer.h           |   4 +
+ 2 files changed, 253 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index a5cda0f38..b9b0f2c7d 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -1,8 +1,15 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
+ #include "common/alignment.h"
++#include "common/logging.h"
+ #include "video_core/control/channel_state.h"
++#include "video_core/engines/maxwell_3d.h"
++#include "video_core/guest_memory.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/renderer_null/null_rasterizer.h"
+@@ -11,11 +18,13 @@ namespace Null {
+ 
+ AccelerateDMA::AccelerateDMA() = default;
+ 
++// Not accelerated: the DMA engine copies and fills in software instead, in emulated memory, which
++// the null renderer's frames are composed from.
+ bool AccelerateDMA::BufferCopy(GPUVAddr start_address, GPUVAddr end_address, u64 amount) {
+-    return true;
++    return false;
+ }
+ bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
+-    return true;
++    return false;
+ }
+ 
+ RasterizerNull::RasterizerNull(Tegra::GPU& gpu) : m_gpu{gpu} {}
+@@ -23,7 +32,243 @@ RasterizerNull::~RasterizerNull() = default;
+ 
+ void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {}
+ void RasterizerNull::DrawTexture() {}
+-void RasterizerNull::Clear(u32 layer_count) {}
++namespace {
++
++float ToSrgb(float linear) {
++    return linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
++}
++
++u32 Unorm(float value, u32 bits) {
++    const float max = float((1u << bits) - 1);
++    return u32(std::clamp(value, 0.0f, 1.0f) * max + 0.5f);
++}
++
++u16 ToHalf(float value) {
++    u32 f;
++    std::memcpy(&f, &value, sizeof(f));
++    const u32 sign = (f >> 16) & 0x8000;
++    const s32 exponent = s32((f >> 23) & 0xFF) - 127 + 15;
++    const u32 mantissa = f & 0x7FFFFF;
++    if (((f >> 23) & 0xFF) == 0xFF) {
++        return u16(sign | 0x7C00 | (mantissa ? 0x200 : 0));
++    }
++    if (exponent <= 0) {
++        return u16(sign); // underflow: zero
++    }
++    if (exponent >= 31) {
++        return u16(sign | 0x7C00);
++    }
++    return u16(sign | (u32(exponent) << 10) | (mantissa >> 13));
++}
++
++/// A clear colour in a render target format: its bytes and size. False for formats not handled.
++bool EncodeClearColor(Tegra::RenderTargetFormat format, const std::array<f32, 4>& color,
++                      std::array<u8, 16>& out, u32& bytes) {
++    const auto put32 = [&](u32 value) {
++        std::memcpy(out.data(), &value, 4);
++        bytes = 4;
++    };
++    const auto put16 = [&](u32 value) {
++        const u16 v = u16(value);
++        std::memcpy(out.data(), &v, 2);
++        bytes = 2;
++    };
++    const float r = color[0], g = color[1], b = color[2], a = color[3];
++    using F = Tegra::RenderTargetFormat;
++    switch (format) {
++    case F::A8B8G8R8_UNORM:
++        put32(Unorm(r, 8) | Unorm(g, 8) << 8 | Unorm(b, 8) << 16 | Unorm(a, 8) << 24);
++        return true;
++    case F::A8B8G8R8_SRGB:
++        put32(Unorm(ToSrgb(r), 8) | Unorm(ToSrgb(g), 8) << 8 | Unorm(ToSrgb(b), 8) << 16 |
++              Unorm(a, 8) << 24);
++        return true;
++    case F::X8B8G8R8_UNORM:
++        put32(Unorm(r, 8) | Unorm(g, 8) << 8 | Unorm(b, 8) << 16 | 0xFF000000u);
++        return true;
++    case F::X8B8G8R8_SRGB:
++        put32(Unorm(ToSrgb(r), 8) | Unorm(ToSrgb(g), 8) << 8 | Unorm(ToSrgb(b), 8) << 16 |
++              0xFF000000u);
++        return true;
++    case F::A8R8G8B8_UNORM:
++        put32(Unorm(b, 8) | Unorm(g, 8) << 8 | Unorm(r, 8) << 16 | Unorm(a, 8) << 24);
++        return true;
++    case F::A8R8G8B8_SRGB:
++        put32(Unorm(ToSrgb(b), 8) | Unorm(ToSrgb(g), 8) << 8 | Unorm(ToSrgb(r), 8) << 16 |
++              Unorm(a, 8) << 24);
++        return true;
++    case F::X8R8G8B8_UNORM:
++        put32(Unorm(b, 8) | Unorm(g, 8) << 8 | Unorm(r, 8) << 16 | 0xFF000000u);
++        return true;
++    case F::X8R8G8B8_SRGB:
++        put32(Unorm(ToSrgb(b), 8) | Unorm(ToSrgb(g), 8) << 8 | Unorm(ToSrgb(r), 8) << 16 |
++              0xFF000000u);
++        return true;
++    case F::A2B10G10R10_UNORM:
++        put32(Unorm(r, 10) | Unorm(g, 10) << 10 | Unorm(b, 10) << 20 | Unorm(a, 2) << 30);
++        return true;
++    case F::A2R10G10B10_UNORM:
++        put32(Unorm(b, 10) | Unorm(g, 10) << 10 | Unorm(r, 10) << 20 | Unorm(a, 2) << 30);
++        return true;
++    case F::R5G6B5_UNORM:
++        put16(Unorm(b, 5) | Unorm(g, 6) << 5 | Unorm(r, 5) << 11);
++        return true;
++    case F::A1R5G5B5_UNORM:
++        put16(Unorm(b, 5) | Unorm(g, 5) << 5 | Unorm(r, 5) << 10 | Unorm(a, 1) << 15);
++        return true;
++    case F::X1R5G5B5_UNORM:
++        put16(Unorm(b, 5) | Unorm(g, 5) << 5 | Unorm(r, 5) << 10 | 0x8000);
++        return true;
++    case F::R8G8_UNORM:
++        put16(Unorm(r, 8) | Unorm(g, 8) << 8);
++        return true;
++    case F::R8_UNORM:
++        out[0] = u8(Unorm(r, 8));
++        bytes = 1;
++        return true;
++    case F::R16G16B16A16_FLOAT:
++    case F::R16G16B16X16_FLOAT: {
++        const u16 h[4] = {ToHalf(r), ToHalf(g), ToHalf(b),
++                          ToHalf(format == F::R16G16B16X16_FLOAT ? 1.0f : a)};
++        std::memcpy(out.data(), h, 8);
++        bytes = 8;
++        return true;
++    }
++    case F::R32G32B32A32_FLOAT:
++    case F::R32G32B32X32_FLOAT:
++        std::memcpy(out.data(), color.data(), 16);
++        bytes = 16;
++        return true;
++    case F::R32_FLOAT:
++        std::memcpy(out.data(), &r, 4);
++        bytes = 4;
++        return true;
++    default:
++        return false;
++    }
++}
++
++} // Anonymous namespace
++
++// Colour clears, done in emulated memory: what a program draws with clears (and the DMA and 2D
++// engines, also in software) shows in the null renderer's frames. Depth and stencil clears and
++// anything drawn with shaders still do nothing.
++void RasterizerNull::Clear(u32 layer_count) {
++    if (!maxwell3d || !gpu_memory) {
++        return;
++    }
++    const auto& regs = maxwell3d->regs;
++    const auto& surface = regs.clear_surface;
++    if (!(surface.R || surface.G || surface.B || surface.A)) {
++        return;
++    }
++    const u32 index = regs.rt_control.Map(surface.RT);
++    const auto& rt = regs.rt[index];
++    const GPUVAddr address = rt.Address();
++    if (address == 0 || rt.width == 0 || rt.height == 0) {
++        return;
++    }
++    std::array<u8, 16> pixel{};
++    u32 bpp = 0;
++    if (!EncodeClearColor(rt.format, regs.clear_color, pixel, bpp)) {
++        LOG_WARNING(Render, "Software clear: render target format {:#x} not handled",
++                    static_cast<u32>(rt.format));
++        return;
++    }
++    // A channel left out (by the clear or the colour mask) keeps its value: only whole bytes, for
++    // the 8-bit-per-channel formats, otherwise the clear is all or nothing.
++    const auto& mask = regs.color_mask_common ? regs.color_mask[0] : regs.color_mask[index];
++    const bool channels[4] = {surface.R && mask.R, surface.G && mask.G, surface.B && mask.B,
++                              surface.A && mask.A};
++    const bool all = channels[0] && channels[1] && channels[2] && channels[3];
++    std::array<bool, 4> byte_mask{true, true, true, true};
++    if (!all) {
++        using F = Tegra::RenderTargetFormat;
++        const bool bgra = rt.format == F::A8R8G8B8_UNORM || rt.format == F::A8R8G8B8_SRGB ||
++                          rt.format == F::X8R8G8B8_UNORM || rt.format == F::X8R8G8B8_SRGB;
++        const bool rgba = rt.format == F::A8B8G8R8_UNORM || rt.format == F::A8B8G8R8_SRGB ||
++                          rt.format == F::X8B8G8R8_UNORM || rt.format == F::X8B8G8R8_SRGB;
++        if (!rgba && !bgra) {
++            return;
++        }
++        byte_mask = {channels[bgra ? 2 : 0], channels[1], channels[bgra ? 0 : 2], channels[3]};
++    }
++
++    const bool pitch_linear = rt.tile_mode.is_pitch_linear != 0;
++    const u32 pitch = pitch_linear ? rt.width : 0; // a pitch render target's width is its pitch
++    const u32 width = pitch_linear ? rt.width / bpp : rt.width;
++    const u32 height = rt.height;
++    u32 x0 = 0, y0 = 0, x1 = width, y1 = height;
++    if (regs.clear_control.use_scissor && regs.scissor_test[0].enable) {
++        const auto& scissor = regs.scissor_test[0];
++        x0 = std::max<u32>(x0, scissor.min_x);
++        y0 = std::max<u32>(y0, scissor.min_y);
++        x1 = std::min<u32>(x1, scissor.max_x);
++        y1 = std::min<u32>(y1, scissor.max_y);
++    }
++    if (x0 >= x1 || y0 >= y1) {
++        return;
++    }
++    const u32 extent_x = x1 - x0;
++
++    if (pitch_linear) {
++        for (u32 y = y0; y < y1; ++y) {
++            Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
++                row(*gpu_memory, address + u64{y} * pitch + u64{x0} * bpp, extent_x * bpp, &m_scratch);
++            for (u32 x = 0; x < extent_x; ++x) {
++                for (u32 i = 0; i < bpp; ++i) {
++                    if (bpp != 4 || byte_mask[i]) {
++                        row[x * bpp + i] = pixel[i];
++                    }
++                }
++            }
++        }
++        return;
++    }
++
++    // Block linear: a block (one GOB wide, 1 << block_height GOBs high) is contiguous, so each
++    // block the rectangle touches is read, written and written back on its own.
++    const u32 block_height = rt.tile_mode.block_height;
++    const u32 block_rows = 8u << block_height;
++    const u32 block_bytes = 512u << block_height;
++    const u32 gobs_in_x = (width * bpp + 63) / 64;
++    const u64 block_row_size = u64{gobs_in_x} * block_bytes;
++    const u32 pixels_per_gob = 64 / bpp;
++    const u32 layers = std::max<u32>(layer_count, 1);
++    for (u32 layer = 0; layer < layers; ++layer) {
++        const GPUVAddr layer_address =
++            address + u64{surface.layer + layer} * (u64{rt.array_pitch} << 2);
++        for (u32 by = y0 / block_rows; by <= (y1 - 1) / block_rows; ++by) {
++            const u32 ys = std::max(y0, by * block_rows), ye = std::min(y1, (by + 1) * block_rows);
++            for (u32 gx = x0 / pixels_per_gob; gx <= (x1 - 1) / pixels_per_gob; ++gx) {
++                const u32 xs = std::max(x0, gx * pixels_per_gob);
++                const u32 xe = std::min(x1, (gx + 1) * pixels_per_gob);
++                Tegra::Memory::GpuGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
++                    block(*gpu_memory, layer_address + by * block_row_size + u64{gx} * block_bytes,
++                          block_bytes, &m_scratch);
++                for (u32 y = ys; y < ye; ++y) {
++                    const u32 in_block = y - by * block_rows;
++                    const u32 row = in_block % 8;
++                    const u32 row_offset = (in_block / 8) * 512 + (row / 2) * 64 + (row % 2) * 16;
++                    for (u32 x = xs; x < xe; ++x) {
++                        const u32 xb = (x * bpp) % 64;
++                        u8* out = block.data() + row_offset + (xb / 32) * 256 + ((xb % 32) / 16) * 32 +
++                                  (xb % 16);
++                        if (all) {
++                            std::memcpy(out, pixel.data(), bpp);
++                        } else {
++                            for (u32 b = 0; b < bpp; ++b) {
++                                if (byte_mask[b]) {
++                                    out[b] = pixel[b];
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+ void RasterizerNull::DispatchCompute() {}
+ void RasterizerNull::ResetCounter(VideoCommon::QueryType type) {}
+ void RasterizerNull::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+@@ -88,7 +333,7 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerNull::AccessAccelerateDMA() {
+ bool RasterizerNull::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
+                                            const Tegra::Engines::Fermi2D::Surface& dst,
+                                            const Tegra::Engines::Fermi2D::Config& copy_config) {
+-    return true;
++    return false; // the 2D engine's software blitter copies it
+ }
+ void RasterizerNull::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
+                                               std::span<const u8> memory) {}
+diff --git a/src/video_core/renderer_null/null_rasterizer.h b/src/video_core/renderer_null/null_rasterizer.h
+index c7f5849c7..99621fc99 100644
+--- a/src/video_core/renderer_null/null_rasterizer.h
++++ b/src/video_core/renderer_null/null_rasterizer.h
+@@ -3,7 +3,10 @@
+ 
+ #pragma once
+ 
++#include <vector>
++
+ #include "common/common_types.h"
++#include "common/scratch_buffer.h"
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/engines/maxwell_dma.h"
+ #include "video_core/rasterizer_interface.h"
+@@ -86,6 +89,7 @@ public:
+ private:
+     Tegra::GPU& m_gpu;
+     AccelerateDMA m_accelerate_dma;
++    Common::ScratchBuffer<u8> m_scratch;
+ };
+ 
+ } // namespace Null

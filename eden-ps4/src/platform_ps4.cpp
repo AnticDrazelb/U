@@ -1,7 +1,8 @@
 // The launcher on the PS4. A start page first: it shows what an unfinished last run left behind
 // (the end of its log.txt, its crash report and boot trace) so that a photo of it is enough to see
 // where it stopped, and lets the player pick a program from a list (D-pad, X): the package's
-// (two games, a controller test, the test program hello.nro) and every .nro in /data/eden-ps4.
+// (two games, a controller test, a GPU test, the test program hello.nro) and every .nro in
+// /data/eden-ps4.
 // Then the program runs. What it draws (with the CPU: there's no GPU emulation yet) fills the
 // screen; otherwise its text output and Eden's warnings and errors are shown, and they always go
 // to /data/eden-ps4/log.txt. The controller is player 1's Pro Controller. When the program ends,
@@ -609,6 +610,7 @@ std::vector<Program> ListPrograms()
         {"/app0/breakout.nro", "Breakout (a game: stick or D-pad to move, X to launch, OPTIONS to quit)"},
         {"/app0/blocks.nro", "Blocks (a game: D-pad to move, X / O to rotate, up to drop, OPTIONS to quit)"},
         {"/app0/padtest.nro", "Controller test (OPTIONS + touchpad click to quit)"},
+        {"/app0/gputest.nro", "GPU test (drawn with the Switch's GPU, as clears: OPTIONS to quit)"},
         {kTestProgram, "The test program (hello.nro: text only)"},
     };
     std::vector<std::string> found;

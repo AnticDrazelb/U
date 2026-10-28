@@ -1,4 +1,4 @@
-# Eden for PS4: stage 3, a Switch game playable
+# Eden for PS4: stage 3, Switch games playable; stage 4 begun, the GPU
 
 Stage 1 ([switch-bench](../switch-bench/README.md), results in
 [RESULTS.md](../switch-bench/RESULTS.md)) measured Eden's recompiler and the memory a PS4 can give
@@ -100,6 +100,35 @@ few: no RomFS, no program ID or title (it has no NACP), and controller mappings 
 driver, which this build leaves out with SDL. The launcher sets no Cemuhook (UDP) controller
 servers, so that client opens no socket.
 
+## Stage 4, begun: the GPU
+
+`game/gputest.c` draws with the Switch's GPU instead of the CPU. It talks to the GPU through
+libnx's nvidia services (no deko3d, no shaders): a GPU channel bound to the Maxwell 3D engine, the
+window's framebuffers mapped into the GPU's address space as its render target, every rectangle a
+clear limited to a scissor rectangle, and a fence that the command stream signals (a syncpoint
+increment) before the frame is queued. It draws a backdrop, bouncing squares and the word GPU,
+about 80 clears a frame.
+
+![The GPU test in shadPS4, drawn by the null renderer's software clears](screenshots/gputest-shadps4.png)
+
+Two ways it shows:
+
+- **The null renderer, in software** (patch 0014; the PS4 build): colour clears are written to
+  emulated memory (block linear or pitch, scissored, the common colour formats, channel masks for
+  the 8-bit ones), a block of the surface at a time, and DMA copies and 2D engine blits go to their
+  engines' software paths instead of being claimed as done. So a program that draws with clears,
+  copies and blits shows in the CPU-composed frames, on the PS4 now: the GPU test runs at 60 frames
+  a second on the desktop and 34 in shadPS4 (its display's pace again). Anything drawn with shaders
+  still shows nothing.
+- **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
+  renderer makes a surface that shows nothing (`VK_EXT_headless_surface`) and reads each frame back
+  for the launcher instead of presenting it. With lavapipe, Mesa's Vulkan driver that runs on the
+  CPU, the GPU test draws at 58 frames a second, through Eden's whole GPU path: the Maxwell engine,
+  its texture cache, its Vulkan renderer and presenter. That is the CPU-Vulkan route below, shown
+  working; what's left for the PS4 is a CPU Vulkan built for it.
+
+![The GPU test through Eden's Vulkan renderer on lavapipe](screenshots/gputest-vulkan-lavapipe.png)
+
 ## What's next: the GPU
 
 What draws with the CPU runs now; what draws with the GPU (every commercial game, and homebrew
@@ -108,10 +137,13 @@ Maxwell GPU's commands and shaders into Vulkan or OpenGL, and a PS4 app has neit
 speaks GNM, through Sony's libraries. The ways there, roughly by size:
 
 - **A CPU Vulkan.** SwiftShader (or Mesa's lavapipe) is a Vulkan driver that runs on the CPU, with
-  its shaders compiled by a JIT. Built for the PS4 (its JIT needs the system pool's executable
-  memory, as dynarmic does), it would run Eden's Vulkan renderer unchanged; its frames would reach
-  the screen as the null renderer's do now. Slow, but enough for 2D homebrew at 720p or below, and
-  the shortest way to a first GPU-drawn picture.
+  its shaders compiled by a JIT. Eden's side is done (patch 0013, tested with lavapipe above);
+  SwiftShader with its Subzero JIT (no LLVM) is the one to port, as it's built to be portable. It's
+  cloned in this build environment, but building it wasn't allowed here (newly downloaded code).
+  Built for the PS4 (its JIT needs the system pool's executable memory, as dynarmic does), it would
+  run Eden's Vulkan renderer unchanged; its frames would reach the screen as the null renderer's do
+  now. Slow, but enough for 2D homebrew at 720p or below, and the shortest way to a first GPU-drawn
+  picture.
 - **A GNM backend for Eden's renderer.** Eden's Vulkan renderer rewritten against the PS4's GPU
   library, and its shader recompiler (SPIR-V now) taught to emit PS4 shaders. Fast, and a much
   larger project: the PS4's shader format isn't documented.
@@ -127,6 +159,8 @@ of programs: the D-pad chooses, X boots.
   OPTIONS to quit.
 - **Blocks** (`blocks.nro`, in the package). D-pad or stick to move and to drop faster, Cross and
   Circle to rotate, up or Triangle to drop, the touchpad's click for the music, OPTIONS to quit.
+- **GPU test** (`gputest.nro`, in the package): drawn with the Switch's GPU (stage 4, above).
+  OPTIONS quits.
 - **Controller test** (`padtest.nro`, in the package). OPTIONS and the touchpad's click together
   quit.
 - **The test program** (`hello.nro`, in the package): stage 2's checks, text only.
@@ -151,7 +185,7 @@ Nothing is written outside `/data/eden-ps4`.
 
 Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells the most:
 
-1. Install `out/EdenPS4.pkg` and start it. The start page should list four programs. If the app
+1. Install `out/EdenPS4.pkg` and start it. The start page should list five programs. If the app
    closes or freezes before that, `/data/eden-ps4/boot-trace.log` has its last steps and
    `crash.log` its crash report (next start, the start page shows both: a photo is enough).
 2. **The test program** (stage 2's checks): every line should end with "passed" or a result, and
@@ -161,7 +195,9 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    long each waited for a buffer off the screen (the display's pace) and how long scaling it took
    (the launcher's cost).
 4. **Controller test**: each PS4 button should light its Switch button.
-5. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
+5. **GPU test**: the backdrop, the squares and GPU, drawn by the GPU emulation (software clears),
+   and its frame rate as a green bar (6 pixels a frame a second).
+6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
 After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnings and errors, and
@@ -218,6 +254,8 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: one layer at its own size | a frame with one layer (the usual case) isn't scaled to 1280x720 on its way to the frontend, which scales it anyway |
 | host memory: clear large regions on Linux by dropping their pages | a homebrew program's 3.2 GiB heap, cleared in no time on the desktop (above) |
 | audio: frontend sink streams play silently when the output can't open | a stream without an output still consumes its buffers at an output's pace, so a program waiting for them doesn't stall |
+| vulkan: headless rendering for frontends that take frames | stage 4's Vulkan renderer without a window, above |
+| null renderer: colour clears, DMA copies and 2D blits in software | stage 4's GPU test on the PS4, above |
 
 The PS4 memory changes, from what stage 1 measured:
 
@@ -245,7 +283,8 @@ consoles), and FFmpeg is built without its Linux-only calls (below).
 `test.sh` runs each program in the desktop build with scripted controller input and checks what it
 printed, drew and played: the test program's checks, Breakout's frames and beeps, Blocks' frames,
 tune and best score (saved by one run, read by the next), the controller test, stopping a program,
-and that a program with libnx's full-memory heap starts at once. 17 checks, about 25 s.
+the GPU test (its fences, and its frames having the picture), and that a program with libnx's
+full-memory heap starts at once. 20 checks, about 30 s.
 
 ## Building
 

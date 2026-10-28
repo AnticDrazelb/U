@@ -79,6 +79,17 @@ run padtest "$work/padtest.nro" 20 "1:A+Left,2:,3:Plus+Minus,3.3:"
 check "exits on + and -" code padtest 0
 check "draws 1280x720 frames (libnx's console)" drew padtest "1280 720"
 
+echo "gputest.nro: drawn with the GPU (clears, done in software by the null renderer)"
+run gputest "$work/gputest.nro" 20 "5:Plus,5.5:"
+check "exits on +" code gputest 0
+check "submits GPU work and waits on its fences" says gputest "gputest: [0-9]* fps"
+check "its frames have the picture" python3 - "$work/gputest-frames/last.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+pixels = data[data.index(b'255\n') + 4:]
+sys.exit(0 if sum(pixels) / len(pixels) > 40 else 1)
+PY
+
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"
 check "Stop ends it (exit code 3)" code stop 3
