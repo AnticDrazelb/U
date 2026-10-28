@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 05:19:57 +0000
+Subject: [PATCH] null renderer: frames for frontends without a GPU renderer
+
+When the window asks for them (EmuWindow::WantsSoftwareFrames), the null
+renderer composes each frame's layers on the CPU, reading the guest
+framebuffers as the Vulkan presenter's fallback does (block linear,
+unswizzled), and hands the frame to EmuWindow::OnSoftwareFrame. A frontend
+without a GPU renderer, such as the PS4's for now, can then show what
+programs draw with the CPU.
+---
+ src/core/frontend/emu_window.h                |  11 ++
+ .../renderer_null/renderer_null.cpp           | 111 +++++++++++++++++-
+ src/video_core/renderer_null/renderer_null.h  |  12 +-
+ src/video_core/video_core.cpp                 |   2 +-
+ 4 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
+index ee7a7693b..af103da71 100644
+--- a/src/core/frontend/emu_window.h
++++ b/src/core/frontend/emu_window.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <span>
+ #include <utility>
+ 
+ #include "common/common_types.h"
+@@ -76,6 +77,16 @@ public:
+     /// Called from GPU thread when a frame is displayed.
+     virtual void OnFrameDisplayed() {}
+ 
++    /// Whether the null renderer should compose each frame on the CPU for OnSoftwareFrame (for a
++    /// frontend without a GPU renderer, which can still show what programs draw with the CPU).
++    virtual bool WantsSoftwareFrames() const {
++        return false;
++    }
++
++    /// A frame composed by the null renderer: `width` x `height` pixels, each R, G, B, A bytes
++    /// (opaque). Called from the GPU thread.
++    virtual void OnSoftwareFrame(std::span<const u32> pixels, u32 width, u32 height) {}
++
+     /**
+      * Returns a GraphicsContext that the frontend provides to be used for rendering.
+      */
+diff --git a/src/video_core/renderer_null/renderer_null.cpp b/src/video_core/renderer_null/renderer_null.cpp
+index e6147d66c..98dba975a 100644
+--- a/src/video_core/renderer_null/renderer_null.cpp
++++ b/src/video_core/renderer_null/renderer_null.cpp
+@@ -1,16 +1,62 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++
+ #include "core/frontend/emu_window.h"
++#include "core/frontend/framebuffer_layout.h"
+ #include "core/frontend/graphics_context.h"
+ #include "video_core/capture.h"
++#include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/renderer_null/renderer_null.h"
++#include "video_core/surface.h"
++#include "video_core/textures/decoders.h"
+ 
+ namespace Null {
+ 
+-RendererNull::RendererNull(Core::Frontend::EmuWindow& emu_window, Tegra::GPU& gpu,
++namespace {
++
++// One pixel as R, G, B, A bytes, from the framebuffer's format.
++u32 ToRgba(const u8* p, Service::android::PixelFormat format) {
++    switch (format) {
++    case Service::android::PixelFormat::Rgba8888:
++        return u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24;
++    case Service::android::PixelFormat::Rgbx8888:
++        return u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | 0xFF000000u;
++    case Service::android::PixelFormat::Bgra8888:
++        return u32(p[2]) | u32(p[1]) << 8 | u32(p[0]) << 16 | u32(p[3]) << 24;
++    case Service::android::PixelFormat::Rgb565: {
++        const u32 v = u32(p[0]) | u32(p[1]) << 8;
++        const u32 r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, b = v & 0x1F;
++        return (r << 3 | r >> 2) | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2) << 16 | 0xFF000000u;
++    }
++    default:
++        return 0xFF000000u;
++    }
++}
++
++u32 Blend(u32 dst, u32 src, Tegra::BlendMode mode) {
++    const u32 a = src >> 24;
++    if (mode == Tegra::BlendMode::Opaque || a == 0xFF) {
++        return src | 0xFF000000u;
++    }
++    u32 out = 0xFF000000u;
++    for (int shift = 0; shift < 24; shift += 8) {
++        const u32 s = (src >> shift) & 0xFF, d = (dst >> shift) & 0xFF;
++        const u32 v = mode == Tegra::BlendMode::Premultiplied ? s + d * (255 - a) / 255
++                                                              : (s * a + d * (255 - a)) / 255;
++        out |= std::min<u32>(v, 255) << shift;
++    }
++    return out;
++}
++
++} // namespace
++
++RendererNull::RendererNull(Core::Frontend::EmuWindow& emu_window,
++                           Tegra::MaxwellDeviceMemoryManager& device_memory, Tegra::GPU& gpu,
+                            std::unique_ptr<Core::Frontend::GraphicsContext> context_)
+-    : RendererBase(emu_window, std::move(context_)), m_gpu(gpu), m_rasterizer(gpu) {}
++    : RendererBase(emu_window, std::move(context_)), m_device_memory(device_memory), m_gpu(gpu),
++      m_rasterizer(gpu) {}
+ 
+ RendererNull::~RendererNull() = default;
+ 
+@@ -19,10 +65,71 @@ void RendererNull::Composite(std::span<const Tegra::FramebufferConfig> framebuff
+         return;
+     }
+ 
++    if (render_window.WantsSoftwareFrames()) {
++        ComposeSoftwareFrame(framebuffers);
++    }
++
+     m_gpu.RendererFrameEndNotify();
+     render_window.OnFrameDisplayed();
+ }
+ 
++void RendererNull::ComposeSoftwareFrame(std::span<const Tegra::FramebufferConfig> framebuffers) {
++    // The Switch's screen (handheld): layers are scaled to it, in order, bottom to top.
++    constexpr u32 width = Layout::ScreenUndocked::Width;
++    constexpr u32 height = Layout::ScreenUndocked::Height;
++    m_frame.assign(size_t(width) * height, 0xFF000000u);
++
++    for (const auto& layer : framebuffers) {
++        if (!(layer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
++                                           Service::Nvnflinger::LayerStackId::Default))) {
++            continue;
++        }
++        using namespace VideoCore::Surface;
++        const u32 bpp = BytesPerBlock(PixelFormatFromGPUPixelFormat(layer.pixel_format));
++        const u8* const tiled = m_device_memory.GetPointer<u8>(layer.address + layer.offset);
++        if (!tiled || layer.width == 0 || layer.height == 0 || bpp == 0) {
++            continue;
++        }
++        // Block linear, as the Vulkan presenter reads it (block height 16 GOBs).
++        constexpr u32 block_height_log2 = 4;
++        const u64 tiled_size = Tegra::Texture::CalculateSize(true, bpp, layer.stride, layer.height,
++                                                             1, block_height_log2, 0);
++        m_linear.resize(size_t(layer.width) * layer.height * bpp);
++        Tegra::Texture::UnswizzleTexture(m_linear, std::span(tiled, tiled_size), bpp, layer.width,
++                                         layer.height, 1, block_height_log2, 0);
++
++        Common::Rectangle<int> crop = layer.crop_rect;
++        if (crop.GetWidth() <= 0 || crop.GetHeight() <= 0) {
++            crop = {0, 0, int(layer.width), int(layer.height)};
++        }
++        crop.right = std::min<int>(crop.right, int(layer.width));
++        crop.bottom = std::min<int>(crop.bottom, int(layer.height));
++        const int crop_w = crop.GetWidth(), crop_h = crop.GetHeight();
++        if (crop_w <= 0 || crop_h <= 0) {
++            continue;
++        }
++        const auto flags = static_cast<u32>(layer.transform_flags);
++        const bool flip_h = flags & static_cast<u32>(Service::android::BufferTransformFlags::FlipH);
++        const bool flip_v = flags & static_cast<u32>(Service::android::BufferTransformFlags::FlipV);
++        for (u32 y = 0; y < height; y++) {
++            int sy = crop.top + int(u64(y) * crop_h / height);
++            if (flip_v) {
++                sy = crop.bottom - 1 - (sy - crop.top);
++            }
++            const u8* row = m_linear.data() + size_t(sy) * layer.width * bpp;
++            u32* out = m_frame.data() + size_t(y) * width;
++            for (u32 x = 0; x < width; x++) {
++                int sx = crop.left + int(u64(x) * crop_w / width);
++                if (flip_h) {
++                    sx = crop.right - 1 - (sx - crop.left);
++                }
++                out[x] = Blend(out[x], ToRgba(row + size_t(sx) * bpp, layer.pixel_format), layer.blending);
++            }
++        }
++    }
++    render_window.OnSoftwareFrame(m_frame, width, height);
++}
++
+ std::vector<u8> RendererNull::GetAppletCaptureBuffer() {
+     return std::vector<u8>(VideoCore::Capture::TiledSize);
+ }
+diff --git a/src/video_core/renderer_null/renderer_null.h b/src/video_core/renderer_null/renderer_null.h
+index 34dbe1e4f..ef1705554 100644
+--- a/src/video_core/renderer_null/renderer_null.h
++++ b/src/video_core/renderer_null/renderer_null.h
+@@ -5,7 +5,9 @@
+ 
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
++#include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/renderer_null/null_rasterizer.h"
+ 
+@@ -13,7 +15,8 @@ namespace Null {
+ 
+ class RendererNull final : public VideoCore::RendererBase {
+ public:
+-    explicit RendererNull(Core::Frontend::EmuWindow& emu_window, Tegra::GPU& gpu,
++    explicit RendererNull(Core::Frontend::EmuWindow& emu_window,
++                          Tegra::MaxwellDeviceMemoryManager& device_memory, Tegra::GPU& gpu,
+                           std::unique_ptr<Core::Frontend::GraphicsContext> context);
+     ~RendererNull() override;
+ 
+@@ -30,8 +33,15 @@ public:
+     }
+ 
+ private:
++    /// Composes the layers on the CPU (as the Vulkan presenter's fallback reads framebuffers
++    /// drawn by the CPU) and hands the frame to the window.
++    void ComposeSoftwareFrame(std::span<const Tegra::FramebufferConfig> framebuffers);
++
++    Tegra::MaxwellDeviceMemoryManager& m_device_memory;
+     Tegra::GPU& m_gpu;
+     RasterizerNull m_rasterizer;
++    std::vector<u32> m_frame;
++    std::vector<u8> m_linear;
+ };
+ 
+ } // namespace Null
+diff --git a/src/video_core/video_core.cpp b/src/video_core/video_core.cpp
+index 54fb8f623..c261dff03 100644
+--- a/src/video_core/video_core.cpp
++++ b/src/video_core/video_core.cpp
+@@ -35,7 +35,7 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
+     case Settings::RendererBackend::Vulkan:
+         return std::make_unique<Vulkan::RendererVulkan>(emu_window, device_memory, gpu, std::move(context));
+     case Settings::RendererBackend::Null:
+-        return std::make_unique<Null::RendererNull>(emu_window, gpu, std::move(context));
++        return std::make_unique<Null::RendererNull>(emu_window, device_memory, gpu, std::move(context));
+     default:
+         return nullptr;
+     }

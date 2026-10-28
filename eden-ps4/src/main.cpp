@@ -5,6 +5,7 @@
 
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <system_error>
@@ -20,8 +21,11 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "launcher.h"
 #include "network/network.h"
@@ -30,19 +34,35 @@
 namespace Launcher {
 namespace {
 
-/// A window that is never drawn to: the null renderer only needs the interface.
+/// A window without a GPU behind it: the null renderer composes frames drawn by the CPU, which
+/// go to the platform's frame sink.
 class HeadlessWindow final : public Core::Frontend::EmuWindow {
 public:
-    HeadlessWindow() {
+    explicit HeadlessWindow(FrameSink frames_) : frames{frames_} {
         window_info.type = Core::Frontend::WindowSystemType::Headless;
     }
     std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override {
         return std::make_unique<Core::Frontend::GraphicsContext>();
     }
     bool IsShown() const override {
-        return false;
+        return frames != nullptr;
     }
+    bool WantsSoftwareFrames() const override {
+        return frames != nullptr;
+    }
+    void OnSoftwareFrame(std::span<const u32> pixels, u32 width, u32 height) override {
+        frames(pixels, width, height);
+    }
+
+private:
+    FrameSink frames;
 };
+
+// Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
+// while a program runs.
+std::mutex g_pad_mutex;
+InputCommon::VirtualGamepad* g_gamepad = nullptr;
+PadState g_pad_state;
 
 std::mutex g_output_mutex;
 LineSink g_sink = nullptr;
@@ -69,16 +89,43 @@ void OnLog(Common::Log::Class log_class, Common::Log::Level level, std::string_v
         Output(LineKind::Error, line);
     } else if (level == Common::Log::Level::Warning) {
         Output(LineKind::Warning, line);
+    } else if (g_sink) {
+        // only with a log filter below Warning (EDEN_PS4_LOG); not in log.txt
+        g_sink(LineKind::Info, line);
     }
 }
 
 void ApplyLauncherSettings() {
+    // Eden's log filter (e.g. "*:Info Service.VI:Debug"); by default warnings and errors only
+    const char* filter = std::getenv("EDEN_PS4_LOG");
+    Settings::values.log_filter = filter ? filter : "*:Warning Debug.Emulated:Info";
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Null);
     Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
     Settings::values.use_disk_shader_cache.SetValue(false);
     // No Cemuhook (UDP) controller servers: their client would open a host socket at start,
     // for controllers this launcher doesn't use.
     Settings::values.udp_input_servers.SetValue("");
+    // No ring controller (it maps to the Joy-Con driver, which isn't in this build).
+    Settings::values.ringcon_analogs = "";
+
+    // Player 1: a Pro Controller on the virtual gamepad (SetPad); no handheld console.
+    auto& players = Settings::values.players.GetValue();
+    for (auto& player : players) {
+        player.connected = false;
+    }
+    auto& player = players[0];
+    player.connected = true;
+    player.controller_type = Settings::ControllerType::ProController;
+    for (int i = 0; i < Settings::NativeButton::NumButtons; i++) {
+        player.buttons[i] = i < 20 ? fmt::format("engine:virtual_gamepad,port:0,button:{}", i) : "";
+    }
+    for (int i = 0; i < Settings::NativeAnalog::NumAnalogs; i++) {
+        player.analogs[i] = fmt::format(
+            "engine:virtual_gamepad,port:0,axis_x:{},axis_y:{},deadzone:0.0,range:1.0", i * 2, i * 2 + 1);
+    }
+    for (auto& motion : player.motions) {
+        motion = "";
+    }
 }
 
 const char* LoadError(Core::SystemResultStatus status) {
@@ -96,8 +143,29 @@ const char* LoadError(Core::SystemResultStatus status) {
 
 } // namespace
 
+void SetPad(const PadState& state) {
+    std::scoped_lock lock{g_pad_mutex};
+    if (!g_gamepad) {
+        return;
+    }
+    const u32 changed = state.buttons ^ g_pad_state.buttons;
+    for (int i = 0; i < 20; i++) {
+        if (changed & (1u << i)) {
+            g_gamepad->SetButtonState(0, i, (state.buttons >> i) & 1);
+        }
+    }
+    using Stick = InputCommon::VirtualGamepad::VirtualStick;
+    if (state.lx != g_pad_state.lx || state.ly != g_pad_state.ly) {
+        g_gamepad->SetStickPosition(0, Stick::Left, state.lx, state.ly);
+    }
+    if (state.rx != g_pad_state.rx || state.ry != g_pad_state.ry) {
+        g_gamepad->SetStickPosition(0, Stick::Right, state.rx, state.ry);
+    }
+    g_pad_state = state;
+}
+
 BootResult Boot(const std::filesystem::path& program, const std::filesystem::path& data_dir,
-                LineSink sink, std::chrono::milliseconds timeout) {
+                LineSink sink, FrameSink frames, std::chrono::milliseconds timeout) {
     // Eden's data folders (NAND, SD card, keys...) in data_dir/user.
     std::error_code ec;
     std::filesystem::create_directories(data_dir / "user", ec);
@@ -109,11 +177,11 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
     g_sink = sink;
     g_log = std::fopen((data_dir / "log.txt").c_str(), "w");
 
+    ApplyLauncherSettings();
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(false);
     Common::Log::SetCallback(OnLog);
     Common::Log::Start();
-    ApplyLauncherSettings();
     // ENet and the multiplayer room, which the BSD sockets service expects
     Network::Init();
 
@@ -124,10 +192,15 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
         InputCommon::InputSubsystem input;
         input.Initialize();
         {
+            std::scoped_lock lock{g_pad_mutex};
+            g_gamepad = input.GetVirtualGamepad();
+            g_pad_state = {};
+        }
+        {
             Core::System system;
             system.Initialize();
             system.ApplySettings();
-            HeadlessWindow window;
+            HeadlessWindow window{frames};
 
             system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
             system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
@@ -159,8 +232,26 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     result = {BootResult::Status::Exited, {}};
                 lock.unlock();
                 void(system.Pause());
+                if (!exited) {
+                    // Where the program's threads were: addresses relative to its start (the
+                    // NRO's ELF addresses), to symbolize
+                    if (auto* process = system.ApplicationProcess()) {
+                        const u64 base = GetInteger(process->GetEntryPoint());
+                        for (auto& thread : process->GetThreadList()) {
+                            const auto& ctx = thread.GetContext();
+                            Output(LineKind::Status,
+                                   fmt::format("thread {}: pc {:#x} lr {:#x} sp {:#x} (image at {:#x})",
+                                               thread.GetThreadId(), ctx.pc - base, ctx.lr - base,
+                                               ctx.sp, base));
+                        }
+                    }
+                }
                 system.ShutdownMainProcess();
             }
+        }
+        {
+            std::scoped_lock lock{g_pad_mutex};
+            g_gamepad = nullptr;
         }
         input.Shutdown();
     }

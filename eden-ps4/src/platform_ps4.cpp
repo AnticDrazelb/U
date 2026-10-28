@@ -1,11 +1,14 @@
 // The launcher on the PS4. A start page first: it shows what an unfinished last run left behind
 // (the end of its log.txt, its crash report and boot trace) so that a photo of it is enough to see
 // where it stopped, and lets the player pick a program:
-//   X       the test program in the package (hello.nro)
-//   SQUARE  /data/eden-ps4/boot.nro
-// Then the program runs, with its output and Eden's warnings and errors on screen (a text console
-// drawn into a video-out framebuffer) and in /data/eden-ps4/log.txt. Nothing is written outside
-// /data/eden-ps4; Eden's data folders are in /data/eden-ps4/user.
+//   X         Breakout, a game in the package (breakout.nro)
+//   TRIANGLE  the test program in the package (hello.nro)
+//   SQUARE    /data/eden-ps4/boot.nro
+// Then the program runs. What it draws (with the CPU: there's no GPU emulation yet) fills the
+// screen; otherwise its text output and Eden's warnings and errors are shown, and they always go
+// to /data/eden-ps4/log.txt. The controller is player 1's Pro Controller. When the program ends,
+// the start page comes back. Nothing is written outside /data/eden-ps4; Eden's data folders are
+// in /data/eden-ps4/user.
 //
 // The screen, controller and start page are switch-bench's (../../switch-bench/src/platform_ps4.cpp).
 #include <algorithm>
@@ -14,7 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <atomic>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -55,6 +60,7 @@ constexpr const char* kCrashFile = "/data/eden-ps4/crash.log";
 // The last run's boot trace: Crema's runtime renames boot-trace.log to this as the app starts.
 constexpr const char* kLastTraceFile = "/data/eden-ps4/boot-trace-launcher.log";
 constexpr const char* kTestProgram = "/app0/hello.nro";
+constexpr const char* kGame = "/app0/breakout.nro";
 constexpr const char* kUserProgram = "/data/eden-ps4/boot.nro";
 // The last line of log.txt after a run that finished.
 constexpr const char* kFinishedLine = "eden-ps4: run finished";
@@ -154,6 +160,41 @@ public:
         Draw();
     }
 
+    // A frame the program drew, scaled to fill the screen (nearest pixel). Its pixels are R, G, B,
+    // A bytes: the buffers' own order.
+    void DrawFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
+    {
+        if (!open || width == 0 || height == 0)
+            return;
+        if (map_width != width || map_height != height)
+        {
+            x_map.resize(kWidth);
+            y_map.resize(kHeight);
+            for (int x = 0; x < kWidth; x++)
+                x_map[x] = uint32_t(uint64_t(x) * width / kWidth);
+            for (int y = 0; y < kHeight; y++)
+                y_map[y] = uint32_t(uint64_t(y) * height / kHeight);
+            map_width = width;
+            map_height = height;
+        }
+        WaitForImageOffScreen();
+        uint32_t* fb = buffers[current];
+        for (int y = 0; y < kHeight; y++)
+        {
+            uint32_t* dst = fb + size_t(y) * kWidth;
+            if (y > 0 && y_map[y] == y_map[y - 1])
+            {
+                std::memcpy(dst, dst - kWidth, kWidth * sizeof(uint32_t));
+                continue;
+            }
+            const uint32_t* src = pixels.data() + size_t(y_map[y]) * width;
+            for (int x = 0; x < kWidth; x++)
+                dst[x] = src[x_map[x]];
+        }
+        sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, int64_t(++flips));
+        current = (current + 1) % kFrames;
+    }
+
     void Draw()
     {
         if (!open)
@@ -196,6 +237,8 @@ private:
     int line_height = 24;
     std::vector<Line> lines;
     std::string status;
+    std::vector<uint32_t> x_map, y_map;
+    uint32_t map_width = 0, map_height = 0;
 
     static bool Failed(const char* call, int32_t ret)
     {
@@ -398,18 +441,72 @@ bool Exists(const char* path)
     return stat(path, &st) == 0;
 }
 
-// Shows the start page and waits for a choice. Without a controller, or after a finished run, the
-// test program boots after a countdown.
-std::string StartPage()
+// Player 1's controller from the PS4 pad, by the PS4's conventions: Cross is A (confirm),
+// Circle B, Square Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -.
+Launcher::PadState ToSwitchPad(const OrbisPadData& pad)
+{
+    static const std::pair<uint32_t, uint32_t> map[] = {
+        {ORBIS_PAD_BUTTON_CROSS, Launcher::ButtonA},       {ORBIS_PAD_BUTTON_CIRCLE, Launcher::ButtonB},
+        {ORBIS_PAD_BUTTON_SQUARE, Launcher::ButtonY},      {ORBIS_PAD_BUTTON_TRIANGLE, Launcher::ButtonX},
+        {ORBIS_PAD_BUTTON_L1, Launcher::ButtonL},          {ORBIS_PAD_BUTTON_R1, Launcher::ButtonR},
+        {ORBIS_PAD_BUTTON_L2, Launcher::ButtonZL},         {ORBIS_PAD_BUTTON_R2, Launcher::ButtonZR},
+        {ORBIS_PAD_BUTTON_OPTIONS, Launcher::ButtonPlus},  {ORBIS_PAD_BUTTON_TOUCH_PAD, Launcher::ButtonMinus},
+        {ORBIS_PAD_BUTTON_L3, Launcher::ButtonLStick},     {ORBIS_PAD_BUTTON_R3, Launcher::ButtonRStick},
+        {ORBIS_PAD_BUTTON_UP, Launcher::ButtonUp},         {ORBIS_PAD_BUTTON_DOWN, Launcher::ButtonDown},
+        {ORBIS_PAD_BUTTON_LEFT, Launcher::ButtonLeft},     {ORBIS_PAD_BUTTON_RIGHT, Launcher::ButtonRight}};
+    Launcher::PadState state;
+    for (const auto& [ps4, nx] : map)
+        if (pad.buttons & ps4)
+            state.buttons |= nx;
+    const auto axis = [](uint8_t v) { return std::clamp((int(v) - 128) / 127.0f, -1.0f, 1.0f); };
+    state.lx = axis(pad.leftStick.x);
+    state.ly = -axis(pad.leftStick.y);
+    state.rx = axis(pad.rightStick.x);
+    state.ry = -axis(pad.rightStick.y);
+    return state;
+}
+
+// While a program runs: the pad, read every 4 ms, as player 1's controller.
+std::atomic<bool> g_running{false};
+void* PadThread(void*)
+{
+    while (g_running)
+    {
+        union {
+            OrbisPadData data;
+            unsigned char room[512]; // in case the system's structure is larger than the header's
+        } state{};
+        if (g_pad >= 0 && scePadReadState(g_pad, &state.data) == 0 && state.data.connected)
+            Launcher::SetPad(ToSwitchPad(state.data));
+        usleep(4000);
+    }
+    return nullptr;
+}
+
+// Frames from the program: once it draws, the screen shows its frames instead of the text.
+std::atomic<bool> g_drawing{false};
+void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
+{
+    std::lock_guard lock{g_mutex};
+    if (!g_drawing.exchange(true))
+        Trace("first frame from the program");
+    g_screen.DrawFrame(pixels, width, height);
+}
+
+// Shows the start page and waits for a choice. On the first one, without a controller or after a
+// finished run, the test program boots after a countdown; later ones wait for a button.
+std::string StartPage(bool first)
 {
     const std::vector<std::string> log = ReadLines(kLogFile);
     const std::vector<std::string> crash = ReadLines(kCrashFile);
     const std::vector<std::string> trace = ReadLines(kLastTraceFile);
-    const bool unfinished = !crash.empty() || (!log.empty() && log.back() != kFinishedLine);
+    const bool unfinished = first && (!crash.empty() || (!log.empty() && log.back() != kFinishedLine));
     const bool have_user_program = Exists(kUserProgram);
 
+    std::lock_guard lock{g_mutex};
+    g_screen.Clear();
     g_screen.SetScale(1.75f);
-    g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": Eden's Switch core, booting a Switch program (text only: no GPU, no audio yet)",
+    g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": Eden's Switch core, booting Switch homebrew (drawn with the CPU: no GPU emulation yet)",
                  kGreen, false);
     if (unfinished)
     {
@@ -434,18 +531,32 @@ std::string StartPage()
             g_screen.Add("   " + l, kWhite, false);
         g_screen.Add("", kWhite, false);
     }
-    g_screen.Add(fmt::format("Press  X: the test program (hello.nro)    SQUARE: {}", have_user_program
-                                 ? "/data/eden-ps4/boot.nro"
-                                 : "/data/eden-ps4/boot.nro (there is none)"),
+    else if (!first)
+    {
+        g_screen.Add("The program ended; its output is in /data/eden-ps4/log.txt.", kWhite, false);
+    }
+    g_screen.Add("", kWhite, false);
+    g_screen.Add("Press  X: Breakout (a game)    TRIANGLE: the test program (hello.nro)", kYellow, false);
+    g_screen.Add(fmt::format("       SQUARE: {}", have_user_program ? "/data/eden-ps4/boot.nro"
+                                                                    : "/data/eden-ps4/boot.nro (there is none)"),
                  kYellow, false);
-    OpenPad();
+    g_screen.Add("In Breakout: left stick or D-pad to move, X to launch the ball, OPTIONS to quit.", kGrey, false);
+    if (first)
+        OpenPad();
     Trace(fmt::format("start page: last run {}, pad {}", unfinished ? "unfinished" : "finished or none", g_pad));
 
-    // with a controller after an unfinished run: wait for the choice (the photo comes first)
-    const bool wait = unfinished && g_pad >= 0;
+    // with a controller after an unfinished run, or after this session's first run: wait for the
+    // choice (the photo comes first)
+    const bool wait = g_pad >= 0 && (unfinished || !first);
+    if (!first && g_pad < 0)
+    {
+        g_screen.SetStatus("no controller: close the app (PS button)");
+        for (;;)
+            sleep(1);
+    }
     const int countdown = g_pad < 0 ? 60 : 15;
     const double start = Seconds();
-    uint32_t previous = PadButtons(); // a button still held from starting the app doesn't count
+    uint32_t previous = PadButtons(); // a button still held from before doesn't count
     std::string program = kTestProgram;
     for (int last_shown = -1;;)
     {
@@ -453,6 +564,11 @@ std::string StartPage()
         const uint32_t pressed = buttons & ~previous;
         previous = buttons;
         if (pressed & ORBIS_PAD_BUTTON_CROSS)
+        {
+            program = kGame;
+            break;
+        }
+        if (pressed & ORBIS_PAD_BUTTON_TRIANGLE)
             break;
         if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && have_user_program)
         {
@@ -473,7 +589,9 @@ std::string StartPage()
             last_shown = 0;
             g_screen.SetStatus("waiting for a button");
         }
+        g_mutex.unlock();
         usleep(50 * 1000);
+        g_mutex.lock();
     }
     Trace("start page: booting " + program);
 
@@ -504,29 +622,40 @@ void ShowLine(Launcher::LineKind kind, std::string_view text)
         color = kYellow;
         Trace(std::string(text));
         break;
+    case Launcher::LineKind::Info:
+        return;
     }
-    g_screen.Add(std::string(text), color);
+    // while the program draws, its frames have the screen: the lines are kept for later
+    g_screen.Add(std::string(text), color, !g_drawing);
 }
 
 void* Run(void*)
 {
-    const std::string program = StartPage();
     // Eden finds its data under $HOME when no folder is given, and a few paths it always takes
     // from there: keep them in the app's folder.
     setenv("HOME", kDataDir, 1);
-    g_screen.SetStatus(fmt::format("booting {}", program));
-    const auto result = Launcher::Boot(program, kDataDir, ShowLine, std::chrono::minutes(10));
-    Trace(fmt::format("boot returned: status {}", int(result.status)));
-    if (FILE* f = std::fopen(kLogFile, "a"))
+    for (bool first = true;; first = false)
     {
-        std::fprintf(f, "%s\n", kFinishedLine);
-        std::fclose(f);
+        const std::string program = StartPage(first);
+        {
+            std::lock_guard lock{g_mutex};
+            g_screen.SetStatus(fmt::format("booting {}", program));
+        }
+        g_drawing = false;
+        g_running = true;
+        pthread_t pad_thread;
+        pthread_create(&pad_thread, nullptr, PadThread, nullptr);
+        const auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
+        g_running = false;
+        pthread_join(pad_thread, nullptr);
+        g_drawing = false;
+        Trace(fmt::format("boot returned: status {}", int(result.status)));
+        if (FILE* f = std::fopen(kLogFile, "a"))
+        {
+            std::fprintf(f, "%s\n", kFinishedLine);
+            std::fclose(f);
+        }
     }
-    std::lock_guard lock{g_mutex};
-    g_screen.Add(fmt::format("Done. The output is in {}. Take a photo of this screen, then close the app (PS button).",
-                             kLogFile),
-                 kGreen);
-    g_screen.SetStatus("finished");
     return nullptr;
 }
 

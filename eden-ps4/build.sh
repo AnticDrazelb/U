@@ -72,6 +72,7 @@ ps4)
     cp "$build/extra_frontend/eden-ps4_eboot/eboot.bin" "$stage/"
     cp "$HERE/sce_sys/icon0.png" "$stage/sce_sys/"
     OUT="$stage" "$HERE/hello/build.sh" >/dev/null
+    OUT="$stage" "$HERE/game/build.sh" >/dev/null
     mkdir -p "$build/no-modules" "$HERE/../out"
     pkg="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR="$build/no-modules" \
         "$HERE/../scripts/make-pkg.sh" "$stage" EDNP00001 "Eden for PS4" "$version" EDENPS4 "$build/out" |
