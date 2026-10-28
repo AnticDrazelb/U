@@ -20,7 +20,8 @@
 // And a floor in perspective (bottom middle) with a mipmapped texture: each level a colour of its
 // own, sampled where the floor's derivatives choose, the shader branching per pixel for stripes.
 // And two squares whose fragment programs write their own depths (top right), and a square of the
-// tile through an sRGB texture header.
+// tile through an sRGB texture header. And a compute program (shared memory, a barrier) filling a
+// texture shown on a square at the top.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100).
 
@@ -45,7 +46,9 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define CLASS_3D 0xB197 // Maxwell B
 #define CLASS_2D 0x902D // Fermi 2D
 #define CLASS_DMA 0xB0B5 // Maxwell DMA copy
+#define CLASS_COMPUTE 0xB1C0 // Maxwell compute
 #define SUBCH_3D 0
+#define SUBCH_COMPUTE 1
 #define SUBCH_2D 2
 #define SUBCH_DMA 4
 #define M2D_DST_FORMAT 0x080 // format, layout, block size, depth, layer
@@ -173,6 +176,45 @@ static u64 exit_(void) { // EXIT (condition: true)
 static u64 nop(void) {
     return 0xA16ull << 51 | PT;
 }
+// compute's: S2R Rdest, special register (33, 34: the invocation's x, y; 37, 38: the workgroup's)
+static u64 s2r(u32 dest, u32 special) {
+    return 0xF0C8ull << 48 | (u64)special << 20 | PT | RZ << 8 | dest;
+}
+// ISCADD Rdest, Ra, Rb, scale: (Ra << scale) + Rb
+static u64 iscadd(u32 dest, u32 a, u32 b, u32 scale) {
+    return 0x5C18ull << 48 | (u64)scale << 39 | (u64)b << 20 | PT | (u64)a << 8 | dest;
+}
+// SHL Rdest, Rsrc, shift
+static u64 shl(u32 dest, u32 src, u32 shift) {
+    return 0x3848ull << 48 | (u64)shift << 20 | PT | (u64)src << 8 | dest;
+}
+// LOP.OR Rdest, Ra, Rb
+static u64 lop_or(u32 dest, u32 a, u32 b) {
+    return 0x5C47ull << 48 /* no predicate out */ | 1ull << 41 /* or */ | (u64)b << 20 | PT | (u64)a << 8 | dest;
+}
+// LOP32I Rdest, Rsrc, value: 1 or, 2 xor
+static u64 lop32i(u32 dest, u32 src, u32 operation, u32 value) {
+    return 1ull << 58 | (u64)operation << 53 | (u64)value << 20 | PT | (u64)src << 8 | dest;
+}
+// STS [Raddr], Rsrc and LDS Rdest, [Raddr]: 32 bits of shared memory
+static u64 sts(u32 addr, u32 src) {
+    return 0xEF5Cull << 48 | PT | (u64)addr << 8 | src;
+}
+static u64 lds(u32 dest, u32 addr) {
+    return 0xEF4Cull << 48 | PT | (u64)addr << 8 | dest;
+}
+// BAR.SYNC 0: the workgroup's invocations wait for each other
+static u64 bar_sync(void) {
+    return 0xF0A8ull << 48 | 1ull << 44 | 1ull << 43 | 1ull << 39 /* sync */ | PT;
+}
+// IADD Rdest, Ra, c[bank][offset]
+static u64 iadd_cbuf(u32 dest, u32 a, u32 bank, u32 offset) {
+    return 0x4C10ull << 48 | (u64)bank << 34 | (u64)(offset / 4) << 20 | PT | (u64)a << 8 | dest;
+}
+// STG.E [Raddr..Raddr+1], Rsrc: 32 bits to a 64-bit GPU address
+static u64 stg(u32 addr, u32 src) {
+    return 0xEEDCull << 48 | 1ull << 45 | PT | (u64)addr << 8 | src;
+}
 #define SCHED 0x001F8000FC0007E0ull // a scheduling word (before every three instructions)
 
 // The shader programs, in a GPU buffer: each a 0x50-byte header (SPH) and its code, placed so
@@ -186,6 +228,10 @@ static u64 nop(void) {
 #define FS_DEPTH_OFFSET 0x610 // colour from varying 0, depth from varying 1's x
 #define VS_DEPTH_OFFSET 0x710 // the vertex program with a third attribute, as varying 1
 #define FS_SRGB_OFFSET 0x810  // the tile, through an sRGB texture header (handle 3)
+#define FS_COMPUTED_OFFSET 0xA10 // the texture the compute program fills (handle 4)
+#define CS_OFFSET 0x900       // the compute program (no header)
+#define CS_CBUF 0x4800        // its constant buffer 0: the storage buffer it writes, at 0x110
+#define QMD_OFFSET 0x4A00     // its launch description (256-byte aligned)
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -326,6 +372,30 @@ static void write_programs(u8* heap) {
     u64* fsrgb = (u64*)(heap + FS_SRGB_OFFSET + 0x50);
     memcpy(fsrgb, ft, 8 * sizeof(u64));
     fsrgb[3] = tex2d(0, 4, 12);
+    u32* fc_sph = (u32*)(heap + FS_COMPUTED_OFFSET);
+    memcpy(fc_sph, ft_sph, 0x50);
+    u64* fcomp = (u64*)(heap + FS_COMPUTED_OFFSET + 0x50);
+    memcpy(fcomp, ft, 8 * sizeof(u64));
+    fcomp[3] = tex2d(0, 4, 16);
+
+    // the compute program: workgroups of 8x8, each invocation a colour from where it is (red its x
+    // across the image, green its y, blue its index in the workgroup) put in shared memory; after
+    // the barrier, each takes the colour of the one mirrored in the workgroup (index 63 - its own)
+    // and writes it to its texel of a 32x32 image (a storage buffer)
+    u64* cs = (u64*)(heap + CS_OFFSET);
+    const u64 code[] = {
+        s2r(0, 33), s2r(1, 34), s2r(2, 37),                          // R0, R1 = x, y in the workgroup; R2 = its x
+        s2r(3, 38), iscadd(4, 1, 0, 3), iscadd(5, 2, 0, 3),          // R3 = its y; R4 = index; R5 = x
+        iscadd(6, 3, 1, 3), shl(7, 5, 3), shl(8, 6, 11),             // R6 = y; red, green
+        shl(9, 4, 18), lop_or(7, 7, 8), lop_or(7, 7, 9),             // blue
+        lop32i(7, 7, 1, 0xFF000000u), shl(10, 4, 2), sts(10, 7),     // opaque; shared[index] = colour
+        bar_sync(), lop32i(11, 10, 2, 0xFC), lds(12, 11),            // R12 = shared[63 - index]
+        iscadd(13, 6, 5, 5), shl(13, 13, 2), mov_cbuf(15, 0, 0x114), // its texel's offset
+        iadd_cbuf(14, 13, 0, 0x110), stg(14, 12), exit_(),           // stored
+    };
+    for (size_t i = 0, k = 0; i < sizeof(code) / sizeof(code[0]); k++) {
+        cs[k] = k % 4 == 0 ? SCHED : code[i++];
+    }
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -377,6 +447,23 @@ static void write_tile_texture(u8* heap, iova_t image) {
     memcpy(heap + TSC_POOL + 96, tsc, 32);
     *(u32*)(heap + FS_CBUF + 12) = 3;
 }
+// The compute program's image: 32x32, pitch linear, header and sampler 4 (point sampling), and its
+// storage buffer in the compute program's constant buffer (address, size)
+static void write_computed_texture(u8* heap, iova_t image) {
+    u32* tic = (u32*)(heap + TIC_POOL + 128);
+    tic[0] = 0x08 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    tic[1] = (u32)image;
+    tic[2] = (u32)(image >> 32) | 2 << 21 /* pitch */;
+    tic[3] = (32 * 4) >> 5;
+    tic[4] = 31 | 1 << 23;
+    tic[5] = 31 | 1u << 31;
+    u32* tsc = (u32*)(heap + TSC_POOL + 128);
+    tsc[0] = 2 | 2 << 3 | 2 << 6;
+    tsc[1] = 1 | 1 << 4 | 1 << 6;
+    *(u32*)(heap + FS_CBUF + 16) = 4;
+    u32* slot = (u32*)(heap + CS_CBUF + 0x110);
+    slot[0] = (u32)image, slot[1] = (u32)(image >> 32), slot[2] = 32 * 32 * 4, slot[3] = 0;
+}
 // The floor's texture: 64x64 and its 6 smaller levels, block linear, written by the CPU. Level 0
 // a grey checkerboard, the rest a colour each (red, orange, green, cyan, blue, purple), so where
 // each is sampled shows; header and sampler 2: trilinear, repeating.
@@ -423,6 +510,9 @@ static void write_mip_texture(u8* heap, u8* image_mem, iova_t image) {
     tsc[2] = ((MIP_LEVELS - 1) * 256) << 12;  // levels of detail 0 to 6
     *(u32*)(heap + FS_CBUF + 8) = 2;
 }
+#define MC_LAUNCH_DESC 0xAD // compute: its launch description's address >> 8; launch; programs' region
+#define MC_LAUNCH 0xAF
+#define MC_CODE_LOC 0x582
 #define M_FENCE_VALUE 0x1C // GPFIFO (puller) methods
 #define M_FENCE_ACTION 0x1D
 #define M_RENDER_TARGET 0x200 // 8 words each, 0x10 apart: address (2), width, height, format,
@@ -682,6 +772,8 @@ int main(int argc, char* argv[]) {
     }
     memset(mip_mem, 0, 0x8000);
     write_mip_texture(heap, mip_mem, mip_iova);
+    const iova_t computed_image = mip_iova + 0x6000; // (after the floor's levels)
+    write_computed_texture(heap, computed_image);
     // The stress test's sprites' vertices: 4 for each, for each command buffer
 #define MAX_SPRITES 2000
 #define SPRITE_VERTEX_BYTES ((CMD_BUFS * MAX_SPRITES * 128 + 0xFFF) & ~0xFFF) // whole pages
@@ -711,6 +803,7 @@ int main(int argc, char* argv[]) {
 #define FLOOR_OFFSET(i) (0x3C00 + (i) * 0x80)   // the floor (4 vertices)
 #define FRAG_DEPTH_OFFSET(i) (0x3E00 + (i) * 0x200) // 2 squares of 4 vertices, 48 bytes each
 #define SRGB_OFFSET(i) (0x4400 + (i) * 0x80)        // the sRGB square (4 vertices)
+#define COMPUTED_OFFSET(i) (0x4600 + (i) * 0x80)    // the compute program's image's square
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -770,6 +863,24 @@ int main(int argc, char* argv[]) {
             emit(CLASS_2D);
             emit(header(INCREASING, 1, SUBCH_DMA, 0));
             emit(CLASS_DMA);
+            emit(header(INCREASING, 1, SUBCH_COMPUTE, 0));
+            emit(CLASS_COMPUTE);
+            // the compute engine: its programs' region, and the launch description of the one
+            // dispatch (4x4 workgroups of 8x8, 256 bytes of shared memory, constant buffer 0)
+            const u32 code_loc[2] = {(u32)(heap_iova >> 32), (u32)heap_iova};
+            method_on(SUBCH_COMPUTE, MC_CODE_LOC, 2, code_loc);
+            u32* qmd = (u32*)(heap + QMD_OFFSET);
+            memset(qmd, 0, 0x100);
+            qmd[0x08] = CS_OFFSET;
+            qmd[0x0C] = 4;           // workgroups across
+            qmd[0x0D] = 4 | 1 << 16; // down, deep
+            qmd[0x11] = 256;         // shared memory
+            qmd[0x12] = 8u << 16;    // invocations across
+            qmd[0x13] = 8 | 1 << 16; // down, deep
+            qmd[0x14] = 1;           // constant buffer 0
+            const iova_t cs_cbuf = heap_iova + CS_CBUF;
+            qmd[0x1D] = (u32)cs_cbuf;
+            qmd[0x1E] = (u32)(cs_cbuf >> 32) | 0x200u << 15;
             // the sprite's copy, by the DMA engine: one line of its bytes, pitch to pitch
             const u32 dma[8] = {(u32)(sprite_iova >> 32), (u32)sprite_iova, (u32)(sprite_copy >> 32),
                                 (u32)sprite_copy, SPRITE * SPRITE * 4, SPRITE * SPRITE * 4,
@@ -807,9 +918,9 @@ int main(int argc, char* argv[]) {
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             // textures: the pools, the handles' constant buffer
             method1(M_SAMPLER_BINDING, 1);
-            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 3};
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 4};
             method(M_TEX_HEADER_POOL, 3, headers);
-            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 3};
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 4};
             // blending (for the tiles): source alpha over the frame
             const u32 blend[8] = {0, BLEND_ADD, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA,
                                   BLEND_ADD, BLEND_SRC_ALPHA, 0, BLEND_ONE_MINUS_SRC_ALPHA};
@@ -1173,6 +1284,36 @@ int main(int argc, char* argv[]) {
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
             method1(M_DRAW_END, 0);
             method1(M_STENCIL_ENABLE, 0);
+        }
+        // the compute program, dispatched, and its image on a square at the top: in each 8x8 block,
+        // the colours mirrored both ways (through shared memory and a barrier)
+        {
+            const u32 launch_desc = (u32)((heap_iova + QMD_OFFSET) >> 8);
+            method_on(SUBCH_COMPUTE, MC_LAUNCH_DESC, 1, &launch_desc);
+            const u32 go = 1;
+            method_on(SUBCH_COMPUTE, MC_LAUNCH, 1, &go);
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + COMPUTED_OFFSET(index));
+            for (int k = 0; k < 4; k++) {
+                v[k * 8 + 0] = (k & 1) ? 0.2f : 0.0f, v[k * 8 + 1] = (k & 2) ? -0.70f : -0.95f;
+                v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = (float)(k & 1), v[k * 8 + 5] = (float)((k >> 1) & 1);
+                v[k * 8 + 6] = 0.0f, v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t square = heap_iova + COMPUTED_OFFSET(index);
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_COMPUTED_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(square >> 32), (u32)square, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = square + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
         // the stress test: sprites (the sprite texture on 24x24 squares) wandering, a draw each
         if (stress) {

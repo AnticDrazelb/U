@@ -1,0 +1,606 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 22:25:21 +0000
+Subject: [PATCH] null renderer: compute shaders in software
+
+The compute engine's dispatches run: its program (found and translated as a draw's stages
+are, through Eden's compute environment), its constant buffers from the launch description,
+textures from the compute engine's pools and storage buffers from the constant buffers. Each
+workgroup's invocations run 16 at a time, with shared memory, their local and workgroup ids,
+and atomics on shared memory, storage buffers and global memory (32-bit integer ones, and
+float adds). A program with barriers runs each group of 16 to the barrier, saving where it
+stopped, then the next, until all are past it.
+---
+ .../renderer_null/null_rasterizer.cpp         |   5 +-
+ .../renderer_null/software_draw.cpp           | 399 +++++++++++++++++-
+ src/video_core/renderer_null/software_draw.h  |  15 +-
+ 3 files changed, 408 insertions(+), 11 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index a3d496c09..5615ad104 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -293,7 +293,10 @@ void RasterizerNull::Clear(u32 layer_count) {
+     FillRect(*gpu_memory, m_scratch, fill, x0, y0, x1, y1, surface.layer, layers);
+ }
+ void RasterizerNull::DispatchCompute() {
+-    m_software.Flush();
++    if (kepler_compute && gpu_memory) {
++        gpu_memory->FlushCaching();
++        m_software.Dispatch(*kepler_compute, *gpu_memory);
++    }
+ }
+ void RasterizerNull::ResetCounter(VideoCommon::QueryType type) {}
+ void RasterizerNull::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index e597ea573..c589da67b 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -35,6 +35,7 @@
+ #include "video_core/guest_memory.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/renderer_null/software_draw.h"
++#include "video_core/engines/kepler_compute.h"
+ #include "video_core/shader_environment.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/decode_bc.h"
+@@ -401,7 +402,7 @@ constexpr u32 QuadTopLeft(u32 lane) {
+     return lane & ~9u;
+ }
+ 
+-enum class Kind : u8 { Ir, Move, Jump, JumpIfTrue, JumpIfFalse, Return };
++enum class Kind : u8 { Ir, Move, Jump, JumpIfTrue, JumpIfFalse, Return, Barrier };
+ 
+ struct Op {
+     Kind kind;
+@@ -475,6 +476,23 @@ bool IsSupported(IR::Opcode op) {
+     case O::ConvertU8U32: case O::ConvertU32U8: case O::ConvertS32S8: case O::ConvertS32S16:
+     case O::ConvertS16F32: case O::ConvertU16F32:
+     case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
++    case O::WorkgroupId: case O::LocalInvocationId:
++    case O::LoadSharedU8: case O::LoadSharedS8: case O::LoadSharedU16: case O::LoadSharedS16:
++    case O::LoadSharedU32: case O::LoadSharedU64: case O::LoadSharedU128:
++    case O::WriteSharedU8: case O::WriteSharedU16: case O::WriteSharedU32: case O::WriteSharedU64:
++    case O::WriteSharedU128:
++    case O::SharedAtomicIAdd32: case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
++    case O::SharedAtomicSMax32: case O::SharedAtomicUMax32: case O::SharedAtomicInc32:
++    case O::SharedAtomicDec32: case O::SharedAtomicAnd32: case O::SharedAtomicOr32:
++    case O::SharedAtomicXor32: case O::SharedAtomicExchange32:
++    case O::StorageAtomicIAdd32: case O::StorageAtomicSMin32: case O::StorageAtomicUMin32:
++    case O::StorageAtomicSMax32: case O::StorageAtomicUMax32: case O::StorageAtomicInc32:
++    case O::StorageAtomicDec32: case O::StorageAtomicAnd32: case O::StorageAtomicOr32:
++    case O::StorageAtomicXor32: case O::StorageAtomicExchange32: case O::StorageAtomicAddF32:
++    case O::GlobalAtomicIAdd32: case O::GlobalAtomicSMin32: case O::GlobalAtomicUMin32:
++    case O::GlobalAtomicSMax32: case O::GlobalAtomicUMax32: case O::GlobalAtomicInc32:
++    case O::GlobalAtomicDec32: case O::GlobalAtomicAnd32: case O::GlobalAtomicOr32:
++    case O::GlobalAtomicXor32: case O::GlobalAtomicExchange32: case O::GlobalAtomicAddF32:
+     case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod:
+     case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod: case O::ImageGather:
+     case O::ImageGatherDref: case O::ImageFetch: case O::ImageQueryDimensions:
+@@ -1434,6 +1452,8 @@ struct SoftwareDraw::Program {
+     bool writes_depth = false;
+     bool can_discard = false;
+     bool writes_memory = false; // storage buffers or global memory
++    u32 shared_bytes = 0;       // a compute program's workgroup's shared memory
++    bool has_barrier = false;   // it waits for its workgroup's other invocations
+ };
+ 
+ struct SoftwareDraw::Textures {
+@@ -1639,6 +1659,13 @@ private:
+ 
+ namespace {
+ 
++/// Where a run stopped at a barrier (a compute program's), to go on from there
++struct RunState {
++    bool suspended = false;
++    u32 pc = 0, exec = 0, waiting = 0, next_join = ~0u;
++    std::array<u32, LANES> lane_pc{};
++};
++
+ /// What an invocation reads and writes. Inputs, outputs and colours are kept 'stride' lanes to an
+ /// attribute (or colour component), 'n' lanes run from 'lane'. Of those, 'run' are run: the quads
+ /// with pixels in them; 'live' are the pixels (the rest are helpers, run for their quads'
+@@ -1659,11 +1686,18 @@ struct Io {
+     u32 run = 1, live = 1;
+     bool quads = false; // the lanes are 2x2 quads (see INVOCATION_ID): a fragment shader's
+     f32* frag_depth = nullptr; // a fragment shader's depth output, by lane
++    // compute: the workgroup's shared memory, its id, each lane's id in it ([axis][lane]), and
++    // where a run stops at a barrier (none: barriers are passed)
++    u8* shared = nullptr;
++    u32 shared_bytes = 0;
++    std::array<u32, 3> workgroup_id{};
++    const u32* local_id = nullptr;
++    RunState* resume = nullptr;
+ };
+ 
+ class Flattener {
+ public:
+-    explicit Flattener(SoftwareDraw::Program& out_) : out{out_} {}
++    explicit Flattener(SoftwareDraw::Program& out_, bool compute_) : out{out_}, compute{compute_} {}
+ 
+     bool Run(const IR::Program& program) {
+         for (const IR::Block* block : program.blocks) {
+@@ -1812,9 +1846,13 @@ private:
+             case O::Phi:
+                 InstSlot(&inst);
+                 continue;
++            case O::Barrier: // (a compute program's invocations run in turn: it's where they meet)
++                if (compute) {
++                    Emit({Kind::Barrier, {}, 0, {}, 0});
++                }
++                continue;
+             case O::Void: case O::Reference: case O::PhiMove: case O::Prologue: case O::Epilogue:
+-            case O::Join: case O::Barrier: case O::WorkgroupMemoryBarrier:
+-            case O::DeviceMemoryBarrier:
++            case O::Join: case O::WorkgroupMemoryBarrier: case O::DeviceMemoryBarrier:
+                 continue;
+             case O::Identity:
+             case O::ConditionRef:
+@@ -1895,6 +1933,7 @@ private:
+     }
+ 
+     SoftwareDraw::Program& out;
++    bool compute;
+     std::unordered_map<const IR::Inst*, u16> slots;
+     std::unordered_map<const IR::Block*, u32> labels;
+     std::vector<std::pair<u32, const IR::Block*>> fixups;
+@@ -1917,6 +1956,54 @@ u32 ReadCbuf(const Io& io, u32 index, u32 byte_offset, u32 bytes) {
+     return bytes == 1 ? (value >> shift) & 0xFF : (value >> (shift & 16)) & 0xFFFF;
+ }
+ 
++/// An atomic operation's new value from the old one and its operand (for 32 bits)
++u32 AtomicResult(IR::Opcode op, u32 old, u32 value) {
++    using O = IR::Opcode;
++    switch (op) {
++    case O::SharedAtomicIAdd32: case O::StorageAtomicIAdd32: case O::GlobalAtomicIAdd32:
++        return old + value;
++    case O::SharedAtomicSMin32: case O::StorageAtomicSMin32: case O::GlobalAtomicSMin32:
++        return u32(std::min(s32(old), s32(value)));
++    case O::SharedAtomicUMin32: case O::StorageAtomicUMin32: case O::GlobalAtomicUMin32:
++        return std::min(old, value);
++    case O::SharedAtomicSMax32: case O::StorageAtomicSMax32: case O::GlobalAtomicSMax32:
++        return u32(std::max(s32(old), s32(value)));
++    case O::SharedAtomicUMax32: case O::StorageAtomicUMax32: case O::GlobalAtomicUMax32:
++        return std::max(old, value);
++    case O::SharedAtomicInc32: case O::StorageAtomicInc32: case O::GlobalAtomicInc32:
++        return old >= value ? 0 : old + 1;
++    case O::SharedAtomicDec32: case O::StorageAtomicDec32: case O::GlobalAtomicDec32:
++        return old == 0 || old > value ? value : old - 1;
++    case O::SharedAtomicAnd32: case O::StorageAtomicAnd32: case O::GlobalAtomicAnd32:
++        return old & value;
++    case O::SharedAtomicOr32: case O::StorageAtomicOr32: case O::GlobalAtomicOr32:
++        return old | value;
++    case O::SharedAtomicXor32: case O::StorageAtomicXor32: case O::GlobalAtomicXor32:
++        return old ^ value;
++    case O::StorageAtomicAddF32: case O::GlobalAtomicAddF32:
++        return std::bit_cast<u32>(std::bit_cast<f32>(old) + std::bit_cast<f32>(value));
++    default: // exchanges
++        return value;
++    }
++}
++
++/// Bytes a shared memory load or write moves
++u32 SharedBytes(IR::Opcode op) {
++    using O = IR::Opcode;
++    switch (op) {
++    case O::LoadSharedU8: case O::LoadSharedS8: case O::WriteSharedU8:
++        return 1;
++    case O::LoadSharedU16: case O::LoadSharedS16: case O::WriteSharedU16:
++        return 2;
++    case O::LoadSharedU64: case O::WriteSharedU64:
++        return 8;
++    case O::LoadSharedU128: case O::WriteSharedU128:
++        return 16;
++    default:
++        return 4;
++    }
++}
++
+ /// The texture a texture instruction samples: its descriptor's, the element of an array
+ const Binding* GetBinding(const SoftwareDraw::Program& program, const Io& io, u32 descriptor,
+                           u32 element) {
+@@ -2435,6 +2522,12 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     u32 next_join = ~0u;          // the earliest of those
+     Branches branches;
+     Lanes saved;
++    if (io.resume && io.resume->suspended) { // on from a barrier
++        const RunState& state = *io.resume;
++        pc = state.pc, exec = state.exec, waiting = state.waiting, next_join = state.next_join;
++        branches.lane_pc = state.lane_pc;
++        io.resume->suspended = false;
++    }
+ #define SET_STATE(state)                                                                          \
+     do {                                                                                          \
+         const Branches::State s_ = (state);                                                       \
+@@ -2495,6 +2588,15 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+             }
+             PICK();
+             continue;
++        case Kind::Barrier: // stopped here until the workgroup's other invocations get here
++            if (++pc == next_join) {
++                JOIN();
++            }
++            if (io.resume) {
++                *io.resume = {true, pc, exec, waiting, next_join, branches.lane_pc};
++                return;
++            }
++            continue;
+         case Kind::Ir:
+             break;
+         }
+@@ -2584,6 +2686,93 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+                 std::memset(d.w[k], 0, lanes * sizeof(u32));
+             }
+             break;
++        case O::WorkgroupId:
++            LANE_LOOP {
++                d.w[0][i] = io.workgroup_id[0], d.w[1][i] = io.workgroup_id[1], d.w[2][i] = io.workgroup_id[2];
++            }
++            break;
++        case O::LocalInvocationId:
++            LANE_LOOP {
++                for (u32 k = 0; k < 3; ++k) {
++                    d.w[k][i] = io.local_id ? io.local_id[k * LANES + io.lane + i] : 0;
++                }
++            }
++            break;
++        case O::LoadSharedU8: case O::LoadSharedS8: case O::LoadSharedU16: case O::LoadSharedS16:
++        case O::LoadSharedU32: case O::LoadSharedU64: case O::LoadSharedU128: { // offset
++            const u32 bytes = SharedBytes(o.op);
++            EXEC_LOOP(exec) {
++                u32 words[4]{};
++                if (u64{a.w[0][i]} + bytes <= io.shared_bytes) {
++                    std::memcpy(words, io.shared + a.w[0][i], bytes);
++                }
++                if (o.op == O::LoadSharedS8) {
++                    words[0] = u32(s32(s8(words[0])));
++                } else if (o.op == O::LoadSharedS16) {
++                    words[0] = u32(s32(s16(words[0])));
++                }
++                for (u32 k = 0; k < 4; ++k) {
++                    d.w[k][i] = words[k];
++                }
++            }
++            break;
++        }
++        case O::WriteSharedU8: case O::WriteSharedU16: case O::WriteSharedU32: case O::WriteSharedU64:
++        case O::WriteSharedU128: { // offset, value
++            const u32 bytes = SharedBytes(o.op);
++            EXEC_LOOP(exec) {
++                if (u64{a.w[0][i]} + bytes <= io.shared_bytes) {
++                    const u32 words[4] = {b.w[0][i], b.w[1][i], b.w[2][i], b.w[3][i]};
++                    std::memcpy(io.shared + a.w[0][i], words, bytes);
++                }
++            }
++            break;
++        }
++        case O::SharedAtomicIAdd32: case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
++        case O::SharedAtomicSMax32: case O::SharedAtomicUMax32: case O::SharedAtomicInc32:
++        case O::SharedAtomicDec32: case O::SharedAtomicAnd32: case O::SharedAtomicOr32:
++        case O::SharedAtomicXor32: case O::SharedAtomicExchange32: // offset, value: the old value
++            EXEC_LOOP(exec) { // (one lane after another: an order atomics allow)
++                u32 old = 0;
++                if (u64{a.w[0][i]} + 4 <= io.shared_bytes) {
++                    std::memcpy(&old, io.shared + a.w[0][i], 4);
++                    const u32 result = AtomicResult(o.op, old, b.w[0][i]);
++                    std::memcpy(io.shared + a.w[0][i], &result, 4);
++                }
++                d.w[0][i] = old;
++            }
++            break;
++        case O::StorageAtomicIAdd32: case O::StorageAtomicSMin32: case O::StorageAtomicUMin32:
++        case O::StorageAtomicSMax32: case O::StorageAtomicUMax32: case O::StorageAtomicInc32:
++        case O::StorageAtomicDec32: case O::StorageAtomicAnd32: case O::StorageAtomicOr32:
++        case O::StorageAtomicXor32: case O::StorageAtomicExchange32: case O::StorageAtomicAddF32:
++            EXEC_LOOP(exec) { // binding, offset, value: the old value
++                GPUVAddr address;
++                u32 old = 0;
++                if (StorageAddress(io, a.w[0][i], b.w[0][i], 4, address)) {
++                    io.memory->ReadBlockUnsafe(address, &old, 4);
++                    if (((io.live >> i) & 1) != 0) {
++                        const u32 result = AtomicResult(o.op, old, e.w[0][i]);
++                        io.memory->WriteBlockUnsafe(address, &result, 4);
++                    }
++                }
++                d.w[0][i] = old;
++            }
++            break;
++        case O::GlobalAtomicIAdd32: case O::GlobalAtomicSMin32: case O::GlobalAtomicUMin32:
++        case O::GlobalAtomicSMax32: case O::GlobalAtomicUMax32: case O::GlobalAtomicInc32:
++        case O::GlobalAtomicDec32: case O::GlobalAtomicAnd32: case O::GlobalAtomicOr32:
++        case O::GlobalAtomicXor32: case O::GlobalAtomicExchange32: case O::GlobalAtomicAddF32:
++            EXEC_LOOP(exec) { // address, value: the old value
++                u32 old = 0;
++                io.memory->ReadBlockUnsafe(U64l(a, i), &old, 4);
++                if (((io.live >> i) & 1) != 0) {
++                    const u32 result = AtomicResult(o.op, old, b.w[0][i]);
++                    io.memory->WriteBlockUnsafe(U64l(a, i), &result, 4);
++                }
++                d.w[0][i] = old;
++            }
++            break;
+         case O::LoadLocal: // each lane's own: a word's lanes together
+             IO_LOOP {
+                 const u32 word = a.w[0][i] / 4;
+@@ -3346,14 +3535,22 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+         recent.program = it->second.get();
+         return recent.program;
+     }
++    const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
++    std::unique_ptr<Program> program = Translate(env, cfg_offset, stage == 0);
++    recent.program = programs.emplace(key, std::move(program)).first->second.get();
++    return recent.program;
++}
++
++/// A program's translation (Eden's shader recompiler) and its interpretable form
++std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::GenericEnvironment& env,
++                                                               u32 cfg_offset, bool exits_to_dispatcher) {
+     auto program = std::make_unique<Program>();
+     try {
+         Shader::HostTranslateInfo host_info{};
+         host_info.support_float64 = false;
+         host_info.support_float16 = false;
+         host_info.support_int64 = false;
+-        const u32 cfg_offset = static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
+-        Shader::Maxwell::Flow::CFG cfg(env, pools->flow_block, cfg_offset, stage == 0);
++        Shader::Maxwell::Flow::CFG cfg(env, pools->flow_block, cfg_offset, exits_to_dispatcher);
+         IR::Program ir = Shader::Maxwell::TranslateProgram(pools->inst, pools->block, env, cfg,
+                                                            host_info);
+         program->interpolation = ir.info.interpolation;
+@@ -3372,7 +3569,10 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+         if (!ir.info.image_descriptors.empty() || !ir.info.image_buffer_descriptors.empty()) {
+             LogOnce("storage images aren't drawn");
+         }
+-        program->ok = Flattener{*program}.Run(ir);
++        const bool compute = ir.stage == Shader::Stage::Compute;
++        program->shared_bytes = ir.shared_memory_size;
++        program->ok = Flattener{*program, compute}.Run(ir);
++        program->has_barrier = std::ranges::any_of(program->ops, [](const Op& op) { return op.kind == Kind::Barrier; });
+         program->writes_memory = std::ranges::any_of(program->ops, [](const Op& op) {
+             return op.kind == Kind::Ir &&
+                    (op.op == IR::Opcode::WriteStorageU8 || op.op == IR::Opcode::WriteStorageS8 ||
+@@ -3381,7 +3581,9 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+                     op.op == IR::Opcode::WriteStorage128 || op.op == IR::Opcode::WriteGlobalU8 ||
+                     op.op == IR::Opcode::WriteGlobalS8 || op.op == IR::Opcode::WriteGlobalU16 ||
+                     op.op == IR::Opcode::WriteGlobalS16 || op.op == IR::Opcode::WriteGlobal32 ||
+-                    op.op == IR::Opcode::WriteGlobal64 || op.op == IR::Opcode::WriteGlobal128);
++                    op.op == IR::Opcode::WriteGlobal64 || op.op == IR::Opcode::WriteGlobal128 ||
++                    (op.op >= IR::Opcode::GlobalAtomicIAdd32 && op.op <= IR::Opcode::GlobalAtomicMaxF32x2) ||
++                    (op.op >= IR::Opcode::StorageAtomicIAdd32 && op.op <= IR::Opcode::StorageAtomicMaxF32x2));
+         });
+         program->can_discard = std::ranges::any_of(program->ops, [](const Op& op) {
+             return op.kind == Kind::Ir && op.op == IR::Opcode::DemoteToHelperInvocation;
+@@ -3393,10 +3595,189 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+     pools->inst.ReleaseContents();
+     pools->block.ReleaseContents();
+     pools->flow_block.ReleaseContents();
+-    recent.program = programs.emplace(key, std::move(program)).first->second.get();
++    return program;
++}
++
++/// The compute engine's program, found as GetProgram finds a stage's
++SoftwareDraw::Program* SoftwareDraw::GetComputeProgram(Tegra::Engines::KeplerCompute& kepler_compute,
++                                                       Tegra::MemoryManager& gpu_memory) {
++    const GPUVAddr base = kepler_compute.regs.code_loc.Address();
++    const u32 start = kepler_compute.launch_description.program_start;
++    const u64 recent_key = (base + start) ^ (u64{7} << 60);
++    RecentProgram& recent = recent_programs[recent_key];
++    if (recent.program && recent.frame == frame_count) {
++        return recent.program;
++    }
++    if (recent.program && !recent.code.empty()) {
++        code_scratch.resize(recent.code.size());
++        gpu_memory.ReadBlockUnsafe(recent.address, code_scratch.data(), code_scratch.size());
++        if (code_scratch == recent.code) {
++            recent.frame = frame_count;
++            return recent.program;
++        }
++    }
++    VideoCommon::ComputeEnvironment env{kepler_compute, gpu_memory, base, start};
++    const std::optional<u64> hash = env.Analyze();
++    if (!hash) {
++        LogOnce("a compute program whose end can't be found");
++        return nullptr;
++    }
++    const auto& qmd = kepler_compute.launch_description;
++    const u64 key = *hash ^ (u64{7} << 60) ^ (u64{start} << 32) ^ (u64{qmd.shared_alloc} << 8);
++    recent.frame = frame_count;
++    recent.address = base + start;
++    recent.size = env.CachedSizeBytes();
++    recent.code.resize(recent.size);
++    gpu_memory.ReadBlockUnsafe(recent.address, recent.code.data(), recent.code.size());
++    recent.device_range = false;
++    if (gpu_memory.IsContinuousRange(recent.address, recent.size)) {
++        if (const auto device = gpu_memory.GpuToCpuAddress(recent.address)) {
++            recent.device_address = *device;
++            recent.device_range = true;
++        }
++    }
++    if (const auto it = programs.find(key); it != programs.end()) {
++        recent.program = it->second.get();
++        return recent.program;
++    }
++    recent.program = programs.emplace(key, Translate(env, static_cast<u32>(env.StartAddress()), false)).first->second.get();
+     return recent.program;
+ }
+ 
++/// A dispatch: every workgroup in turn, its invocations 16 at a time. A program with barriers runs
++/// each group of 16 to the next barrier, then the next group, until all are past it.
++void SoftwareDraw::Dispatch(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory) {
++    Flush();
++    Program* const cs = GetComputeProgram(kepler_compute, gpu_memory);
++    if (!cs || !cs->ok) {
++        return;
++    }
++    const auto& qmd = kepler_compute.launch_description;
++    const auto& regs = kepler_compute.regs;
++    // constant buffers, from the launch description
++    std::array<std::vector<u32>, 18> cbufs;
++    for (u32 i = 0; i < qmd.const_buffer_config.size(); ++i) {
++        const auto& cbuf = qmd.const_buffer_config[i];
++        if (((qmd.const_buffer_enable_mask.Value() >> i) & 1) == 0 || cbuf.Address() == 0) {
++            continue;
++        }
++        cbufs[i].resize(std::min<u32>(cbuf.size, 0x10000) / 4);
++        gpu_memory.ReadBlockUnsafe(cbuf.Address(), cbufs[i].data(), cbufs[i].size() * 4);
++    }
++    const auto word = [&](u32 cbuf, u32 offset) -> u32 {
++        return cbuf < cbufs.size() && offset / 4 < cbufs[cbuf].size() ? cbufs[cbuf][offset / 4] : 0;
++    };
++    // textures, from the compute engine's pools; storage buffers, from the constant buffers
++    std::vector<Binding> bindings;
++    for (const Shader::TextureDescriptor& desc : cs->textures) {
++        for (u32 element = 0; element < std::max(desc.count, 1u); ++element) {
++            const u32 element_offset = element << desc.size_shift;
++            u32 raw = word(desc.cbuf_index, desc.cbuf_offset + element_offset);
++            if (desc.has_secondary) {
++                raw = (raw << desc.shift_left) |
++                      (word(desc.secondary_cbuf_index, desc.secondary_cbuf_offset + element_offset)
++                       << desc.secondary_shift_left);
++            }
++            const auto [tic_index, tsc_index] = Tegra::Texture::TexturePair(raw, qmd.linked_tsc != 0);
++            Binding binding;
++            if (tic_index <= regs.tic.limit) {
++                binding.texture = textures->Get(gpu_memory, regs.tic.Address() + u64{tic_index} * sizeof(Tegra::Texture::TICEntry));
++            }
++            if (tsc_index <= regs.tsc.limit) {
++                gpu_memory.ReadBlockUnsafe(regs.tsc.Address() + u64{tsc_index} * sizeof(Tegra::Texture::TSCEntry),
++                                           &binding.sampler, sizeof(binding.sampler));
++            }
++            binding.Prepare();
++            bindings.push_back(binding);
++        }
++    }
++    std::vector<StorageBuffer> storage;
++    for (const Shader::StorageBufferDescriptor& desc : cs->storage) {
++        StorageBuffer buffer;
++        buffer.address = u64{word(desc.cbuf_index, desc.cbuf_offset)} |
++                         (u64{word(desc.cbuf_index, desc.cbuf_offset + 4)} << 32);
++        const u32 size = word(desc.cbuf_index, desc.cbuf_offset + 8);
++        const bool size_follows = word(desc.cbuf_index, desc.cbuf_offset + 12) == 0 && size != 0;
++        buffer.size = size_follows ? size : 8u << 20;
++        storage.push_back(buffer);
++    }
++
++    const u32 size_x = std::max<u32>(qmd.block_dim_x, 1), size_y = std::max<u32>(qmd.block_dim_y, 1);
++    const u32 size_z = std::max<u32>(qmd.block_dim_z, 1);
++    const u32 invocations = size_x * size_y * size_z;
++    const u32 groups = (invocations + LANES - 1) / LANES;
++    // a group of 16 at a time unless there are barriers: then each group's values are kept
++    const u32 kept = cs->has_barrier ? groups : 1;
++    std::vector<std::vector<Lanes>> cells(kept);
++    for (auto& group_cells : cells) {
++        Broadcast(cs->cells, group_cells);
++    }
++    std::vector<std::vector<u32>> local(kept, std::vector<u32>(size_t(cs->local_words + 1) * LANES));
++    std::vector<RunState> states(kept);
++    std::vector<u8> shared(std::max<u32>(qmd.shared_alloc, cs->shared_bytes) + 16);
++    std::vector<f32> inputs(256 * LANES), outputs(256 * LANES), colors(32 * LANES);
++    std::array<bool, LANES> discard{};
++    std::vector<u32> local_ids(size_t(3) * LANES * groups);
++    std::vector<u32> group_lanes(groups);
++    for (u32 g = 0; g < groups; ++g) {
++        for (u32 i = 0; i < LANES; ++i) {
++            const u32 index = g * LANES + i;
++            if (index >= invocations) {
++                continue;
++            }
++            group_lanes[g] |= 1u << i;
++            local_ids[(size_t(g) * 3 + 0) * LANES + i] = index % size_x;
++            local_ids[(size_t(g) * 3 + 1) * LANES + i] = index / size_x % size_y;
++            local_ids[(size_t(g) * 3 + 2) * LANES + i] = index / (size_x * size_y);
++        }
++    }
++    Io io{inputs.data(), outputs.data(), colors.data(), discard.data(), LANES, 0,
++          &cbufs, nullptr, cs->local_words, &bindings, &storage, &gpu_memory};
++    io.quads = true; // (a subgroup of 16)
++    io.shared = shared.data();
++    io.shared_bytes = u32(shared.size() - 16);
++    const u32 grid_x = qmd.grid_dim_x, grid_y = qmd.grid_dim_y, grid_z = qmd.grid_dim_z;
++    for (u32 wz = 0; wz < grid_z; ++wz) {
++        for (u32 wy = 0; wy < grid_y; ++wy) {
++            for (u32 wx = 0; wx < grid_x; ++wx) {
++                io.workgroup_id = {wx, wy, wz};
++                std::fill(shared.begin(), shared.end(), u8{0});
++                const auto run_group = [&](u32 g, u32 slot) {
++                    io.run = io.live = group_lanes[g];
++                    io.local_id = local_ids.data() + size_t(g) * 3 * LANES;
++                    io.local = local[slot].data();
++                    io.resume = cs->has_barrier ? &states[slot] : nullptr;
++                    Run(*cs, cells[slot].data(), io, LANES);
++                };
++                if (!cs->has_barrier) {
++                    for (u32 g = 0; g < groups; ++g) {
++                        run_group(g, 0);
++                    }
++                    continue;
++                }
++                // each group to its next barrier, in turn, until none stopped at one
++                for (RunState& state : states) {
++                    state = {};
++                }
++                bool stopped = true;
++                for (u32 round = 0; stopped && round < 1u << 16; ++round) {
++                    stopped = false;
++                    for (u32 g = 0; g < groups; ++g) {
++                        if (round > 0 && !states[g].suspended) {
++                            continue; // done
++                        }
++                        run_group(g, g);
++                        stopped |= states[g].suspended;
++                    }
++                }
++            }
++        }
++    }
++    if (cs->writes_memory) {
++        MarkAllWritten(); // textures it may have written to are checked again
++    }
++}
++
+ namespace {
+ 
+ /// With EDEN_SW_STATS set: what the software draws did and how long they took, every 2 seconds
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index 79dd0b51f..8c39bfcc8 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -15,10 +15,15 @@
+ namespace Tegra {
+ class MemoryManager;
+ namespace Engines {
++class KeplerCompute;
+ class Maxwell3D;
+-}
++} // namespace Engines
+ } // namespace Tegra
+ 
++namespace VideoCommon {
++class GenericEnvironment;
++}
++
+ namespace Null {
+ 
+ /// A colour in a render target format: its bytes and size. False for formats not handled.
+@@ -58,6 +63,10 @@ public:
+     void Draw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+               bool is_indexed, u32 instance_count);
+ 
++    /// The compute engine's dispatch: its program run for every invocation of every workgroup the
++    /// launch description asks for, after the queued draws.
++    void Dispatch(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory);
++
+     /// The 3D engine's textured rectangle (NVN's DrawTexture): a texture's rectangle, scaled, into
+     /// render target 0.
+     void DrawTexture(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory);
+@@ -87,6 +96,10 @@ public:
+ private:
+     Program* GetProgram(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+                         u32 stage);
++    Program* GetComputeProgram(Tegra::Engines::KeplerCompute& kepler_compute,
++                               Tegra::MemoryManager& gpu_memory);
++    std::unique_ptr<Program> Translate(VideoCommon::GenericEnvironment& env, u32 cfg_offset,
++                                       bool exits_to_dispatcher);
+ 
+     struct Pools;
+     std::unique_ptr<Pools> pools;

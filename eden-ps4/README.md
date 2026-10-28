@@ -247,6 +247,17 @@ Two ways it shows:
   about 22 ns on one desktop thread (60 frames a second; the stress test 37). The test has two
   squares whose fragment programs write opposite depths, and a square of the tile through an sRGB
   texture header (top right); both match the Vulkan renderer.
+- **Compute shaders** (patch 0031): the compute engine's dispatches run, which nothing did before:
+  the program translated as a draw's stages are (through Eden's compute environment), constant
+  buffers from the launch description, textures from the compute engine's pools, storage buffers.
+  A workgroup's invocations run 16 at a time, with shared memory, their ids, and atomics on shared
+  memory, storage buffers and global memory. A program with barriers runs each group of 16 to the
+  barrier, keeping where it stopped, then the next group, until all are past it. The GPU test
+  dispatches a compute program of its own every frame (4x4 workgroups of 8x8: each invocation puts
+  a colour in shared memory and, after a barrier, writes its mirror image's to a texture), shown on
+  a square at the top. Eden's Vulkan renderer shows that square black: its texture cache doesn't
+  see a storage buffer's writes to a texture's memory, so the test checks every texel against what
+  they should be instead.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -332,7 +343,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    right, a floor in perspective at the bottom (a grey checkerboard near, then red, orange, green,
    cyan and blue bands into the distance: mipmaps; darker stripes across it: a shader's branch),
    under the bars a red square left and a green one right (each fragment program's own depth),
-   and a dark square of diamonds below them (an sRGB texture),
+   and a dark square of diamonds below them (an sRGB texture), a square of colour blocks at the
+   top (a compute program's),
    all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame
    a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
@@ -414,6 +426,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: software fragment shaders run in 2x2 quads, branching per lane | above |
 | null renderer: software draws recheck shaders by their code, and flush for reads only where they draw | above |
 | null renderer: RGBA8 writes and bilinear filtering in arrays, sRGB in the fast path, fragment shaders' own depth | above |
+| null renderer: compute shaders in software | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

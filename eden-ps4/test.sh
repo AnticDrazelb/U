@@ -212,6 +212,27 @@ green = sum(p[1] for p in square) / len(square)
 ok &= 40 < green < 110
 sys.exit(0 if ok else 1)
 PY
+# its compute program: 4x4 workgroups of 8x8 invocations, each putting a colour from where it is in
+# shared memory and, after a barrier, writing its mirror image's (in its workgroup) to a texture
+# shown on a square at the top: every texel as worked out here
+check "its compute program runs (shared memory, a barrier, a storage buffer)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+bad = 0
+for py in range(11, 52):
+    for px in range(322, 382):
+        u, v = (px + 0.5 - 320) / 64 * 32, (py + 0.5 - 9) / 45 * 32
+        if abs(v - round(v)) < 0.05:
+            continue  # on a texel's edge
+        x, y = int(u), int(v)
+        tx, ty = x % 8, y % 8
+        expected = ((x // 8 * 8 + 7 - tx) * 8, (y // 8 * 8 + 7 - ty) * 8, (63 - (ty * 8 + tx)) * 4)
+        bad += at(px, py) != expected
+sys.exit(0 if bad == 0 else 1)
+PY
 
 echo "gputest.nro's stress test: 400 more sprites, a draw each (queued, rasterized together)"
 run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"
