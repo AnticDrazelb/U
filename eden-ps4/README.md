@@ -12,12 +12,15 @@ and its sound.
 `game/breakout.c` is a small Switch game, written for this: Breakout at 640x360, drawn by the CPU
 into a libnx framebuffer (no GPU commands), with the controller read through HID and beeps played
 through `audout`. It's built with libnx, the Switch homebrew library, compiled with clang (below).
-In the package as `breakout.nro`, first on the start page's list. `game/blocks.c` is a second
-game, falling blocks with a ghost piece, a next-piece preview, levels, and a tune (Korobeiniki, a
-19th-century Russian folk song) under the beeps. Its best score is kept on the emulated SD card
-(`/data/eden-ps4/user/sdmc/blocks-best.txt` on the PS4), through Eden's file system services; the two share `game/nxgame.h` (drawing, the font,
-sound). And `game/padtest.c`, a controller test: every Switch button with the PS4 button it's mapped to, lit while held, and the
-sticks' positions, as text through libnx's console (also drawn by the CPU).
+In the package as `breakout.nro`, first on the start page's list.
+
+`game/blocks.c` is a second game: falling blocks with a ghost piece, a next-piece preview, levels,
+and a tune (Korobeiniki, a 19th-century Russian folk song) under the beeps. Its best score is kept
+on the emulated SD card (`/data/eden-ps4/user/sdmc/blocks-best.txt` on the PS4), through Eden's
+file system services. The two games share `game/nxgame.h` (drawing, the font, sound).
+
+`game/padtest.c` is a controller test: every Switch button with the PS4 button it's mapped to, lit
+while held, and the sticks' positions, as text through libnx's console (also drawn by the CPU).
 
 ![Blocks in shadPS4](screenshots/blocks-shadps4.png)
 ![The controller test in shadPS4, Cross held and the left stick right](screenshots/padtest-shadps4.png)
@@ -33,8 +36,9 @@ What runs it:
   unswizzled from the GPU's block-linear layout, converted to RGBA (RGBA8, RGBX8, BGRA8 and RGB565),
   cropped, flipped and blended as the compositor asks. A frame of one layer, the usual case, goes
   to the launcher at its own size (Breakout's: 640x360), more layers scaled to 1280x720 and
-  blended. The launcher scales it to 1920x1080 into the video-out buffers. A game that draws with the GPU (NVN, Vulkan, OpenGL)
-  shows nothing: its buffers hold whatever the GPU would have drawn, and there's no GPU emulation.
+  blended. The launcher scales it to 1920x1080 into the video-out buffers. A game that draws with
+  the GPU (NVN, Vulkan, OpenGL) shows nothing: its buffers hold whatever the GPU would have drawn,
+  and there's no GPU emulation.
 - **Controller.** The PS4 pad, read every 4 ms, is player 1's Pro Controller, through Eden's virtual
   gamepad input engine (`Launcher::SetPad`). By the PS4's conventions: Cross is A, Circle B, Square
   Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -, and both sticks.
@@ -53,18 +57,18 @@ start page. That rate is shadPS4's display here, which draws with a software Vul
 frame waits 28 to 30 ms for a buffer to come off the screen, and scaling it onto the screen takes
 2.2 to 2.4 ms (the boot trace's numbers). A console flips in hardware. It hasn't run on one yet.
 
-The test program from stage 2 (`hello.nro`) is still in the package.
-
 Most homebrew programs built with libnx ask for all the memory there is as their heap at start,
 about 3.2 GiB, which Eden's kernel clears. On the desktop that took about 30 s, every page of the
 emulated DRAM faulting in to be written; patch 0011 drops the pages instead, and they read as zeros
 (Linux only). On the PS4 the emulated DRAM is direct memory, committed from the start, so clearing
-it is a plain write of 3.2 GiB, a second or so; Breakout and the controller test ask for 64 MiB
-anyway.
+it is a plain write of 3.2 GiB, a second or so; the package's games and controller test ask for
+64 MiB anyway.
 
-The first program is `hello/`, a small Switch homebrew program built by hand (no libnx). It checks
-what a game needs first and prints the results through the Switch kernel's debug output call
-(`svcOutputDebugString`):
+## Stage 2: the test program
+
+Stage 2's program, still in the package, is `hello/`: a small Switch homebrew program built by
+hand (no libnx). It checks what a game needs first and prints the results through the Switch
+kernel's debug output call (`svcOutputDebugString`):
 
 ```
 hello: a Switch program is running, on emulated core 0
@@ -117,44 +121,43 @@ speaks GNM, through Sony's libraries. The ways there, roughly by size:
 `out/EdenPS4.pkg` (title ID EDNP00001, version in `VERSION`). It opens on a start page with a list
 of programs: the D-pad chooses, X boots.
 
-- **Breakout** (`breakout.nro`, in the package). Left stick or D-pad to move, X to launch the
-  ball, OPTIONS to quit.
+- **Breakout** (`breakout.nro`, in the package). Left stick or D-pad to move, X to launch the ball,
+  OPTIONS to quit.
 - **Blocks** (`blocks.nro`, in the package). D-pad or stick to move and to drop faster, Cross and
   Circle to rotate, up or Triangle to drop, the touchpad's click for the music, OPTIONS to quit.
 - **Controller test** (`padtest.nro`, in the package). OPTIONS and the touchpad's click together
   quit.
 - **The test program** (`hello.nro`, in the package): stage 2's checks, text only.
 - **Every `.nro` in `/data/eden-ps4`.** A homebrew program that draws with the CPU (libnx's
-  framebuffer or console, as the two above) can work; one that draws with the GPU (deko3d, OpenGL,
-  SDL's renderer) shows nothing.
+  framebuffer or console, as the games and the controller test) can work; one that draws with the
+  GPU (deko3d, OpenGL, SDL's renderer) shows nothing.
 
-When the program ends, the start page comes back. Both sticks pressed in (L3 + R3) for a second
-stop a program, for one without a way to quit or one that hangs; where its threads were goes to
-`log.txt`. Without a controller, the test program boots after a countdown; pressing up or down
-stops it. If the last run didn't finish, the
-page first shows what that run left behind: the end of its output (`log.txt`), its crash report
-(`crash.log`) and the last steps of its boot trace. With a controller connected, it then waits for
-a button, so a photo of it can come first. Stack addresses are ELF addresses: symbolize them with
-`llvm-symbolizer --obj=<that build's ELF> 0x...`. `build.sh ps4` keeps every build's ELF in
-`~/eden-ps4-elves`.
+When the program ends, the start page comes back. Both sticks pressed in (L3 + R3) for a second stop
+a program, for one without a way to quit or one that hangs; where its threads were goes to
+`log.txt`. Without a controller, the test program boots after a countdown; pressing up or down stops
+it. If the last run didn't finish, the page first shows what that run left behind: the end of its
+output (`log.txt`), its crash report (`crash.log`) and the last steps of its boot trace. With a
+controller connected, it then waits for a button, so a photo of it can come first. Stack addresses
+are ELF addresses: symbolize them with `llvm-symbolizer --obj=<that build's ELF> 0x...`.
+`build.sh ps4` keeps every build's ELF in `~/eden-ps4-elves`.
 
 Until the program draws, its output and Eden's warnings and errors are on screen; they always go to
-`/data/eden-ps4/log.txt`.
-Eden's data folders (NAND, SD card, keys) are in `/data/eden-ps4/user`. Nothing is written outside
-`/data/eden-ps4`.
+`/data/eden-ps4/log.txt`. Eden's data folders (NAND, SD card, keys) are in `/data/eden-ps4/user`.
+Nothing is written outside `/data/eden-ps4`.
 
 ## Testing on a console
 
 Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells the most:
 
-1. Install `out/EdenPS4.pkg` and start it. The start page should list three programs. If the app
+1. Install `out/EdenPS4.pkg` and start it. The start page should list four programs. If the app
    closes or freezes before that, `/data/eden-ps4/boot-trace.log` has its last steps and
    `crash.log` its crash report (next start, the start page shows both: a photo is enough).
 2. **The test program** (stage 2's checks): every line should end with "passed" or a result, and
    the start page come back.
 3. **Breakout** and **Blocks**: the picture, the controls, the beeps (and Blocks' tune). Both
-   show their frame rate. `boot-trace.log` gets a line every 10 s with the frames a
-   second and how long the launcher takes to draw each onto the screen.
+   show their frame rate. `boot-trace.log` gets a line every 10 s with the frames a second, how
+   long each waited for a buffer off the screen (the display's pace) and how long scaling it took
+   (the launcher's cost).
 4. **Controller test**: each PS4 button should light its Switch button.
 5. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
@@ -166,15 +169,17 @@ Stack addresses in a crash report are symbolized with that build's ELF (kept nex
 
 ## Testing in shadPS4
 
-With 02.00: the start page lists the package's three programs and an `.nro` put in
-`/data/eden-ps4`. Breakout: X (shadPS4's keyboard: N), the game's first frame 1.6 s later, an
-AudioOut port opened for its sound; X launched the ball, the paddle followed the stick (D), OPTIONS
-(Enter) quit to the start page. The controller test showed Cross (N) as A and the stick (D) at
-full right, and quit with OPTIONS and the touchpad (Enter and Space). A keyboard tap of a few
-milliseconds can fall between two of a game's reads of the controller; a held key always counts.
-shadPS4 has no sound here (no audio device), so the sound is tested on the desktop: there the WAV
-file has Breakout's beeps, each at its pitch and length (the ball's launch 660 Hz for 60 ms, a
-brick about 1 kHz, a wall 330 Hz, a lost ball 160 Hz for 250 ms), in real time.
+With 02.00: the start page lists the package's programs and an `.nro` put in `/data/eden-ps4`.
+Breakout: X (shadPS4's keyboard: N), the game's first frame 1.6 s later, an AudioOut port opened for
+its sound; X launched the ball, the paddle followed the stick (D), OPTIONS (Enter) quit to the start
+page. The controller test showed Cross (N) as A and the stick (D) at full right, and quit with
+OPTIONS and the touchpad (Enter and Space). Blocks played (the arrows, N, Up), and its best score
+was written to the SD card by one run and read by the next. L3 + R3 (X and M) held stopped a game
+and brought the list back, three times in a row in one session. A keyboard tap of a few milliseconds
+can fall between two of a game's reads of the controller; a held key always counts. shadPS4 has no
+sound here (no audio device), so the sound is tested on the desktop: there the WAV file has
+Breakout's beeps, each at its pitch and length (the ball's launch 660 Hz for 60 ms, a brick about
+1 kHz, a wall 330 Hz, a lost ball 160 Hz for 250 ms), in real time.
 
 As for stage 1 (see [its README](../switch-bench/README.md#testing-in-shadps4) for building
 shadPS4 and running it headless): the PKG's staging folder `~/eden-ps4-build/stage` without
@@ -248,7 +253,7 @@ EDEN_DIR=~/eden eden-ps4/build.sh host    # desktop: ~/eden-host/bin/eden-ps4 <p
 EDEN_DIR=~/eden eden-ps4/build.sh ps4     # out/EdenPS4.pkg
 eden-ps4/hello/build.sh               # hello.nro on its own
 eden-ps4/nx/build.sh                  # libnx and its toolchain, with clang, into ~/nx/devkitpro
-eden-ps4/game/build.sh                # the games and the controller test (build.sh ps4 builds them too)
+eden-ps4/game/build.sh                # the games and the controller test (build.sh ps4 does too)
 ```
 
 `nx/build.sh` builds what devkitPro's packages would give (their servers are blocked in some build
@@ -281,6 +286,6 @@ and reads the controller, without a screen, speakers or a controller:
 
 - `EDEN_PS4_FRAMES=<dir>` saves its frames as PPM images: the first, one a second, and the last
 - `EDEN_PS4_AUDIO=<file.wav>` records its sound
-- `EDEN_PS4_INPUT="<seconds>:<buttons>,..."` presses player 1's buttons, e.g. `"3:A,3.2:,5:Right,6:"`
-  (`Stop` for the buttons stops the program, as L3 + R3 on the PS4)
+- `EDEN_PS4_INPUT="<seconds>:<buttons>,..."` presses player 1's buttons, e.g.
+  `"3:A,3.2:,5:Right,6:"` (`Stop` for the buttons stops the program, as L3 + R3 on the PS4)
 - `EDEN_PS4_LOG=<filter>` sets Eden's log filter, e.g. `"*:Info Service.VI:Debug"`
