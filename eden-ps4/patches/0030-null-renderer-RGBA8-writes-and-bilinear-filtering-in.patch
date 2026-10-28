@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 22:11:46 +0000
+Subject: [PATCH] null renderer: RGBA8 writes and bilinear filtering in arrays,
+ sRGB in the fast path, fragment shaders' own depth
+
+A block's pixels in a block-linear RGBA8 render target are two runs of 32 bytes (4 columns
+by 2 rows, as a GOB keeps them; blocks now start on 4 columns): their colours are
+converted, blended by source alpha and stored in loops the compiler vectorizes, where each
+pixel was addressed, converted and blended on its own. Bilinear filtering does two channels
+in each 32-bit multiply, and sRGB textures, which went one lane at a time, are decoded
+through their table and filtered in floats in the fast path.
+
+A fragment shader that writes its own depth gets the depth test after it, with that depth;
+the interpolated depth was used.
+---
+ .../renderer_null/software_draw.cpp           | 141 +++++++++++++++---
+ 1 file changed, 117 insertions(+), 24 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 17dfc884a..e597ea573 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -1658,6 +1658,7 @@ struct Io {
+     Tegra::MemoryManager* memory;
+     u32 run = 1, live = 1;
+     bool quads = false; // the lanes are 2x2 quads (see INVOCATION_ID): a fragment shader's
++    f32* frag_depth = nullptr; // a fragment shader's depth output, by lane
+ };
+ 
+ class Flattener {
+@@ -2079,8 +2080,8 @@ void ImplicitLods(const Io& io, const Texture& texture, Shader::TextureType type
+     }
+ }
+ 
+-/// The fast paths' samples of a level of a 2D texture of 8-bit texels (an identity swizzle; for
+-/// bilinear ones, not sRGB), for the lanes in 'exec': all lanes at once in arrays (the compiler
++/// The fast paths' samples of a level of a 2D texture of 8-bit texels (an identity swizzle), for
++/// the lanes in 'exec': all lanes at once in arrays (the compiler
+ /// vectorizes all but the texel loads), each lane's texel or footprint wrapped or clamped as the
+ /// sampler says. Into 'd' for those lanes; returned, the lanes it can't do (a footprint outside the
+ /// texture, neither wrapped nor clamped), for one at a time.
+@@ -2140,14 +2141,40 @@ u32 SampleLevelFast(const Texture& texture, const Binding& binding, const Level&
+             t00[i] = texels[top[i] + left[i]], t10[i] = texels[top[i] + right[i]];
+             t01[i] = texels[bottom[i] + left[i]], t11[i] = texels[bottom[i] + right[i]];
+         }
+-        for (u32 ch = 0; ch < 4; ++ch) {
+-            const u32 shift = ch * 8;
++        if (texture.srgb) { // decoded first (the colours through the sRGB table), filtered in floats
++            const f32* const rgb = texture.rgb_table;
++            const f32* const unorm = UnormTable().data();
++            for (u32 ch = 0; ch < 4; ++ch) {
++                const f32* const table = ch < 3 ? rgb : unorm;
++                const u32 shift = ch * 8;
++                for (u32 i = 0; i < LANES; ++i) {
++                    const f32 fx = f32(wx[i]) * (1.0f / 256.0f), fy = f32(wy[i]) * (1.0f / 256.0f);
++                    const f32 c00 = table[(t00[i] >> shift) & 0xFF], c10 = table[(t10[i] >> shift) & 0xFF];
++                    const f32 c01 = table[(t01[i] >> shift) & 0xFF], c11 = table[(t11[i] >> shift) & 0xFF];
++                    const f32 top = c00 + (c10 - c00) * fx, bottom = c01 + (c11 - c01) * fx;
++                    out[ch][i] = top + (bottom - top) * fy;
++                }
++            }
++        } else {
++            // two channels at once in each 32-bit multiply (red and blue, green and alpha, 16 bits
++            // apart): across, then down, each rounded
++            alignas(64) u32 filtered[LANES];
+             for (u32 i = 0; i < LANES; ++i) {
+-                const u32 w00 = (256 - wx[i]) * (256 - wy[i]), w10 = wx[i] * (256 - wy[i]);
+-                const u32 w01 = (256 - wx[i]) * wy[i], w11 = wx[i] * wy[i];
+-                const u32 sum = ((t00[i] >> shift) & 0xFF) * w00 + ((t10[i] >> shift) & 0xFF) * w10 +
+-                                ((t01[i] >> shift) & 0xFF) * w01 + ((t11[i] >> shift) & 0xFF) * w11;
+-                out[ch][i] = f32((sum + 32768) >> 16) * (1.0f / 255.0f);
++                constexpr u32 mask = 0x00FF00FF, half = 0x00800080;
++                const u32 ax = 256 - wx[i], ay = 256 - wy[i];
++                const auto across = [&](u32 a, u32 b, u32 shift) {
++                    return ((((a >> shift) & mask) * ax + ((b >> shift) & mask) * wx[i] + half) >> 8) & mask;
++                };
++                const u32 top_rb = across(t00[i], t10[i], 0), top_ga = across(t00[i], t10[i], 8);
++                const u32 bottom_rb = across(t01[i], t11[i], 0), bottom_ga = across(t01[i], t11[i], 8);
++                const u32 rb = ((top_rb * ay + bottom_rb * wy[i] + half) >> 8) & mask;
++                const u32 ga = ((top_ga * ay + bottom_ga * wy[i] + half) >> 8) & mask;
++                filtered[i] = rb | ga << 8;
++            }
++            for (u32 ch = 0; ch < 4; ++ch) {
++                for (u32 i = 0; i < LANES; ++i) {
++                    out[ch][i] = f32((filtered[i] >> (ch * 8)) & 0xFF) * (1.0f / 255.0f);
++                }
+             }
+         }
+     }
+@@ -2225,10 +2252,6 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+                 group &= remaining;
+                 remaining &= ~group;
+                 const bool linear = (key & 0x100) != 0 ? binding->min_linear : binding->mag_linear;
+-                if (linear && texture->srgb) { // (filtered in 8 bits: not for sRGB)
+-                    slow |= group;
+-                    continue;
+-                }
+                 const u32 index = key & 0xFF;
+                 slow |= SampleLevelFast(*texture, *binding, texture->levels[texture->base_level + index], linear,
+                                         coords, scale_u, scale_v, offset_x, offset_y, group, d);
+@@ -2536,7 +2559,11 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+             break;
+         }
+         case O::SetSampleMask:
++            break;
+         case O::SetFragDepth:
++            if (io.frag_depth) {
++                EXEC_LOOP(exec) io.frag_depth[io.lane + i] = Fl(a, i);
++            }
+             break;
+         case O::IsHelperInvocation:
+             LANE_LOOP d.w[0][i] = ((io.live >> i) & 1) ^ 1;
+@@ -3486,6 +3513,10 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+     Io io{in, st.outputs.data(), st.colors.data(), st.discard.data(), LANES, 0,
+           &fs_cbufs, st.local.data(), fs->local_words, &fs_textures, &fs_storage, &gpu_memory};
+     io.quads = true;
++    // a shader that writes depth: the depth test after it (the stencil test still before)
++    const bool late_depth = fs->writes_depth;
++    alignas(64) std::array<f32, LANES> frag_depth{};
++    io.frag_depth = frag_depth.data();
+     for (const Triangle& t : triangles) {
+         const s32 ys = std::max(t.y0, row_begin), ye = std::min(t.y1, row_end);
+         if (ys >= ye) {
+@@ -3533,7 +3564,7 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+             if (!top && !bottom) {
+                 continue;
+             }
+-            const s32 left = (top && bottom ? std::min(xs[0], xs[1]) : top ? xs[0] : xs[1]) & ~1;
++            const s32 left = (top && bottom ? std::min(xs[0], xs[1]) : top ? xs[0] : xs[1]) & ~3; // (on 4: see the RGBA8 writes)
+             const s32 right = top && bottom ? std::max(xe[0], xe[1]) : top ? xe[0] : xe[1];
+             for (s32 bx = left; bx < right; bx += 8) {
+                 u32 live = 0;
+@@ -3642,7 +3673,7 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                             st.stencil_pass[j] = DepthPasses(face.func, face.ref & face.func_mask,
+                                                              st.stencil_value[j] & face.func_mask);
+                         }
+-                        if (depth_test && st.stencil_pass[j]) {
++                        if (depth_test && st.stencil_pass[j] && !late_depth) {
+                             st.depth_value[j] = DepthValue(zeta_format, position_z[j]);
+                             st.depth_pass[j] = DepthPasses(depth_func, st.depth_value[j], ReadDepth(zeta_format, zp));
+                         }
+@@ -3659,7 +3690,21 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                     }
+                 }
+                 io.run = run, io.live = live;
++                if (late_depth) { // the shader's depth, where it writes one; the triangle's elsewhere
++                    std::copy_n(position_z, LANES, frag_depth.data());
++                }
+                 Run(*fs, st.cells.data(), io, LANES);
++                if (late_depth && depth_test) { // tested now, with the shader's depth
++                    for (u32 m = live; m != 0; m &= m - 1) {
++                        const u32 j = u32(std::countr_zero(m));
++                        if (st.depth_pixel[j] && st.stencil_pass[j] && !st.discard[j]) {
++                            const f32 depth = frag_depth[j] == frag_depth[j] ? std::clamp(frag_depth[j], 0.0f, 1.0f) : 0.0f;
++                            st.depth_value[j] = DepthValue(zeta_format, depth);
++                            st.depth_pass[j] = DepthPasses(depth_func, st.depth_value[j], ReadDepth(zeta_format, st.depth_pixel[j]));
++                        }
++                    }
++                }
++                u32 written = 0; // the pixels whose colours are written
+                 for (u32 m = live; m != 0; m &= m - 1) {
+                     const u32 j = u32(std::countr_zero(m));
+                     if (st.discard[j]) {
+@@ -3679,11 +3724,62 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                             WriteDepth(zeta_format, st.depth_pixel[j], st.depth_value[j]);
+                         }
+                     }
+-                    for (size_t ti = 0; ti < targets.size(); ++ti) {
+-                        const Target& tg = targets[ti];
+-                        if (!tg.write_any) {
+-                            continue;
++                    written |= 1u << j;
++                }
++                for (size_t ti = 0; ti < targets.size() && written != 0; ++ti) {
++                    const Target& tg = targets[ti];
++                    if (!tg.write_any) {
++                        continue;
++                    }
++                    if (tg.fast_write && !tg.pitch_linear && tg.bpp == 4) {
++                        // RGBA8, block linear: the block is two runs of 32 bytes (4 columns by 2
++                        // rows, as a GOB keeps them), converted, blended and stored 16 pixels at a
++                        // time
++                        const f32* const fragments = st.colors.data() + tg.attachment * 4 * LANES;
++                        alignas(64) u32 src[LANES];
++                        for (u32 j = 0; j < LANES; ++j) {
++                            const u32 r = Unorm(fragments[j], 8), g = Unorm(fragments[LANES + j], 8);
++                            const u32 b = Unorm(fragments[2 * LANES + j], 8), a = Unorm(fragments[3 * LANES + j], 8);
++                            src[j] = (tg.bgra ? b | r << 16 : r | b << 16) | g << 8 | a << 24;
+                         }
++                        for (u32 half = 0; half < 2; ++half) {
++                            const u32 lanes = ((written >> (4 * half)) & 0xF) | ((written >> (8 + 4 * half)) & 0xF) << 4;
++                            const s32 x = bx + s32(4 * half);
++                            if (lanes == 0 || u32(x) >= tg.width || u32(y) >= tg.height) {
++                                continue;
++                            }
++                            const u32 xb = u32(x) * 4, column = xb / 64;
++                            u8*& gob = st.gobs[ti][column];
++                            if (!gob) {
++                                gob = gpu_memory.GetPointer(gob_row_address[ti] + u64{column} * tg.block_bytes);
++                                if (!gob) {
++                                    continue;
++                                }
++                            }
++                            u8* const run32 = gob + (u32(y) % 8 / 2) * 64 + (xb % 64 / 32) * 256 + (xb % 32 / 16) * 32;
++                            alignas(32) u32 dst[8], out[8];
++                            std::memcpy(dst, run32, sizeof(dst));
++                            for (u32 k = 0; k < 8; ++k) {
++                                u32 pixel_value = src[(k / 4) * 8 + 4 * half + k % 4];
++                                if (tg.blend) { // (s * sa + d * (255 - sa)) / 255 a channel
++                                    const u32 d = dst[k], sa = pixel_value >> 24, da = d >> 24;
++                                    const auto mix = [&](u32 sc, u32 dc) {
++                                        const u32 v = sc * sa + dc * (255 - sa) + 128;
++                                        return (v + (v >> 8)) >> 8;
++                                    };
++                                    const u32 out_a = tg.alpha_by_one ? std::min(sa + (da * (255 - sa) + 127) / 255, 255u)
++                                                                      : mix(sa, da);
++                                    pixel_value = mix(pixel_value & 0xFF, d & 0xFF) | mix((pixel_value >> 8) & 0xFF, (d >> 8) & 0xFF) << 8 |
++                                                  mix((pixel_value >> 16) & 0xFF, (d >> 16) & 0xFF) << 16 | out_a << 24;
++                                }
++                                out[k] = ((lanes >> k) & 1) != 0 ? pixel_value : dst[k];
++                            }
++                            std::memcpy(run32, out, sizeof(out));
++                        }
++                        continue;
++                    }
++                    for (u32 m = written; m != 0; m &= m - 1) {
++                        const u32 j = u32(std::countr_zero(m));
+                         u8* const out = pixel(ti, lane_x(j), lane_y(j));
+                         if (!out) {
+                             continue;
+@@ -4101,8 +4197,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         clip_y1 = std::min<s32>(clip_y1, regs.scissor_test[0].max_y);
+     }
+ 
+-    // Depth and stencil: tested against the depth buffer before the fragment shader runs (the
+-    // shader's own depth isn't used), and written, when the tests are on
++    // Depth and stencil: tested against the depth buffer before the fragment shader runs (after it,
++    // for the depth test, when the shader writes its own depth), and written, when the tests are on
+     const auto zeta_format = regs.zeta.format;
+     const bool zeta_on = regs.zeta_enable != 0 && regs.zeta.Address() != 0;
+     const u32 zeta_bpp = zeta_on ? DepthBytes(zeta_format) : 0;
+@@ -4132,9 +4228,6 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     if (zs_test) {
+         clip_x1 = std::min<s32>(clip_x1, s32(regs.zeta_size.width));
+         clip_y1 = std::min<s32>(clip_y1, s32(regs.zeta_size.height));
+-        if (fs->writes_depth) {
+-            LogOnce("a fragment shader's own depth isn't used: the interpolated depth is");
+-        }
+     }
+     if (targets.empty() && !zs_test) {
+         return;

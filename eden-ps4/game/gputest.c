@@ -19,6 +19,8 @@
 // bouncing squares are cleared by a GPU macro (MME, as deko3d and Mesa draw through macros).
 // And a floor in perspective (bottom middle) with a mipmapped texture: each level a colour of its
 // own, sampled where the floor's derivatives choose, the shader branching per pixel for stripes.
+// And two squares whose fragment programs write their own depths (top right), and a square of the
+// tile through an sRGB texture header.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100).
 
@@ -181,6 +183,9 @@ static u64 nop(void) {
 #define FS_TILES_OFFSET 0x310
 #define FS_STORAGE_OFFSET 0x410
 #define FS_FLOOR_OFFSET 0x510
+#define FS_DEPTH_OFFSET 0x610 // colour from varying 0, depth from varying 1's x
+#define VS_DEPTH_OFFSET 0x710 // the vertex program with a third attribute, as varying 1
+#define FS_SRGB_OFFSET 0x810  // the tile, through an sRGB texture header (handle 3)
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -280,6 +285,47 @@ static void write_programs(u8* heap) {
     ff[17] = exit_();
     ff[18] = nop();
     ff[19] = nop();
+
+    // a depth of its own (varying 1's x, in the register after the colour's and the sample mask's)
+    u32* fd_sph = (u32*)(heap + FS_DEPTH_OFFSET);
+    fd_sph[0] = 2 | 3 << 5 | 5 << 10;
+    ((u8*)fd_sph)[24] = 0xFF; // varying 0, xyzw, linear in screen space
+    ((u8*)fd_sph)[25] = 0x03; // varying 1, x
+    fd_sph[18] = 0xF;         // render target 0 gets R0..R3
+    fd_sph[19] = 1 << 1;      // and the depth, R5
+    u64* fd = (u64*)(heap + FS_DEPTH_OFFSET + 0x50);
+    fd[0] = SCHED;
+    fd[1] = ipa(0, 0x80);
+    fd[2] = ipa(1, 0x84);
+    fd[3] = ipa(2, 0x88);
+    fd[4] = SCHED;
+    fd[5] = ipa(3, 0x8C);
+    fd[6] = ipa(5, 0x90);
+    fd[7] = exit_();
+    u32* vd_sph = (u32*)(heap + VS_DEPTH_OFFSET);
+    memcpy(vd_sph, vs_sph, 0x50);
+    ((u8*)vd_sph)[25] = 0x0F; // reads attribute 2 too
+    ((u8*)vd_sph)[54] = 0xFF; // and writes varying 1
+    u64* vd = (u64*)(heap + VS_DEPTH_OFFSET + 0x50);
+    vd[0] = SCHED;
+    vd[1] = ald128(0, 0x80);
+    vd[2] = ald128(4, 0x90);
+    vd[3] = ald128(8, 0xA0);
+    vd[4] = SCHED;
+    vd[5] = ast128(0x70, 0);
+    vd[6] = ast128(0x80, 4);
+    vd[7] = ast128(0x90, 8);
+    vd[8] = SCHED;
+    vd[9] = exit_();
+    vd[10] = nop();
+    vd[11] = nop();
+
+    // the sRGB square's: the textured one's, with handle 3
+    u32* fs_sph_srgb = (u32*)(heap + FS_SRGB_OFFSET);
+    memcpy(fs_sph_srgb, ft_sph, 0x50);
+    u64* fsrgb = (u64*)(heap + FS_SRGB_OFFSET + 0x50);
+    memcpy(fsrgb, ft, 8 * sizeof(u64));
+    fsrgb[3] = tex2d(0, 4, 12);
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -325,6 +371,11 @@ static void write_tile_texture(u8* heap, iova_t image) {
     tsc[0] = 0;                   // repeat
     tsc[1] = 2 | 2 << 4 | 1 << 6; // linear, linear, no mipmaps
     *(u32*)(heap + FS_CBUF + 4) = 1;
+    // header and sampler 3: the same image, its colours in sRGB, filtered bilinearly
+    memcpy(heap + TIC_POOL + 96, tic, 32);
+    ((u32*)(heap + TIC_POOL + 96))[4] |= 1 << 22; // sRGB
+    memcpy(heap + TSC_POOL + 96, tsc, 32);
+    *(u32*)(heap + FS_CBUF + 12) = 3;
 }
 // The floor's texture: 64x64 and its 6 smaller levels, block linear, written by the CPU. Level 0
 // a grey checkerboard, the rest a colour each (red, orange, green, cyan, blue, purple), so where
@@ -658,6 +709,8 @@ int main(int argc, char* argv[]) {
 #define DEPTH_OFFSET(i) (0x2400 + (i) * 0x200) // the depth bars (8 vertices), then the storage square (4)
 #define LINES_OFFSET(i) (0x3200 + (i) * 0x200)  // the lines (5 vertices), then the point (1)
 #define FLOOR_OFFSET(i) (0x3C00 + (i) * 0x80)   // the floor (4 vertices)
+#define FRAG_DEPTH_OFFSET(i) (0x3E00 + (i) * 0x200) // 2 squares of 4 vertices, 48 bytes each
+#define SRGB_OFFSET(i) (0x4400 + (i) * 0x80)        // the sRGB square (4 vertices)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -754,9 +807,9 @@ int main(int argc, char* argv[]) {
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             // textures: the pools, the handles' constant buffer
             method1(M_SAMPLER_BINDING, 1);
-            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 2};
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 3};
             method(M_TEX_HEADER_POOL, 3, headers);
-            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 2};
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 3};
             // blending (for the tiles): source alpha over the frame
             const u32 blend[8] = {0, BLEND_ADD, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA,
                                   BLEND_ADD, BLEND_SRC_ALPHA, 0, BLEND_ONE_MINUS_SRC_ALPHA};
@@ -970,8 +1023,63 @@ int main(int argc, char* argv[]) {
                 method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
                 method1(M_DRAW_END, 0);
             }
+            // two squares over each other below the bars, at the same depth but for the depths their
+            // fragment program writes: a red one's from 0.2 (left) to 0.8, then a green one's from
+            // 0.8 to 0.2; the red one in front on the left half, the green on the right
+            float* q = (float*)(heap + FRAG_DEPTH_OFFSET(index));
+            for (int square = 0; square < 2; square++) {
+                for (int k = 0; k < 4; k++) {
+                    float* p = q + (square * 4 + k) * 12;
+                    const int right = k & 1;
+                    p[0] = right ? 0.95f : 0.45f, p[1] = (k >> 1) ? -0.30f : -0.45f, p[2] = 0.5f, p[3] = 1.0f;
+                    p[4] = square ? 0.2f : 1.0f, p[5] = square ? 0.9f : 0.15f, p[6] = 0.15f, p[7] = 1.0f;
+                    p[8] = (right ^ square) ? 0.8f : 0.2f, p[9] = p[10] = 0.0f, p[11] = 1.0f;
+                }
+            }
+            const iova_t squares_iova = heap_iova + FRAG_DEPTH_OFFSET(index);
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_DEPTH_OFFSET);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_DEPTH_OFFSET);
+            method1(M_VERTEX_ATTRIB + 2, ATTR_RGBA32F | 32 << 7);
+            const u32 stream48[4] = {48 | 1 << 12, (u32)(squares_iova >> 32), (u32)squares_iova, 0};
+            method(M_VERTEX_STREAM, 4, stream48);
+            const iova_t squares_last = squares_iova + 8 * 48 - 1;
+            const u32 squares_limit[2] = {(u32)(squares_last >> 32), (u32)squares_last};
+            method(M_VERTEX_STREAM_LIMIT, 2, squares_limit);
+            for (int square = 0; square < 2; square++) {
+                const u32 range[2] = {(u32)square * 4, 4};
+                method(M_VERTEX_FIRST, 2, range);
+                method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+                method1(M_DRAW_END, 0);
+            }
+            method1(M_VERTEX_ATTRIB + 2, 1 << 6); // constant again
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_OFFSET);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
             method1(M_DEPTH_TEST_ENABLE, 0);
             method1(M_DEPTH_WRITE_ENABLE, 0);
+        }
+        // a square of the tile through an sRGB texture header (its colours decoded, so darker than
+        // the backdrop's), filtered bilinearly, below them
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + SRGB_OFFSET(index));
+            for (int k = 0; k < 4; k++) {
+                v[k * 8 + 0] = (k & 1) ? 0.65f : 0.45f, v[k * 8 + 1] = (k & 2) ? -0.05f : -0.25f;
+                v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = (k & 1) ? 1.5f : 0.0f, v[k * 8 + 5] = (k & 2) ? 1.5f : 0.0f;
+                v[k * 8 + 6] = 0.0f, v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t square = heap_iova + SRGB_OFFSET(index);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_SRGB_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(square >> 32), (u32)square, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = square + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
         // a square coloured from a storage buffer, top left
         {

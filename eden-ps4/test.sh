@@ -195,6 +195,23 @@ ok &= far[2] > 200 and far[0] < 130 and far[1] < 130
 ok &= dark[0] < bright[0] * 0.75 and dark[1] < bright[1] * 0.75
 sys.exit(0 if ok else 1)
 PY
+# its squares whose fragment programs write their own depths (otherwise the same: the green one,
+# drawn second, would cover the red), top right under the bars: red in front on the left, green on
+# the right; and the tile through an sRGB header below them, its colours decoded (the tile's green,
+# 120 and up, averages under 110 decoded)
+check "its fragment programs' own depths are tested, and sRGB textures decoded" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+(lr, lg, lb), (rr, rg, rb) = at(480, 112), at(608, 112)
+ok = lr > 200 and lg < 100 and rg > 200 and rr < 100
+square = [at(x, y) for x in range(468, 525) for y in range(139, 168)]
+green = sum(p[1] for p in square) / len(square)
+ok &= 40 < green < 110
+sys.exit(0 if ok else 1)
+PY
 
 echo "gputest.nro's stress test: 400 more sprites, a draw each (queued, rasterized together)"
 run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"

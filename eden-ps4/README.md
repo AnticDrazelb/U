@@ -237,6 +237,16 @@ Two ways it shows:
   through a draw's setup. The program's bytes are kept and compared instead, and a read of memory
   rasterizes the queue only if a queued draw draws there. A draw's setup went from 157 to 31
   microseconds on the desktop; the GPU test draws at 53 frames a second on one desktop thread.
+- **Writes and filtering in arrays, a shader's own depth** (patch 0030): a profile showed the
+  rasterizer spending most of its time writing pixels one at a time. In a block-linear RGBA8
+  render target, a block's 16 pixels are two runs of 32 bytes (4 columns by 2 rows, as a GOB keeps
+  them), so they're converted, blended and stored in loops the compiler vectorizes now. Bilinear
+  filtering does two channels in each 32-bit multiply; sRGB textures, which went a pixel at a time,
+  take the fast path (decoded through their table, filtered in floats). And a fragment shader that
+  writes its own depth gets the depth test after it, with that depth. A pixel of the GPU test costs
+  about 22 ns on one desktop thread (60 frames a second; the stress test 37). The test has two
+  squares whose fragment programs write opposite depths, and a square of the tile through an sRGB
+  texture header (top right); both match the Vulkan renderer.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -321,6 +331,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    triangle on the left (stencil), a yellow rectangle of lines with a white point in it, bottom
    right, a floor in perspective at the bottom (a grey checkerboard near, then red, orange, green,
    cyan and blue bands into the distance: mipmaps; darker stripes across it: a shader's branch),
+   under the bars a red square left and a green one right (each fragment program's own depth),
+   and a dark square of diamonds below them (an sRGB texture),
    all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame
    a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
@@ -401,6 +413,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: small software draws queued and rasterized together on the rasterizing threads | above |
 | null renderer: software fragment shaders run in 2x2 quads, branching per lane | above |
 | null renderer: software draws recheck shaders by their code, and flush for reads only where they draw | above |
+| null renderer: RGBA8 writes and bilinear filtering in arrays, sRGB in the fast path, fragment shaders' own depth | above |
 
 The PS4 memory changes, from what stage 1 measured:
 
