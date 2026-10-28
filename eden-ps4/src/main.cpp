@@ -197,6 +197,20 @@ void SetAudio(AudioFactory factory) {
     });
 }
 
+// The running program's end: it exited, or Stop was called.
+std::mutex g_run_mutex;
+std::condition_variable g_run_cv;
+bool g_running = false;
+bool g_stop = false;
+
+void Stop() {
+    std::scoped_lock lock{g_run_mutex};
+    if (g_running) {
+        g_stop = true;
+        g_run_cv.notify_all();
+    }
+}
+
 BootResult Boot(const std::filesystem::path& program, const std::filesystem::path& data_dir,
                 LineSink sink, FrameSink frames, std::chrono::milliseconds timeout) {
     // Eden's data folders (NAND, SD card, keys...) in data_dir/user.
@@ -240,13 +254,11 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
             system.GetUserChannel().clear();
 
-            std::mutex exit_mutex;
-            std::condition_variable exit_cv;
             bool exited = false;
             system.RegisterExitCallback([&] {
-                std::scoped_lock lock{exit_mutex};
+                std::scoped_lock lock{g_run_mutex};
                 exited = true;
-                exit_cv.notify_all();
+                g_run_cv.notify_all();
             });
 
             Output(LineKind::Status, fmt::format("booting {}", program.filename().string()));
@@ -259,10 +271,18 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             } else {
                 system.GPU().Start();
                 system.GetCpuManager().OnGpuReady();
+                std::unique_lock lock{g_run_mutex};
+                g_running = true;
+                g_stop = false;
+                lock.unlock();
                 void(system.Run());
-                std::unique_lock lock{exit_mutex};
-                if (exit_cv.wait_for(lock, timeout, [&] { return exited; }))
+                lock.lock();
+                g_run_cv.wait_for(lock, timeout, [&] { return exited || g_stop; });
+                if (exited)
                     result = {BootResult::Status::Exited, {}};
+                else if (g_stop)
+                    result = {BootResult::Status::Stopped, {}};
+                g_running = false;
                 lock.unlock();
                 void(system.Pause());
                 if (!exited) {
@@ -300,6 +320,9 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
     case BootResult::Status::TimedOut:
         Output(LineKind::Error, fmt::format("the program was still running after {} s",
                                             timeout.count() / 1000));
+        break;
+    case BootResult::Status::Stopped:
+        Output(LineKind::Status, "the program was stopped");
         break;
     }
 

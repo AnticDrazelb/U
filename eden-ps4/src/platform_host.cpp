@@ -1,6 +1,7 @@
 // The launcher on a desktop: eden-ps4 <program.nro>. Output on stdout; Eden's data folders in
 // $EDEN_PS4_DATA (default: a new temporary folder). Exit code 0 if the program exited, 1 if it
-// didn't load, 2 if it was still running after $EDEN_PS4_TIMEOUT seconds (default 60).
+// didn't load, 2 if it was still running after $EDEN_PS4_TIMEOUT seconds (default 60), 3 if it was
+// stopped (EDEN_PS4_INPUT's Stop).
 //
 // For testing programs that draw and read the controller, without a screen or a controller:
 //   EDEN_PS4_FRAMES=<dir>   saves frames there as PPM images: frame-0001.ppm (the first), then
@@ -8,7 +9,8 @@
 //   EDEN_PS4_LOG=<filter>   Eden's log filter, e.g. "*:Info Service.VI:Debug" (default: warnings)
 //   EDEN_PS4_INPUT=<script> player 1's buttons over time: "<seconds>:<buttons>,..." with the
 //                           buttons joined by '+' (A B X Y L R ZL ZR Plus Minus Left Up Right
-//                           Down LStick RStick) or none, e.g. "3:A,3.2:,5:Right+B,6:"
+//                           Down LStick RStick) or none, e.g. "3:A,3.2:,5:Right+B,6:"; "Stop"
+//                           stops the program (as L3+R3 held on the PS4)
 //   EDEN_PS4_AUDIO=<file>   records the sound to a WAV file, in real time (a second stream Eden
 //                           opens goes to <file>.2.wav, and so on)
 
@@ -123,6 +125,10 @@ void PlayInput(std::string script, std::atomic<bool>* done) {
         const auto at = start + std::chrono::milliseconds(long(std::atof(step.c_str()) * 1000));
         while (std::chrono::steady_clock::now() < at && !*done) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (step.substr(colon + 1) == "Stop") {
+            Launcher::Stop();
+            continue;
         }
         Launcher::PadState state;
         state.buttons = ParseButtons(step.substr(colon + 1));
@@ -253,6 +259,8 @@ int main(int argc, char** argv) {
         return 1;
     case Launcher::BootResult::Status::TimedOut:
         return 2;
+    case Launcher::BootResult::Status::Stopped:
+        return 3;
     }
     return 1;
 }

@@ -5,7 +5,7 @@
 // Then the program runs. What it draws (with the CPU: there's no GPU emulation yet) fills the
 // screen; otherwise its text output and Eden's warnings and errors are shown, and they always go
 // to /data/eden-ps4/log.txt. The controller is player 1's Pro Controller. When the program ends,
-// the start page comes back. Nothing is written outside /data/eden-ps4; Eden's data folders are
+// or L3 + R3 held for a second stop it, the start page comes back. Nothing is written outside /data/eden-ps4; Eden's data folders are
 // in /data/eden-ps4/user.
 //
 // The screen, controller and start page are switch-bench's (../../switch-bench/src/platform_ps4.cpp).
@@ -521,10 +521,13 @@ std::unique_ptr<Launcher::AudioOutput> MakeAudioOutput()
     return std::make_unique<Ps4AudioOutput>();
 }
 
-// While a program runs: the pad, read every 4 ms, as player 1's controller.
+// While a program runs: the pad, read every 4 ms, as player 1's controller. Both sticks pressed
+// in (L3 + R3) for a second stop the program.
 std::atomic<bool> g_running{false};
 void* PadThread(void*)
 {
+    constexpr uint32_t kStopButtons = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
+    double stop_held_since = -1;
     while (g_running)
     {
         union {
@@ -532,7 +535,19 @@ void* PadThread(void*)
             unsigned char room[512]; // in case the system's structure is larger than the header's
         } state{};
         if (g_pad >= 0 && scePadReadState(g_pad, &state.data) == 0 && state.data.connected)
+        {
             Launcher::SetPad(ToSwitchPad(state.data));
+            if ((state.data.buttons & kStopButtons) != kStopButtons)
+                stop_held_since = -1;
+            else if (stop_held_since < 0)
+                stop_held_since = Seconds();
+            else if (Seconds() - stop_held_since >= 1)
+            {
+                Trace("L3 + R3 held: stopping the program");
+                Launcher::Stop();
+                stop_held_since = 1e18; // once
+            }
+        }
         usleep(4000);
     }
     return nullptr;
@@ -642,6 +657,7 @@ std::string StartPage(bool first)
         }
         g_screen.Add("", kWhite, false);
         g_screen.Add("Choose a program with the D-pad, X to boot it. Put more (.nro) in /data/eden-ps4.", kYellow, false);
+        g_screen.Add("In a program, both sticks pressed in (L3 + R3) for a second stop it.", kGrey, false);
         for (size_t i = 0; i < programs.size(); i++)
             g_screen.Add((i == selected ? "  >  " : "      ") + programs[i].label, i == selected ? kGreen : kWhite,
                          false);

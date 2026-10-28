@@ -104,8 +104,10 @@ of programs: the D-pad chooses, X boots.
   framebuffer or console, as the two above) can work; one that draws with the GPU (deko3d, OpenGL,
   SDL's renderer) shows nothing.
 
-When the program ends, the start page comes back. Without a controller, the test program boots
-after a countdown; pressing up or down stops it. If the last run didn't finish, the
+When the program ends, the start page comes back. Both sticks pressed in (L3 + R3) for a second
+stop a program, for one without a way to quit or one that hangs; where its threads were goes to
+`log.txt`. Without a controller, the test program boots after a countdown; pressing up or down
+stops it. If the last run didn't finish, the
 page first shows what that run left behind: the end of its output (`log.txt`), its crash report
 (`crash.log`) and the last steps of its boot trace. With a controller connected, it then waits for
 a button, so a photo of it can come first. Stack addresses are ELF addresses: symbolize them with
@@ -130,7 +132,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    shows its frame rate at the top. `boot-trace.log` gets a line every 10 s with the frames a
    second and how long the launcher takes to draw each onto the screen.
 4. **Controller test**: each PS4 button should light its Switch button.
-5. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list.
+5. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
+   held for a second stops it.
 
 After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnings and errors, and
 `boot-trace.log` the launcher's steps (the audio port it opened, the first frame, the frame rate).
@@ -255,4 +258,5 @@ and reads the controller, without a screen, speakers or a controller:
 - `EDEN_PS4_FRAMES=<dir>` saves its frames as PPM images: the first, one a second, and the last
 - `EDEN_PS4_AUDIO=<file.wav>` records its sound
 - `EDEN_PS4_INPUT="<seconds>:<buttons>,..."` presses player 1's buttons, e.g. `"3:A,3.2:,5:Right,6:"`
+  (`Stop` for the buttons stops the program, as L3 + R3 on the PS4)
 - `EDEN_PS4_LOG=<filter>` sets Eden's log filter, e.g. `"*:Info Service.VI:Debug"`

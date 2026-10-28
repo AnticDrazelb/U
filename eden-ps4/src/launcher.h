@@ -74,11 +74,15 @@ struct BootResult {
         Exited,     // the program ended itself (svcExitProcess)
         LoadFailed, // Eden could not load it
         TimedOut,   // still running after the timeout
+        Stopped,    // stopped with Stop()
     } status;
     std::string detail;
 };
 
-/// Boots `program` and runs it until it exits or `timeout` passes. Eden's data folders (NAND, SD
+/// Stops the program running in Boot, which returns Stopped. Any thread; ignored while none runs.
+void Stop();
+
+/// Boots `program` and runs it until it exits, Stop is called or `timeout` passes. Eden's data folders (NAND, SD
 /// card, keys) are in `data_dir`/user, and everything the sink is given also goes to
 /// `data_dir`/log.txt.
 /// `frames` may be null: then nothing is composed (the null renderer's frames are dropped).
