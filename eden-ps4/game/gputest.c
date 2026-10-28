@@ -6,8 +6,9 @@
 //
 // It draws a backdrop, bouncing squares and the word GPU with the 3D engine's clears, and sprites
 // with the 2D engine: a 32x32 image drawn by the CPU, copied once by the DMA engine, then blitted
-// and scaled onto the frame. It waits for each frame's GPU work through a fence the command stream
-// signals, and quits on +.
+// and scaled onto the frame. And a triangle drawn with shaders: a vertex and a fragment program in
+// Maxwell machine code, assembled by hand below (there's no shader compiler here). It waits for each
+// frame's GPU work through a fence the command stream signals, and quits on +.
 
 #include <math.h>
 #include <stdbool.h>
@@ -43,6 +44,80 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define MDMA_LAUNCH 0x0C0
 #define MDMA_OFFSET_IN 0x100 // in (2), out (2), pitch in, pitch out, line length, line count
 #define SPRITE 32
+#define M_VIEWPORT_TRANSFORM 0x280 // scale x, y, z, translate x, y, z, swizzle, snap
+#define M_VIEWPORT 0x300           // x | width << 16, y | height << 16, near, far
+#define M_VERTEX_FIRST 0x35D       // first, count
+#define M_VERTEX_ATTRIB 0x458      // one word per attribute
+#define M_VIEWPORT_TRANSFORM_ENABLE 0x64B
+#define M_PROGRAM_REGION 0x582     // address (2)
+#define M_DRAW_END 0x585
+#define M_DRAW_BEGIN 0x586
+#define M_VERTEX_STREAM 0x700      // config (stride | enable << 12), address (2), frequency
+#define M_VERTEX_STREAM_LIMIT 0x7C0 // last address (2)
+#define M_PIPELINE 0x800           // 0x10 apart: config (enable | type << 4), offset, -, registers
+#define TOPOLOGY_TRIANGLES 4
+#define ATTR_RGBA32F (0x01u << 21 | 7u << 27) // R32G32B32A32, float, buffer 0 (offset << 7)
+
+// Maxwell instructions (64-bit), with the guard predicate PT (always) in bits 16..19
+#define PT (7ull << 16)
+#define RZ 0xFFull
+static u64 ald128(u32 dest, u32 attribute) { // ALD.128 Rdest, a[attribute]
+    return 0x1DFBull << 51 | 3ull << 47 | RZ << 39 | (u64)attribute << 20 | PT | RZ << 8 | dest;
+}
+static u64 ast128(u32 attribute, u32 src) { // AST.128 a[attribute], Rsrc
+    return 0x1DFEull << 51 | 3ull << 47 | RZ << 39 | (u64)attribute << 20 | PT | RZ << 8 | src;
+}
+static u64 mov32i(u32 dest, float value) { // MOV32I Rdest, value
+    u32 bits;
+    memcpy(&bits, &value, 4);
+    return 0x010ull << 52 | (u64)bits << 20 | PT | 0xFull << 12 | dest;
+}
+static u64 ipa(u32 dest, u32 attribute) { // IPA.PASS Rdest, a[attribute] (an interpolated input)
+    return 0xE0ull << 56 | (u64)(attribute / 4) << 30 | RZ << 20 | PT | RZ << 8 | dest;
+}
+static u64 exit_(void) { // EXIT (condition: true)
+    return 0xE30ull << 52 | PT | 0xF;
+}
+static u64 nop(void) {
+    return 0xA16ull << 51 | PT;
+}
+#define SCHED 0x001F8000FC0007E0ull // a scheduling word (before every three instructions)
+
+// The shader programs, in a GPU buffer: each a 0x50-byte header (SPH) and its code, placed so
+// that the code starts on 32 bytes (the scheduling words sit at multiples of 32).
+#define VS_OFFSET 0x10
+#define FS_OFFSET 0x110
+static void write_programs(u8* heap) {
+    u32* vs_sph = (u32*)(heap + VS_OFFSET);
+    vs_sph[0] = 1 /* vertex, geometry etc. */ | 3 << 5 /* version */ | 1 << 10 /* vertex */;
+    ((u8*)vs_sph)[24] = 0xFF; // reads attributes 0 and 1 (xyzw)
+    ((u8*)vs_sph)[53] = 0xF0; // writes position (xyzw)
+    ((u8*)vs_sph)[54] = 0x0F; // and varying 0 (xyzw)
+    u64* vs = (u64*)(heap + VS_OFFSET + 0x50);
+    vs[0] = SCHED;
+    vs[1] = ald128(0, 0x80); // R0..R3 = vertex attribute 0 (position)
+    vs[2] = ald128(4, 0x90); // R4..R7 = vertex attribute 1 (colour)
+    vs[3] = ast128(0x70, 0); // position = R0..R3
+    vs[4] = SCHED;
+    vs[5] = ast128(0x80, 4); // varying 0 = R4..R7
+    vs[6] = exit_();
+    vs[7] = nop();
+
+    u32* fs_sph = (u32*)(heap + FS_OFFSET);
+    fs_sph[0] = 2 /* pixel */ | 3 << 5 | 5 << 10 /* pixel */;
+    ((u8*)fs_sph)[24] = 0xFF; // varying 0, xyzw interpolated linearly in screen space
+    fs_sph[18] = 0xF;         // render target 0 gets R0..R3
+    u64* fs = (u64*)(heap + FS_OFFSET + 0x50);
+    fs[0] = SCHED;
+    fs[1] = ipa(0, 0x80); // R0..R3 = varying 0
+    fs[2] = ipa(1, 0x84);
+    fs[3] = ipa(2, 0x88);
+    fs[4] = SCHED;
+    fs[5] = ipa(3, 0x8C);
+    fs[6] = exit_();
+    fs[7] = nop();
+    (void)mov32i;
+}
 #define M_FENCE_VALUE 0x1C // GPFIFO (puller) methods
 #define M_FENCE_ACTION 0x1D
 #define M_RENDER_TARGET 0x200 // 8 words each, 0x10 apart: address (2), width, height, format,
@@ -223,6 +298,19 @@ int main(int argc, char* argv[]) {
     draw_sprite(sprite_mem);
     const iova_t sprite_copy = sprite_iova + 0x8000;
 
+    // The shader programs and, for each command buffer, the triangle's vertices.
+    u8* heap = aligned_alloc(0x1000, 0x10000);
+    NvMap heap_map;
+    iova_t heap_iova = 0;
+    if (!heap || R_FAILED(rc = nvMapCreate(&heap_map, heap, 0x10000, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(rc = nvAddressSpaceMap(&as, nvMapGetHandle(&heap_map), true, NvKind_Pitch, &heap_iova))) {
+        fprintf(stderr, "gputest: shader buffer: %#x\n", rc);
+        return 1;
+    }
+    memset(heap, 0, 0x10000);
+    write_programs(heap);
+#define VERTICES_OFFSET(i) (0x1000 + (i) * 0x100)
+
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
 
@@ -281,6 +369,21 @@ int main(int argc, char* argv[]) {
             method1(M_RT_CONTROL, 1 | (076543210 << 4)); // one render target, mapped to itself
             method1(M_COLOR_MASK, 0x1111);
             method1(M_CLEAR_FLAGS, CLEAR_FLAGS_SCISSOR);
+            // the shaders, and the triangle's fixed state: one float4 attribute, the viewport
+            const u32 region[2] = {(u32)(heap_iova >> 32), (u32)heap_iova};
+            method(M_PROGRAM_REGION, 2, region);
+            const u32 vertex_b[4] = {1 | 1 << 4, VS_OFFSET, 0, 8};
+            method(M_PIPELINE + 1 * 0x10, 4, vertex_b);
+            const u32 pixel[4] = {1 | 5 << 4, FS_OFFSET, 0, 8};
+            method(M_PIPELINE + 5 * 0x10, 4, pixel);
+            const u32 attribs[2] = {ATTR_RGBA32F, ATTR_RGBA32F | 16 << 7};
+            method(M_VERTEX_ATTRIB, 2, attribs);
+            const u32 transform[8] = {f32bits(W / 2.0f), f32bits(H / 2.0f), f32bits(0.5f), f32bits(W / 2.0f),
+                                      f32bits(H / 2.0f), f32bits(0.5f), 0x6420 /* identity */, 0};
+            method(M_VIEWPORT_TRANSFORM, 8, transform);
+            const u32 viewport[4] = {(u32)W << 16, (u32)H << 16, f32bits(0.0f), f32bits(1.0f)};
+            method(M_VIEWPORT, 4, viewport);
+            method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             const u32 screen[2] = {(u32)W << 16, (u32)H << 16};
             method(M_SCREEN_SCISSOR, 2, screen);
             first = false;
@@ -310,6 +413,32 @@ int main(int argc, char* argv[]) {
             const int scale = i + 1;
             const int cx = W / 2 + (int)(200 * cosf(angle)), cy = H / 2 + (int)(110 * sinf(angle));
             sprite(sprite_copy, target, cx - SPRITE * scale / 2, cy - SPRITE * scale / 2, scale);
+        }
+        // the triangle, drawn with the shaders, turning
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + VERTICES_OFFSET(index));
+            static const float colours[3][4] = {{1, 0.2f, 0.2f, 1}, {0.2f, 1, 0.3f, 1}, {0.3f, 0.4f, 1, 1}};
+            for (int k = 0; k < 3; k++) {
+                const float a = (float)frame * 0.02f + k * 2.0944f;
+                v[k * 8 + 0] = 0.55f * cosf(a) * H / W;
+                v[k * 8 + 1] = 0.55f * sinf(a);
+                v[k * 8 + 2] = 0.5f;
+                v[k * 8 + 3] = 1.0f;
+                memcpy(&v[k * 8 + 4], colours[k], sizeof(colours[k]));
+            }
+            const iova_t vertices = heap_iova + VERTICES_OFFSET(index);
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(vertices >> 32), (u32)vertices, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = vertices + 3 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 3};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLES);
+            method1(M_DRAW_END, 0);
         }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
