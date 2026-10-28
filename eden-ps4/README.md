@@ -181,8 +181,11 @@ sound here (no audio device), so the sound is tested on the desktop: there the W
 Breakout's beeps, each at its pitch and length (the ball's launch 660 Hz for 60 ms, a brick about
 1 kHz, a wall 330 Hz, a lost ball 160 Hz for 250 ms), in real time.
 
-As for stage 1 (see [its README](../switch-bench/README.md#testing-in-shadps4) for building
-shadPS4 and running it headless): the PKG's staging folder `~/eden-ps4-build/stage` without
+`shadps4-play.sh` runs the package's staging folder in shadPS4, headless, and plays a script of
+key presses, waits on the boot trace and screenshots, read from stdin (its header lists them);
+those runs above are such scripts. As for stage 1 (see
+[its README](../switch-bench/README.md#testing-in-shadps4) for building shadPS4 and running it
+headless): the PKG's staging folder `~/eden-ps4-build/stage` without
 `sce_module/`, run from a folder with a `user/` subfolder, so the app's `/data` is `user/data`.
 shadPS4 can't show what the console does with memory pools or executable memory, but the boot
 trace shows which pools the runtime and Eden got their memory from.
@@ -234,6 +237,13 @@ The PS4 memory changes, from what stage 1 measured:
 Other PS4 choices, in the launcher and `ps4-eden.cmake`: Boost.Asio is built without kqueue (the
 PS4 has no `sys/event.h`), thread names and priorities aren't set (not calls Crema makes on these
 consoles), and FFmpeg is built without its Linux-only calls (below).
+
+## Testing on the desktop
+
+`test.sh` runs each program in the desktop build with scripted controller input and checks what it
+printed, drew and played: the test program's checks, Breakout's frames and beeps, Blocks' frames,
+tune and best score (saved by one run, read by the next), the controller test, stopping a program,
+and that a program with libnx's full-memory heap starts at once. 17 checks, about 25 s.
 
 ## Building
 

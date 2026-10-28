@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Desktop regression tests for the launcher and the test programs: each program runs in the
+# desktop build (build.sh host) with scripted controller input, and what it printed, drew and
+# played is checked. Builds the programs first (hello/build.sh, game/build.sh).
+#   EDEN_PS4_BIN  the desktop build (default ~/eden-host/bin/eden-ps4)
+# Exit code: the number of failed checks.
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+BIN="${EDEN_PS4_BIN:-$HOME/eden-host/bin/eden-ps4}"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+failed=0
+
+check() { # check <description> <command...>
+    local what="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        echo "  ok    $what"
+    else
+        echo "  FAIL  $what"
+        failed=$((failed + 1))
+    fi
+}
+
+# run <name> <program> <timeout> <input script> [extra env...]: output in $work/<name>.log, frames
+# in $work/<name>-frames, sound in $work/<name>.wav, exit code in $work/<name>.code
+run() {
+    local name="$1" program="$2" timeout="$3" input="$4"
+    shift 4
+    env EDEN_PS4_DATA="$work/data" EDEN_PS4_FRAMES="$work/$name-frames" EDEN_PS4_AUDIO="$work/$name.wav" \
+        EDEN_PS4_INPUT="$input" EDEN_PS4_TIMEOUT="$timeout" "$@" "$BIN" "$program" >"$work/$name.log" 2>&1
+    echo $? >"$work/$name.code"
+}
+code() { [ "$(cat "$work/$1.code")" = "$2" ]; }
+says() { grep -q "$2" "$work/$1.log"; }
+drew() { [ -s "$work/$1-frames/last.ppm" ] && head -c 20 "$work/$1-frames/last.ppm" | grep -q "$2"; }
+# loud <name> <seconds>: the WAV has at least that many seconds of sound above a whisper
+loud() {
+    python3 - "$work/$1.wav" "$2" <<'PY'
+import struct, sys, wave
+w = wave.open(sys.argv[1])
+data = w.readframes(w.getnframes())
+samples = struct.unpack('<%dh' % (len(data) // 2), data)[0::w.getnchannels()]
+window = 4800
+loud = sum(1 for i in range(0, len(samples), window) if max(map(abs, samples[i:i + window]), default=0) > 300)
+sys.exit(0 if loud * window / 48000 >= float(sys.argv[2]) else 1)
+PY
+}
+
+echo "building the programs"
+OUT="$work" "$HERE/hello/build.sh" >/dev/null || { echo "hello/build.sh failed"; exit 1; }
+OUT="$work" "$HERE/game/build.sh" >/dev/null || { echo "game/build.sh failed"; exit 1; }
+
+echo "hello.nro: stage 2's checks"
+run hello "$work/hello.nro" 30 ""
+check "exits" code hello 0
+check "all checks pass" says hello "hello: all checks passed"
+
+echo "breakout.nro: picture, controller, sound"
+run breakout "$work/breakout.nro" 20 "2:A,2.2:,3:Right,4:,7:Plus,7.3:"
+check "exits on +" code breakout 0
+check "A launches the ball" says breakout "breakout: ball launched"
+check "draws 640x360 frames" drew breakout "640 360"
+check "beeps (audout)" loud breakout 0.2
+
+echo "blocks.nro: picture, sound, the SD card"
+run blocks "$work/blocks.nro" 20 "1:Up,1.1:,1.6:Up,1.7:,2.2:Up,2.3:,5:Plus,5.3:"
+check "exits on +" code blocks 0
+check "draws 640x360 frames" drew blocks "640 360"
+check "plays its tune" loud blocks 2
+check "saves its best score" test -s "$work/data/user/sdmc/blocks-best.txt"
+best="$(cat "$work/data/user/sdmc/blocks-best.txt" 2>/dev/null)"
+run blocks2 "$work/blocks.nro" 20 "1:Plus,1.3:"
+check "reads it back" says blocks2 "best score $best\$"
+check "doesn't save a lower score" bash -c "! grep -q 'saved' '$work/blocks2.log'"
+
+echo "padtest.nro: the controller test"
+run padtest "$work/padtest.nro" 20 "1:A+Left,2:,3:Plus+Minus,3.3:"
+check "exits on + and -" code padtest 0
+check "draws 1280x720 frames (libnx's console)" drew padtest "1280 720"
+
+echo "the launcher: stopping a program"
+run stop "$work/breakout.nro" 20 "2:Stop"
+check "Stop ends it (exit code 3)" code stop 3
+check "says so" says stop "the program was stopped"
+
+echo "the launcher: a program's full-memory heap (libnx's default) is quick to clear"
+cat >"$work/fullheap.c" <<'C'
+#include <stdio.h>
+#include <switch.h>
+int main(void) {
+    consoleDebugInit(debugDevice_SVC);
+    fprintf(stderr, "fullheap: started\n");
+    return 0;
+}
+C
+"${NX_BUILD:-$HOME/nx/devkitpro/libnx-clang/nx-build}" "$work/fullheap.nro" fullheap test 1.0 "$work/fullheap.c" >/dev/null 2>&1
+start=$(date +%s)
+run fullheap "$work/fullheap.nro" 60 ""
+check "starts and exits in under 15 s" bash -c "grep -q 'fullheap: started' '$work/fullheap.log' && [ \$(( \$(date +%s) - $start )) -lt 15 ]"
+
+echo "$failed failed"
+exit "$failed"

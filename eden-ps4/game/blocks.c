@@ -156,12 +156,13 @@ int main(int argc, char* argv[]) {
     padInitializeDefault(&pad);
     audio_init();
     music_play(kTune, sizeof(kTune) / sizeof(kTune[0]), 180);
-    fprintf(stderr, "blocks: started, audio %s\n", g_audio_ok ? "on" : "off");
+    const int best_at_start = load_best();
+    fprintf(stderr, "blocks: started, audio %s, best score %d\n", g_audio_ok ? "on" : "off", best_at_start);
 
     const double tick_freq = (double)armGetSystemTickFreq();
     g_seed = (u32)armGetSystemTick();
     State state = Playing;
-    int score = 0, lines = 0, level = 0, next = next_type(), best = load_best();
+    int score = 0, lines = 0, level = 0, next = next_type(), best = best_at_start;
     Piece cur = {0};
     double fall_timer = 0, repeat_timer = 0;
     int repeat_dir = 0;
