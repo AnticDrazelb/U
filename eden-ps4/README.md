@@ -258,6 +258,14 @@ Two ways it shows:
   a square at the top. Eden's Vulkan renderer shows that square black: its texture cache doesn't
   see a storage buffer's writes to a texture's memory, so the test checks every texel against what
   they should be instead.
+- **More of the 3D engine's fixed functions** (patch 0032): primitive restart (an indexed draw's
+  runs between restart indices), the provoking vertex register (first or last, for flat
+  varyings), polygon offset (the depth bias: a constant and a slope factor, clamped, for the kinds
+  of primitive it's enabled for), the alpha test, and point coordinates (gl_PointCoord) across
+  points. The GPU test shows three of them on the right: the tile with the alpha test, a strip of
+  two quads with a restart between them, and a point coloured by its coordinates; they match the
+  Vulkan renderer. (A restart index other than all ones is drawn as the GPU would, but Eden's
+  Vulkan renderer can't: Vulkan restarts only at all ones.)
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -427,6 +435,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: software draws recheck shaders by their code, and flush for reads only where they draw | above |
 | null renderer: RGBA8 writes and bilinear filtering in arrays, sRGB in the fast path, fragment shaders' own depth | above |
 | null renderer: compute shaders in software | above |
+| null renderer: primitive restart, the provoking vertex, polygon offset, the alpha test and point coordinates in software draws | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

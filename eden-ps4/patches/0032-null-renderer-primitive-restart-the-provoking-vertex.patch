@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 22:36:26 +0000
+Subject: [PATCH] null renderer: primitive restart, the provoking vertex,
+ polygon offset, the alpha test and point coordinates in software draws
+
+Indexed draws with primitive restart are drawn as the runs of indices between restart
+indices. Flat varyings come from the first vertex or the last, as the provoking vertex
+register says. Polygon offset (for triangles, lines and points, each as enabled) adds the
+depth bias: the constant in the depth format's smallest step (the register's half, as
+Eden's Vulkan renderer takes it) and the slope factor times the depth's steepest slope,
+clamped. The alpha test discards what fails against render target 0's alpha. A fragment
+shader's point coordinates (gl_PointCoord) run from 0 to 1 across each point, t down from
+the top as Eden's Vulkan renderer has it.
+---
+ .../renderer_null/software_draw.cpp           | 112 +++++++++++++++---
+ 1 file changed, 93 insertions(+), 19 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index c589da67b..364330470 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -1445,6 +1445,7 @@ struct SoftwareDraw::Program {
+     std::vector<Cell> cells;   // constants filled in; the rest are the program's values
+     std::array<Shader::Interpolation, 32> interpolation{};
+     std::array<bool, 32> generic_loaded{};
++    bool loads_point_coord = false; // a fragment shader's gl_PointCoord
+     u32 local_words = 0;
+     std::vector<Shader::TextureDescriptor> textures;
+     std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
+@@ -1542,6 +1543,10 @@ struct SoftwareDraw::Batch {
+     std::vector<Triangle> triangles;
+     std::vector<f32> varying_data;
+     bool zs_test = false, depth_test = false, stencil_test = false, depth_write = false;
++    bool alpha_test = false;   // render target 0's alpha against a reference
++    Maxwell::Regs::ComparisonOp alpha_func{};
++    f32 alpha_ref = 0.0f;
++    bool can_discard = false;  // the shader can discard pixels, or the alpha test
+     Tegra::DepthFormat zeta_format{};
+     u32 zeta_bpp = 0;
+     Maxwell::Regs::ComparisonOp depth_func{};
+@@ -3134,7 +3139,8 @@ void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+ }
+ 
+ /// The depth test: the incoming depth against the buffer's, both as the buffer keeps them
+-bool DepthPasses(Maxwell::Regs::ComparisonOp op, u32 incoming, u32 stored) {
++template <typename T>
++bool DepthPasses(Maxwell::Regs::ComparisonOp op, T incoming, T stored) {
+     using C = Maxwell::Regs::ComparisonOp;
+     switch (op) {
+     case C::Never_D3D: case C::Never_GL: return false;
+@@ -3150,9 +3156,11 @@ bool DepthPasses(Maxwell::Regs::ComparisonOp op, u32 incoming, u32 stored) {
+ 
+ // ---- the draw
+ 
++constexpr u32 POINT_COORD_SLOT = 128; // where a vertex keeps a point's corner's coordinates
++
+ struct Vertex {
+     std::array<f32, 4> position; // clip space
+-    std::array<f32, 128> varyings; // generic 0..31, xyzw
++    std::array<f32, 130> varyings; // generic 0..31, xyzw; then the point coordinates (s, t)
+     f32 point_size;
+ };
+ 
+@@ -3557,6 +3565,7 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+         for (u32 i = 0; i < 32; ++i) {
+             program->generic_loaded[i] = ir.info.loads.Generic(i);
+         }
++        program->loads_point_coord = ir.info.loads[IR::Attribute::PointSpriteS] || ir.info.loads[IR::Attribute::PointSpriteT];
+         program->local_words = (ir.local_memory_size + 3) / 4;
+         program->writes_depth = ir.info.stores_frag_depth;
+         program->storage.assign(ir.info.storage_buffers_descriptors.begin(), ir.info.storage_buffers_descriptors.end());
+@@ -4060,7 +4069,7 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                         }
+                         any |= st.stencil_pass[j] && st.depth_pass[j];
+                     }
+-                    if (!any && !fs->can_discard) {
++                    if (!any && !b.can_discard) {
+                         for (u32 m = stencil_test ? live : 0; m != 0; m &= m - 1) {
+                             const u32 j = u32(std::countr_zero(m));
+                             if (st.depth_pixel[j]) {
+@@ -4075,6 +4084,13 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                     std::copy_n(position_z, LANES, frag_depth.data());
+                 }
+                 Run(*fs, st.cells.data(), io, LANES);
++                if (b.alpha_test) { // fails: discarded
++                    const f32* const alpha = st.colors.data() + 3 * LANES;
++                    for (u32 m = live; m != 0; m &= m - 1) {
++                        const u32 j = u32(std::countr_zero(m));
++                        st.discard[j] = st.discard[j] || !DepthPasses(b.alpha_func, alpha[j], b.alpha_ref);
++                    }
++                }
+                 if (late_depth && depth_test) { // tested now, with the shader's depth
+                     for (u32 m = live; m != 0; m &= m - 1) {
+                         const u32 j = u32(std::countr_zero(m));
+@@ -4467,6 +4483,17 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     // The vertices the draw uses
+     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+     std::vector<u32> indices(count);
++    // with primitive restart, the draw's runs of indices between restart indices (drawn as draws of
++    // their own)
++    std::vector<std::pair<u32, u32>> runs;
++    const bool restart = is_indexed && regs.primitive_restart.enabled != 0;
++    u32 run_start = 0;
++    const auto restart_at = [&](u32 i, u32 index) {
++        if (restart && index == regs.primitive_restart.index) {
++            runs.emplace_back(run_start, i);
++            run_start = i + 1;
++        }
++    };
+     if (is_indexed && !draw_state.inline_index_draw_indexes.empty()) {
+         // indices sent in the command stream (32-bit)
+         const auto& inline_indices = draw_state.inline_index_draw_indexes;
+@@ -4474,6 +4501,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             u32 index;
+             std::memcpy(&index, inline_indices.data() + size_t(i) * 4, 4);
+             indices[i] = index + draw_state.base_index;
++            restart_at(i, index);
+         }
+     } else if (is_indexed) {
+         const auto& ib = draw_state.index_buffer;
+@@ -4484,6 +4512,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             u32 index = 0;
+             std::memcpy(&index, raw.data() + size_t(i) * size, size);
+             indices[i] = index + draw_state.base_index;
++            restart_at(i, index);
+         }
+     } else {
+         for (u32 i = 0; i < count; ++i) {
+@@ -4529,7 +4558,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+               &vs_cbufs, vs_local.data(), vs->local_words, &vs_textures, &vs_storage, &gpu_memory};
+         Run(*vs, vs_cells.data(), io, 1);
+         std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+-        std::memcpy(out.varyings.data(), &outputs[32], sizeof(out.varyings));
++        std::memcpy(out.varyings.data(), &outputs[32], POINT_COORD_SLOT * sizeof(f32));
++        out.varyings[POINT_COORD_SLOT] = out.varyings[POINT_COORD_SLOT + 1] = 0.0f;
+         out.point_size = outputs[static_cast<u32>(IR::Attribute::PointSize)];
+     };
+ 
+@@ -4542,6 +4572,10 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             }
+         }
+     }
++    if (fs->loads_point_coord) { // across each point, 0 to 1 (0 elsewhere)
++        varyings.push_back({u16(IR::Attribute::PointSpriteS), u16(POINT_COORD_SLOT), Shader::Interpolation::NoPerspective});
++        varyings.push_back({u16(IR::Attribute::PointSpriteT), u16(POINT_COORD_SLOT + 1), Shader::Interpolation::NoPerspective});
++    }
+     const size_t num_varyings = varyings.size();
+ 
+     // Window coordinates (Vulkan's: the y axis down), as Eden's Vulkan renderer sets the viewport
+@@ -4629,8 +4663,15 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     // varyings the fragment shader reads after them in 'varying_data'
+     std::vector<Triangle> triangles;
+     std::vector<f32> varying_data;
++    // flat varyings from the provoking vertex; depth bias (polygon offset) for the kinds of
++    // primitive it's on for: a constant (in the depth format's smallest step, the register's half,
++    // as Eden's Vulkan renderer has it) and a slope factor, clamped
++    const u32 provoking = regs.provoking_vertex == Maxwell::Regs::ProvokingVertex::First ? 0 : 2;
++    const f32 bias_step = zeta_format == Tegra::DepthFormat::Z16_UNORM ? 1.0f / 65536.0f : 1.0f / 16777216.0f;
++    const f32 bias_units = regs.depth_bias * 0.5f * bias_step, bias_slope = regs.slope_scale_depth_bias;
++    const f32 bias_clamp = regs.depth_bias_clamp;
+     const auto add_triangle = [&](const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c,
+-                                  bool cullable = true) {
++                                  bool cullable = true, bool biased = false) {
+         const ScreenVertex* v[3] = {&a, &b, &c};
+         Triangle t;
+         for (u32 i = 0; i < 3; ++i) {
+@@ -4655,6 +4696,21 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                 return;
+             }
+         }
++        if (biased) {
++            // the depth's steepest slope in window coordinates
++            const f32 x1 = v[1]->x - v[0]->x, y1 = v[1]->y - v[0]->y, x2 = v[2]->x - v[0]->x, y2 = v[2]->y - v[0]->y;
++            const f32 z1 = v[1]->z - v[0]->z, z2 = v[2]->z - v[0]->z, det = x1 * y2 - x2 * y1;
++            const f32 slope = det != 0.0f ? std::max(std::fabs((z1 * y2 - z2 * y1) / det), std::fabs((z2 * x1 - z1 * x2) / det)) : 0.0f;
++            f32 offset = bias_units + bias_slope * slope;
++            if (bias_clamp > 0.0f) {
++                offset = std::min(offset, bias_clamp);
++            } else if (bias_clamp < 0.0f) {
++                offset = std::max(offset, bias_clamp);
++            }
++            for (f32& z : t.z) {
++                z += offset;
++            }
++        }
+         u32 order[3] = {0, 1, 2};
+         if (area < 0) { // counter-clockwise from here on: inside, the edge functions are positive
+             std::swap(order[1], order[2]);
+@@ -4678,8 +4734,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         t.varyings = varying_data.size();
+         for (u32 i = 0; i < 3; ++i) {
+             for (const Varying& varying : varyings) {
+-                // flat: the provoking vertex's value (the last, as on Maxwell) everywhere
+-                const ScreenVertex* source = varying.interpolation == Shader::Interpolation::Flat ? v[2] : v[order[i]];
++                // flat: the provoking vertex's value everywhere
++                const ScreenVertex* source = varying.interpolation == Shader::Interpolation::Flat ? v[provoking] : v[order[i]];
+                 varying_data.push_back(source->varyings[varying.vertex]);
+             }
+         }
+@@ -4713,6 +4769,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         return v;
+     };
+     std::vector<Vertex> polygon, clipped;
++    const bool bias_fill = regs.polygon_offset_fill_enable != 0;
++    const bool bias_line = regs.polygon_offset_line_enable != 0, bias_point = regs.polygon_offset_point_enable != 0;
+     const auto clip_and_add = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
+         u32 outside = 0;
+         for (u32 plane = 0; plane < 5; ++plane) {
+@@ -4721,7 +4779,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             }
+         }
+         if (outside == 0) {
+-            add_triangle(to_screen(a), to_screen(b), to_screen(c));
++            add_triangle(to_screen(a), to_screen(b), to_screen(c), true, bias_fill);
+             return;
+         }
+         polygon.assign({a, b, c});
+@@ -4748,7 +4806,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         }
+         const ScreenVertex first = to_screen(polygon[0]);
+         for (size_t i = 1; i + 1 < polygon.size(); ++i) {
+-            add_triangle(first, to_screen(polygon[i]), to_screen(polygon[i + 1]));
++            add_triangle(first, to_screen(polygon[i]), to_screen(polygon[i + 1]), true, bias_fill);
+         }
+     };
+ 
+@@ -4762,13 +4820,18 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+                 return;
+             }
+         }
+-        const ScreenVertex c = to_screen(v);
+         const f32 half = std::max(program_point_size ? v.point_size : regs.point_size, 1.0f) * 0.5f;
+-        ScreenVertex q[4] = {c, c, c, c};
+-        q[0].x -= half, q[0].y -= half, q[1].x += half, q[1].y -= half;
+-        q[2].x -= half, q[2].y += half, q[3].x += half, q[3].y += half;
+-        add_triangle(q[0], q[1], q[2], false);
+-        add_triangle(q[2], q[1], q[3], false);
++        Vertex corners[4] = {v, v, v, v}; // (t down from the top, as Eden's Vulkan renderer has it)
++        ScreenVertex q[4];
++        for (u32 k = 0; k < 4; ++k) {
++            corners[k].varyings[POINT_COORD_SLOT] = f32(k & 1);
++            corners[k].varyings[POINT_COORD_SLOT + 1] = f32((k >> 1) & 1);
++            q[k] = to_screen(corners[k]);
++            q[k].x += (k & 1) ? half : -half;
++            q[k].y += (k & 2) ? half : -half;
++        }
++        add_triangle(q[0], q[1], q[2], false, bias_point);
++        add_triangle(q[2], q[1], q[3], false, bias_point);
+     };
+     const auto add_line = [&](const Vertex& a, const Vertex& b) {
+         Vertex p = a, q = b;
+@@ -4789,8 +4852,8 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         ScreenVertex v[4] = {s0, s0, s1, s1};
+         v[0].x -= ox, v[0].y -= oy, v[1].x += ox, v[1].y += oy;
+         v[2].x -= ox, v[2].y -= oy, v[3].x += ox, v[3].y += oy;
+-        add_triangle(v[0], v[1], v[2], false); // the last vertex provoking, as Maxwell's lines have it
+-        add_triangle(v[2], v[1], v[3], false);
++        add_triangle(v[0], v[1], v[2], false, bias_line); // (the second vertex provoking for both)
++        add_triangle(v[2], v[1], v[3], false, bias_line);
+     };
+ 
+     const auto topology = draw_state.topology;
+@@ -4798,10 +4861,17 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         LogOnce(fmt::format("primitive topology {} not drawn", static_cast<u32>(topology)));
+         return;
+     }
+-    std::vector<Vertex> vertices(count);
++    runs.emplace_back(run_start, count);
++    std::vector<Vertex> all_vertices(count);
+     for (u32 instance = 0; instance < std::max(instance_count, 1u); ++instance) {
++      for (const auto& [run_begin, run_end] : runs) {
++        if (run_begin >= run_end) {
++            continue;
++        }
++        Vertex* const vertices = all_vertices.data() + run_begin;
++        const u32 count = run_end - run_begin;
+         for (u32 i = 0; i < count; ++i) {
+-            shade_vertex(indices[i], instance, vertices[i]);
++            shade_vertex(indices[run_begin + i], instance, vertices[i]);
+         }
+         switch (topology) {
+         case Topology::Triangles:
+@@ -4843,6 +4913,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         default:
+             break;
+         }
++      }
+     }
+     if (triangles.empty()) {
+         return;
+@@ -4872,6 +4943,9 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     batch->varying_data = std::move(varying_data);
+     batch->zs_test = zs_test, batch->depth_test = depth_test, batch->stencil_test = stencil_test;
+     batch->depth_write = depth_write;
++    batch->alpha_test = regs.alpha_test_enabled != 0;
++    batch->alpha_func = regs.alpha_test_func, batch->alpha_ref = regs.alpha_test_ref;
++    batch->can_discard = fs->can_discard || batch->alpha_test;
+     batch->zeta_format = zeta_format, batch->zeta_bpp = zeta_bpp, batch->depth_func = depth_func;
+     batch->front_stencil = front_stencil, batch->back_stencil = back_stencil;
+     batch->zeta_address = zeta_address, batch->zeta_pitch_linear = zeta_pitch_linear;

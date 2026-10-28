@@ -233,6 +233,21 @@ for py in range(11, 52):
         bad += at(px, py) != expected
 sys.exit(0 if bad == 0 else 1)
 PY
+# on the right: an indexed strip of two magenta quads with a restart index between them (nothing
+# drawn between), and a point of 32 pixels coloured by its coordinates (black top left, red top
+# right, green bottom left, yellow bottom right)
+check "its primitive restart and point coordinates work" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+magenta = lambda p: p[0] > 200 and p[1] < 80 and p[2] > 180
+ok = magenta(at(582, 186)) and magenta(at(618, 186)) and not magenta(at(600, 186))
+tl, tr, bl, br = at(586, 208), at(614, 208), at(586, 236), at(614, 236)
+ok &= max(tl[:2]) < 60 and tr[0] > 200 and tr[1] < 60 and bl[1] > 200 and bl[0] < 60 and min(br[:2]) > 200
+sys.exit(0 if ok else 1)
+PY
 
 echo "gputest.nro's stress test: 400 more sprites, a draw each (queued, rasterized together)"
 run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"

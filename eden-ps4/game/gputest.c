@@ -21,7 +21,8 @@
 // own, sampled where the floor's derivatives choose, the shader branching per pixel for stripes.
 // And two squares whose fragment programs write their own depths (top right), and a square of the
 // tile through an sRGB texture header. And a compute program (shared memory, a barrier) filling a
-// texture shown on a square at the top.
+// texture shown on a square at the top. And on the right, the alpha test, primitive restart and a
+// point's coordinates.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100).
 
@@ -107,6 +108,11 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define STENCIL_OFFSET(i) (0x3800 + (i) * 0x100) // the stencil triangle (3 vertices), then its square (4)
 #define M_LINE_WIDTH 0x4ED         // aliased lines
 #define M_POINT_SIZE 0x546
+#define M_POINT_SPRITE_ENABLE 0x548
+#define M_ALPHA_TEST_ENABLE 0x4BB
+#define M_ALPHA_TEST_REF 0x4C4      // ref, func
+#define M_PRIMITIVE_RESTART 0x591   // enable, index
+#define FUNC_GREATER 0x204
 #define TOPOLOGY_POINTS 0
 #define M_DRAW_INLINE_INDEX 0x57A  // a draw's indices in the command stream, one a word
 #define TOPOLOGY_LINE_STRIP 3
@@ -230,6 +236,7 @@ static u64 stg(u32 addr, u32 src) {
 #define FS_SRGB_OFFSET 0x810  // the tile, through an sRGB texture header (handle 3)
 #define FS_COMPUTED_OFFSET 0xA10 // the texture the compute program fills (handle 4)
 #define CS_OFFSET 0x900       // the compute program (no header)
+#define FS_POINT_COORD_OFFSET 0xB10 // a point's coordinates (gl_PointCoord) as its colour
 #define CS_CBUF 0x4800        // its constant buffer 0: the storage buffer it writes, at 0x110
 #define QMD_OFFSET 0x4A00     // its launch description (256-byte aligned)
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
@@ -265,7 +272,6 @@ static void write_programs(u8* heap) {
     fs[5] = ipa(3, 0x8C);
     fs[6] = exit_();
     fs[7] = nop();
-    (void)mov32i;
 
     // the textured one: varying 0's x, y are texture coordinates
     u32* ft_sph = (u32*)(heap + FS_TEX_OFFSET);
@@ -396,6 +402,20 @@ static void write_programs(u8* heap) {
     for (size_t i = 0, k = 0; i < sizeof(code) / sizeof(code[0]); k++) {
         cs[k] = k % 4 == 0 ? SCHED : code[i++];
     }
+
+    // red and green from the point's coordinates (a[0x2E0], a[0x2E4]: gl_PointCoord's s, t)
+    u32* fp_sph = (u32*)(heap + FS_POINT_COORD_OFFSET);
+    fp_sph[0] = 2 | 3 << 5 | 5 << 10;
+    fp_sph[18] = 0xF;
+    u64* fp = (u64*)(heap + FS_POINT_COORD_OFFSET + 0x50);
+    fp[0] = SCHED;
+    fp[1] = ipa(0, 0x2E0);
+    fp[2] = ipa(1, 0x2E4);
+    fp[3] = mov32i(2, 0.0f);
+    fp[4] = SCHED;
+    fp[5] = mov32i(3, 1.0f);
+    fp[6] = exit_();
+    fp[7] = nop();
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -804,6 +824,7 @@ int main(int argc, char* argv[]) {
 #define FRAG_DEPTH_OFFSET(i) (0x3E00 + (i) * 0x200) // 2 squares of 4 vertices, 48 bytes each
 #define SRGB_OFFSET(i) (0x4400 + (i) * 0x80)        // the sRGB square (4 vertices)
 #define COMPUTED_OFFSET(i) (0x4600 + (i) * 0x80)    // the compute program's image's square
+#define FIXED_OFFSET(i) (0x4C00 + (i) * 0x200)      // the alpha-tested square (4), the strip (9), the point (1)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -1284,6 +1305,64 @@ int main(int argc, char* argv[]) {
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
             method1(M_DRAW_END, 0);
             method1(M_STENCIL_ENABLE, 0);
+        }
+        // on the right: the tile with the alpha test (alpha over 0.3: its opaque rings only), a strip
+        // of two quads with a restart index between them (nothing between them), and a point of
+        // 32 pixels coloured by its coordinates (red across, green down)
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + FIXED_OFFSET(index));
+            static const float points[14][4] = {
+                {0.775f, -0.2778f, 0, 0}, {0.975f, -0.2778f, 1, 0}, {0.775f, -0.0778f, 0, 1}, {0.975f, -0.0778f, 1, 1},
+                {0.775f, -0.0444f, 0, 0}, {0.8625f, -0.0444f, 0, 0}, {0.775f, 0.1111f, 0, 0}, {0.8625f, 0.1111f, 0, 0},
+                {0.8875f, -0.0444f, 0, 0}, {0.975f, -0.0444f, 0, 0}, {0.8875f, 0.1111f, 0, 0}, {0.975f, 0.1111f, 0, 0},
+                {0.875f, 0.3111f, 0, 0}, // (unused)
+                {0.875f, 0.2333f, 0, 0}};
+            for (int k = 0; k < 14; k++) {
+                v[k * 8 + 0] = points[k][0], v[k * 8 + 1] = points[k][1], v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                const bool square = k < 4;
+                v[k * 8 + 4] = square ? points[k][2] : 0.95f, v[k * 8 + 5] = square ? points[k][3] : 0.2f;
+                v[k * 8 + 6] = square ? 0.0f : 0.85f, v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t fixed = heap_iova + FIXED_OFFSET(index);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(fixed >> 32), (u32)fixed, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = fixed + 14 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            // the alpha test
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_TILES_OFFSET);
+            const u32 alpha_ref[2] = {f32bits(0.3f), FUNC_GREATER};
+            method(M_ALPHA_TEST_REF, 2, alpha_ref);
+            method1(M_ALPHA_TEST_ENABLE, 1);
+            const u32 square_range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, square_range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_ALPHA_TEST_ENABLE, 0);
+            // the strip with a restart (the index of all ones: the one Vulkan can restart at too)
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+            const u32 restart[2] = {1, 0xFFFFFFFFu};
+            method(M_PRIMITIVE_RESTART, 2, restart);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            static const u32 strip[9] = {4, 5, 6, 7, 0xFFFFFFFFu, 8, 9, 10, 11};
+            emit(header(NONINCREASING, 9, SUBCH_3D, M_DRAW_INLINE_INDEX));
+            for (u32 i = 0; i < 9; i++)
+                emit(strip[i]);
+            method1(M_DRAW_END, 0);
+            method1(M_PRIMITIVE_RESTART, 0);
+            // the point
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_POINT_COORD_OFFSET);
+            method1(M_POINT_SPRITE_ENABLE, 1);
+            method1(M_POINT_SIZE, f32bits(32.0f));
+            const u32 point_range[2] = {13, 1};
+            method(M_VERTEX_FIRST, 2, point_range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_POINTS);
+            method1(M_DRAW_END, 0);
+            method1(M_POINT_SPRITE_ENABLE, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
         // the compute program, dispatched, and its image on a square at the top: in each 8x8 block,
         // the colours mirrored both ways (through shared memory and a barrier)
