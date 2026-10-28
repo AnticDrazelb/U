@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:13:18 +0000
+Subject: [PATCH] null renderer: storage buffers, global memory and subgroup
+ ops in software shaders
+
+---
+ .../renderer_null/software_draw.cpp           | 177 +++++++++++++++++-
+ 1 file changed, 173 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 6ca4d0c11..479331c35 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -441,6 +441,20 @@ bool IsSupported(IR::Opcode op) {
+     case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod: case O::ImageGather:
+     case O::ImageGatherDref: case O::ImageFetch: case O::ImageQueryDimensions:
+     case O::ImageQueryLod: case O::ImageGradient: case O::GetSparseFromOp:
++    case O::IsTextureScaled: case O::IsImageScaled: case O::GetInBoundsFromOp:
++    case O::LaneId: case O::VoteAll: case O::VoteAny: case O::VoteEqual: case O::SubgroupBallot:
++    case O::SubgroupEqMask: case O::SubgroupLtMask: case O::SubgroupLeMask: case O::SubgroupGtMask:
++    case O::SubgroupGeMask: case O::ShuffleIndex: case O::ShuffleUp: case O::ShuffleDown:
++    case O::ShuffleButterfly: case O::QuadBroadcast: case O::QuadSwap: case O::FSwizzleAdd:
++    case O::InvocationInfo: case O::IAbs64:
++    case O::LoadStorageU8: case O::LoadStorageS8: case O::LoadStorageU16: case O::LoadStorageS16:
++    case O::LoadStorage32: case O::LoadStorage64: case O::LoadStorage128:
++    case O::WriteStorageU8: case O::WriteStorageS8: case O::WriteStorageU16: case O::WriteStorageS16:
++    case O::WriteStorage32: case O::WriteStorage64: case O::WriteStorage128:
++    case O::LoadGlobalU8: case O::LoadGlobalS8: case O::LoadGlobalU16: case O::LoadGlobalS16:
++    case O::LoadGlobal32: case O::LoadGlobal64: case O::LoadGlobal128:
++    case O::WriteGlobalU8: case O::WriteGlobalS8: case O::WriteGlobalU16: case O::WriteGlobalS16:
++    case O::WriteGlobal32: case O::WriteGlobal64: case O::WriteGlobal128:
+         return true;
+     default:
+         return false;
+@@ -1367,6 +1381,7 @@ struct SoftwareDraw::Program {
+     std::vector<Shader::TextureDescriptor> textures;
+     std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
+     bool one_lane = false; // it branches (or uses local memory): run a pixel at a time
++    std::vector<Shader::StorageBufferDescriptor> storage;
+     bool writes_depth = false;
+ };
+ 
+@@ -1478,7 +1493,12 @@ private:
+ 
+ namespace {
+ 
+-/// What an invocation reads and writes.
++/// A storage buffer a shader reads or writes: where it is in the GPU's address space
++struct StorageBuffer {
++    GPUVAddr address = 0;
++    u32 size = 0;
++};
++
+ /// What an invocation reads and writes. Inputs, outputs and colours are kept 'stride' lanes to an
+ /// attribute (or colour component), 'n' lanes run from 'lane'.
+ struct Io {
+@@ -1492,6 +1512,8 @@ struct Io {
+     u32* local;
+     u32 local_words;
+     const std::vector<Binding>* textures;
++    const std::vector<StorageBuffer>* storage;
++    Tegra::MemoryManager* memory;
+ };
+ 
+ class Flattener {
+@@ -1781,6 +1803,56 @@ Cell LaneCell(const Lanes& x, u32 i) {
+     return {{x.w[0][i], x.w[1][i], x.w[2][i], x.w[3][i]}};
+ }
+ 
++/// Storage buffer and global memory accesses: 'bytes' at a buffer's offset (in its bounds), or
++/// at an address
++bool StorageAddress(const Io& io, u32 binding, u32 offset, u32 bytes, GPUVAddr& address) {
++    if (!io.storage || binding >= io.storage->size()) {
++        return false;
++    }
++    const StorageBuffer& buffer = (*io.storage)[binding];
++    if (buffer.address == 0 || u64{offset} + bytes > buffer.size) {
++        return false;
++    }
++    address = buffer.address + offset;
++    return true;
++}
++
++void ReadMemory(const Io& io, GPUVAddr address, u32 bytes, bool sign, Lanes& d, u32 i) {
++    u32 words[4]{};
++    io.memory->ReadBlockUnsafe(address, words, bytes);
++    if (bytes == 1) {
++        words[0] = sign ? u32(s32(s8(words[0]))) : words[0] & 0xFF;
++    } else if (bytes == 2) {
++        words[0] = sign ? u32(s32(s16(words[0]))) : words[0] & 0xFFFF;
++    }
++    for (u32 k = 0; k < 4; ++k) {
++        d.w[k][i] = words[k];
++    }
++}
++
++void WriteMemory(const Io& io, GPUVAddr address, u32 bytes, const Lanes& value, u32 i) {
++    const u32 words[4] = {value.w[0][i], value.w[1][i], value.w[2][i], value.w[3][i]};
++    io.memory->WriteBlockUnsafe(address, words, bytes);
++}
++
++u32 AccessBytes(IR::Opcode op) {
++    using O = IR::Opcode;
++    switch (op) {
++    case O::LoadStorageU8: case O::LoadStorageS8: case O::WriteStorageU8: case O::WriteStorageS8:
++    case O::LoadGlobalU8: case O::LoadGlobalS8: case O::WriteGlobalU8: case O::WriteGlobalS8:
++        return 1;
++    case O::LoadStorageU16: case O::LoadStorageS16: case O::WriteStorageU16: case O::WriteStorageS16:
++    case O::LoadGlobalU16: case O::LoadGlobalS16: case O::WriteGlobalU16: case O::WriteGlobalS16:
++        return 2;
++    case O::LoadStorage64: case O::WriteStorage64: case O::LoadGlobal64: case O::WriteGlobal64:
++        return 8;
++    case O::LoadStorage128: case O::WriteStorage128: case O::LoadGlobal128: case O::WriteGlobal128:
++        return 16;
++    default:
++        return 4;
++    }
++}
++
+ /// The texture instructions, a lane at a time
+ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io, u32 n) {
+     using O = IR::Opcode;
+@@ -2247,8 +2319,83 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+             RunTexture(program, o, c, io, n);
+             break;
+         case O::GetSparseFromOp:
+-            LANE_LOOP d.w[0][i] = 1; // every texel is resident
++        case O::GetInBoundsFromOp:
++            LANE_LOOP d.w[0][i] = 1; // every texel is resident; every shuffle in bounds
++            break;
++        case O::IsTextureScaled:
++        case O::IsImageScaled:
++        case O::LaneId:
++        case O::InvocationInfo:
++        case O::SubgroupLtMask:
++        case O::SubgroupGtMask:
++            LANE_LOOP d.w[0][i] = 0;
++            break;
++        // each lane is an invocation of its own (a subgroup of one)
++        case O::VoteAll:
++        case O::VoteAny:
++            LANE_LOOP d.w[0][i] = a.w[0][i] != 0;
++            break;
++        case O::VoteEqual:
++        case O::SubgroupEqMask:
++        case O::SubgroupLeMask:
++        case O::SubgroupGeMask:
++            LANE_LOOP d.w[0][i] = 1;
+             break;
++        case O::SubgroupBallot:
++            LANE_LOOP d.w[0][i] = a.w[0][i] != 0 ? 1 : 0;
++            break;
++        case O::ShuffleIndex: case O::ShuffleUp: case O::ShuffleDown: case O::ShuffleButterfly:
++        case O::QuadBroadcast: case O::QuadSwap:
++            LANE_LOOP d.w[0][i] = a.w[0][i];
++            break;
++        case O::FSwizzleAdd: { // as the quad's first invocation does it
++            static constexpr f32 modifier_a[4] = {1.0f, -1.0f, 1.0f, 0.0f};
++            static constexpr f32 modifier_b[4] = {1.0f, 1.0f, -1.0f, 1.0f};
++            LANE_LOOP {
++                const u32 mode = e.w[0][i] & 3;
++                SetFl(d, i, Fl(a, i) * modifier_a[mode] + Fl(b, i) * modifier_b[mode]);
++            }
++            break;
++        }
++        case O::IAbs64: LANE_LOOP SetU64l(d, i, s64(U64l(a, i)) < 0 ? 0 - U64l(a, i) : U64l(a, i)); break;
++        case O::LoadStorageU8: case O::LoadStorageS8: case O::LoadStorageU16: case O::LoadStorageS16:
++        case O::LoadStorage32: case O::LoadStorage64: case O::LoadStorage128: {
++            const u32 bytes = AccessBytes(o.op);
++            const bool sign = o.op == O::LoadStorageS8 || o.op == O::LoadStorageS16;
++            IO_LOOP {
++                GPUVAddr address;
++                if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
++                    ReadMemory(io, address, bytes, sign, d, i);
++                } else {
++                    d.w[0][i] = d.w[1][i] = d.w[2][i] = d.w[3][i] = 0;
++                }
++            }
++            break;
++        }
++        case O::WriteStorageU8: case O::WriteStorageS8: case O::WriteStorageU16: case O::WriteStorageS16:
++        case O::WriteStorage32: case O::WriteStorage64: case O::WriteStorage128: {
++            const u32 bytes = AccessBytes(o.op);
++            IO_LOOP {
++                GPUVAddr address;
++                if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
++                    WriteMemory(io, address, bytes, e, i);
++                }
++            }
++            break;
++        }
++        case O::LoadGlobalU8: case O::LoadGlobalS8: case O::LoadGlobalU16: case O::LoadGlobalS16:
++        case O::LoadGlobal32: case O::LoadGlobal64: case O::LoadGlobal128: {
++            const u32 bytes = AccessBytes(o.op);
++            const bool sign = o.op == O::LoadGlobalS8 || o.op == O::LoadGlobalS16;
++            IO_LOOP ReadMemory(io, U64l(a, i), bytes, sign, d, i);
++            break;
++        }
++        case O::WriteGlobalU8: case O::WriteGlobalS8: case O::WriteGlobalU16: case O::WriteGlobalS16:
++        case O::WriteGlobal32: case O::WriteGlobal64: case O::WriteGlobal128: {
++            const u32 bytes = AccessBytes(o.op);
++            IO_LOOP WriteMemory(io, U64l(a, i), bytes, b, i);
++            break;
++        }
+         default:
+             break;
+         }
+@@ -2540,6 +2687,7 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+         }
+         program->local_words = (ir.local_memory_size + 3) / 4;
+         program->writes_depth = ir.info.stores_frag_depth;
++        program->storage.assign(ir.info.storage_buffers_descriptors.begin(), ir.info.storage_buffers_descriptors.end());
+         program->textures.assign(ir.info.texture_descriptors.begin(), ir.info.texture_descriptors.end());
+         u32 bindings = 0;
+         for (const auto& descriptor : program->textures) {
+@@ -2695,6 +2843,27 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     bind_textures(*vs, vs_cbufs, vs_textures);
+     bind_textures(*fs, fs_cbufs, fs_textures);
+ 
++    // Storage buffers: their addresses and sizes in the constant buffers, as Eden's buffer cache
++    // reads them
++    const auto bind_storage = [&](const Program& program, const std::array<std::vector<u32>, 18>& cbufs,
++                                  std::vector<StorageBuffer>& out) {
++        const auto word = [&](u32 cbuf, u32 offset) -> u32 {
++            return cbuf < cbufs.size() && offset / 4 < cbufs[cbuf].size() ? cbufs[cbuf][offset / 4] : 0;
++        };
++        for (const Shader::StorageBufferDescriptor& desc : program.storage) {
++            StorageBuffer buffer;
++            buffer.address = u64{word(desc.cbuf_index, desc.cbuf_offset)} |
++                             (u64{word(desc.cbuf_index, desc.cbuf_offset + 4)} << 32);
++            const u32 size = word(desc.cbuf_index, desc.cbuf_offset + 8);
++            const bool size_follows = word(desc.cbuf_index, desc.cbuf_offset + 12) == 0 && size != 0;
++            buffer.size = size_follows ? size : 8u << 20;
++            out.push_back(buffer);
++        }
++    };
++    std::vector<StorageBuffer> vs_storage, fs_storage;
++    bind_storage(*vs, vs_cbufs, vs_storage);
++    bind_storage(*fs, fs_cbufs, fs_storage);
++
+     // The vertices the draw uses
+     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+     std::vector<u32> indices(count);
+@@ -2749,7 +2918,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         outputs.fill(0.0f);
+         outputs[static_cast<u32>(IR::Attribute::PositionW)] = 1.0f;
+         Io io{inputs.data(), outputs.data(), vs_colors.data(), &vs_discard, 1, 0,
+-              &vs_cbufs, vs_local.data(), vs->local_words, &vs_textures};
++              &vs_cbufs, vs_local.data(), vs->local_words, &vs_textures, &vs_storage, &gpu_memory};
+         Run(*vs, vs_cells.data(), io, 1);
+         std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+         std::memcpy(out.varyings.data(), &outputs[32], sizeof(out.varyings));
+@@ -3102,7 +3271,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         f32* const in = st.inputs.data();
+         const auto input = [&](IR::Attribute attribute) { return in + static_cast<u32>(attribute) * LANES; };
+         Io io{in, st.outputs.data(), st.colors.data(), st.discard.data(), LANES, 0,
+-              &fs_cbufs, st.local.data(), fs->local_words, &fs_textures};
++              &fs_cbufs, st.local.data(), fs->local_words, &fs_textures, &fs_storage, &gpu_memory};
+         for (const Triangle& t : triangles) {
+             const s32 ys = std::max(t.y0, row_begin), ye = std::min(t.y1, row_end);
+             if (ys >= ye) {

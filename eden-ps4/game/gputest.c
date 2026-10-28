@@ -108,6 +108,14 @@ static u64 tex2d(u32 dest, u32 coord, u32 handle_offset) {
     return 0x18ull << 59 | 7ull << 51 /* no sparse predicate */ | (u64)(handle_offset / 4) << 36 |
            0xFull << 31 /* rgba */ | 2ull << 28 /* 2D */ | RZ << 20 | PT | (u64)coord << 8 | dest;
 }
+// MOV Rdest, c[bank][offset]
+static u64 mov_cbuf(u32 dest, u32 bank, u32 offset) {
+    return 0x4C98ull << 48 | 0xFull << 39 /* all bytes */ | (u64)bank << 34 | (u64)(offset / 4) << 20 | PT | dest;
+}
+// LDG.E.128 Rdest..Rdest+3, [Raddr..Raddr+1]: 16 bytes from a 64-bit GPU address
+static u64 ldg128(u32 dest, u32 addr) {
+    return 0xEED0ull << 48 | 6ull << 48 /* 128 bits */ | 1ull << 45 /* 64-bit address */ | PT | (u64)addr << 8 | dest;
+}
 static u64 exit_(void) { // EXIT (condition: true)
     return 0xE30ull << 52 | PT | 0xF;
 }
@@ -122,6 +130,8 @@ static u64 nop(void) {
 #define FS_OFFSET 0x110
 #define FS_TEX_OFFSET 0x210
 #define FS_TILES_OFFSET 0x310
+#define FS_STORAGE_OFFSET 0x410
+#define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
 #define FS_CBUF 0x2200  // the fragment stage's constant buffer 0: texture handles
@@ -177,6 +187,21 @@ static void write_programs(u8* heap) {
     u64* tt = (u64*)(heap + FS_TILES_OFFSET + 0x50);
     memcpy(tt, ft, 8 * sizeof(u64));
     tt[3] = tex2d(0, 4, 4);
+
+    // the storage buffer's: its colour loaded from the buffer whose address (as NVN puts it) is
+    // at 0x110 in the constant buffer
+    u32* fb_sph = (u32*)(heap + FS_STORAGE_OFFSET);
+    fb_sph[0] = 2 | 3 << 5 | 5 << 10;
+    fb_sph[18] = 0xF;
+    u64* fbuf = (u64*)(heap + FS_STORAGE_OFFSET + 0x50);
+    fbuf[0] = SCHED;
+    fbuf[1] = mov_cbuf(2, 0, 0x110);
+    fbuf[2] = mov_cbuf(3, 0, 0x114);
+    fbuf[3] = ldg128(0, 2);
+    fbuf[4] = SCHED;
+    fbuf[5] = exit_();
+    fbuf[6] = nop();
+    fbuf[7] = nop();
 }
 
 // A texture header (TIC) for a 2D, pitch-linear RGBA8 texture, and a point-sampling, clamping
@@ -428,10 +453,17 @@ int main(int argc, char* argv[]) {
     write_programs(heap);
     write_texture(heap, sprite_iova, SPRITE, SPRITE, SPRITE * 4);
     write_tile_texture(heap, tile_image);
+    {   // the storage buffer (a cyan), its address and size in the constant buffer
+        const float colour[4] = {0.1f, 0.9f, 0.95f, 1.0f};
+        memcpy(heap + STORAGE_OFFSET, colour, sizeof(colour));
+        const iova_t storage = heap_iova + STORAGE_OFFSET;
+        u32* const slot = (u32*)(heap + FS_CBUF + 0x110);
+        slot[0] = (u32)storage, slot[1] = (u32)(storage >> 32), slot[2] = sizeof(colour), slot[3] = 0;
+    }
 #define VERTICES_OFFSET(i) (0x1000 + (i) * 0x100)
 #define QUAD_OFFSET(i) (0x1800 + (i) * 0x100)
 #define TILES_OFFSET(i) (0x1C00 + (i) * 0x80)
-#define DEPTH_OFFSET(i) (0x2400 + (i) * 0x100)
+#define DEPTH_OFFSET(i) (0x2400 + (i) * 0x200) // the depth bars (8 vertices), then the storage square (4)
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -527,7 +559,7 @@ int main(int argc, char* argv[]) {
             method(M_BLEND, 8, blend);
             method(M_TEX_SAMPLER_POOL, 3, samplers);
             method1(M_TEXTURE_CBUF_SLOT, 0);
-            const u32 cbuf[3] = {0x100, (u32)((heap_iova + FS_CBUF) >> 32), (u32)(heap_iova + FS_CBUF)};
+            const u32 cbuf[3] = {0x200, (u32)((heap_iova + FS_CBUF) >> 32), (u32)(heap_iova + FS_CBUF)};
             method(M_CONST_BUFFER, 3, cbuf);
             method1(M_BIND_FRAGMENT_CBUF, 1 | 0 << 4);
             const u32 screen[2] = {(u32)W << 16, (u32)H << 16};
@@ -696,6 +728,29 @@ int main(int argc, char* argv[]) {
             }
             method1(M_DEPTH_TEST_ENABLE, 0);
             method1(M_DEPTH_WRITE_ENABLE, 0);
+        }
+        // a square coloured from a storage buffer, top left
+        {
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + DEPTH_OFFSET(index) + 8 * 32);
+            for (int k = 0; k < 4; k++) {
+                v[k * 8 + 0] = (k & 1) ? -0.75f : -0.95f;
+                v[k * 8 + 1] = (k & 2) ? -0.80f : -0.95f;
+                v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = v[k * 8 + 5] = v[k * 8 + 6] = v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t square = heap_iova + DEPTH_OFFSET(index) + 8 * 32;
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_STORAGE_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(square >> 32), (u32)square, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = square + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);

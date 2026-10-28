@@ -117,6 +117,9 @@ sampled), and a backdrop of tiles over the bands, scrolling, blended by its alph
 drawn by the CPU and copied by the DMA engine into a block-linear image, the GPU's own layout, as
 games upload their textures; it's filtered bilinearly and repeats. And a depth test: two bars
 across each other in depth, a red one drawn first and a green one, each in front on its own half.
+And a square coloured from a storage buffer: its fragment program loads 16 bytes from a GPU
+address it finds in the constant buffer (where NVN keeps storage buffers' addresses), which Eden's
+shader recompiler turns into a storage buffer read.
 
 ![The GPU test in shadPS4: everything on it drawn by the null renderer's software GPU](screenshots/gputest-shadps4.png)
 
@@ -166,6 +169,10 @@ Two ways it shows:
 - **Depth** (patch 0019): the depth test against the depth buffer (every depth format, as the
   buffer keeps it, so the test is exact), before the fragment shader runs, so pixels behind skip
   it; depth writes; and depth and stencil clears.
+- **Storage buffers and global memory** (patch 0020): shaders' storage buffer reads and writes
+  (their addresses and sizes read from the constant buffers, as Eden's buffer cache reads them),
+  and global memory accesses the recompiler couldn't tie to a buffer, go to emulated memory. The
+  subgroup operations (votes, ballots, shuffles, the quad swizzle) work as for subgroups of one.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -313,6 +320,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: textures in software draws | above |
 | null renderer: faster software draws, on several threads | above |
 | null renderer: depth testing, depth and stencil clears | above |
+| null renderer: storage buffers, global memory and subgroup ops in software shaders | above |
 
 The PS4 memory changes, from what stage 1 measured:
 
