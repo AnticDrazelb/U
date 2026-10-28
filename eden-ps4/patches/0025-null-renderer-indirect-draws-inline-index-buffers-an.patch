@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@localhost>
+Date: Wed, 28 Oct 2026 15:46:45 +0000
+Subject: [PATCH] null renderer: indirect draws, inline index buffers and
+ DrawTexture in software
+
+---
+ .../renderer_null/null_rasterizer.cpp         | 52 ++++++++++++-
+ .../renderer_null/null_rasterizer.h           |  1 +
+ .../renderer_null/software_draw.cpp           | 77 ++++++++++++++++++-
+ src/video_core/renderer_null/software_draw.h  |  4 +
+ 4 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index f0debd283..e41faa0d6 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -39,7 +39,57 @@ void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {
+         m_software.Draw(*maxwell3d, *gpu_memory, is_indexed, instance_count);
+     }
+ }
+-void RasterizerNull::DrawTexture() {}
++// Indirect draws: each draw's parameters read from the indirect buffer (and their count from the
++// count buffer), then drawn as a direct draw with them
++void RasterizerNull::DrawIndirect() {
++    if (!maxwell3d || !gpu_memory) {
++        return;
++    }
++    gpu_memory->FlushCaching();
++    auto& draw_manager = maxwell3d->draw_manager;
++    const auto params = draw_manager.indirect_state;
++    if (params.is_byte_count) {
++        LOG_WARNING(Render, "Software draw: transform feedback draws aren't drawn");
++        return;
++    }
++    u64 draws = std::max<u64>(params.max_draw_counts, 1);
++    if (params.include_count) {
++        draws = std::min<u64>(draws, gpu_memory->Read<u32>(params.count_start_address));
++    }
++    const u64 stride = params.stride ? params.stride : (params.is_indexed ? 20 : 16);
++    auto& state = draw_manager.draw_state;
++    const auto saved_vertices = state.vertex_buffer;
++    const auto saved_indices = state.index_buffer;
++    const u32 saved_base_index = state.base_index, saved_base_instance = state.base_instance;
++    for (u64 i = 0; i < draws; ++i) {
++        u32 command[5]{};
++        gpu_memory->ReadBlockUnsafe(params.indirect_start_address + i * stride, command,
++                                    params.is_indexed ? 20 : 16);
++        if (params.is_indexed) { // count, instances, first index, vertex offset, first instance
++            state.index_buffer.count = command[0];
++            state.index_buffer.first = command[2];
++            state.base_index = command[3];
++            state.base_instance = command[4];
++        } else { // count, instances, first vertex, first instance
++            state.vertex_buffer.count = command[0];
++            state.vertex_buffer.first = command[2];
++            state.base_instance = command[3];
++        }
++        if (command[0] != 0 && command[1] != 0) {
++            m_software.Draw(*maxwell3d, *gpu_memory, params.is_indexed, command[1]);
++        }
++    }
++    state.vertex_buffer = saved_vertices;
++    state.index_buffer = saved_indices;
++    state.base_index = saved_base_index, state.base_instance = saved_base_instance;
++}
++
++void RasterizerNull::DrawTexture() {
++    if (maxwell3d && gpu_memory) {
++        gpu_memory->FlushCaching();
++        m_software.DrawTexture(*maxwell3d, *gpu_memory);
++    }
++}
+ 
+ namespace {
+ 
+diff --git a/src/video_core/renderer_null/null_rasterizer.h b/src/video_core/renderer_null/null_rasterizer.h
+index 460bfc5c7..c72531aea 100644
+--- a/src/video_core/renderer_null/null_rasterizer.h
++++ b/src/video_core/renderer_null/null_rasterizer.h
+@@ -42,6 +42,7 @@ public:
+     ~RasterizerNull() override;
+ 
+     void Draw(bool is_indexed, u32 instance_count) override;
++    void DrawIndirect() override;
+     void DrawTexture() override;
+     void Clear(u32 layer_count) override;
+     void DispatchCompute() override;
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index f623852ef..8e28f9a86 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -480,6 +480,9 @@ bool IsSupported(IR::Opcode op) {
+ f32 F(const Cell& c, int i = 0) {
+     return std::bit_cast<f32>(c.w[i]);
+ }
++void SetCellF(Cell& c, f32 v, int i) {
++    c.w[i] = std::bit_cast<u32>(v);
++}
+ 
+ u32 BitFieldExtract(u32 base, u32 offset, u32 count, bool sign) {
+     offset &= 31;
+@@ -2664,6 +2667,70 @@ const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPU
+     return &texture;
+ }
+ 
++void SoftwareDraw::DrawTexture(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory) {
++    const auto& regs = maxwell3d.regs;
++    const auto& state = maxwell3d.draw_manager.draw_texture_state;
++    const auto& rt = regs.rt[regs.rt_control.Map(0)];
++    std::array<u8, 16> probe{};
++    u32 bpp = 0;
++    if (rt.Address() == 0 || !EncodeColor(rt.format, {0, 0, 0, 0}, probe, bpp)) {
++        return;
++    }
++    if (state.src_texture > regs.tex_header.limit || state.src_sampler > regs.tex_sampler.limit) {
++        return;
++    }
++    Binding binding;
++    binding.texture = textures->Get(gpu_memory, regs.tex_header.Address() +
++                                                    u64{state.src_texture} * sizeof(Tegra::Texture::TICEntry));
++    gpu_memory.ReadBlockUnsafe(regs.tex_sampler.Address() + u64{state.src_sampler} * sizeof(Tegra::Texture::TSCEntry),
++                               &binding.sampler, sizeof(binding.sampler));
++    binding.Prepare();
++    if (!binding.texture || !binding.texture->ok) {
++        return;
++    }
++    const Level& level = binding.texture->levels[binding.texture->base_level];
++    const bool pitch_linear = rt.tile_mode.is_pitch_linear != 0;
++    const u32 width = pitch_linear ? rt.width / bpp : rt.width;
++    const u32 block_rows = 8u << rt.tile_mode.block_height;
++    const u32 block_bytes = 512u << rt.tile_mode.block_height;
++    const u64 block_row_size = u64{(width * bpp + 63) / 64} * block_bytes;
++    const s32 x0 = std::max(0, s32(std::floor(std::min(state.dst_x0, state.dst_x1))));
++    const s32 x1 = std::min(s32(width), s32(std::ceil(std::max(state.dst_x0, state.dst_x1))));
++    const s32 y0 = std::max(0, s32(std::floor(std::min(state.dst_y0, state.dst_y1))));
++    const s32 y1 = std::min(s32(rt.height), s32(std::ceil(std::max(state.dst_y0, state.dst_y1))));
++    const f32 scale_x = (state.src_x1 - state.src_x0) / (state.dst_x1 - state.dst_x0);
++    const f32 scale_y = (state.src_y1 - state.src_y0) / (state.dst_y1 - state.dst_y0);
++    IR::TextureInstInfo info{};
++    info.type.Assign(Shader::TextureType::Color2D);
++    const Cell no_offset{};
++    for (s32 y = y0; y < y1; ++y) {
++        for (s32 x = x0; x < x1; ++x) {
++            // the texel under the pixel's centre, in the source rectangle (texels)
++            Cell coords{};
++            SetCellF(coords, (state.src_x0 + (f32(x) + 0.5f - state.dst_x0) * scale_x) / f32(level.width), 0);
++            SetCellF(coords, (state.src_y0 + (f32(y) + 0.5f - state.dst_y0) * scale_y) / f32(level.height), 1);
++            const std::array<f32, 4> color = SampleTexture(binding, info, coords, no_offset, 0.0f, nullptr);
++            u64 offset;
++            if (pitch_linear) {
++                offset = u64(y) * rt.width + u64(x) * bpp;
++            } else {
++                const u32 xb = u32(x) * bpp, row = u32(y) % 8, in_gob = xb % 64;
++                offset = u64(u32(y) / block_rows) * block_row_size + u64{xb / 64} * block_bytes +
++                         (u32(y) % block_rows / 8) * 512 + (row / 2) * 64 + (row % 2) * 16 +
++                         (in_gob / 32) * 256 + ((in_gob % 32) / 16) * 32 + in_gob % 16;
++            }
++            u8* const out = gpu_memory.GetPointer(rt.Address() + offset);
++            std::array<u8, 16> encoded{};
++            u32 bytes = 0;
++            if (out && EncodeColor(rt.format, color, encoded, bytes)) {
++                std::memcpy(out, encoded.data(), bytes);
++            }
++        }
++    }
++    MarkWritten(rt.Address(), pitch_linear ? u64{rt.width} * rt.height
++                                           : block_row_size * ((rt.height + block_rows - 1) / block_rows));
++}
++
+ void SoftwareDraw::MarkWritten(GPUVAddr address, u64 size) {
+     textures->marks++;
+     for (auto& [key, texture] : textures->entries) {
+@@ -2989,7 +3056,15 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     // The vertices the draw uses
+     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+     std::vector<u32> indices(count);
+-    if (is_indexed) {
++    if (is_indexed && !draw_state.inline_index_draw_indexes.empty()) {
++        // indices sent in the command stream (32-bit)
++        const auto& inline_indices = draw_state.inline_index_draw_indexes;
++        for (u32 i = 0; i < count && (i + 1) * 4 <= inline_indices.size(); ++i) {
++            u32 index;
++            std::memcpy(&index, inline_indices.data() + size_t(i) * 4, 4);
++            indices[i] = index + draw_state.base_index;
++        }
++    } else if (is_indexed) {
+         const auto& ib = draw_state.index_buffer;
+         const u32 size = static_cast<u32>(ib.FormatSizeInBytes());
+         std::vector<u8> raw(size_t(count) * size);
+diff --git a/src/video_core/renderer_null/software_draw.h b/src/video_core/renderer_null/software_draw.h
+index 2d68a8836..a21886184 100644
+--- a/src/video_core/renderer_null/software_draw.h
++++ b/src/video_core/renderer_null/software_draw.h
+@@ -58,6 +58,10 @@ public:
+     void Draw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
+               bool is_indexed, u32 instance_count);
+ 
++    /// The 3D engine's textured rectangle (NVN's DrawTexture): a texture's rectangle, scaled, into
++    /// render target 0.
++    void DrawTexture(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory);
++
+     /// Something wrote to emulated memory there: textures decoded from it are checked again
+     /// before they're next sampled.
+     void MarkWritten(GPUVAddr address, u64 size);

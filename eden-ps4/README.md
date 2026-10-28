@@ -200,6 +200,10 @@ Two ways it shows:
   and clears, from its parameters). And the null rasterizer reports the writes the memory manager
   gathers (constant buffer updates among them) before each draw and clear, as the Vulkan one does:
   they gathered without end.
+- **Indirect draws, inline indices, DrawTexture** (patch 0025): draws whose parameters are in a
+  buffer (each read, with their count, and drawn), indices sent in the command stream (the storage
+  buffer's square is drawn with them; they were read from memory before), and the 3D engine's
+  textured rectangle (NVN's DrawTexture).
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -354,6 +358,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: stencil testing and several render targets in software draws | above |
 | null renderer: tick the rasterizer each frame, so CPU-written textures are seen | above |
 | null renderer: report gathered writes before draws and clears | above |
+| null renderer: indirect draws, inline index buffers and DrawTexture in software | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

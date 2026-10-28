@@ -127,8 +127,9 @@ at = lambda x, y: pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
 (lr, lg, lb), (rr, rg, rb) = at(480, 54), at(608, 54)
 sys.exit(0 if lr > 200 and lg < 100 and rg > 200 and rr < 100 else 1)
 PY
-# its square coloured from a storage buffer (a global load the shader recompiler tracks to one)
-check "its storage buffer is read (a cyan square, top left)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+# its square coloured from a storage buffer (a global load the shader recompiler tracks to one),
+# drawn with its indices in the command stream
+check "its storage buffer is read (a cyan square, top left, drawn with inline indices)" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()
 width = int(data.split(b'\n')[1].split()[0])

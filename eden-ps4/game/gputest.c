@@ -14,7 +14,8 @@
 // fence the command stream signals, and quits on +. And a depth test: two bars across each other
 // in depth, each in front on its own half. And a square coloured from a storage buffer, lines and a
 // point, and a stencil test: a triangle drawn only into the stencil, then a square drawn where it
-// is. From frame 30 the CPU paints the sprite's middle blue, which the turning square shows. The
+// is (the storage square is drawn with its indices in the command stream). From frame 30 the CPU
+// paints the sprite's middle blue, which the turning square shows. The
 // bouncing squares are cleared by a GPU macro (MME, as deko3d and Mesa draw through macros).
 
 #include <math.h>
@@ -98,6 +99,7 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M_LINE_WIDTH 0x4ED         // aliased lines
 #define M_POINT_SIZE 0x546
 #define TOPOLOGY_POINTS 0
+#define M_DRAW_INLINE_INDEX 0x57A  // a draw's indices in the command stream, one a word
 #define TOPOLOGY_LINE_STRIP 3
 #define TOPOLOGY_TRIANGLES 4
 #define TOPOLOGY_TRIANGLE_STRIP 5
@@ -819,9 +821,11 @@ int main(int argc, char* argv[]) {
             const iova_t last = square + 4 * 32 - 1;
             const u32 limit[2] = {(u32)(last >> 32), (u32)last};
             method(M_VERTEX_STREAM_LIMIT, 2, limit);
-            const u32 range[2] = {0, 4};
-            method(M_VERTEX_FIRST, 2, range);
+            // drawn with its indices in the command stream (backwards: the same square)
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            emit(header(NONINCREASING, 4, SUBCH_3D, M_DRAW_INLINE_INDEX));
+            for (u32 i = 0; i < 4; i++)
+                emit(3 - i);
             method1(M_DRAW_END, 0);
             method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
         }
