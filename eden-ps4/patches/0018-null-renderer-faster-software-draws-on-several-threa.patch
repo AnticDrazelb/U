@@ -5,9 +5,9 @@ Subject: [PATCH] null renderer: faster software draws, on several threads
 
 ---
  .../renderer_null/null_rasterizer.cpp         |    8 +-
- .../renderer_null/software_draw.cpp           | 1534 ++++++++++++-----
+ .../renderer_null/software_draw.cpp           | 1535 ++++++++++++-----
  src/video_core/renderer_null/software_draw.h  |    7 +
- 3 files changed, 1082 insertions(+), 467 deletions(-)
+ 3 files changed, 1083 insertions(+), 467 deletions(-)
 
 diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
 index b48098f9b..2e4559558 100644
@@ -43,7 +43,7 @@ index b48098f9b..2e4559558 100644
                            block_bytes, &m_scratch);
                  for (u32 y = ys; y < ye; ++y) {
 diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
-index e166be5b5..db9f8f495 100644
+index e166be5b5..50406d2f1 100644
 --- a/src/video_core/renderer_null/software_draw.cpp
 +++ b/src/video_core/renderer_null/software_draw.cpp
 @@ -2,8 +2,15 @@
@@ -1221,7 +1221,7 @@ index e166be5b5..db9f8f495 100644
  }
  
  // ---- the draw
-@@ -1942,6 +2267,24 @@ SoftwareDraw::SoftwareDraw()
+@@ -1942,6 +2267,23 @@ SoftwareDraw::SoftwareDraw()
  
  SoftwareDraw::~SoftwareDraw() = default;
  
@@ -1236,9 +1236,8 @@ index e166be5b5..db9f8f495 100644
 +            const u32 processors = std::thread::hardware_concurrency();
 +            count = processors ? std::clamp(processors / 2, 1u, 4u) : 3;
 +        }
-+        workers = std::make_unique<Workers>(std::clamp(count, 1u, 16u) - 1);
-+        LOG_INFO(Render, "Software draw: rasterizing on {} threads", count);
 +        worker_count = std::clamp(count, 1u, 16u);
++        workers = std::make_unique<Workers>(worker_count - 1);
 +    }
 +    return worker_count;
 +}
@@ -1246,7 +1245,7 @@ index e166be5b5..db9f8f495 100644
  const Texture* SoftwareDraw::Textures::Get(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address) {
      Tegra::Texture::TICEntry tic{};
      gpu_memory.ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
-@@ -2048,6 +2391,11 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2048,6 +2390,11 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
              LogOnce("storage images aren't drawn");
          }
          program->ok = Flattener{*program}.Run(ir);
@@ -1258,7 +1257,7 @@ index e166be5b5..db9f8f495 100644
      } catch (const std::exception& exception) {
          LogOnce(fmt::format("shader translation failed: {}", exception.what()));
          program->ok = false;
-@@ -2058,8 +2406,44 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
+@@ -2058,8 +2405,45 @@ SoftwareDraw::Program* SoftwareDraw::GetProgram(Maxwell& maxwell3d,
      return programs.emplace(key, std::move(program)).first->second.get();
  }
  
@@ -1270,6 +1269,7 @@ index e166be5b5..db9f8f495 100644
 +    bool enabled = std::getenv("EDEN_SW_STATS") != nullptr;
 +    Clock::time_point last = Clock::now();
 +    u64 draws = 0, triangles = 0, fragments = 0;
++    u32 threads = 1;
 +    Clock::duration setup{}, raster{};
 +
 +    void Report() {
@@ -1280,9 +1280,9 @@ index e166be5b5..db9f8f495 100644
 +        const f64 seconds = std::chrono::duration<f64>(now - last).count();
 +        const auto ms = [&](Clock::duration d) { return std::chrono::duration<f64, std::milli>(d).count() / seconds; };
 +        LOG_WARNING(Render, "Software draw: a second: {:.0f} draws, {:.0f} triangles, {:.0f} k fragments; "
-+                            "{:.1f} ms setting up, {:.1f} ms rasterizing",
++                            "{:.1f} ms setting up, {:.1f} ms rasterizing (on up to {} threads)",
 +                    f64(draws) / seconds, f64(triangles) / seconds, f64(fragments) / seconds / 1000.0,
-+                    ms(setup), ms(raster));
++                    ms(setup), ms(raster), threads);
 +        last = now;
 +        draws = triangles = fragments = 0;
 +        setup = raster = {};
@@ -1690,7 +1690,7 @@ index e166be5b5..db9f8f495 100644
          }
      };
  
-@@ -2454,29 +2797,294 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+@@ -2454,29 +2797,295 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
          }
          switch (topology) {
          case Topology::Triangles:
@@ -1989,6 +1989,7 @@ index e166be5b5..db9f8f495 100644
 +        stats.fragments += pixels;
 +        stats.setup += raster_start - start;
 +        stats.raster += end - raster_start;
++        stats.threads = std::max(stats.threads, threads);
 +        stats.Report();
      }
      // textures drawn to (render to texture) are checked again before they're next sampled

@@ -111,9 +111,13 @@ about 80 clears a frame, and sprites with the 2D engine: a 32x32 image the CPU d
 by the DMA engine, then blitted onto the frame at 1x, 2x and 3x. And a triangle drawn with shaders:
 a vertex program (two attribute loads and stores: position and colour) and a fragment program (the
 colour interpolated, into the render target), with their shader program headers, in Maxwell machine
-code written by hand, as there's no shader compiler in this build environment.
+code written by hand, as there's no shader compiler in this build environment. And textured shapes,
+drawn as games draw sprites and backgrounds: a turning square with the sprite on it (point
+sampled), and a backdrop of tiles over the bands, scrolling, blended by its alpha. The tile is
+drawn by the CPU and copied by the DMA engine into a block-linear image, the GPU's own layout, as
+games upload their textures; it's filtered bilinearly and repeats.
 
-![The GPU test in shadPS4, drawn by the null renderer's software clears](screenshots/gputest-shadps4.png)
+![The GPU test in shadPS4: everything on it drawn by the null renderer's software GPU](screenshots/gputest-shadps4.png)
 
 Two ways it shows:
 
@@ -135,8 +139,29 @@ Two ways it shows:
   them, culled, and rasterized into render target 0 in emulated memory a block at a time, with the
   varyings interpolated as Vulkan interpolates them (perspective, linear, flat) and blended. The
   GPU test's first frame comes out the same as through the Vulkan renderer (below), and it draws at
-  60 frames a second on the desktop. Not done yet: textures, depth and stencil, more than one
-  render target, points and lines; a draw that needs them is skipped, and logged once.
+  60 frames a second on the desktop. Not done yet: depth and stencil, more than one render target,
+  points and lines, storage images; a draw that needs them is skipped (or drawn without them), and
+  logged once.
+- **Textures, in software** (patch 0017): a texture is decoded from emulated memory the first
+  time it's sampled, with Eden's own code for the GPU's layouts and compressed formats (its
+  unswizzle, its BC1-7 and ASTC decoders), into 8-bit RGBA for the formats that fit and floats for
+  the rest, every mip level and layer, and kept. It's checked again (its bytes hashed) after
+  anything that might have written to it (a draw or clear into it, a DMA copy, a 2D blit, an
+  inline upload) and once a frame, for the CPU's writes. Sampling follows the texture header and
+  the sampler: nearest or bilinear filtering, mipmaps (explicit levels; an implicit one is the base
+  level, as there are no derivatives here), every wrap mode and border colours, swizzles, sRGB,
+  depth compares, gathers, texel fetches, size queries; 1D, 2D, 3D, cube maps and arrays. Linear
+  inline uploads, which the null renderer dropped, are written to memory now.
+- **Faster, on several threads** (patch 0018): each draw's triangles are set up first (24.8 fixed
+  point edge functions, so the edge two triangles share is drawn once, by the top-left rule;
+  clipped to a guard band), then rasterized 8 rows at a time (a row of the render target's GOBs,
+  reached directly) by a few threads: `EDEN_SW_THREADS`, by default half the processors, up to 4.
+  The fragment shader runs on 16 pixels at a time (a program that branches, a pixel at a time),
+  with fast paths for the commonest work: 2D 8-bit textures filtered with 8-bit weights, blending
+  by source alpha into RGBA8, and 2D triangles (no perspective correction). A pixel of the GPU
+  test's blended, filtered backdrop costs about 70 ns on one desktop thread, against 200 before:
+  the test draws at 40-48 frames a second on one thread, 60 on four. `EDEN_SW_STATS` (always on
+  in the PS4 build) logs what the draws cost every 2 seconds.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -214,9 +239,12 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    long each waited for a buffer off the screen (the display's pace) and how long scaling it took
    (the launcher's cost).
 4. **Controller test**: each PS4 button should light its Switch button.
-5. **GPU test**: the backdrop, the squares and GPU (clears), three circling sprites (2D blits of
-   a DMA copy), a turning RGB triangle (shaders), all drawn by the GPU emulation in software, and
-   its frame rate as a green bar (6 pixels a frame a second).
+5. **GPU test**: the bands, the squares and GPU (clears), three circling sprites (2D blits of a
+   DMA copy), a turning RGB triangle (shaders), a turning square with the sprite on it and a
+   scrolling backdrop of diamond tiles over the bands (textures), all drawn by the GPU emulation in
+   software, and its frame rate as a green bar (6 pixels a frame a second). Its `log.txt` gets a
+   line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
+   the console's cores make of the software GPU.
 6. Any CPU-drawn homebrew `.nro` copied to `/data/eden-ps4` (FTP) appears in the list. L3 + R3
    held for a second stops it.
 
@@ -278,6 +306,8 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: colour clears, DMA copies and 2D blits in software | stage 4's GPU test on the PS4, above |
 | sw_blitter: nearest-neighbour scaling reads the right source pixel | an upstream bug the GPU test's sprites found, above |
 | null renderer: shader draws in software | stage 4's software renderer, above |
+| null renderer: textures in software draws | above |
+| null renderer: faster software draws, on several threads | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

@@ -771,6 +771,8 @@ void* Run(void*)
     // Eden finds its data under $HOME when no folder is given, and a few paths it always takes
     // from there: keep them in the app's folder.
     setenv("HOME", kDataDir, 1);
+    // the null renderer's software draws log what they cost (every 2 seconds, in log.txt)
+    setenv("EDEN_SW_STATS", "1", 0);
     Launcher::SetAudio(MakeAudioOutput);
     for (bool first = true;; first = false)
     {
