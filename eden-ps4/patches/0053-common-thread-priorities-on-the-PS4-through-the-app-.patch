@@ -1,0 +1,47 @@
+From 1cf2c78a5fbe03452d3a56f252c13959a8e0ec26 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:35:03 +0000
+Subject: [PATCH 53/54] common: thread priorities on the PS4, through the app's
+ runtime
+
+SetCurrentThreadPriority did nothing on __OPENORBIS__, so the emulated
+CPU cores, the GPU thread and the Vulkan worker shared their time
+equally with logging, loading and shader compiling. It now calls the
+runtime's ps4_set_thread_priority (weak, as ps4_watch_thread), which
+sets the PS4's own priorities.
+---
+ src/common/thread.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 45b07653d..9e02d87bd 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -26,6 +26,7 @@
+ #else
+ #ifdef __OPENORBIS__
+ extern "C" __attribute__((weak)) void ps4_watch_thread(const char* name); // the PS4 app's runtime
++extern "C" __attribute__((weak)) void ps4_set_thread_priority(int level); // 0 Low .. 4 Critical
+ #endif
+ #if defined(__FreeBSD__) && !defined(__OPENORBIS__) // the PS4 has neither header
+ #include <sys/cpuset.h>
+@@ -479,9 +480,13 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
+     }();
+     set_thread_priority(find_thread(NULL), priority);
+ #elif defined(__OPENORBIS__)
+-    // The PS4: not among the system calls a homebrew app makes there (the musl headers' SCHED_OTHER
+-    // isn't FreeBSD's either).
+-    (void)new_priority;
++    // The PS4's own priorities, set by the app's runtime (pthread_setschedparam isn't among the
++    // system calls a homebrew app makes there, and the musl headers' SCHED_OTHER isn't FreeBSD's):
++    // without them the emulated CPU cores and the GPU thread shared their time equally with
++    // logging, loading and shader compiling.
++    if (ps4_set_thread_priority) {
++        ps4_set_thread_priority(static_cast<int>(new_priority));
++    }
+ #elif defined(__ANDROID__)
+     const int nice_value = NiceValueForPriority(new_priority);
+     const pid_t tid = gettid();
+-- 
+2.43.0
+

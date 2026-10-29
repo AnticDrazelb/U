@@ -1,0 +1,161 @@
+From a42e75fcc2b1dd31e0305a29e39d4bfd4f0f91c9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:35:03 +0000
+Subject: [PATCH 52/54] dynarmic: reads of marked pages stay fast unless asked
+
+Eden marks the pages the GPU caches so that a write invalidates the
+GPU's copy. Without fastmem (the PS4) the recompiler's page table walk
+treated a marked page as unmapped for reads too, and every read went
+through a callback that asks the GPU for a flush area and can wait for
+it: reactive flushing, always, on the CPU's hot path. With fastmem such
+pages stay readable when reactive flushing is off.
+
+UserConfig::page_table_marked_bit_reads (default true, as before) lets
+reads skip the marked bit; Eden sets it from use_reactive_flushing (or
+the debugger, for watchpoints). The x64 backend only.
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp              |  7 +++++++
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp              |  7 +++++++
+ .../src/dynarmic/backend/x64/emit_x64_memory.cpp.inc   |  4 ++--
+ .../src/dynarmic/backend/x64/emit_x64_memory.h         | 10 +++++-----
+ src/dynarmic/src/dynarmic/interface/A32/config.h       |  5 +++++
+ src/dynarmic/src/dynarmic/interface/A64/config.h       |  5 +++++
+ 6 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 94f4105df..291232408 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -162,6 +162,13 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+             const_cast<Common::PageTable::PageEntryData*>(page_table->entries.data()));
+         config.page_table_pointer_mask = Common::PageTable::ATTRIBUTE_MASK;
+         config.page_table_marked_bit = uint8_t(0);
++        // Pages the GPU caches are marked so that a write invalidates its copy; a read needs the
++        // slow path only to have GPU writes flushed back first (reactive flushing) or for the
++        // debugger's watchpoints. Otherwise reads stay fast, as with fastmem, where such pages are
++        // left readable: without fastmem (the PS4) each read of one went through a callback that
++        // could wait for the GPU.
++        config.page_table_marked_bit_reads =
++            Settings::values.use_reactive_flushing.GetValue() || m_system.DebuggerEnabled();
+         config.absolute_offset_page_table = true;
+         config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+         config.only_detect_misalignment_via_page_table_on_page_boundary = true;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index cd37c3d20..e95bdbb6f 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -203,6 +203,13 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         config.page_table_address_space_bits = std::uint32_t(address_space_bits);
+         config.page_table_pointer_mask = Common::PageTable::ATTRIBUTE_MASK;
+         config.page_table_marked_bit = uint8_t(0);
++        // Pages the GPU caches are marked so that a write invalidates its copy; a read needs the
++        // slow path only to have GPU writes flushed back first (reactive flushing) or for the
++        // debugger's watchpoints. Otherwise reads stay fast, as with fastmem, where such pages are
++        // left readable: without fastmem (the PS4) each read of one went through a callback that
++        // could wait for the GPU.
++        config.page_table_marked_bit_reads =
++            Settings::values.use_reactive_flushing.GetValue() || m_system.DebuggerEnabled();
+         config.silently_mirror_page_table = false;
+         config.absolute_offset_page_table = true;
+         config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 8bb8be3d5..527a8f392 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -114,7 +114,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     } else {
+         // Use page table
+         ASSERT(conf.page_table);
+-        const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
++        const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, true);
+         EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+@@ -201,7 +201,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+     } else {
+         // Use page table
+         ASSERT(conf.page_table);
+-        const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
++        const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, false);
+         EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index 6ad6d273f..724e8d233 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -74,10 +74,10 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
+ }
+ 
+ template<typename EmitContext>
+-Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr);
++Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_read);
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
++[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A32EmitContext>(BlockOfCode& code, A32EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_read) {
+     const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
+     const Xbyak::Reg64 tmp = ctx.conf.absolute_offset_page_table && ctx.conf.page_table_pointer_mask == 0 ? page : ctx.reg_alloc.ScratchGpr(code);
+ 
+@@ -94,7 +94,7 @@ template<>
+     }
+ 
+     // check for marked bit, use as unmapped if marked
+-	if (ctx.conf.page_table_marked_bit) {
++    if (ctx.conf.page_table_marked_bit && (!is_read || ctx.conf.page_table_marked_bit_reads)) {
+         code.bt(page, *ctx.conf.page_table_marked_bit);
+         code.jc(abort, code.T_NEAR);
+ 	}
+@@ -123,7 +123,7 @@ template<>
+ }
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr) {
++[[maybe_unused]] Xbyak::RegExp EmitVAddrLookup<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_read) {
+     const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_table_const_bits;
+     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
+ 
+@@ -169,7 +169,7 @@ template<>
+     }
+ 
+     // check for marked bit, use as unmapped if marked
+-    if (ctx.conf.page_table_marked_bit) {
++    if (ctx.conf.page_table_marked_bit && (!is_read || ctx.conf.page_table_marked_bit_reads)) {
+         code.bt(page, *ctx.conf.page_table_marked_bit);
+         code.jc(abort, code.T_NEAR);
+     }
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 49063ed61..225914cf3 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -169,6 +169,11 @@ struct UserConfig {
+     /// This bit should be included as part of `page_table_pointer_mask_bits`.
+     std::optional<std::uint8_t> page_table_marked_bit = std::nullopt;
+ 
++    /// Whether reads check `page_table_marked_bit` too. False: only writes treat a marked page as
++    /// unmapped, for frontends that mark pages to track writes alone (as a read-only protection of
++    /// fastmem would), whose reads then stay on the fast path.
++    bool page_table_marked_bit_reads = true;
++
+     /// If this value is set, Dynarmic will sign extend the page table pointer by this bit.
+     /// Useful for compacting bits into the page table and should be used as part of `page_table_pointer_mask`.
+     std::optional<std::uint8_t> page_table_sign_extension = std::nullopt;
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 859aeba70..215d29268 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -183,6 +183,11 @@ struct UserConfig {
+     /// This bit should be included as part of `page_table_pointer_mask`.
+     std::optional<std::uint8_t> page_table_marked_bit = std::nullopt;
+ 
++    /// Whether reads check `page_table_marked_bit` too. False: only writes treat a marked page as
++    /// unmapped, for frontends that mark pages to track writes alone (as a read-only protection of
++    /// fastmem would), whose reads then stay on the fast path.
++    bool page_table_marked_bit_reads = true;
++
+     /// If this value is set, Dynarmic will sign extend the page table pointer by this bit.
+     /// Useful for compacting bits into the page table and should be used as part of `page_table_pointer_mask`.
+     std::optional<std::uint8_t> page_table_sign_extension = std::nullopt;
+-- 
+2.43.0
+

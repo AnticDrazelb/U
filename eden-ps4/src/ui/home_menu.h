@@ -57,6 +57,7 @@ struct MenuSettings
     bool shader_cache = true;  // shaders kept on disk, built while a game loads the next time
     bool async_shaders = true; // shaders built in the background (a draw waits for none)
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
+    bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
 };
 

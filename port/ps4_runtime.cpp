@@ -1135,6 +1135,33 @@ extern "C" void ps4_boost_thread() {
         reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kModule0Cores);
 }
 
+// Eden's thread priorities (Common::SetCurrentThreadPriority: 0 Low .. 4 Critical) as the PS4's,
+// after the above. Critical, the emulated CPU cores, the GPU thread and the Vulkan worker: boosted
+// (650). High, audio rendering, GPU fences and presentation: as busy at times, so the same (a
+// fixed priority above theirs would take a core from them whenever it ran). VeryHigh, core timing
+// and the vsync conductor, which wake for moments: just above (640), so they are on time. Low,
+// shader compilers and other background workers: just below the default (720), which they still
+// get whenever a busier thread waits.
+extern "C" void ps4_set_thread_priority(int level) {
+    switch (level) {
+    case 0:
+        scePthreadSetprio(scePthreadSelf(), 720);
+        break;
+    case 2:
+        scePthreadSetprio(scePthreadSelf(), 650);
+        break;
+    case 3:
+        scePthreadSetprio(scePthreadSelf(), 640);
+        break;
+    case 4:
+        ps4_boost_thread();
+        break;
+    default:
+        scePthreadSetprio(scePthreadSelf(), 700);
+        break;
+    }
+}
+
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
     // the stack: at least kMinThreadStack
     pthread_attr_t local;

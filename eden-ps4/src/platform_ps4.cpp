@@ -605,6 +605,9 @@ std::unique_ptr<Launcher::AudioOutput> MakeAudioOutput()
 std::atomic<bool> g_running{false};
 void* PadThread(void*)
 {
+    // above the emulation's busy threads (650): a poll is a moment's work, and with all seven
+    // cores busy at a lower priority than theirs the controller would lag
+    scePthreadSetprio(scePthreadSelf(), 600);
     constexpr uint32_t kStopButtons = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
     double stop_held_since = -1;
     while (g_running)
@@ -866,6 +869,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
             settings.cpu_unsafe = true;
+        else if (line == "gpu=high")
+            settings.gpu_high = true;
         else if (line == "cores=6")
             settings.seventh_core = false;
     }
@@ -876,12 +881,12 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
 {
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
-        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ncpu=%s\n"
-                        "cores=%d\n",
+        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
+                        "cpu=%s\ncores=%d\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
-                     settings.async_shaders ? "on" : "off", settings.cpu_unsafe ? "unsafe" : "auto",
-                     settings.seventh_core ? 7 : 6);
+                     settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
+                     settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6);
         std::fclose(f);
     }
 }
@@ -973,10 +978,19 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
-         "One program after another: the first console run crashed when a second program started, because each "
-         "program left about 66 MiB behind (Eden's emulated threads kept their stacks) and the GPU driver kept a "
-         "device per program. Both are fixed, and stopping a program on Vulkan no longer uses freed memory.\n"
-         "Keys and firmware from a USB drive: Games and Keys, Import from USB (Square)."},
+         "Faster on the PS4's CPU: reads of memory the GPU caches no longer take a slow path (without "
+         "fastmem every one could wait for the GPU), GPU macros are compiled instead of interpreted, the "
+         "emulated CPU cores and the GPU thread now come before logging and shader compiling, and the "
+         "code caches went to the cores games run on.\n"
+         "New in System Settings, Graphics: GPU Accuracy. Normal (the default) is Eden's choice on "
+         "phones; High reads back what the GPU drew whenever the game might look at it, for the few "
+         "games whose effects need it.\n"
+         "Fixed: a crash as a program exited (its GPU memory freed while still in use), memory written "
+         "after it was freed at every Vulkan shutdown, and input reaching a stopped system."},
+        {"Before: 03.40",
+         "One program after another (each left about 66 MiB behind, and the GPU driver kept a device "
+         "per program), and keys and firmware from a USB drive: Games and Keys, Import from USB "
+         "(Square)."},
         {"Games",
          "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive. They need the keys and firmware of "
          "the Switch they were dumped from: put prod.keys and title.keys at the top of a USB drive (or in its switch "
@@ -1154,12 +1168,13 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
             choice.settings = menu.Settings();
             SaveMenuSettings(choice.settings);
             Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
-                              "asynchronous shaders {}, CPU {}, {} cores",
+                              "asynchronous shaders {}, GPU accuracy {}, CPU {}, {} cores",
                               choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
                               choice.settings.docked ? "docked" : "handheld", choice.settings.resolution,
                               choice.settings.shader_cache ? "on" : "off", choice.settings.async_shaders ? "on" : "off",
-                              choice.settings.cpu_unsafe ? "unsafe" : "auto", choice.settings.seventh_core ? 7 : 6));
+                              choice.settings.gpu_high ? "high" : "normal", choice.settings.cpu_unsafe ? "unsafe" : "auto",
+                              choice.settings.seventh_core ? 7 : 6));
         }
         menu.Draw(canvas, now);
         g_screen.DrawFrame({canvas.Pixels(), size_t(canvas.Width()) * canvas.Height()}, uint32_t(canvas.Width()),
@@ -1270,6 +1285,7 @@ private:
     }
     void Watch()
     {
+        scePthreadSetprio(scePthreadSelf(), 600); // (it sleeps; when it looks, it must get to)
         const uint64_t base = Frames();
         uint64_t last = base;
         int seconds = 0, stale = 0;
@@ -1403,13 +1419,15 @@ void* Run(void*)
         Launcher::SetShaderCache(settings.shader_cache);
         Launcher::SetAsyncShaders(settings.async_shaders);
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
+        Launcher::SetGpuAccuracyHigh(settings.gpu_high);
         ps4_set_app_cores(settings.seventh_core ? 0x7F : 0x3F);
         NoteRecent(program);
-        Trace(fmt::format("renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}; "
-                          "CPU {}, {} cores",
+        Trace(fmt::format("renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
+                          "GPU accuracy {}; CPU {}, {} cores",
                           g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
                           settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
-                          settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6));
+                          settings.gpu_high ? "high" : "normal", settings.cpu_unsafe ? "unsafe" : "auto",
+                          settings.seventh_core ? 7 : 6));
         {
             std::lock_guard lock{g_mutex};
             g_screen.SetStatus(fmt::format("booting {}", program));

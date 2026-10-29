@@ -1,0 +1,64 @@
+From 64c09b49c76c06009b94dbe27d8a6da00c38b6a5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 18:54:57 +0000
+Subject: [PATCH 49/54] network: no stale interrupt pipe after Finalize
+
+Finalize closed the interrupt pipe but kept its descriptors' numbers,
+and a frontend that runs one program after another initializes the
+network again for each. Where pipe() then failed, the old numbers (by
+then other files') stayed, and stopping socket operations wrote a byte
+into them (and asserted: shadPS4 logs it at every shutdown). The
+descriptors are reset, and both ends skipped when there is no pipe.
+---
+ src/core/internal_network/network.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/internal_network/network.cpp b/src/core/internal_network/network.cpp
+index 1e4ef1896..5b17b19ad 100644
+--- a/src/core/internal_network/network.cpp
++++ b/src/core/internal_network/network.cpp
+@@ -181,6 +181,8 @@ int interrupt_pipe_fd[2] = {-1, -1};
+ void Initialize() {
+     if (pipe(interrupt_pipe_fd) != 0) {
+         LOG_ERROR(Network, "Failed to create interrupt pipe!");
++        interrupt_pipe_fd[0] = interrupt_pipe_fd[1] = -1;
++        return;
+     }
+     int flags = fcntl(interrupt_pipe_fd[0], F_GETFL);
+     ASSERT_MSG(fcntl(interrupt_pipe_fd[0], F_SETFL, flags | O_NONBLOCK) == 0,
+@@ -188,20 +190,31 @@ void Initialize() {
+ }
+ 
+ void Finalize() {
++    // (reset: a frontend may initialize again, and a closed descriptor's number is soon another
++    // file's, which the interrupt would then write a byte into)
+     if (interrupt_pipe_fd[0] >= 0) {
+         close(interrupt_pipe_fd[0]);
+     }
+     if (interrupt_pipe_fd[1] >= 0) {
+         close(interrupt_pipe_fd[1]);
+     }
++    interrupt_pipe_fd[0] = interrupt_pipe_fd[1] = -1;
+ }
+ 
+ void InterruptSocketOperations() {
++    if (interrupt_pipe_fd[1] < 0) {
++        return;
++    }
+     u8 value = 0;
+-    ASSERT(write(interrupt_pipe_fd[1], &value, sizeof(value)) == 1);
++    if (write(interrupt_pipe_fd[1], &value, sizeof(value)) != 1) {
++        LOG_ERROR(Network, "Failed to interrupt socket operations");
++    }
+ }
+ 
+ void AcknowledgeInterrupt() {
++    if (interrupt_pipe_fd[0] < 0) {
++        return;
++    }
+     u8 value = 0;
+     ssize_t ret = read(interrupt_pipe_fd[0], &value, sizeof(value));
+     if (ret != 1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+-- 
+2.43.0
+

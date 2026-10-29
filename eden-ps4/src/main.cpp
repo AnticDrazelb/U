@@ -86,7 +86,7 @@ public:
 bool g_gpu_display = false;
 bool g_docked = true;
 int g_resolution = 100;
-bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false;
+bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false;
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
 // while a program runs.
@@ -97,12 +97,20 @@ PadState g_pad_state;
 std::mutex g_output_mutex;
 LineSink g_sink = nullptr;
 std::FILE* g_log = nullptr;
+// log.txt stops at this size (a game that warns every frame would fill the PS4's storage over a
+// long session); what's written so far
+constexpr size_t kLogLimit = size_t(32) << 20;
+size_t g_log_bytes = 0;
 
 void Output(LineKind kind, std::string_view text) {
     std::scoped_lock lock{g_output_mutex};
-    if (g_log) {
+    if (g_log && g_log_bytes < kLogLimit) {
         std::fwrite(text.data(), 1, text.size(), g_log);
         std::fputc('\n', g_log);
+        g_log_bytes += text.size() + 1;
+        if (g_log_bytes >= kLogLimit) {
+            std::fputs("(log.txt stops here, at 32 MiB)\n", g_log);
+        }
         std::fflush(g_log);
     }
     if (g_sink)
@@ -149,10 +157,27 @@ void ApplyLauncherSettings() {
     Settings::values.use_disk_shader_cache.SetValue(g_shader_cache);
     Settings::values.use_asynchronous_shaders.SetValue(g_async_shaders);
     Settings::values.cpu_accuracy.SetValue(g_cpu_unsafe ? Settings::CpuAccuracy::Unsafe : Settings::CpuAccuracy::Auto);
-    // GPU macros (MME: deko3d's and Mesa's draws use them) interpreted: the macro JIT writes x86 code
-    // into memory it makes executable itself, which a PS4 app can't (EDEN_PS4_MACRO_JIT=1 for it)
+    // EDEN_PS4_FASTMEM=0: no fastmem on the desktop either, so that guest memory goes through the
+    // recompiler's page table walk, as on the PS4 (which can't map memory twice): Debugging
+    // accuracy, with the optimisations Auto has otherwise
+    if (const char* fastmem = std::getenv("EDEN_PS4_FASTMEM"); fastmem && std::string_view{fastmem} == "0") {
+        if (g_cpu_unsafe) {
+            Settings::values.cpuopt_unsafe_host_mmu.SetValue(false);
+        } else {
+            Settings::values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Debugging);
+            Settings::values.cpuopt_fastmem.SetValue(false);
+            Settings::values.cpuopt_fastmem_exclusives.SetValue(false);
+        }
+    }
+    // Low GPU accuracy and no reactive flushing unless asked: High reads GPU-written memory back for
+    // the CPU and marks it so that every guest access to it takes the slow path (no fastmem here)
+    Settings::values.gpu_accuracy.SetValue(g_gpu_high ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);
+    Settings::values.use_reactive_flushing.SetValue(g_gpu_high);
+    // GPU macros (MME: games' draws and state changes go through them, on the GPU thread) compiled
+    // to x86 code (on the PS4 into memory mapped executable from the start, patch 0051), not
+    // interpreted; EDEN_PS4_MACRO_JIT=0 interprets them
     const char* macro_jit = std::getenv("EDEN_PS4_MACRO_JIT");
-    Settings::values.disable_macro_jit.SetValue(!(macro_jit && std::string_view{macro_jit} == "1"));
+    Settings::values.disable_macro_jit.SetValue(macro_jit && std::string_view{macro_jit} == "0");
     // No Cemuhook (UDP) controller servers: their client would open a host socket at start,
     // for controllers this launcher doesn't use.
     Settings::values.udp_input_servers.SetValue("");
@@ -212,6 +237,10 @@ void SetAsyncShaders(bool on) {
 
 void SetCpuUnsafe(bool on) {
     g_cpu_unsafe = on;
+}
+
+void SetGpuAccuracyHigh(bool on) {
+    g_gpu_high = on;
 }
 
 std::filesystem::path TitleCachePath(const std::filesystem::path& data_dir, std::string_view program,
@@ -328,6 +357,7 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
 
     g_sink = sink;
     g_log = std::fopen((data_dir / "log.txt").c_str(), "w");
+    g_log_bytes = 0;
 
     ApplyLauncherSettings();
     Common::Log::Initialize();
@@ -418,6 +448,12 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                                                ctx.sp, base));
                         }
                     }
+                }
+                {
+                    // no input into a system that is shutting down (it reached objects on its
+                    // services' stacks through the controllers' callbacks)
+                    std::scoped_lock pad_lock{g_pad_mutex};
+                    g_gamepad = nullptr;
                 }
                 system.ShutdownMainProcess();
             }

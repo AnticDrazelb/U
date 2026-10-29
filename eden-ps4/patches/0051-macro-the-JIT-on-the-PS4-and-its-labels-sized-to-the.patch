@@ -1,0 +1,153 @@
+From 2194c9cc5615eb597e42efc47baf273546fe541d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:34:44 +0000
+Subject: [PATCH 51/54] macro: the JIT on the PS4, and its labels sized to the
+ macro
+
+The PS4 only runs code from memory mapped executable to begin with (an
+mprotect adding PROT_EXEC fails): on __OPENORBIS__ each macro's code
+memory is mapped read/write/execute once, as dynarmic's is, and never
+re-protected. Frontends there had to interpret macros, the GPU
+thread's per-draw work.
+
+Every compiled macro also carried two arrays of 65536 labels (2 MiB);
+they are vectors sized to the macro now, freed once it is compiled. A
+branch outside the macro ends it (it indexed past the arrays), and the
+label past the last instruction is bound to the end.
+---
+ src/video_core/macro.cpp | 76 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 69 insertions(+), 7 deletions(-)
+
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index 86f528af1..d121548c8 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -11,6 +11,12 @@
+ 
+ #include <fstream>
+ #include <variant>
++#include <vector>
++#ifdef __OPENORBIS__
++#include <mutex>
++#include <unordered_map>
++#include <sys/mman.h>
++#endif
+ 
+ #ifdef ARCHITECTURE_x86_64
+ #include "common/x64/xbyak.h"
+@@ -712,9 +718,47 @@ static const auto default_cg_mode = Xbyak::DontSetProtectRWE;
+ static const auto default_cg_mode = nullptr; //Allow RWE
+ #endif
+ 
++#ifdef __OPENORBIS__
++/// The PS4 runs code only from memory mapped executable to begin with (an mprotect adding
++/// PROT_EXEC fails, and the app's runtime serves such mappings from the pool that can run code):
++/// each macro's code memory is mapped read/write/execute once, as dynarmic's is, and never
++/// re-protected.
++struct MacroCodeAllocator final : Xbyak::Allocator {
++    uint8_t* alloc(size_t size) override {
++        size = (size + 0x3FFF) & ~size_t(0x3FFF);
++        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
++        if (p == MAP_FAILED)
++            return nullptr;
++        std::lock_guard lock{mutex};
++        sizes[p] = size;
++        return static_cast<uint8_t*>(p);
++    }
++    void free(uint8_t* p) override {
++        std::lock_guard lock{mutex};
++        if (auto it = sizes.find(p); it != sizes.end()) {
++            munmap(p, it->second);
++            sizes.erase(it);
++        }
++    }
++    bool useProtect() const override { return false; }
++    std::mutex mutex;
++    std::unordered_map<void*, size_t> sizes;
++};
++Xbyak::Allocator* MacroCodeMemory() {
++    static MacroCodeAllocator allocator;
++    return &allocator;
++}
++constexpr bool macro_code_protect = false;
++#else
++Xbyak::Allocator* MacroCodeMemory() {
++    return nullptr;
++}
++constexpr bool macro_code_protect = true;
++#endif
++
+ struct MacroJITx64Impl final : public Xbyak::CodeGenerator, public DynamicCachedMacro {
+     explicit MacroJITx64Impl(Core::System& system, std::span<const u32> code_)
+-        : Xbyak::CodeGenerator(MAX_CODE_SIZE, default_cg_mode)
++        : Xbyak::CodeGenerator(MAX_CODE_SIZE, default_cg_mode, MacroCodeMemory())
+         , code{code_}
+     {
+         Compile(system);
+@@ -759,8 +803,10 @@ struct MacroJITx64Impl final : public Xbyak::CodeGenerator, public DynamicCached
+     OptimizerState optimizer{};
+     std::optional<Macro::Opcode> next_opcode{};
+     ProgramType program{nullptr};
+-    std::array<Xbyak::Label, MAX_CODE_SIZE> labels;
+-    std::array<Xbyak::Label, MAX_CODE_SIZE> delay_skip;
++    // one per instruction (and one past the end), while compiling: two arrays of MAX_CODE_SIZE
++    // were 2 MiB in every compiled macro
++    std::vector<Xbyak::Label> labels;
++    std::vector<Xbyak::Label> delay_skip;
+     Xbyak::Label end_of_code{};
+     bool is_delay_slot{};
+     u32 pc{};
+@@ -1035,7 +1081,12 @@ void MacroJITx64Impl::Compile_Send(Core::System& system, Xbyak::Reg32 value) {
+ 
+ void MacroJITx64Impl::Compile_Branch(Macro::Opcode opcode) {
+     ASSERT(!is_delay_slot && "Executing a branch in a delay slot is not valid");
+-    const s32 jump_address = s32(pc) + s32(opcode.GetBranchTarget() / sizeof(s32));
++    s32 jump_address = s32(pc) + s32(opcode.GetBranchTarget() / sizeof(s32));
++    if (jump_address < 0 || size_t(jump_address) >= labels.size()) {
++        // (outside the macro: it ends there, as the interpreter's fetch past the end would)
++        LOG_ERROR(HW_GPU, "Macro branch at {} to {}, outside its {} instructions", pc, jump_address, code.size());
++        jump_address = s32(code.size());
++    }
+ 
+     Xbyak::Label end;
+     auto value = Compile_GetRegister(opcode.src_a, eax);
+@@ -1106,8 +1157,11 @@ void MacroJITx64Impl::Optimizer_ScanFlags() {
+ 
+ void MacroJITx64Impl::Compile(Core::System& system) {
+     // Matching PROTECT_RE needed for W^X systems
+-    setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RW);
+-    labels.fill(Xbyak::Label());
++    if (macro_code_protect) {
++        setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RW);
++    }
++    labels.assign(code.size() + 1, Xbyak::Label());
++    delay_skip.assign(code.size() + 1, Xbyak::Label());
+ 
+     Common::X64::ABI_PushRegistersAndAdjustStack(*this, Common::X64::ABI_ALL_CALLEE_SAVED, 8);
+     // JIT state
+@@ -1149,13 +1203,21 @@ void MacroJITx64Impl::Compile(Core::System& system) {
+         Compile_NextInstruction(system);
+     }
+ 
++    // (past the last instruction: the end)
++    if (!labels[op_count].getAddress()) {
++        L(labels[op_count]);
++    }
+     L(end_of_code);
+ 
+     Common::X64::ABI_PopRegistersAndAdjustStack(*this, Common::X64::ABI_ALL_CALLEE_SAVED, 8);
+     ret();
+     ready();
+-    setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RE);
++    if (macro_code_protect) {
++        setProtectMode(Xbyak::CodeArray::ProtectMode::PROTECT_RE);
++    }
+     program = getCode<ProgramType>();
++    labels = {};
++    delay_skip = {};
+ }
+ 
+ bool MacroJITx64Impl::Compile_NextInstruction(Core::System& system) {
+-- 
+2.43.0
+

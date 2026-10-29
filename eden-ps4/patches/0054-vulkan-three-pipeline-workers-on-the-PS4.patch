@@ -1,0 +1,33 @@
+From 65e03ddb2898f86609556ed258874f6e36c0999f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:35:03 +0000
+Subject: [PATCH 54/54] vulkan: three pipeline workers on the PS4
+
+One per CPU but one meant six or seven ACO compiles at once there, each
+holding its memory in the app's heap (about half a GiB, shared with
+everything) while four of the seven cores run the emulation.
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index a85e2811a..76b980cd3 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -306,7 +306,12 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
+ size_t GetTotalPipelineWorkers() {
+     const size_t max_core_threads =
+         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+-#ifdef __ANDROID__
++#if defined(__OPENORBIS__)
++    // The PS4: three. Each compile holds its own memory in the app's heap (about half a GiB, shared
++    // with everything else) until it's done, and the emulated CPU cores and the GPU thread keep
++    // four of its seven cores busy.
++    return std::min<size_t>(max_core_threads, 3);
++#elif defined(__ANDROID__)
+     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
+     const int clamped = std::clamp(configured, 2, 8);
+     const size_t desired = static_cast<size_t>(clamped);
+-- 
+2.43.0
+

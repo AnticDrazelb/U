@@ -1,0 +1,74 @@
+From 94d4c0276ddd7242568a54b58a10b62a170db13f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:34:43 +0000
+Subject: [PATCH 50/54] nvdrv: channels keep their GPU address space alive
+
+nvhost_as_gpu owned its Tegra::MemoryManager alone (unique_ptr) and
+gave channels a raw pointer. A program that closes its address space
+right after its last submission (as it exits) freed the memory manager
+while the GPU thread was still running that channel's commands: the
+test program's 3D stress test crashed in MemoryManager::
+IsContinuousRange, from a clear in a macro, in about one exit in three
+under load (core dump: the freed object's table pointer read back,
+the table itself unmapped). The address space is shared now, and the
+channel holds a reference as long as it exists.
+---
+ src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp | 5 ++++-
+ src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h   | 2 +-
+ src/video_core/control/channel_state.h               | 4 ++++
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp b/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+index 3c9e42f60..967de7d09 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp
+@@ -138,7 +138,7 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
+         static_cast<u32>((vm.va_range_end - vm.va_range_split) >> vm.big_page_size_bits)};
+     vm.big_page_allocator.emplace(start_big_pages, end_big_pages);
+ 
+-    gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
++    gmmu = std::make_shared<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
+     system.GPU().InitAddressSpace(*gmmu);
+     vm.initialised = true;
+ 
+@@ -416,6 +416,9 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
+ 
+     auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
+     gpu_channel_device->channel_state->memory_manager = gmmu.get();
++    // (the channel keeps it alive: closing this address space freed it under the GPU thread, which
++    // could still be running the channel's last commands)
++    gpu_channel_device->channel_state->memory_manager_owner = gmmu;
+     return NvResult::Success;
+ }
+ 
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h b/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h
+index b13b1c9ef..c78af02df 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h
++++ b/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.h
+@@ -219,7 +219,7 @@ private:
+ 
+         bool initialised{};
+     } vm;
+-    std::unique_ptr<Tegra::MemoryManager> gmmu;
++    std::shared_ptr<Tegra::MemoryManager> gmmu; //! (shared with the channels bound to it)
+ };
+ 
+ } // namespace Service::Nvidia::Devices
+diff --git a/src/video_core/control/channel_state.h b/src/video_core/control/channel_state.h
+index 80811c145..d1802ca41 100644
+--- a/src/video_core/control/channel_state.h
++++ b/src/video_core/control/channel_state.h
+@@ -58,6 +58,10 @@ struct ChannelState {
+     };
+     std::optional<Payload> payload;
+     MemoryManager* memory_manager = nullptr;
++    /// Keeps memory_manager alive while the channel exists: its address space (nvhost_as_gpu) can
++    /// be closed while the GPU thread still runs commands the channel was given, as a program does
++    /// as it exits
++    std::shared_ptr<MemoryManager> memory_manager_owner;
+ 
+     s32 bind_id = -1;
+     u64 program_id = 0;
+-- 
+2.43.0
+

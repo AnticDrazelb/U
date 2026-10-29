@@ -1,0 +1,53 @@
+From 8b35d891bae15c2884cf970ba01788790e54fe5b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:43:53 +0000
+Subject: [PATCH] arm: the PS4's code caches where the game runs
+
+Four 32 MiB caches, one per emulated core, from the PS4's only pool that
+runs code (shared with the app's heap). A Switch game runs on cores 0
+to 2; the fourth is the system's, whose services are HLE here. Cores 0
+to 2 get 40 MiB each now and core 3 8 MiB: the same 128 MiB, fewer
+full-cache flushes (each one a stutter while the code compiles again)
+where the game's code is.
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 6 ++++--
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 6 ++++--
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 291232408..30f41efcd 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -198,8 +198,10 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-    // The PS4 runs code only from its system memory pool, which the app's heap shares.
+-    config.code_cache_size = std::uint32_t(32_MiB);
++    // The PS4 runs code only from its system memory pool, which the app's heap shares: 128 MiB in
++    // all, most of it for the three cores a Switch game runs on (a full cache is flushed and its
++    // code compiled again, a stutter); the fourth is the system's, whose services are HLE.
++    config.code_cache_size = std::uint32_t(m_core_index == 3 ? 8_MiB : 40_MiB);
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index e95bdbb6f..a3bbc4ada 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -252,8 +252,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-    // The PS4 runs code only from its system memory pool, which the app's heap shares.
+-    config.code_cache_size = std::uint32_t(32_MiB);
++    // The PS4 runs code only from its system memory pool, which the app's heap shares: 128 MiB in
++    // all, most of it for the three cores a Switch game runs on (a full cache is flushed and its
++    // code compiled again, a stutter); the fourth is the system's, whose services are HLE.
++    config.code_cache_size = std::uint32_t(m_core_index == 3 ? 8_MiB : 40_MiB);
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+-- 
+2.43.0
+

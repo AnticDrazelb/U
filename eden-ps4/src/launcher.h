@@ -75,6 +75,9 @@ void SetResolution(int percent);
 void SetShaderCache(bool on);
 void SetAsyncShaders(bool on);
 void SetCpuUnsafe(bool on);
+/// Eden's High GPU accuracy, with reactive flushing (GPU-written memory read back when the CPU
+/// touches it); off: Low, without, as Eden's phone builds default to. Set it before Boot.
+void SetGpuAccuracyHigh(bool on);
 
 /// Where Boot keeps what it learned of a program that loaded (for a menu to show next time):
 /// data_dir/cache/titles/<hash of its path>.<extension>, "jpg" its icon, "txt" its title and

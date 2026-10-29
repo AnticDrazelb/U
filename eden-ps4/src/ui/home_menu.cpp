@@ -633,6 +633,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "New shaders are built in the background instead of stopping the game while they compile (slow on "
              "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",
              [](MenuSettings& s) { s.async_shaders = !s.async_shaders; }},
+            {"GPU Accuracy", settings.gpu_high ? "High" : "Normal",
+             "How closely the CPU waits for the GPU. High reads back what the GPU drew whenever the game's CPU code "
+             "might look at it, and makes the CPU's every access to such memory take a slow path: needed by a few "
+             "games (effects, screenshots), a large cost on the PS4's CPU for the rest. Normal is Eden's choice on "
+             "phones.",
+             [](MenuSettings& s) { s.gpu_high = !s.gpu_high; }},
         };
     }
     case 2:

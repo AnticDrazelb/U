@@ -3,12 +3,17 @@
 # desktop build (build.sh host) with scripted controller input, and what it printed, drew and
 # played is checked. Builds the programs first (hello/build.sh, game/build.sh).
 #   EDEN_PS4_BIN  the desktop build (default ~/eden-host/bin/eden-ps4)
+#   TEST_KEEP=1   keeps the work folder (each run's whole log, e.g. a sanitizer's report)
 # Exit code: the number of failed checks.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="${EDEN_PS4_BIN:-$HOME/eden-host/bin/eden-ps4}"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+if [ "${TEST_KEEP:-}" = 1 ]; then
+    echo "work folder: $work"
+else
+    trap 'rm -rf "$work"' EXIT
+fi
 failed=0
 
 check() { # check <description> <command...>
@@ -19,6 +24,10 @@ check() { # check <description> <command...>
     else
         echo "  FAIL  $what"
         failed=$((failed + 1))
+        # the run's last lines (the work folder goes at the end): where an intermittent crash was
+        if [ -f "$work/$2.log" ]; then
+            tail -n 8 "$work/$2.log" | sed 's/^/        | /'
+        fi
     fi
 }
 
@@ -159,7 +168,8 @@ sys.exit(0 if ir > 230 and 100 < ig < 180 and ib < 60 and not (orr > 230 and ob 
 PY
 # a texture the CPU writes to: from frame 30 the sprite's middle is blue, and the turning square
 # (which samples the sprite) shows it in the last frame
-check "a texture the CPU rewrites is drawn as rewritten" python3 - "$work/gputest-frames/last.ppm" <<'PY'
+rewritten() {
+    python3 - "$work/$1-frames/last.ppm" <<'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()
 width = int(data.split(b'\n')[1].split()[0])
@@ -167,9 +177,12 @@ pixels = data[data.index(b'255\n') + 4:]
 r, g, b = pixels[(261 * width + 144) * 3:(261 * width + 144) * 3 + 3]
 sys.exit(0 if b > 200 and r < 80 and g < 120 else 1)
 PY
-# its bouncing squares, cleared by a GPU macro (MME, run by Eden's macro interpreter): the first
-# is grey, top left
-check "its squares are drawn by a GPU macro" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+}
+check "a texture the CPU rewrites is drawn as rewritten" rewritten gputest
+# its bouncing squares, cleared by a GPU macro (MME, compiled by Eden's macro JIT; interpreted
+# with EDEN_PS4_MACRO_JIT=0): the first is grey, top left
+square() {
+    python3 - "$work/$1-frames/frame-0001.ppm" <<'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()
 width = int(data.split(b'\n')[1].split()[0])
@@ -177,7 +190,11 @@ pixels = data[data.index(b'255\n') + 4:]
 r, g, b = pixels[(74 * width + 53) * 3:(74 * width + 53) * 3 + 3]
 sys.exit(0 if all(abs(c - 77) < 6 for c in (r, g, b)) else 1)
 PY
-check "its macro is interpreted (no macro JIT)" bash -c "! grep -q 'Macro JIT' '$work/gputest.log'"
+}
+check "its squares are drawn by a GPU macro" square gputest
+check "its macro compiles cleanly (macro JIT)" bash -c "! grep -q 'Macro JIT\\|Macro branch' '$work/gputest.log'"
+run gputest_interp "$work/gputest.nro" 20 "3:Plus,3.5:" EDEN_PS4_MACRO_JIT=0
+check "and with the macro interpreter" square gputest_interp
 # its floor in perspective, mipmapped (a colour a level), striped by a branch in its shader: near,
 # level 0's grey checkerboard blended toward level 1's red; halfway, orange (levels 1 and 2); far,
 # blue (level 5); a darkened stripe between two bright ones
@@ -309,6 +326,15 @@ echo "gputest.nro's 3D stress test: 12 large lit, textured, depth-tested quads"
 run gputest_3d "$work/gputest.nro" 20 "2:B,2.3:,7:Plus,7.5:"
 check "exits on +" code gputest_3d 0
 check "draws them" says gputest_3d "fps, [0-9]* command words a frame (3D stress test)"
+
+echo "the PS4's memory path: no fastmem (the recompiler walks the page table), GPU accuracy Normal and High"
+run nofastmem "$work/gputest.nro" 20 "5:Plus,5.5:" EDEN_PS4_FASTMEM=0
+check "exits on +" code nofastmem 0
+check "its squares are drawn by a GPU macro" square nofastmem
+check "a texture the CPU rewrites is drawn as rewritten" rewritten nofastmem
+run nofastmem_high "$work/breakout.nro" 20 "2:A,2.2:,3:Right,4:,7:Plus,7.3:" EDEN_PS4_FASTMEM=0 EDEN_PS4_GPU_HIGH=1
+check "breakout with GPU accuracy High exits on +" code nofastmem_high 0
+check "and launches the ball" says nofastmem_high "breakout: ball launched"
 
 echo "the launcher: stopping a program"
 run stop "$work/breakout.nro" 20 "2:Stop"

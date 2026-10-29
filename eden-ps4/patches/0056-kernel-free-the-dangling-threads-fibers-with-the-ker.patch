@@ -1,0 +1,63 @@
+From 0aff4a309c11b369b40aa4e5c4b6391104b9c543 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:48:12 +0000
+Subject: [PATCH] kernel: free the dangling threads' fibers with the kernel
+
+Patch 0048's fibers were freed in Shutdown, but a service thread's stack
+never unwinds, and objects on it can still be reached from subsystems
+the system destroys before the kernel: the AM service's ButtonPoller
+lives on its service thread's stack and keeps a callback in the HID
+controllers (hid_core outlives the kernel's Shutdown). Input after
+shutdown then ran into the freed stack (AddressSanitizer: SEGV in
+ButtonPoller::OnButtonStateChanged, from the frontend's input thread).
+The fibers are moved into a list the kernel frees when it is destroyed,
+after everything else: still once per System, no longer a leak per
+program for a frontend that makes a System for each.
+---
+ src/core/hle/kernel/kernel.cpp | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
+index 5a3d93fc9..39246a166 100644
+--- a/src/core/hle/kernel/kernel.cpp
++++ b/src/core/hle/kernel/kernel.cpp
+@@ -10,6 +10,7 @@
+ #include <functional>
+ #include <memory>
+ #include <thread>
++#include <vector>
+ #include "common/container/unordered_map.h"
+ #include "common/container/unordered_set.h"
+ #include <utility>
+@@ -199,10 +200,15 @@ struct KernelCore::Impl {
+ 
+         // A thread still alive here never runs again (the cores are shut down) but holds its host
+         // fiber, two stacks: ~66 such threads (services, the cores' main and idle threads) leaked
+-        // 66 MiB on the PS4 each time a program ended, 264 MiB elsewhere
+-        global_object_list_container->ForEach([](KAutoObjectWithList& object) {
++        // 66 MiB on the PS4 each time a program ended, 264 MiB elsewhere. They go with the kernel,
++        // not now: a service thread's stack never unwinds, and objects on it can still be reached
++        // from what the system destroys before the kernel (the AM service's button poller, from a
++        // controller's callbacks), so freed here, input after shutdown crashed.
++        global_object_list_container->ForEach([this](KAutoObjectWithList& object) {
+             if (auto* thread = object.DynamicCast<KThread*>()) {
+-                thread->GetHostContext().reset();
++                if (auto& fiber = thread->GetHostContext()) {
++                    dangling_host_contexts.push_back(std::move(fiber));
++                }
+             }
+         });
+ 
+@@ -842,6 +848,9 @@ struct KernelCore::Impl {
+     std::optional<KMemoryLayout> memory_layout;
+ 
+     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> shutdown_threads{};
++
++    // The host fibers of threads still alive at shutdown, freed with the kernel (see Shutdown)
++    std::vector<std::shared_ptr<Common::Fiber>> dangling_host_contexts;
+     std::array<std::optional<Kernel::KScheduler>, Core::Hardware::NUM_CPU_CORES> schedulers{};
+ 
+     bool is_multicore{};
+-- 
+2.43.0
+

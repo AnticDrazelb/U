@@ -1,0 +1,38 @@
+From f54712790e804045cf3dffd960ea61c9c3324295 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 19:56:58 +0000
+Subject: [PATCH] gpu: destroy the renderer while the channels are still there
+
+GPU::Impl's members went in reverse order: the channel scheduler,
+declared after the renderer, first, freeing the channels' 3D engines,
+whose dirty flags the Vulkan state tracker points to. The renderer's
+last submission (its destructor's, and the rasterizer's) then wrote to
+them: AddressSanitizer, heap-use-after-free in
+StateTracker::InvalidateCommandBufferState, at every Vulkan shutdown.
+~Impl resets the renderer first.
+---
+ src/video_core/gpu.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 4e36d086e..acc710795 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -62,7 +62,13 @@ struct GPU::Impl {
+         , is_async{is_async_}
+     {}
+ 
+-    ~Impl() = default;
++    ~Impl() {
++        // The renderer first, while the channels are still here: members go in reverse order, and
++        // the channel scheduler (below the renderer) went first, freeing the 3D engines whose dirty
++        // flags the Vulkan state tracker points to; the renderer's last submission then wrote to
++        // them (AddressSanitizer: heap-use-after-free in StateTracker::InvalidateCommandBufferState)
++        renderer.reset();
++    }
+ 
+     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
+         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
+-- 
+2.43.0
+

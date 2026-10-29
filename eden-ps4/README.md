@@ -193,10 +193,13 @@ Two ways it shows:
   command buffers it reads, thousands of times a second, which marked every texture before. The
   GPU test's CPU paints the sprite's middle blue at frame 30, and the turning square shows it.
   The stats line counts the textures checked and decoded, and the bytes hashed.
-- **GPU macros** (launcher; patch 0024): deko3d and Mesa draw through the 3D engine's macros
-  (MME), and Eden's macro JIT writes x86 code into memory it makes executable itself, which a PS4
-  app can't do: the launcher has Eden interpret macros instead (`EDEN_PS4_MACRO_JIT=1` for the
-  JIT). The GPU test's bouncing squares are cleared by a macro of its own (it sets the clear colour
+- **GPU macros** (launcher; patches 0024, 0051): deko3d, Mesa and games draw through the 3D
+  engine's macros (MME), on the GPU thread. Eden's macro JIT made its code memory executable with
+  mprotect, which a PS4 app can't do, so until 03.50 the launcher had Eden interpret macros. Patch
+  0051 maps each macro's code read/write/execute once on the PS4 (as dynarmic's code is), and the
+  JIT is used everywhere (`EDEN_PS4_MACRO_JIT=0` interprets). Each compiled macro also carried two
+  arrays of 65536 labels, 2 MiB: they are sized to the macro now, and freed once it is compiled.
+  The GPU test's bouncing squares are cleared by a macro of its own (it sets the clear colour
   and clears, from its parameters). And the null rasterizer reports the writes the memory manager
   gathers (constant buffer updates among them) before each draw and clear, as the Vulkan one does:
   they gathered without end.
@@ -374,6 +377,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+Bugs found in 03.50 (an AddressSanitizer build of the desktop launcher, `test.sh` under load):
+- **A program's exit could free its GPU address space under the GPU thread** (patch 0050). The
+  address space device owned its memory manager alone and channels had a raw pointer; a program
+  that closes it right after its last submission (as it exits) freed it while the channel's last
+  commands still ran. The test program's 3D stress test crashed at about one exit in three under
+  load (a core dump showed the freed object's table pointer read back). Channels share it now.
+- **Input after shutdown reached a freed stack** (patch 0056, launcher). 03.40's fix for the
+  threads' fibers freed them at the kernel's shutdown, but the AM service's button poller lives on
+  its service thread's stack (which never unwinds) and keeps a callback in the controllers, which
+  outlive that; the controller thread, still polling, ran into it. The fibers go with the kernel
+  now, after everything else, and the launcher stops feeding input before shutting down.
+- **Every Vulkan shutdown wrote to freed memory** (patch 0057): the GPU's members went in reverse
+  order, the channels (whose 3D engines' dirty flags the Vulkan state tracker points to) before the
+  renderer, whose last submission then marked those flags. The renderer goes first now.
+- **The network's interrupt pipe** (patch 0049) kept its closed descriptors' numbers after
+  `Finalize`; a later `pipe()` failing (shadPS4 asserted at every shutdown) left them, by then
+  other files', to be written to.
+- `log.txt` stops at 32 MiB (a game that warns every frame would fill the storage over a session).
+
 If Vulkan doesn't start (RADV can't open the GPU), the launcher keeps that boot's log as
 `log-vulkan.txt` and boots the program again with the software renderer, which it then keeps
 using until it is restarted. RADV's own log is in `/data/eden-ps4/gpu/radv-ps4.log` (with
@@ -465,8 +487,31 @@ the Switch's (`src/ui/`, since 03.20):
     the system shares; with 6, the runtime keeps every thread started from then on to cores 0-5
     (`ps4_set_app_cores`).
 
+  - **Graphics, GPU Accuracy** (03.50): Normal (the default) or High. High is Eden's desktop
+    default: GPU-written memory read back whenever the game's CPU code might look at it (reactive
+    flushing), safe reads of command lists, precise queries. Normal is what Eden's phone builds
+    default to (Low, no reactive flushing): a few games need High for some effects.
+
   Not an option: tuning the recompiler for the Jaguar, where stage 1 found it slowest (calls x10,
   vector floats x12.5), is work on dynarmic itself.
+
+  Speed in 03.50, everywhere (on the PS4, where the CPU is what holds a game back):
+  - **Reads of memory the GPU caches** (patch 0052). Eden marks such pages so that a write
+    invalidates the GPU's copy. Without fastmem the recompiler treated a marked page as unmapped for
+    reads too, so each read went through a callback that asks the GPU for a flush area and can wait
+    for the GPU: reactive flushing, always, on the CPU's hot path. Reads now stay on the fast path
+    unless GPU Accuracy is High, as with fastmem.
+  - **GPU macros compiled** (patch 0051, above), not interpreted, on the GPU thread.
+  - **Thread priorities** (patch 0053, `port/ps4_runtime.cpp`). Eden's had no effect on the PS4,
+    so the emulated CPU cores and the GPU thread shared their time equally with logging, loading and
+    shader compiling. Now, as Crema does: those and the Vulkan worker at 650 (the default is 700),
+    core timing and the vsync conductor just above (640, they wake for moments), shader compilers
+    just below (720), the controller's polling and the hang watchdog at 600, audio at 400.
+  - **Code caches** (patch 0055): 40 MiB for each of the three cores a game runs on, 8 MiB for the
+    system's (whose services are HLE), instead of 32 MiB each: fewer flushes of a full cache, each
+    a stutter while the code compiles again, in the same 128 MiB of memory that runs code.
+  - **Three pipeline workers** (patch 0054), not one per CPU but one: each ACO compile holds memory
+    in the app's heap until it's done.
 - The user's icon and the time at the top; the controller and the buttons' hints at the bottom.
 - A game without the keys: a dialog says where they go, instead of a loader error. After a run that
   didn't finish: its report first (the end of `log.txt`, `crash.log` and its last steps), to
@@ -736,3 +781,12 @@ and reads the controller, without a screen, speakers or a controller:
 - `EDEN_PS4_LOG=<filter>` sets Eden's log filter, e.g. `"*:Info Service.VI:Debug"`
 - `EDEN_PS4_BOOTS=<n>` boots it n times in one process, as the PS4's HOME menu runs one program
   after another, and prints the heap in use after each (what a run leaves behind)
+- `EDEN_PS4_FASTMEM=0` turns fastmem off, so that guest memory goes through the recompiler's page
+  table walk as on the PS4 (which can't map memory twice)
+- `EDEN_PS4_GPU_HIGH=1` is System Settings' GPU Accuracy High (Normal by default)
+- `EDEN_PS4_MACRO_JIT=0` interprets GPU macros instead of compiling them
+
+`test.sh` runs every test program this way and checks what it printed, drew and played
+(`TEST_KEEP=1` keeps each run's whole log; a failed check prints the end of it). With
+`EDEN_PS4_BIN` it runs another build: an AddressSanitizer one found two of 03.50's fixes (a core
+dump of a run under load, a third).

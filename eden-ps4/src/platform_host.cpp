@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
     };
     Launcher::SetShaderCache(flag("EDEN_PS4_SHADER_CACHE"));
     Launcher::SetAsyncShaders(flag("EDEN_PS4_ASYNC_SHADERS"));
+    Launcher::SetGpuAccuracyHigh(flag("EDEN_PS4_GPU_HIGH"));
     if (const char* env = std::getenv("EDEN_PS4_INPUT")) {
         input = std::thread(PlayInput, std::string(env), &done);
     }
