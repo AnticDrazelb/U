@@ -115,6 +115,15 @@ void HomeMenu::ShowMessage(std::string title, std::string text)
     OpenDialog(std::move(dialog));
 }
 
+bool HomeMenu::UpdateMessage(std::string title, std::string text)
+{
+    if (dialogs.empty() || dialogs.back().kind != DialogKind::Message)
+        return false;
+    dialogs.back().title = std::move(title);
+    dialogs.back().text = std::move(text);
+    return true;
+}
+
 size_t HomeMenu::HomeCount() const
 {
     return std::min(titles.size(), kHomeTitles);
@@ -154,9 +163,9 @@ MenuAction HomeMenu::Start(size_t index)
         Dialog dialog;
         dialog.kind = DialogKind::NoKeys;
         dialog.title = "The keys of your Switch are needed.";
-        dialog.text = "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from in "
-                      "/data/eden-ps4/user/keys/, and that Switch's firmware in "
-                      "/data/eden-ps4/user/nand/system/Contents/registered/.";
+        dialog.text = "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
+                      "that Switch's firmware. Put them on a USB drive (the keys at the top, the firmware's .nca "
+                      "files in a folder), then Import from USB (Square) in Games and Keys.";
         dialog.buttons = {"OK"};
         OpenDialog(std::move(dialog));
         return {};
@@ -374,6 +383,8 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
     case Screen::Games:
         if (pressed & kCircle)
             screen = Screen::Home;
+        if (screen == Screen::Games && (pressed & kSquare))
+            return {MenuAction::Kind::ImportUsb, {}};
         if (moves & kDown)
             page_scroll += 60;
         if (moves & kUp)
@@ -753,7 +764,7 @@ void HomeMenu::DrawGames(Canvas& c)
     if (end - page_scroll < kBottomLine - 40 && page_scroll > 0)
         page_scroll = std::max(0.0f, end - (kBottomLine - 40));
     c.ResetClip();
-    DrawBottomBar(c, {{Glyph::Circle, "Back"}});
+    DrawBottomBar(c, {{Glyph::Square, "Import from USB"}, {Glyph::Circle, "Back"}});
 }
 
 void HomeMenu::DrawControllers(Canvas& c, double now)

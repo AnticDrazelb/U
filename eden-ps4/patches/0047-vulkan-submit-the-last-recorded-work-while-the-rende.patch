@@ -1,0 +1,34 @@
+From 47942fae4fe81ca450b505d9e479fb9b909f3947 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 12:23:28 +0000
+Subject: [PATCH 47/48] vulkan: submit the last recorded work while the
+ renderer is whole
+
+~RendererVulkan waited for the GPU, then its members went in reverse
+order: frame_gen and applet_frame (declared after the rasterizer) first,
+then ~RasterizerVulkan, whose scheduler.Finish() submitted the work still
+recorded, which can use them. lavapipe crashed running it (or corrupted
+the heap) every time a program was stopped. The destructor now finishes
+the scheduler before anything is destroyed.
+---
+ src/video_core/renderer_vulkan/renderer_vulkan.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index aeb9d7dde..13ea1e1b2 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -201,6 +201,10 @@ try
+ 
+ RendererVulkan::~RendererVulkan() {
+     scheduler.RegisterOnSubmit([] {});
++    // Work still recorded runs now, while everything it uses is alive: the rasterizer's destructor
++    // submitted it after the members declared below it (frame_gen, applet_frame) were destroyed,
++    // and lavapipe crashed running it whenever a program was stopped
++    scheduler.Finish();
+     void(device.GetLogical().WaitIdle());
+ }
+ 
+-- 
+2.43.0
+

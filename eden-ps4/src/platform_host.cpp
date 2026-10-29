@@ -13,7 +13,10 @@
 //                           stops the program (as L3+R3 held on the PS4)
 //   EDEN_PS4_AUDIO=<file>   records the sound to a WAV file, in real time (a second stream Eden
 //                           opens goes to <file>.2.wav, and so on)
+//   EDEN_PS4_BOOTS=<n>      boots it n times in one process (as the PS4's HOME menu runs one
+//                           program after another), with the heap in use after each
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +28,8 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <malloc.h>
 
 #include "launcher.h"
 
@@ -250,7 +255,25 @@ int main(int argc, char** argv) {
         input = std::thread(PlayInput, std::string(env), &done);
     }
 
-    const auto result = Launcher::Boot(program, data_dir, PrintLine, frames, timeout);
+    // EDEN_PS4_BOOTS=N boots it N times in this process, as the PS4's HOME menu does one program
+    // after another, and says how much heap each run leaves behind
+    const char* boots_env = std::getenv("EDEN_PS4_BOOTS");
+    const int boots = std::max(1, boots_env ? std::atoi(boots_env) : 1);
+    const auto heap_in_use = [] {
+        const struct mallinfo2 info = mallinfo2();
+        return std::pair{info.uordblks >> 20, info.hblkhd >> 20};
+    };
+    const auto heap_before = heap_in_use();
+    Launcher::BootResult result{};
+    for (int boot = 0; boot < boots; boot++) {
+        result = Launcher::Boot(program, data_dir, PrintLine, frames, timeout);
+        if (boots > 1) {
+            const auto heap = heap_in_use();
+            std::printf("eden-ps4: boot %d of %d done, heap in use %zu MiB + %zu MiB in large blocks "
+                        "(%zu + %zu before the first)\n",
+                        boot + 1, boots, heap.first, heap.second, heap_before.first, heap_before.second);
+        }
+    }
 
     done = true;
     if (input.joinable()) {

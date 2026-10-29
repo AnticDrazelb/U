@@ -37,7 +37,8 @@ if (PS4)
     set_source_files_properties(ui/canvas.cpp PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")
 
-    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp ${EDEN_PS4_UI_SOURCES} ${EDEN_PS4_RUNTIME_SOURCES})
+    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp usb_import.cpp ${EDEN_PS4_UI_SOURCES}
+                            ${EDEN_PS4_RUNTIME_SOURCES})
     target_include_directories(eden-ps4 PRIVATE ${CMAKE_CURRENT_LIST_DIR})
     target_compile_definitions(eden-ps4 PRIVATE EDEN_PS4_VERSION="${EDEN_PS4_VERSION}")
     target_link_libraries(eden-ps4 PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut

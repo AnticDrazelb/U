@@ -1124,6 +1124,16 @@ ps4_check_va_free(uint64_t addr, uint64_t size, const char *what)
 static struct util_sync_provider *ps4_sync_provider_init(ac_drm_device *dev);
 static ac_drm_device *ps4_last_device;
 
+/* One device for the whole process. RADV asks for a device for each winsys it makes (one per
+ * VkInstance), and Eden makes a new instance for every program it boots: a device each time
+ * reserved new GPU address windows (16 + 8 GiB) and kept the last one's buffers in quarantine
+ * (up to 96 MiB of direct memory) forever. Now the first device is handed out again, and when
+ * its last user goes, the GPU has finished everything and the quarantine is released. */
+static pthread_mutex_t ps4_device_lock = PTHREAD_MUTEX_INITIALIZER;
+static ac_drm_device *ps4_device;
+static unsigned ps4_device_users;
+static bool ps4_jobs_idle(void);
+
 /* Logs the first memory operations (bring-up). */
 static unsigned ps4_verbose_left = 64;
 #define PS4_VERBOSE(...) do { if (ps4_verbose_left) { ps4_verbose_left--; ps4_log(__VA_ARGS__); } } while (0)
@@ -1134,9 +1144,21 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
 {
    (void)fd;
    (void)is_virtio;
+   pthread_mutex_lock(&ps4_device_lock);
+   if (ps4_device) {
+      ps4_device_users++;
+      pthread_mutex_unlock(&ps4_device_lock);
+      ps4_log("radv/ps4: device in use again (%u users)\n", ps4_device_users);
+      *major_version = 3;
+      *minor_version = 61;
+      *out = ps4_device;
+      return 0;
+   }
    ac_drm_device *dev = calloc(1, sizeof(*dev));
-   if (!dev)
+   if (!dev) {
+      pthread_mutex_unlock(&ps4_device_lock);
       return -ENOMEM;
+   }
    simple_mtx_init(&dev->lock, mtx_plain);
 
    if (!ps4_load_gnm(dev))
@@ -1207,10 +1229,14 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
       ps4_install_fault_capture(dev, dev->gnm_module);
    ps4_fault_dev = dev; /* the last device created is the one in use */
    ps4_start_flight_recorder(dev);
+   ps4_device = dev;
+   ps4_device_users = 1;
+   pthread_mutex_unlock(&ps4_device_lock);
    ps4_log("radv/ps4: device initialized\n");
    return 0;
 
 fail:
+   pthread_mutex_unlock(&ps4_device_lock);
    free(dev);
    return -ENODEV;
 }
@@ -1230,8 +1256,36 @@ ac_drm_device_get_cookie(ac_drm_device *dev)
 void
 ac_drm_device_deinitialize(ac_drm_device *dev)
 {
-   /* The device lives for the whole process. */
-   (void)dev;
+   /* The device lives for the whole process; when its last user goes (a program's renderer),
+    * the buffers it left waiting are released once the GPU has finished with them. (Under the
+    * lock: a new user waits until that's done.) */
+   pthread_mutex_lock(&ps4_device_lock);
+   if (dev != ps4_device || !ps4_device_users || --ps4_device_users) {
+      pthread_mutex_unlock(&ps4_device_lock);
+      return;
+   }
+   const int64_t deadline = os_time_get_nano() + 2000000000ll;
+   while (!ps4_jobs_idle() && os_time_get_nano() < deadline)
+      usleep(1000);
+   const bool idle = ps4_jobs_idle() && ps4_wait_seq(dev, dev->last_seq, deadline);
+   char line[200];
+   if (idle) {
+      simple_mtx_lock(&dev->lock);
+      const unsigned waiting = dev->num_deferred;
+      ps4_run_deferred_ex(dev, 0);
+      simple_mtx_unlock(&dev->lock);
+      snprintf(line, sizeof(line), "radv/ps4: no users left: %u released buffers freed, %llu MiB in %llu "
+               "buffers still allocated", waiting, (unsigned long long)(dev->bo_bytes >> 20),
+               (unsigned long long)dev->bo_count);
+   } else {
+      /* (the GPU may still write to them: they stay until it's done, as before) */
+      snprintf(line, sizeof(line), "radv/ps4: no users left, but the GPU is still busy (submission %llu "
+               "of %llu): the released buffers stay", (unsigned long long)ps4_completed(dev),
+               (unsigned long long)dev->last_seq);
+   }
+   pthread_mutex_unlock(&ps4_device_lock);
+   ps4_log("%s\n", line);
+   ps4_boot_trace(line);
 }
 
 int
@@ -1856,7 +1910,7 @@ ps4_run_deferred_ex(ac_drm_device *dev, uint64_t keep)
       if (dev->deferred[ready].op == 'F' && dev->deferred[ready].bo)
          held += dev->deferred[ready].bo->size;
    unsigned n = 0;
-   for (; n < ready && held > keep; n++) {
+   for (; n < ready && (held > keep || !keep); n++) {
       struct ps4_deferred *d = &dev->deferred[n];
       switch (d->op) {
       case 'U':
@@ -2682,6 +2736,16 @@ ps4_submit_thread(void *arg)
       pthread_mutex_unlock(&ps4_job_lock);
    }
    return NULL;
+}
+
+/* Every queued submission and flip handed to the system? */
+static bool
+ps4_jobs_idle(void)
+{
+   pthread_mutex_lock(&ps4_job_lock);
+   const bool idle = ps4_job_head == ps4_job_tail;
+   pthread_mutex_unlock(&ps4_job_lock);
+   return idle;
 }
 
 /* Queues a submission (called with dev->lock held, in sequence order). */

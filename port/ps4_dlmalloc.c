@@ -37,3 +37,28 @@ int ps4_heap_ok(void* msp) {
   mstate ms = (mstate)msp;
   return ok_magic(ms);
 }
+
+/* Bytes in use in an mspace (chunks not free; dlmalloc's mallinfo uordblks, which NO_MALLINFO
+ * leaves out), and its size. Walks every chunk: for diagnostics, a few times per program. */
+void ps4_heap_in_use(void* msp, size_t* in_use, size_t* size) {
+  mstate m = (mstate)msp;
+  *in_use = *size = 0;
+  if (!ok_magic(m) || PREACTION(m))
+    return;
+  if (is_initialized(m)) {
+    size_t mfree = m->topsize + TOP_FOOT_SIZE;
+    msegmentptr s = &m->seg;
+    while (s != 0) {
+      mchunkptr q = align_as_chunk(s->base);
+      while (segment_holds(s, q) && q != m->top && q->head != FENCEPOST_HEAD) {
+        if (!is_inuse(q))
+          mfree += chunksize(q);
+        q = next_chunk(q);
+      }
+      s = s->next;
+    }
+    *in_use = m->footprint - mfree;
+    *size = m->footprint;
+  }
+  POSTACTION(m);
+}

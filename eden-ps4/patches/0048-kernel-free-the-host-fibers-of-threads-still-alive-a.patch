@@ -1,0 +1,63 @@
+From a8d2a2295189b0970ad3220050337f69bda90104 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 12:23:28 +0000
+Subject: [PATCH 48/48] kernel: free the host fibers of threads still alive at
+ shutdown
+
+About 66 kernel threads are still referenced when the kernel shuts down
+(the services', and each core's main, idle and shutdown threads), and a
+thread's host fiber (two stacks) is only released when it is destroyed:
+264 MiB leaked every time a program ended (66 MiB on the PS4, whose
+fiber stacks are smaller), so a frontend that runs one program after
+another ran out of memory. The cores are shut down by then, so the
+fibers never run again: Shutdown now releases them for every thread in
+the object list container (only live objects are registered there; the
+registered_objects set also holds objects freed without Close).
+---
+ src/core/hle/kernel/k_auto_object_container.h | 9 +++++++++
+ src/core/hle/kernel/kernel.cpp                | 9 +++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/src/core/hle/kernel/k_auto_object_container.h b/src/core/hle/kernel/k_auto_object_container.h
+index 770743d21..1e325275c 100644
+--- a/src/core/hle/kernel/k_auto_object_container.h
++++ b/src/core/hle/kernel/k_auto_object_container.h
+@@ -30,6 +30,15 @@ public:
+     void Unregister(KAutoObjectWithList* obj);
+     size_t GetOwnedCount(KProcess* owner);
+ 
++    // Calls func with each object still registered (alive)
++    template <typename Func>
++    void ForEach(Func&& func) {
++        KScopedSpinLock lk(m_lock);
++        for (auto& object : m_object_list) {
++            func(object);
++        }
++    }
++
+ private:
+     KSpinLock m_lock;
+     ListType m_object_list;
+diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
+index 4f1d84920..5a3d93fc9 100644
+--- a/src/core/hle/kernel/kernel.cpp
++++ b/src/core/hle/kernel/kernel.cpp
+@@ -197,6 +197,15 @@ struct KernelCore::Impl {
+ 
+         object_name_global_data.reset();
+ 
++        // A thread still alive here never runs again (the cores are shut down) but holds its host
++        // fiber, two stacks: ~66 such threads (services, the cores' main and idle threads) leaked
++        // 66 MiB on the PS4 each time a program ended, 264 MiB elsewhere
++        global_object_list_container->ForEach([](KAutoObjectWithList& object) {
++            if (auto* thread = object.DynamicCast<KThread*>()) {
++                thread->GetHostContext().reset();
++            }
++        });
++
+         // Ensure that the object list container is finalized and properly shutdown.
+         global_object_list_container->Finalize();
+         global_object_list_container.reset();
+-- 
+2.43.0
+

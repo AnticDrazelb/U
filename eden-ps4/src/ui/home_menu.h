@@ -75,7 +75,7 @@ struct Report
 
 struct MenuAction
 {
-    enum class Kind { None, Boot, Quit, SettingsChanged } kind = Kind::None;
+    enum class Kind { None, Boot, Quit, SettingsChanged, ImportUsb } kind = Kind::None;
     std::string path; // Boot: what to boot
 };
 
@@ -101,6 +101,8 @@ public:
     // Shown first, until dismissed
     void ShowReport(Report report);
     void ShowMessage(std::string title, std::string text);
+    // Changes the message on top (a copy's progress, then its result); false if none is open
+    bool UpdateMessage(std::string title, std::string text);
     // "No controller: the test program starts in N s" (negative: hidden)
     void SetCountdown(int seconds) { countdown = seconds; }
 

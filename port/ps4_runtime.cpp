@@ -63,6 +63,7 @@ void* mspace_memalign(mspace msp, size_t alignment, size_t bytes);
 size_t mspace_usable_size(const void* mem);
 size_t mspace_footprint(mspace msp);
 size_t mspace_max_footprint(mspace msp);
+void ps4_heap_in_use(void* msp, size_t* in_use, size_t* size);
 void* memcpy(void* dst, const void* src, size_t n);
 
 // port/ps4_crashlog.cpp (weak: a program may link without it).
@@ -587,6 +588,23 @@ void* __wrap_memalign(size_t alignment, size_t size) {
 // Direct memory the overflow heaps leave free for the GPU (see overflowAlloc); 0, the default,
 // takes what they can.
 void ps4_heap_set_overflow_gpu_reserve(size_t bytes) { g_overflowGpuReserve = bytes; }
+
+// The heap's bytes in use and its size (the main heap and the overflow heaps; the busy threads'
+// arenas are carved from them). Walks every chunk: for diagnostics.
+void ps4_heap_usage(size_t* in_use, size_t* size) {
+    *in_use = *size = 0;
+    const auto add = [&](mspace msp) {
+        size_t used = 0, total = 0;
+        ps4_heap_in_use(msp, &used, &total);
+        *in_use += used;
+        *size += total;
+    };
+    if (g_heap)
+        add(g_heap);
+    const int count = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < count; i++)
+        add(g_overflows[i].msp);
+}
 
 // Gives the calling thread a private arena if it is one of the emulator's busy threads (called
 // when a thread names itself: SetThreadName -> ps4_watch_thread). Crema's (Cemu's) names: until

@@ -342,6 +342,38 @@ in `/data/eden-ps4/user/keys/prod.keys` (and `title.keys`) and that Switch's fir
 files) in `/data/eden-ps4/user/nand/system/Contents/registered/`; without `prod.keys` the start
 page says so when a game is chosen, instead of booting it.
 
+Getting them there (03.40): **Games and Keys, Import from USB** (Square). Without root access on
+the console (PS4-Xplorer on 13.52 with GoldHEN says "Not Supported"), file managers can't write
+the app's data folder, but the app itself reads USB drives (`src/usb_import.cpp`): `prod.keys`
+and `title.keys` from the top of a drive, a folder at its top (Lockpick_RCM writes them to
+`switch/`) or that folder's `keys` folder; the firmware's `.nca` files from the folder (at the
+top, or one below) that has the most of them, e.g. `Firmware 19.0.1`. The firmware already there
+is replaced, as Eden's own firmware install does; files are copied through a `.part` name, and a
+message shows the progress and what was copied from where. GoldHEN's FTP server (port 2121, from
+its settings) also reaches `/data/eden-ps4`.
+
+One program after another (03.40): the first console run (13.52, GoldHEN) crashed when a second
+program started in the same session, without a crash log, its C heap grown by six 32 MiB
+overflow heaps. Three things, found on the desktop with `EDEN_PS4_BOOTS=<n>` (several boots in
+one process, the heap in use after each):
+- Eden kept the host fibers (two stacks each) of the ~66 kernel threads still referenced at
+  shutdown: 264 MiB per program on the desktop, 66 MiB on the PS4 (patch 0048: the kernel's
+  shutdown releases them for every live thread). The heap now stays flat from one program to the
+  next (desktop: 3 MiB after each of three boots, software or Vulkan).
+- Stopping a program on Vulkan used freed memory: `~RasterizerVulkan` submitted the last recorded
+  work after `frame_gen` and `applet_frame` were destroyed; lavapipe crashed every time (patch
+  0047: `~RendererVulkan` finishes the scheduler first).
+- RADV's PS4 winsys made a new GPU device for every Vulkan instance (one per program), each with
+  new GPU address windows (16 + 8 GiB), and kept the last one's buffers in quarantine (up to
+  96 MiB of direct memory) forever. One device now lives for the whole process; when its last
+  user goes, the GPU has finished, the quarantine is released, and the boot trace says how much
+  is still allocated.
+
+The boot trace now has a `memory before booting` and `memory after the program` line (C heap in
+use, flexible memory free, the largest free block of direct memory), and the last session's
+`gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
+new log over it).
+
 If Vulkan doesn't start (RADV can't open the GPU), the launcher keeps that boot's log as
 `log-vulkan.txt` and boots the program again with the software renderer, which it then keeps
 using until it is restarted. RADV's own log is in `/data/eden-ps4/gpu/radv-ps4.log` (with
@@ -408,7 +440,7 @@ the Switch's (`src/ui/`, since 03.20):
   art.
 - **The round buttons** below: **News** (what's new, how to report problems), **Games and Keys**
   (whether `prod.keys`, `title.keys` and the firmware are where they should be, the games found,
-  and where things go), **Controllers** (the PS4 buttons each Switch button is, and Test Input
+  where things go, and Import from USB), **Controllers** (the PS4 buttons each Switch button is, and Test Input
   Devices: the controller test), **System Settings** (Themes: Basic Black or Basic White; Graphics:
   Vulkan on the PS4's GPU or the software renderer, and which one is in use, and the resolution
   games render at, 100%, 75% or 50% of the console mode's; Console: handheld, 1280x720, the
@@ -702,3 +734,5 @@ and reads the controller, without a screen, speakers or a controller:
 - `EDEN_PS4_INPUT="<seconds>:<buttons>,..."` presses player 1's buttons, e.g.
   `"3:A,3.2:,5:Right,6:"` (`Stop` for the buttons stops the program, as L3 + R3 on the PS4)
 - `EDEN_PS4_LOG=<filter>` sets Eden's log filter, e.g. `"*:Info Service.VI:Debug"`
+- `EDEN_PS4_BOOTS=<n>` boots it n times in one process, as the PS4's HOME menu runs one program
+  after another, and prints the heap in use after each (what a run leaves behind)

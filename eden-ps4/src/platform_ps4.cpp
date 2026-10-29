@@ -20,6 +20,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -42,6 +43,7 @@
 #include "ui/canvas.h"
 #include "ui/home_menu.h"
 #include "ui/nro.h"
+#include "usb_import.h"
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes
 // (as in port/ps4_runtime.cpp).
@@ -69,6 +71,9 @@ int sceSystemServiceLoadExec(const char* path, char* const argv[]);
 void ps4_set_app_cores(uint64_t mask);
 // port/ps4_runtime.cpp: direct memory the C heap's overflow leaves for the GPU
 void ps4_heap_set_overflow_gpu_reserve(size_t bytes);
+// port/ps4_runtime.cpp: the C heap's bytes in use, and its size
+void ps4_heap_usage(size_t* in_use, size_t* size);
+int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
 void ps4_dump_thread_stacks(const char* path, const char* reason);
 }
@@ -882,13 +887,14 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
 }
 
 // The Games and Keys screen: the keys, the firmware and the games found
-std::vector<Ui::StatusRow> GamesStatus(const std::vector<Ui::Title>& titles)
+std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
 {
     std::vector<Ui::StatusRow> rows;
     std::error_code ec;
     const bool keys = std::filesystem::exists(kKeysFile, ec);
     rows.push_back({"Keys (prod.keys)", keys ? fmt::format("Found: {}", kKeysFile)
-                                             : fmt::format("Not found: copy it to {}", kKeysFile), keys});
+                                             : fmt::format("Not found: Import from USB, or copy it to {}", kKeysFile),
+                    keys});
     const bool title_keys = std::filesystem::exists(kTitleKeysFile, ec);
     rows.push_back({"Title keys (title.keys)",
                     title_keys ? fmt::format("Found: {}", kTitleKeysFile)
@@ -898,9 +904,15 @@ std::vector<Ui::StatusRow> GamesStatus(const std::vector<Ui::Title>& titles)
     for (std::filesystem::directory_iterator it(kFirmwareDir, ec), end; !ec && it != end; it.increment(ec))
         firmware++;
     rows.push_back({"Firmware", firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
-                                         : fmt::format("None in {}: copy your Switch's firmware (.nca files) there",
+                                         : fmt::format("None in {}: Import from USB, or copy your Switch's firmware "
+                                                       "(.nca files) there",
                                                        kFirmwareDir),
                     firmware > 0});
+    return rows;
+}
+
+Ui::StatusRow SoftwareStatus(const std::vector<Ui::Title>& titles)
+{
     size_t games = 0, on_usb = 0, homebrew = 0;
     for (const Ui::Title& title : titles)
     {
@@ -916,33 +928,72 @@ std::vector<Ui::StatusRow> GamesStatus(const std::vector<Ui::Title>& titles)
             homebrew++;
         }
     }
-    rows.push_back({"Software",
-                    fmt::format("{} game{} ({} on USB drives) and {} homebrew program{}", games, games == 1 ? "" : "s",
-                                on_usb, homebrew, homebrew == 1 ? "" : "s"),
-                    games + homebrew > 0});
-    return rows;
+    return {"Software",
+            fmt::format("{} game{} ({} on USB drives) and {} homebrew program{}", games, games == 1 ? "" : "s", on_usb,
+                        homebrew, homebrew == 1 ? "" : "s"),
+            games + homebrew > 0};
+}
+
+constexpr const char* kGamesHelp =
+    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or at the top of a USB drive (exFAT or FAT32). A "
+    "game needs the keys and firmware of the Switch it was dumped from: put prod.keys and title.keys at the top of a "
+    "USB drive (or in its switch folder) and the firmware's .nca files in a folder on it, then Import from USB.";
+
+// Import from USB (Games and Keys): the copy runs on its own thread, its progress in a message
+struct UsbImportJob
+{
+    std::thread thread;
+    std::atomic<bool> done{false};
+    std::atomic<size_t> copied{0}, total{0};
+    Launcher::UsbImport result;
+};
+
+std::string UsbImportReport(const Launcher::UsbImport& r)
+{
+    if (r.keys_folder.empty() && r.firmware_folder.empty())
+        return "No prod.keys and no firmware on a USB drive. Put prod.keys and title.keys at the top of the drive (or "
+               "in its switch folder), and the firmware's .nca files in a folder on it (Firmware 19.0.1, say). The "
+               "drive must be exFAT or FAT32.";
+    std::string text;
+    if (!r.keys_folder.empty())
+        text += fmt::format("prod.keys{} from {}.\n", r.title_keys ? " and title.keys" : "", r.keys_folder);
+    else
+        text += "No prod.keys found (only the firmware was copied).\n";
+    if (!r.firmware_folder.empty())
+        text += fmt::format("{} firmware files from {} (the firmware that was there was replaced).\n",
+                            r.firmware_files, r.firmware_folder);
+    else
+        text += "No firmware found (a folder of .nca files).\n";
+    if (!r.error.empty())
+        text += "Stopped: " + r.error + ".";
+    return text;
 }
 
 std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
-         "A HOME menu laid out as the Switch's. Your software is in the row, the most recently played first, and "
-         "All Software at its end has everything. Below: News, Games and Keys (what's found, and where things go), "
-         "Controllers, System Settings (theme, renderer, console mode) and Power. OPTIONS on a title shows where it "
-         "is."},
+         "One program after another: the first console run crashed when a second program started, because each "
+         "program left about 66 MiB behind (Eden's emulated threads kept their stacks) and the GPU driver kept a "
+         "device per program. Both are fixed, and stopping a program on Vulkan no longer uses freed memory.\n"
+         "Keys and firmware from a USB drive: Games and Keys, Import from USB (Square)."},
         {"Games",
-         "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive, with the keys and firmware of the "
-         "Switch they were dumped from (Games and Keys says where). A game's icon and name appear once it has booted "
-         "once."},
+         "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive. They need the keys and firmware of "
+         "the Switch they were dumped from: put prod.keys and title.keys at the top of a USB drive (or in its switch "
+         "folder) and the firmware's .nca files in a folder on it, then Import from USB in Games and Keys. A game's "
+         "icon and name appear once it has booted once."},
+        {"The HOME menu",
+         "Your software is in the row, the most recently played first, and All Software at its end has everything. "
+         "Below: News, Games and Keys (what's found, and where things go), Controllers, System Settings (theme, "
+         "renderer, resolution, shader cache, CPU, console mode) and Power. OPTIONS on a title shows where it is."},
         {"The PS4's GPU",
          "Games are drawn with the PS4's GPU through Mesa's RADV. If Vulkan doesn't start, the software renderer "
          "takes over (System Settings, Graphics, says so) and log-vulkan.txt and gpu/radv-ps4.log in /data/eden-ps4 "
          "say why."},
         {"If something goes wrong",
          "In a game, L3 + R3 held for a second stops it. If it froze, hang.log has where its threads were; if it "
-         "crashed, this menu shows its report when it comes back. Send log.txt, crash.log, hang.log and "
-         "gpu/radv-ps4.log from /data/eden-ps4."},
+         "crashed, this menu shows its report when it comes back. Send boot-trace.log, log.txt, crash.log, hang.log "
+         "and gpu/radv-ps4.log (radv-ps4-previous.log after a crash) from /data/eden-ps4."},
     };
 }
 
@@ -1014,15 +1065,19 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     if (first)
         OpenPad();
     std::vector<Ui::Title> titles = LoadTitles();
-    menu.SetGamesStatus(GamesStatus(titles), "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or at "
-                                             "the top of a USB drive (FTP, or a USB drive formatted exFAT). A game "
-                                             "needs the keys and firmware of the Switch it was dumped from.");
+    const Ui::StatusRow software_status = SoftwareStatus(titles);
+    const auto set_games_status = [&] {
+        std::vector<Ui::StatusRow> rows = KeysAndFirmwareStatus();
+        rows.push_back(software_status);
+        menu.SetGamesStatus(std::move(rows), kGamesHelp);
+        std::error_code ec;
+        menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec));
+    };
+    set_games_status();
     const size_t count = titles.size();
     menu.SetTitles(std::move(titles));
     menu.SetSettings(settings);
     menu.SetInfo(EDEN_PS4_VERSION, g_renderer_label, radv);
-    std::error_code ec;
-    menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec));
     menu.SetNews(News());
     menu.SetControllerTest("/app0/padtest.nro");
     if (unfinished)
@@ -1030,6 +1085,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     Trace(fmt::format("start page: last run {}, pad {}, {} programs", unfinished ? "unfinished" : "finished or none",
                       g_pad, count));
 
+    static std::unique_ptr<UsbImportJob> import_job; // (none while a program runs: a boot waits for it)
     menu.SetHeld(MenuButtons(MenuPad())); // (a button still held from the game doesn't count)
     const double start = Seconds();
     const int countdown = 60;
@@ -1048,7 +1104,41 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                 break;
         }
         const Ui::MenuAction action = menu.Update(MenuButtons(pad), now);
-        if (action.kind == Ui::MenuAction::Kind::Boot)
+        if (action.kind == Ui::MenuAction::Kind::ImportUsb && !import_job)
+        {
+            Trace("start page: importing keys and firmware from USB");
+            menu.ShowMessage("Import from USB", "Looking for prod.keys, title.keys and firmware on the USB drives...");
+            import_job = std::make_unique<UsbImportJob>();
+            import_job->thread = std::thread([job = import_job.get()] {
+                std::vector<std::string> drives;
+                for (int i = 0; i < 8; i++)
+                    drives.push_back(fmt::format("/mnt/usb{}", i));
+                job->result = Launcher::ImportFromUsb(drives, std::string(kDataDir) + "/user",
+                                                      [job](size_t copied, size_t total) {
+                                                          job->total = total;
+                                                          job->copied = copied;
+                                                      });
+                job->done = true;
+            });
+        }
+        if (import_job && import_job->done)
+        {
+            import_job->thread.join();
+            const std::string report = UsbImportReport(import_job->result);
+            Trace("start page: USB import: " + report);
+            if (!menu.UpdateMessage("Import from USB", report))
+                menu.ShowMessage("Import from USB", report);
+            set_games_status();
+            import_job.reset();
+        }
+        else if (import_job && import_job->total)
+        {
+            menu.UpdateMessage("Import from USB", fmt::format("Copying the firmware: {} of {} files...",
+                                                              import_job->copied.load(), import_job->total.load()));
+        }
+        if (action.kind == Ui::MenuAction::Kind::Boot && import_job)
+            menu.ShowMessage("Import from USB", "Still copying: start it again once the import is done.");
+        if (action.kind == Ui::MenuAction::Kind::Boot && !import_job)
         {
             choice.program = action.path;
             break;
@@ -1222,6 +1312,18 @@ private:
     std::thread thread;
 };
 
+// The C heap, flexible and direct memory, in the boot trace: what a program left behind shows
+// up as the next one starts (the first console run ran out after two programs)
+void MemoryTrace(const char* when)
+{
+    size_t in_use = 0, size = 0, flexible = 0;
+    ps4_heap_usage(&in_use, &size);
+    sceKernelAvailableFlexibleMemorySize(&flexible);
+    Trace(fmt::format("memory {}: C heap {} of {} MiB in use, {} MiB of flexible memory free, largest free "
+                      "block of direct memory {} MiB",
+                      when, in_use / MB, size / MB, flexible / MB, Common::PS4Diagnostics::LargestFreeDirect() / MB));
+}
+
 // EDEN_PS4_HEAP_TEST=<MiB> in settings.txt: with 4 GiB of direct memory taken first (as the
 // Switch's RAM will be) and RADV's reserve set, the C heap grows by that much (8 MiB blocks), to
 // see where its overflow heaps come from (boot-trace.log); everything is then given back.
@@ -1265,6 +1367,11 @@ void* Run(void*)
     setenv("EDEN_SW_STATS", "1", 0);
     setenv("EDEN_SW_THREADS", "4", 0);
     Launcher::SetAudio(MakeAudioOutput);
+    // RADV's own log and its GPU hang and fault reports (port/mesa/ac_ps4_drm.c), here (the last
+    // session's log kept: it starts a new one, and a crash restarts the app)
+    setenv("RADV_PS4_DIR", (std::string(kDataDir) + "/gpu").c_str(), 0);
+    rename((std::string(kDataDir) + "/gpu/radv-ps4.log").c_str(),
+           (std::string(kDataDir) + "/gpu/radv-ps4-previous.log").c_str());
     // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless System Settings
     // (or settings.txt, EDEN_PS4_RENDERER=null) chose the software renderer, or Vulkan didn't
     // start this session
@@ -1272,8 +1379,6 @@ void* Run(void*)
     const bool radv = vk_icdGetInstanceProcAddr(nullptr, "vkCreateInstance") != nullptr;
     const bool forced_null = renderer && std::string_view{renderer} == "null";
     bool vulkan_failed = false;
-    // RADV's own log and its GPU hang and fault reports (port/mesa/ac_ps4_drm.c), here
-    setenv("RADV_PS4_DIR", (std::string(kDataDir) + "/gpu").c_str(), 0);
     Ui::MenuSettings settings = LoadMenuSettings();
     const auto choose_renderer = [&] {
         const bool use_gpu = radv && !forced_null && !settings.software_renderer && !vulkan_failed;
@@ -1322,6 +1427,7 @@ void* Run(void*)
         // The C heap's overflow (once its 384 MiB are full) leaves direct memory to the GPU: the
         // Switch's 4 GiB leave about 480 MiB of it, and RADV needs most of what's left
         ps4_heap_set_overflow_gpu_reserve((gpu ? 256 : 32) * MB);
+        MemoryTrace("before booting");
         HangWatchdog watchdog;
         watchdog.Start(program);
         auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
@@ -1349,6 +1455,7 @@ void* Run(void*)
             result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
             watchdog.Stop();
         }
+        MemoryTrace("after the program");
         g_running = false;
         pthread_join(pad_thread, nullptr);
         g_drawing = false;
