@@ -377,6 +377,15 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.51: **every program that plays sound was killed on a console** as it opened its audio output:
+the launcher never loaded the AudioOut system module (Crema's list has it), and a PS4 kills an app
+that calls into a library whose module isn't loaded, without a signal, so without a crash log.
+shadPS4 doesn't care. Breakout (03.30) and Blocks (03.50) died that way, a few seconds in; the
+controller and GPU tests, silent, ran. The boot trace now also says when the heap has to grow, for
+what size, on which thread and from where (code addresses: symbolize them with the build's ELF).
+The first console runs grew it past 540 MiB in a test program, where the desktop and shadPS4 use a
+fraction of that.
+
 Bugs found in 03.50 (an AddressSanitizer build of the desktop launcher, `test.sh` under load):
 - **A program's exit could free its GPU address space under the GPU thread** (patch 0050). The
   address space device owned its memory manager alone and channels had a raw pointer; a program

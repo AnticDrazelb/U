@@ -68,6 +68,7 @@ void* memcpy(void* dst, const void* src, size_t n);
 
 // port/ps4_crashlog.cpp (weak: a program may link without it).
 __attribute__((weak)) void ps4_boot_trace(const char* stage);
+__attribute__((weak)) void ps4_trace_callers(const char* what);  // port/ps4_crashlog.cpp
 int ps4_heap_ok(void* msp);  // port/ps4_dlmalloc.c
 
 extern char __text_start[];  // OpenOrbis link.x: start of .text (ELF address 0)
@@ -248,6 +249,12 @@ inline mspace getHeap() {
 extern "C" int32_t ps4QueryDirectMemory(off_t start, off_t end, size_t align, off_t* physOut, size_t* sizeOut)
     asm("sceKernelAvailableDirectMemorySize");
 
+// The current allocation's operation and caller (the wrappers set them), and the thread's name, for
+// reports
+__attribute__((tls_model("initial-exec"))) thread_local char t_threadName[32] = "";  // as it named itself
+__attribute__((tls_model("initial-exec"))) thread_local const char* t_op = "?";
+__attribute__((tls_model("initial-exec"))) thread_local const void* t_caller = nullptr;
+
 // Overflow heaps: mapped when the main heap can't serve a request. Spider-Man 2 fills most of the
 // 512 MiB main heap; a save state then needed one 99 MiB block (148 MiB in Mario Kart: Double
 // Dash!!), the allocation failed and the app crashed. With FOOTERS, free and realloc find each
@@ -347,6 +354,13 @@ void* overflowAlloc(size_t need, F alloc) {
     for (int i = count; i < g_overflowCount && !result; i++)
         result = alloc(g_overflows[i].msp);
     if (!result && g_overflowGpuReserve) {
+        // Who makes the heap grow, in the boot trace (the first console runs grew it past 540 MiB
+        // in a test program, which uses a fraction of that elsewhere)
+        char what[128];
+        snprintf(what, sizeof(what), "[cemu] heap: full, growing for %s(%zu KiB) on thread '%s'", t_op, need / 1024,
+                 t_threadName);
+        if (ps4_trace_callers)
+            ps4_trace_callers(what);
         // Room for the request and dlmalloc's own bookkeeping: at least 32 MiB.
         const size_t step = need > 29 * MB ? (need + 3 * MB + 2 * MB - 1) & ~(2 * MB - 1) : 32 * MB;
         if (g_overflowCount >= MAX_OVERFLOW_HEAPS)
@@ -385,8 +399,6 @@ bool ownsPointer(const void* p) {
 
 // The operation in progress, for error reports (thread-local: allocations happen on any thread).
 // initial-exec: the executable's own TLS, so access never goes through __tls_get_addr.
-__attribute__((tls_model("initial-exec"))) thread_local const char* t_op = "?";
-__attribute__((tls_model("initial-exec"))) thread_local const void* t_caller = nullptr;
 int g_errors = 0;
 
 // Per-thread arenas. One locked heap made Dolphin's busy threads (CPU, video, Vulkan submission,
@@ -617,6 +629,10 @@ void ps4_heap_private_arena(const char* name) {
                                        "LatteThread", "compilePl", "vkShaderComp", "plCacheCompiler",
                                        "vkDriverPlCache", "fileCache", "PS4AudioOut", "H264Decoder",
                                        "CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3", "CPUThread", "GPU"};
+    if (name) {
+        strncpy(t_threadName, name, sizeof(t_threadName) - 1);
+        t_threadName[sizeof(t_threadName) - 1] = 0;
+    }
     if (t_arena || !name || !getHeap())
         return;
     bool wanted = false;

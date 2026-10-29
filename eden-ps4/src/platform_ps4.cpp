@@ -401,9 +401,12 @@ Screen g_screen;
 // port/ps4_net.cpp.)
 void LoadSystemModules()
 {
+    // (AudioOut was missing until 03.51: every program that played sound, Breakout and Blocks,
+    // was killed without a trace as it opened its audio output on a console; shadPS4 doesn't care)
     const std::pair<const char*, uint32_t> modules[] = {{"SystemService", 0x80000010},
                                                         {"UserService", 0x80000011},
                                                         {"VideoOut", 0x80000022},
+                                                        {"AudioOut", 0x80000001},
                                                         {"Pad", 0x80000024},
                                                         {"Net", 0x8000001C}};
     for (const auto& [name, id] : modules)
@@ -562,7 +565,9 @@ public:
     {
         if (channels != 2)
             return false;
-        // 0x8026000E: already initialized
+        // 0x8026000E: already initialized. (The step first: a console kills the app without a trace
+        // if libSceAudioOut's module isn't loaded, as until 03.51)
+        Trace(fmt::format("audio: opening ({} frames)", frames));
         static const int32_t init = sceAudioOutInit();
         if (init != 0 && init != int32_t(0x8026000E))
         {
@@ -978,7 +983,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
-         "Faster on the PS4's CPU: reads of memory the GPU caches no longer take a slow path (without "
+         "Sound: Breakout and Blocks were closed by the console as they started, because the app never "
+         "loaded the PS4's audio module. Fixed.\n"
+         "From 03.50: faster on the PS4's CPU: reads of memory the GPU caches no longer take a slow path (without "
          "fastmem every one could wait for the GPU), GPU macros are compiled instead of interpreted, the "
          "emulated CPU cores and the GPU thread now come before logging and shader compiling, and the "
          "code caches went to the cores games run on.\n"
