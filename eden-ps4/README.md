@@ -305,6 +305,11 @@ Two ways it shows:
   GPU test shows the storage image again as a 16x16 texture of 2x2 samples, each pixel's bottom
   right: as Eden's Vulkan renderer draws it); and varyings are interpolated after the early depth
   test, not for blocks it rejects (4% on the 3D test).
+- **Vertices shaded once, 16 at a time** (patch 0042): a draw's distinct vertices are shaded once
+  each (an indexed mesh uses each about six times), 16 at a time so vertex programs run in native
+  code too, and each one's window coordinates and clip planes are worked out once for all its
+  triangles. The GPU test's X turns on a vertex stress test (16 indexed meshes of 4225 vertices,
+  each transformed by a matrix in a constant buffer): 5 to 17 frames a second on the desktop.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -491,6 +496,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: storage images and texel buffers in software shaders | above |
 | null renderer: software shaders compiled to native code | above |
 | null renderer: multisampled texel fetches, varyings after the depth test, a native code self-test | above |
+| null renderer: software vertex shaders 16 vertices at a time, each distinct vertex once | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

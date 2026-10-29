@@ -27,7 +27,9 @@
 // restart and a point's coordinates.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100). B turns on another, as 3D games draw: 12 large
-// quads, lit per pixel, textured, depth-tested.
+// quads, lit per pixel, textured, depth-tested. X turns on a third, of vertices: 16 indexed meshes
+// of 64x64 quads (4225 vertices, 24576 indices each), each transformed by a matrix in a constant
+// buffer, drawn small.
 
 #include <math.h>
 #include <stdbool.h>
@@ -82,6 +84,8 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M_TEX_HEADER_POOL 0x55D    // address (2), last index
 #define M_CONST_BUFFER 0x8E0       // size, address (2): the buffer the next bind binds
 #define M_BIND_FRAGMENT_CBUF 0x924 // valid | slot << 4, for the fragment stage (bind group 4)
+#define M_BIND_VERTEX_CBUF 0x904   // the same, for the vertex stage (bind group 0)
+#define M_INDEX_BUFFER 0x5F2       // address (2), limit (2), format (2: 32-bit), first, count
 #define M_TEXTURE_CBUF_SLOT 0x982  // the constant buffer holding texture handles
 #define M_BLEND 0x4CF              // separate alpha, colour op, source, dest, alpha op, source, -, dest
 #define M_BLEND_ENABLE 0x4D8       // one word per render target
@@ -272,6 +276,13 @@ static u64 tld2d_ms(u32 dest, u32 coord, u32 sample, u32 handle_offset) {
            (u64)(handle_offset / 4) << 36 | 0xFull << 31 | 2ull << 28 /* 2D */ | (u64)sample << 20 | PT |
            (u64)coord << 8 | dest;
 }
+// FMUL Rdest, Ra, c[bank][offset]; FFMA Rdest, Ra, c[bank][offset], Rc
+static u64 fmul_cbuf(u32 dest, u32 a, u32 bank, u32 offset) {
+    return 0x4C68ull << 48 | (u64)bank << 34 | (u64)(offset / 4) << 20 | PT | (u64)a << 8 | dest;
+}
+static u64 ffma_cbuf(u32 dest, u32 a, u32 bank, u32 offset, u32 c) {
+    return 0x4980ull << 48 | (u64)c << 39 | (u64)bank << 34 | (u64)(offset / 4) << 20 | PT | (u64)a << 8 | dest;
+}
 #define SCHED 0x001F8000FC0007E0ull // a scheduling word (before every three instructions)
 
 // The shader programs, in a GPU buffer: each a 0x50-byte header (SPH) and its code, placed so
@@ -297,6 +308,8 @@ static u64 tld2d_ms(u32 dest, u32 coord, u32 sample, u32 handle_offset) {
 #define QMD_IMAGE_OFFSET 0x7200 // its launch description
 #define TEXEL_BUFFER_OFFSET 0x7300 // its texel buffer: 8 colours, RGBA32F
 #define FS_MSAA_OFFSET 0x7610 // sample 3 of each pixel of the storage image as a 2x2 multisampled texture
+#define VS_MESH_OFFSET 0x7A10 // the vertex stress test's: position times a matrix (constant buffer 1)
+#define MESH_CBUF(i, d) (0x8000 + ((i) * 16 + (d)) * 64) // each mesh draw's matrix, by command buffer
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -478,6 +491,24 @@ static void write_programs(u8* heap) {
     u64* fm = (u64*)(heap + FS_MSAA_OFFSET + 0x50);
     for (size_t i = 0, k = 0; i < sizeof(msaa_code) / sizeof(msaa_code[0]); k++) {
         fm[k] = k % 4 == 0 ? SCHED : msaa_code[i++];
+    }
+
+    // the vertex stress test's: attribute 0 times the 4x4 matrix in constant buffer 1 (rows), the
+    // colour (attribute 1) passed on
+    u32* vm_sph = (u32*)(heap + VS_MESH_OFFSET);
+    memcpy(vm_sph, vs_sph, 0x50);
+    const u64 mesh_code[] = {
+        ald128(0, 0x80), ald128(4, 0x90), fmul_cbuf(8, 0, 1, 0x00),
+        ffma_cbuf(8, 1, 1, 0x04, 8), ffma_cbuf(8, 2, 1, 0x08, 8), ffma_cbuf(8, 3, 1, 0x0C, 8),
+        fmul_cbuf(9, 0, 1, 0x10), ffma_cbuf(9, 1, 1, 0x14, 9), ffma_cbuf(9, 2, 1, 0x18, 9),
+        ffma_cbuf(9, 3, 1, 0x1C, 9), fmul_cbuf(10, 0, 1, 0x20), ffma_cbuf(10, 1, 1, 0x24, 10),
+        ffma_cbuf(10, 2, 1, 0x28, 10), ffma_cbuf(10, 3, 1, 0x2C, 10), fmul_cbuf(11, 0, 1, 0x30),
+        ffma_cbuf(11, 1, 1, 0x34, 11), ffma_cbuf(11, 2, 1, 0x38, 11), ffma_cbuf(11, 3, 1, 0x3C, 11),
+        ast128(0x70, 8), ast128(0x80, 4), exit_(),
+    };
+    u64* vm = (u64*)(heap + VS_MESH_OFFSET + 0x50);
+    for (size_t i = 0, k = 0; i < sizeof(mesh_code) / sizeof(mesh_code[0]); k++) {
+        vm[k] = k % 4 == 0 ? SCHED : mesh_code[i++];
     }
 
     // the storage image's: workgroups of 8x8, each invocation at x, y of a 32x32 image; its colour
@@ -962,8 +993,40 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "gputest: sprite vertices: %#x\n", rc);
         return 1;
     }
+    // The vertex stress test's mesh: 65x65 vertices (position, colour) on [-1, 1], then its
+    // indices (two triangles a quad, 32-bit)
+#define MESH_SIDE 64
+#define MESH_VERTICES ((MESH_SIDE + 1) * (MESH_SIDE + 1))
+#define MESH_INDICES (MESH_SIDE * MESH_SIDE * 6)
+#define MESH_BYTES 0x40000
+    u8* mesh = aligned_alloc(0x1000, MESH_BYTES);
+    NvMap mesh_map;
+    iova_t mesh_iova = 0;
+    if (!mesh || R_FAILED(rc = nvMapCreate(&mesh_map, mesh, MESH_BYTES, 0x1000, NvKind_Pitch, true)) ||
+        R_FAILED(rc = nvAddressSpaceMap(&as, nvMapGetHandle(&mesh_map), true, NvKind_Pitch, &mesh_iova))) {
+        fprintf(stderr, "gputest: mesh: %#x\n", rc);
+        return 1;
+    }
+    {
+        float* mv = (float*)mesh;
+        for (int y = 0; y <= MESH_SIDE; y++)
+            for (int x = 0; x <= MESH_SIDE; x++) {
+                float* p = mv + (y * (MESH_SIDE + 1) + x) * 8;
+                p[0] = (float)x / MESH_SIDE * 2.0f - 1.0f, p[1] = (float)y / MESH_SIDE * 2.0f - 1.0f;
+                p[2] = 0.0f, p[3] = 1.0f;
+                p[4] = (float)x / MESH_SIDE, p[5] = (float)y / MESH_SIDE, p[6] = (float)((x ^ y) & 7) / 7.0f, p[7] = 1.0f;
+            }
+        u32* mi = (u32*)(mesh + MESH_VERTICES * 32);
+        for (int y = 0, k = 0; y < MESH_SIDE; y++)
+            for (int x = 0; x < MESH_SIDE; x++) {
+                const u32 a = (u32)(y * (MESH_SIDE + 1) + x), b = a + 1, c = a + MESH_SIDE + 1, d = c + 1;
+                mi[k++] = a, mi[k++] = b, mi[k++] = c, mi[k++] = b, mi[k++] = d, mi[k++] = c;
+            }
+        armDCacheFlush(mesh, MESH_BYTES);
+    }
     bool stress = false;
     bool stress_3d = false; // B: 12 large lit, textured, depth-tested quads
+    bool stress_vertices = false; // X: 16 meshes of 4225 vertices
     int stress_sprites = 400;
     {   // the storage buffer (a cyan), its address and size in the constant buffer
         const float colour[4] = {0.1f, 0.9f, 0.95f, 1.0f};
@@ -1018,6 +1081,10 @@ int main(int argc, char* argv[]) {
         if (down & HidNpadButton_B) {
             stress_3d = !stress_3d;
             fprintf(stderr, "gputest: 3D stress test %s\n", stress_3d ? "on" : "off");
+        }
+        if (down & HidNpadButton_X) {
+            stress_vertices = !stress_vertices;
+            fprintf(stderr, "gputest: vertex stress test %s\n", stress_vertices ? "on" : "off");
         }
         if (down & (HidNpadButton_Up | HidNpadButton_Down)) {
             stress_sprites += (down & HidNpadButton_Up) ? 100 : -100;
@@ -1700,6 +1767,41 @@ int main(int argc, char* argv[]) {
             method1(M_DEPTH_TEST_ENABLE, 0);
             method1(M_DEPTH_WRITE_ENABLE, 0);
         }
+        // the vertex stress test: 16 meshes, 4x4 at the bottom left, each turning, scaled to 60x44
+        // pixels by its matrix (constant buffer 1 of the vertex stage), an indexed draw of 24576
+        // indices
+        if (stress_vertices) {
+            const int index = (int)(g_cmd - cmds);
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_MESH_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(mesh_iova >> 32), (u32)mesh_iova, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = mesh_iova + MESH_VERTICES * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const iova_t mesh_indices = mesh_iova + MESH_VERTICES * 32;
+            const iova_t indices_last = mesh_indices + MESH_INDICES * 4 - 1;
+            for (int d = 0; d < 16; d++) {
+                const float angle = (float)frame * 0.02f + (float)d * 0.4f, c = cosf(angle), sn = sinf(angle);
+                const float sx = 30.0f / (W / 2.0f), sy = 22.0f / (H / 2.0f);
+                const float tx = -0.95f + sx + (float)(d % 4) * 2.2f * sx, ty = -0.3f + sy + (float)(d / 4) * 2.2f * sy;
+                float* m = (float*)(heap + MESH_CBUF(index, d));
+                const float rows[16] = {c * sx, -sn * sx, 0.0f, tx, sn * sy, c * sy, 0.0f, ty,
+                                        0.0f, 0.0f, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f};
+                memcpy(m, rows, sizeof(rows));
+                const iova_t cbuf = heap_iova + MESH_CBUF(index, d);
+                const u32 bind[3] = {64, (u32)(cbuf >> 32), (u32)cbuf};
+                method(M_CONST_BUFFER, 3, bind);
+                method1(M_BIND_VERTEX_CBUF, 1 | 1 << 4);
+                const u32 ib[7] = {(u32)(mesh_indices >> 32), (u32)mesh_indices, (u32)(indices_last >> 32),
+                                   (u32)indices_last, 2 /* 32-bit */, 0, MESH_INDICES};
+                method(M_INDEX_BUFFER, 7, ib);
+                method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLES);
+                method1(M_DRAW_END, 0);
+            }
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_OFFSET);
+        }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
 
@@ -1731,9 +1833,10 @@ int main(int argc, char* argv[]) {
             fps = (int)fps_frames;
             fps_frames = 0;
             fps_tick = now;
-            if (frame < 200 || frame % 600 < 60 || stress || stress_3d)
-                fprintf(stderr, "gputest: %d fps, %u command words a frame%s%s\n", fps, g_cmd->used,
-                        stress ? " (stress test)" : "", stress_3d ? " (3D stress test)" : "");
+            if (frame < 200 || frame % 600 < 60 || stress || stress_3d || stress_vertices)
+                fprintf(stderr, "gputest: %d fps, %u command words a frame%s%s%s\n", fps, g_cmd->used,
+                        stress ? " (stress test)" : "", stress_3d ? " (3D stress test)" : "",
+                        stress_vertices ? " (vertex stress test)" : "");
         }
     }
 

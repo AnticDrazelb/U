@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 04:37:28 +0000
+Subject: [PATCH] null renderer: software vertex shaders 16 vertices at a time,
+ each distinct vertex once
+
+A draw's distinct vertices (an indexed mesh uses each several times) are shaded once each, 16
+at a time, so vertex programs run wide and in native code; each one's window coordinates and
+clip planes are worked out once for all its triangles. Vertex attributes are read in place when
+their stream is one range of memory. Window coordinates are rounded without lround's call.
+
+A fragment shader's colour write while some lanes have left earlier (none waiting) writes only
+the lanes running it, in the interpreter and native code; native code also stores vertex
+outputs (SetAttribute) for the lanes run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ .../renderer_null/software_draw.cpp           | 243 ++++++++++++++----
+ 1 file changed, 186 insertions(+), 57 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 49dd864b3..2746dcfd8 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -3017,7 +3017,7 @@ template <bool Wide>
+         break;
+     case O::SetFragColor: {
+         f32* const out = io.colors + (((o.extra / 4) & 7) * 4 + o.extra % 4) * io.stride + io.lane;
+-        if (waiting) {
++        if (exec != (1u << n) - 1) { // only the lanes run (those that left earlier keep theirs)
+             EXEC_LOOP(exec) out[i] = Fl(e, i);
+         } else {
+             std::memcpy(out, e.w[0], n * sizeof(u32));
+@@ -3501,14 +3501,22 @@ u32 ReadCbufNative(const Io* io, u32 index, u32 byte_offset) {
+ using NativeFn = void (*)(Lanes* c, Io* io, u32 exec);
+ 
+ /// Vectors native code reads, four of each: sign bits, all but them, 1.0, 0, 1, all bits,
+-/// 65536.0, the low 16 bits
+-alignas(16) constexpr u32 JIT_CONSTANTS[8][4] = {
+-    {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u}, {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu},
+-    {0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u}, {0, 0, 0, 0},
+-    {1, 1, 1, 1}, {~0u, ~0u, ~0u, ~0u},
+-    {0x47800000u, 0x47800000u, 0x47800000u, 0x47800000u}, {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
+-};
+-enum JitConstant { SIGN, ABS, ONE, ZERO, ONE_INT, ALL_ONES, F65536, LOW16 };
++/// 65536.0, the low 16 bits; then four lanes' masks for each four bits of a lane mask
++alignas(16) constexpr std::array<std::array<u32, 4>, 24> JIT_CONSTANTS = [] {
++    std::array<std::array<u32, 4>, 24> c{{
++        {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u}, {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu},
++        {0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u}, {0, 0, 0, 0},
++        {1, 1, 1, 1}, {~0u, ~0u, ~0u, ~0u},
++        {0x47800000u, 0x47800000u, 0x47800000u, 0x47800000u}, {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
++    }};
++    for (u32 bits = 0; bits < 16; ++bits) {
++        for (u32 lane = 0; lane < 4; ++lane) {
++            c[8 + bits][lane] = (bits >> lane) & 1 ? ~0u : 0u;
++        }
++    }
++    return c;
++}();
++enum JitConstant { SIGN, ABS, ONE, ZERO, ONE_INT, ALL_ONES, F65536, LOW16, LANE_MASKS };
+ 
+ /// What native code does with an instruction
+ enum class JitUse {
+@@ -3574,7 +3582,7 @@ JitUse UseOf(const Op& o, const std::vector<bool>& written) {
+         return o.extra ? JitUse::Lanes : JitUse::Call;
+     case O::ShiftLeftLogical32: case O::ShiftRightLogical32: case O::ShiftRightArithmetic32:
+         return constant(o.a[1]) ? JitUse::Lanes : JitUse::Call;
+-    case O::GetAttribute: case O::GetAttributeU32: case O::SetFragColor:
++    case O::GetAttribute: case O::GetAttributeU32: case O::SetFragColor: case O::SetAttribute:
+     case O::CompositeConstructU32x2: case O::CompositeConstructU32x3: case O::CompositeConstructU32x4:
+     case O::CompositeConstructF32x2: case O::CompositeConstructF32x3: case O::CompositeConstructF32x4:
+     case O::BitCastU32F32: case O::BitCastF32U32: case O::BitCastU64F64: case O::BitCastF64U64:
+@@ -3617,7 +3625,7 @@ public:
+         mov(rbx, rdi);  // the cells
+         mov(r12, rsi);  // the io
+         mov(r13d, edx); // the lanes run
+-        mov(r14, reinterpret_cast<u64>(&JIT_CONSTANTS[0][0]));
++        mov(r14, reinterpret_cast<u64>(JIT_CONSTANTS.data()));
+         for (u32 pc = first; pc < last;) {
+             const JitUse use = UseOf(ops[pc], written);
+             if (use == JitUse::Call) {
+@@ -3648,9 +3656,17 @@ public:
+             if (lanes) {
+                 mov(r8, ptr[r12 + offsetof(Io, inputs)]);
+                 mov(r9, ptr[r12 + offsetof(Io, colors)]);
++                mov(rdi, ptr[r12 + offsetof(Io, outputs)]);
+                 xor_(r10d, r10d); // the four lanes' offset in a word's sixteen
+                 Xbyak::Label loop;
+                 L(loop);
++                // r11: the four lanes' mask's offset in the constants (for outputs: those run)
++                mov(ecx, r10d);
++                shr(ecx, 2);
++                mov(r11d, r13d);
++                shr(r11d, cl);
++                and_(r11d, 15);
++                shl(r11d, 4);
+                 cache.Reset();
+                 for (u32 i = pc; i < end; ++i) {
+                     if (UseOf(ops[i], written) == JitUse::Lanes) {
+@@ -3747,6 +3763,15 @@ private:
+         cache.used[x.getIdx()] = ++cache.clock;
+     }
+ 
++    /// The lanes run's values stored, the others' kept
++    void StoreRun(const Xbyak::Address& at, const Xbyak::Xmm& x) {
++        using namespace Xbyak::util;
++        vmovups(xmm13, at);
++        vmovaps(xmm14, ptr[r14 + r11 + u32(LANE_MASKS) * 16]);
++        vblendvps(xmm13, xmm13, x, xmm14);
++        vmovups(at, xmm13);
++    }
++
+     void EmitUniform(const Op& o) {
+         using namespace Xbyak::util;
+         const u32 index = program.cells[o.a[0]].w[0], offset = program.cells[o.a[1]].w[0];
+@@ -3848,11 +3873,12 @@ private:
+             Def(o.dest, 0, d);
+             break;
+         }
+-        case O::SetFragColor: {
+-            const Xbyak::Xmm x = Load(o.a[2], 0);
+-            vmovups(ptr[r9 + r10 + (((o.extra / 4) & 7) * 4 + o.extra % 4) * LANES * 4], x);
++        case O::SetFragColor: // (only the lanes run: some may have left with their own)
++            StoreRun(ptr[r9 + r10 + (((o.extra / 4) & 7) * 4 + o.extra % 4) * LANES * 4], Load(o.a[2], 0));
++            break;
++        case O::SetAttribute:
++            StoreRun(ptr[rdi + r10 + (o.extra & 0xFF) * LANES * 4], Load(o.a[1], 0));
+             break;
+-        }
+         case O::CompositeConstructU32x2: case O::CompositeConstructF32x2:
+             copy(0, o.a[0], 0), copy(1, o.a[1], 0);
+             break;
+@@ -4267,7 +4293,7 @@ void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n);
+ void JitSelfTest(ShaderJit& jit) {
+     using O = IR::Opcode;
+     static constexpr O tested[] = {
+-        O::GetAttribute, O::SetFragColor, O::CompositeConstructF32x2, O::CompositeConstructU32x3,
++        O::GetAttribute, O::SetFragColor, O::SetAttribute, O::CompositeConstructF32x2, O::CompositeConstructU32x3,
+         O::CompositeConstructF32x4, O::CompositeExtractF32x4, O::BitCastU32F32, O::BitCastU64F64,
+         O::SelectU32, O::SelectF32, O::SelectU64, O::FPAbs32, O::FPAdd32, O::FPFma32, O::FPMax32,
+         O::FPMin32, O::FPMul32, O::FPNeg32, O::FPRecip32, O::FPRecipSqrt32, O::FPSqrt,
+@@ -4309,6 +4335,7 @@ void JitSelfTest(ShaderJit& jit) {
+     };
+     u32 checked = 0, failures = 0;
+     std::vector<f32> inputs(256 * LANES), colors_native(32 * LANES), colors_interpreted(32 * LANES);
++    std::vector<f32> outputs_native(256 * LANES), outputs_interpreted(256 * LANES);
+     std::array<bool, LANES> discard{};
+     const std::array<std::vector<u32>, 18> cbufs{};
+     for (const O op : tested) {
+@@ -4322,6 +4349,7 @@ void JitSelfTest(ShaderJit& jit) {
+             const u32 extra = op == O::CompositeExtractF32x4 ? 1 + round % 4
+                               : op == O::GetAttribute    ? 40 + round
+                               : op == O::SetFragColor    ? round % 32
++                              : op == O::SetAttribute    ? 32 + round * 7
+                                                          : 0;
+             const bool shift = op == O::ShiftLeftLogical32 || op == O::ShiftRightLogical32 ||
+                                op == O::ShiftRightArithmetic32;
+@@ -4352,12 +4380,18 @@ void JitSelfTest(ShaderJit& jit) {
+             std::vector<Lanes> interpreted_cells = cells;
+             std::fill(colors_native.begin(), colors_native.end(), 0.0f);
+             std::fill(colors_interpreted.begin(), colors_interpreted.end(), 0.0f);
+-            Io io{inputs.data(), nullptr, colors_native.data(), discard.data(), LANES, 0, &cbufs, nullptr, 0,
++            std::fill(outputs_native.begin(), outputs_native.end(), 0.0f);
++            std::fill(outputs_interpreted.begin(), outputs_interpreted.end(), 0.0f);
++            Io io{inputs.data(), outputs_native.data(), colors_native.data(), discard.data(), LANES, 0, &cbufs, nullptr, 0,
+                   nullptr, nullptr, nullptr};
+             io.run = io.live = 0xFFFF;
+             io.quads = true;
+             Io interpreted_io = io;
+             interpreted_io.colors = colors_interpreted.data();
++            interpreted_io.outputs = outputs_interpreted.data();
++            // (some rounds with lanes left out: outputs stored only for those run)
++            const u32 exec = round % 3 == 2 ? 0xA5C3u : 0xFFFFu;
++            io.run = interpreted_io.run = exec;
+             Run(native, cells.data(), io, LANES);
+             Run(program, interpreted_cells.data(), interpreted_io, LANES);
+             bool ok = true;
+@@ -4380,6 +4414,9 @@ void JitSelfTest(ShaderJit& jit) {
+             for (size_t i = 0; i < colors_native.size(); ++i) {
+                 ok &= same(std::bit_cast<u32>(colors_native[i]), std::bit_cast<u32>(colors_interpreted[i]));
+             }
++            for (size_t i = 0; i < outputs_native.size(); ++i) {
++                ok &= same(std::bit_cast<u32>(outputs_native[i]), std::bit_cast<u32>(outputs_interpreted[i]));
++            }
+             failures += ok ? 0 : 1;
+             ++checked;
+         }
+@@ -4864,7 +4901,8 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+         program->shared_bytes = ir.shared_memory_size;
+         program->ok = Flattener{*program, compute}.Run(ir);
+ #ifdef SOFTWARE_JIT
+-        if (program->ok && (ir.stage == Shader::Stage::Fragment || compute)) { // (the stages run 16 lanes wide)
++        if (program->ok && (ir.stage == Shader::Stage::Fragment || ir.stage == Shader::Stage::VertexB ||
++                            compute)) { // (the stages run 16 lanes wide)
+             if (ShaderJit* const jit = ShaderJit::Get()) {
+                 static const bool tested = std::getenv("EDEN_SW_JIT_TEST") && (JitSelfTest(*jit), true);
+                 (void)tested;
+@@ -5966,48 +6004,83 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         }
+     }
+ 
+-    // Vertex shader: once per vertex (and instance)
++    // Vertex shader: each vertex the draw uses once (per instance), 16 at a time
+     std::vector<Lanes> vs_cells;
+     Broadcast(vs->cells, vs_cells);
+-    std::vector<u32> vs_local(vs->local_words + 1);
+-    std::array<f32, 256> inputs{};
+-    std::array<f32, 256> outputs{};
+-    std::array<f32, 8 * 4> vs_colors{};
+-    bool vs_discard = false;
+-    const auto shade_vertex = [&](u32 index, u32 instance, Vertex& out) {
+-        inputs.fill(0.0f);
++    std::vector<u32> vs_local(size_t(vs->local_words + 1) * LANES);
++    std::vector<f32> vs_inputs(256 * LANES), vs_outputs(256 * LANES), vs_colors(32 * LANES);
++    std::array<bool, LANES> vs_discard{};
++    // each stream's bytes, when it's one range of memory (as it nearly always is): read in place
++    std::array<const u8*, 32> stream_bytes{};
++    std::array<GPUVAddr, 32> stream_begin{}, stream_end{};
++    for (u32 i = 0; i < regs.vertex_streams.size() && i < stream_bytes.size(); ++i) {
++        const auto& stream = regs.vertex_streams[i];
++        if (!stream.IsEnabled()) {
++            continue;
++        }
++        const GPUVAddr begin = stream.Address(), end = regs.vertex_stream_limits[i].Address() + 1;
++        if (end > begin && end - begin <= (256u << 20) && gpu_memory.IsContinuousRange(begin, end - begin)) {
++            if (const u8* const bytes = gpu_memory.GetPointer(begin)) {
++                stream_bytes[i] = bytes, stream_begin[i] = begin, stream_end[i] = end;
++            }
++        }
++    }
++    const auto shade_vertices = [&](const u32* vertex_indices, u32 n, u32 instance, Vertex* out) {
+         for (u32 attr = 0; attr < 32; ++attr) {
+             if (!vs->generic_loaded[attr]) {
+                 continue;
+             }
+             const auto& format = regs.vertex_attrib_format[attr];
+-            std::array<f32, 4> value{0.0f, 0.0f, 0.0f, 1.0f};
+-            if (!format.constant) {
++            f32* const in = vs_inputs.data() + (32 + attr * 4) * LANES;
++            for (u32 lane = 0; lane < LANES; ++lane) {
++                std::array<f32, 4> value{0.0f, 0.0f, 0.0f, 1.0f};
+                 const auto& stream = regs.vertex_streams[format.buffer];
+-                if (stream.IsEnabled()) {
++                if (lane < n && !format.constant && stream.IsEnabled()) {
+                     const u32 element = stream.frequency > 0 && regs.vertex_stream_instances.IsInstancingEnabled(format.buffer)
+                                             ? draw_state.base_instance + instance / stream.frequency
+-                                            : index;
++                                            : vertex_indices[lane];
+                     const GPUVAddr address = stream.Address() + u64{element} * stream.stride + format.offset;
+                     u8 data[16]{};
+-                    gpu_memory.ReadBlockUnsafe(address, data, sizeof(data));
++                    const u32 b = format.buffer;
++                    if (stream_bytes[b] && address >= stream_begin[b] && address + 16 <= stream_end[b]) {
++                        std::memcpy(data, stream_bytes[b] + (address - stream_begin[b]), sizeof(data));
++                    } else {
++                        gpu_memory.ReadBlockUnsafe(address, data, sizeof(data));
++                    }
+                     FetchAttribute(format, data, value);
+                 }
++                for (u32 c = 0; c < 4; ++c) {
++                    in[c * LANES + lane] = value[c];
++                }
+             }
+-            std::memcpy(&inputs[32 + attr * 4], value.data(), sizeof(value));
+         }
+-        inputs[static_cast<u32>(IR::Attribute::VertexId)] = std::bit_cast<f32>(index);
+-        inputs[static_cast<u32>(IR::Attribute::InstanceId)] = std::bit_cast<f32>(instance);
+-        outputs.fill(0.0f);
+-        outputs[static_cast<u32>(IR::Attribute::PositionW)] = 1.0f;
+-        Io io{inputs.data(), outputs.data(), vs_colors.data(), &vs_discard, 1, 0,
++        for (u32 lane = 0; lane < LANES; ++lane) {
++            vs_inputs[static_cast<u32>(IR::Attribute::VertexId) * LANES + lane] =
++                std::bit_cast<f32>(lane < n ? vertex_indices[lane] : 0u);
++            vs_inputs[static_cast<u32>(IR::Attribute::InstanceId) * LANES + lane] = std::bit_cast<f32>(instance);
++        }
++        // what's read back (positions, varyings, the point size), from 0 (w from 1) where unwritten
++        const u32 position = static_cast<u32>(IR::Attribute::PositionX);
++        std::fill_n(vs_outputs.data() + position * LANES, 3 * LANES, 0.0f);
++        std::fill_n(vs_outputs.data() + (position + 3) * LANES, LANES, 1.0f);
++        std::fill_n(vs_outputs.data() + 32 * LANES, POINT_COORD_SLOT * LANES, 0.0f);
++        std::fill_n(vs_outputs.data() + static_cast<u32>(IR::Attribute::PointSize) * LANES, LANES, 0.0f);
++        Io io{vs_inputs.data(), vs_outputs.data(), vs_colors.data(), vs_discard.data(), LANES, 0,
+               &vs_cbufs, vs_local.data(), vs->local_words, &vs_textures, &vs_storage, &gpu_memory};
+         io.views = &vs_views;
+-        Run(*vs, vs_cells.data(), io, 1);
+-        std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+-        std::memcpy(out.varyings.data(), &outputs[32], POINT_COORD_SLOT * sizeof(f32));
+-        out.varyings[POINT_COORD_SLOT] = out.varyings[POINT_COORD_SLOT + 1] = 0.0f;
+-        out.point_size = outputs[static_cast<u32>(IR::Attribute::PointSize)];
++        io.run = io.live = n >= LANES ? 0xFFFFu : (1u << n) - 1;
++        Run(*vs, vs_cells.data(), io, LANES);
++        for (u32 lane = 0; lane < n; ++lane) {
++            Vertex& v = out[lane];
++            for (u32 c = 0; c < 4; ++c) {
++                v.position[c] = vs_outputs[(position + c) * LANES + lane];
++            }
++            for (u32 k = 0; k < POINT_COORD_SLOT; ++k) {
++                v.varyings[k] = vs_outputs[(32 + k) * LANES + lane];
++            }
++            v.varyings[POINT_COORD_SLOT] = v.varyings[POINT_COORD_SLOT + 1] = 0.0f;
++            v.point_size = vs_outputs[static_cast<u32>(IR::Attribute::PointSize) * LANES + lane];
++        }
+     };
+ 
+     // The varyings the fragment shader reads, and how each is interpolated
+@@ -6130,8 +6203,10 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+             if (!std::isfinite(v[i]->x) || !std::isfinite(v[i]->y)) {
+                 return;
+             }
+-            t.x[i] = s32(std::lround(v[i]->x * 256.0f));
+-            t.y[i] = s32(std::lround(v[i]->y * 256.0f));
++            // 24.8 fixed point, rounded half away from 0 (as lround, without its call: exact in doubles)
++            const f64 fx = f64(v[i]->x) * 256.0, fy = f64(v[i]->y) * 256.0;
++            t.x[i] = s32(fx >= 0.0 ? fx + 0.5 : fx - 0.5);
++            t.y[i] = s32(fy >= 0.0 ? fy + 0.5 : fy - 0.5);
+             t.z[i] = v[i]->z;
+             t.inv_w[i] = v[i]->inv_w;
+         }
+@@ -6221,17 +6296,18 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         return v;
+     };
+     std::vector<Vertex> polygon, clipped;
++    // the draw's distinct vertices shaded, each one's window coordinates and the planes it's outside
++    // (bits), worked out once for all the triangles it's in
++    std::vector<Vertex> shaded;
++    std::vector<ScreenVertex> screen;
++    std::vector<u8> outcode;
+     const bool bias_fill = regs.polygon_offset_fill_enable != 0;
+     const bool bias_line = regs.polygon_offset_line_enable != 0, bias_point = regs.polygon_offset_point_enable != 0;
+-    const auto clip_and_add = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
+-        u32 outside = 0;
+-        for (u32 plane = 0; plane < 5; ++plane) {
+-            if (distance(a, plane) < 0.0f || distance(b, plane) < 0.0f || distance(c, plane) < 0.0f) {
+-                outside |= 1u << plane;
+-            }
+-        }
++    const auto clip_and_add = [&](const Vertex& a, const Vertex& b, const Vertex& c) { // (three of 'shaded')
++        const size_t ia = size_t(&a - shaded.data()), ib = size_t(&b - shaded.data()), ic = size_t(&c - shaded.data());
++        const u32 outside = outcode[ia] | outcode[ib] | outcode[ic];
+         if (outside == 0) {
+-            add_triangle(to_screen(a), to_screen(b), to_screen(c), true, bias_fill);
++            add_triangle(screen[ia], screen[ib], screen[ic], true, bias_fill);
+             return;
+         }
+         polygon.assign({a, b, c});
+@@ -6316,17 +6392,70 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         return;
+     }
+     runs.emplace_back(run_start, count);
+-    std::vector<Vertex> all_vertices(count);
++    // the draw's distinct vertices (an indexed mesh uses each several times), and which each index's is
++    std::vector<u32> distinct;
++    std::vector<u32> slot_of(count);
++    {
++        u32 lo = ~0u, hi = 0;
++        for (const auto& [run_begin, run_end] : runs) {
++            for (u32 i = run_begin; i < run_end; ++i) {
++                lo = std::min(lo, indices[i]), hi = std::max(hi, indices[i]);
++            }
++        }
++        if (lo <= hi && u64{hi} - lo < u64{count} * 4 + 4096) { // (a table over their range)
++            std::vector<u32> table(size_t(hi - lo) + 1, ~0u);
++            for (const auto& [run_begin, run_end] : runs) {
++                for (u32 i = run_begin; i < run_end; ++i) {
++                    u32& slot = table[indices[i] - lo];
++                    if (slot == ~0u) {
++                        slot = u32(distinct.size());
++                        distinct.push_back(indices[i]);
++                    }
++                    slot_of[i] = slot;
++                }
++            }
++        } else {
++            std::unordered_map<u32, u32> table;
++            for (const auto& [run_begin, run_end] : runs) {
++                for (u32 i = run_begin; i < run_end; ++i) {
++                    const auto [it, added] = table.try_emplace(indices[i], u32(distinct.size()));
++                    if (added) {
++                        distinct.push_back(indices[i]);
++                    }
++                    slot_of[i] = it->second;
++                }
++            }
++        }
++    }
++    shaded.resize(distinct.size());
++    screen.resize(distinct.size());
++    outcode.resize(distinct.size());
++    struct RunVertices { // a run's vertices by their place in it
++        const Vertex* shaded;
++        const u32* slot;
++        const Vertex& operator[](u32 i) const {
++            return shaded[slot[i]];
++        }
++    };
+     for (u32 instance = 0; instance < std::max(instance_count, 1u); ++instance) {
++      for (size_t first = 0; first < distinct.size(); first += LANES) {
++        shade_vertices(distinct.data() + first, u32(std::min<size_t>(LANES, distinct.size() - first)), instance,
++                       shaded.data() + first);
++      }
++      for (size_t k = 0; k < distinct.size(); ++k) {
++        u8 bits = 0;
++        for (u32 plane = 0; plane < 5; ++plane) {
++            bits |= u8(distance(shaded[k], plane) < 0.0f) << plane;
++        }
++        outcode[k] = bits;
++        screen[k] = bits == 0 ? to_screen(shaded[k]) : ScreenVertex{};
++      }
+       for (const auto& [run_begin, run_end] : runs) {
+         if (run_begin >= run_end) {
+             continue;
+         }
+-        Vertex* const vertices = all_vertices.data() + run_begin;
++        const RunVertices vertices{shaded.data(), slot_of.data() + run_begin};
+         const u32 count = run_end - run_begin;
+-        for (u32 i = 0; i < count; ++i) {
+-            shade_vertex(indices[run_begin + i], instance, vertices[i]);
+-        }
+         switch (topology) {
+         case Topology::Triangles:
+             for (u32 i = 0; i + 2 < count; i += 3) clip_and_add(vertices[i], vertices[i + 1], vertices[i + 2]);

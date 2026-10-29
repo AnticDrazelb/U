@@ -291,6 +291,11 @@ ok &= max(tl[:2]) < 60 and tr[0] > 200 and tr[1] < 60 and bl[1] > 200 and bl[0] 
 sys.exit(0 if ok else 1)
 PY
 
+echo "gputest.nro's vertex stress test: 16 indexed meshes of 4225 vertices, transformed by a matrix"
+run gputest_vertices "$work/gputest.nro" 20 "2:X,2.3:,7:Plus,7.5:"
+check "exits on +" code gputest_vertices 0
+check "draws them" says gputest_vertices "fps, [0-9]* command words a frame (vertex stress test)"
+
 echo "the software shaders' native code: each instruction it does against the interpreter's results"
 run jit_test "$work/gputest.nro" 20 "3:Plus,3.5:" EDEN_SW_JIT_TEST=1
 check "gives the interpreter's results on awkward values" says jit_test "native code self-test: 0 of [0-9]* differ"
