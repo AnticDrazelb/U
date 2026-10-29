@@ -36,6 +36,14 @@ if (PS4)
     # the runtime's __real_gethostbyname: LLD 12's --wrap doesn't fetch libc.a's gethostbyname for
     # it alone, and create-fself can't import it
     target_link_options(eden-ps4 PRIVATE --undefined=gethostbyname)
+    # Mesa's RADV, when scripts/build-mesa.sh has built it: Eden's Vulkan renderer on the PS4's GPU
+    if (EXISTS ${PS4_MESA_BUILD}/src/amd/vulkan/libvulkan_radeon.a)
+        ps4_link_mesa(eden-ps4)
+        target_compile_definitions(eden-ps4 PRIVATE EDEN_PS4_RADV)
+        message(STATUS "eden-ps4: Mesa's RADV linked: Eden's Vulkan renderer on the PS4's GPU")
+    else()
+        message(STATUS "eden-ps4: no Mesa build at ${PS4_MESA_BUILD}: the null renderer only")
+    endif()
     ps4_add_eboot(eden-ps4)
 else()
     add_executable(eden-ps4 main.cpp platform_host.cpp)

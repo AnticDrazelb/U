@@ -55,6 +55,12 @@ struct PadState {
 /// Sets player 1's controller state. Any thread; ignored while no program runs.
 void SetPad(const PadState& state);
 
+/// The PS4's own display for programs: Eden's Vulkan renderer draws on the console's GPU (Mesa's
+/// RADV) straight to the screen, which the platform gives up while a program runs, and nothing
+/// goes to the FrameSink. Off (the default): the null renderer composes frames for the FrameSink.
+/// Set it before Boot.
+void SetGpuDisplay(bool on);
+
 /// A sound output: 48 kHz, signed 16-bit samples, channels interleaved.
 class AudioOutput {
 public:

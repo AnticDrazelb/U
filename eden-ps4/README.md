@@ -321,6 +321,29 @@ Two ways it shows:
 
 ![The GPU test through Eden's Vulkan renderer on lavapipe](screenshots/gputest-vulkan-lavapipe.png)
 
+## Stage 5: the PS4's own GPU (in progress)
+
+Crema, the Wii U emulator this repository builds, already runs Vulkan on the PS4's GPU: Mesa's RADV
+with a GNM winsys (`../port/mesa/ac_ps4_drm.c`, `../patches/mesa-ps4*.patch`,
+`../scripts/build-mesa.sh`). Eden4 (github.com/xatyy/eden4, GPL-3.0-or-later) showed Eden's Vulkan
+renderer working on that kind of stack on a console, on this same Eden commit. Patch 0043 brings
+its Eden side here: RADV linked into the executable, a VideoOut swapchain whose flips are queued
+behind the GPU's work, and GPU memory budgeted from the direct memory left after the Switch's
+4 GiB. The launcher uses it whenever RADV is linked (`src/CMakeLists.txt` links it when
+`~/cemups4-build/build/mesa` has been built): it gives the screen (video out and its direct
+memory) to the program's display while the program runs, and takes it back after.
+`EDEN_PS4_RENDERER=null` in `settings.txt` keeps the software renderer. Without RADV in the
+build, nothing changes.
+
+Commercial games: the start page lists every `.nsp`, `.xci`, `.nso` and `.nro` in
+`/data/eden-ps4`. Eden needs the console's keys in `/data/eden-ps4/user/keys/prod.keys` (and
+`title.keys`) and its firmware (the NCA files) in
+`/data/eden-ps4/user/nand/system/Contents/registered/`, dumped from your own Switch.
+
+Status: Mesa 26.0.8 and libdrm are cloned into `~/cemups4-build/src` with Crema's five patches
+applied; building them (and the PS4 package with patch 0043) needs permission in this build
+environment for building code from outside the repository.
+
 ## What's next: the GPU
 
 What draws with the CPU runs now; what draws with the GPU (every commercial game, and homebrew
@@ -497,6 +520,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: software shaders compiled to native code | above |
 | null renderer: multisampled texel fetches, varyings after the depth test, a native code self-test | above |
 | null renderer: software vertex shaders 16 vertices at a time, each distinct vertex once | above |
+| vulkan: the PS4's GPU through Mesa's RADV, after Eden4 | stage 5, above |
 
 The PS4 memory changes, from what stage 1 measured:
 

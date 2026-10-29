@@ -16,6 +16,23 @@ int mprotect(void* addr, size_t len, int prot)
     return sceKernelMprotect(addr, len, prot);
 }
 
+// Without Mesa's RADV linked (built by scripts/build-mesa.sh, linked when it's there: see
+// CMakeLists.txt), its entry points say there's no Vulkan: the launcher keeps the null renderer.
+#ifndef EDEN_PS4_RADV
+void* vk_icdGetInstanceProcAddr(void*, const char*)
+{
+    return nullptr;
+}
+void* vk_common_GetDeviceProcAddr(void*, const char*)
+{
+    return nullptr;
+}
+int ac_ps4_submit_flip(int, unsigned, unsigned, int64_t)
+{
+    return -1;
+}
+#endif
+
 void ps4_crash_guest_info() {}
 void ps4_crash_guest_regs(int) {}
 void ps4_crash_jit_info(int, uint64_t, int) {}

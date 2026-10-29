@@ -1,0 +1,1228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 04:53:34 +0000
+Subject: [PATCH] vulkan: the PS4's GPU through Mesa's RADV, after Eden4
+
+Eden's Vulkan renderer on the PS4, as Eden4 (github.com/xatyy/eden4, GPL-3.0-or-later, built on
+this same Eden commit) does it: RADV linked into the executable (its ICD entry point installed
+as vkGetInstanceProcAddr, no loader), an Orbis window system without a surface, a swapchain of
+three linear images registered with VideoOut whose flips are queued behind the GPU's work
+(vk_swapchain_ps4.cpp, from Eden4), and GPU memory sized from the free direct memory left after
+the Switch's 4 GiB: smaller VMA blocks, texture and buffer cache budgets from it, staging buffers
+capped at 64 MiB, and a reclaim (wait for the GPU, free idle staging buffers, retry) when an
+allocation would leave too little or fails. common/ps4_diagnostics.h is Eden4's.
+
+Not yet built for the PS4 or run on a console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ src/common/ps4_diagnostics.h                  |  66 +++++
+ src/core/frontend/emu_window.h                |   1 +
+ src/video_core/CMakeLists.txt                 |   3 +-
+ src/video_core/buffer_cache/buffer_cache.h    |   5 +
+ .../renderer_vulkan/present/layer.cpp         |  17 +-
+ .../renderer_vulkan/present/layer.h           |   3 +-
+ .../renderer_vulkan/renderer_vulkan.cpp       |  29 ++
+ .../renderer_vulkan/vk_present_manager.cpp    |  17 +-
+ .../vk_staging_buffer_pool.cpp                |  78 +++++-
+ .../renderer_vulkan/vk_staging_buffer_pool.h  |   8 +
+ src/video_core/renderer_vulkan/vk_swapchain.h |  13 +
+ .../renderer_vulkan/vk_swapchain_ps4.cpp      | 253 ++++++++++++++++++
+ src/video_core/texture_cache/texture_cache.h  |   9 +
+ src/video_core/vulkan_common/vulkan.h         |   2 +-
+ .../vulkan_common/vulkan_device.cpp           |  22 ++
+ src/video_core/vulkan_common/vulkan_device.h  |   4 +
+ .../vulkan_common/vulkan_instance.cpp         |  22 +-
+ .../vulkan_common/vulkan_library.cpp          |   5 +-
+ .../vulkan_common/vulkan_memory_allocator.cpp | 112 +++++++-
+ .../vulkan_common/vulkan_memory_allocator.h   |  12 +
+ .../vulkan_common/vulkan_surface.cpp          |   4 +
+ 21 files changed, 671 insertions(+), 14 deletions(-)
+ create mode 100644 src/common/ps4_diagnostics.h
+ create mode 100644 src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
+
+diff --git a/src/common/ps4_diagnostics.h b/src/common/ps4_diagnostics.h
+new file mode 100644
+index 000000000..447bc7617
+--- /dev/null
++++ b/src/common/ps4_diagnostics.h
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <vector>
++#include <sys/types.h>
++#include "common/common_types.h"
++#include "common/logging.h"
++
++extern "C" size_t sceKernelGetDirectMemorySize();
++// The SDK declaration passes the output arguments by value.
++extern "C" int EdenQueryDirectMemory(off_t, off_t, size_t, off_t*, size_t*)
++    asm("sceKernelAvailableDirectMemorySize");
++
++namespace Common::PS4Diagnostics {
++// ps4.ini "inline_memory=0": use Dynarmic's memory callbacks instead of the inline page table walk.
++inline std::atomic<bool> inline_memory{true};
++// ps4.ini "direct_table=0": the inline walk decodes the packed entries instead of the direct values.
++inline std::atomic<bool> direct_table{true};
++// Sampling profiler (ps4_sampler.cpp); off by default, ps4.ini "profile=on" enables it.
++inline std::atomic<bool> profiler{false};
++// Guest memory accesses that left the JIT's inline page table walk (one 64-byte slot per core).
++inline u64 memory_callbacks[4][8]{};
++inline u64 MemoryCallbackTotal() {
++    return memory_callbacks[0][0] + memory_callbacks[1][0] + memory_callbacks[2][0] + memory_callbacks[3][0];
++}
++// ps4.ini "output=1080": 1920x1080 VideoOut buffers instead of 1280x720 (+~13 MiB of direct memory).
++inline std::atomic<bool> output_1080{false};
++// The launcher's loading screen (1920x1080, 0xAABBGGRR): the game display shows it as its first
++// frame, so it stays up while the game boots. Taken (and freed) by whoever exchanges it out.
++inline std::atomic<std::vector<u32>*> loading_picture{nullptr};
++// What VideoOut accepted for the launcher (PS4 Pro mode may refuse its first setup): the game
++// display follows it.
++inline std::atomic<bool> videoout_needs_1080{false};
++inline std::atomic<bool> videoout_argb{false};
++inline std::atomic<u64> composites{};
++inline std::atomic<u64> flips{};
++inline std::atomic<u64> audio_buffers{};
++inline std::atomic<const char*> stage{"waiting for guest display"};
++
++inline void Reset() {
++    composites = 0;
++    flips = 0;
++    audio_buffers = 0;
++    stage = "waiting for guest display";
++}
++
++inline size_t LargestFreeDirect() {
++    off_t start{};
++    size_t largest{};
++    if (EdenQueryDirectMemory(0, sceKernelGetDirectMemorySize(), 16384, &start, &largest) != 0)
++        return 0;
++    return largest;
++}
++
++inline void LogDirectMemory(const char* reason) {
++    off_t start{};
++    size_t largest{};
++    const int result = EdenQueryDirectMemory(0, sceKernelGetDirectMemorySize(), 16384,
++                                            &start, &largest);
++    LOG_INFO(HW_Memory, "PS4 {}: direct memory query={:#x}, largest free block={} KiB",
++             reason, u32(result), largest / 1024);
++}
++} // namespace Common::PS4Diagnostics
+diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
+index af103da71..19a0637d8 100644
+--- a/src/core/frontend/emu_window.h
++++ b/src/core/frontend/emu_window.h
+@@ -27,6 +27,7 @@ enum class WindowSystemType {
+     Cocoa,
+     Android,
+     Xcb,
++    Orbis,
+ };
+ 
+ /**
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index d2a08a27f..c5319f8f4 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -193,7 +193,8 @@ add_library(video_core STATIC
+     renderer_vulkan/vk_staging_buffer_pool.h
+     renderer_vulkan/vk_state_tracker.cpp
+     renderer_vulkan/vk_state_tracker.h
+-    renderer_vulkan/vk_swapchain.cpp
++    $<$<BOOL:${PS4}>:renderer_vulkan/vk_swapchain_ps4.cpp>
++    $<$<NOT:$<BOOL:${PS4}>>:renderer_vulkan/vk_swapchain.cpp>
+     renderer_vulkan/vk_swapchain.h
+     renderer_vulkan/vk_texture_cache.cpp
+     renderer_vulkan/vk_texture_cache.h
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 53addb5de..fbe92e3e4 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -48,6 +48,11 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
+     critical_memory = static_cast<u64>(
+         (std::max)((std::min)(device_local_memory - min_vacancy_critical, min_spacing_critical),
+                  DEFAULT_CRITICAL_MEMORY));
++#ifdef __OPENORBIS__
++    // See TextureCache: a few hundred MiB of direct memory for everything.
++    minimum_memory = static_cast<u64>(device_local_memory * 40 / 100);
++    critical_memory = static_cast<u64>(device_local_memory * 70 / 100);
++#endif
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/renderer_vulkan/present/layer.cpp b/src/video_core/renderer_vulkan/present/layer.cpp
+index 9f4aaf390..605a2b7cd 100644
+--- a/src/video_core/renderer_vulkan/present/layer.cpp
++++ b/src/video_core/renderer_vulkan/present/layer.cpp
+@@ -98,7 +98,11 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
+         (framebuffer.layer_stack_mask & Service::Nvnflinger::LayerStackBit(
+                                             Service::Nvnflinger::LayerStackId::Recording)) == 0;
+ 
++#ifdef __OPENORBIS__
++    RefreshResources(device, framebuffer, !use_accelerated);
++#else
+     RefreshResources(device, framebuffer);
++#endif
+     SetAntiAliasPass(device);
+ #ifdef HAS_RESHADE
+     SetPostProcessPass(device, is_applet);
+@@ -193,9 +197,10 @@ void Layer::CreateRawImages(const Device& device, const Tegra::FramebufferConfig
+     }
+ }
+ 
+-void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer) {
++void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer,
++                             bool needs_raw_images) {
+     if (framebuffer.width == raw_width && framebuffer.height == raw_height &&
+-        framebuffer.pixel_format == pixel_format && !raw_images.empty()) {
++        framebuffer.pixel_format == pixel_format && (!needs_raw_images || !raw_images.empty())) {
+         return;
+     }
+ 
+@@ -205,8 +210,11 @@ void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfi
+     anti_alias.emplace<std::monostate>();
+ 
+     ReleaseRawImages();
+-    CreateStagingBuffer(device, framebuffer);
+-    CreateRawImages(device, framebuffer);
++    resource_ticks.resize(image_count);
++    if (needs_raw_images) {
++        CreateStagingBuffer(device, framebuffer);
++        CreateRawImages(device, framebuffer);
++    }
+ }
+ 
+ void Layer::SetAntiAliasPass(const Device& device) {
+@@ -278,6 +286,7 @@ void Layer::ReleaseRawImages() {
+     for (const u64 tick : resource_ticks) {
+         scheduler.Wait(tick);
+     }
++    raw_image_views.clear();
+     raw_images.clear();
+     buffer.reset();
+ }
+diff --git a/src/video_core/renderer_vulkan/present/layer.h b/src/video_core/renderer_vulkan/present/layer.h
+index b965ef7c4..7399ef331 100644
+--- a/src/video_core/renderer_vulkan/present/layer.h
++++ b/src/video_core/renderer_vulkan/present/layer.h
+@@ -67,7 +67,8 @@ private:
+     void CreateStagingBuffer(const Device& device, const Tegra::FramebufferConfig& framebuffer);
+     void CreateRawImages(const Device& device, const Tegra::FramebufferConfig& framebuffer);
+ 
+-    void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer);
++    void RefreshResources(const Device& device, const Tegra::FramebufferConfig& framebuffer,
++                          bool needs_raw_images = true);
+     void SetAntiAliasPass(const Device& device);
+ #ifdef HAS_RESHADE
+     void SetPostProcessPass(const Device& device, bool is_applet);
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index e074ca3d7..aeb9d7dde 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -18,6 +18,9 @@
+ #include <ranges>
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
++#ifdef __OPENORBIS__
++#include "common/ps4_diagnostics.h"
++#endif
+ #include "core/core_timing.h"
+ #include "core/frontend/graphics_context.h"
+ #include "video_core/capture.h"
+@@ -202,6 +205,17 @@ RendererVulkan::~RendererVulkan() {
+ }
+ 
+ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
++#ifdef __OPENORBIS__
++    const auto frame_number = ++Common::PS4Diagnostics::composites;
++    Common::PS4Diagnostics::stage = "applet capture";
++    if (frame_number <= 3) {
++        LOG_INFO(Render_Vulkan, "PS4 composite {}: {} guest layers", frame_number, framebuffers.size());
++        for (const auto& fb : framebuffers) {
++            LOG_INFO(Render_Vulkan, "PS4 guest layer: {}x{}, stride={}, format={}",
++                     fb.width, fb.height, fb.stride, u32(fb.pixel_format));
++        }
++    }
++#endif
+     SCOPE_EXIT {
+         render_window.OnFrameDisplayed();
+     };
+@@ -221,9 +235,15 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+     }
+ 
+     RenderScreenshot(framebuffers);
++#ifdef __OPENORBIS__
++    Common::PS4Diagnostics::stage = "acquiring render frame";
++#endif
+     Frame* frame = present_manager.GetRenderFrame();
+ 
+     scheduler.RequestOutsideRenderPassOperationContext();
++#ifdef __OPENORBIS__
++    Common::PS4Diagnostics::stage = "drawing display layers";
++#endif
+     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
+                                render_window.GetFramebufferLayout(),
+                                present_manager.SwapchainImageCount(),
+@@ -245,8 +265,14 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+     }
+ #endif
+ 
++#ifdef __OPENORBIS__
++    Common::PS4Diagnostics::stage = "submitting display layers";
++#endif
+     scheduler.Flush(*frame->render_ready);
+ 
++#ifdef __OPENORBIS__
++    Common::PS4Diagnostics::stage = "copying to VideoOut buffer";
++#endif
+     present_manager.Present(frame);
+ #ifdef HAS_LSFG
+     scheduler.DispatchWork();
+@@ -254,6 +280,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+ 
+     gpu.RendererFrameEndNotify();
+     rasterizer.TickFrame();
++#ifdef __OPENORBIS__
++    Common::PS4Diagnostics::stage = "waiting for next guest display";
++#endif
+ }
+ 
+ void RendererVulkan::Report() const {
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index 929876454..ac2d69ff7 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -129,7 +129,13 @@ PresentManager::PresentManager(const vk::Instance& instance_,
+     , surface{surface_}
+     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
+     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
++#ifdef __OPENORBIS__
++    // VideoOut currently waits for GPU completion. Drain the scheduler before presenting
++    // so a queued render semaphore cannot depend on a worker blocked by that wait.
++    , use_present_thread{false}
++#else
+     , use_present_thread{Settings::values.async_presentation.GetValue()}
++#endif
+ {
+     SetImageCount();
+ 
+@@ -493,7 +499,11 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++#ifdef __OPENORBIS__
++            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++#else
+             .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++#endif
+             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+             .image = image,
+@@ -556,12 +566,17 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+     const VkSubmitInfo submit_info{
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .pNext = nullptr,
++#ifdef __OPENORBIS__
++        .waitSemaphoreCount = 1U,
++        .pWaitSemaphores = &wait_semaphores[1],
++#else
+         .waitSemaphoreCount = 2U,
+         .pWaitSemaphores = wait_semaphores.data(),
++#endif
+         .pWaitDstStageMask = wait_stage_masks.data(),
+         .commandBufferCount = 1,
+         .pCommandBuffers = cmdbuf.address(),
+-        .signalSemaphoreCount = 1U,
++        .signalSemaphoreCount = render_semaphore ? 1U : 0U,
+         .pSignalSemaphores = &render_semaphore,
+     };
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 7b6571d33..13dc3c8e5 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <utility>
+ #include <vector>
+ 
+@@ -19,6 +20,10 @@
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#ifdef __OPENORBIS__
++#include "common/logging.h"
++#include "common/ps4_diagnostics.h"
++#endif
+ 
+ namespace Vulkan {
+ namespace {
+@@ -33,7 +38,12 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
+ // Windows ones however, can intake bigger buffers and generally do not OOM.
+ // - GTX 960 on Windows will not OOM with 256mib
+ // - GT 1030 on ^NIX will OOM with 256mib
+-#if defined(__FreeBSD__)
++#if defined(__OPENORBIS__)
++constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 16_MiB;
++// Staging buffers pile up while a game loads (none are reused until the GPU is done with them);
++// above this, wait for the GPU and reuse or free them instead of allocating more.
++constexpr size_t PS4_STAGING_CAP = 64_MiB;
++#elif defined(__FreeBSD__)
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
+ #else
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
+@@ -96,11 +106,46 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+     }
+     stream_pointer = stream_buffer.Mapped();
+     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
++#ifdef __OPENORBIS__
++    SetPS4MemoryReclaim([this] {
++        // Buffers handed out since the last submission may not be recorded yet: keep them.
++        const u64 keep = scheduler.CurrentTick();
++        scheduler.Finish();
++        ReleaseAllFree(keep);
++    });
++#endif
++}
++
++#ifdef __OPENORBIS__
++StagingBufferPool::~StagingBufferPool() {
++    SetPS4MemoryReclaim({});
+ }
+ 
++void StagingBufferPool::ReleaseAllFree(u64 keep) {
++    for (StagingBuffersCache* cache : {&device_local_cache, &upload_cache, &download_cache}) {
++        for (StagingBuffers& level : *cache) {
++            auto& entries = level.entries;
++            const auto it = std::remove_if(entries.begin(), entries.end(), [&](const StagingBuffer& entry) {
++                const bool idle = entry.tick < keep && scheduler.IsFree(entry.tick);
++                if (idle) {
++                    total_bytes -= size_t{1} << entry.log2_level;
++                }
++                return idle;
++            });
++            entries.erase(it, entries.end());
++            level.delete_index = 0;
++            level.iterate_index = 0;
++        }
++    }
++}
++#else
+ StagingBufferPool::~StagingBufferPool() = default;
++#endif
+ 
+ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
++#ifdef __OPENORBIS__
++    ClaimPS4ReclaimThread();
++#endif
+     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
+         return GetStreamBuffer(size);
+     }
+@@ -120,11 +165,29 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+ }
+ 
+ void StagingBufferPool::TickFrame() {
++#ifdef __OPENORBIS__
++    // Every level every frame (upstream: one level per frame, so a buffer can idle for 64 frames).
++    ClaimPS4ReclaimThread();
++    for (size_t level = 0; level < NUM_LEVELS; ++level) {
++        ReleaseLevel(device_local_cache, level);
++        ReleaseLevel(upload_cache, level);
++        ReleaseLevel(download_cache, level);
++    }
++    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count());
++    if (now >= last_status_log + 10) {
++        last_status_log = now;
++        LOG_INFO(Render_Vulkan, "PS4 GPU memory: staging buffers {} MiB, largest free direct block {} MiB",
++                 total_bytes >> 20, Common::PS4Diagnostics::LargestFreeDirect() >> 20);
++    }
++#else
+     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+ 
+     ReleaseCache(MemoryUsage::DeviceLocal);
+     ReleaseCache(MemoryUsage::Upload);
+     ReleaseCache(MemoryUsage::Download);
++#endif
+ }
+ 
+ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+@@ -204,6 +267,13 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
+ 
+ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
++#ifdef __OPENORBIS__
++    if (total_bytes + (size_t{1} << log2_size) > PS4_STAGING_CAP && PS4Reclaim(0, true)) {
++        if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
++            return *ref;
++        }
++    }
++#endif
+     VkBufferCreateInfo buffer_ci = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .pNext = nullptr,
+@@ -232,6 +302,9 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+         device.IsBufferDeviceAddressSupported()
+             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
+             : VkDeviceAddress{};
++#ifdef __OPENORBIS__
++    total_bytes += size_t{1} << log2_size;
++#endif
+     StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
+         .buffer = std::move(buffer),
+         .device_address = buffer_address,
+@@ -276,6 +349,9 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
+     const auto begin = entries.begin() + begin_offset;
+     const auto end = entries.begin() + end_offset;
++#ifdef __OPENORBIS__
++    total_bytes -= static_cast<size_t>(std::count_if(begin, end, is_deletable)) << log2;
++#endif
+     entries.erase(std::remove_if(begin, end, is_deletable), end);
+ 
+     const size_t new_size = entries.size();
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 6d967abb4..0bd3acd9a 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -100,6 +100,14 @@ private:
+     void ReleaseCache(MemoryUsage usage);
+ 
+     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
++
++#ifdef __OPENORBIS__
++    /// Frees every idle staging buffer handed out before tick `keep`.
++    void ReleaseAllFree(u64 keep);
++
++    size_t total_bytes = 0;
++    u64 last_status_log = 0;
++#endif
+     size_t Region(size_t iter) const noexcept {
+         return iter / region_size;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain.h b/src/video_core/renderer_vulkan/vk_swapchain.h
+index d926cc118..90abea478 100644
+--- a/src/video_core/renderer_vulkan/vk_swapchain.h
++++ b/src/video_core/renderer_vulkan/vk_swapchain.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <vector>
++#include <memory>
+ 
+ #include "common/common_types.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -90,11 +91,19 @@ public:
+     }
+ 
+     VkSemaphore CurrentPresentSemaphore() const {
++#ifdef __OPENORBIS__
++        return VK_NULL_HANDLE;
++#else
+         return *present_semaphores[frame_index];
++#endif
+     }
+ 
+     VkSemaphore CurrentRenderSemaphore() const {
++#ifdef __OPENORBIS__
++        return VK_NULL_HANDLE;
++#else
+         return *render_semaphores[image_index];
++#endif
+     }
+ 
+     u32 GetWidth() const {
+@@ -110,6 +119,10 @@ public:
+     }
+ 
+ private:
++#ifdef __OPENORBIS__
++    struct PS4State;
++    std::unique_ptr<PS4State> ps4;
++#endif
+     void CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities);
+     void CreateSemaphores();
+     void CreateImageViews();
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp b/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
+new file mode 100644
+index 000000000..1c68efe1b
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
+@@ -0,0 +1,253 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// VideoOut presentation follows DolphinPS4's RADV integration (GPL-2.0-or-later).
++
++#include <algorithm>
++#include <memory>
++#include <array>
++#include <limits>
++#include <orbis/VideoOut.h>
++#include <unistd.h>
++#include "common/alignment.h"
++#include "common/logging.h"
++#include "common/ps4_diagnostics.h"
++#include "common/settings.h"
++#include "video_core/renderer_vulkan/vk_swapchain.h"
++#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/vulkan_common/vulkan_device.h"
++
++// RADV's PS4 winsys (ac_ps4_drm.c): queues a VideoOut flip behind all GPU work submitted so far.
++extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
++
++namespace Vulkan {
++namespace {
++constexpr u32 BufferCount = 3;
++constexpr VkDeviceSize BufferAlignment = 2 * 1024 * 1024;
++}
++
++struct Swapchain::PS4State {
++    explicit PS4State(const vk::Device& logical_) : logical{logical_} {}
++    ~PS4State() {
++        void(logical.WaitIdle());
++        if (video >= 0) sceVideoOutClose(video);
++        const auto& api = logical.Dispatch();
++        for (u32 i = 0; i < BufferCount; ++i) {
++            if (images[i]) api.vkDestroyImage(*logical, images[i], nullptr);
++            if (mapped[i]) api.vkUnmapMemory(*logical, memories[i]);
++            if (memories[i]) api.vkFreeMemory(*logical, memories[i], nullptr);
++        }
++    }
++    const vk::Device& logical;
++    int video{-1};
++    std::array<VkImage, BufferCount> images{};
++    std::array<VkDeviceMemory, BufferCount> memories{};
++    std::array<bool, BufferCount> mapped{};
++    std::array<s64, BufferCount> last_flip{};
++    s64 submitted{};
++    bool gpu_flips{true};
++};
++
++Swapchain::Swapchain(VkSurfaceKHR_T* surface_, const Device& device_, Scheduler& scheduler_,
++                     u32 width_, u32 height_)
++    : surface{surface_}, device{device_}, scheduler{scheduler_} {
++    Create(surface_, width_, height_);
++}
++
++Swapchain::~Swapchain() {
++    Destroy();
++}
++
++void Swapchain::Create(VkSurfaceKHR_T* surface_, u32 width_, u32 height_) {
++    Destroy();
++    surface = surface_;
++    width = width_;
++    height = height_;
++    const bool full_hd = Common::PS4Diagnostics::output_1080 || Common::PS4Diagnostics::videoout_needs_1080;
++    const bool argb = Common::PS4Diagnostics::videoout_argb;
++    extent = full_hd ? VkExtent2D{1920, 1080} : VkExtent2D{1280, 720};
++    surface_format = {argb ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM,
++                      VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
++    image_view_format = surface_format.format;
++    is_outdated = false;
++    is_suboptimal = false;
++    ps4 = std::make_unique<PS4State>(device.GetLogical());
++    ps4->video = sceVideoOutOpen(0xff, 0, 0, nullptr);
++    if (ps4->video < 0) {
++        LOG_ERROR(Render_Vulkan, "PS4 VideoOut open failed: {:#x}", u32(ps4->video));
++        throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
++    }
++    const auto& logical = device.GetLogical();
++    const auto& api = logical.Dispatch();
++    const auto memory_properties = device.GetPhysical().GetMemoryProperties().memoryProperties;
++    std::array<void*, BufferCount> addresses{};
++    u32 pitch{};
++    for (u32 i = 0; i < BufferCount; ++i) {
++        const VkImageCreateInfo info{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++            .imageType = VK_IMAGE_TYPE_2D,
++            .format = surface_format.format,
++            .extent = {extent.width, extent.height, 1},
++            .mipLevels = 1,
++            .arrayLayers = 1,
++            .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_LINEAR,
++            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        };
++        vk::Check(api.vkCreateImage(*logical, &info, nullptr, &ps4->images[i]));
++        const auto requirements = logical.GetImageMemoryRequirements(ps4->images[i]);
++        constexpr auto wanted = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        u32 type = std::numeric_limits<u32>::max();
++        for (u32 candidate = 0; candidate < memory_properties.memoryTypeCount; ++candidate) {
++            if ((requirements.memoryTypeBits & (1u << candidate)) &&
++                (memory_properties.memoryTypes[candidate].propertyFlags & wanted) == wanted) {
++                type = candidate;
++                break;
++            }
++        }
++        if (type == std::numeric_limits<u32>::max())
++            throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
++        const VkMemoryAllocateInfo allocate{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++            .allocationSize = requirements.size + BufferAlignment,
++            .memoryTypeIndex = type,
++        };
++        vk::Check(api.vkAllocateMemory(*logical, &allocate, nullptr, &ps4->memories[i]));
++        void* base = nullptr;
++        vk::Check(api.vkMapMemory(*logical, ps4->memories[i], 0, VK_WHOLE_SIZE, 0, &base));
++        ps4->mapped[i] = true;
++        const auto pointer = reinterpret_cast<uintptr_t>(base);
++        const VkDeviceSize offset = Common::AlignUp(pointer, BufferAlignment) - pointer;
++        if (offset % requirements.alignment != 0)
++            throw vk::Exception(VK_ERROR_MEMORY_MAP_FAILED);
++        vk::Check(api.vkBindImageMemory(*logical, ps4->images[i], ps4->memories[i], offset));
++        const VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
++        VkSubresourceLayout layout{};
++        api.vkGetImageSubresourceLayout(*logical, ps4->images[i], &subresource, &layout);
++        if (i && pitch != layout.rowPitch / 4)
++            throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
++        pitch = static_cast<u32>(layout.rowPitch / 4);
++        addresses[i] = static_cast<u8*>(base) + offset + layout.offset;
++    }
++    OrbisVideoOutBufferAttribute attributes{};
++    sceVideoOutSetBufferAttribute(&attributes, argb ? 0x80000000 /* A8R8G8B8_SRGB */
++                                                    : ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB,
++        ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, extent.width, extent.height, pitch);
++    const int result = sceVideoOutRegisterBuffers(ps4->video, 0, addresses.data(), BufferCount,
++                                                 &attributes);
++    if (result < 0) {
++        LOG_ERROR(Render_Vulkan, "PS4 VideoOut buffer registration failed: {:#x}", u32(result));
++        throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
++    }
++    images.assign(ps4->images.begin(), ps4->images.end());
++    image_count = BufferCount;
++    if (const std::unique_ptr<std::vector<u32>> picture{Common::PS4Diagnostics::loading_picture.exchange(nullptr)};
++        picture && picture->size() == size_t(1920) * 1080) {
++        // The launcher's loading screen until the game's first frame: box-filtered into buffer 0.
++        auto* out = static_cast<u32*>(addresses[0]);
++        for (u32 y = 0; y < extent.height; ++y) {
++            const u32 y0 = y * 1080 / extent.height, y1 = std::max(y0 + 1, (y + 1) * 1080 / extent.height);
++            for (u32 x = 0; x < extent.width; ++x) {
++                const u32 x0 = x * 1920 / extent.width, x1 = std::max(x0 + 1, (x + 1) * 1920 / extent.width);
++                u32 sum[3]{}, count = 0;
++                for (u32 sy = y0; sy < y1; ++sy)
++                    for (u32 sx = x0; sx < x1; ++sx, ++count) {
++                        const u32 pixel = (*picture)[size_t(sy) * 1920 + sx];
++                        for (int c = 0; c < 3; ++c) sum[c] += (pixel >> (c * 8)) & 255;
++                    }
++                u32 r = sum[0] / count, g = sum[1] / count, b = sum[2] / count;
++                if (argb) std::swap(r, b);
++                out[size_t(y) * pitch + x] = 0xff000000u | (b << 16) | (g << 8) | r;
++            }
++        }
++        __builtin_ia32_sfence();
++        if (sceVideoOutSubmitFlip(ps4->video, 0, ORBIS_VIDEO_OUT_FLIP_VSYNC, 1) >= 0) {
++            ps4->submitted = 1;
++            ps4->last_flip[0] = 1;
++            frame_index = 1;
++            LOG_INFO(Render_Vulkan, "PS4 display: loading screen shown until the first game frame");
++        }
++    }
++    LOG_INFO(Render_Vulkan, "PS4 RADV display ready: {}x{}, {} buffers, pitch {}",
++             extent.width, extent.height, image_count, pitch);
++}
++
++bool Swapchain::AcquireNextImage() {
++    image_index = frame_index;
++    const s64 previous = ps4->last_flip[image_index];
++    if (previous != 0) {
++        bool available = false;
++        for (u32 attempt = 0; attempt < 1000; ++attempt) {
++            OrbisVideoOutFlipStatus status{};
++            if (sceVideoOutGetFlipStatus(ps4->video, &status) < 0)
++                throw vk::Exception(VK_ERROR_DEVICE_LOST);
++            if (status.flipArg > previous) { available = true; break; }
++            usleep(1000);
++        }
++        if (!available) {
++            LOG_ERROR(Render_Vulkan, "PS4 display did not release buffer {}", image_index);
++            throw vk::Exception(VK_TIMEOUT);
++        }
++    }
++    return false;
++}
++
++void Swapchain::Present(VkSemaphore) {
++    const int mode = Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Immediate ?
++        ORBIS_VIDEO_OUT_FLIP_HSYNC : ORBIS_VIDEO_OUT_FLIP_VSYNC;
++    const s64 argument = ps4->submitted + 1;
++    // The copy into the VideoOut buffer was submitted just before this (PresentManager::
++    // CopyToSwapchain): queue the flip behind it on the GPU instead of waiting for the GPU to go
++    // idle first, which stalled this thread (and the emulated GPU) every frame.
++    int result = -1;
++    if (ps4->gpu_flips) {
++        Common::PS4Diagnostics::stage = "queueing VideoOut flip";
++        std::scoped_lock lock{scheduler.submit_mutex};
++        result = ac_ps4_submit_flip(ps4->video, image_index, static_cast<unsigned>(mode), argument);
++        if (result != 0) {
++            LOG_WARNING(Render_Vulkan, "PS4 GPU-queued flip failed ({:#x}); waiting for the GPU instead",
++                        u32(result));
++            ps4->gpu_flips = false;
++        }
++    }
++    if (result != 0) {
++        {
++            Common::PS4Diagnostics::stage = "waiting for GPU display copy";
++            std::scoped_lock lock{scheduler.submit_mutex};
++            vk::Check(device.GetLogical().WaitIdle());
++        }
++        Common::PS4Diagnostics::stage = "submitting VideoOut flip";
++        result = sceVideoOutSubmitFlip(ps4->video, static_cast<int>(image_index), mode, argument);
++    }
++    if (result < 0) {
++        LOG_ERROR(Render_Vulkan, "PS4 display flip failed: {:#x}", u32(result));
++        throw vk::Exception(VK_ERROR_DEVICE_LOST);
++    }
++    ps4->submitted = argument;
++    ps4->last_flip[image_index] = argument;
++    const auto flip = ++Common::PS4Diagnostics::flips;
++    if (flip <= 3) {
++        LOG_INFO(Render_Vulkan, "PS4 VideoOut flip {} submitted: buffer={}, argument={}, {}",
++                 flip, image_index, argument, ps4->gpu_flips ? "queued on the GPU" : "after GPU idle");
++        Common::PS4Diagnostics::LogDirectMemory("display flip");
++    }
++    frame_index = (frame_index + 1) % BufferCount;
++}
++
++void Swapchain::Destroy() {
++    if (ps4) {
++        std::scoped_lock lock{scheduler.submit_mutex};
++        ps4.reset();
++    }
++    images.clear();
++    image_count = 0;
++    frame_index = 0;
++    image_index = 0;
++}
++
++bool Swapchain::NeedsPresentModeUpdate() const {
++    return false;
++}
++} // namespace Vulkan
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index e92e54f8c..0b4902038 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -71,6 +71,15 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
+             (std::max)((std::min)(device_local_memory - min_vacancy_critical, min_spacing_critical),
+                      DEFAULT_CRITICAL_MEMORY));
+         minimum_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
++#ifdef __OPENORBIS__
++        // The budget is all free direct memory (shared with buffers, staging, command buffers),
++        // a few hundred MiB: collect early.
++        minimum_memory = static_cast<u64>(device_local_memory * 30 / 100);
++        expected_memory = static_cast<u64>(device_local_memory * 50 / 100);
++        critical_memory = static_cast<u64>(device_local_memory * 70 / 100);
++        LOG_INFO(HW_GPU, "PS4 texture cache GC: minimum {} MiB, expected {} MiB, critical {} MiB",
++                 minimum_memory >> 20, expected_memory >> 20, critical_memory >> 20);
++#endif
+     } else {
+         expected_memory = DEFAULT_EXPECTED_MEMORY + 512_MiB;
+         critical_memory = DEFAULT_CRITICAL_MEMORY + 1_GiB;
+diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
+index 2609e8dc0..d25887273 100644
+--- a/src/video_core/vulkan_common/vulkan.h
++++ b/src/video_core/vulkan_common/vulkan.h
+@@ -15,7 +15,7 @@
+ #define VK_USE_PLATFORM_ANDROID_KHR
+ #elif defined(__HAIKU__)
+ #define VK_USE_PLATFORM_XCB_KHR
+-#else
++#elif !defined(__OPENORBIS__)
+ #define VK_USE_PLATFORM_XLIB_KHR
+ #define VK_USE_PLATFORM_WAYLAND_KHR
+ #endif
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index be09bca8d..9a51389fe 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -30,6 +30,9 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#ifdef __OPENORBIS__
++#include "common/ps4_diagnostics.h"
++#endif
+ 
+ #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+ #include <adrenotools/bcenabler.h>
+@@ -752,9 +755,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             .flags = flags,
+             .physicalDevice = physical,
+             .device = *logical,
++#ifdef __OPENORBIS__
++            // Guest RAM and RADV share the same 4.5 GiB direct-memory pool.
++            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
++#else
+             .preferredLargeHeapBlockSize = is_integrated
+                                            ? (64u * 1024u * 1024u)
+                                            : (256u * 1024u * 1024u),
++#endif
+             .pAllocationCallbacks = nullptr,
+             .pDeviceMemoryCallbacks = nullptr,
+             .pHeapSizeLimit = nullptr,
+@@ -1575,6 +1583,8 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
+     }
+     if (present) {
+         present_family = *present;
++    } else if (!surface) {
++        present_family = graphics_family;
+     }
+ }
+ 
+@@ -1601,6 +1611,12 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
+ }
+ 
+ u64 Device::GetDeviceMemoryUsage() const {
++#ifdef __OPENORBIS__
++    // Every GPU allocation (and some CPU ones) comes out of the same ~0.5 GiB of direct memory;
++    // RADV's heaps claim 1 + 2 GiB. Usage = what has gone since the device was created.
++    const u64 free = Common::PS4Diagnostics::LargestFreeDirect();
++    return free < device_access_memory ? device_access_memory - free : 0;
++#endif
+     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget;
+     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+     budget.pNext = nullptr;
+@@ -1654,6 +1670,12 @@ void Device::CollectPhysicalMemoryInfo() {
+             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
+         }
+     }
++#ifdef __OPENORBIS__
++    // The caches size their garbage collection from this; the real limit is the free direct memory
++    // left after the 4 GiB of guest RAM (00.16: Clubhouse Games ran it out with 3 GiB "reported").
++    device_access_memory = Common::PS4Diagnostics::LargestFreeDirect();
++    LOG_INFO(Render_Vulkan, "PS4 GPU memory budget: {} MiB of free direct memory", device_access_memory >> 20);
++#endif
+ }
+ 
+ void Device::CollectToolingInfo() {
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index bbf3754e3..d437e1300 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -958,7 +958,11 @@ FN_MAX_LIMIT_LIST
+     }
+ 
+     bool CanReportMemoryUsage() const {
++#ifdef __OPENORBIS__
++        return true; // from free direct memory, see GetDeviceMemoryUsage
++#else
+         return extensions.memory_budget;
++#endif
+     }
+ 
+     u64 GetDeviceMemoryUsage() const;
+diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
+index 31fbfafbb..1a6218fdc 100644
+--- a/src/video_core/vulkan_common/vulkan_instance.cpp
++++ b/src/video_core/vulkan_common/vulkan_instance.cpp
+@@ -20,6 +20,15 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+ namespace Vulkan {
++#ifdef __OPENORBIS__
++extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance, const char*);
++extern "C" PFN_vkVoidFunction vk_common_GetDeviceProcAddr(VkDevice, const char*);
++static PFN_vkVoidFunction PS4GetInstanceProcAddr(VkInstance instance, const char* name) {
++    if (std::strcmp(name, "vkGetDeviceProcAddr") == 0)
++        return reinterpret_cast<PFN_vkVoidFunction>(vk_common_GetDeviceProcAddr);
++    return vk_icdGetInstanceProcAddr(instance, name);
++}
++#endif
+ namespace {
+ 
+ [[nodiscard]] bool AreExtensionsSupported(const vk::InstanceDispatch& dld, std::vector<VkExtensionProperties> const& properties, std::span<const char* const> extensions) {
+@@ -49,6 +58,10 @@ namespace {
+             extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+         }
+         break;
++#ifdef __OPENORBIS__
++    case Core::Frontend::WindowSystemType::Orbis:
++        break;
++#endif
+ #ifdef _WIN32
+     case Core::Frontend::WindowSystemType::Windows:
+         extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+@@ -65,7 +78,7 @@ namespace {
+     case Core::Frontend::WindowSystemType::Xcb:
+         extensions.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
+         break;
+-#else
++#elif !defined(__OPENORBIS__)
+     case Core::Frontend::WindowSystemType::X11:
+         extensions.push_back(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+         break;
+@@ -77,7 +90,8 @@ namespace {
+         LOG_ERROR(Render_Vulkan, "Presentation not supported on this platform");
+         break;
+     }
+-    if (window_type != Core::Frontend::WindowSystemType::Headless) {
++    if (window_type != Core::Frontend::WindowSystemType::Headless &&
++        window_type != Core::Frontend::WindowSystemType::Orbis) {
+         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+     }
+     // Probe optional extensions against the same snapshot the caller verifies against, so the
+@@ -122,6 +136,9 @@ void RemoveUnavailableLayers(const vk::InstanceDispatch& dld, std::vector<const
+ vk::Instance CreateInstance(const Common::DynamicLibrary& library, vk::InstanceDispatch& dld,
+                             u32 required_version, Core::Frontend::WindowSystemType window_type,
+                             bool enable_validation) {
++#ifdef __OPENORBIS__
++    dld.vkGetInstanceProcAddr = PS4GetInstanceProcAddr;
++#else
+     if (!library.IsOpen()) {
+         LOG_ERROR(Render_Vulkan, "Vulkan library not available");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+@@ -130,6 +147,7 @@ vk::Instance CreateInstance(const Common::DynamicLibrary& library, vk::InstanceD
+         LOG_ERROR(Render_Vulkan, "vkGetInstanceProcAddr not present in Vulkan");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+     }
++#endif
+     if (!vk::Load(dld)) {
+         LOG_ERROR(Render_Vulkan, "Failed to load Vulkan function pointers");
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+diff --git a/src/video_core/vulkan_common/vulkan_library.cpp b/src/video_core/vulkan_common/vulkan_library.cpp
+index d174a9d3c..2a5167611 100644
+--- a/src/video_core/vulkan_common/vulkan_library.cpp
++++ b/src/video_core/vulkan_common/vulkan_library.cpp
+@@ -16,7 +16,10 @@ namespace Vulkan {
+ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
+     [[maybe_unused]] Core::Frontend::GraphicsContext* context) {
+     LOG_DEBUG(Render_Vulkan, "Looking for a Vulkan library");
+-#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
++#if defined(__OPENORBIS__)
++    // RADV is linked into the executable; CreateInstance installs its ICD resolver.
++    return std::make_shared<Common::DynamicLibrary>();
++#elif defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+     // Android manages its Vulkan driver from the frontend.
+     return context->GetDriverLibrary();
+ #else
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index f4721543a..c24a07e9a 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -5,7 +5,10 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <bit>
++#include <chrono>
++#include <thread>
+ #include <limits>
+ #include <optional>
+ #include <type_traits>
+@@ -24,10 +27,36 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/settings.h"
++#ifdef __OPENORBIS__
++#include "common/ps4_diagnostics.h"
++#endif
+ 
+ namespace Vulkan {
+ namespace {
+ 
++#ifdef __OPENORBIS__
++std::function<void()> g_ps4_reclaim;
++std::atomic<std::thread::id> g_ps4_reclaim_thread{};
++thread_local bool t_ps4_reclaiming = false;
++// Kept free for what Eden does not allocate itself: RADV command buffers, descriptor pools, ...
++constexpr size_t PS4_HEADROOM = 48ULL << 20;
++
++void LogAllocationFailure(VmaAllocator allocator, const Device& device, VkResult result) {
++    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
++    vmaGetHeapBudgets(allocator, budgets);
++    const auto properties = device.GetPhysical().GetMemoryProperties().memoryProperties;
++    LOG_ERROR(Render_Vulkan, "PS4 Vulkan allocation failed: {} ({})",
++              vk::Exception{result}.what(), static_cast<int>(result));
++    for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
++        LOG_ERROR(Render_Vulkan, "VMA heap {}: blocks={} KiB, allocations={} KiB, budget={} KiB",
++                  i, budgets[i].statistics.blockBytes / 1024,
++                  budgets[i].statistics.allocationBytes / 1024, budgets[i].budget / 1024);
++    }
++    Common::PS4Diagnostics::LogDirectMemory("allocation failure");
++    Common::Log::Stop();
++}
++#endif
++
+ // Helpers translating MemoryUsage to flags/usage
+ 
+     [[maybe_unused]] VkMemoryPropertyFlags MemoryUsagePropertyFlags(MemoryUsage usage) {
+@@ -205,6 +234,43 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
+ 
+ MemoryAllocator::~MemoryAllocator() = default;
+ 
++#ifdef __OPENORBIS__
++void SetPS4MemoryReclaim(std::function<void()> reclaim) {
++    g_ps4_reclaim = std::move(reclaim);
++}
++
++void ClaimPS4ReclaimThread() {
++    g_ps4_reclaim_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
++}
++
++bool PS4Reclaim(size_t need, bool force) {
++    if (!g_ps4_reclaim || t_ps4_reclaiming ||
++        g_ps4_reclaim_thread.load(std::memory_order_relaxed) != std::this_thread::get_id()) {
++        return false;
++    }
++    const size_t free_before = Common::PS4Diagnostics::LargestFreeDirect();
++    if (!force && free_before >= need + PS4_HEADROOM) {
++        return false;
++    }
++    // Low memory that a reclaim cannot fix would otherwise stall every allocation on the GPU.
++    static std::chrono::steady_clock::time_point last_low_memory_reclaim{};
++    const auto now = std::chrono::steady_clock::now();
++    if (!force) {
++        if (now - last_low_memory_reclaim < std::chrono::milliseconds(250)) {
++            return false;
++        }
++        last_low_memory_reclaim = now;
++    }
++    t_ps4_reclaiming = true;
++    g_ps4_reclaim();
++    t_ps4_reclaiming = false;
++    LOG_WARNING(Render_Vulkan, "PS4 memory reclaim ({}): largest free direct block {} -> {} KiB",
++                force ? "allocation failed" : "low memory", free_before / 1024,
++                Common::PS4Diagnostics::LargestFreeDirect() / 1024);
++    return true;
++}
++#endif
++
+ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci) const
+ {
+     const VmaAllocationCreateInfo alloc_ci = {
+@@ -221,7 +287,21 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci) const
+     VkImage handle{};
+     VmaAllocation allocation{};
+     VmaAllocationInfo alloc_info{};
+-    vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++#ifdef __OPENORBIS__
++    PS4Reclaim(0, false);
++    VkResult result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    if (result != VK_SUCCESS && PS4Reclaim(0, true)) {
++        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    }
++    if (result != VK_SUCCESS) {
++        LOG_ERROR(Render_Vulkan, "Image allocation: {}x{}x{}, format={}, usage={:#x}",
++                  ci.extent.width, ci.extent.height, ci.extent.depth, u32(ci.format), ci.usage);
++        LogAllocationFailure(allocator, device, result);
++    }
++#else
++    const VkResult result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++#endif
++    vk::Check(result);
+ 
+     // Log GPU memory allocation for images
+     if (GPU::Logging::IsActive() &&
+@@ -258,7 +338,20 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
+     VmaAllocation allocation{};
+     VkMemoryPropertyFlags property_flags{};
+ 
+-    vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++#ifdef __OPENORBIS__
++    PS4Reclaim(ci.size, false);
++    VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    if (result != VK_SUCCESS && PS4Reclaim(ci.size, true)) {
++        result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    }
++    if (result != VK_SUCCESS) {
++        LOG_ERROR(Render_Vulkan, "Buffer allocation: {} KiB, usage={:#x}", ci.size / 1024, ci.usage);
++        LogAllocationFailure(allocator, device, result);
++    }
++#else
++    const VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++#endif
++    vk::Check(result);
+     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+ 
+     // Log GPU memory allocation for buffers
+@@ -314,8 +407,23 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
+     VmaAllocation allocation{};
+     VkMemoryPropertyFlags property_flags{};
+ 
++#ifdef __OPENORBIS__
++    PS4Reclaim(ci.size, false);
++    VkResult result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
++                                                   &allocation, &alloc_info);
++    if (result != VK_SUCCESS && PS4Reclaim(ci.size, true)) {
++        result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
++                                              &allocation, &alloc_info);
++    }
++    if (result != VK_SUCCESS) {
++        LOG_ERROR(Render_Vulkan, "Aligned buffer allocation: {} KiB", ci.size / 1024);
++        LogAllocationFailure(allocator, device, result);
++    }
++    vk::Check(result);
++#else
+     vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
+                                            &allocation, &alloc_info));
++#endif
+     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+ 
+     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+index a0f9081fc..8024ee882 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <functional>
+ #include <memory>
+ #include <span>
+ #include <vector>
+@@ -86,6 +87,17 @@ namespace Vulkan {
+ 
+ /// Memory allocator container.
+ /// Allocates and releases memory allocations on demand.
++#ifdef __OPENORBIS__
++    /// PS4: all GPU memory is ~0.5 GiB of direct memory. The renderer registers a way to give some
++    /// back (wait for the GPU, drop idle staging buffers); allocations run it, on the renderer's
++    /// thread only, when direct memory gets low or an allocation fails.
++    void SetPS4MemoryReclaim(std::function<void()> reclaim);
++    void ClaimPS4ReclaimThread();
++    /// Runs the reclaim if this is the renderer's thread and (force or) free direct memory is below
++    /// `need` plus the headroom kept for the driver. Returns whether it ran.
++    bool PS4Reclaim(size_t need, bool force);
++#endif
++
+     class MemoryAllocator {
+     public:
+         /**
+diff --git a/src/video_core/vulkan_common/vulkan_surface.cpp b/src/video_core/vulkan_common/vulkan_surface.cpp
+index d938fdf27..da5c2845e 100644
+--- a/src/video_core/vulkan_common/vulkan_surface.cpp
++++ b/src/video_core/vulkan_common/vulkan_surface.cpp
+@@ -15,6 +15,9 @@ vk::SurfaceKHR CreateSurface(
+     const vk::Instance& instance,
+     [[maybe_unused]] const Core::Frontend::EmuWindow::WindowSystemInfo& window_info) {
+     [[maybe_unused]] const vk::InstanceDispatch& dld = instance.Dispatch();
++#ifdef __OPENORBIS__
++    return {};
++#else
+     VkSurfaceKHR unsafe_surface = VkSurfaceKHR{};
+ 
+ #ifdef _WIN32
+@@ -124,6 +127,7 @@ vk::SurfaceKHR CreateSurface(
+         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+     }
+     return vk::SurfaceKHR(unsafe_surface, *instance, dld);
++#endif
+ }
+ 
+ } // namespace Vulkan

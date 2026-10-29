@@ -1,11 +1,13 @@
 // The launcher on the PS4. A start page first: it shows what an unfinished last run left behind
 // (the end of its log.txt, its crash report and boot trace) so that a photo of it is enough to see
 // where it stopped, and lets the player pick a program from a list (D-pad, X): the package's
-// (two games, a controller test, a GPU test, the test program hello.nro) and every .nro in
-// /data/eden-ps4.
-// Then the program runs. What it draws (with the CPU: there's no GPU emulation yet) fills the
-// screen; otherwise its text output and Eden's warnings and errors are shown, and they always go
-// to /data/eden-ps4/log.txt. The controller is player 1's Pro Controller. When the program ends,
+// (two games, a controller test, a GPU test, the test program hello.nro) and every program or
+// game in /data/eden-ps4 (.nro, .nso, .nsp, .xci: commercial games need the console's keys in
+// /data/eden-ps4/user/keys and its firmware in /data/eden-ps4/user/nand).
+// Then the program runs. With Mesa's RADV linked, Eden's Vulkan renderer draws it on the PS4's GPU,
+// straight to the screen (which the launcher gives up meanwhile); otherwise the null renderer's
+// frames (drawn on the CPU) fill the screen. Until it draws, its text output and Eden's warnings
+// and errors are shown, and they always go to /data/eden-ps4/log.txt. The controller is player 1's Pro Controller. When the program ends,
 // or L3 + R3 held for a second stop it, the start page comes back. Nothing is written outside /data/eden-ps4; Eden's data folders are
 // in /data/eden-ps4/user.
 //
@@ -44,6 +46,8 @@ int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t
                                       off_t* physOut);
 int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
                                  size_t align);
+int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
+int32_t sceKernelMunmap(void* addr, size_t len);
 int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
 int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 int32_t sceSysmoduleLoadModuleInternal(uint32_t id);
@@ -52,6 +56,8 @@ int32_t scePthreadSetaffinity(void* thread, uint64_t cpus);
 int32_t scePthreadSetprio(void* thread, int32_t priority);
 // port/ps4_crashlog.cpp: a line in /data/eden-ps4/boot-trace.log
 void ps4_boot_trace(const char* stage);
+// Mesa's RADV (or ps4_stubs.cpp's stand-in, without it)
+void* vk_icdGetInstanceProcAddr(void* instance, const char* name);
 }
 
 namespace {
@@ -96,20 +102,22 @@ public:
         if (handle < 0)
             return Failed("sceVideoOutOpen", handle);
         Trace("screen: flip event queue");
-        sceKernelCreateEqueue(&flip_queue, "eden-ps4 flip");
+        if (!flip_queue)
+            sceKernelCreateEqueue(&flip_queue, "eden-ps4 flip");
         sceVideoOutAddFlipEvent(flip_queue, handle, nullptr);
         Trace("screen: direct memory for 3 frames");
-        const size_t buffer_size = (size_t(kWidth) * kHeight * 4 + 2 * MB - 1) & ~(2 * MB - 1);
-        off_t phys = 0;
-        int32_t ret = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), buffer_size * kFrames,
+        int32_t ret = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kBufferSize * kFrames,
                                                     2 * MB, 3 /* write-combined, as Crema's VRAM */, &phys);
         if (ret != 0)
+        {
+            phys = -1;
             return Failed("sceKernelAllocateDirectMemory", ret);
+        }
         Trace("screen: map it");
-        void* base = nullptr;
-        ret = sceKernelMapDirectMemory(&base, buffer_size * kFrames, kProtCpuGpuRw, 0, phys, 2 * MB);
+        ret = sceKernelMapDirectMemory(&base, kBufferSize * kFrames, kProtCpuGpuRw, 0, phys, 2 * MB);
         if (ret != 0)
             return Failed("sceKernelMapDirectMemory", ret);
+        const size_t buffer_size = kBufferSize;
         for (int i = 0; i < kFrames; i++)
             buffers[i] = reinterpret_cast<uint32_t*>(static_cast<char*>(base) + buffer_size * i);
         Trace("screen: register buffers");
@@ -120,7 +128,26 @@ public:
         if (ret < 0)
             return Failed("sceVideoOutRegisterBuffers", ret);
         open = true;
+        flips = 0;
+        current = 0;
         return true;
+    }
+
+    // Gives the screen up (video out, and its frames' direct memory) for a program whose own
+    // display takes it: Eden's Vulkan renderer. Open takes it back.
+    void Release()
+    {
+        if (handle >= 0)
+            sceVideoOutClose(handle);
+        handle = -1;
+        if (base)
+            sceKernelMunmap(base, kBufferSize * kFrames);
+        if (phys >= 0)
+            sceKernelReleaseDirectMemory(phys, kBufferSize * kFrames);
+        base = nullptr;
+        phys = -1;
+        open = false;
+        Trace("screen: given up");
     }
 
     // Text size: 2 for the program's output (readable in a photo), 1.75 for the longer start page.
@@ -244,7 +271,10 @@ private:
         uint32_t color;
     };
     static constexpr int kFrames = 3;
+    static constexpr size_t kBufferSize = (size_t(kWidth) * kHeight * 4 + 2 * MB - 1) & ~(2 * MB - 1);
     int handle = -1;
+    off_t phys = -1; // the frames' direct memory
+    void* base = nullptr;
     bool open = false;
     OrbisKernelEqueue flip_queue = 0;
     uint32_t* buffers[kFrames] = {};
@@ -616,8 +646,14 @@ std::vector<Program> ListPrograms()
     std::vector<std::string> found;
     std::error_code ec;
     for (std::filesystem::directory_iterator it(kDataDir, ec), end; !ec && it != end; it.increment(ec))
-        if (it->path().extension() == ".nro" && it->is_regular_file(ec))
+    {
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return char(std::tolower(c)); });
+        if ((extension == ".nro" || extension == ".nso" || extension == ".nsp" || extension == ".xci") &&
+            it->is_regular_file(ec))
             found.push_back(it->path().string());
+    }
     std::sort(found.begin(), found.end());
     for (const std::string& path : found)
         programs.push_back({path, path});
@@ -806,6 +842,15 @@ void* Run(void*)
     setenv("EDEN_SW_STATS", "1", 0);
     setenv("EDEN_SW_THREADS", "4", 0);
     Launcher::SetAudio(MakeAudioOutput);
+    // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless settings.txt says
+    // EDEN_PS4_RENDERER=null (the software renderer)
+    const char* renderer = std::getenv("EDEN_PS4_RENDERER");
+    const bool radv = vk_icdGetInstanceProcAddr(nullptr, "vkCreateInstance") != nullptr;
+    const bool gpu = radv && !(renderer && std::string_view{renderer} == "null");
+    Trace(fmt::format("renderer: {}", gpu    ? "Vulkan on the PS4's GPU (Mesa's RADV)"
+                                      : radv ? "null (EDEN_PS4_RENDERER=null)"
+                                             : "null (no RADV in this build)"));
+    Launcher::SetGpuDisplay(gpu);
     for (bool first = true;; first = false)
     {
         const std::string program = StartPage(first);
@@ -817,10 +862,22 @@ void* Run(void*)
         g_running = true;
         pthread_t pad_thread;
         pthread_create(&pad_thread, nullptr, PadThread, nullptr);
+        if (gpu)
+        {
+            // the program's display takes the screen: what it prints still goes to log.txt
+            std::lock_guard lock{g_mutex};
+            g_screen.Release();
+        }
         const auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
         g_running = false;
         pthread_join(pad_thread, nullptr);
         g_drawing = false;
+        if (gpu)
+        {
+            std::lock_guard lock{g_mutex};
+            Trace(g_screen.Open() ? "screen open again" : "no screen (video out failed)");
+            g_screen.Draw();
+        }
         Trace(fmt::format("boot returned: status {}", int(result.status)));
         if (FILE* f = std::fopen(kLogFile, "a"))
         {

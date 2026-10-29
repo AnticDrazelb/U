@@ -1,6 +1,7 @@
 // The Eden PS4 launcher's core: boots a Switch program in Eden's core (kernel, scheduler, CPU
-// cores, HLE services, loader) with no GPU: the null renderer, whose frames (composed on the CPU)
-// go to the platform. Sound goes to the platform's output through Eden's frontend sink.
+// cores, HLE services, loader) with the null renderer, whose frames (composed on the CPU) go to
+// the platform; or, on the PS4 with Mesa's RADV linked, Eden's Vulkan renderer drawing straight to
+// the screen. Sound goes to the platform's output through Eden's frontend sink.
 // What the program prints, and Eden's warnings and errors, go to the platform's sink and to
 // log.txt.
 
@@ -60,6 +61,26 @@ private:
     FrameSink frames;
 };
 
+/// The PS4's screen, for Eden's Vulkan renderer: its swapchain (vk_swapchain_ps4.cpp) opens the
+/// console's video out and flips its own buffers, 1280x720.
+class ConsoleWindow final : public Core::Frontend::EmuWindow {
+public:
+    ConsoleWindow() {
+        window_info.type = Core::Frontend::WindowSystemType::Orbis;
+        window_info.render_surface = nullptr;
+        NotifyClientAreaSizeChanged({1280u, 720u});
+        UpdateCurrentFramebufferLayout(1280, 720);
+    }
+    std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override {
+        return std::make_unique<Core::Frontend::GraphicsContext>();
+    }
+    bool IsShown() const override {
+        return true;
+    }
+};
+
+bool g_gpu_display = false;
+
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
 // while a program runs.
 std::mutex g_pad_mutex;
@@ -104,7 +125,7 @@ void ApplyLauncherSettings() {
     // The null renderer composes frames on the CPU and drops GPU work; EDEN_PS4_RENDERER=vulkan
     // runs Eden's Vulkan renderer without a window (its frames read back), for GPU-drawn programs.
     const char* renderer = std::getenv("EDEN_PS4_RENDERER");
-    const bool vulkan = renderer && std::string_view{renderer} == "vulkan";
+    const bool vulkan = g_gpu_display || (renderer && std::string_view{renderer} == "vulkan");
     Settings::values.renderer_backend.SetValue(vulkan ? Settings::RendererBackend::Vulkan
                                                       : Settings::RendererBackend::Null);
     Settings::values.sink_id.SetValue(AudioCore::Sink::HasFrontendAudio() ? Settings::AudioEngine::Frontend
@@ -154,6 +175,10 @@ const char* LoadError(Core::SystemResultStatus status) {
 }
 
 } // namespace
+
+void SetGpuDisplay(bool on) {
+    g_gpu_display = on;
+}
 
 void SetPad(const PadState& state) {
     std::scoped_lock lock{g_pad_mutex};
@@ -256,7 +281,10 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             Core::System system;
             system.Initialize();
             system.ApplySettings();
-            HeadlessWindow window{frames};
+            HeadlessWindow headless{frames};
+            ConsoleWindow console;
+            Core::Frontend::EmuWindow& window = g_gpu_display ? static_cast<Core::Frontend::EmuWindow&>(console)
+                                                              : headless;
 
             system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
             system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
