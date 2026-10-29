@@ -416,6 +416,25 @@ the Switch's (`src/ui/`, since 03.20):
   less of the PS4's GPU memory (480 MiB once the Switch's 4 GiB are mapped; a quarter at 50%) and
   less GPU work, but doesn't speed up a game held back by the CPU, which most are (stage 1 measured
   a PS4 core at 15-25% of a busy Switch core's speed).
+
+  Since 03.30, also for speed (each item says what it does under it):
+  - **Graphics, Shader Cache** (on): a game's shaders are kept in
+    `/data/eden-ps4/user/cache/shader/<title id>`, with RADV's compiled pipelines, and built while
+    it loads the next time, so they don't stutter when they first appear again. (Eden's frontends
+    call `LoadDiskResources` themselves; this launcher didn't, so the cache was never used.
+    Homebrew without a title id in its NACP has none.) On the desktop with Vulkan, a second run's
+    first second went from 36 to 55 frames.
+  - **Graphics, Asynchronous Shaders** (on): new shaders are built in the background instead of
+    stopping the game while the PS4's CPU compiles them; what needs one is missing for a moment.
+  - **CPU, Accuracy**: Auto, or Unsafe (stage 1 measured about 10% on vector maths, nothing
+    elsewhere; some games misbehave with it).
+  - **CPU, CPU Cores**: 7 (the default) or 6. The package now asks for the PS4's 7-CPU mode
+    (`param.sfo` ATTRIBUTE 0x10002, as Crema's package does), which lets an app use the 7th core
+    the system shares; with 6, the runtime keeps every thread started from then on to cores 0-5
+    (`ps4_set_app_cores`).
+
+  Not an option: tuning the recompiler for the Jaguar, where stage 1 found it slowest (calls x10,
+  vector floats x12.5), is work on dynarmic itself.
 - The user's icon and the time at the top; the controller and the buttons' hints at the bottom.
 - A game without the keys: a dialog says where they go, instead of a loader error. After a run that
   didn't finish: its report first (the end of `log.txt`, `crash.log` and its last steps), to

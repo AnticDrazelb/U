@@ -69,6 +69,13 @@ void SetDocked(bool docked);
 /// 50 (Eden's resolution scaler, then scaled up for the screen). Set it before Boot.
 void SetResolution(int percent);
 
+/// Eden's disk shader cache (shaders kept in data_dir/user/shader and built while a game loads the
+/// next time), its asynchronous shaders (built in the background, a draw waiting for none), and
+/// its Unsafe CPU accuracy (instead of Auto). All off unless set. Set them before Boot.
+void SetShaderCache(bool on);
+void SetAsyncShaders(bool on);
+void SetCpuUnsafe(bool on);
+
 /// Where Boot keeps what it learned of a program that loaded (for a menu to show next time):
 /// data_dir/cache/titles/<hash of its path>.<extension>, "jpg" its icon, "txt" its title and
 /// publisher (a line each).

@@ -35,6 +35,8 @@
 #include "launcher.h"
 #include "network/network.h"
 #include "video_core/gpu.h"
+#include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_base.h"
 
 namespace Launcher {
 namespace {
@@ -84,6 +86,7 @@ public:
 bool g_gpu_display = false;
 bool g_docked = true;
 int g_resolution = 100;
+bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false;
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
 // while a program runs.
@@ -143,7 +146,9 @@ void ApplyLauncherSettings() {
                                                       : Settings::RendererBackend::Null);
     Settings::values.sink_id.SetValue(AudioCore::Sink::HasFrontendAudio() ? Settings::AudioEngine::Frontend
                                                                            : Settings::AudioEngine::Null);
-    Settings::values.use_disk_shader_cache.SetValue(false);
+    Settings::values.use_disk_shader_cache.SetValue(g_shader_cache);
+    Settings::values.use_asynchronous_shaders.SetValue(g_async_shaders);
+    Settings::values.cpu_accuracy.SetValue(g_cpu_unsafe ? Settings::CpuAccuracy::Unsafe : Settings::CpuAccuracy::Auto);
     // GPU macros (MME: deko3d's and Mesa's draws use them) interpreted: the macro JIT writes x86 code
     // into memory it makes executable itself, which a PS4 app can't (EDEN_PS4_MACRO_JIT=1 for it)
     const char* macro_jit = std::getenv("EDEN_PS4_MACRO_JIT");
@@ -195,6 +200,18 @@ void SetDocked(bool docked) {
 
 void SetResolution(int percent) {
     g_resolution = percent;
+}
+
+void SetShaderCache(bool on) {
+    g_shader_cache = on;
+}
+
+void SetAsyncShaders(bool on) {
+    g_async_shaders = on;
+}
+
+void SetCpuUnsafe(bool on) {
+    g_cpu_unsafe = on;
 }
 
 std::filesystem::path TitleCachePath(const std::filesystem::path& data_dir, std::string_view program,
@@ -363,6 +380,17 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                 CacheTitle(system, data_dir, program.string());
                 system.GPU().Start();
                 system.GetCpuManager().OnGpuReady();
+                // the shaders this game used before, built now (as yuzu-cmd does): a longer start,
+                // no stutter for them later (title id 0, as homebrew without one: no cache)
+                if (Settings::values.use_disk_shader_cache.GetValue() &&
+                    Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan) {
+                    u64 title_id = 0;
+                    if (system.GetAppLoader().ReadProgramId(title_id) != Loader::ResultStatus::Success || !title_id)
+                        title_id = system.GetApplicationProcessProgramID();
+                    Output(LineKind::Status, fmt::format("loading the shader cache of {:016x}", title_id));
+                    system.Renderer().ReadRasterizer()->LoadDiskResources(
+                        title_id, std::stop_token{}, [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+                }
                 std::unique_lock lock{g_run_mutex};
                 g_running = true;
                 g_stop = false;

@@ -54,7 +54,8 @@ else
     set_entry APP_TYPE Integer 4 1
     # 0x2: system dialogs (the keyboard) confirm with Cross. Without it they follow the
     # console's region default, which is Circle on some consoles (DolphinPS4 Lab's fix).
-    set_entry ATTRIBUTE Integer 4 0x2
+    # SFO_ATTRIBUTE replaces it (0x10002: also 7-CPU mode, the 7th core the system shares).
+    set_entry ATTRIBUTE Integer 4 "${SFO_ATTRIBUTE:-0x2}"
     set_entry CATEGORY Utf8 4 gd
     set_entry SYSTEM_VER Integer 4 0
 fi

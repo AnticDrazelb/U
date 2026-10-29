@@ -53,7 +53,11 @@ struct MenuSettings
     bool white_theme = false;
     bool software_renderer = false;
     bool docked = false;
-    int resolution = 100; // what games render at, in percent of the console mode's: 100, 75 or 50
+    int resolution = 100;      // what games render at, in percent of the console mode's: 100, 75 or 50
+    bool shader_cache = true;  // shaders kept on disk, built while a game loads the next time
+    bool async_shaders = true; // shaders built in the background (a draw waits for none)
+    bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
+    bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
 };
 
 // One line of the Games and Keys screen: something found (or not), and where
@@ -119,6 +123,12 @@ private:
         double opened = 0;
     };
     struct Theme;
+    struct SettingItem
+    {
+        std::string label, value, description;
+        void (*change)(MenuSettings&);
+    };
+    std::vector<SettingItem> SettingItems(int category) const;
 
     const Theme& CurrentTheme() const;
     size_t HomeCount() const;

@@ -972,6 +972,18 @@ int g_crema_core_layout = 0;
 }
 
 namespace {
+// the cores new threads may run on (ps4_set_app_cores): every core the app may use by default
+uint64_t g_app_cores = 0x7F;
+}
+
+// The cores threads started from now on may run on: 0x7F all seven (the 7th, shared with the
+// system, needs the package's 7-CPU attribute), 0x3F the six that are the app's alone (Eden for
+// PS4's System Settings, CPU Cores).
+extern "C" void ps4_set_app_cores(uint64_t mask) {
+    g_app_cores = mask;
+}
+
+namespace {
 constexpr uint64_t kAppCores = 0x7F;  // every core the app may use (the 7th is shared with the system)
 constexpr uint64_t kModule0Cores = 0x0F; // cores 0-3: the first Jaguar module, all the app's
 constexpr uint64_t kModule1Cores = 0x70; // cores 4-6 of the second (the 7th is the system's)
@@ -992,7 +1004,7 @@ void* startOnAppCores(void* raw) {
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
     reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(),
-                                                            g_crema_core_layout == 2 ? kModule1Cores : kAppCores);
+                                                            g_crema_core_layout == 2 ? kModule1Cores : g_app_cores);
     ps4_install_signal_stack();
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name

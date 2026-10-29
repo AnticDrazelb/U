@@ -65,6 +65,8 @@ void ps4_boot_trace(const char* stage);
 void* vk_icdGetInstanceProcAddr(void* instance, const char* name);
 // libSceSystemService: "exit" closes the app (back to the PS4's home screen)
 int sceSystemServiceLoadExec(const char* path, char* const argv[]);
+// port/ps4_runtime.cpp: the cores new threads may run on
+void ps4_set_app_cores(uint64_t mask);
 // port/ps4_runtime.cpp: direct memory the C heap's overflow leaves for the GPU
 void ps4_heap_set_overflow_gpu_reserve(size_t bytes);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
@@ -853,6 +855,14 @@ Ui::MenuSettings LoadMenuSettings()
             settings.resolution = 75;
         else if (line == "resolution=50")
             settings.resolution = 50;
+        else if (line == "shader_cache=off")
+            settings.shader_cache = false;
+        else if (line == "async_shaders=off")
+            settings.async_shaders = false;
+        else if (line == "cpu=unsafe")
+            settings.cpu_unsafe = true;
+        else if (line == "cores=6")
+            settings.seventh_core = false;
     }
     return settings;
 }
@@ -861,9 +871,12 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
 {
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
-        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\n", settings.white_theme ? "white" : "black",
-                     settings.software_renderer ? "software" : "vulkan", settings.docked ? "docked" : "handheld",
-                     settings.resolution);
+        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ncpu=%s\n"
+                        "cores=%d\n",
+                     settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
+                     settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
+                     settings.async_shaders ? "on" : "off", settings.cpu_unsafe ? "unsafe" : "auto",
+                     settings.seventh_core ? 7 : 6);
         std::fclose(f);
     }
 }
@@ -1050,10 +1063,13 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         {
             choice.settings = menu.Settings();
             SaveMenuSettings(choice.settings);
-            Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%",
+            Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
+                              "asynchronous shaders {}, CPU {}, {} cores",
                               choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
-                              choice.settings.docked ? "docked" : "handheld", choice.settings.resolution));
+                              choice.settings.docked ? "docked" : "handheld", choice.settings.resolution,
+                              choice.settings.shader_cache ? "on" : "off", choice.settings.async_shaders ? "on" : "off",
+                              choice.settings.cpu_unsafe ? "unsafe" : "auto", choice.settings.seventh_core ? 7 : 6));
         }
         menu.Draw(canvas, now);
         g_screen.DrawFrame({canvas.Pixels(), size_t(canvas.Width()) * canvas.Height()}, uint32_t(canvas.Width()),
@@ -1279,9 +1295,16 @@ void* Run(void*)
         Launcher::SetGpuDisplay(gpu);
         Launcher::SetDocked(settings.docked);
         Launcher::SetResolution(settings.resolution);
+        Launcher::SetShaderCache(settings.shader_cache);
+        Launcher::SetAsyncShaders(settings.async_shaders);
+        Launcher::SetCpuUnsafe(settings.cpu_unsafe);
+        ps4_set_app_cores(settings.seventh_core ? 0x7F : 0x3F);
         NoteRecent(program);
-        Trace(fmt::format("renderer: {}; console mode: {}; resolution {}%", g_renderer_label,
-                          settings.docked ? "docked" : "handheld", settings.resolution));
+        Trace(fmt::format("renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}; "
+                          "CPU {}, {} cores",
+                          g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
+                          settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
+                          settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6));
         {
             std::lock_guard lock{g_mutex};
             g_screen.SetStatus(fmt::format("booting {}", program));

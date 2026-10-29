@@ -124,6 +124,11 @@ int main(int argc, char** argv)
     Press(menu, kDown);
     Press(menu, kCross);
     Shot(menu, "settings-graphics");
+    Press(menu, kLeft);
+    Press(menu, kDown);
+    Press(menu, kRight);
+    Press(menu, kDown);
+    Shot(menu, "settings-cpu");
     Press(menu, kCircle);
     Press(menu, kCircle);
     Press(menu, kLeft);

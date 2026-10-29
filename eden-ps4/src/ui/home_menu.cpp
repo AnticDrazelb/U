@@ -39,8 +39,8 @@ constexpr SystemButton kButtons[] = {
 };
 constexpr int kButtonCount = int(sizeof(kButtons) / sizeof(kButtons[0]));
 
-const char* const kCategories[] = {"Themes", "Graphics", "Console", "About"};
-constexpr int kCategoryCount = 4;
+const char* const kCategories[] = {"Themes", "Graphics", "CPU", "Console", "About"};
+constexpr int kCategoryCount = 5;
 
 float Smooth(float current, float target, float dt)
 {
@@ -338,7 +338,8 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
                 screen = Screen::Home;
             return {};
         }
-        const int items = settings_category == 1 ? 2 : settings_category < 3 ? 1 : 0;
+        const std::vector<SettingItem> list = SettingItems(settings_category);
+        const int items = int(list.size());
         if (!settings_items)
         {
             if (moves & kUp)
@@ -361,16 +362,9 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
             settings_item = std::max(0, settings_item - 1);
         if (moves & kDown)
             settings_item = std::min(items - 1, settings_item + 1);
-        if (pressed & kCross)
+        if ((pressed & kCross) && settings_item < items)
         {
-            if (settings_category == 0)
-                settings.white_theme = !settings.white_theme;
-            else if (settings_category == 1 && settings_item == 0)
-                settings.software_renderer = !settings.software_renderer;
-            else if (settings_category == 1)
-                settings.resolution = settings.resolution == 100 ? 75 : settings.resolution == 75 ? 50 : 100;
-            else if (settings_category == 2)
-                settings.docked = !settings.docked;
+            list[settings_item].change(settings);
             return {MenuAction::Kind::SettingsChanged, {}};
         }
         return {};
@@ -594,6 +588,65 @@ void HomeMenu::DrawAllSoftware(Canvas& c, double now)
     DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Options, "Options"}, {Glyph::Cross, "Start"}});
 }
 
+std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
+{
+    const auto on_off = [](bool on) { return std::string(on ? "On" : "Off"); };
+    switch (category)
+    {
+    case 0:
+        return {{"Theme", settings.white_theme ? "Basic White" : "Basic Black",
+                 "The HOME menu's colours, as the Switch's two themes.",
+                 [](MenuSettings& s) { s.white_theme = !s.white_theme; }}};
+    case 1: {
+        const int width = (settings.docked ? 1920 : 1280) * settings.resolution / 100;
+        const int height = (settings.docked ? 1080 : 720) * settings.resolution / 100;
+        return {
+            {"Renderer", settings.software_renderer ? "Software (the PS4's CPU)" : "Vulkan (the PS4's GPU)",
+             "Vulkan draws the Switch's GPU work with the PS4's GPU, through Mesa's RADV driver" +
+                 std::string(radv_linked ? "." : " (not in this build).") +
+                 " The software renderer draws it with the CPU: every title works the same, but 3D games are far "
+                 "too slow to play. If Vulkan doesn't start, the software renderer takes over.\n\nNow: " +
+                 renderer + ".",
+             [](MenuSettings& s) { s.software_renderer = !s.software_renderer; }},
+            {"Resolution",
+             std::to_string(settings.resolution) + "%  (" + std::to_string(width) + "x" + std::to_string(height) + ")",
+             "Games draw at this share of the console mode's resolution, then scaled up: less of the PS4's GPU "
+             "memory (a quarter at 50%) and less GPU work, at the cost of sharpness. It doesn't speed up a game held "
+             "back by the CPU, as most are. Some games show glitches below 100%.",
+             [](MenuSettings& s) { s.resolution = s.resolution == 100 ? 75 : s.resolution == 75 ? 50 : 100; }},
+            {"Shader Cache", on_off(settings.shader_cache),
+             "A game's shaders are kept in /data/eden-ps4/user/cache/shader, and built while it loads the next time "
+             "instead of when they first appear: a longer start, less stutter once it runs.",
+             [](MenuSettings& s) { s.shader_cache = !s.shader_cache; }},
+            {"Asynchronous Shaders", on_off(settings.async_shaders),
+             "New shaders are built in the background instead of stopping the game while they compile (slow on "
+             "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",
+             [](MenuSettings& s) { s.async_shaders = !s.async_shaders; }},
+        };
+    }
+    case 2:
+        return {
+            {"Accuracy", settings.cpu_unsafe ? "Unsafe" : "Auto",
+             "How exactly the Switch's CPU is followed. Unsafe skips some exactness in floating-point maths and in "
+             "how cores share memory: about 10% faster on vector maths on the PS4 (measured), no faster on the "
+             "rest, and some games misbehave with it.",
+             [](MenuSettings& s) { s.cpu_unsafe = !s.cpu_unsafe; }},
+            {"CPU Cores", settings.seventh_core ? "7 (with the shared one)" : "6",
+             "A PS4 app has 6 cores to itself and may use a 7th that the system shares. With 7, Eden's threads "
+             "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "
+             "system needs its core.",
+             [](MenuSettings& s) { s.seventh_core = !s.seventh_core; }},
+        };
+    case 3:
+        return {{"Console Mode", settings.docked ? "Docked (TV, 1920x1080)" : "Handheld (1280x720)",
+                 "Games run as on a Switch in handheld mode, at 1280x720, or docked, at 1920x1080. Handheld asks "
+                 "less of the PS4's GPU.",
+                 [](MenuSettings& s) { s.docked = !s.docked; }}};
+    default:
+        return {};
+    }
+}
+
 void HomeMenu::DrawSettings(Canvas& c, double now)
 {
     const Theme& t = CurrentTheme();
@@ -612,47 +665,8 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
     }
     c.Line(kCategoryWidth + 30, kHeaderLine + 12, kCategoryWidth + 30, kBottomLine - 12, 1.2f, t.line);
 
-    // the category's items and what they mean
-    struct Item
-    {
-        std::string label, value;
-    };
-    std::vector<Item> items;
-    std::string description;
-    switch (settings_category)
-    {
-    case 0:
-        items = {{"Theme", settings.white_theme ? "Basic White" : "Basic Black"}};
-        description = "The HOME menu's colours, as the Switch's two themes.";
-        break;
-    case 1: {
-        const int width = (settings.docked ? 1920 : 1280) * settings.resolution / 100;
-        const int height = (settings.docked ? 1080 : 720) * settings.resolution / 100;
-        items = {{"Renderer", settings.software_renderer ? "Software (the PS4's CPU)" : "Vulkan (the PS4's GPU)"},
-                 {"Resolution", std::to_string(settings.resolution) + "%  (" + std::to_string(width) + "x" +
-                                    std::to_string(height) + ")"}};
-        description = "Vulkan draws the Switch's GPU work with the PS4's GPU, through Mesa's RADV driver" +
-                      std::string(radv_linked ? "." : " (not in this build).") +
-                      " The software renderer draws it with the CPU: every title works the same, but 3D games are "
-                      "far too slow to play. If Vulkan doesn't start, the software renderer takes over.\n\n"
-                      "Resolution: games draw at this share of the console mode's resolution, then scaled up. Less "
-                      "of the PS4's GPU memory (a quarter at 50%) and less GPU work, at the cost of sharpness. It "
-                      "doesn't speed up a game held back by the CPU, as most are. Some games show glitches below "
-                      "100%.\n\nNow: " +
-                      renderer + ".";
-        break;
-    }
-    case 2:
-        items = {{"Console Mode", settings.docked ? "Docked (TV, 1920x1080)" : "Handheld (1280x720)"}};
-        description = "Games run as on a Switch in handheld mode, at 1280x720, or docked, at 1920x1080. Handheld "
-                      "asks less of the PS4's GPU.";
-        break;
-    default:
-        description = "Eden for PS4 " + version + "\nThe Nintendo Switch emulator Eden (eden-emu.dev), on the PS4.\n\n"
-                      "Renderer: " + renderer + "\nData folder: /data/eden-ps4\n\nGPL-3.0-or-later. The font is "
-                      "Inter (rsms.me/inter), under the SIL Open Font License.";
-        break;
-    }
+    // the category's items, and what the selected one means
+    const std::vector<SettingItem> items = SettingItems(settings_category);
     c.Text(kItemLeft, 150, kCategories[settings_category], 24, Weight::SemiBold, t.text);
     float y = 176;
     for (size_t i = 0; i < items.size(); i++)
@@ -666,6 +680,13 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
         y += kItemHeight;
         c.Line(kItemLeft, y, kItemRight, y, 1.0f, t.line);
     }
+    std::string description;
+    if (items.empty())
+        description = "Eden for PS4 " + version + "\nThe Nintendo Switch emulator Eden (eden-emu.dev), on the PS4.\n\n"
+                      "Renderer: " + renderer + "\nData folder: /data/eden-ps4\n\nGPL-3.0-or-later. The font is "
+                      "Inter (rsms.me/inter), under the SIL Open Font License.";
+    else
+        description = items[std::min(size_t(settings_items ? settings_item : 0), items.size() - 1)].description;
     y += items.empty() ? 0 : 36;
     for (const std::string& line : c.Wrap(description, 17, Weight::Regular, kItemRight - kItemLeft - 16))
     {

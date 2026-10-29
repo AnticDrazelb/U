@@ -22,6 +22,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -238,6 +239,13 @@ int main(int argc, char** argv) {
     }
     std::atomic<bool> done{false};
     std::thread input;
+    // Eden's disk shader cache and asynchronous shaders (off unless set to 1)
+    const auto flag = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value && std::string_view{value} == "1";
+    };
+    Launcher::SetShaderCache(flag("EDEN_PS4_SHADER_CACHE"));
+    Launcher::SetAsyncShaders(flag("EDEN_PS4_ASYNC_SHADERS"));
     if (const char* env = std::getenv("EDEN_PS4_INPUT")) {
         input = std::thread(PlayInput, std::string(env), &done);
     }
