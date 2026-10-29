@@ -5,7 +5,9 @@
       "Bash(git clone https://github.com/shadps4-emu/shadPS4.git *)",
       "Bash(cmake -S /root/emu/shadPS4 *)",
       "Bash(ninja -C /root/emu/shadPS4/build *)",
-      "Bash(xvfb-run -a /root/emu/shadPS4/build/shadps4 *)"
+      "Bash(xvfb-run -a /root/emu/shadPS4/build/shadps4 *)",
+      "Bash(scripts/build-mesa.sh *)",
+      "Bash(CMAKE=/opt/cmake-3.31.6-linux-x86_64/bin/cmake EDEN_DIR=/root/eden-ps4src ./build.sh ps4*)"
     ]
   }
 }
