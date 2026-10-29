@@ -336,9 +336,11 @@ memory) to the program's display while the program runs, and takes it back after
 build, nothing changes.
 
 Commercial games: the start page lists every `.nsp`, `.xci`, `.nso` and `.nro` in
-`/data/eden-ps4`. Eden needs the console's keys in `/data/eden-ps4/user/keys/prod.keys` (and
-`title.keys`) and its firmware (the NCA files) in
-`/data/eden-ps4/user/nand/system/Contents/registered/`, dumped from your own Switch.
+`/data/eden-ps4` and at the top of a USB drive (`/mnt/usb0` to `/mnt/usb7`), with each file's
+size and where it is (a long list scrolls). Eden needs the keys of the Switch it was dumped from
+in `/data/eden-ps4/user/keys/prod.keys` (and `title.keys`) and that Switch's firmware (the NCA
+files) in `/data/eden-ps4/user/nand/system/Contents/registered/`; without `prod.keys` the start
+page says so when a game is chosen, instead of booting it.
 
 If Vulkan doesn't start (RADV can't open the GPU), the launcher keeps that boot's log as
 `log-vulkan.txt` and boots the program again with the software renderer, which it then keeps
@@ -400,9 +402,10 @@ of programs: the D-pad chooses, X boots.
 - **Controller test** (`padtest.nro`, in the package). OPTIONS and the touchpad's click together
   quit.
 - **The test program** (`hello.nro`, in the package): stage 2's checks, text only.
-- **Every `.nro` in `/data/eden-ps4`.** A homebrew program that draws with the CPU (libnx's
-  framebuffer or console, as the games and the controller test) can work; one that draws with the
-  GPU (deko3d, OpenGL, SDL's renderer) shows nothing.
+- **Every `.nro`, `.nso`, `.nsp` and `.xci` in `/data/eden-ps4` and at the top of a USB drive.**
+  A homebrew program that draws with the CPU (libnx's framebuffer or console, as the games and the
+  controller test) works with either renderer; what draws with the GPU (games, deko3d, OpenGL)
+  needs the Vulkan renderer on the PS4's GPU, or is drawn (slowly) by the software renderer.
 
 When the program ends, the start page comes back. Both sticks pressed in (L3 + R3) for a second stop
 a program, for one without a way to quit or one that hangs; where its threads were goes to
@@ -551,6 +554,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | vulkan: the PS4's GPU through Mesa's RADV, after Eden4 | stage 5, above |
 | core: free the application's process before the kernel when loading fails | an upstream use-after-free on a failed boot: harmless with glibc, a crash on the PS4 (stage 5, above) |
 | common: the PS4's thread names go to the app's runtime | named threads in `hang.log`, and heap arenas for the busy ones (above) |
+| common: the GPU's page table takes PS4 memory as it is used | below |
 
 The PS4 memory changes, from what stage 1 measured:
 
@@ -572,6 +576,10 @@ The PS4 memory changes, from what stage 1 measured:
   direct memory would have left RADV about 100 MiB. Eden4 learned this on a console: one large
   overflow heap left its Vulkan driver 320 KiB in Clubhouse Games. Eden's CPU core threads and its
   GPU thread get heap arenas of their own (10 MiB each), as Crema's busy threads do.
+- **The GPU's page table** (`common/multi_level_page_table.inc`): a game's GPU address space
+  (37 bits) took 128 MiB of system flexible memory the moment it was made, mapped in full; it
+  only reserves its range now, and takes 64 KiB at a time as the game maps GPU memory there, as
+  on Windows (Eden4 found this too).
 - **No fastmem**: the PS4 can't map the same memory twice for an app.
 - Fiber stacks were already 512 KiB on the PS4 upstream (2 MiB elsewhere). Eden makes about 75
   fibers (one per emulated thread, most of them for HLE services).

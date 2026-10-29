@@ -624,6 +624,8 @@ void* PadThread(void*)
 // boot trace gets their rate every 10 s, how long the launcher waited for a buffer off the screen
 // (the display's pace) and how long scaling a frame onto it took.
 std::atomic<bool> g_drawing{false};
+// What draws the Switch's GPU work, for the start page (Run sets it)
+std::string g_renderer_label = "the software renderer";
 std::atomic<uint64_t> g_frames_shown{0}; // (for the hang watchdog)
 void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
 {
@@ -654,11 +656,21 @@ void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height
     }
 }
 
-// The programs on the start page: the package's, then every .nro in the data folder.
+// The programs on the start page: the package's, then every program (.nro, .nso) and game (.nsp,
+// .xci) in the data folder and at the top of a USB drive (/mnt/usb0 to /mnt/usb7).
 struct Program {
     std::string path;
     std::string label;
 };
+
+bool IsGame(const std::string& path)
+{
+    std::string extension = std::filesystem::path(path).extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    return extension == ".nsp" || extension == ".xci";
+}
+
 std::vector<Program> ListPrograms()
 {
     std::vector<Program> programs = {
@@ -668,20 +680,32 @@ std::vector<Program> ListPrograms()
         {"/app0/gputest.nro", "GPU test (drawn with the Switch's GPU, as clears: OPTIONS to quit)"},
         {kTestProgram, "The test program (hello.nro: text only)"},
     };
-    std::vector<std::string> found;
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it(kDataDir, ec), end; !ec && it != end; it.increment(ec))
+    std::vector<std::pair<std::string, std::string>> folders = {{kDataDir, "data folder"}};
+    for (int i = 0; i < 8; i++)
+        folders.push_back({fmt::format("/mnt/usb{}", i), fmt::format("USB {}", i)});
+    for (const auto& [folder, where] : folders)
     {
-        std::string extension = it->path().extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(),
-                       [](unsigned char c) { return char(std::tolower(c)); });
-        if ((extension == ".nro" || extension == ".nso" || extension == ".nsp" || extension == ".xci") &&
-            it->is_regular_file(ec))
-            found.push_back(it->path().string());
+        std::vector<std::filesystem::path> found;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
+        {
+            std::string extension = it->path().extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char c) { return char(std::tolower(c)); });
+            if ((extension == ".nro" || extension == ".nso" || extension == ".nsp" || extension == ".xci") &&
+                it->is_regular_file(ec))
+                found.push_back(it->path());
+        }
+        std::sort(found.begin(), found.end());
+        for (const std::filesystem::path& path : found)
+        {
+            const uintmax_t size = std::filesystem::file_size(path, ec);
+            const std::string amount = ec ? "?"
+                                     : size >= 1024 * MB ? fmt::format("{:.1f} GB", double(size) / (1024 * MB))
+                                                         : fmt::format("{} MB", (size + MB - 1) / MB);
+            programs.push_back({path.string(), fmt::format("{}  ({}, {})", path.filename().string(), where, amount)});
+        }
     }
-    std::sort(found.begin(), found.end());
-    for (const std::string& path : found)
-        programs.push_back({path, path});
     return programs;
 }
 
@@ -697,6 +721,7 @@ std::string StartPage(bool first)
     static size_t selected = 0; // kept between runs
     if (selected >= programs.size())
         selected = 0;
+    std::string notice; // why the chosen program didn't boot
 
     std::lock_guard lock{g_mutex};
     if (first)
@@ -704,8 +729,8 @@ std::string StartPage(bool first)
     const auto page = [&] {
         g_screen.Clear();
         g_screen.SetScale(1.75f);
-        g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": Eden's Switch core, booting Switch homebrew (drawn with the CPU: no GPU emulation yet)",
-                     kGreen, false);
+        g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": the Switch emulator Eden; the Switch's GPU through " +
+                         g_renderer_label, kGreen, false);
         if (unfinished)
         {
             g_screen.Add("The last run didn't finish. What it left behind is below: take a photo of this screen first.",
@@ -733,11 +758,23 @@ std::string StartPage(bool first)
             g_screen.Add("The program ended; its output is in /data/eden-ps4/log.txt.", kWhite, false);
         }
         g_screen.Add("", kWhite, false);
-        g_screen.Add("Choose a program with the D-pad, X to boot it. Put more (.nro) in /data/eden-ps4.", kYellow, false);
+        g_screen.Add("Choose a program with the D-pad, X to boot it. Games (.nsp, .xci) and homebrew (.nro) go in "
+                     "/data/eden-ps4 or at the top of a USB drive.", kYellow, false);
         g_screen.Add("In a program, both sticks pressed in (L3 + R3) for a second stop it.", kGrey, false);
-        for (size_t i = 0; i < programs.size(); i++)
+        if (!notice.empty())
+            g_screen.Add(notice, kRed, false);
+        // (a window of the list around the choice, when it is long)
+        constexpr size_t kShown = 16;
+        const size_t first_shown = programs.size() <= kShown ? 0
+                                   : std::min(selected > kShown / 2 ? selected - kShown / 2 : 0, programs.size() - kShown);
+        const size_t end_shown = std::min(programs.size(), first_shown + kShown);
+        if (first_shown > 0)
+            g_screen.Add(fmt::format("      ({} more above)", first_shown), kGrey, false);
+        for (size_t i = first_shown; i < end_shown; i++)
             g_screen.Add((i == selected ? "  >  " : "      ") + programs[i].label, i == selected ? kGreen : kWhite,
                          false);
+        if (end_shown < programs.size())
+            g_screen.Add(fmt::format("      ({} more below)", programs.size() - end_shown), kGrey, false);
     };
     page();
     Trace(fmt::format("start page: last run {}, pad {}, {} programs", unfinished ? "unfinished" : "finished or none",
@@ -763,8 +800,19 @@ std::string StartPage(bool first)
         previous = buttons;
         if (pressed & ORBIS_PAD_BUTTON_CROSS)
         {
-            program = programs[selected].path;
-            break;
+            // a game needs the keys of the Switch it was dumped from
+            const std::string keys = std::string(kDataDir) + "/user/keys/prod.keys";
+            std::error_code ec;
+            if (!IsGame(programs[selected].path) || std::filesystem::exists(keys, ec))
+            {
+                program = programs[selected].path;
+                break;
+            }
+            notice = "No keys: a game (.nsp, .xci) needs prod.keys (and title.keys) from your Switch in "
+                     "/data/eden-ps4/user/keys/, and its firmware in /data/eden-ps4/user/nand/system/Contents/registered/.";
+            Trace("start page: no " + keys + " for " + programs[selected].path);
+            wait = true;
+            page();
         }
         if (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))
         {
@@ -984,6 +1032,7 @@ void* Run(void*)
                                       : radv ? "null (EDEN_PS4_RENDERER=null)"
                                              : "null (no RADV in this build)"));
     Launcher::SetGpuDisplay(gpu);
+    g_renderer_label = gpu ? "Vulkan on the PS4's GPU (Mesa's RADV)" : "the software renderer";
     for (bool first = true;; first = false)
     {
         const std::string program = StartPage(first);
@@ -1022,6 +1071,7 @@ void* Run(void*)
             gpu = false;
             Launcher::SetGpuDisplay(false);
             rename(kLogFile, "/data/eden-ps4/log-vulkan.txt");
+            g_renderer_label = "the software renderer (Vulkan didn't start: see log-vulkan.txt)";
             Trace("renderer: Vulkan did not start; the null renderer from now on");
             ShowLine(Launcher::LineKind::Status,
                      "Vulkan did not start (see log-vulkan.txt): booting again with the software renderer");

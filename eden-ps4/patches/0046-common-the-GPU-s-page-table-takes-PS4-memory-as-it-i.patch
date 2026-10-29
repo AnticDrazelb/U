@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 09:21:17 +0000
+Subject: [PATCH] common: the GPU's page table takes PS4 memory as it is used
+
+MultiLevelPageTable mmapped its whole range, which the PS4 commits at
+once: 128 MiB of system flexible memory (the pool shared with the app
+heap, the code caches and Sony's own modules) for a 37-bit GPU address
+space, 1 GiB for 40 bits. Its range is now only reserved, and each
+first-level chunk (64 KiB) gets memory when first used, as on Windows.
+(Eden4 does the same.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ src/common/multi_level_page_table.inc | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/common/multi_level_page_table.inc b/src/common/multi_level_page_table.inc
+index 79125e8e0..9465666e8 100644
+--- a/src/common/multi_level_page_table.inc
++++ b/src/common/multi_level_page_table.inc
+@@ -9,9 +9,20 @@
+ 
+ #include "common/assert.h"
+ #include "common/multi_level_page_table.h"
++#ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
++#endif
+ 
+ namespace Common {
+ 
++#ifdef __OPENORBIS__
++// The PS4 commits flexible memory as it is mapped: the table only reserves its range (128 MiB for
++// a 37-bit GPU address space, 1 GiB for 40 bits), and each first-level chunk (64 KiB) gets memory
++// when it is first used, as on Windows. A chunk smaller than the PS4's 16 KiB page can't be mapped
++// on its own; then the whole table is mapped at once.
++constexpr std::size_t OrbisPageSize = 0x4000;
++#endif
++
+ template <typename BaseAddr>
+ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bits_, std::size_t first_level_bits_, std::size_t page_bits_)
+     : address_space_bits{address_space_bits_}
+@@ -28,6 +39,12 @@ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bit
+     first_level_map.resize(first_level_size, nullptr);
+ #ifdef _WIN32
+     void* base{VirtualAlloc(nullptr, alloc_size, MEM_RESERVE, PAGE_READWRITE)};
++#elif defined(__OPENORBIS__)
++    void* base{Orbis::ReserveRange(alloc_size, OrbisPageSize)};
++    if (base && first_level_chunk_size % OrbisPageSize != 0 && !Orbis::MapFlexibleMemory(base, alloc_size)) {
++        Orbis::ReleaseRange(base, alloc_size);
++        base = nullptr;
++    }
+ #else
+     void* base{mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)};
+     if (base == MAP_FAILED)
+@@ -44,6 +61,8 @@ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
+     }
+ #ifdef _WIN32
+     ASSERT(VirtualFree(base_ptr, 0, MEM_RELEASE));
++#elif defined(__OPENORBIS__)
++    Orbis::ReleaseRange(base_ptr, alloc_size);
+ #else
+     ASSERT(munmap(base_ptr, alloc_size) == 0);
+ #endif
+@@ -64,6 +83,11 @@ void MultiLevelPageTable<BaseAddr>::AllocateLevel(u64 index) {
+ #ifdef _WIN32
+     void* base = VirtualAlloc(ptr, first_level_chunk_size, MEM_COMMIT, PAGE_READWRITE);
+     ASSERT(base);
++#elif defined(__OPENORBIS__)
++    void* base = ptr;
++    if (first_level_chunk_size % OrbisPageSize == 0) {
++        ASSERT(Orbis::MapFlexibleMemory(ptr, first_level_chunk_size));
++    }
+ #else
+     void* base = ptr;
+ #endif
