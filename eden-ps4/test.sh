@@ -233,6 +233,27 @@ for py in range(11, 52):
         bad += at(px, py) != expected
 sys.exit(0 if bad == 0 else 1)
 PY
+# its storage image: a compute program storing (formatted stores) each texel's colour, read from a
+# texel buffer of 8 by (x + y) / 4 % 8, shown on the square below: every texel as worked out here
+check "its storage image is written (formatted stores) from a texel buffer" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+palette = [(0.9, 0.2, 0.2), (0.95, 0.6, 0.1), (0.95, 0.9, 0.2), (0.3, 0.85, 0.3),
+           (0.2, 0.8, 0.85), (0.25, 0.4, 0.95), (0.6, 0.3, 0.9), (0.95, 0.95, 0.95)]
+bad = checked = 0
+for py in range(65, 106):
+    for px in range(322, 382):
+        u, v = (px + 0.5 - 320) / 64 * 32, (py + 0.5 - 63) / 45 * 32
+        if abs(v - round(v)) < 0.05:
+            continue  # on a texel's edge
+        expected = tuple(int(c * 255 + 0.5) for c in palette[(int(u) + int(v)) // 4 % 8])
+        bad += max(abs(a - b) for a, b in zip(at(px, py), expected)) > 1
+        checked += 1
+sys.exit(0 if bad == 0 and checked > 2000 else 1)
+PY
 # on the right: an indexed strip of two magenta quads with a restart index between them (nothing
 # drawn between), and a point of 32 pixels coloured by its coordinates (black top left, red top
 # right, green bottom left, yellow bottom right)

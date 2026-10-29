@@ -1,0 +1,676 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 00:16:42 +0000
+Subject: [PATCH] null renderer: storage images and texel buffers in software
+ shaders
+
+Image loads, stores and atomics read and write the texel in emulated memory where the texture
+header says it is (pitch or block linear, the view's level and layer), formatted (converted
+from and to the image's format) or typed (the bytes as they are). Texel buffers are fetched the
+same way. Textures a shader may have written to are checked again afterwards, fragment and
+vertex shaders' writes included.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ .../renderer_null/software_draw.cpp           | 461 +++++++++++++++++-
+ 1 file changed, 454 insertions(+), 7 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index cd351d290..93a421869 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -17,7 +17,9 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "common/alignment.h"
+ #include "common/cityhash.h"
++#include "common/div_ceil.h"
+ #include "common/logging.h"
+ #include "shader_recompiler/environment.h"
+ #include "shader_recompiler/exception.h"
+@@ -512,6 +514,11 @@ bool IsSupported(IR::Opcode op) {
+     case O::LoadGlobal32: case O::LoadGlobal64: case O::LoadGlobal128:
+     case O::WriteGlobalU8: case O::WriteGlobalS8: case O::WriteGlobalU16: case O::WriteGlobalS16:
+     case O::WriteGlobal32: case O::WriteGlobal64: case O::WriteGlobal128:
++    case O::ImageRead: case O::ImageWrite:
++    case O::ImageAtomicIAdd32: case O::ImageAtomicSMin32: case O::ImageAtomicUMin32:
++    case O::ImageAtomicSMax32: case O::ImageAtomicUMax32: case O::ImageAtomicInc32:
++    case O::ImageAtomicDec32: case O::ImageAtomicAnd32: case O::ImageAtomicOr32:
++    case O::ImageAtomicXor32: case O::ImageAtomicExchange32:
+         return true;
+     default:
+         return false;
+@@ -591,13 +598,13 @@ struct Texture {
+     std::vector<Level> levels; // every level of the image, its texels [layer][z][y][x]
+ };
+ 
+-/// A texture and the sampler it's sampled with, the sampler's state decoded once per draw
+ /// A storage buffer a shader reads or writes: where it is in the GPU's address space
+ struct StorageBuffer {
+     GPUVAddr address = 0;
+     u32 size = 0;
+ };
+ 
++/// A texture and the sampler it's sampled with, the sampler's state decoded once per draw
+ struct Binding {
+     const Texture* texture = nullptr;
+     Tegra::Texture::TSCEntry sampler{};
+@@ -621,6 +628,214 @@ struct Binding {
+     }
+ };
+ 
++/// A storage image or a texel buffer: read (and written) in place, a texel at a time, where its
++/// texture header says it is
++struct ImageView {
++    GPUVAddr address = 0; // its level's first layer
++    PixelFormat format = PixelFormat::Invalid;
++    u32 bpp_log2 = 0;
++    u32 width = 0, height = 1, depth = 1, layers = 1; // the level's
++    bool linear = false; // rows 'pitch' bytes apart (a buffer: one row)
++    u32 pitch = 0;
++    u32 block_height = 0, block_depth = 0, gobs_in_x = 0; // block linear: the level's blocks (log2 GOBs)
++    u64 layer_stride = 0;
++    bool ok = false;
++};
++
++/// The view a texture header describes, at its base level and layer
++ImageView MakeView(Tegra::MemoryManager& gpu_memory, GPUVAddr tic_address) {
++    using namespace VideoCore::Surface;
++    Tegra::Texture::TICEntry tic{};
++    gpu_memory.ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
++    const VideoCommon::ImageInfo info{tic};
++    ImageView view;
++    view.format = info.format;
++    if (info.format == PixelFormat::Invalid || IsPixelFormatASTC(info.format) || IsPixelFormatBCn(info.format) ||
++        DefaultBlockWidth(info.format) != 1 || info.num_samples > 1) {
++        return view;
++    }
++    view.bpp_log2 = u32(std::countr_zero(BytesPerBlock(info.format)));
++    view.address = tic.Address();
++    view.width = std::max(info.size.width, 1u);
++    if (info.type == VideoCommon::ImageType::Buffer) {
++        view.linear = true;
++        view.ok = true;
++        return view;
++    }
++    if (info.type == VideoCommon::ImageType::Linear) {
++        view.height = std::max(info.size.height, 1u);
++        view.linear = true;
++        view.pitch = info.pitch;
++        view.ok = true;
++        return view;
++    }
++    const u32 levels = u32(std::max(info.resources.levels, 1));
++    const u32 level = std::min<u32>(tic.res_min_mip_level, levels - 1);
++    const u32 base_layer = info.type == VideoCommon::ImageType::e3D ? 0 : tic.BaseLayer();
++    view.width = std::max(info.size.width >> level, 1u);
++    view.height = std::max(info.size.height >> level, 1u);
++    view.depth = std::max(info.size.depth >> level, 1u);
++    view.layers = u32(std::max(info.resources.layers - s32(base_layer), 1));
++    view.layer_stride = info.layer_stride;
++    view.address += VideoCommon::CalculateMipLevelOffsets(info)[level] + u64{base_layer} * info.layer_stride;
++    // the level's blocks, as Eden's UnswizzleImage finds them (smaller for a smaller level)
++    const auto fit = [](u32 extent, u32 block, u32 gob) {
++        while (block > 0 && extent <= (1u << (block - 1)) * gob) {
++            --block;
++        }
++        return block;
++    };
++    view.block_height = fit(view.height, info.block.height, 8);
++    view.block_depth = level == 0 && levels == 1 ? info.block.depth : fit(view.depth, info.block.depth, 1);
++    const u32 gob_width = 6 - view.bpp_log2 + info.tile_width_spacing;
++    const bool small = view.width <= (1u << gob_width) || view.height <= (1u << (3 + info.block.height)) ||
++                       view.depth < (1u << info.block.depth);
++    const u32 stride = Common::AlignUpLog2(view.width, small ? 6 - view.bpp_log2 : gob_width) << view.bpp_log2;
++    view.gobs_in_x = Common::DivCeil(stride, 64u);
++    view.ok = true;
++    return view;
++}
++
++/// Where a view's texel is (false: outside the view)
++bool TexelAddress(const ImageView& view, u32 x, u32 y, u32 z, u32 layer, GPUVAddr& address) {
++    if (!view.ok || x >= view.width || y >= view.height || z >= view.depth || layer >= view.layers) {
++        return false;
++    }
++    const u32 xb = x << view.bpp_log2;
++    u64 offset = layer * view.layer_stride;
++    if (view.linear) {
++        offset += u64(y) * view.pitch + xb;
++    } else {
++        // blocks a GOB (64 bytes by 8 rows) wide, 2^block_height GOBs tall and 2^block_depth deep;
++        // a row of them across the level, then the next row down, then the next slice of rows
++        const u32 bh = view.block_height, bd = view.block_depth;
++        const u64 block_row = u64{view.gobs_in_x} << (9 + bh + bd);
++        const u64 slice = u64{Common::DivCeil(view.height, 8u << bh)} * block_row;
++        const u32 gob_y = y >> 3;
++        offset += (z >> bd) * slice + (u64{z & ((1u << bd) - 1)} << (9 + bh)) + (gob_y >> bh) * block_row +
++                  (u64{gob_y & ((1u << bh) - 1)} << 9) + (u64{xb >> 6} << (9 + bh + bd)) +
++                  ((xb & 63) >> 5) * 256 + ((y & 7) >> 1) * 64 + ((xb & 31) >> 4) * 32 + (y & 1) * 16 + (xb & 15);
++    }
++    address = view.address + offset;
++    return true;
++}
++
++/// The unsigned 11- and 10-bit floats of B10G11R11, from a float
++u32 ToUfloat(f32 value, u32 mantissa_bits) {
++    const u32 f = std::bit_cast<u32>(value);
++    if (std::isnan(value)) {
++        return (31u << mantissa_bits) | 1;
++    }
++    if ((f >> 31) != 0) {
++        return 0;
++    }
++    const s32 exponent = s32(f >> 23) - 127 + 15;
++    if (exponent <= 0) {
++        return 0;
++    }
++    if (exponent >= 31) {
++        return 31u << mantissa_bits;
++    }
++    return (u32(exponent) << mantissa_bits) | ((f & 0x7FFFFF) >> (23 - mantissa_bits));
++}
++
++/// A texel of a format from four components (floats, or an integer format's integers), as a
++/// formatted image store writes it; its bytes in 'bytes'
++bool EncodeTexel(PixelFormat format, const std::array<u32, 4>& value, std::array<u8, 16>& out, u32& bytes) {
++    enum Kind { Unorm8, Unorm16, Snorm8, Snorm16, Int, Half, Full };
++    struct Channel {
++        u32 component, shift, bits;
++    };
++    Kind kind = Int;
++    std::array<Channel, 4> channels{};
++    u32 count = 0;
++    const auto fill = [&](Kind k, u32 n, u32 bits) { // R, G, B, A in order, 'bits' each
++        kind = k, count = n, bytes = n * bits / 8;
++        for (u32 c = 0; c < n; ++c) {
++            channels[c] = {c, c * bits, bits};
++        }
++    };
++    using P = PixelFormat;
++    switch (format) {
++    case P::A8B8G8R8_UNORM: fill(Unorm8, 4, 8); break;
++    case P::A8B8G8R8_SNORM: fill(Snorm8, 4, 8); break;
++    case P::A8B8G8R8_UINT: case P::A8B8G8R8_SINT: fill(Int, 4, 8); break;
++    case P::B8G8R8A8_UNORM:
++        fill(Unorm8, 4, 8);
++        channels[0].component = 2, channels[2].component = 0;
++        break;
++    case P::R16G16B16A16_FLOAT: fill(Half, 4, 16); break;
++    case P::R16G16B16A16_UNORM: fill(Unorm16, 4, 16); break;
++    case P::R16G16B16A16_SNORM: fill(Snorm16, 4, 16); break;
++    case P::R16G16B16A16_UINT: case P::R16G16B16A16_SINT: fill(Int, 4, 16); break;
++    case P::R32G32B32A32_FLOAT: fill(Full, 4, 32); break;
++    case P::R32G32B32A32_UINT: case P::R32G32B32A32_SINT: fill(Int, 4, 32); break;
++    case P::R32G32_FLOAT: fill(Full, 2, 32); break;
++    case P::R32G32_UINT: case P::R32G32_SINT: fill(Int, 2, 32); break;
++    case P::R16G16_FLOAT: fill(Half, 2, 16); break;
++    case P::R16G16_UNORM: fill(Unorm16, 2, 16); break;
++    case P::R16G16_SNORM: fill(Snorm16, 2, 16); break;
++    case P::R16G16_UINT: case P::R16G16_SINT: fill(Int, 2, 16); break;
++    case P::R8G8_UNORM: fill(Unorm8, 2, 8); break;
++    case P::R8G8_SNORM: fill(Snorm8, 2, 8); break;
++    case P::R8G8_UINT: case P::R8G8_SINT: fill(Int, 2, 8); break;
++    case P::R32_FLOAT: fill(Full, 1, 32); break;
++    case P::R32_UINT: case P::R32_SINT: fill(Int, 1, 32); break;
++    case P::R16_FLOAT: fill(Half, 1, 16); break;
++    case P::R16_UNORM: fill(Unorm16, 1, 16); break;
++    case P::R16_SNORM: fill(Snorm16, 1, 16); break;
++    case P::R16_UINT: case P::R16_SINT: fill(Int, 1, 16); break;
++    case P::R8_UNORM: fill(Unorm8, 1, 8); break;
++    case P::R8_SNORM: fill(Snorm8, 1, 8); break;
++    case P::R8_UINT: case P::R8_SINT: fill(Int, 1, 8); break;
++    case P::A2B10G10R10_UNORM: case P::A2B10G10R10_UINT: {
++        const bool unorm = format == P::A2B10G10R10_UNORM;
++        u32 packed = 0;
++        for (u32 c = 0; c < 4; ++c) {
++            const u32 bits = c == 3 ? 2 : 10;
++            const u32 v = unorm ? Unorm(std::bit_cast<f32>(value[c]), bits) : value[c] & ((1u << bits) - 1);
++            packed |= v << (c * 10);
++        }
++        std::memcpy(out.data(), &packed, 4);
++        bytes = 4;
++        return true;
++    }
++    case P::B10G11R11_FLOAT: {
++        const u32 packed = ToUfloat(std::bit_cast<f32>(value[0]), 6) |
++                           ToUfloat(std::bit_cast<f32>(value[1]), 6) << 11 |
++                           ToUfloat(std::bit_cast<f32>(value[2]), 5) << 22;
++        std::memcpy(out.data(), &packed, 4);
++        bytes = 4;
++        return true;
++    }
++    default:
++        return false;
++    }
++    std::array<u32, 4> words{};
++    for (u32 c = 0; c < count; ++c) {
++        const Channel& ch = channels[c];
++        const u32 raw = value[ch.component];
++        const f32 f = std::bit_cast<f32>(raw);
++        const u32 mask = ch.bits == 32 ? ~0u : (1u << ch.bits) - 1;
++        u32 v = 0;
++        switch (kind) {
++        case Unorm8: v = Unorm(f, 8); break;
++        case Unorm16: v = Unorm(f, 16); break;
++        case Snorm8: case Snorm16: {
++            const f32 max = kind == Snorm8 ? 127.0f : 32767.0f;
++            v = u32(s32(std::round(std::clamp(std::isnan(f) ? 0.0f : f, -1.0f, 1.0f) * max)));
++            break;
++        }
++        case Int: v = raw; break;
++        case Half: v = ToHalf(f); break;
++        case Full: v = raw; break;
++        }
++        words[ch.shift / 32] |= (v & mask) << (ch.shift % 32);
++    }
++    std::memcpy(out.data(), words.data(), bytes);
++    return true;
++}
++
+ float FromSnorm(s32 value, u32 bits) {
+     return std::max(float(value) / float((1 << (bits - 1)) - 1), -1.0f);
+ }
+@@ -1438,6 +1653,17 @@ std::array<f32, 4> FetchTexture(const Binding& binding, IR::TextureInstInfo info
+     return Swizzle(texture, sampling.Fetch(level, x, y, z));
+ }
+ 
++/// A texel buffer's or a storage image's descriptor: where its handle is, as a texture's
++struct ViewDescriptor {
++    u32 cbuf_index = 0, cbuf_offset = 0;
++    bool has_secondary = false;
++    u32 secondary_cbuf_index = 0, secondary_cbuf_offset = 0, shift_left = 0, secondary_shift_left = 0;
++    u32 count = 1, size_shift = 0;
++    Shader::ImageFormat format = Shader::ImageFormat::Typeless;
++    bool is_integer = false;
++    u32 first = 0;
++};
++
+ } // Anonymous namespace
+ 
+ struct SoftwareDraw::Program {
+@@ -1452,6 +1678,9 @@ struct SoftwareDraw::Program {
+     std::vector<Shader::TextureDescriptor> textures;
+     std::vector<u32> texture_bindings; // each descriptor's first binding (arrays have several)
+     std::vector<Shader::StorageBufferDescriptor> storage;
++    // texel buffers sampled, storage images and storage texel buffers: each descriptor's handle and
++    // its first view in a draw's (arrays have several)
++    std::vector<ViewDescriptor> texel_buffers, images, image_buffers;
+     bool writes_depth = false;
+     bool can_discard = false;
+     bool writes_memory = false; // storage buffers or global memory
+@@ -1539,6 +1768,7 @@ struct SoftwareDraw::Batch {
+     std::array<std::vector<u32>, 18> fs_cbufs;
+     std::vector<Binding> fs_textures;
+     std::vector<StorageBuffer> fs_storage;
++    std::vector<ImageView> fs_views;
+     std::vector<Target> targets;
+     std::array<f32, 4> blend_constant{};
+     std::vector<Varying> varyings;
+@@ -1701,6 +1931,7 @@ struct Io {
+     std::array<u32, 3> workgroup_id{};
+     const u32* local_id = nullptr;
+     RunState* resume = nullptr;
++    const std::vector<ImageView>* views = nullptr; // texel buffers and storage images
+ };
+ 
+ /// The words a value of a type takes in a cell (a move copies only those)
+@@ -1938,7 +2169,12 @@ private:
+                 break;
+             case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGather:
+             case O::ImageFetch: case O::ImageQueryDimensions: case O::ImageQueryLod:
+-            case O::ImageGradient: // the handle, then what's used of the rest in its first four
++            case O::ImageGradient: case O::ImageRead: case O::ImageWrite:
++            case O::ImageAtomicIAdd32: case O::ImageAtomicSMin32: case O::ImageAtomicUMin32:
++            case O::ImageAtomicSMax32: case O::ImageAtomicUMax32: case O::ImageAtomicInc32:
++            case O::ImageAtomicDec32: case O::ImageAtomicAnd32: case O::ImageAtomicOr32:
++            case O::ImageAtomicXor32: case O::ImageAtomicExchange32:
++                // the handle, then what's used of the rest in its first four
+                 op.extra = inst.Flags<IR::TextureInstInfo>().raw;
+                 for (size_t i = 0; i < num_args; ++i) {
+                     op.a[i] = Slot(inst.Arg(i));
+@@ -2007,24 +2243,34 @@ u32 AtomicResult(IR::Opcode op, u32 old, u32 value) {
+     using O = IR::Opcode;
+     switch (op) {
+     case O::SharedAtomicIAdd32: case O::StorageAtomicIAdd32: case O::GlobalAtomicIAdd32:
++    case O::ImageAtomicIAdd32:
+         return old + value;
+     case O::SharedAtomicSMin32: case O::StorageAtomicSMin32: case O::GlobalAtomicSMin32:
++    case O::ImageAtomicSMin32:
+         return u32(std::min(s32(old), s32(value)));
+     case O::SharedAtomicUMin32: case O::StorageAtomicUMin32: case O::GlobalAtomicUMin32:
++    case O::ImageAtomicUMin32:
+         return std::min(old, value);
+     case O::SharedAtomicSMax32: case O::StorageAtomicSMax32: case O::GlobalAtomicSMax32:
++    case O::ImageAtomicSMax32:
+         return u32(std::max(s32(old), s32(value)));
+     case O::SharedAtomicUMax32: case O::StorageAtomicUMax32: case O::GlobalAtomicUMax32:
++    case O::ImageAtomicUMax32:
+         return std::max(old, value);
+     case O::SharedAtomicInc32: case O::StorageAtomicInc32: case O::GlobalAtomicInc32:
++    case O::ImageAtomicInc32:
+         return old >= value ? 0 : old + 1;
+     case O::SharedAtomicDec32: case O::StorageAtomicDec32: case O::GlobalAtomicDec32:
++    case O::ImageAtomicDec32:
+         return old == 0 || old > value ? value : old - 1;
+     case O::SharedAtomicAnd32: case O::StorageAtomicAnd32: case O::GlobalAtomicAnd32:
++    case O::ImageAtomicAnd32:
+         return old & value;
+     case O::SharedAtomicOr32: case O::StorageAtomicOr32: case O::GlobalAtomicOr32:
++    case O::ImageAtomicOr32:
+         return old | value;
+     case O::SharedAtomicXor32: case O::StorageAtomicXor32: case O::GlobalAtomicXor32:
++    case O::ImageAtomicXor32:
+         return old ^ value;
+     case O::StorageAtomicAddF32: case O::GlobalAtomicAddF32:
+         return std::bit_cast<u32>(std::bit_cast<f32>(old) + std::bit_cast<f32>(value));
+@@ -2061,6 +2307,35 @@ const Binding* GetBinding(const SoftwareDraw::Program& program, const Io& io, u3
+     return index < io.textures->size() ? &(*io.textures)[index] : nullptr;
+ }
+ 
++/// The view of a texel buffer or storage image descriptor, the element of an array
++const ImageView* GetView(const std::vector<ViewDescriptor>& descriptors, const Io& io, u32 descriptor,
++                         u32 element) {
++    if (descriptor >= descriptors.size() || !io.views) {
++        return nullptr;
++    }
++    const ViewDescriptor& desc = descriptors[descriptor];
++    const size_t index = desc.first + std::min(element, std::max(desc.count, 1u) - 1);
++    return index < io.views->size() ? &(*io.views)[index] : nullptr;
++}
++
++/// An image instruction's texel: its coordinates by the image's type
++bool ImageTexel(const ImageView& view, Shader::TextureType type, const Lanes& coords, u32 i, GPUVAddr& address) {
++    using T = Shader::TextureType;
++    const u32 x = coords.w[0][i], y = coords.w[1][i], w = coords.w[2][i];
++    switch (type) {
++    case T::Color1D: case T::Buffer:
++        return TexelAddress(view, x, 0, 0, 0, address);
++    case T::ColorArray1D:
++        return TexelAddress(view, x, 0, 0, y, address);
++    case T::Color3D:
++        return TexelAddress(view, x, y, w, 0, address);
++    case T::ColorArray2D: case T::ColorCube: case T::ColorArrayCube:
++        return TexelAddress(view, x, y, 0, w, address);
++    default:
++        return TexelAddress(view, x, y, 0, 0, address);
++    }
++}
++
+ f32 Fl(const Lanes& x, u32 i, u32 k = 0) {
+     return std::bit_cast<f32>(x.w[k][i]);
+ }
+@@ -2319,6 +2594,90 @@ u32 SampleLevelFast(const Texture& texture, const Binding& binding, const Level&
+     return slow;
+ }
+ 
++/// Storage image loads, stores and atomics, for the lanes in 'exec' (stores and atomics only for
++/// the live ones: helpers have no effects). A typed load or store (a format in the instruction)
++/// moves the texel's bytes as they are; the rest convert them from and to the image's format.
++void RunImage(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io, u32 exec) {
++    using O = IR::Opcode;
++    IR::TextureInstInfo info{};
++    info.raw = o.extra;
++    const bool buffer = info.type == Shader::TextureType::Buffer;
++    const auto& descriptors = buffer ? program.image_buffers : program.images;
++    const u32 descriptor = info.descriptor_index;
++    const bool integer = descriptor < descriptors.size() && descriptors[descriptor].is_integer;
++    using F = Shader::ImageFormat;
++    const F format = info.image_format;
++    const u32 typed_bytes = format == F::R8_UINT || format == F::R8_SINT     ? 1
++                            : format == F::R16_UINT || format == F::R16_SINT ? 2
++                            : format == F::R32G32_UINT                       ? 8
++                            : format == F::R32G32B32A32_UINT                 ? 16
++                                                                             : 4;
++    Lanes& d = c[o.dest];
++    const Lanes& coords = c[o.a[1]];
++    const Lanes& value = c[o.a[2]];
++    if (o.op != O::ImageRead) {
++        exec &= io.live;
++    }
++    for (u32 m = exec; m != 0; m &= m - 1) {
++        const u32 i = u32(std::countr_zero(m));
++        const ImageView* const view = GetView(descriptors, io, descriptor, c[o.a[0]].w[0][i]);
++        GPUVAddr address;
++        const bool inside = view && ImageTexel(*view, info.type, coords, i, address);
++        if (o.op == O::ImageRead) {
++            std::array<u32, 4> texel{};
++            if (inside && format != F::Typeless) {
++                u8 bytes[16]{};
++                io.memory->ReadBlockUnsafe(address, bytes, typed_bytes);
++                std::memcpy(texel.data(), bytes, std::max(typed_bytes, 4u));
++                if (format == F::R8_SINT) {
++                    texel[0] = u32(s32(s8(bytes[0])));
++                } else if (format == F::R16_SINT) {
++                    s16 v;
++                    std::memcpy(&v, bytes, 2);
++                    texel[0] = u32(s32(v));
++                }
++            } else if (inside) {
++                u8 bytes[16]{};
++                io.memory->ReadBlockUnsafe(address, bytes, 1u << view->bpp_log2);
++                std::array<f32, 4> decoded{};
++                if (DecodeTexel(view->format, bytes, decoded)) {
++                    std::memcpy(texel.data(), decoded.data(), 16);
++                } else {
++                    LogOnce(fmt::format("storage image format {} not read", static_cast<u32>(view->format)));
++                }
++                (void)integer; // (an integer format's texels are its integers already)
++            }
++            for (u32 k = 0; k < 4; ++k) {
++                d.w[k][i] = texel[k];
++            }
++        } else if (o.op == O::ImageWrite) {
++            if (!inside) {
++                continue;
++            }
++            const std::array<u32, 4> texel{value.w[0][i], value.w[1][i], value.w[2][i], value.w[3][i]};
++            if (format != F::Typeless) {
++                io.memory->WriteBlockUnsafe(address, texel.data(), typed_bytes);
++                continue;
++            }
++            std::array<u8, 16> bytes{};
++            u32 size = 0;
++            if (EncodeTexel(view->format, texel, bytes, size)) {
++                io.memory->WriteBlockUnsafe(address, bytes.data(), size);
++            } else {
++                LogOnce(fmt::format("storage image format {} not written", static_cast<u32>(view->format)));
++            }
++        } else { // an atomic: the old value
++            u32 old = 0;
++            if (inside) {
++                io.memory->ReadBlockUnsafe(address, &old, 4);
++                const u32 result = AtomicResult(o.op, old, value.w[0][i]);
++                io.memory->WriteBlockUnsafe(address, &result, 4);
++            }
++            d.w[0][i] = old;
++        }
++    }
++}
++
+ /// The texture instructions, for the lanes in 'exec'
+ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io, u32 exec) {
+     using O = IR::Opcode;
+@@ -2426,7 +2785,19 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+         const Binding* const binding = GetBinding(program, io, info.descriptor_index, c[o.a[0]].w[0][i]);
+         const Cell b = LaneCell(c[o.a[1]], i), e = LaneCell(c[o.a[2]], i), f = LaneCell(c[o.a[3]], i);
+         std::array<f32, 4> result{};
+-        if (binding && info.type != Shader::TextureType::Buffer) {
++        if (info.type == Shader::TextureType::Buffer) { // a texel buffer: fetched, or its size
++            const ImageView* const view = GetView(program.texel_buffers, io, info.descriptor_index, c[o.a[0]].w[0][i]);
++            GPUVAddr address;
++            if (o.op == O::ImageFetch && view && TexelAddress(*view, b.w[0], 0, 0, 0, address)) {
++                u8 bytes[16]{};
++                io.memory->ReadBlockUnsafe(address, bytes, 1u << view->bpp_log2);
++                if (!DecodeTexel(view->format, bytes, result)) {
++                    LogOnce(fmt::format("texel buffer format {} not read", static_cast<u32>(view->format)));
++                }
++            } else if (o.op == O::ImageQueryDimensions && view && view->ok) {
++                result[0] = std::bit_cast<f32>(view->width);
++            }
++        } else if (binding) {
+             const Texture* const texture = binding->texture;
+             const f32 lod = implicit && texture && texture->ok ? QuadLod(*texture, info.type, c[o.a[1]], i) : 0.0f;
+             switch (o.op) {
+@@ -3040,6 +3411,13 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+         case O::ImageQueryDimensions: case O::ImageQueryLod:
+             RunTexture(program, o, c, io, exec);
+             break;
++        case O::ImageRead: case O::ImageWrite:
++        case O::ImageAtomicIAdd32: case O::ImageAtomicSMin32: case O::ImageAtomicUMin32:
++        case O::ImageAtomicSMax32: case O::ImageAtomicUMax32: case O::ImageAtomicInc32:
++        case O::ImageAtomicDec32: case O::ImageAtomicAnd32: case O::ImageAtomicOr32:
++        case O::ImageAtomicXor32: case O::ImageAtomicExchange32:
++            RunImage(program, o, c, io, exec);
++            break;
+         case O::GetSparseFromOp:
+             LANE_LOOP d.w[0][i] = 1; // every texel is resident
+             break;
+@@ -3637,9 +4015,29 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+             program->texture_bindings.push_back(bindings);
+             bindings += std::max(descriptor.count, 1u);
+         }
+-        if (!ir.info.image_descriptors.empty() || !ir.info.image_buffer_descriptors.empty()) {
+-            LogOnce("storage images aren't drawn");
+-        }
++        u32 views = 0;
++        const auto add_views = [&](const auto& from, std::vector<ViewDescriptor>& to) {
++            for (const auto& desc : from) {
++                ViewDescriptor view;
++                view.cbuf_index = desc.cbuf_index, view.cbuf_offset = desc.cbuf_offset;
++                view.count = std::max(desc.count, 1u), view.size_shift = desc.size_shift;
++                using D = std::decay_t<decltype(desc)>;
++                if constexpr (std::is_same_v<D, Shader::TextureBufferDescriptor>) {
++                    view.has_secondary = desc.has_secondary;
++                    view.secondary_cbuf_index = desc.secondary_cbuf_index;
++                    view.secondary_cbuf_offset = desc.secondary_cbuf_offset;
++                    view.shift_left = desc.shift_left, view.secondary_shift_left = desc.secondary_shift_left;
++                } else {
++                    view.format = desc.format, view.is_integer = desc.is_integer;
++                }
++                view.first = views;
++                views += view.count;
++                to.push_back(view);
++            }
++        };
++        add_views(ir.info.texture_buffer_descriptors, program->texel_buffers);
++        add_views(ir.info.image_descriptors, program->images);
++        add_views(ir.info.image_buffer_descriptors, program->image_buffers);
+         const bool compute = ir.stage == Shader::Stage::Compute;
+         program->shared_bytes = ir.shared_memory_size;
+         program->ok = Flattener{*program, compute}.Run(ir);
+@@ -3654,7 +4052,9 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+                     op.op == IR::Opcode::WriteGlobalS16 || op.op == IR::Opcode::WriteGlobal32 ||
+                     op.op == IR::Opcode::WriteGlobal64 || op.op == IR::Opcode::WriteGlobal128 ||
+                     (op.op >= IR::Opcode::GlobalAtomicIAdd32 && op.op <= IR::Opcode::GlobalAtomicMaxF32x2) ||
+-                    (op.op >= IR::Opcode::StorageAtomicIAdd32 && op.op <= IR::Opcode::StorageAtomicMaxF32x2));
++                    (op.op >= IR::Opcode::StorageAtomicIAdd32 && op.op <= IR::Opcode::StorageAtomicMaxF32x2) ||
++                    op.op == IR::Opcode::ImageWrite ||
++                    (op.op >= IR::Opcode::ImageAtomicIAdd32 && op.op <= IR::Opcode::ImageAtomicExchange32));
+         });
+         program->can_discard = std::ranges::any_of(program->ops, [](const Op& op) {
+             return op.kind == Kind::Ir && op.op == IR::Opcode::DemoteToHelperInvocation;
+@@ -3727,6 +4127,39 @@ SoftwareDraw::Program* SoftwareDraw::GetComputeProgram(Tegra::Engines::KeplerCom
+ 
+ /// A dispatch: every workgroup in turn, its invocations 16 at a time. A program with barriers runs
+ /// each group of 16 to the next barrier, then the next group, until all are past it.
++namespace {
++
++/// The views a program's texel buffers and storage images bind: each handle read from the
++/// constant buffers as a texture's is, its texture header from the pool
++std::vector<ImageView> BindViews(const SoftwareDraw::Program& program, const std::array<std::vector<u32>, 18>& cbufs,
++                                 Tegra::MemoryManager& gpu_memory, GPUVAddr tic_base, u32 tic_limit,
++                                 bool via_header_index) {
++    std::vector<ImageView> views;
++    const auto word = [&](u32 cbuf, u32 offset) -> u32 {
++        return cbuf < cbufs.size() && offset / 4 < cbufs[cbuf].size() ? cbufs[cbuf][offset / 4] : 0;
++    };
++    for (const auto* descriptors : {&program.texel_buffers, &program.images, &program.image_buffers}) {
++        for (const ViewDescriptor& desc : *descriptors) {
++            for (u32 element = 0; element < desc.count; ++element) {
++                const u32 element_offset = element << desc.size_shift;
++                u32 raw = word(desc.cbuf_index, desc.cbuf_offset + element_offset);
++                if (desc.has_secondary) {
++                    raw = (raw << desc.shift_left) |
++                          (word(desc.secondary_cbuf_index, desc.secondary_cbuf_offset + element_offset)
++                           << desc.secondary_shift_left);
++                }
++                const u32 tic_index = Tegra::Texture::TexturePair(raw, via_header_index).first;
++                views.push_back(tic_index <= tic_limit
++                                    ? MakeView(gpu_memory, tic_base + u64{tic_index} * sizeof(Tegra::Texture::TICEntry))
++                                    : ImageView{});
++            }
++        }
++    }
++    return views;
++}
++
++} // Anonymous namespace
++
+ void SoftwareDraw::Dispatch(Tegra::Engines::KeplerCompute& kepler_compute, Tegra::MemoryManager& gpu_memory) {
+     Flush();
+     Program* const cs = GetComputeProgram(kepler_compute, gpu_memory);
+@@ -3782,6 +4215,8 @@ void SoftwareDraw::Dispatch(Tegra::Engines::KeplerCompute& kepler_compute, Tegra
+         buffer.size = size_follows ? size : 8u << 20;
+         storage.push_back(buffer);
+     }
++    const std::vector<ImageView> views = BindViews(*cs, cbufs, gpu_memory, regs.tic.Address(), regs.tic.limit,
++                                                   qmd.linked_tsc != 0);
+ 
+     const u32 size_x = std::max<u32>(qmd.block_dim_x, 1), size_y = std::max<u32>(qmd.block_dim_y, 1);
+     const u32 size_z = std::max<u32>(qmd.block_dim_z, 1);
+@@ -3815,6 +4250,7 @@ void SoftwareDraw::Dispatch(Tegra::Engines::KeplerCompute& kepler_compute, Tegra
+     Io io{inputs.data(), outputs.data(), colors.data(), discard.data(), LANES, 0,
+           &cbufs, nullptr, cs->local_words, &bindings, &storage, &gpu_memory};
+     io.quads = true; // (a subgroup of 16)
++    io.views = &views;
+     io.shared = shared.data();
+     io.shared_bytes = u32(shared.size() - 16);
+     const u32 grid_x = qmd.grid_dim_x, grid_y = qmd.grid_dim_y, grid_z = qmd.grid_dim_z;
+@@ -3975,6 +4411,7 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+     Io io{in, st.outputs.data(), st.colors.data(), st.discard.data(), LANES, 0,
+           &fs_cbufs, st.local.data(), fs->local_words, &fs_textures, &fs_storage, &gpu_memory};
+     io.quads = true;
++    io.views = &b.fs_views;
+     // a shader that writes depth: the depth test after it (the stencil test still before)
+     const bool late_depth = fs->writes_depth;
+     using DF = Tegra::DepthFormat;
+@@ -4651,6 +5088,11 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     std::vector<StorageBuffer> vs_storage, fs_storage;
+     bind_storage(*vs, vs_cbufs, vs_storage);
+     bind_storage(*fs, fs_cbufs, fs_storage);
++    // texel buffers and storage images: their texture headers, from the same pool as textures'
++    const std::vector<ImageView> vs_views =
++        BindViews(*vs, vs_cbufs, gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index);
++    std::vector<ImageView> fs_views =
++        BindViews(*fs, fs_cbufs, gpu_memory, regs.tex_header.Address(), regs.tex_header.limit, via_header_index);
+ 
+     // The vertices the draw uses
+     const u32 count = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+@@ -4728,6 +5170,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+         outputs[static_cast<u32>(IR::Attribute::PositionW)] = 1.0f;
+         Io io{inputs.data(), outputs.data(), vs_colors.data(), &vs_discard, 1, 0,
+               &vs_cbufs, vs_local.data(), vs->local_words, &vs_textures, &vs_storage, &gpu_memory};
++        io.views = &vs_views;
+         Run(*vs, vs_cells.data(), io, 1);
+         std::memcpy(out.position.data(), &outputs[static_cast<u32>(IR::Attribute::PositionX)], 16);
+         std::memcpy(out.varyings.data(), &outputs[32], POINT_COORD_SLOT * sizeof(f32));
+@@ -5115,6 +5558,7 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     batch->fs_cbufs = std::move(fs_cbufs);
+     batch->fs_textures = std::move(fs_textures);
+     batch->fs_storage = std::move(fs_storage);
++    batch->fs_views = std::move(fs_views);
+     batch->targets = std::move(targets);
+     batch->blend_constant = blend_constant;
+     batch->varyings = std::move(varyings);
+@@ -5173,6 +5617,9 @@ void SoftwareDraw::Draw(Maxwell& maxwell3d, Tegra::MemoryManager& gpu_memory, bo
+     if (fs->writes_memory || queued_pixels >= queued_pixels_flushed || queue.size() >= queued_draws_flushed) {
+         Flush(); // a shader writing memory: its writes before anything that comes after
+     }
++    if (vs->writes_memory || fs->writes_memory) {
++        MarkAllWritten(); // textures they may have written to are checked again
++    }
+     if (stats.enabled) {
+         stats.draws++;
+         stats.triangles += triangle_count;

@@ -21,8 +21,9 @@
 // own, sampled where the floor's derivatives choose, the shader branching per pixel for stripes.
 // And two squares whose fragment programs write their own depths (top right), and a square of the
 // tile through an sRGB texture header. And a compute program (shared memory, a barrier) filling a
-// texture shown on a square at the top. And on the right, the alpha test, primitive restart and a
-// point's coordinates.
+// texture shown on a square at the top, and another filling a storage image (formatted stores)
+// with colours from a texel buffer, shown below it. And on the right, the alpha test, primitive
+// restart and a point's coordinates.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100). B turns on another, as 3D games draw: 12 large
 // quads, lit per pixel, textured, depth-tested.
@@ -235,6 +236,25 @@ static u64 iadd_cbuf(u32 dest, u32 a, u32 bank, u32 offset) {
 static u64 stg(u32 addr, u32 src) {
     return 0xEEDCull << 48 | 1ull << 45 | PT | (u64)addr << 8 | src;
 }
+// IADD Rdest, Ra, Rb; SHR.U32 Rdest, Rsrc, shift
+static u64 iadd(u32 dest, u32 a, u32 b) {
+    return 0x5C10ull << 48 | (u64)b << 20 | PT | (u64)a << 8 | dest;
+}
+static u64 shr(u32 dest, u32 src, u32 shift) {
+    return 0x3828ull << 48 | (u64)shift << 20 | PT | (u64)src << 8 | dest;
+}
+// TLD.LZ Rdest..Rdest+3, Rcoord, a 1D texture (a texel buffer, as its header says) whose handle is
+// at 'handle_offset' in the bound texture constant buffer: the texel at index Rcoord
+static u64 tld1d(u32 dest, u32 coord, u32 handle_offset) {
+    return 0xDCull << 56 | 7ull << 51 /* no sparse predicate */ | (u64)(handle_offset / 4) << 36 |
+           0xFull << 31 /* rgba */ | RZ << 20 | PT | (u64)coord << 8 | dest;
+}
+// SUST.P.2D.RGBA [Rcoord, Rcoord+1], Rdata..Rdata+3: a formatted store (the four components
+// converted to the image's format) to a storage image whose handle is at 'handle_offset'
+static u64 sust_p2d(u32 data, u32 coord, u32 handle_offset) {
+    return 0xEB2ull << 52 | 1ull << 51 /* bound */ | (u64)(handle_offset / 4) << 36 | 3ull << 33 /* 2D */ |
+           0xFull << 20 /* rgba */ | PT | (u64)coord << 8 | data;
+}
 #define SCHED 0x001F8000FC0007E0ull // a scheduling word (before every three instructions)
 
 // The shader programs, in a GPU buffer: each a 0x50-byte header (SPH) and its code, placed so
@@ -252,8 +272,13 @@ static u64 stg(u32 addr, u32 src) {
 #define CS_OFFSET 0x900       // the compute program (no header)
 #define FS_POINT_COORD_OFFSET 0xB10 // a point's coordinates (gl_PointCoord) as its colour
 #define FS_LIT_OFFSET 0xC10   // the 3D stress test's: perspective texture, a normal, light
+#define CS_IMAGE_OFFSET 0xE00 // the compute program filling the storage image (no header)
+#define FS_IMAGE_OFFSET 0xF10 // the storage image, sampled (handle 6)
 #define CS_CBUF 0x4800        // its constant buffer 0: the storage buffer it writes, at 0x110
 #define QMD_OFFSET 0x4A00     // its launch description (256-byte aligned)
+#define CS_IMAGE_CBUF 0x7000  // the image compute program's constant buffer 0: its handles at 0x120
+#define QMD_IMAGE_OFFSET 0x7200 // its launch description
+#define TEXEL_BUFFER_OFFSET 0x7300 // its texel buffer: 8 colours, RGBA32F
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -398,6 +423,11 @@ static void write_programs(u8* heap) {
     u64* fcomp = (u64*)(heap + FS_COMPUTED_OFFSET + 0x50);
     memcpy(fcomp, ft, 8 * sizeof(u64));
     fcomp[3] = tex2d(0, 4, 16);
+    u32* fi_sph = (u32*)(heap + FS_IMAGE_OFFSET);
+    memcpy(fi_sph, ft_sph, 0x50);
+    u64* fimage = (u64*)(heap + FS_IMAGE_OFFSET + 0x50);
+    memcpy(fimage, ft, 8 * sizeof(u64));
+    fimage[3] = tex2d(0, 4, 20);
 
     // the compute program: workgroups of 8x8, each invocation a colour from where it is (red its x
     // across the image, green its y, blue its index in the workgroup) put in shared memory; after
@@ -416,6 +446,19 @@ static void write_programs(u8* heap) {
     };
     for (size_t i = 0, k = 0; i < sizeof(code) / sizeof(code[0]); k++) {
         cs[k] = k % 4 == 0 ? SCHED : code[i++];
+    }
+
+    // the storage image's: workgroups of 8x8, each invocation at x, y of a 32x32 image; its colour
+    // the texel buffer's ((x + y) / 4 % 8), stored to its texel with a formatted store
+    u64* csi = (u64*)(heap + CS_IMAGE_OFFSET);
+    const u64 image_code[] = {
+        s2r(0, 33), s2r(1, 34), s2r(2, 37),                      // R0, R1 = x, y in the workgroup; R2 = its x
+        s2r(3, 38), iscadd(5, 2, 0, 3), iscadd(6, 3, 1, 3),      // R3 = its y; R5, R6 = x, y
+        iadd(7, 5, 6), shr(7, 7, 2), lop32i(7, 7, 0, 7),         // R7 = (x + y) / 4 % 8
+        tld1d(8, 7, 0x124), sust_p2d(8, 5, 0x120), exit_(),      // its colour, stored at x, y
+    };
+    for (size_t i = 0, k = 0; i < sizeof(image_code) / sizeof(image_code[0]); k++) {
+        csi[k] = k % 4 == 0 ? SCHED : image_code[i++];
     }
 
     // red and green from the point's coordinates (a[0x2E0], a[0x2E4]: gl_PointCoord's s, t)
@@ -523,6 +566,37 @@ static void write_computed_texture(u8* heap, iova_t image) {
     *(u32*)(heap + FS_CBUF + 16) = 4;
     u32* slot = (u32*)(heap + CS_CBUF + 0x110);
     slot[0] = (u32)image, slot[1] = (u32)(image >> 32), slot[2] = 32 * 32 * 4, slot[3] = 0;
+}
+// The storage image: 32x32 RGBA8, block linear (blocks 4 GOBs high), header and sampler 6 (point
+// sampling); the texel buffer, header 5: 8 colours (RGBA32F); their handles in the image compute
+// program's constant buffer
+static const float palette[8][4] = {
+    {0.9f, 0.2f, 0.2f, 1.0f}, {0.95f, 0.6f, 0.1f, 1.0f}, {0.95f, 0.9f, 0.2f, 1.0f}, {0.3f, 0.85f, 0.3f, 1.0f},
+    {0.2f, 0.8f, 0.85f, 1.0f}, {0.25f, 0.4f, 0.95f, 1.0f}, {0.6f, 0.3f, 0.9f, 1.0f}, {0.95f, 0.95f, 0.95f, 1.0f},
+};
+static void write_storage_image(u8* heap, iova_t heap_iova, iova_t image) {
+    u32* tic = (u32*)(heap + TIC_POOL + 192);
+    tic[0] = 0x08 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    tic[1] = (u32)image;
+    tic[2] = (u32)(image >> 32) | 3 << 21 /* block linear */;
+    tic[3] = 2 << 3; // blocks 4 GOBs high
+    tic[4] = 31 | 1 << 23;
+    tic[5] = 31 | 1u << 31;
+    u32* tsc = (u32*)(heap + TSC_POOL + 192);
+    tsc[0] = 2 | 2 << 3 | 2 << 6;
+    tsc[1] = 1 | 1 << 4 | 1 << 6;
+    *(u32*)(heap + FS_CBUF + 20) = 6;
+    memcpy(heap + TEXEL_BUFFER_OFFSET, palette, sizeof(palette));
+    const iova_t buffer = heap_iova + TEXEL_BUFFER_OFFSET;
+    u32* tbo = (u32*)(heap + TIC_POOL + 160);
+    tbo[0] = 0x01 /* R32G32B32A32 */ | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16 /* float */ |
+             2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    tbo[1] = (u32)buffer;
+    tbo[2] = (u32)(buffer >> 32) | 0 << 21 /* a buffer */;
+    tbo[3] = 0;                 // (the width's high bits)
+    tbo[4] = (8 - 1) | 6 << 23; // 8 texels, a 1D buffer
+    u32* handles = (u32*)(heap + CS_IMAGE_CBUF + 0x120);
+    handles[0] = 6, handles[1] = 5;
 }
 // The floor's texture: 64x64 and its 6 smaller levels, block linear, written by the CPU. Level 0
 // a grey checkerboard, the rest a colour each (red, orange, green, cyan, blue, purple), so where
@@ -834,6 +908,8 @@ int main(int argc, char* argv[]) {
     write_mip_texture(heap, mip_mem, mip_iova);
     const iova_t computed_image = mip_iova + 0x6000; // (after the floor's levels)
     write_computed_texture(heap, computed_image);
+    const iova_t storage_image = mip_iova + 0x7000; // (after the computed image)
+    write_storage_image(heap, heap_iova, storage_image);
     // The stress test's sprites' vertices: 4 for each, for each command buffer
 #define MAX_SPRITES 2000
 #define SPRITE_VERTEX_BYTES ((CMD_BUFS * MAX_SPRITES * 128 + 0xFFF) & ~0xFFF) // whole pages
@@ -867,6 +943,7 @@ int main(int argc, char* argv[]) {
 #define COMPUTED_OFFSET(i) (0x4600 + (i) * 0x80)    // the compute program's image's square
 #define FIXED_OFFSET(i) (0x4C00 + (i) * 0x200)      // the alpha-tested square (4), the strip (9), the point (1)
 #define LIT_OFFSET(i) (0x5200 + (i) * 0xA00)        // the 3D stress test's quads (12 of 4, 48 bytes each)
+#define IMAGE_OFFSET(i) (0x7400 + (i) * 0x80)       // the storage image's square
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -948,6 +1025,21 @@ int main(int argc, char* argv[]) {
             const iova_t cs_cbuf = heap_iova + CS_CBUF;
             qmd[0x1D] = (u32)cs_cbuf;
             qmd[0x1E] = (u32)(cs_cbuf >> 32) | 0x200u << 15;
+            // the image one's: 4x4 workgroups of 8x8, no shared memory, its constant buffer 0; and
+            // the compute engine's texture pools (the 3D engine's), its handles in constant buffer 0
+            u32* qmd_image = (u32*)(heap + QMD_IMAGE_OFFSET);
+            memcpy(qmd_image, qmd, 0x100);
+            qmd_image[0x08] = CS_IMAGE_OFFSET;
+            qmd_image[0x11] = 0;
+            const iova_t image_cbuf = heap_iova + CS_IMAGE_CBUF;
+            qmd_image[0x1D] = (u32)image_cbuf;
+            qmd_image[0x1E] = (u32)(image_cbuf >> 32) | 0x200u << 15;
+            const u32 compute_headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 6};
+            method_on(SUBCH_COMPUTE, M_TEX_HEADER_POOL, 3, compute_headers);
+            const u32 compute_samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 6};
+            method_on(SUBCH_COMPUTE, M_TEX_SAMPLER_POOL, 3, compute_samplers);
+            const u32 compute_cbuf_slot = 0;
+            method_on(SUBCH_COMPUTE, M_TEXTURE_CBUF_SLOT, 1, &compute_cbuf_slot);
             // the sprite's copy, by the DMA engine: one line of its bytes, pitch to pitch
             const u32 dma[8] = {(u32)(sprite_iova >> 32), (u32)sprite_iova, (u32)(sprite_copy >> 32),
                                 (u32)sprite_copy, SPRITE * SPRITE * 4, SPRITE * SPRITE * 4,
@@ -985,9 +1077,9 @@ int main(int argc, char* argv[]) {
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             // textures: the pools, the handles' constant buffer
             method1(M_SAMPLER_BINDING, 1);
-            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 4};
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 6};
             method(M_TEX_HEADER_POOL, 3, headers);
-            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 4};
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 6};
             // blending (for the tiles): source alpha over the frame
             const u32 blend[8] = {0, BLEND_ADD, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA,
                                   BLEND_ADD, BLEND_SRC_ALPHA, 0, BLEND_ONE_MINUS_SRC_ALPHA};
@@ -1429,6 +1521,34 @@ int main(int argc, char* argv[]) {
             const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
             method(M_SCISSOR, 3, scissor);
             method1(M_PIPELINE + 5 * 0x10 + 1, FS_COMPUTED_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(square >> 32), (u32)square, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = square + 4 * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_OFFSET);
+        }
+        // the storage image's compute program, dispatched, and the image on a square below the other:
+        // diagonal bands of the texel buffer's colours
+        {
+            const u32 launch_desc = (u32)((heap_iova + QMD_IMAGE_OFFSET) >> 8);
+            method_on(SUBCH_COMPUTE, MC_LAUNCH_DESC, 1, &launch_desc);
+            const u32 go = 1;
+            method_on(SUBCH_COMPUTE, MC_LAUNCH, 1, &go);
+            const int index = (int)(g_cmd - cmds);
+            float* v = (float*)(heap + IMAGE_OFFSET(index));
+            for (int k = 0; k < 4; k++) {
+                v[k * 8 + 0] = (k & 1) ? 0.2f : 0.0f, v[k * 8 + 1] = (k & 2) ? -0.40f : -0.65f;
+                v[k * 8 + 2] = 0.5f, v[k * 8 + 3] = 1.0f;
+                v[k * 8 + 4] = (float)(k & 1), v[k * 8 + 5] = (float)((k >> 1) & 1);
+                v[k * 8 + 6] = 0.0f, v[k * 8 + 7] = 1.0f;
+            }
+            const iova_t square = heap_iova + IMAGE_OFFSET(index);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_IMAGE_OFFSET);
             const u32 stream[4] = {32 | 1 << 12, (u32)(square >> 32), (u32)square, 0};
             method(M_VERTEX_STREAM, 4, stream);
             const iova_t last = square + 4 * 32 - 1;

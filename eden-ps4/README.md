@@ -283,6 +283,13 @@ Two ways it shows:
   copy only what a value takes). The 3D test went from 26 to 37 frames a second on one desktop
   thread (12 ns a pixel of its triangles' bounding boxes, from 18), and the 2D scenes gained about
   10%. `EDEN_SW_DUMP=1` logs each program's ops.
+- **Storage images and texel buffers** (patch 0039): shaders' image loads, stores and atomics read
+  and write the texel in emulated memory where its texture header says it is (pitch or block
+  linear, the view's level and layer), converting from and to the image's format (formatted) or
+  moving its bytes as they are (typed); texel buffers are fetched the same way. Textures a shader
+  may have written are checked again afterwards. The GPU test's second compute program stores
+  diagonal bands of colours from a texel buffer into a block-linear storage image, shown below the
+  first compute square; Eden's Vulkan renderer on lavapipe draws it the same, texel for texel.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -369,7 +376,7 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    cyan and blue bands into the distance: mipmaps; darker stripes across it: a shader's branch),
    under the bars a red square left and a green one right (each fragment program's own depth),
    and a dark square of diamonds below them (an sRGB texture), a square of colour blocks at the
-   top (a compute program's),
+   top (a compute program's) and one of diagonal colour bands below it (a storage image),
    all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame
    a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
@@ -464,6 +471,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: software shaders' identities are their arguments, and moves copy what a value takes | above |
 | null renderer: varyings interpolated in plane form, constant-index extracts a word's copy | above |
 | null renderer: EDEN_SW_DUMP logs each software program's ops | above |
+| null renderer: storage images and texel buffers in software shaders | above |
 
 The PS4 memory changes, from what stage 1 measured:
 
