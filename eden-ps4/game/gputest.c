@@ -22,7 +22,8 @@
 // And two squares whose fragment programs write their own depths (top right), and a square of the
 // tile through an sRGB texture header. And a compute program (shared memory, a barrier) filling a
 // texture shown on a square at the top, and another filling a storage image (formatted stores)
-// with colours from a texel buffer, shown below it. And on the right, the alpha test, primitive
+// with colours from a texel buffer, shown below it, and the same image as a multisampled texture
+// (2x2: a sample of each pixel fetched) beside that. And on the right, the alpha test, primitive
 // restart and a point's coordinates.
 // A turns a stress test on and off: 400 more sprites, each a draw of its own, as 2D games draw
 // them (up and down change how many, by 100). B turns on another, as 3D games draw: 12 large
@@ -255,6 +256,22 @@ static u64 sust_p2d(u32 data, u32 coord, u32 handle_offset) {
     return 0xEB2ull << 52 | 1ull << 51 /* bound */ | (u64)(handle_offset / 4) << 36 | 3ull << 33 /* 2D */ |
            0xFull << 20 /* rgba */ | PT | (u64)coord << 8 | data;
 }
+// F2I.U32.TRUNC Rdest, Rsrc: a float to an unsigned integer, rounded toward zero
+static u64 f2i(u32 dest, u32 src) {
+    return 0x5CB0ull << 48 | 3ull << 39 /* trunc */ | (u64)src << 20 | PT | 2ull << 10 /* F32 */ |
+           2ull << 8 /* I32 */ | dest;
+}
+// MOV32I Rdest, an integer
+static u64 mov32i_int(u32 dest, u32 value) {
+    return 0x010ull << 52 | (u64)value << 20 | PT | 0xFull << 12 | dest;
+}
+// TLD.LZ.MS Rdest..Rdest+3, [Rcoord, Rcoord+1], Rsample: a texel's sample of a multisampled 2D
+// texture whose handle is at 'handle_offset'
+static u64 tld2d_ms(u32 dest, u32 coord, u32 sample, u32 handle_offset) {
+    return 0xDCull << 56 | 7ull << 51 /* no sparse predicate */ | 1ull << 50 /* multisampled */ |
+           (u64)(handle_offset / 4) << 36 | 0xFull << 31 | 2ull << 28 /* 2D */ | (u64)sample << 20 | PT |
+           (u64)coord << 8 | dest;
+}
 #define SCHED 0x001F8000FC0007E0ull // a scheduling word (before every three instructions)
 
 // The shader programs, in a GPU buffer: each a 0x50-byte header (SPH) and its code, placed so
@@ -279,6 +296,7 @@ static u64 sust_p2d(u32 data, u32 coord, u32 handle_offset) {
 #define CS_IMAGE_CBUF 0x7000  // the image compute program's constant buffer 0: its handles at 0x120
 #define QMD_IMAGE_OFFSET 0x7200 // its launch description
 #define TEXEL_BUFFER_OFFSET 0x7300 // its texel buffer: 8 colours, RGBA32F
+#define FS_MSAA_OFFSET 0x7610 // sample 3 of each pixel of the storage image as a 2x2 multisampled texture
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -448,6 +466,20 @@ static void write_programs(u8* heap) {
         cs[k] = k % 4 == 0 ? SCHED : code[i++];
     }
 
+    // sample 3 (the bottom right of each pixel's 2x2) of the storage image seen as a 16x16
+    // multisampled texture (handle 7): the texel at (u, v) * 16
+    u32* fm_sph = (u32*)(heap + FS_MSAA_OFFSET);
+    memcpy(fm_sph, ft_sph, 0x50);
+    const u64 msaa_code[] = {
+        ipa(4, 0x80), ipa(5, 0x84), fmul32i(4, 4, 16.0f),
+        fmul32i(5, 5, 16.0f), f2i(4, 4), f2i(5, 5),
+        mov32i_int(6, 3), tld2d_ms(0, 4, 6, 28), exit_(),
+    };
+    u64* fm = (u64*)(heap + FS_MSAA_OFFSET + 0x50);
+    for (size_t i = 0, k = 0; i < sizeof(msaa_code) / sizeof(msaa_code[0]); k++) {
+        fm[k] = k % 4 == 0 ? SCHED : msaa_code[i++];
+    }
+
     // the storage image's: workgroups of 8x8, each invocation at x, y of a 32x32 image; its colour
     // the texel buffer's ((x + y) / 4 % 8), stored to its texel with a formatted store
     u64* csi = (u64*)(heap + CS_IMAGE_OFFSET);
@@ -597,6 +629,14 @@ static void write_storage_image(u8* heap, iova_t heap_iova, iova_t image) {
     tbo[4] = (8 - 1) | 6 << 23; // 8 texels, a 1D buffer
     u32* handles = (u32*)(heap + CS_IMAGE_CBUF + 0x120);
     handles[0] = 6, handles[1] = 5;
+    // header and sampler 7: the image as a 16x16 texture of 2x2 samples
+    u32* msaa = (u32*)(heap + TIC_POOL + 224);
+    memcpy(msaa, tic, 32);
+    msaa[4] = 15 | 1 << 23;
+    msaa[5] = 15 | 1u << 31;
+    msaa[7] = 2 << 8; // 2x2
+    memcpy(heap + TSC_POOL + 224, tsc, 32);
+    *(u32*)(heap + FS_CBUF + 28) = 7;
 }
 // The floor's texture: 64x64 and its 6 smaller levels, block linear, written by the CPU. Level 0
 // a grey checkerboard, the rest a colour each (red, orange, green, cyan, blue, purple), so where
@@ -944,6 +984,7 @@ int main(int argc, char* argv[]) {
 #define FIXED_OFFSET(i) (0x4C00 + (i) * 0x200)      // the alpha-tested square (4), the strip (9), the point (1)
 #define LIT_OFFSET(i) (0x5200 + (i) * 0xA00)        // the 3D stress test's quads (12 of 4, 48 bytes each)
 #define IMAGE_OFFSET(i) (0x7400 + (i) * 0x80)       // the storage image's square
+#define MSAA_OFFSET(i) (0x7800 + (i) * 0x80)        // the multisampled texture's square
 
     fprintf(stderr, "gputest: GPU channel open, syncpoint %u, framebuffers at GPU address %#lx\n",
             nvGpuChannelGetSyncpointId(&channel), fb_iova);
@@ -1034,9 +1075,9 @@ int main(int argc, char* argv[]) {
             const iova_t image_cbuf = heap_iova + CS_IMAGE_CBUF;
             qmd_image[0x1D] = (u32)image_cbuf;
             qmd_image[0x1E] = (u32)(image_cbuf >> 32) | 0x200u << 15;
-            const u32 compute_headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 6};
+            const u32 compute_headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 7};
             method_on(SUBCH_COMPUTE, M_TEX_HEADER_POOL, 3, compute_headers);
-            const u32 compute_samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 6};
+            const u32 compute_samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 7};
             method_on(SUBCH_COMPUTE, M_TEX_SAMPLER_POOL, 3, compute_samplers);
             const u32 compute_cbuf_slot = 0;
             method_on(SUBCH_COMPUTE, M_TEXTURE_CBUF_SLOT, 1, &compute_cbuf_slot);
@@ -1077,9 +1118,9 @@ int main(int argc, char* argv[]) {
             method1(M_VIEWPORT_TRANSFORM_ENABLE, 1);
             // textures: the pools, the handles' constant buffer
             method1(M_SAMPLER_BINDING, 1);
-            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 6};
+            const u32 headers[3] = {(u32)((heap_iova + TIC_POOL) >> 32), (u32)(heap_iova + TIC_POOL), 7};
             method(M_TEX_HEADER_POOL, 3, headers);
-            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 6};
+            const u32 samplers[3] = {(u32)((heap_iova + TSC_POOL) >> 32), (u32)(heap_iova + TSC_POOL), 7};
             // blending (for the tiles): source alpha over the frame
             const u32 blend[8] = {0, BLEND_ADD, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA,
                                   BLEND_ADD, BLEND_SRC_ALPHA, 0, BLEND_ONE_MINUS_SRC_ALPHA};
@@ -1555,6 +1596,24 @@ int main(int argc, char* argv[]) {
             const u32 limit[2] = {(u32)(last >> 32), (u32)last};
             method(M_VERTEX_STREAM_LIMIT, 2, limit);
             const u32 range[2] = {0, 4};
+            method(M_VERTEX_FIRST, 2, range);
+            method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
+            method1(M_DRAW_END, 0);
+            // beside it, the image as a multisampled texture: each pixel's bottom-right sample
+            float* m = (float*)(heap + MSAA_OFFSET(index));
+            for (int k = 0; k < 4; k++) {
+                m[k * 8 + 0] = (k & 1) ? 0.42f : 0.22f, m[k * 8 + 1] = (k & 2) ? -0.40f : -0.65f;
+                m[k * 8 + 2] = 0.5f, m[k * 8 + 3] = 1.0f;
+                m[k * 8 + 4] = (float)(k & 1), m[k * 8 + 5] = (float)((k >> 1) & 1);
+                m[k * 8 + 6] = 0.0f, m[k * 8 + 7] = 1.0f;
+            }
+            const iova_t msaa_square = heap_iova + MSAA_OFFSET(index);
+            method1(M_PIPELINE + 5 * 0x10 + 1, FS_MSAA_OFFSET);
+            const u32 msaa_stream[4] = {32 | 1 << 12, (u32)(msaa_square >> 32), (u32)msaa_square, 0};
+            method(M_VERTEX_STREAM, 4, msaa_stream);
+            const iova_t msaa_last = msaa_square + 4 * 32 - 1;
+            const u32 msaa_limit[2] = {(u32)(msaa_last >> 32), (u32)msaa_last};
+            method(M_VERTEX_STREAM_LIMIT, 2, msaa_limit);
             method(M_VERTEX_FIRST, 2, range);
             method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLE_STRIP);
             method1(M_DRAW_END, 0);

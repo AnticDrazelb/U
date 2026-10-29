@@ -298,6 +298,13 @@ Two ways it shows:
   16. Where lanes have branched apart, the interpreter steps through the run instead. The 3D test
   went from 37 to 43 frames a second on one desktop thread (9.6 ns a pixel, from 11.6), the 2D
   scenes 10% faster; the pictures are the same, byte for byte. `EDEN_SW_JIT=0` interprets.
+  `EDEN_SW_JIT_TEST=1` runs every instruction it compiles on awkward values (NaNs, infinities,
+  zeros of both signs, denormals, edge integers) against the interpreter (test.sh does).
+- **Multisampled texel fetches, and varyings only where they're needed** (patch 0041): a shader's
+  texel fetch from a multisampled texture reads its sample from the pixel's grid of samples (the
+  GPU test shows the storage image again as a 16x16 texture of 2x2 samples, each pixel's bottom
+  right: as Eden's Vulkan renderer draws it); and varyings are interpolated after the early depth
+  test, not for blocks it rejects (4% on the 3D test).
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -384,7 +391,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
    cyan and blue bands into the distance: mipmaps; darker stripes across it: a shader's branch),
    under the bars a red square left and a green one right (each fragment program's own depth),
    and a dark square of diamonds below them (an sRGB texture), a square of colour blocks at the
-   top (a compute program's) and one of diagonal colour bands below it (a storage image),
+   top (a compute program's) and two of diagonal colour bands below it (a storage image, and
+   the same as a multisampled texture),
    all drawn by the GPU emulation in software, and its frame rate as a green bar (6 pixels a frame
    a second). Its `log.txt` gets a
    line every 2 seconds, "Software draw: a second: ... ms rasterizing (on up to N threads)": what
@@ -482,6 +490,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: EDEN_SW_DUMP logs each software program's ops | above |
 | null renderer: storage images and texel buffers in software shaders | above |
 | null renderer: software shaders compiled to native code | above |
+| null renderer: multisampled texel fetches, varyings after the depth test, a native code self-test | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

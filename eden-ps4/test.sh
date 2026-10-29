@@ -254,6 +254,27 @@ for py in range(65, 106):
         checked += 1
 sys.exit(0 if bad == 0 and checked > 2000 else 1)
 PY
+# beside it, the same image as a 16x16 texture of 2x2 samples: each pixel's sample 3 (bottom right)
+check "its multisampled texture's samples are fetched" python3 - "$work/gputest-frames/frame-0001.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+width = int(data.split(b'\n')[1].split()[0])
+pixels = data[data.index(b'255\n') + 4:]
+at = lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+palette = [(0.9, 0.2, 0.2), (0.95, 0.6, 0.1), (0.95, 0.9, 0.2), (0.3, 0.85, 0.3),
+           (0.2, 0.8, 0.85), (0.25, 0.4, 0.95), (0.6, 0.3, 0.9), (0.95, 0.95, 0.95)]
+bad = checked = 0
+for py in range(65, 106):
+    for px in range(392, 452):
+        u, v = (px + 0.5 - 390.4) / 64 * 16, (py + 0.5 - 63) / 45 * 16
+        if min(abs(u - round(u)), abs(v - round(v))) < 0.05:
+            continue  # on a texel's edge
+        x, y = 2 * int(u) + 1, 2 * int(v) + 1
+        expected = tuple(int(c * 255 + 0.5) for c in palette[(x + y) // 4 % 8])
+        bad += max(abs(a - b) for a, b in zip(at(px, py), expected)) > 1
+        checked += 1
+sys.exit(0 if bad == 0 and checked > 1500 else 1)
+PY
 # on the right: an indexed strip of two magenta quads with a restart index between them (nothing
 # drawn between), and a point of 32 pixels coloured by its coordinates (black top left, red top
 # right, green bottom left, yellow bottom right)
@@ -269,6 +290,10 @@ tl, tr, bl, br = at(586, 208), at(614, 208), at(586, 236), at(614, 236)
 ok &= max(tl[:2]) < 60 and tr[0] > 200 and tr[1] < 60 and bl[1] > 200 and bl[0] < 60 and min(br[:2]) > 200
 sys.exit(0 if ok else 1)
 PY
+
+echo "the software shaders' native code: each instruction it does against the interpreter's results"
+run jit_test "$work/gputest.nro" 20 "3:Plus,3.5:" EDEN_SW_JIT_TEST=1
+check "gives the interpreter's results on awkward values" says jit_test "native code self-test: 0 of [0-9]* differ"
 
 echo "gputest.nro's stress test: 400 more sprites, a draw each (queued, rasterized together)"
 run gputest_stress "$work/gputest.nro" 20 "2:A,2.3:,7:Plus,7.5:"

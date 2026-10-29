@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 04:16:17 +0000
+Subject: [PATCH] null renderer: multisampled texel fetches, varyings after the
+ depth test, a native code self-test
+
+Texel fetches from a multisampled texture read the sample's place in the pixel's grid (its
+texels decoded as multisampled render targets are drawn: a grid of samples a pixel).
+
+Varyings are interpolated after the early depth test, not for blocks it rejects.
+
+EDEN_SW_JIT_TEST=1 runs each instruction native code does on awkward values (NaNs, infinities,
+zeros of both signs, denormals, edge integers) against the interpreter, and logs how many
+differ. It found the logical instructions assuming their operands were 0 or 1; they now treat
+any value but 0 as true, as the interpreter does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ .../renderer_null/software_draw.cpp           | 268 +++++++++++++++---
+ 1 file changed, 224 insertions(+), 44 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index cd8590e8c..49dd864b3 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -13,6 +13,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <random>
+ #include <set>
+ #include <string_view>
+ #include <unordered_map>
+@@ -599,6 +600,7 @@ struct Texture {
+     bool integer = false;
+     u32 base_level = 0, num_levels = 0; // the view's
+     u32 base_layer = 0, num_layers = 0;
++    u32 samples_x = 1, samples_y = 1; // multisampled: its levels' texels are grids of samples
+     std::array<SwizzleSource, 4> swizzle{};
+     bool identity_swizzle = false;
+     const f32* rgb_table = nullptr; // 8-bit colour channels to floats (sRGB decoded, or not)
+@@ -1145,10 +1147,9 @@ bool DecodeTexture(Tegra::MemoryManager& gpu_memory, const Tegra::Texture::TICEn
+         LogOnce("texture buffers aren't sampled");
+         return false;
+     }
+-    if (info.num_samples > 1) {
+-        LogOnce("multisampled textures aren't sampled");
+-        return false;
+-    }
++    // (multisampled: its texels a grid of samples, as multisampled render targets are drawn)
++    texture.samples_x = u32(VideoCommon::NumSamplesX(tic.msaa_mode));
++    texture.samples_y = u32(VideoCommon::NumSamplesY(tic.msaa_mode));
+     if (format == PixelFormat::Invalid || IsPixelFormatETC2(format) ||
+         format == PixelFormat::EAC_R11_UNORM || format == PixelFormat::EAC_R11_SNORM ||
+         format == PixelFormat::EAC_R11G11_UNORM || format == PixelFormat::EAC_R11G11_SNORM) {
+@@ -1635,7 +1636,7 @@ std::array<f32, 4> GatherTexture(const Binding& binding, IR::TextureInstInfo inf
+ 
+ /// A texel by its integer coordinates, unfiltered; zero outside the image
+ std::array<f32, 4> FetchTexture(const Binding& binding, IR::TextureInstInfo info,
+-                                const Cell& coords, const Cell& offset, u32 lod) {
++                                const Cell& coords, const Cell& offset, u32 lod, u32 sample) {
+     if (!binding.texture || !binding.texture->ok || lod >= binding.texture->num_levels) {
+         return {};
+     }
+@@ -1652,6 +1653,14 @@ std::array<f32, 4> FetchTexture(const Binding& binding, IR::TextureInstInfo info
+     case T::Color3D: y = s32(coords.w[1]) + off[1], z = s32(coords.w[2]) + off[2]; break;
+     default: return {};
+     }
++    if (texture.samples_x * texture.samples_y > 1) { // the sample's place in the pixel's grid
++        sample %= texture.samples_x * texture.samples_y;
++        if (x < 0 || y < 0) {
++            return {};
++        }
++        x = x * s32(texture.samples_x) + s32(sample % texture.samples_x);
++        y = y * s32(texture.samples_y) + s32(sample / texture.samples_x);
++    }
+     if (x < 0 || y < 0 || z < 0 || layer < 0 || u32(x) >= level.width || u32(y) >= level.height ||
+         u32(z) >= level.depth || u32(layer) >= texture.num_layers) {
+         return {};
+@@ -2175,8 +2184,17 @@ private:
+                 op.a[0] = Slot(inst.Arg(0)), op.a[1] = Slot(inst.Arg(1));
+                 op.extra = inst.Arg(0).IsImmediate() && inst.Arg(1).IsImmediate() ? 1 : 0;
+                 break;
++            case O::ImageFetch: // handle, coords, offset, lod, sample: the lod and sample in one cell
++                if (!inst.Arg(4).IsEmpty()) {
++                    op.extra = inst.Flags<IR::TextureInstInfo>().raw;
++                    const u16 pair = NewCell();
++                    Emit({Kind::Ir, O::CompositeConstructU32x2, pair, {Slot(inst.Arg(3)), Slot(inst.Arg(4))}, 0});
++                    op.a = {Slot(inst.Arg(0)), Slot(inst.Arg(1)), Slot(inst.Arg(2)), pair};
++                    break;
++                }
++                [[fallthrough]];
+             case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGather:
+-            case O::ImageFetch: case O::ImageQueryDimensions: case O::ImageQueryLod:
++            case O::ImageQueryDimensions: case O::ImageQueryLod:
+             case O::ImageGradient: case O::ImageRead: case O::ImageWrite:
+             case O::ImageAtomicIAdd32: case O::ImageAtomicSMin32: case O::ImageAtomicUMin32:
+             case O::ImageAtomicSMax32: case O::ImageAtomicUMax32: case O::ImageAtomicInc32:
+@@ -2846,7 +2864,7 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+                 break;
+             }
+             case O::ImageFetch: // coords, offset, lod
+-                result = FetchTexture(*binding, info, b, e, f.w[0]);
++                result = FetchTexture(*binding, info, b, e, f.w[0], f.w[1]); // (lod, sample)
+                 break;
+             case O::ImageQueryDimensions: { // lod
+                 if (!texture || !texture->ok) {
+@@ -2858,7 +2876,8 @@ void RunTexture(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io&
+                 const T type = info.type;
+                 const bool array = type == T::ColorArray1D || type == T::ColorArray2D || type == T::ColorArrayCube;
+                 const u32 layers = type == T::ColorArrayCube ? texture->num_layers / 6 : texture->num_layers;
+-                const u32 dims[4] = {level.width, type == T::ColorArray1D ? layers : level.height,
++                const u32 dims[4] = {level.width / texture->samples_x,
++                                     type == T::ColorArray1D ? layers : level.height / texture->samples_y,
+                                      type == T::Color3D ? level.depth : array && type != T::ColorArray1D ? layers : 0,
+                                      texture->num_levels};
+                 std::memcpy(result.data(), dims, sizeof(dims));
+@@ -3937,11 +3956,40 @@ private:
+                 vpsubd(d, d, a);
+             });
+             break;
+-        case O::BitwiseAnd32: case O::LogicalAnd: binary([&](auto d, auto a, auto b) { vpand(d, a, b); }); break;
+-        case O::BitwiseOr32: case O::LogicalOr: binary([&](auto d, auto a, auto b) { vpor(d, a, b); }); break;
+-        case O::BitwiseXor32: case O::LogicalXor: binary([&](auto d, auto a, auto b) { vpxor(d, a, b); }); break;
++        case O::BitwiseAnd32: binary([&](auto d, auto a, auto b) { vpand(d, a, b); }); break;
++        case O::BitwiseOr32: binary([&](auto d, auto a, auto b) { vpor(d, a, b); }); break;
++        case O::BitwiseXor32: binary([&](auto d, auto a, auto b) { vpxor(d, a, b); }); break;
+         case O::BitwiseNot32: unary([&](auto d, auto a) { vpxor(d, a, Const(ALL_ONES)); }); break;
+-        case O::LogicalNot: unary([&](auto d, auto a) { vpxor(d, a, Const(ONE_INT)); }); break;
++        // the logical ones as the interpreter's: any value but 0 true (each operand's "is 0" first)
++        case O::LogicalOr:
++            binary([&](auto d, auto a, auto b) {
++                vpor(d, a, b);
++                vpcmpeqd(d, d, Const(ZERO));
++                vpaddd(d, d, Const(ONE_INT));
++            });
++            break;
++        case O::LogicalAnd:
++            binary([&](auto d, auto a, auto b) {
++                vpcmpeqd(xmm14, a, Const(ZERO));
++                vpcmpeqd(xmm15, b, Const(ZERO));
++                vpor(d, xmm14, xmm15);
++                vpaddd(d, d, Const(ONE_INT));
++            });
++            break;
++        case O::LogicalXor:
++            binary([&](auto d, auto a, auto b) {
++                vpcmpeqd(xmm14, a, Const(ZERO));
++                vpcmpeqd(xmm15, b, Const(ZERO));
++                vpxor(d, xmm14, xmm15);
++                vpsrld(d, d, 31);
++            });
++            break;
++        case O::LogicalNot:
++            unary([&](auto d, auto a) {
++                vpcmpeqd(d, a, Const(ZERO));
++                vpsrld(d, d, 31);
++            });
++            break;
+         case O::IEqual: icompare(true, false, false, false); break;
+         case O::INotEqual: icompare(true, false, true, false); break;
+         case O::SLessThan: icompare(false, true, false, false); break;
+@@ -4210,6 +4258,136 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+ #undef IO_LOOP
+ #undef LANE_LOOP
+ 
++void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n);
++
++#ifdef SOFTWARE_JIT
++/// With EDEN_SW_JIT_TEST set: each instruction native code does, compiled and run on awkward values
++/// (NaNs, infinities, zeros of both signs, denormals, the integers at the edges), its results
++/// against the interpreter's; how many differ is logged, and the first few
++void JitSelfTest(ShaderJit& jit) {
++    using O = IR::Opcode;
++    static constexpr O tested[] = {
++        O::GetAttribute, O::SetFragColor, O::CompositeConstructF32x2, O::CompositeConstructU32x3,
++        O::CompositeConstructF32x4, O::CompositeExtractF32x4, O::BitCastU32F32, O::BitCastU64F64,
++        O::SelectU32, O::SelectF32, O::SelectU64, O::FPAbs32, O::FPAdd32, O::FPFma32, O::FPMax32,
++        O::FPMin32, O::FPMul32, O::FPNeg32, O::FPRecip32, O::FPRecipSqrt32, O::FPSqrt,
++        O::FPSaturate32, O::FPClamp32, O::FPRoundEven32, O::FPFloor32, O::FPCeil32, O::FPTrunc32,
++        O::FPOrdEqual32, O::FPUnordEqual32, O::FPOrdNotEqual32, O::FPUnordNotEqual32,
++        O::FPOrdLessThan32, O::FPUnordLessThan32, O::FPOrdGreaterThan32, O::FPUnordGreaterThan32,
++        O::FPOrdLessThanEqual32, O::FPUnordLessThanEqual32, O::FPOrdGreaterThanEqual32,
++        O::FPUnordGreaterThanEqual32, O::FPIsNan32, O::IAdd32, O::ISub32, O::IMul32, O::INeg32,
++        O::BitwiseAnd32, O::BitwiseOr32, O::BitwiseXor32, O::BitwiseNot32, O::IEqual, O::INotEqual,
++        O::SLessThan, O::SGreaterThan, O::SLessThanEqual, O::SGreaterThanEqual, O::ULessThan,
++        O::UGreaterThan, O::ULessThanEqual, O::UGreaterThanEqual, O::LogicalOr, O::LogicalAnd,
++        O::LogicalXor, O::LogicalNot, O::ShiftLeftLogical32, O::ShiftRightLogical32,
++        O::ShiftRightArithmetic32, O::ConvertF32S32, O::ConvertF32U32, O::UndefU32,
++    };
++    static constexpr u32 awkward[] = {
++        0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u, 0x7FC00000u,
++        0xFFC00001u, 0x7F800001u, 0x00000001u, 0x807FFFFFu, 0x3F000000u, 0x4B000001u, 0xCAFFFFFFu,
++        0x7FFFFFFFu, 0xFFFFFFFFu, 31, 32, 1, 0x00010000u, 0x4F800000u, 0x3FC00000u, 0xBFC00000u,
++    };
++    std::mt19937 rng(20261029);
++    const auto random_value = [&] {
++        switch (rng() % 3) {
++        case 0: return awkward[rng() % std::size(awkward)];
++        case 1: return std::bit_cast<u32>(std::uniform_real_distribution<f32>(-1000.0f, 1000.0f)(rng));
++        default: return u32(rng());
++        }
++    };
++    const auto words_of = [](O op) -> u32 {
++        switch (op) {
++        case O::CompositeConstructF32x2: case O::BitCastU64F64: case O::SelectU64: return 2;
++        case O::CompositeConstructU32x3: return 3;
++        case O::CompositeConstructF32x4: case O::UndefU32: return 4;
++        default: return 1;
++        }
++    };
++    const auto same = [](u32 a, u32 b) { // bit for bit, or both NaN, or both zero
++        const f32 fa = std::bit_cast<f32>(a), fb = std::bit_cast<f32>(b);
++        return a == b || (std::isnan(fa) && std::isnan(fb)) || (fa == 0.0f && fb == 0.0f);
++    };
++    u32 checked = 0, failures = 0;
++    std::vector<f32> inputs(256 * LANES), colors_native(32 * LANES), colors_interpreted(32 * LANES);
++    std::array<bool, LANES> discard{};
++    const std::array<std::vector<u32>, 18> cbufs{};
++    for (const O op : tested) {
++        for (u32 round = 0; round < 12; ++round) {
++            // cells: 0..2 the operands' sources, 3..5 the operands (written by moves: not
++            // constants), 6 and 7 the results, 8 a constant (shift counts)
++            SoftwareDraw::Program program;
++            program.ok = true;
++            program.cells.resize(9);
++            program.cells[8].w[0] = round * 3;
++            const u32 extra = op == O::CompositeExtractF32x4 ? 1 + round % 4
++                              : op == O::GetAttribute    ? 40 + round
++                              : op == O::SetFragColor    ? round % 32
++                                                         : 0;
++            const bool shift = op == O::ShiftLeftLogical32 || op == O::ShiftRightLogical32 ||
++                               op == O::ShiftRightArithmetic32;
++            const std::array<u16, 4> args{3, u16(shift ? 8 : 4), 5, 3};
++            program.ops = {
++                Op{Kind::Move, {}, 3, {0}, 4}, Op{Kind::Move, {}, 4, {1}, 4}, Op{Kind::Move, {}, 5, {2}, 4},
++                Op{Kind::Ir, op, 6, args, extra}, Op{Kind::Ir, op, 7, {5, u16(shift ? 8 : 3), 4, 5}, extra},
++                Op{Kind::Return, {}, 0, {}, 0},
++            };
++            SoftwareDraw::Program native = program;
++            if (!jit.Compile(native) || native.native.empty()) {
++                LOG_WARNING(Render, "Software draw: native code self-test: {} not compiled", op);
++                ++failures;
++                break;
++            }
++            std::vector<Lanes> cells;
++            Broadcast(program.cells, cells);
++            for (u32 cell = 0; cell < 3; ++cell) {
++                for (u32 k = 0; k < 4; ++k) {
++                    for (u32 i = 0; i < LANES; ++i) {
++                        cells[cell].w[k][i] = random_value();
++                    }
++                }
++            }
++            for (f32& input : inputs) {
++                input = std::bit_cast<f32>(random_value());
++            }
++            std::vector<Lanes> interpreted_cells = cells;
++            std::fill(colors_native.begin(), colors_native.end(), 0.0f);
++            std::fill(colors_interpreted.begin(), colors_interpreted.end(), 0.0f);
++            Io io{inputs.data(), nullptr, colors_native.data(), discard.data(), LANES, 0, &cbufs, nullptr, 0,
++                  nullptr, nullptr, nullptr};
++            io.run = io.live = 0xFFFF;
++            io.quads = true;
++            Io interpreted_io = io;
++            interpreted_io.colors = colors_interpreted.data();
++            Run(native, cells.data(), io, LANES);
++            Run(program, interpreted_cells.data(), interpreted_io, LANES);
++            bool ok = true;
++            for (u32 cell = 6; cell < 8; ++cell) {
++                for (u32 k = 0; k < words_of(op); ++k) {
++                    for (u32 i = 0; i < LANES; ++i) {
++                        const u32 a = cells[cell].w[k][i], b = interpreted_cells[cell].w[k][i];
++                        if (!same(a, b)) {
++                            if (ok && failures < 16) {
++                                LOG_WARNING(Render, "Software draw: native code self-test: {} gives {:#010x}, the "
++                                            "interpreter {:#010x} (operands {:#010x} {:#010x} {:#010x})",
++                                            op, a, b, interpreted_cells[3].w[0][i], interpreted_cells[4].w[0][i],
++                                            interpreted_cells[5].w[0][i]);
++                            }
++                            ok = false;
++                        }
++                    }
++                }
++            }
++            for (size_t i = 0; i < colors_native.size(); ++i) {
++                ok &= same(std::bit_cast<u32>(colors_native[i]), std::bit_cast<u32>(colors_interpreted[i]));
++            }
++            failures += ok ? 0 : 1;
++            ++checked;
++        }
++    }
++    LOG_WARNING(Render, "Software draw: native code self-test: {} of {} differ", failures, checked);
++}
++#endif
++
+ void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     if (n == 1) {
+         RunLanes<false>(program, c, io, 1);
+@@ -4688,6 +4866,8 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+ #ifdef SOFTWARE_JIT
+         if (program->ok && (ir.stage == Shader::Stage::Fragment || compute)) { // (the stages run 16 lanes wide)
+             if (ShaderJit* const jit = ShaderJit::Get()) {
++                static const bool tested = std::getenv("EDEN_SW_JIT_TEST") && (JitSelfTest(*jit), true);
++                (void)tested;
+                 jit->Compile(*program);
+             }
+         }
+@@ -5177,38 +5357,6 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                     position_y[j] = (f32(lane_y(j)) + 0.5f) * b.frag_scale_y;
+                     position_z[j] = w0[j] * t.z[0] + w1[j] * t.z[1] + w2[j] * t.z[2];
+                 }
+-                // each varying in plane form: a + (b - a) u + (c - a) v, u and v the second and
+-                // third vertices' weights (corrected for perspective once, for all of them)
+-                alignas(64) f32 pu[LANES], pv[LANES];
+-                for (u32 j = 0; j < LANES; ++j) {
+-                    pu[j] = pw1[j] * inv_psum[j], pv[j] = pw2[j] * inv_psum[j];
+-                }
+-                for (size_t k = 0; k < num_varyings; ++k) {
+-                    const f32 a = data[k], db = data[num_varyings + k] - a, dc = data[2 * num_varyings + k] - a;
+-                    alignas(64) f32 value[LANES];
+-                    switch (varyings[k].interpolation) {
+-                    case Shader::Interpolation::Flat:
+-                        std::fill_n(value, LANES, a);
+-                        break;
+-                    case Shader::Interpolation::NoPerspective:
+-                        for (u32 j = 0; j < LANES; ++j) {
+-                            value[j] = a + db * w1[j] + dc * w2[j];
+-                        }
+-                        break;
+-                    default:
+-                        for (u32 j = 0; j < LANES; ++j) {
+-                            value[j] = a + db * pu[j] + dc * pv[j];
+-                        }
+-                        break;
+-                    }
+-                    std::memcpy(in + varyings[k].input * LANES, value, sizeof(value));
+-                }
+-                for (const Target& tg : targets) {
+-                    f32* const out = st.colors.data() + tg.attachment * 4 * LANES;
+-                    std::fill_n(out, 3 * LANES, 0.0f);
+-                    std::fill_n(out + 3 * LANES, LANES, 1.0f);
+-                }
+-                st.discard.fill(false);
+                 // the stencil and depth tests: a batch whose pixels all fail isn't shaded (unless
+                 // the shader can discard, which keeps a pixel from the stencil's updates)
+                 const StencilFace& face = t.front ? front_stencil : back_stencil;
+@@ -5319,6 +5467,38 @@ void SoftwareDraw::RasterRows(Batch& b, Raster& st, s32 row_begin, s32 row_end)
+                         continue;
+                     }
+                 }
++                // (after the depth test: not for blocks it rejects) each varying in plane form: a + (b - a) u + (c - a) v, u and v the second and
++                // third vertices' weights (corrected for perspective once, for all of them)
++                alignas(64) f32 pu[LANES], pv[LANES];
++                for (u32 j = 0; j < LANES; ++j) {
++                    pu[j] = pw1[j] * inv_psum[j], pv[j] = pw2[j] * inv_psum[j];
++                }
++                for (size_t k = 0; k < num_varyings; ++k) {
++                    const f32 a = data[k], db = data[num_varyings + k] - a, dc = data[2 * num_varyings + k] - a;
++                    alignas(64) f32 value[LANES];
++                    switch (varyings[k].interpolation) {
++                    case Shader::Interpolation::Flat:
++                        std::fill_n(value, LANES, a);
++                        break;
++                    case Shader::Interpolation::NoPerspective:
++                        for (u32 j = 0; j < LANES; ++j) {
++                            value[j] = a + db * w1[j] + dc * w2[j];
++                        }
++                        break;
++                    default:
++                        for (u32 j = 0; j < LANES; ++j) {
++                            value[j] = a + db * pu[j] + dc * pv[j];
++                        }
++                        break;
++                    }
++                    std::memcpy(in + varyings[k].input * LANES, value, sizeof(value));
++                }
++                for (const Target& tg : targets) {
++                    f32* const out = st.colors.data() + tg.attachment * 4 * LANES;
++                    std::fill_n(out, 3 * LANES, 0.0f);
++                    std::fill_n(out + 3 * LANES, LANES, 1.0f);
++                }
++                st.discard.fill(false);
+                 io.run = run, io.live = live;
+                 if (late_depth) { // the shader's depth, where it writes one; the triangle's elsewhere
+                     std::copy_n(position_z, LANES, frag_depth.data());
