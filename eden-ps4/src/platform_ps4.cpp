@@ -23,6 +23,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <pthread.h>
@@ -36,6 +37,7 @@
 #include <orbis/VideoOut.h>
 #include <stb/stb_easy_font.h>
 
+#include "common/ps4_diagnostics.h"
 #include "launcher.h"
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes
@@ -58,6 +60,10 @@ int32_t scePthreadSetprio(void* thread, int32_t priority);
 void ps4_boot_trace(const char* stage);
 // Mesa's RADV (or ps4_stubs.cpp's stand-in, without it)
 void* vk_icdGetInstanceProcAddr(void* instance, const char* name);
+// port/ps4_runtime.cpp: direct memory the C heap's overflow leaves for the GPU
+void ps4_heap_set_overflow_gpu_reserve(size_t bytes);
+// port/ps4_sampler.cpp: every thread's stack, appended to a file
+void ps4_dump_thread_stacks(const char* path, const char* reason);
 }
 
 namespace {
@@ -67,6 +73,7 @@ constexpr int32_t kProtCpuGpuRw = 0x33;
 constexpr const char* kDataDir = "/data/eden-ps4";
 constexpr const char* kLogFile = "/data/eden-ps4/log.txt";
 constexpr const char* kCrashFile = "/data/eden-ps4/crash.log";
+constexpr const char* kHangFile = "/data/eden-ps4/hang.log";
 // The last run's boot trace: Crema's runtime renames boot-trace.log to this as the app starts.
 constexpr const char* kLastTraceFile = "/data/eden-ps4/boot-trace-launcher.log";
 constexpr const char* kTestProgram = "/app0/hello.nro";
@@ -137,12 +144,20 @@ public:
     // display takes it: Eden's Vulkan renderer. Open takes it back.
     void Release()
     {
-        // (once the last flip is on screen: none left pending on buffers about to go)
-        for (int tries = 0; handle >= 0 && flips > 0 && tries < 50; tries++)
+        // (once the last flip is on screen: none left pending on buffers about to go. A flip shadPS4
+        // still had queued after 100 ms took it down, "flip of an unregistered buffer")
+        for (int tries = 0; handle >= 0 && flips > 0; tries++)
         {
             OrbisVideoOutFlipStatus flip_status = {};
-            if (sceVideoOutGetFlipStatus(handle, &flip_status) < 0 || flip_status.flipArg >= int64_t(flips))
+            if (sceVideoOutGetFlipStatus(handle, &flip_status) < 0 ||
+                (flip_status.flipArg >= int64_t(flips) && flip_status.numFlipPending == 0))
                 break;
+            if (tries == 1000)
+            {
+                Trace(fmt::format("screen: flips still pending after 2 s (flip {} of {}, {} pending)",
+                                  flip_status.flipArg, flips, flip_status.numFlipPending));
+                break;
+            }
             usleep(2000);
         }
         if (handle >= 0)
@@ -609,8 +624,10 @@ void* PadThread(void*)
 // boot trace gets their rate every 10 s, how long the launcher waited for a buffer off the screen
 // (the display's pace) and how long scaling a frame onto it took.
 std::atomic<bool> g_drawing{false};
+std::atomic<uint64_t> g_frames_shown{0}; // (for the hang watchdog)
 void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
 {
+    g_frames_shown.fetch_add(1, std::memory_order_relaxed);
     static double period_start = 0, drawing = 0, waiting = 0;
     static unsigned frames = 0;
     std::lock_guard lock{g_mutex};
@@ -779,6 +796,7 @@ std::string StartPage(bool first)
     // the last run's files are kept, under other names
     rename(kLogFile, "/data/eden-ps4/log-previous.txt");
     rename(kCrashFile, "/data/eden-ps4/crash-previous.log");
+    rename(kHangFile, "/data/eden-ps4/hang-previous.log");
     g_screen.Clear();
     g_screen.SetScale(2.0f);
     return program;
@@ -838,12 +856,117 @@ void ReadSettings()
     std::fclose(file);
 }
 
+// The hang watchdog (after Eden4's): while a program runs, if its frames stop for 20 s after they
+// had started, or none has come 90 s after it booted, every thread's stack goes to hang.log, once
+// until frames move again: what to send when a game freezes on the console. It allocates nothing
+// before the dump, which then still happens when the hang is in the heap. EDEN_PS4_HANG_SECONDS
+// in settings.txt changes the 20 (and the 90 with it, 4.5 times as long).
+class HangWatchdog
+{
+public:
+    void Start(const std::string& program)
+    {
+        name = program;
+        const char* seconds = std::getenv("EDEN_PS4_HANG_SECONDS");
+        stall_limit = seconds ? std::max(1, std::atoi(seconds)) : 20;
+        boot_limit = stall_limit * 9 / 2;
+        stop = false;
+        thread = std::thread([this] { Watch(); });
+    }
+    void Stop()
+    {
+        stop = true;
+        if (thread.joinable())
+            thread.join();
+    }
+
+private:
+    static uint64_t Frames()
+    {
+        return Common::PS4Diagnostics::composites.load(std::memory_order_relaxed) +
+               g_frames_shown.load(std::memory_order_relaxed);
+    }
+    void Watch()
+    {
+        const uint64_t base = Frames();
+        uint64_t last = base;
+        int seconds = 0, stale = 0;
+        bool dumped = false;
+        while (!stop)
+        {
+            for (int i = 0; i < 10 && !stop; i++)
+                usleep(100 * 1000);
+            seconds++;
+            const uint64_t frames = Frames();
+            if (frames != last)
+            {
+                last = frames;
+                stale = 0;
+                dumped = false;
+                continue;
+            }
+            stale++;
+            const bool started = frames != base;
+            if (dumped || (started ? stale < stall_limit : seconds < boot_limit))
+                continue;
+            dumped = true;
+            char reason[256];
+            const char* stage = Common::PS4Diagnostics::stage.load();
+            if (started)
+                snprintf(reason, sizeof(reason), "%s: no new frame for %d s, %d s after booting, %llu frames so far "
+                         "(the GPU display: %s)", name.c_str(), stale, seconds, (unsigned long long)(frames - base),
+                         stage);
+            else
+                snprintf(reason, sizeof(reason), "%s: no frame %d s after booting (the GPU display: %s)",
+                         name.c_str(), seconds, stage);
+            ps4_dump_thread_stacks(kHangFile, reason);
+            Trace(std::string("hang watchdog: ") + reason + ": thread stacks in hang.log");
+        }
+    }
+
+    std::string name;
+    int stall_limit = 20, boot_limit = 90;
+    std::atomic<bool> stop{false};
+    std::thread thread;
+};
+
+// EDEN_PS4_HEAP_TEST=<MiB> in settings.txt: with 4 GiB of direct memory taken first (as the
+// Switch's RAM will be) and RADV's reserve set, the C heap grows by that much (8 MiB blocks), to
+// see where its overflow heaps come from (boot-trace.log); everything is then given back.
+void HeapTest(size_t megabytes)
+{
+    off_t ram = 0;
+    const bool have_ram = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), 4096 * MB, 2 * MB, 0,
+                                                        &ram) == 0;
+    Trace(fmt::format("heap test: {} MiB; 4 GiB of direct memory for the Switch's RAM {}", megabytes,
+                      have_ram ? "taken" : "NOT taken"));
+    ps4_heap_set_overflow_gpu_reserve(256 * MB);
+    std::vector<void*> blocks;
+    blocks.reserve(megabytes / 8 + 1);
+    size_t got = 0;
+    while (got < megabytes * MB)
+    {
+        void* block = std::malloc(8 * MB);
+        if (!block)
+            break;
+        blocks.push_back(block);
+        got += 8 * MB;
+    }
+    Trace(fmt::format("heap test: {} of {} MiB allocated", got / MB, megabytes));
+    for (void* block : blocks)
+        std::free(block);
+    if (have_ram)
+        sceKernelReleaseDirectMemory(ram, 4096 * MB);
+}
+
 void* Run(void*)
 {
     // Eden finds its data under $HOME when no folder is given, and a few paths it always takes
     // from there: keep them in the app's folder.
     setenv("HOME", kDataDir, 1);
     ReadSettings();
+    if (const char* test = std::getenv("EDEN_PS4_HEAP_TEST"))
+        HeapTest(std::strtoul(test, nullptr, 10));
     // the null renderer's software draws log what they cost (every 2 seconds, in log.txt), and
     // rasterize on 4 threads (the GPU thread and 3 more) of the app's 6 cores, leaving the
     // emulated CPU's thread one of its own
@@ -878,7 +1001,13 @@ void* Run(void*)
             std::lock_guard lock{g_mutex};
             g_screen.Release();
         }
+        // The C heap's overflow (once its 384 MiB are full) leaves direct memory to the GPU: the
+        // Switch's 4 GiB leave about 480 MiB of it, and RADV needs most of what's left
+        ps4_heap_set_overflow_gpu_reserve((gpu ? 256 : 32) * MB);
+        HangWatchdog watchdog;
+        watchdog.Start(program);
         auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
+        watchdog.Stop();
         if (gpu)
         {
             std::lock_guard lock{g_mutex};
@@ -896,7 +1025,10 @@ void* Run(void*)
             Trace("renderer: Vulkan did not start; the null renderer from now on");
             ShowLine(Launcher::LineKind::Status,
                      "Vulkan did not start (see log-vulkan.txt): booting again with the software renderer");
+            ps4_heap_set_overflow_gpu_reserve(32 * MB);
+            watchdog.Start(program);
             result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
+            watchdog.Stop();
         }
         g_running = false;
         pthread_join(pad_thread, nullptr);

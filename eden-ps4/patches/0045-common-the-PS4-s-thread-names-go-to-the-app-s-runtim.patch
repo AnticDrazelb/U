@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 08:00:54 +0000
+Subject: [PATCH] common: the PS4's thread names go to the app's runtime
+
+Thread names were dropped on the PS4 (pthread_rename_np isn't a system
+call a homebrew app makes there). They now go to the runtime the app
+links (ps4_watch_thread, weak): its hang reports name each thread, and
+its busy threads (the emulated CPU cores, the GPU thread) get heap
+arenas of their own instead of all sharing the one locked heap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ src/common/thread.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index a1e3f7882..45b07653d 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -24,6 +24,9 @@
+ #include "common/string_util.h"
+ #include "common/windows/timer_resolution.h"
+ #else
++#ifdef __OPENORBIS__
++extern "C" __attribute__((weak)) void ps4_watch_thread(const char* name); // the PS4 app's runtime
++#endif
+ #if defined(__FreeBSD__) && !defined(__OPENORBIS__) // the PS4 has neither header
+ #include <sys/cpuset.h>
+ #include <sys/_cpuset.h>
+@@ -519,8 +522,11 @@ void SetCurrentThreadName(const char* name) {
+ #elif defined(__HAIKU__)
+     rename_thread(find_thread(NULL), name);
+ #elif defined(__OPENORBIS__)
+-    // The PS4: pthread_rename_np isn't among the system calls a homebrew app makes there.
+-    (void)name;
++    // The PS4: pthread_rename_np isn't among the system calls a homebrew app makes there. The name
++    // goes to the app's runtime instead (port/ps4_sampler.cpp): hang reports name the thread, and
++    // the busy ones get a heap arena of their own.
++    if (ps4_watch_thread)
++        ps4_watch_thread(name);
+ #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+     pthread_set_name_np(pthread_self(), name);
+ #elif defined(__NetBSD__)

@@ -225,6 +225,10 @@ mspace createHeap() {
 }
 
 bool g_creatingHeap = false;
+// The overflow heaps' lock (below): a blocking one, as dlmalloc's (port/ps4_dlmalloc.c: a spinning
+// waiter of higher priority starves the holder), initialized with the heap (initializing it on
+// first use could allocate from the full heap it is there to extend).
+pthread_mutex_t g_overflowLock;
 
 inline mspace getHeap() {
     // The first allocation happens in a static constructor, before any threads exist. While the
@@ -233,56 +237,149 @@ inline mspace getHeap() {
         g_creatingHeap = true;
         g_heap = createHeap();
         g_creatingHeap = false;
+        if (g_heap)
+            pthread_mutex_init(&g_overflowLock, nullptr);
     }
     return g_heap;
 }
 
-// Overflow heap: direct memory, mapped the first time the main heap can't serve a request.
-// Spider-Man 2 fills most of the 512 MiB main heap; a save state then needed one 99 MiB block
-// (148 MiB in Mario Kart: Double Dash!!), the allocation failed and the app crashed. Direct
-// memory is a separate 4.5 GiB pool (the GPU's); with FOOTERS, free and realloc find this heap
-// from the chunk itself.
-mspace g_overflow = nullptr;
-uintptr_t g_overflowBase = 0;
-size_t g_overflowSize = 0;
-bool g_overflowTried = false;
+// Declared by hand: the SDK passes its output arguments by value.
+extern "C" int32_t ps4QueryDirectMemory(off_t start, off_t end, size_t align, off_t* physOut, size_t* sizeOut)
+    asm("sceKernelAvailableDirectMemorySize");
 
-mspace overflowHeap() {
-    if (mspace msp = __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE))
-        return msp;
-    if (__atomic_exchange_n(&g_overflowTried, true, __ATOMIC_ACQ_REL))
-        return __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);  // another thread is (or was) at it
-    const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
-    for (size_t size : sizes) {
-        off_t phys = 0;
-        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
-            continue;
-        // A hint well above 0x200000000, where the kernel library puts its own objects.
-        void* base = reinterpret_cast<void*>(0x1800000000ull);
-        const int32_t ret = sceKernelMapDirectMemory(&base, size, PROT_CPU_RW, 0, phys, 2 * MB);
-        if (ret != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
-            heapLog("[cemu] heap: overflow heap: mapping %zu MiB of direct memory failed (0x%x, %p)\n",
-                    size / MB, ret, base);
-            continue;
-        }
-        mspace msp = create_mspace_with_base(base, size, 1);
-        if (!msp)
-            continue;
-        g_overflowBase = reinterpret_cast<uintptr_t>(base);
-        g_overflowSize = size;
-        __atomic_store_n(&g_overflow, msp, __ATOMIC_RELEASE);
-        heapLog("[cemu] heap: main heap full: overflow heap of %zu MiB of direct memory at %p\n", size / MB,
-                base);
-        return msp;
+// Overflow heaps: mapped when the main heap can't serve a request. Spider-Man 2 fills most of the
+// 512 MiB main heap; a save state then needed one 99 MiB block (148 MiB in Mario Kart: Double
+// Dash!!), the allocation failed and the app crashed. With FOOTERS, free and realloc find each
+// chunk's heap from the chunk itself.
+//  - By default (Crema): one heap of direct memory, a separate 4.5 GiB pool (the GPU's), as large
+//    as it can be.
+//  - With a GPU reserve (ps4_heap_set_overflow_gpu_reserve: Eden for PS4, whose 4 GiB of guest RAM
+//    leaves about 480 MiB of direct memory for the GPU): heaps added in small steps, from regular
+//    flexible memory (which nothing else there uses) first, then from direct memory only while
+//    the reserve stays free. One large direct heap left Eden4's Vulkan driver 320 KiB of direct
+//    memory in Clubhouse Games, and it failed.
+struct OverflowHeap {
+    mspace msp;
+    uintptr_t base;
+    size_t size;
+};
+constexpr int MAX_OVERFLOW_HEAPS = 32;
+constexpr size_t FLEXIBLE_KEEP = 64 * MB;  // regular flexible memory left for the system's libraries
+OverflowHeap g_overflows[MAX_OVERFLOW_HEAPS];
+int g_overflowCount = 0;  // published with release once its entry is written
+bool g_overflowTried = false;  // the default's one heap
+size_t g_overflowGpuReserve = 0;
+__attribute__((tls_model("initial-exec"))) thread_local bool t_inOverflow = false;
+
+bool addOverflow(void* base, size_t size, const char* pool) {
+    mspace msp = create_mspace_with_base(base, size, 1);
+    if (!msp)
+        return false;
+    g_overflows[g_overflowCount] = {msp, reinterpret_cast<uintptr_t>(base), size};
+    __atomic_store_n(&g_overflowCount, g_overflowCount + 1, __ATOMIC_RELEASE);
+    heapLog("[cemu] heap: overflow heap %d: %zu MiB of %s at %p\n", g_overflowCount, size / MB, pool, base);
+    return true;
+}
+
+// Direct memory for an overflow heap, mapped well above 0x200000000 (where the kernel library
+// puts its own objects), each heap in its own 1 GiB.
+bool addDirectOverflow(size_t size) {
+    off_t phys = 0;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 2 * MB, 0, &phys) != 0)
+        return false;
+    void* base = reinterpret_cast<void*>(0x1800000000ull + static_cast<uintptr_t>(g_overflowCount) * 0x40000000ull);
+    const int32_t ret = sceKernelMapDirectMemory(&base, size, PROT_CPU_RW, 0, phys, 2 * MB);
+    if (ret != 0 || reinterpret_cast<uintptr_t>(base) < 0x400000000ull) {
+        heapLog("[cemu] heap: overflow heap: mapping %zu MiB of direct memory failed (0x%x, %p)\n", size / MB,
+                ret, base);
+        if (ret == 0)
+            sceKernelMunmap(base, size);
+        sceKernelReleaseDirectMemory(phys, size);
+        return false;
     }
-    heapLog("[cemu] heap: main heap full and no direct memory for an overflow heap\n");
-    return nullptr;
+    if (addOverflow(base, size, "direct memory"))
+        return true;
+    sceKernelMunmap(base, size);
+    sceKernelReleaseDirectMemory(phys, size);
+    return false;
+}
+
+// With a GPU reserve: one more heap of `size` bytes.
+bool addOverflowStep(size_t size) {
+    size_t flexible = 0;
+    if (sceKernelAvailableFlexibleMemorySize(&flexible) == 0 && flexible >= FLEXIBLE_KEEP + size) {
+        void* base = nullptr;
+        if (sceKernelMapNamedFlexibleMemory(&base, size, PROT_CPU_RW, 0, "heap overflow") == 0) {
+            if (addOverflow(base, size, "regular flexible memory"))
+                return true;
+            sceKernelMunmap(base, size);
+        }
+    }
+    off_t start = 0;
+    size_t largest = 0;
+    const int32_t query = ps4QueryDirectMemory(0, sceKernelGetDirectMemorySize(), 2 * MB, &start, &largest);
+    if (query != 0 || largest < g_overflowGpuReserve + size) {
+        heapLog("[cemu] heap: no memory for a %zu MiB overflow heap (regular flexible %zu MiB free, largest "
+                "free direct block %zu MiB, %zu MiB of it kept for the GPU)\n",
+                size / MB, flexible / MB, largest / MB, g_overflowGpuReserve / MB);
+        return false;
+    }
+    return addDirectOverflow(size);
+}
+
+// `alloc` on each overflow heap in turn; when they are all full, one more is added (by default
+// only the first time).
+template <typename F>
+void* overflowAlloc(size_t need, F alloc) {
+    const int count = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    for (int i = count - 1; i >= 0; i--) {  // the newest has the most room
+        if (void* p = alloc(g_overflows[i].msp))
+            return p;
+    }
+    // An allocation made while this thread adds a heap (a kernel call's) must not wait for itself.
+    if (t_inOverflow)
+        return nullptr;
+    t_inOverflow = true;
+    pthread_mutex_lock(&g_overflowLock);
+    void* result = nullptr;
+    // Another thread may have added one meanwhile.
+    for (int i = count; i < g_overflowCount && !result; i++)
+        result = alloc(g_overflows[i].msp);
+    if (!result && g_overflowGpuReserve) {
+        // Room for the request and dlmalloc's own bookkeeping: at least 32 MiB.
+        const size_t step = need > 29 * MB ? (need + 3 * MB + 2 * MB - 1) & ~(2 * MB - 1) : 32 * MB;
+        if (g_overflowCount >= MAX_OVERFLOW_HEAPS)
+            heapLog("[cemu] heap: all %d overflow heaps full\n", MAX_OVERFLOW_HEAPS);
+        else if (addOverflowStep(step))
+            result = alloc(g_overflows[g_overflowCount - 1].msp);
+    } else if (!result && !g_overflowTried) {
+        g_overflowTried = true;
+        const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
+        bool added = false;
+        for (size_t size : sizes) {
+            if ((added = addDirectOverflow(size)))
+                break;
+        }
+        if (added)
+            result = alloc(g_overflows[g_overflowCount - 1].msp);
+        else
+            heapLog("[cemu] heap: main heap full and no direct memory for an overflow heap\n");
+    }
+    pthread_mutex_unlock(&g_overflowLock);
+    t_inOverflow = false;
+    return result;
 }
 
 bool ownsPointer(const void* p) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(p);
-    return (address >= g_heapBase && address < g_heapBase + g_heapSize) ||
-           (address >= g_overflowBase && address < g_overflowBase + g_overflowSize);
+    if (address >= g_heapBase && address < g_heapBase + g_heapSize)
+        return true;
+    const int count = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < count; i++) {
+        if (address >= g_overflows[i].base && address < g_overflows[i].base + g_overflows[i].size)
+            return true;
+    }
+    return false;
 }
 
 // The operation in progress, for error reports (thread-local: allocations happen on any thread).
@@ -402,8 +499,7 @@ void* __wrap_malloc(size_t size) {
     if (!p)
         p = mspace_malloc(getHeap(), size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_malloc(overflow, size);
+        p = overflowAlloc(size, [&](mspace msp) { return mspace_malloc(msp, size); });
     if (!p)
         reportFailure("malloc", size);
     return p;
@@ -434,8 +530,7 @@ void* __wrap_calloc(size_t nelem, size_t size) {
     if (!p)
         p = mspace_calloc(getHeap(), nelem, size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_calloc(overflow, nelem, size);
+        p = overflowAlloc(nelem * size, [&](mspace msp) { return mspace_calloc(msp, nelem, size); });
     if (!p)
         reportFailure("calloc", nelem * size);
     return p;
@@ -463,8 +558,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
         if (!p)
             p = mspace_malloc(getHeap(), size);
         if (!p)
-            if (mspace overflow = overflowHeap())
-                p = mspace_malloc(overflow, size);
+            p = overflowAlloc(size, [&](mspace msp) { return mspace_malloc(msp, size); });
         if (p && ptr) {
             const size_t old_size = mspace_usable_size(ptr);
             memcpy(p, ptr, old_size < size ? old_size : size);
@@ -484,21 +578,27 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     if (!p)
         p = mspace_memalign(getHeap(), alignment, size);
     if (!p)
-        if (mspace overflow = overflowHeap())
-            p = mspace_memalign(overflow, alignment, size);
+        p = overflowAlloc(size + alignment, [&](mspace msp) { return mspace_memalign(msp, alignment, size); });
     if (!p)
         reportFailure("memalign", size);
     return p;
 }
+
+// Direct memory the overflow heaps leave free for the GPU (see overflowAlloc); 0, the default,
+// takes what they can.
+void ps4_heap_set_overflow_gpu_reserve(size_t bytes) { g_overflowGpuReserve = bytes; }
 
 // Gives the calling thread a private arena if it is one of the emulator's busy threads (called
 // when a thread names itself: SetThreadName -> ps4_watch_thread). Crema's (Cemu's) names: until
 // 1.51 only DolphinPS4's were listed, so every Cemu thread shared the one locked heap and the
 // recompiler (allocation heavy) took seconds per function.
 void ps4_heap_private_arena(const char* name) {
+    // (and Eden for PS4's: its emulated CPU cores, in multi-core and single-core mode, and its GPU
+    // thread)
     static const char* const busy[] = {"PPCRecompiler", "OSSched[core=0]", "OSSched[core=1]", "OSSched[core=2]",
                                        "LatteThread", "compilePl", "vkShaderComp", "plCacheCompiler",
-                                       "vkDriverPlCache", "fileCache", "PS4AudioOut", "H264Decoder"};
+                                       "vkDriverPlCache", "fileCache", "PS4AudioOut", "H264Decoder",
+                                       "CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3", "CPUThread", "GPU"};
     if (t_arena || !name || !getHeap())
         return;
     bool wanted = false;

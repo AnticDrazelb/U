@@ -13,6 +13,8 @@
 #            cleared of eden-ps4 first; the game goes to RUN/game
 #   STAGE    the staging folder (default ~/eden-ps4-build/stage)
 #   SETTINGS the app's settings.txt, if set (NAME=value lines)
+#   DATA     files to copy into the app's data folder (space-separated; a .nro there is listed on
+#            the start page after the package's programs)
 # Example: start Breakout, let it draw, screenshot it:
 #   printf '%s\n' "0 waitfor start page" "0 tap n" "0 waitfor first frame" "2 shot /tmp/b.png" |
 #       eden-ps4/shadps4-play.sh
@@ -28,6 +30,11 @@ if [ -z "${EDEN_PS4_IN_XVFB:-}" ]; then
     if [ -n "${SETTINGS:-}" ]; then
         mkdir -p "$RUN/user/data/eden-ps4"
         printf '%s\n' "$SETTINGS" >"$RUN/user/data/eden-ps4/settings.txt"
+    fi
+    if [ -n "${DATA:-}" ]; then
+        mkdir -p "$RUN/user/data/eden-ps4"
+        # shellcheck disable=SC2086
+        cp $DATA "$RUN/user/data/eden-ps4/"
     fi
     cp -r "$STAGE/." "$RUN/game/"
     rm -rf "$RUN/game/sce_module"

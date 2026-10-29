@@ -353,6 +353,18 @@ there, send `log-vulkan.txt` (or `log.txt`), `gpu/radv-ps4.log` and `crash.log` 
 `/data/eden-ps4`. Patch 0044 fixes a crash in Eden when a boot fails (the new process was
 destroyed after the kernel), which the fallback needs.
 
+03.10 takes what Eden4's test builds learned on consoles (its `docs/CHANGELOG.md` and
+`KNOWN_ISSUES.md`) where this port hadn't yet: the app heap's overflow leaves the GPU its direct
+memory (Eden4 00.04 and 00.15: Vulkan out of memory), Eden's busy threads get heap arenas, and a
+hang watchdog writes `hang.log` (both below). The package already runs in base PS4 mode (PS4 Pro
+mode hung the GPU and crashed the console for Eden4: the winsys describes the base GPU), and the
+heap's locks were already blocking ones (a spinning lock deadlocked Eden4 00.15 and Crema 1.61). In
+shadPS4: the heap test grew the heap 10 steps into flexible memory and 7 into direct memory, then
+stopped with 262 MiB of direct memory free; a program that stops presenting got a `hang.log` with
+each of Eden's threads by name (the emulated cores idle, the GPU thread waiting for work). Handing
+the screen to the GPU display now waits for VideoOut's last flip however long it takes (up to 2
+s): one still queued after 100 ms took shadPS4 down.
+
 ## What's next: the GPU
 
 What draws with the CPU runs now; what draws with the GPU (every commercial game, and homebrew
@@ -444,9 +456,16 @@ Settings: each line of `/data/eden-ps4/settings.txt` (copied by FTP) that reads 
 set as an environment variable before Eden starts. `EDEN_SW_THREADS=5`, say, rasterizes on 5
 threads instead of 4 (the PS4 build's default; an app has 6 cores), to see which the console likes;
 `EDEN_SW_JIT=0` interprets shaders instead of compiling them (`log.txt` says when they're compiled).
+`EDEN_PS4_HANG_SECONDS=60` makes the hang watchdog (below) wait 60 s for a frame instead of 20.
+`EDEN_PS4_HEAP_TEST=1500` is a test of the app heap's growth: at start, with 4 GiB of direct memory
+taken as the Switch's RAM will be, it allocates 1500 MiB and logs where each overflow heap came
+from in `boot-trace.log`.
 
 After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnings and errors, and
 `boot-trace.log` the launcher's steps (the audio port it opened, the first frame, the frame rate).
+If a program's frames stop for 20 s after they had started, or none comes 90 s after it booted (a
+game frozen, or stuck loading), the hang watchdog writes every thread's stack, each thread by name,
+to `hang.log` (once, until frames come again): send it with `log.txt` when a game freezes.
 Stack addresses in a crash report are symbolized with that build's ELF (kept next to the package in
 `out/` when it's sent, and in `~/eden-ps4-elves`).
 
@@ -531,6 +550,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: software vertex shaders 16 vertices at a time, each distinct vertex once | above |
 | vulkan: the PS4's GPU through Mesa's RADV, after Eden4 | stage 5, above |
 | core: free the application's process before the kernel when loading fails | an upstream use-after-free on a failed boot: harmless with glibc, a crash on the PS4 (stage 5, above) |
+| common: the PS4's thread names go to the app's runtime | named threads in `hang.log`, and heap arenas for the busy ones (above) |
 
 The PS4 memory changes, from what stage 1 measured:
 
@@ -545,13 +565,21 @@ The PS4 memory changes, from what stage 1 measured:
 - **Code caches** are 32 MiB per emulated core instead of 512 MiB: the PS4 runs code only from its
   system memory pool. The app heap (Crema's runtime) is capped at 384 MiB of that pool so that the
   caches fit (`PS4_SYSTEM_HEAP_MAX_MB` in `port/ps4_runtime.cpp`; Crema keeps 512 MiB).
+- **The app heap's overflow**: past its 384 MiB, the heap grows in 32 MiB steps (larger for a
+  larger request), first from regular flexible memory (about 390 MiB that nothing else in the app
+  uses: Crema keeps it for Piglet), then from direct memory, but only while 256 MiB of it stay free
+  for the GPU (32 MiB with the software renderer). Crema's one overflow heap of up to 512 MiB of
+  direct memory would have left RADV about 100 MiB. Eden4 learned this on a console: one large
+  overflow heap left its Vulkan driver 320 KiB in Clubhouse Games. Eden's CPU core threads and its
+  GPU thread get heap arenas of their own (10 MiB each), as Crema's busy threads do.
 - **No fastmem**: the PS4 can't map the same memory twice for an app.
 - Fiber stacks were already 512 KiB on the PS4 upstream (2 MiB elsewhere). Eden makes about 75
   fibers (one per emulated thread, most of them for HLE services).
 
 Other PS4 choices, in the launcher and `ps4-eden.cmake`: Boost.Asio is built without kqueue (the
-PS4 has no `sys/event.h`), thread names and priorities aren't set (not calls Crema makes on these
-consoles), and FFmpeg is built without its Linux-only calls (below).
+PS4 has no `sys/event.h`), thread priorities aren't set and thread names go to the runtime (for its
+hang reports and heap arenas) rather than the system (not calls Crema makes on these consoles), and
+FFmpeg is built without its Linux-only calls (below).
 
 ## Testing on the desktop
 
