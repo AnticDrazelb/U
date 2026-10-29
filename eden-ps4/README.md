@@ -367,6 +367,12 @@ each of Eden's threads by name (the emulated cores idle, the GPU thread waiting 
 the screen to the GPU display now waits for VideoOut's last flip however long it takes (up to 2
 s): one still queued after 100 ms took shadPS4 down.
 
+03.12 fixes the crash Eden4 lists for running out of GPU memory in RADV itself: when a command
+buffer's next IB couldn't be allocated, Mesa's error path wrote a chain packet before the old
+IB's start and kept recording past its end. It now records into a host buffer that is thrown
+away, and the command buffer fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+(`../patches/mesa-ps4-cs-grow-oom.patch`).
+
 ## What's next: the GPU
 
 What draws with the CPU runs now; what draws with the GPU (every commercial game, and homebrew

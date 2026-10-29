@@ -47,9 +47,11 @@ made executable (`git config core.fileMode false` keeps that out of git):
 3. Mesa: upstream `mesa-26.0.8` (gitlab.freedesktop.org/mesa/mesa) + these patches, in this order
    (`git apply --exclude=src/amd/common/ac_ps4_drm.c`; `build-mesa.sh` copies
    `port/mesa/ac_ps4_drm.c` in): `mesa-ps4`, `mesa-ps4-aligned-vertex-fetch`,
-   `mesa-ps4-vertex-fetch-switch`, `mesa-ps4-flush-all-draws`, `mesa-ps4-gs-ring-probe`. All five
-   are needed: Crema's settings reference `ac_ps4_flush_all_draws`, `ac_ps4_gs_ring_min` and
-   `ac_ps4_unaligned_vertex_fetch`. libdrm `libdrm-2.4.125` (headers only) in
+   `mesa-ps4-vertex-fetch-switch`, `mesa-ps4-flush-all-draws`, `mesa-ps4-gs-ring-probe`,
+   `mesa-ps4-cs-grow-oom`. The first five are needed: Crema's settings reference
+   `ac_ps4_flush_all_draws`, `ac_ps4_gs_ring_min` and `ac_ps4_unaligned_vertex_fetch`. The sixth
+   makes a command buffer that runs out of GPU memory fail with `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+   instead of writing past its IB (an upstream error path). libdrm `libdrm-2.4.125` (headers only) in
    `~/cemups4-build/src/libdrm`. Then `scripts/build-mesa.sh setup`.
 4. Cemu at `patches/BASE.txt`'s commit + `patches/cemu-ps4.patch`, with the ZArchive, imgui and
    Vulkan-Headers submodules, in `~/cemups4-build/src/Cemu`. Then
