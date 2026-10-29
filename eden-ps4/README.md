@@ -290,6 +290,14 @@ Two ways it shows:
   may have written are checked again afterwards. The GPU test's second compute program stores
   diagonal bands of colours from a texel buffer into a block-linear storage image, shown below the
   first compute square; Eden's Vulkan renderer on lavapipe draws it the same, texel for texel.
+- **Software shaders compiled to native code** (patch 0040): a fragment or compute program's runs
+  of instructions between branches are compiled to x86 when it's translated (Xbyak, AVX at 128
+  bits, which the PS4's Jaguar cores have), into memory mapped readable, writable and executable,
+  as dynarmic's code is on the PS4. A run's arithmetic is done four lanes at a time, a value to a
+  register; textures, memory and instructions that mix lanes call the interpreter's code for all
+  16. Where lanes have branched apart, the interpreter steps through the run instead. The 3D test
+  went from 37 to 43 frames a second on one desktop thread (9.6 ns a pixel, from 11.6), the 2D
+  scenes 10% faster; the pictures are the same, byte for byte. `EDEN_SW_JIT=0` interprets.
 
 ![The GPU test's first frame: Eden's Vulkan renderer on lavapipe (left), the software renderer (right)](screenshots/gputest-vulkan-vs-software.png)
 - **Eden's Vulkan renderer, headless** (patch 0013; the desktop, `EDEN_PS4_RENDERER=vulkan`): the
@@ -389,7 +397,8 @@ Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells th
 
 Settings: each line of `/data/eden-ps4/settings.txt` (copied by FTP) that reads `NAME=value` is
 set as an environment variable before Eden starts. `EDEN_SW_THREADS=5`, say, rasterizes on 5
-threads instead of 4 (the PS4 build's default; an app has 6 cores), to see which the console likes.
+threads instead of 4 (the PS4 build's default; an app has 6 cores), to see which the console likes;
+`EDEN_SW_JIT=0` interprets shaders instead of compiling them (`log.txt` says when they're compiled).
 
 After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnings and errors, and
 `boot-trace.log` the launcher's steps (the audio port it opened, the first frame, the frame rate).
@@ -472,6 +481,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: varyings interpolated in plane form, constant-index extracts a word's copy | above |
 | null renderer: EDEN_SW_DUMP logs each software program's ops | above |
 | null renderer: storage images and texel buffers in software shaders | above |
+| null renderer: software shaders compiled to native code | above |
 
 The PS4 memory changes, from what stage 1 measured:
 

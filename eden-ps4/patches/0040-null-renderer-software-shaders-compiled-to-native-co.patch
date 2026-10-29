@@ -1,0 +1,1916 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 00:31:43 +0000
+Subject: [PATCH] null renderer: software shaders compiled to native code
+
+Fragment and compute programs' runs of instructions between branches are compiled to x86 (AVX,
+128 bits, which the PS4's Jaguar has) with Xbyak, into memory mapped read, write and execute as
+dynarmic's is on the PS4. A run's arithmetic is done four lanes at a time, a value to a register
+(a small cache of them); textures, memory and instructions whose lanes mix are called out to the
+interpreter's code for all 16 lanes. A run is used when no lanes wait at a branch; otherwise
+the interpreter steps through it. EDEN_SW_JIT=0 interprets everything.
+
+The interpreter's instructions move into RunIr, which native code calls.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ .../renderer_null/software_draw.cpp           | 1772 +++++++++++------
+ 1 file changed, 1212 insertions(+), 560 deletions(-)
+
+diff --git a/src/video_core/renderer_null/software_draw.cpp b/src/video_core/renderer_null/software_draw.cpp
+index 93a421869..cd8590e8c 100644
+--- a/src/video_core/renderer_null/software_draw.cpp
++++ b/src/video_core/renderer_null/software_draw.cpp
+@@ -14,9 +14,16 @@
+ #include <cstring>
+ #include <limits>
+ #include <set>
++#include <string_view>
+ #include <unordered_map>
+ #include <vector>
+ 
++#if defined(ARCHITECTURE_x86_64) && !defined(_WIN32)
++#define SOFTWARE_JIT // software shaders compiled to native code
++#include <sys/mman.h>
++#include "common/x64/xbyak.h"
++#endif
++
+ #include "common/alignment.h"
+ #include "common/cityhash.h"
+ #include "common/div_ceil.h"
+@@ -405,7 +412,7 @@ constexpr u32 QuadTopLeft(u32 lane) {
+     return lane & ~9u;
+ }
+ 
+-enum class Kind : u8 { Ir, Move, Jump, JumpIfTrue, JumpIfFalse, Return, Barrier };
++enum class Kind : u8 { Ir, Move, Jump, JumpIfTrue, JumpIfFalse, Return, Barrier, Native };
+ 
+ struct Op {
+     Kind kind;
+@@ -1686,6 +1693,7 @@ struct SoftwareDraw::Program {
+     bool writes_memory = false; // storage buffers or global memory
+     u32 shared_bytes = 0;       // a compute program's workgroup's shared memory
+     bool has_barrier = false;   // it waits for its workgroup's other invocations
++    std::vector<void*> native;  // each Kind::Native op's code (ShaderJit)
+ };
+ 
+ struct SoftwareDraw::Textures {
+@@ -2923,628 +2931,1264 @@ struct Branches {
+ /// the others wait, each at its own, and join them when they get there (the earliest first keeps
+ /// an if's lanes apart until its end, and a loop's until all have left it). While some wait, an
+ /// instruction's result is kept only for the lanes that ran it.
+-template <bool Wide>
+-void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+-    using O = IR::Opcode;
+-    const Op* const ops = program.ops.data();
+-    constexpr u32 lanes = Wide ? LANES : 1;
+ #define LANE_LOOP for (u32 i = 0; i < lanes; ++i)
+ #define IO_LOOP for (u32 i = 0; i < n; ++i)
+ #define EXEC_LOOP(mask) for (u32 m_ = (mask), i = 0; m_ != 0 && ((i = u32(std::countr_zero(m_))), true); m_ &= m_ - 1)
+-    // (plain values, never referred to: the compiler would reload what's referred to after every
+-    // write to the lanes)
+-    u32 pc = 0;
+-    u32 exec = Wide ? io.run : 1; // the lanes running the instruction at pc
+-    u32 waiting = 0;              // the lanes waiting, each at its own instruction (all after pc)
+-    u32 next_join = ~0u;          // the earliest of those
+-    Branches branches;
+-    Lanes saved;
+-    if (io.resume && io.resume->suspended) { // on from a barrier
+-        const RunState& state = *io.resume;
+-        pc = state.pc, exec = state.exec, waiting = state.waiting, next_join = state.next_join;
+-        branches.lane_pc = state.lane_pc;
+-        io.resume->suspended = false;
+-    }
+-#define SET_STATE(state)                                                                          \
+-    do {                                                                                          \
+-        const Branches::State s_ = (state);                                                       \
+-        pc = s_.pc, exec = s_.exec, waiting = s_.waiting, next_join = s_.next_join;                \
+-    } while (false)
+-#define JOIN() SET_STATE(branches.Join({pc, exec, waiting, next_join}))
+-#define PICK() SET_STATE(branches.Pick(waiting))
+-    for (;;) {
+-        const Op& o = ops[pc];
+-        switch (o.kind) {
+-        case Kind::Move: // (the words the value takes: 'extra')
+-            if (waiting) {
+-                EXEC_LOOP(exec) {
+-                    for (u32 k = 0; k < o.extra; ++k) {
+-                        c[o.dest].w[k][i] = c[o.a[0]].w[k][i];
+-                    }
+-                }
+-            } else {
+-                for (u32 k = 0; k < o.extra; ++k) {
+-                    std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], lanes * sizeof(u32));
+-                }
+-            }
+-            if (++pc == next_join) {
+-                JOIN();
+-            }
+-            continue;
+-        case Kind::Jump:
+-            if (waiting) {
+-                branches.Park(exec, o.extra);
+-                waiting |= exec;
+-                PICK();
+-            } else {
+-                pc = o.extra;
+-            }
+-            continue;
+-        case Kind::JumpIfTrue:
+-        case Kind::JumpIfFalse: {
+-            const u32 want = o.kind == Kind::JumpIfTrue ? 1 : 0;
+-            u32 taken = 0;
+-            EXEC_LOOP(exec) {
+-                if (u32(c[o.a[0]].w[0][i] != 0) == want) {
+-                    taken |= 1u << i;
+-                }
+-            }
+-            if (!waiting && (taken == exec || taken == 0)) {
+-                pc = taken != 0 ? o.extra : pc + 1;
+-            } else {
+-                branches.Park(taken, o.extra);
+-                branches.Park(exec & ~taken, pc + 1);
+-                waiting |= exec;
+-                PICK();
+-            }
+-            continue;
++
++/// An instruction (Kind::Ir) for the lanes: all of them, those in 'exec' where it matters, the
++/// lanes not in 'exec' (some 'waiting') kept by the caller
++template <bool Wide>
++[[gnu::always_inline]] inline void RunIr(const SoftwareDraw::Program& program, const Op& o, Lanes* c, Io& io,
++                                         u32 n, u32 exec, u32 waiting) {
++    using O = IR::Opcode;
++    constexpr u32 lanes = Wide ? LANES : 1;
++    Lanes& d = c[o.dest];
++    const Lanes& a = c[o.a[0]];
++    const Lanes& b = c[o.a[1]];
++    const Lanes& e = c[o.a[2]];
++    const Lanes& f = c[o.a[3]];
++    switch (o.op) {
++    case O::GetCbufU8:
++        IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 1);
++        break;
++    case O::GetCbufS8:
++        IO_LOOP d.w[0][i] = u32(s32(s8(ReadCbuf(io, a.w[0][i], b.w[0][i], 1))));
++        break;
++    case O::GetCbufU16:
++        IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 2);
++        break;
++    case O::GetCbufS16:
++        IO_LOOP d.w[0][i] = u32(s32(s16(ReadCbuf(io, a.w[0][i], b.w[0][i], 2))));
++        break;
++    case O::GetCbufU32:
++    case O::GetCbufF32:
++        if (o.extra) {
++            const u32 value = ReadCbuf(io, a.w[0][0], b.w[0][0], 4);
++            LANE_LOOP d.w[0][i] = value;
++            break;
+         }
+-        case Kind::Return:
+-            if (!waiting) {
+-                return;
+-            }
+-            PICK();
+-            continue;
+-        case Kind::Barrier: // stopped here until the workgroup's other invocations get here
+-            if (++pc == next_join) {
+-                JOIN();
+-            }
+-            if (io.resume) {
+-                *io.resume = {true, pc, exec, waiting, next_join, branches.lane_pc};
+-                return;
++        IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
++        break;
++    case O::GetCbufU32x2:
++        if (o.extra) {
++            const u32 low = ReadCbuf(io, a.w[0][0], b.w[0][0], 4);
++            const u32 high = ReadCbuf(io, a.w[0][0], b.w[0][0] + 4, 4);
++            LANE_LOOP {
++                d.w[0][i] = low, d.w[1][i] = high;
+             }
+-            continue;
+-        case Kind::Ir:
+             break;
+         }
+-        Lanes& d = c[o.dest];
+-        const Lanes& a = c[o.a[0]];
+-        const Lanes& b = c[o.a[1]];
+-        const Lanes& e = c[o.a[2]];
+-        const Lanes& f = c[o.a[3]];
++        IO_LOOP {
++            d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
++            d.w[1][i] = ReadCbuf(io, a.w[0][i], b.w[0][i] + 4, 4);
++        }
++        break;
++    case O::GetAttribute:
++    case O::GetAttributeU32:
++        std::memcpy(d.w[0], io.inputs + (o.extra & 0xFF) * io.stride + io.lane, n * sizeof(u32));
++        break;
++    case O::GetAttributeIndexed:
++        IO_LOOP d.w[0][i] = std::bit_cast<u32>(io.inputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i]);
++        break;
++    case O::SetAttribute:
++        EXEC_LOOP(exec) io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
++        break;
++    case O::SetAttributeIndexed:
++        EXEC_LOOP(exec) io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
++        break;
++    case O::SetFragColor: {
++        f32* const out = io.colors + (((o.extra / 4) & 7) * 4 + o.extra % 4) * io.stride + io.lane;
+         if (waiting) {
+-            saved = d;
++            EXEC_LOOP(exec) out[i] = Fl(e, i);
++        } else {
++            std::memcpy(out, e.w[0], n * sizeof(u32));
+         }
+-        switch (o.op) {
+-        case O::DemoteToHelperInvocation: // the lanes that ran it are done
+-            EXEC_LOOP(exec) io.discard[io.lane + i] = true;
+-            if (!waiting) {
+-                return;
+-            }
+-            PICK();
+-            continue;
+-        case O::GetCbufU8:
+-            IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 1);
+-            break;
+-        case O::GetCbufS8:
+-            IO_LOOP d.w[0][i] = u32(s32(s8(ReadCbuf(io, a.w[0][i], b.w[0][i], 1))));
+-            break;
+-        case O::GetCbufU16:
+-            IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 2);
+-            break;
+-        case O::GetCbufS16:
+-            IO_LOOP d.w[0][i] = u32(s32(s16(ReadCbuf(io, a.w[0][i], b.w[0][i], 2))));
+-            break;
+-        case O::GetCbufU32:
+-        case O::GetCbufF32:
+-            if (o.extra) {
+-                const u32 value = ReadCbuf(io, a.w[0][0], b.w[0][0], 4);
+-                LANE_LOOP d.w[0][i] = value;
+-                break;
+-            }
+-            IO_LOOP d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
+-            break;
+-        case O::GetCbufU32x2:
+-            if (o.extra) {
+-                const u32 low = ReadCbuf(io, a.w[0][0], b.w[0][0], 4);
+-                const u32 high = ReadCbuf(io, a.w[0][0], b.w[0][0] + 4, 4);
+-                LANE_LOOP {
+-                    d.w[0][i] = low, d.w[1][i] = high;
+-                }
+-                break;
+-            }
+-            IO_LOOP {
+-                d.w[0][i] = ReadCbuf(io, a.w[0][i], b.w[0][i], 4);
+-                d.w[1][i] = ReadCbuf(io, a.w[0][i], b.w[0][i] + 4, 4);
+-            }
+-            break;
+-        case O::GetAttribute:
+-        case O::GetAttributeU32:
+-            std::memcpy(d.w[0], io.inputs + (o.extra & 0xFF) * io.stride + io.lane, n * sizeof(u32));
+-            break;
+-        case O::GetAttributeIndexed:
+-            IO_LOOP d.w[0][i] = std::bit_cast<u32>(io.inputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i]);
+-            break;
+-        case O::SetAttribute:
+-            EXEC_LOOP(exec) io.outputs[(o.extra & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
+-            break;
+-        case O::SetAttributeIndexed:
+-            EXEC_LOOP(exec) io.outputs[((a.w[0][i] / 4) & 0xFF) * io.stride + io.lane + i] = Fl(b, i);
+-            break;
+-        case O::SetFragColor: {
+-            f32* const out = io.colors + (((o.extra / 4) & 7) * 4 + o.extra % 4) * io.stride + io.lane;
+-            if (waiting) {
+-                EXEC_LOOP(exec) out[i] = Fl(e, i);
+-            } else {
+-                std::memcpy(out, e.w[0], n * sizeof(u32));
++        break;
++    }
++    case O::SetSampleMask:
++        break;
++    case O::SetFragDepth:
++        if (io.frag_depth) {
++            EXEC_LOOP(exec) io.frag_depth[io.lane + i] = Fl(a, i);
++        }
++        break;
++    case O::IsHelperInvocation:
++        LANE_LOOP d.w[0][i] = ((io.live >> i) & 1) ^ 1;
++        break;
++    case O::YDirection:
++    case O::ResolutionDownFactor:
++    case O::SR_WScaleFactorXY:
++    case O::SR_WScaleFactorZ:
++        LANE_LOOP {
++            SetFl(d, i, 1.0f);
++            SetFl(d, i, 1.0f, 1);
++        }
++        break;
++    case O::InvocationId:
++    case O::SampleId:
++    case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
++        for (u32 k = 0; k < 4; ++k) {
++            std::memset(d.w[k], 0, lanes * sizeof(u32));
++        }
++        break;
++    case O::WorkgroupId:
++        LANE_LOOP {
++            d.w[0][i] = io.workgroup_id[0], d.w[1][i] = io.workgroup_id[1], d.w[2][i] = io.workgroup_id[2];
++        }
++        break;
++    case O::LocalInvocationId:
++        LANE_LOOP {
++            for (u32 k = 0; k < 3; ++k) {
++                d.w[k][i] = io.local_id ? io.local_id[k * LANES + io.lane + i] : 0;
+             }
+-            break;
+         }
+-        case O::SetSampleMask:
+-            break;
+-        case O::SetFragDepth:
+-            if (io.frag_depth) {
+-                EXEC_LOOP(exec) io.frag_depth[io.lane + i] = Fl(a, i);
++        break;
++    case O::LoadSharedU8: case O::LoadSharedS8: case O::LoadSharedU16: case O::LoadSharedS16:
++    case O::LoadSharedU32: case O::LoadSharedU64: case O::LoadSharedU128: { // offset
++        const u32 bytes = SharedBytes(o.op);
++        EXEC_LOOP(exec) {
++            u32 words[4]{};
++            if (u64{a.w[0][i]} + bytes <= io.shared_bytes) {
++                std::memcpy(words, io.shared + a.w[0][i], bytes);
+             }
+-            break;
+-        case O::IsHelperInvocation:
+-            LANE_LOOP d.w[0][i] = ((io.live >> i) & 1) ^ 1;
+-            break;
+-        case O::YDirection:
+-        case O::ResolutionDownFactor:
+-        case O::SR_WScaleFactorXY:
+-        case O::SR_WScaleFactorZ:
+-            LANE_LOOP {
+-                SetFl(d, i, 1.0f);
+-                SetFl(d, i, 1.0f, 1);
++            if (o.op == O::LoadSharedS8) {
++                words[0] = u32(s32(s8(words[0])));
++            } else if (o.op == O::LoadSharedS16) {
++                words[0] = u32(s32(s16(words[0])));
+             }
+-            break;
+-        case O::InvocationId:
+-        case O::SampleId:
+-        case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
+             for (u32 k = 0; k < 4; ++k) {
+-                std::memset(d.w[k], 0, lanes * sizeof(u32));
+-            }
+-            break;
+-        case O::WorkgroupId:
+-            LANE_LOOP {
+-                d.w[0][i] = io.workgroup_id[0], d.w[1][i] = io.workgroup_id[1], d.w[2][i] = io.workgroup_id[2];
++                d.w[k][i] = words[k];
+             }
+-            break;
+-        case O::LocalInvocationId:
+-            LANE_LOOP {
+-                for (u32 k = 0; k < 3; ++k) {
+-                    d.w[k][i] = io.local_id ? io.local_id[k * LANES + io.lane + i] : 0;
+-                }
++        }
++        break;
++    }
++    case O::WriteSharedU8: case O::WriteSharedU16: case O::WriteSharedU32: case O::WriteSharedU64:
++    case O::WriteSharedU128: { // offset, value
++        const u32 bytes = SharedBytes(o.op);
++        EXEC_LOOP(exec) {
++            if (u64{a.w[0][i]} + bytes <= io.shared_bytes) {
++                const u32 words[4] = {b.w[0][i], b.w[1][i], b.w[2][i], b.w[3][i]};
++                std::memcpy(io.shared + a.w[0][i], words, bytes);
+             }
+-            break;
+-        case O::LoadSharedU8: case O::LoadSharedS8: case O::LoadSharedU16: case O::LoadSharedS16:
+-        case O::LoadSharedU32: case O::LoadSharedU64: case O::LoadSharedU128: { // offset
+-            const u32 bytes = SharedBytes(o.op);
+-            EXEC_LOOP(exec) {
+-                u32 words[4]{};
+-                if (u64{a.w[0][i]} + bytes <= io.shared_bytes) {
+-                    std::memcpy(words, io.shared + a.w[0][i], bytes);
+-                }
+-                if (o.op == O::LoadSharedS8) {
+-                    words[0] = u32(s32(s8(words[0])));
+-                } else if (o.op == O::LoadSharedS16) {
+-                    words[0] = u32(s32(s16(words[0])));
+-                }
+-                for (u32 k = 0; k < 4; ++k) {
+-                    d.w[k][i] = words[k];
+-                }
++        }
++        break;
++    }
++    case O::SharedAtomicIAdd32: case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
++    case O::SharedAtomicSMax32: case O::SharedAtomicUMax32: case O::SharedAtomicInc32:
++    case O::SharedAtomicDec32: case O::SharedAtomicAnd32: case O::SharedAtomicOr32:
++    case O::SharedAtomicXor32: case O::SharedAtomicExchange32: // offset, value: the old value
++        EXEC_LOOP(exec) { // (one lane after another: an order atomics allow)
++            u32 old = 0;
++            if (u64{a.w[0][i]} + 4 <= io.shared_bytes) {
++                std::memcpy(&old, io.shared + a.w[0][i], 4);
++                const u32 result = AtomicResult(o.op, old, b.w[0][i]);
++                std::memcpy(io.shared + a.w[0][i], &result, 4);
+             }
+-            break;
++            d.w[0][i] = old;
+         }
+-        case O::WriteSharedU8: case O::WriteSharedU16: case O::WriteSharedU32: case O::WriteSharedU64:
+-        case O::WriteSharedU128: { // offset, value
+-            const u32 bytes = SharedBytes(o.op);
+-            EXEC_LOOP(exec) {
+-                if (u64{a.w[0][i]} + bytes <= io.shared_bytes) {
+-                    const u32 words[4] = {b.w[0][i], b.w[1][i], b.w[2][i], b.w[3][i]};
+-                    std::memcpy(io.shared + a.w[0][i], words, bytes);
++        break;
++    case O::StorageAtomicIAdd32: case O::StorageAtomicSMin32: case O::StorageAtomicUMin32:
++    case O::StorageAtomicSMax32: case O::StorageAtomicUMax32: case O::StorageAtomicInc32:
++    case O::StorageAtomicDec32: case O::StorageAtomicAnd32: case O::StorageAtomicOr32:
++    case O::StorageAtomicXor32: case O::StorageAtomicExchange32: case O::StorageAtomicAddF32:
++        EXEC_LOOP(exec) { // binding, offset, value: the old value
++            GPUVAddr address;
++            u32 old = 0;
++            if (StorageAddress(io, a.w[0][i], b.w[0][i], 4, address)) {
++                io.memory->ReadBlockUnsafe(address, &old, 4);
++                if (((io.live >> i) & 1) != 0) {
++                    const u32 result = AtomicResult(o.op, old, e.w[0][i]);
++                    io.memory->WriteBlockUnsafe(address, &result, 4);
+                 }
+             }
+-            break;
++            d.w[0][i] = old;
+         }
+-        case O::SharedAtomicIAdd32: case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
+-        case O::SharedAtomicSMax32: case O::SharedAtomicUMax32: case O::SharedAtomicInc32:
+-        case O::SharedAtomicDec32: case O::SharedAtomicAnd32: case O::SharedAtomicOr32:
+-        case O::SharedAtomicXor32: case O::SharedAtomicExchange32: // offset, value: the old value
+-            EXEC_LOOP(exec) { // (one lane after another: an order atomics allow)
+-                u32 old = 0;
+-                if (u64{a.w[0][i]} + 4 <= io.shared_bytes) {
+-                    std::memcpy(&old, io.shared + a.w[0][i], 4);
+-                    const u32 result = AtomicResult(o.op, old, b.w[0][i]);
+-                    std::memcpy(io.shared + a.w[0][i], &result, 4);
+-                }
+-                d.w[0][i] = old;
++        break;
++    case O::GlobalAtomicIAdd32: case O::GlobalAtomicSMin32: case O::GlobalAtomicUMin32:
++    case O::GlobalAtomicSMax32: case O::GlobalAtomicUMax32: case O::GlobalAtomicInc32:
++    case O::GlobalAtomicDec32: case O::GlobalAtomicAnd32: case O::GlobalAtomicOr32:
++    case O::GlobalAtomicXor32: case O::GlobalAtomicExchange32: case O::GlobalAtomicAddF32:
++        EXEC_LOOP(exec) { // address, value: the old value
++            u32 old = 0;
++            io.memory->ReadBlockUnsafe(U64l(a, i), &old, 4);
++            if (((io.live >> i) & 1) != 0) {
++                const u32 result = AtomicResult(o.op, old, b.w[0][i]);
++                io.memory->WriteBlockUnsafe(U64l(a, i), &result, 4);
+             }
+-            break;
+-        case O::StorageAtomicIAdd32: case O::StorageAtomicSMin32: case O::StorageAtomicUMin32:
+-        case O::StorageAtomicSMax32: case O::StorageAtomicUMax32: case O::StorageAtomicInc32:
+-        case O::StorageAtomicDec32: case O::StorageAtomicAnd32: case O::StorageAtomicOr32:
+-        case O::StorageAtomicXor32: case O::StorageAtomicExchange32: case O::StorageAtomicAddF32:
+-            EXEC_LOOP(exec) { // binding, offset, value: the old value
+-                GPUVAddr address;
+-                u32 old = 0;
+-                if (StorageAddress(io, a.w[0][i], b.w[0][i], 4, address)) {
+-                    io.memory->ReadBlockUnsafe(address, &old, 4);
+-                    if (((io.live >> i) & 1) != 0) {
+-                        const u32 result = AtomicResult(o.op, old, e.w[0][i]);
+-                        io.memory->WriteBlockUnsafe(address, &result, 4);
+-                    }
+-                }
+-                d.w[0][i] = old;
++            d.w[0][i] = old;
++        }
++        break;
++    case O::LoadLocal: // each lane's own: a word's lanes together
++        IO_LOOP {
++            const u32 word = a.w[0][i] / 4;
++            d.w[0][i] = word < io.local_words ? io.local[word * io.stride + io.lane + i] : 0;
++        }
++        break;
++    case O::WriteLocal:
++        EXEC_LOOP(exec) {
++            const u32 word = a.w[0][i] / 4;
++            if (word < io.local_words) {
++                io.local[word * io.stride + io.lane + i] = b.w[0][i];
+             }
++        }
++        break;
++    case O::CompositeConstructU32x2: case O::CompositeConstructF32x2:
++        std::memcpy(d.w[0], a.w[0], lanes * 4);
++        std::memcpy(d.w[1], b.w[0], lanes * 4);
++        break;
++    case O::CompositeConstructU32x3: case O::CompositeConstructF32x3:
++        std::memcpy(d.w[0], a.w[0], lanes * 4);
++        std::memcpy(d.w[1], b.w[0], lanes * 4);
++        std::memcpy(d.w[2], e.w[0], lanes * 4);
++        break;
++    case O::CompositeConstructU32x4: case O::CompositeConstructF32x4:
++        std::memcpy(d.w[0], a.w[0], lanes * 4);
++        std::memcpy(d.w[1], b.w[0], lanes * 4);
++        std::memcpy(d.w[2], e.w[0], lanes * 4);
++        std::memcpy(d.w[3], f.w[0], lanes * 4);
++        break;
++    case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
++    case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
++        if (o.extra) {
++            std::memcpy(d.w[0], a.w[o.extra - 1], lanes * sizeof(u32));
+             break;
+-        case O::GlobalAtomicIAdd32: case O::GlobalAtomicSMin32: case O::GlobalAtomicUMin32:
+-        case O::GlobalAtomicSMax32: case O::GlobalAtomicUMax32: case O::GlobalAtomicInc32:
+-        case O::GlobalAtomicDec32: case O::GlobalAtomicAnd32: case O::GlobalAtomicOr32:
+-        case O::GlobalAtomicXor32: case O::GlobalAtomicExchange32: case O::GlobalAtomicAddF32:
+-            EXEC_LOOP(exec) { // address, value: the old value
+-                u32 old = 0;
+-                io.memory->ReadBlockUnsafe(U64l(a, i), &old, 4);
+-                if (((io.live >> i) & 1) != 0) {
+-                    const u32 result = AtomicResult(o.op, old, b.w[0][i]);
+-                    io.memory->WriteBlockUnsafe(U64l(a, i), &result, 4);
+-                }
+-                d.w[0][i] = old;
++        }
++        LANE_LOOP d.w[0][i] = a.w[b.w[0][i] & 3][i];
++        break;
++    case O::CompositeInsertU32x2: case O::CompositeInsertU32x3: case O::CompositeInsertU32x4:
++    case O::CompositeInsertF32x2: case O::CompositeInsertF32x3: case O::CompositeInsertF32x4:
++        LANE_LOOP {
++            u32 result[4] = {a.w[0][i], a.w[1][i], a.w[2][i], a.w[3][i]};
++            result[e.w[0][i] & 3] = b.w[0][i];
++            for (u32 k = 0; k < 4; ++k) {
++                d.w[k][i] = result[k];
+             }
+-            break;
+-        case O::LoadLocal: // each lane's own: a word's lanes together
+-            IO_LOOP {
+-                const u32 word = a.w[0][i] / 4;
+-                d.w[0][i] = word < io.local_words ? io.local[word * io.stride + io.lane + i] : 0;
++        }
++        break;
++    case O::SelectU1: case O::SelectU8: case O::SelectU16: case O::SelectU32: case O::SelectF32:
++    case O::SelectU64:
++        LANE_LOOP {
++            const Lanes& source = a.w[0][i] != 0 ? b : e;
++            for (u32 k = 0; k < 4; ++k) {
++                d.w[k][i] = source.w[k][i];
+             }
+-            break;
+-        case O::WriteLocal:
+-            EXEC_LOOP(exec) {
+-                const u32 word = a.w[0][i] / 4;
+-                if (word < io.local_words) {
+-                    io.local[word * io.stride + io.lane + i] = b.w[0][i];
+-                }
++        }
++        break;
++    case O::BitCastU32F32: case O::BitCastF32U32:
++        std::memcpy(d.w[0], a.w[0], lanes * 4);
++        break;
++    case O::BitCastU64F64: case O::BitCastF64U64: case O::PackUint2x32: case O::UnpackUint2x32:
++    case O::PackDouble2x32: case O::UnpackDouble2x32:
++        std::memcpy(d.w[0], a.w[0], lanes * 4);
++        std::memcpy(d.w[1], a.w[1], lanes * 4);
++        break;
++    case O::PackHalf2x16:
++        LANE_LOOP d.w[0][i] = u32(ToHalf(Fl(a, i, 0))) | (u32(ToHalf(Fl(a, i, 1))) << 16);
++        break;
++    case O::UnpackHalf2x16:
++        LANE_LOOP {
++            SetFl(d, i, FromHalf(u16(a.w[0][i])), 0);
++            SetFl(d, i, FromHalf(u16(a.w[0][i] >> 16)), 1);
++        }
++        break;
++    case O::FPAbs32: LANE_LOOP SetFl(d, i, std::fabs(Fl(a, i))); break;
++    case O::FPAdd32: LANE_LOOP SetFl(d, i, Fl(a, i) + Fl(b, i)); break;
++    case O::FPFma32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i) + Fl(e, i)); break; // unfused: the PS4 has no FMA
++    case O::FPMax32: LANE_LOOP SetFl(d, i, std::fmax(Fl(a, i), Fl(b, i))); break;
++    case O::FPMin32: LANE_LOOP SetFl(d, i, std::fmin(Fl(a, i), Fl(b, i))); break;
++    case O::FPMul32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i)); break;
++    case O::FPNeg32: LANE_LOOP SetFl(d, i, -Fl(a, i)); break;
++    case O::FPRecip32: LANE_LOOP SetFl(d, i, 1.0f / Fl(a, i)); break;
++    case O::FPRecipSqrt32: LANE_LOOP SetFl(d, i, 1.0f / std::sqrt(Fl(a, i))); break;
++    case O::FPSqrt: LANE_LOOP SetFl(d, i, std::sqrt(Fl(a, i))); break;
++    case O::FPSin: LANE_LOOP SetFl(d, i, std::sin(Fl(a, i))); break;
++    case O::FPCos: LANE_LOOP SetFl(d, i, std::cos(Fl(a, i))); break;
++    case O::FPExp2: LANE_LOOP SetFl(d, i, std::exp2(Fl(a, i))); break;
++    case O::FPLog2: LANE_LOOP SetFl(d, i, std::log2(Fl(a, i))); break;
++    case O::FPSaturate32: LANE_LOOP SetFl(d, i, std::isnan(Fl(a, i)) ? 0.0f : std::clamp(Fl(a, i), 0.0f, 1.0f)); break;
++    case O::FPClamp32: LANE_LOOP SetFl(d, i, std::fmin(std::fmax(Fl(a, i), Fl(b, i)), Fl(e, i))); break;
++    case O::FPRoundEven32: LANE_LOOP SetFl(d, i, std::nearbyint(Fl(a, i))); break;
++    case O::FPFloor32: LANE_LOOP SetFl(d, i, std::floor(Fl(a, i))); break;
++    case O::FPCeil32: LANE_LOOP SetFl(d, i, std::ceil(Fl(a, i))); break;
++    case O::FPTrunc32: LANE_LOOP SetFl(d, i, std::trunc(Fl(a, i))); break;
++    case O::FPOrdEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) == Fl(b, i); break;
++    case O::FPUnordEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) != Fl(b, i)) || std::isnan(Fl(a, i)) || std::isnan(Fl(b, i)); break;
++    case O::FPOrdNotEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) != Fl(b, i) && !std::isnan(Fl(a, i)) && !std::isnan(Fl(b, i)); break;
++    case O::FPUnordNotEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) != Fl(b, i); break;
++    case O::FPOrdLessThan32: LANE_LOOP d.w[0][i] = Fl(a, i) < Fl(b, i); break;
++    case O::FPUnordLessThan32: LANE_LOOP d.w[0][i] = !(Fl(a, i) >= Fl(b, i)); break;
++    case O::FPOrdGreaterThan32: LANE_LOOP d.w[0][i] = Fl(a, i) > Fl(b, i); break;
++    case O::FPUnordGreaterThan32: LANE_LOOP d.w[0][i] = !(Fl(a, i) <= Fl(b, i)); break;
++    case O::FPOrdLessThanEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) <= Fl(b, i); break;
++    case O::FPUnordLessThanEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) > Fl(b, i)); break;
++    case O::FPOrdGreaterThanEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) >= Fl(b, i); break;
++    case O::FPUnordGreaterThanEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) < Fl(b, i)); break;
++    case O::FPIsNan32: LANE_LOOP d.w[0][i] = std::isnan(Fl(a, i)); break;
++    case O::IAdd32: LANE_LOOP d.w[0][i] = a.w[0][i] + b.w[0][i]; break;
++    case O::ISub32: LANE_LOOP d.w[0][i] = a.w[0][i] - b.w[0][i]; break;
++    case O::IMul32: LANE_LOOP d.w[0][i] = a.w[0][i] * b.w[0][i]; break;
++    case O::SDiv32:
++        LANE_LOOP d.w[0][i] = Sl(b, i) == 0 ? 0 : (Sl(a, i) == std::numeric_limits<s32>::min() && Sl(b, i) == -1) ? a.w[0][i] : u32(Sl(a, i) / Sl(b, i));
++        break;
++    case O::UDiv32: LANE_LOOP d.w[0][i] = b.w[0][i] == 0 ? 0 : a.w[0][i] / b.w[0][i]; break;
++    case O::INeg32: LANE_LOOP d.w[0][i] = 0u - a.w[0][i]; break;
++    case O::IAbs32: LANE_LOOP d.w[0][i] = Sl(a, i) < 0 ? 0u - a.w[0][i] : a.w[0][i]; break;
++    case O::IAdd64: LANE_LOOP SetU64l(d, i, U64l(a, i) + U64l(b, i)); break;
++    case O::ISub64: LANE_LOOP SetU64l(d, i, U64l(a, i) - U64l(b, i)); break;
++    case O::INeg64: LANE_LOOP SetU64l(d, i, 0 - U64l(a, i)); break;
++    case O::ShiftLeftLogical32: LANE_LOOP d.w[0][i] = b.w[0][i] >= 32 ? 0 : a.w[0][i] << b.w[0][i]; break;
++    case O::ShiftRightLogical32: LANE_LOOP d.w[0][i] = b.w[0][i] >= 32 ? 0 : a.w[0][i] >> b.w[0][i]; break;
++    case O::ShiftRightArithmetic32: LANE_LOOP d.w[0][i] = u32(Sl(a, i) >> std::min<u32>(b.w[0][i], 31)); break;
++    case O::ShiftLeftLogical64: LANE_LOOP SetU64l(d, i, b.w[0][i] >= 64 ? 0 : U64l(a, i) << b.w[0][i]); break;
++    case O::ShiftRightLogical64: LANE_LOOP SetU64l(d, i, b.w[0][i] >= 64 ? 0 : U64l(a, i) >> b.w[0][i]); break;
++    case O::ShiftRightArithmetic64: LANE_LOOP SetU64l(d, i, u64(s64(U64l(a, i)) >> std::min<u32>(b.w[0][i], 63))); break;
++    case O::BitwiseAnd32: LANE_LOOP d.w[0][i] = a.w[0][i] & b.w[0][i]; break;
++    case O::BitwiseOr32: LANE_LOOP d.w[0][i] = a.w[0][i] | b.w[0][i]; break;
++    case O::BitwiseXor32: LANE_LOOP d.w[0][i] = a.w[0][i] ^ b.w[0][i]; break;
++    case O::BitFieldInsert:
++        LANE_LOOP {
++            const u32 offset = e.w[0][i] & 31, count = std::min(f.w[0][i], 32 - offset);
++            const u32 field = (count == 32 ? 0xFFFFFFFFu : (1u << count) - 1) << offset;
++            d.w[0][i] = count == 0 ? a.w[0][i] : (a.w[0][i] & ~field) | ((b.w[0][i] << offset) & field);
++        }
++        break;
++    case O::BitFieldSExtract: LANE_LOOP d.w[0][i] = BitFieldExtract(a.w[0][i], b.w[0][i], e.w[0][i], true); break;
++    case O::BitFieldUExtract: LANE_LOOP d.w[0][i] = BitFieldExtract(a.w[0][i], b.w[0][i], e.w[0][i], false); break;
++    case O::BitReverse32:
++        LANE_LOOP {
++            u32 v = a.w[0][i], r = 0;
++            for (int bit = 0; bit < 32; ++bit, v >>= 1) {
++                r = (r << 1) | (v & 1);
+             }
+-            break;
+-        case O::CompositeConstructU32x2: case O::CompositeConstructF32x2:
+-            std::memcpy(d.w[0], a.w[0], lanes * 4);
+-            std::memcpy(d.w[1], b.w[0], lanes * 4);
+-            break;
+-        case O::CompositeConstructU32x3: case O::CompositeConstructF32x3:
+-            std::memcpy(d.w[0], a.w[0], lanes * 4);
+-            std::memcpy(d.w[1], b.w[0], lanes * 4);
+-            std::memcpy(d.w[2], e.w[0], lanes * 4);
+-            break;
+-        case O::CompositeConstructU32x4: case O::CompositeConstructF32x4:
+-            std::memcpy(d.w[0], a.w[0], lanes * 4);
+-            std::memcpy(d.w[1], b.w[0], lanes * 4);
+-            std::memcpy(d.w[2], e.w[0], lanes * 4);
+-            std::memcpy(d.w[3], f.w[0], lanes * 4);
+-            break;
+-        case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
+-        case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
+-            if (o.extra) {
+-                std::memcpy(d.w[0], a.w[o.extra - 1], lanes * sizeof(u32));
+-                break;
++            d.w[0][i] = r;
++        }
++        break;
++    case O::BitCount32: LANE_LOOP d.w[0][i] = std::popcount(a.w[0][i]); break;
++    case O::BitwiseNot32: LANE_LOOP d.w[0][i] = ~a.w[0][i]; break;
++    case O::FindUMsb32: LANE_LOOP d.w[0][i] = a.w[0][i] == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(a.w[0][i]); break;
++    case O::FindSMsb32:
++        LANE_LOOP {
++            const u32 v = Sl(a, i) < 0 ? ~a.w[0][i] : a.w[0][i];
++            d.w[0][i] = v == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(v);
++        }
++        break;
++    case O::SMin32: LANE_LOOP d.w[0][i] = u32(std::min(Sl(a, i), Sl(b, i))); break;
++    case O::UMin32: LANE_LOOP d.w[0][i] = std::min(a.w[0][i], b.w[0][i]); break;
++    case O::SMax32: LANE_LOOP d.w[0][i] = u32(std::max(Sl(a, i), Sl(b, i))); break;
++    case O::UMax32: LANE_LOOP d.w[0][i] = std::max(a.w[0][i], b.w[0][i]); break;
++    case O::SClamp32: LANE_LOOP d.w[0][i] = u32(std::min(std::max(Sl(a, i), Sl(b, i)), Sl(e, i))); break;
++    case O::UClamp32: LANE_LOOP d.w[0][i] = std::min(std::max(a.w[0][i], b.w[0][i]), e.w[0][i]); break;
++    case O::SLessThan: LANE_LOOP d.w[0][i] = Sl(a, i) < Sl(b, i); break;
++    case O::ULessThan: LANE_LOOP d.w[0][i] = a.w[0][i] < b.w[0][i]; break;
++    case O::IEqual: LANE_LOOP d.w[0][i] = a.w[0][i] == b.w[0][i]; break;
++    case O::SLessThanEqual: LANE_LOOP d.w[0][i] = Sl(a, i) <= Sl(b, i); break;
++    case O::ULessThanEqual: LANE_LOOP d.w[0][i] = a.w[0][i] <= b.w[0][i]; break;
++    case O::SGreaterThan: LANE_LOOP d.w[0][i] = Sl(a, i) > Sl(b, i); break;
++    case O::UGreaterThan: LANE_LOOP d.w[0][i] = a.w[0][i] > b.w[0][i]; break;
++    case O::INotEqual: LANE_LOOP d.w[0][i] = a.w[0][i] != b.w[0][i]; break;
++    case O::SGreaterThanEqual: LANE_LOOP d.w[0][i] = Sl(a, i) >= Sl(b, i); break;
++    case O::UGreaterThanEqual: LANE_LOOP d.w[0][i] = a.w[0][i] >= b.w[0][i]; break;
++    case O::LogicalOr: LANE_LOOP d.w[0][i] = (a.w[0][i] | b.w[0][i]) != 0; break;
++    case O::LogicalAnd: LANE_LOOP d.w[0][i] = (a.w[0][i] != 0) && (b.w[0][i] != 0); break;
++    case O::LogicalXor: LANE_LOOP d.w[0][i] = (a.w[0][i] != 0) != (b.w[0][i] != 0); break;
++    case O::LogicalNot: LANE_LOOP d.w[0][i] = a.w[0][i] == 0; break;
++    case O::ConvertS32F32: LANE_LOOP d.w[0][i] = u32(ToS32(Fl(a, i))); break;
++    case O::ConvertU32F32: LANE_LOOP d.w[0][i] = ToU32(Fl(a, i)); break;
++    case O::ConvertS16F32: LANE_LOOP d.w[0][i] = u32(std::clamp(ToS32(Fl(a, i)), -32768, 32767)); break;
++    case O::ConvertU16F32: LANE_LOOP d.w[0][i] = std::min(ToU32(Fl(a, i)), 65535u); break;
++    case O::ConvertF32S32: LANE_LOOP SetFl(d, i, float(Sl(a, i))); break;
++    case O::ConvertF32U32: LANE_LOOP SetFl(d, i, float(a.w[0][i])); break;
++    case O::ConvertF32S8: LANE_LOOP SetFl(d, i, float(s8(a.w[0][i]))); break;
++    case O::ConvertF32S16: LANE_LOOP SetFl(d, i, float(s16(a.w[0][i]))); break;
++    case O::ConvertF32U8: LANE_LOOP SetFl(d, i, float(u8(a.w[0][i]))); break;
++    case O::ConvertF32U16: LANE_LOOP SetFl(d, i, float(u16(a.w[0][i]))); break;
++    case O::ConvertU64U32: LANE_LOOP SetU64l(d, i, a.w[0][i]); break;
++    case O::ConvertU32U64: LANE_LOOP d.w[0][i] = a.w[0][i]; break;
++    case O::ConvertU16U32: case O::ConvertU32U16: LANE_LOOP d.w[0][i] = a.w[0][i] & 0xFFFF; break;
++    case O::ConvertU8U32: case O::ConvertU32U8: LANE_LOOP d.w[0][i] = a.w[0][i] & 0xFF; break;
++    case O::ConvertS32S8: LANE_LOOP d.w[0][i] = u32(s32(s8(a.w[0][i]))); break;
++    case O::ConvertS32S16: LANE_LOOP d.w[0][i] = u32(s32(s16(a.w[0][i]))); break;
++    case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
++        // between a quad's lanes (fine: in the lane's row or column; coarse: the top-left's)
++        LANE_LOOP {
++            if (!io.quads) {
++                d.w[0][i] = 0;
++                continue;
+             }
+-            LANE_LOOP d.w[0][i] = a.w[b.w[0][i] & 3][i];
+-            break;
+-        case O::CompositeInsertU32x2: case O::CompositeInsertU32x3: case O::CompositeInsertU32x4:
+-        case O::CompositeInsertF32x2: case O::CompositeInsertF32x3: case O::CompositeInsertF32x4:
+-            LANE_LOOP {
+-                u32 result[4] = {a.w[0][i], a.w[1][i], a.w[2][i], a.w[3][i]};
+-                result[e.w[0][i] & 3] = b.w[0][i];
+-                for (u32 k = 0; k < 4; ++k) {
+-                    d.w[k][i] = result[k];
++            const u32 from = o.op == O::DPdxFine ? i & ~1u : o.op == O::DPdyFine ? i & ~8u : QuadTopLeft(i);
++            const u32 to = o.op == O::DPdxFine || o.op == O::DPdxCoarse ? from | 1 : from | 8;
++            SetFl(d, i, Fl(a, to) - Fl(a, from));
++        }
++        break;
++    case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGradient:
++    case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod:
++    case O::ImageGather: case O::ImageGatherDref: case O::ImageFetch:
++    case O::ImageQueryDimensions: case O::ImageQueryLod:
++        RunTexture(program, o, c, io, exec);
++        break;
++    case O::ImageRead: case O::ImageWrite:
++    case O::ImageAtomicIAdd32: case O::ImageAtomicSMin32: case O::ImageAtomicUMin32:
++    case O::ImageAtomicSMax32: case O::ImageAtomicUMax32: case O::ImageAtomicInc32:
++    case O::ImageAtomicDec32: case O::ImageAtomicAnd32: case O::ImageAtomicOr32:
++    case O::ImageAtomicXor32: case O::ImageAtomicExchange32:
++        RunImage(program, o, c, io, exec);
++        break;
++    case O::GetSparseFromOp:
++        LANE_LOOP d.w[0][i] = 1; // every texel is resident
++        break;
++    case O::GetInBoundsFromOp:
++        LANE_LOOP d.w[0][i] = a.w[1][i]; // kept by the shuffle
++        break;
++    case O::LaneId:
++        LANE_LOOP d.w[0][i] = io.quads ? INVOCATION_ID[i] : 0;
++        break;
++    case O::IsTextureScaled:
++    case O::IsImageScaled:
++    case O::InvocationInfo:
++        LANE_LOOP d.w[0][i] = 0;
++        break;
++    // A fragment shader's lanes are a subgroup (their ids: INVOCATION_ID), the running ones
++    // active; elsewhere each lane is a subgroup of its own
++    case O::VoteAll: case O::VoteAny: case O::VoteEqual: case O::SubgroupBallot: {
++        u32 ballot = 0, active = 0;
++        EXEC_LOOP(exec) {
++            const u32 bit = 1u << (io.quads ? INVOCATION_ID[i] : 0);
++            active |= bit;
++            ballot |= a.w[0][i] != 0 ? bit : 0;
++        }
++        const u32 result = o.op == O::VoteAll   ? ballot == active
++                           : o.op == O::VoteAny ? ballot != 0
++                           : o.op == O::VoteEqual ? ballot == 0 || ballot == active
++                                                  : ballot;
++        LANE_LOOP d.w[0][i] = result;
++        break;
++    }
++    case O::SubgroupEqMask: case O::SubgroupLtMask: case O::SubgroupLeMask:
++    case O::SubgroupGtMask: case O::SubgroupGeMask:
++        LANE_LOOP {
++            const u32 id = io.quads ? INVOCATION_ID[i] : 0, size = io.quads ? 0xFFFFu : 1u;
++            const u32 lt = (1u << id) - 1, le = (2u << id) - 1;
++            d.w[0][i] = o.op == O::SubgroupEqMask   ? 1u << id
++                        : o.op == O::SubgroupLtMask ? lt
++                        : o.op == O::SubgroupLeMask ? le
++                        : o.op == O::SubgroupGtMask ? ~le & size
++                                                    : ~lt & size;
++        }
++        break;
++    case O::ShuffleIndex: case O::ShuffleUp: case O::ShuffleDown: case O::ShuffleButterfly:
++        // the source lane's value when it's in bounds (value, index, clamp, segment mask), as
++        // Eden's backends work it out; the in-bounds flag kept in the result's second word
++        LANE_LOOP {
++            const u32 id = io.quads ? INVOCATION_ID[i] : 0, index = b.w[0][i];
++            const u32 min_id = id & f.w[0][i], max_id = min_id | (e.w[0][i] & ~f.w[0][i]);
++            u32 source;
++            bool in_bounds;
++            if (o.op == O::ShuffleIndex) {
++                source = (index & ~f.w[0][i]) | min_id, in_bounds = s32(source) <= s32(max_id);
++            } else if (o.op == O::ShuffleUp) {
++                source = id - index, in_bounds = s32(source) >= s32(max_id);
++            } else if (o.op == O::ShuffleDown) {
++                source = id + index, in_bounds = s32(source) <= s32(max_id);
++            } else {
++                source = id ^ index, in_bounds = s32(source) <= s32(max_id);
++            }
++            const bool exists = io.quads ? source < LANES : source == 0;
++            d.w[0][i] = in_bounds && exists ? a.w[0][io.quads ? INVOCATION_LANE[source] : i] : a.w[0][i];
++            d.w[1][i] = in_bounds ? 1 : 0;
++        }
++        break;
++    case O::QuadBroadcast: case O::QuadSwap: // value, the quad's lane; value, direction
++        LANE_LOOP {
++            if (!io.quads) {
++                d.w[0][i] = a.w[0][i];
++                continue;
++            }
++            const u32 id = INVOCATION_ID[i];
++            const u32 source = o.op == O::QuadBroadcast ? (id & ~3u) | (b.w[0][i] & 3) : id ^ ((b.w[0][i] + 1) & 3);
++            d.w[0][i] = a.w[0][INVOCATION_LANE[source]];
++        }
++        break;
++    case O::FSwizzleAdd: { // each lane's mode by its place in its quad
++        static constexpr f32 modifier_a[4] = {1.0f, -1.0f, 1.0f, 0.0f};
++        static constexpr f32 modifier_b[4] = {1.0f, 1.0f, -1.0f, 1.0f};
++        LANE_LOOP {
++            const u32 id = io.quads ? INVOCATION_ID[i] : 0;
++            const u32 mode = (e.w[0][i] >> ((id & 3) * 2)) & 3;
++            SetFl(d, i, Fl(a, i) * modifier_a[mode] + Fl(b, i) * modifier_b[mode]);
++        }
++        break;
++    }
++    case O::IAbs64: LANE_LOOP SetU64l(d, i, s64(U64l(a, i)) < 0 ? 0 - U64l(a, i) : U64l(a, i)); break;
++    case O::LoadStorageU8: case O::LoadStorageS8: case O::LoadStorageU16: case O::LoadStorageS16:
++    case O::LoadStorage32: case O::LoadStorage64: case O::LoadStorage128: {
++        const u32 bytes = AccessBytes(o.op);
++        const bool sign = o.op == O::LoadStorageS8 || o.op == O::LoadStorageS16;
++        IO_LOOP {
++            GPUVAddr address;
++            if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
++                ReadMemory(io, address, bytes, sign, d, i);
++            } else {
++                d.w[0][i] = d.w[1][i] = d.w[2][i] = d.w[3][i] = 0;
++            }
++        }
++        break;
++    }
++    case O::WriteStorageU8: case O::WriteStorageS8: case O::WriteStorageU16: case O::WriteStorageS16:
++    case O::WriteStorage32: case O::WriteStorage64: case O::WriteStorage128: {
++        const u32 bytes = AccessBytes(o.op);
++        EXEC_LOOP(exec & io.live) {
++            GPUVAddr address;
++            if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
++                WriteMemory(io, address, bytes, e, i);
++            }
++        }
++        break;
++    }
++    case O::LoadGlobalU8: case O::LoadGlobalS8: case O::LoadGlobalU16: case O::LoadGlobalS16:
++    case O::LoadGlobal32: case O::LoadGlobal64: case O::LoadGlobal128: {
++        const u32 bytes = AccessBytes(o.op);
++        const bool sign = o.op == O::LoadGlobalS8 || o.op == O::LoadGlobalS16;
++        EXEC_LOOP(exec) ReadMemory(io, U64l(a, i), bytes, sign, d, i);
++        break;
++    }
++    case O::WriteGlobalU8: case O::WriteGlobalS8: case O::WriteGlobalU16: case O::WriteGlobalS16:
++    case O::WriteGlobal32: case O::WriteGlobal64: case O::WriteGlobal128: {
++        const u32 bytes = AccessBytes(o.op);
++        EXEC_LOOP(exec & io.live) WriteMemory(io, U64l(a, i), bytes, b, i);
++        break;
++    }
++    default:
++        break;
++    }
++}
++
++/// The same, called from native code (16 lanes, none waiting)
++void RunIrNative(const SoftwareDraw::Program* program, const Op* o, Lanes* c, Io* io, u32 exec) {
++    RunIr<true>(*program, *o, c, *io, LANES, exec, 0);
++}
++
++// ---- native code: a fragment or compute program's runs of instructions between branches
++// compiled to x86 (AVX, 128 bits: SSE's instructions in their three-operand form, which the
++// PS4's Jaguar cores have), for when no lanes wait at a branch. Arithmetic is done four lanes at
++// a time, a value to a register, the run's arithmetic once for each four (each lane's own: lanes
++// don't mix in it); what's left (textures, memory, lanes that mix) is called out to the
++// interpreter's code for all 16 lanes at once.
++
++#ifdef SOFTWARE_JIT
++u32 ReadCbufNative(const Io* io, u32 index, u32 byte_offset) {
++    return ReadCbuf(*io, index, byte_offset, 4);
++}
++
++using NativeFn = void (*)(Lanes* c, Io* io, u32 exec);
++
++/// Vectors native code reads, four of each: sign bits, all but them, 1.0, 0, 1, all bits,
++/// 65536.0, the low 16 bits
++alignas(16) constexpr u32 JIT_CONSTANTS[8][4] = {
++    {0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u}, {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu},
++    {0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u}, {0, 0, 0, 0},
++    {1, 1, 1, 1}, {~0u, ~0u, ~0u, ~0u},
++    {0x47800000u, 0x47800000u, 0x47800000u, 0x47800000u}, {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
++};
++enum JitConstant { SIGN, ABS, ONE, ZERO, ONE_INT, ALL_ONES, F65536, LOW16 };
++
++/// What native code does with an instruction
++enum class JitUse {
++    End,     // it ends a run (a branch, a return, a discard)
++    Lanes,   // done natively, four lanes at a time
++    Uniform, // a constant buffer's word at a constant offset: read once, for every lane
++    Call,    // called out, for all lanes at once
++};
++
++/// The process's native code memory (read, write and execute, as dynarmic's on the PS4) and its
++/// compiler
++class ShaderJit {
++public:
++    static ShaderJit* Get() {
++        static ShaderJit* const jit = [] () -> ShaderJit* {
++            if (const char* env = std::getenv("EDEN_SW_JIT"); env && std::string_view{env} == "0") {
++                return nullptr;
++            }
++            const Xbyak::util::Cpu cpu;
++            if (!cpu.has(Xbyak::util::Cpu::tAVX) || !cpu.has(Xbyak::util::Cpu::tSSE41)) {
++                LogOnce("no AVX: software shaders interpreted");
++                return nullptr;
++            }
++            void* const memory = mmap(nullptr, MEMORY_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
++                                      MAP_PRIVATE | MAP_ANON, -1, 0);
++            if (memory == MAP_FAILED) {
++                LogOnce("no executable memory: software shaders interpreted");
++                return nullptr;
++            }
++            LogOnce("fragment and compute shaders compiled to native code (EDEN_SW_JIT=0: interpreted)");
++            return new ShaderJit(static_cast<u8*>(memory));
++        }();
++        return jit;
++    }
++
++    /// The program's runs compiled, each behind a Kind::Native op (its function in 'native', the
++    /// op after the run in 'extra'); the ops' jumps moved to match. False if nothing was.
++    bool Compile(SoftwareDraw::Program& program);
++
++private:
++    static constexpr size_t MEMORY_SIZE = 4u << 20;
++    explicit ShaderJit(u8* memory_) : memory{memory_} {}
++
++    u8* memory;
++    size_t used = 0;
++    bool full = false;
++};
++
++JitUse UseOf(const Op& o, const std::vector<bool>& written) {
++    using O = IR::Opcode;
++    if (o.kind == Kind::Move) {
++        return JitUse::Lanes;
++    }
++    if (o.kind != Kind::Ir || o.op == O::DemoteToHelperInvocation) {
++        return JitUse::End;
++    }
++    const auto constant = [&](u16 cell) { return !written[cell]; };
++    switch (o.op) {
++    case O::GetCbufU32: case O::GetCbufF32: case O::GetCbufU32x2:
++        return o.extra && constant(o.a[0]) && constant(o.a[1]) ? JitUse::Uniform : JitUse::Call;
++    case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
++    case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
++        return o.extra ? JitUse::Lanes : JitUse::Call;
++    case O::ShiftLeftLogical32: case O::ShiftRightLogical32: case O::ShiftRightArithmetic32:
++        return constant(o.a[1]) ? JitUse::Lanes : JitUse::Call;
++    case O::GetAttribute: case O::GetAttributeU32: case O::SetFragColor:
++    case O::CompositeConstructU32x2: case O::CompositeConstructU32x3: case O::CompositeConstructU32x4:
++    case O::CompositeConstructF32x2: case O::CompositeConstructF32x3: case O::CompositeConstructF32x4:
++    case O::BitCastU32F32: case O::BitCastF32U32: case O::BitCastU64F64: case O::BitCastF64U64:
++    case O::PackUint2x32: case O::UnpackUint2x32: case O::PackDouble2x32: case O::UnpackDouble2x32:
++    case O::SelectU1: case O::SelectU8: case O::SelectU16: case O::SelectU32: case O::SelectF32:
++    case O::SelectU64:
++    case O::FPAbs32: case O::FPAdd32: case O::FPFma32: case O::FPMax32: case O::FPMin32:
++    case O::FPMul32: case O::FPNeg32: case O::FPRecip32: case O::FPRecipSqrt32: case O::FPSqrt:
++    case O::FPSaturate32: case O::FPClamp32: case O::FPRoundEven32: case O::FPFloor32:
++    case O::FPCeil32: case O::FPTrunc32:
++    case O::FPOrdEqual32: case O::FPUnordEqual32: case O::FPOrdNotEqual32: case O::FPUnordNotEqual32:
++    case O::FPOrdLessThan32: case O::FPUnordLessThan32: case O::FPOrdGreaterThan32:
++    case O::FPUnordGreaterThan32: case O::FPOrdLessThanEqual32: case O::FPUnordLessThanEqual32:
++    case O::FPOrdGreaterThanEqual32: case O::FPUnordGreaterThanEqual32: case O::FPIsNan32:
++    case O::IAdd32: case O::ISub32: case O::IMul32: case O::INeg32:
++    case O::BitwiseAnd32: case O::BitwiseOr32: case O::BitwiseXor32: case O::BitwiseNot32:
++    case O::IEqual: case O::INotEqual: case O::SLessThan: case O::SGreaterThan:
++    case O::SLessThanEqual: case O::SGreaterThanEqual: case O::ULessThan: case O::UGreaterThan:
++    case O::ULessThanEqual: case O::UGreaterThanEqual:
++    case O::LogicalOr: case O::LogicalAnd: case O::LogicalXor: case O::LogicalNot:
++    case O::ConvertF32S32: case O::ConvertF32U32:
++    case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
++        return JitUse::Lanes;
++    default:
++        return JitUse::Call;
++    }
++}
++
++/// A run's code
++class RunEmitter : public Xbyak::CodeGenerator {
++public:
++    RunEmitter(u8* at, size_t room, const SoftwareDraw::Program& program_, const std::vector<bool>& written_)
++        : Xbyak::CodeGenerator(room, at), program{program_}, written{written_} {}
++
++    /// ops[first, last): the new ops (their addresses called out with)
++    void Emit(const Op* ops, u32 first, u32 last) {
++        using namespace Xbyak::util;
++        push(rbx), push(rbp), push(r12), push(r13), push(r14), push(r15);
++        sub(rsp, 8);
++        mov(rbx, rdi);  // the cells
++        mov(r12, rsi);  // the io
++        mov(r13d, edx); // the lanes run
++        mov(r14, reinterpret_cast<u64>(&JIT_CONSTANTS[0][0]));
++        for (u32 pc = first; pc < last;) {
++            const JitUse use = UseOf(ops[pc], written);
++            if (use == JitUse::Call) {
++                mov(rdi, reinterpret_cast<u64>(&program));
++                mov(rsi, reinterpret_cast<u64>(&ops[pc]));
++                mov(rdx, rbx);
++                mov(rcx, r12);
++                mov(r8d, r13d);
++                mov(rax, reinterpret_cast<u64>(&RunIrNative));
++                call(rax);
++                ++pc;
++                continue;
++            }
++            // a stretch of lane-wise and uniform instructions: the uniforms first (nothing in it
++            // writes what they read), then the rest four lanes at a time
++            u32 end = pc;
++            while (end < last && UseOf(ops[end], written) != JitUse::Call) {
++                ++end;
++            }
++            bool lanes = false;
++            for (u32 i = pc; i < end; ++i) {
++                if (UseOf(ops[i], written) == JitUse::Uniform) {
++                    EmitUniform(ops[i]);
++                } else {
++                    lanes = true;
+                 }
+             }
+-            break;
+-        case O::SelectU1: case O::SelectU8: case O::SelectU16: case O::SelectU32: case O::SelectF32:
+-        case O::SelectU64:
+-            LANE_LOOP {
+-                const Lanes& source = a.w[0][i] != 0 ? b : e;
+-                for (u32 k = 0; k < 4; ++k) {
+-                    d.w[k][i] = source.w[k][i];
++            if (lanes) {
++                mov(r8, ptr[r12 + offsetof(Io, inputs)]);
++                mov(r9, ptr[r12 + offsetof(Io, colors)]);
++                xor_(r10d, r10d); // the four lanes' offset in a word's sixteen
++                Xbyak::Label loop;
++                L(loop);
++                cache.Reset();
++                for (u32 i = pc; i < end; ++i) {
++                    if (UseOf(ops[i], written) == JitUse::Lanes) {
++                        EmitLanes(ops[i]);
++                    }
+                 }
++                add(r10, 16);
++                cmp(r10, 64);
++                jne(loop);
+             }
++            pc = end;
++        }
++        add(rsp, 8);
++        pop(r15), pop(r14), pop(r13), pop(r12), pop(rbp), pop(rbx);
++        ret();
++    }
++
++private:
++    /// Which registers hold which cells' words for the four lanes at hand (all also in memory)
++    struct Cache {
++        static constexpr int REGS = 13; // xmm0..12; 13..15 are scratch
++        std::array<std::vector<u32>, REGS> keys{};
++        std::array<u32, REGS> used{};
++        u32 clock = 0;
++        void Reset() {
++            for (auto& k : keys) {
++                k.clear();
++            }
++        }
++        int Find(u32 key) const {
++            for (int r = 0; r < REGS; ++r) {
++                if (std::ranges::find(keys[r], key) != keys[r].end()) {
++                    return r;
++                }
++            }
++            return -1;
++        }
++        void Forget(u32 key) {
++            for (auto& k : keys) {
++                std::erase(k, key);
++            }
++        }
++    };
++
++    static u32 Key(u16 cell, u32 word) {
++        return u32(cell) * 4 + word;
++    }
++    Xbyak::Address Mem(u16 cell, u32 word) {
++        using namespace Xbyak::util;
++        return ptr[rbx + r10 + (u32(cell) * sizeof(Lanes) + word * LANES * 4)];
++    }
++    Xbyak::Address Const(JitConstant constant) {
++        using namespace Xbyak::util;
++        return ptr[r14 + u32(constant) * 16];
++    }
++
++    /// A register for a result, none of 'keep' (the instruction's operands)
++    Xbyak::Xmm Alloc(std::initializer_list<int> keep = {}) {
++        int best = -1;
++        for (int r = 0; r < Cache::REGS; ++r) {
++            if (std::find(keep.begin(), keep.end(), r) != keep.end()) {
++                continue;
++            }
++            if (cache.keys[r].empty()) {
++                best = r;
++                break;
++            }
++            if (best < 0 || cache.used[r] < cache.used[best]) {
++                best = r;
++            }
++        }
++        cache.keys[best].clear();
++        cache.used[best] = ++cache.clock;
++        return Xbyak::Xmm(best);
++    }
++    /// A cell's word in a register (loaded unless it's there)
++    Xbyak::Xmm Load(u16 cell, u32 word, std::initializer_list<int> keep = {}) {
++        const u32 key = Key(cell, word);
++        if (const int r = cache.Find(key); r >= 0) {
++            cache.used[r] = ++cache.clock;
++            return Xbyak::Xmm(r);
++        }
++        const Xbyak::Xmm x = Alloc(keep);
++        vmovups(x, Mem(cell, word));
++        cache.keys[x.getIdx()].push_back(key);
++        return x;
++    }
++    /// The result in 'x' is the cell's word: stored, and kept
++    void Def(u16 cell, u32 word, const Xbyak::Xmm& x) {
++        const u32 key = Key(cell, word);
++        cache.Forget(key);
++        vmovups(Mem(cell, word), x);
++        cache.keys[x.getIdx()].push_back(key);
++        cache.used[x.getIdx()] = ++cache.clock;
++    }
++
++    void EmitUniform(const Op& o) {
++        using namespace Xbyak::util;
++        const u32 index = program.cells[o.a[0]].w[0], offset = program.cells[o.a[1]].w[0];
++        const u32 words = o.op == IR::Opcode::GetCbufU32x2 ? 2 : 1;
++        for (u32 k = 0; k < words; ++k) {
++            mov(rdi, r12);
++            mov(esi, index);
++            mov(edx, offset + k * 4);
++            mov(rax, reinterpret_cast<u64>(&ReadCbufNative));
++            call(rax);
++            vmovd(xmm0, eax);
++            vpshufd(xmm0, xmm0, 0);
++            for (u32 chunk = 0; chunk < LANES / 4; ++chunk) {
++                vmovups(ptr[rbx + (u32(o.dest) * sizeof(Lanes) + k * LANES * 4 + chunk * 16)], xmm0);
++            }
++        }
++    }
++
++    void EmitLanes(const Op& o) {
++        using O = IR::Opcode;
++        using namespace Xbyak::util;
++        const auto copy = [&](u32 to_word, u16 from, u32 from_word) { // a word, shared
++            const Xbyak::Xmm x = Load(from, from_word);
++            Def(o.dest, to_word, x);
++        };
++        if (o.kind == Kind::Move) {
++            for (u32 k = 0; k < o.extra; ++k) {
++                copy(k, o.a[0], k);
++            }
++            return;
++        }
++        // the instruction's result from one or two (or three) operands
++        const auto unary = [&](auto&& body) {
++            const Xbyak::Xmm a = Load(o.a[0], 0);
++            const Xbyak::Xmm d = Alloc({a.getIdx()});
++            body(d, a);
++            Def(o.dest, 0, d);
++        };
++        const auto binary = [&](auto&& body) {
++            const Xbyak::Xmm a = Load(o.a[0], 0);
++            const Xbyak::Xmm b = Load(o.a[1], 0, {a.getIdx()});
++            const Xbyak::Xmm d = Alloc({a.getIdx(), b.getIdx()});
++            body(d, a, b);
++            Def(o.dest, 0, d);
++        };
++        const auto ternary = [&](auto&& body) {
++            const Xbyak::Xmm a = Load(o.a[0], 0);
++            const Xbyak::Xmm b = Load(o.a[1], 0, {a.getIdx()});
++            const Xbyak::Xmm e = Load(o.a[2], 0, {a.getIdx(), b.getIdx()});
++            const Xbyak::Xmm d = Alloc({a.getIdx(), b.getIdx(), e.getIdx()});
++            body(d, a, b, e);
++            Def(o.dest, 0, d);
++        };
++        // std::fmax and fmin: a NaN operand gives the other
++        const auto fmax = [&](const Xbyak::Xmm& d, const Xbyak::Xmm& a, const Xbyak::Xmm& b) {
++            vmaxps(d, a, b); // (b if either is NaN)
++            vcmpunordps(xmm15, b, b);
++            vblendvps(d, d, a, xmm15);
++        };
++        const auto fmin = [&](const Xbyak::Xmm& d, const Xbyak::Xmm& a, const Xbyak::Xmm& b) {
++            vminps(d, a, b);
++            vcmpunordps(xmm15, b, b);
++            vblendvps(d, d, a, xmm15);
++        };
++        const auto compare = [&](u8 predicate) { // 1 where it holds
++            binary([&](auto d, auto a, auto b) {
++                vcmpps(d, a, b, predicate);
++                vpsrld(d, d, 31);
++            });
++        };
++        // integer comparisons: 'swap' compares b with a, 'invert' the opposite, 'is_unsigned' with
++        // the sign bits flipped
++        const auto icompare = [&](bool equal, bool swap, bool invert, bool is_unsigned) {
++            binary([&](auto d, auto a, auto b) {
++                Xbyak::Xmm x = a, y = b;
++                if (is_unsigned) {
++                    vpxor(xmm14, a, Const(SIGN));
++                    vpxor(xmm15, b, Const(SIGN));
++                    x = xmm14, y = xmm15;
++                }
++                if (equal) {
++                    vpcmpeqd(d, x, y);
++                } else if (swap) {
++                    vpcmpgtd(d, y, x);
++                } else {
++                    vpcmpgtd(d, x, y);
++                }
++                if (invert) {
++                    vpaddd(d, d, Const(ONE_INT)); // -1 to 0, 0 to 1
++                } else {
++                    vpsrld(d, d, 31);
++                }
++            });
++        };
++        switch (o.op) {
++        case O::GetAttribute: case O::GetAttributeU32: {
++            const Xbyak::Xmm d = Alloc();
++            vmovups(d, ptr[r8 + r10 + (o.extra & 0xFF) * LANES * 4]);
++            Def(o.dest, 0, d);
+             break;
+-        case O::BitCastU32F32: case O::BitCastF32U32:
+-            std::memcpy(d.w[0], a.w[0], lanes * 4);
+-            break;
+-        case O::BitCastU64F64: case O::BitCastF64U64: case O::PackUint2x32: case O::UnpackUint2x32:
+-        case O::PackDouble2x32: case O::UnpackDouble2x32:
+-            std::memcpy(d.w[0], a.w[0], lanes * 4);
+-            std::memcpy(d.w[1], a.w[1], lanes * 4);
++        }
++        case O::SetFragColor: {
++            const Xbyak::Xmm x = Load(o.a[2], 0);
++            vmovups(ptr[r9 + r10 + (((o.extra / 4) & 7) * 4 + o.extra % 4) * LANES * 4], x);
+             break;
+-        case O::PackHalf2x16:
+-            LANE_LOOP d.w[0][i] = u32(ToHalf(Fl(a, i, 0))) | (u32(ToHalf(Fl(a, i, 1))) << 16);
++        }
++        case O::CompositeConstructU32x2: case O::CompositeConstructF32x2:
++            copy(0, o.a[0], 0), copy(1, o.a[1], 0);
+             break;
+-        case O::UnpackHalf2x16:
+-            LANE_LOOP {
+-                SetFl(d, i, FromHalf(u16(a.w[0][i])), 0);
+-                SetFl(d, i, FromHalf(u16(a.w[0][i] >> 16)), 1);
+-            }
++        case O::CompositeConstructU32x3: case O::CompositeConstructF32x3:
++            copy(0, o.a[0], 0), copy(1, o.a[1], 0), copy(2, o.a[2], 0);
+             break;
+-        case O::FPAbs32: LANE_LOOP SetFl(d, i, std::fabs(Fl(a, i))); break;
+-        case O::FPAdd32: LANE_LOOP SetFl(d, i, Fl(a, i) + Fl(b, i)); break;
+-        case O::FPFma32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i) + Fl(e, i)); break; // unfused: the PS4 has no FMA
+-        case O::FPMax32: LANE_LOOP SetFl(d, i, std::fmax(Fl(a, i), Fl(b, i))); break;
+-        case O::FPMin32: LANE_LOOP SetFl(d, i, std::fmin(Fl(a, i), Fl(b, i))); break;
+-        case O::FPMul32: LANE_LOOP SetFl(d, i, Fl(a, i) * Fl(b, i)); break;
+-        case O::FPNeg32: LANE_LOOP SetFl(d, i, -Fl(a, i)); break;
+-        case O::FPRecip32: LANE_LOOP SetFl(d, i, 1.0f / Fl(a, i)); break;
+-        case O::FPRecipSqrt32: LANE_LOOP SetFl(d, i, 1.0f / std::sqrt(Fl(a, i))); break;
+-        case O::FPSqrt: LANE_LOOP SetFl(d, i, std::sqrt(Fl(a, i))); break;
+-        case O::FPSin: LANE_LOOP SetFl(d, i, std::sin(Fl(a, i))); break;
+-        case O::FPCos: LANE_LOOP SetFl(d, i, std::cos(Fl(a, i))); break;
+-        case O::FPExp2: LANE_LOOP SetFl(d, i, std::exp2(Fl(a, i))); break;
+-        case O::FPLog2: LANE_LOOP SetFl(d, i, std::log2(Fl(a, i))); break;
+-        case O::FPSaturate32: LANE_LOOP SetFl(d, i, std::isnan(Fl(a, i)) ? 0.0f : std::clamp(Fl(a, i), 0.0f, 1.0f)); break;
+-        case O::FPClamp32: LANE_LOOP SetFl(d, i, std::fmin(std::fmax(Fl(a, i), Fl(b, i)), Fl(e, i))); break;
+-        case O::FPRoundEven32: LANE_LOOP SetFl(d, i, std::nearbyint(Fl(a, i))); break;
+-        case O::FPFloor32: LANE_LOOP SetFl(d, i, std::floor(Fl(a, i))); break;
+-        case O::FPCeil32: LANE_LOOP SetFl(d, i, std::ceil(Fl(a, i))); break;
+-        case O::FPTrunc32: LANE_LOOP SetFl(d, i, std::trunc(Fl(a, i))); break;
+-        case O::FPOrdEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) == Fl(b, i); break;
+-        case O::FPUnordEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) != Fl(b, i)) || std::isnan(Fl(a, i)) || std::isnan(Fl(b, i)); break;
+-        case O::FPOrdNotEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) != Fl(b, i) && !std::isnan(Fl(a, i)) && !std::isnan(Fl(b, i)); break;
+-        case O::FPUnordNotEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) != Fl(b, i); break;
+-        case O::FPOrdLessThan32: LANE_LOOP d.w[0][i] = Fl(a, i) < Fl(b, i); break;
+-        case O::FPUnordLessThan32: LANE_LOOP d.w[0][i] = !(Fl(a, i) >= Fl(b, i)); break;
+-        case O::FPOrdGreaterThan32: LANE_LOOP d.w[0][i] = Fl(a, i) > Fl(b, i); break;
+-        case O::FPUnordGreaterThan32: LANE_LOOP d.w[0][i] = !(Fl(a, i) <= Fl(b, i)); break;
+-        case O::FPOrdLessThanEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) <= Fl(b, i); break;
+-        case O::FPUnordLessThanEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) > Fl(b, i)); break;
+-        case O::FPOrdGreaterThanEqual32: LANE_LOOP d.w[0][i] = Fl(a, i) >= Fl(b, i); break;
+-        case O::FPUnordGreaterThanEqual32: LANE_LOOP d.w[0][i] = !(Fl(a, i) < Fl(b, i)); break;
+-        case O::FPIsNan32: LANE_LOOP d.w[0][i] = std::isnan(Fl(a, i)); break;
+-        case O::IAdd32: LANE_LOOP d.w[0][i] = a.w[0][i] + b.w[0][i]; break;
+-        case O::ISub32: LANE_LOOP d.w[0][i] = a.w[0][i] - b.w[0][i]; break;
+-        case O::IMul32: LANE_LOOP d.w[0][i] = a.w[0][i] * b.w[0][i]; break;
+-        case O::SDiv32:
+-            LANE_LOOP d.w[0][i] = Sl(b, i) == 0 ? 0 : (Sl(a, i) == std::numeric_limits<s32>::min() && Sl(b, i) == -1) ? a.w[0][i] : u32(Sl(a, i) / Sl(b, i));
++        case O::CompositeConstructU32x4: case O::CompositeConstructF32x4:
++            copy(0, o.a[0], 0), copy(1, o.a[1], 0), copy(2, o.a[2], 0), copy(3, o.a[3], 0);
+             break;
+-        case O::UDiv32: LANE_LOOP d.w[0][i] = b.w[0][i] == 0 ? 0 : a.w[0][i] / b.w[0][i]; break;
+-        case O::INeg32: LANE_LOOP d.w[0][i] = 0u - a.w[0][i]; break;
+-        case O::IAbs32: LANE_LOOP d.w[0][i] = Sl(a, i) < 0 ? 0u - a.w[0][i] : a.w[0][i]; break;
+-        case O::IAdd64: LANE_LOOP SetU64l(d, i, U64l(a, i) + U64l(b, i)); break;
+-        case O::ISub64: LANE_LOOP SetU64l(d, i, U64l(a, i) - U64l(b, i)); break;
+-        case O::INeg64: LANE_LOOP SetU64l(d, i, 0 - U64l(a, i)); break;
+-        case O::ShiftLeftLogical32: LANE_LOOP d.w[0][i] = b.w[0][i] >= 32 ? 0 : a.w[0][i] << b.w[0][i]; break;
+-        case O::ShiftRightLogical32: LANE_LOOP d.w[0][i] = b.w[0][i] >= 32 ? 0 : a.w[0][i] >> b.w[0][i]; break;
+-        case O::ShiftRightArithmetic32: LANE_LOOP d.w[0][i] = u32(Sl(a, i) >> std::min<u32>(b.w[0][i], 31)); break;
+-        case O::ShiftLeftLogical64: LANE_LOOP SetU64l(d, i, b.w[0][i] >= 64 ? 0 : U64l(a, i) << b.w[0][i]); break;
+-        case O::ShiftRightLogical64: LANE_LOOP SetU64l(d, i, b.w[0][i] >= 64 ? 0 : U64l(a, i) >> b.w[0][i]); break;
+-        case O::ShiftRightArithmetic64: LANE_LOOP SetU64l(d, i, u64(s64(U64l(a, i)) >> std::min<u32>(b.w[0][i], 63))); break;
+-        case O::BitwiseAnd32: LANE_LOOP d.w[0][i] = a.w[0][i] & b.w[0][i]; break;
+-        case O::BitwiseOr32: LANE_LOOP d.w[0][i] = a.w[0][i] | b.w[0][i]; break;
+-        case O::BitwiseXor32: LANE_LOOP d.w[0][i] = a.w[0][i] ^ b.w[0][i]; break;
+-        case O::BitFieldInsert:
+-            LANE_LOOP {
+-                const u32 offset = e.w[0][i] & 31, count = std::min(f.w[0][i], 32 - offset);
+-                const u32 field = (count == 32 ? 0xFFFFFFFFu : (1u << count) - 1) << offset;
+-                d.w[0][i] = count == 0 ? a.w[0][i] : (a.w[0][i] & ~field) | ((b.w[0][i] << offset) & field);
+-            }
++        case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4:
++        case O::CompositeExtractF32x2: case O::CompositeExtractF32x3: case O::CompositeExtractF32x4:
++            copy(0, o.a[0], o.extra - 1);
+             break;
+-        case O::BitFieldSExtract: LANE_LOOP d.w[0][i] = BitFieldExtract(a.w[0][i], b.w[0][i], e.w[0][i], true); break;
+-        case O::BitFieldUExtract: LANE_LOOP d.w[0][i] = BitFieldExtract(a.w[0][i], b.w[0][i], e.w[0][i], false); break;
+-        case O::BitReverse32:
+-            LANE_LOOP {
+-                u32 v = a.w[0][i], r = 0;
+-                for (int bit = 0; bit < 32; ++bit, v >>= 1) {
+-                    r = (r << 1) | (v & 1);
+-                }
+-                d.w[0][i] = r;
+-            }
++        case O::BitCastU32F32: case O::BitCastF32U32:
++            copy(0, o.a[0], 0);
+             break;
+-        case O::BitCount32: LANE_LOOP d.w[0][i] = std::popcount(a.w[0][i]); break;
+-        case O::BitwiseNot32: LANE_LOOP d.w[0][i] = ~a.w[0][i]; break;
+-        case O::FindUMsb32: LANE_LOOP d.w[0][i] = a.w[0][i] == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(a.w[0][i]); break;
+-        case O::FindSMsb32:
+-            LANE_LOOP {
+-                const u32 v = Sl(a, i) < 0 ? ~a.w[0][i] : a.w[0][i];
+-                d.w[0][i] = v == 0 ? 0xFFFFFFFFu : 31u - std::countl_zero(v);
+-            }
++        case O::BitCastU64F64: case O::BitCastF64U64: case O::PackUint2x32: case O::UnpackUint2x32:
++        case O::PackDouble2x32: case O::UnpackDouble2x32:
++            copy(0, o.a[0], 0), copy(1, o.a[0], 1);
+             break;
+-        case O::SMin32: LANE_LOOP d.w[0][i] = u32(std::min(Sl(a, i), Sl(b, i))); break;
+-        case O::UMin32: LANE_LOOP d.w[0][i] = std::min(a.w[0][i], b.w[0][i]); break;
+-        case O::SMax32: LANE_LOOP d.w[0][i] = u32(std::max(Sl(a, i), Sl(b, i))); break;
+-        case O::UMax32: LANE_LOOP d.w[0][i] = std::max(a.w[0][i], b.w[0][i]); break;
+-        case O::SClamp32: LANE_LOOP d.w[0][i] = u32(std::min(std::max(Sl(a, i), Sl(b, i)), Sl(e, i))); break;
+-        case O::UClamp32: LANE_LOOP d.w[0][i] = std::min(std::max(a.w[0][i], b.w[0][i]), e.w[0][i]); break;
+-        case O::SLessThan: LANE_LOOP d.w[0][i] = Sl(a, i) < Sl(b, i); break;
+-        case O::ULessThan: LANE_LOOP d.w[0][i] = a.w[0][i] < b.w[0][i]; break;
+-        case O::IEqual: LANE_LOOP d.w[0][i] = a.w[0][i] == b.w[0][i]; break;
+-        case O::SLessThanEqual: LANE_LOOP d.w[0][i] = Sl(a, i) <= Sl(b, i); break;
+-        case O::ULessThanEqual: LANE_LOOP d.w[0][i] = a.w[0][i] <= b.w[0][i]; break;
+-        case O::SGreaterThan: LANE_LOOP d.w[0][i] = Sl(a, i) > Sl(b, i); break;
+-        case O::UGreaterThan: LANE_LOOP d.w[0][i] = a.w[0][i] > b.w[0][i]; break;
+-        case O::INotEqual: LANE_LOOP d.w[0][i] = a.w[0][i] != b.w[0][i]; break;
+-        case O::SGreaterThanEqual: LANE_LOOP d.w[0][i] = Sl(a, i) >= Sl(b, i); break;
+-        case O::UGreaterThanEqual: LANE_LOOP d.w[0][i] = a.w[0][i] >= b.w[0][i]; break;
+-        case O::LogicalOr: LANE_LOOP d.w[0][i] = (a.w[0][i] | b.w[0][i]) != 0; break;
+-        case O::LogicalAnd: LANE_LOOP d.w[0][i] = (a.w[0][i] != 0) && (b.w[0][i] != 0); break;
+-        case O::LogicalXor: LANE_LOOP d.w[0][i] = (a.w[0][i] != 0) != (b.w[0][i] != 0); break;
+-        case O::LogicalNot: LANE_LOOP d.w[0][i] = a.w[0][i] == 0; break;
+-        case O::ConvertS32F32: LANE_LOOP d.w[0][i] = u32(ToS32(Fl(a, i))); break;
+-        case O::ConvertU32F32: LANE_LOOP d.w[0][i] = ToU32(Fl(a, i)); break;
+-        case O::ConvertS16F32: LANE_LOOP d.w[0][i] = u32(std::clamp(ToS32(Fl(a, i)), -32768, 32767)); break;
+-        case O::ConvertU16F32: LANE_LOOP d.w[0][i] = std::min(ToU32(Fl(a, i)), 65535u); break;
+-        case O::ConvertF32S32: LANE_LOOP SetFl(d, i, float(Sl(a, i))); break;
+-        case O::ConvertF32U32: LANE_LOOP SetFl(d, i, float(a.w[0][i])); break;
+-        case O::ConvertF32S8: LANE_LOOP SetFl(d, i, float(s8(a.w[0][i]))); break;
+-        case O::ConvertF32S16: LANE_LOOP SetFl(d, i, float(s16(a.w[0][i]))); break;
+-        case O::ConvertF32U8: LANE_LOOP SetFl(d, i, float(u8(a.w[0][i]))); break;
+-        case O::ConvertF32U16: LANE_LOOP SetFl(d, i, float(u16(a.w[0][i]))); break;
+-        case O::ConvertU64U32: LANE_LOOP SetU64l(d, i, a.w[0][i]); break;
+-        case O::ConvertU32U64: LANE_LOOP d.w[0][i] = a.w[0][i]; break;
+-        case O::ConvertU16U32: case O::ConvertU32U16: LANE_LOOP d.w[0][i] = a.w[0][i] & 0xFFFF; break;
+-        case O::ConvertU8U32: case O::ConvertU32U8: LANE_LOOP d.w[0][i] = a.w[0][i] & 0xFF; break;
+-        case O::ConvertS32S8: LANE_LOOP d.w[0][i] = u32(s32(s8(a.w[0][i]))); break;
+-        case O::ConvertS32S16: LANE_LOOP d.w[0][i] = u32(s32(s16(a.w[0][i]))); break;
+-        case O::DPdxFine: case O::DPdyFine: case O::DPdxCoarse: case O::DPdyCoarse:
+-            // between a quad's lanes (fine: in the lane's row or column; coarse: the top-left's)
+-            LANE_LOOP {
+-                if (!io.quads) {
+-                    d.w[0][i] = 0;
+-                    continue;
+-                }
+-                const u32 from = o.op == O::DPdxFine ? i & ~1u : o.op == O::DPdyFine ? i & ~8u : QuadTopLeft(i);
+-                const u32 to = o.op == O::DPdxFine || o.op == O::DPdxCoarse ? from | 1 : from | 8;
+-                SetFl(d, i, Fl(a, to) - Fl(a, from));
++        case O::SelectU1: case O::SelectU8: case O::SelectU16: case O::SelectU32: case O::SelectF32:
++        case O::SelectU64: { // the condition (0 or 1), then b where it's 1, e where it's 0
++            const u32 words = o.op == O::SelectU64 ? 2 : 1;
++            const Xbyak::Xmm cond = Load(o.a[0], 0);
++            vpcmpeqd(xmm13, cond, Const(ZERO));
++            for (u32 k = 0; k < words; ++k) {
++                const Xbyak::Xmm b = Load(o.a[1], k);
++                const Xbyak::Xmm e = Load(o.a[2], k, {b.getIdx()});
++                const Xbyak::Xmm d = Alloc({b.getIdx(), e.getIdx()});
++                vblendvps(d, b, e, xmm13);
++                Def(o.dest, k, d);
+             }
+             break;
+-        case O::ImageSampleImplicitLod: case O::ImageSampleExplicitLod: case O::ImageGradient:
+-        case O::ImageSampleDrefImplicitLod: case O::ImageSampleDrefExplicitLod:
+-        case O::ImageGather: case O::ImageGatherDref: case O::ImageFetch:
+-        case O::ImageQueryDimensions: case O::ImageQueryLod:
+-            RunTexture(program, o, c, io, exec);
+-            break;
+-        case O::ImageRead: case O::ImageWrite:
+-        case O::ImageAtomicIAdd32: case O::ImageAtomicSMin32: case O::ImageAtomicUMin32:
+-        case O::ImageAtomicSMax32: case O::ImageAtomicUMax32: case O::ImageAtomicInc32:
+-        case O::ImageAtomicDec32: case O::ImageAtomicAnd32: case O::ImageAtomicOr32:
+-        case O::ImageAtomicXor32: case O::ImageAtomicExchange32:
+-            RunImage(program, o, c, io, exec);
++        }
++        case O::FPAbs32: unary([&](auto d, auto a) { vandps(d, a, Const(ABS)); }); break;
++        case O::FPNeg32: unary([&](auto d, auto a) { vxorps(d, a, Const(SIGN)); }); break;
++        case O::FPAdd32: binary([&](auto d, auto a, auto b) { vaddps(d, a, b); }); break;
++        case O::FPMul32: binary([&](auto d, auto a, auto b) { vmulps(d, a, b); }); break;
++        case O::FPFma32: // unfused, as the interpreter's (the PS4 has no FMA)
++            ternary([&](auto d, auto a, auto b, auto e) {
++                vmulps(d, a, b);
++                vaddps(d, d, e);
++            });
+             break;
+-        case O::GetSparseFromOp:
+-            LANE_LOOP d.w[0][i] = 1; // every texel is resident
++        case O::FPMax32: binary([&](auto d, auto a, auto b) { fmax(d, a, b); }); break;
++        case O::FPMin32: binary([&](auto d, auto a, auto b) { fmin(d, a, b); }); break;
++        case O::FPClamp32:
++            ternary([&](auto d, auto a, auto b, auto e) {
++                fmax(xmm13, a, b);
++                fmin(d, xmm13, e);
++            });
+             break;
+-        case O::GetInBoundsFromOp:
+-            LANE_LOOP d.w[0][i] = a.w[1][i]; // kept by the shuffle
++        case O::FPRecip32:
++            unary([&](auto d, auto a) {
++                vmovaps(d, Const(ONE));
++                vdivps(d, d, a);
++            });
+             break;
+-        case O::LaneId:
+-            LANE_LOOP d.w[0][i] = io.quads ? INVOCATION_ID[i] : 0;
++        case O::FPRecipSqrt32:
++            unary([&](auto d, auto a) {
++                vsqrtps(xmm13, a);
++                vmovaps(d, Const(ONE));
++                vdivps(d, d, xmm13);
++            });
+             break;
+-        case O::IsTextureScaled:
+-        case O::IsImageScaled:
+-        case O::InvocationInfo:
+-            LANE_LOOP d.w[0][i] = 0;
++        case O::FPSqrt: unary([&](auto d, auto a) { vsqrtps(d, a); }); break;
++        case O::FPSaturate32: // (NaN to 0: maxps gives its second operand for a NaN)
++            unary([&](auto d, auto a) {
++                vmaxps(d, a, Const(ZERO));
++                vminps(d, d, Const(ONE));
++            });
+             break;
+-        // A fragment shader's lanes are a subgroup (their ids: INVOCATION_ID), the running ones
+-        // active; elsewhere each lane is a subgroup of its own
+-        case O::VoteAll: case O::VoteAny: case O::VoteEqual: case O::SubgroupBallot: {
+-            u32 ballot = 0, active = 0;
+-            EXEC_LOOP(exec) {
+-                const u32 bit = 1u << (io.quads ? INVOCATION_ID[i] : 0);
+-                active |= bit;
+-                ballot |= a.w[0][i] != 0 ? bit : 0;
+-            }
+-            const u32 result = o.op == O::VoteAll   ? ballot == active
+-                               : o.op == O::VoteAny ? ballot != 0
+-                               : o.op == O::VoteEqual ? ballot == 0 || ballot == active
+-                                                      : ballot;
+-            LANE_LOOP d.w[0][i] = result;
++        case O::FPRoundEven32: unary([&](auto d, auto a) { vroundps(d, a, 0); }); break;
++        case O::FPFloor32: unary([&](auto d, auto a) { vroundps(d, a, 1); }); break;
++        case O::FPCeil32: unary([&](auto d, auto a) { vroundps(d, a, 2); }); break;
++        case O::FPTrunc32: unary([&](auto d, auto a) { vroundps(d, a, 3); }); break;
++        case O::FPOrdEqual32: compare(0x00); break;          // EQ_OQ
++        case O::FPUnordEqual32: compare(0x08); break;        // EQ_UQ
++        case O::FPOrdNotEqual32: compare(0x0C); break;       // NEQ_OQ
++        case O::FPUnordNotEqual32: compare(0x04); break;     // NEQ_UQ
++        case O::FPOrdLessThan32: compare(0x11); break;       // LT_OQ
++        case O::FPUnordLessThan32: compare(0x19); break;     // NGE_UQ
++        case O::FPOrdGreaterThan32: compare(0x1E); break;    // GT_OQ
++        case O::FPUnordGreaterThan32: compare(0x16); break;  // NLE_UQ
++        case O::FPOrdLessThanEqual32: compare(0x12); break;  // LE_OQ
++        case O::FPUnordLessThanEqual32: compare(0x1A); break; // NGT_UQ
++        case O::FPOrdGreaterThanEqual32: compare(0x1D); break; // GE_OQ
++        case O::FPUnordGreaterThanEqual32: compare(0x15); break; // NLT_UQ
++        case O::FPIsNan32:
++            unary([&](auto d, auto a) {
++                vcmpunordps(d, a, a);
++                vpsrld(d, d, 31);
++            });
+             break;
+-        }
+-        case O::SubgroupEqMask: case O::SubgroupLtMask: case O::SubgroupLeMask:
+-        case O::SubgroupGtMask: case O::SubgroupGeMask:
+-            LANE_LOOP {
+-                const u32 id = io.quads ? INVOCATION_ID[i] : 0, size = io.quads ? 0xFFFFu : 1u;
+-                const u32 lt = (1u << id) - 1, le = (2u << id) - 1;
+-                d.w[0][i] = o.op == O::SubgroupEqMask   ? 1u << id
+-                            : o.op == O::SubgroupLtMask ? lt
+-                            : o.op == O::SubgroupLeMask ? le
+-                            : o.op == O::SubgroupGtMask ? ~le & size
+-                                                        : ~lt & size;
+-            }
++        case O::IAdd32: binary([&](auto d, auto a, auto b) { vpaddd(d, a, b); }); break;
++        case O::ISub32: binary([&](auto d, auto a, auto b) { vpsubd(d, a, b); }); break;
++        case O::IMul32: binary([&](auto d, auto a, auto b) { vpmulld(d, a, b); }); break;
++        case O::INeg32:
++            unary([&](auto d, auto a) {
++                vpxor(d, d, d);
++                vpsubd(d, d, a);
++            });
+             break;
+-        case O::ShuffleIndex: case O::ShuffleUp: case O::ShuffleDown: case O::ShuffleButterfly:
+-            // the source lane's value when it's in bounds (value, index, clamp, segment mask), as
+-            // Eden's backends work it out; the in-bounds flag kept in the result's second word
+-            LANE_LOOP {
+-                const u32 id = io.quads ? INVOCATION_ID[i] : 0, index = b.w[0][i];
+-                const u32 min_id = id & f.w[0][i], max_id = min_id | (e.w[0][i] & ~f.w[0][i]);
+-                u32 source;
+-                bool in_bounds;
+-                if (o.op == O::ShuffleIndex) {
+-                    source = (index & ~f.w[0][i]) | min_id, in_bounds = s32(source) <= s32(max_id);
+-                } else if (o.op == O::ShuffleUp) {
+-                    source = id - index, in_bounds = s32(source) >= s32(max_id);
+-                } else if (o.op == O::ShuffleDown) {
+-                    source = id + index, in_bounds = s32(source) <= s32(max_id);
++        case O::BitwiseAnd32: case O::LogicalAnd: binary([&](auto d, auto a, auto b) { vpand(d, a, b); }); break;
++        case O::BitwiseOr32: case O::LogicalOr: binary([&](auto d, auto a, auto b) { vpor(d, a, b); }); break;
++        case O::BitwiseXor32: case O::LogicalXor: binary([&](auto d, auto a, auto b) { vpxor(d, a, b); }); break;
++        case O::BitwiseNot32: unary([&](auto d, auto a) { vpxor(d, a, Const(ALL_ONES)); }); break;
++        case O::LogicalNot: unary([&](auto d, auto a) { vpxor(d, a, Const(ONE_INT)); }); break;
++        case O::IEqual: icompare(true, false, false, false); break;
++        case O::INotEqual: icompare(true, false, true, false); break;
++        case O::SLessThan: icompare(false, true, false, false); break;
++        case O::SGreaterThan: icompare(false, false, false, false); break;
++        case O::SLessThanEqual: icompare(false, false, true, false); break;
++        case O::SGreaterThanEqual: icompare(false, true, true, false); break;
++        case O::ULessThan: icompare(false, true, false, true); break;
++        case O::UGreaterThan: icompare(false, false, false, true); break;
++        case O::ULessThanEqual: icompare(false, false, true, true); break;
++        case O::UGreaterThanEqual: icompare(false, true, true, true); break;
++        case O::ShiftLeftLogical32: case O::ShiftRightLogical32: case O::ShiftRightArithmetic32: {
++            const u32 count = program.cells[o.a[1]].w[0];
++            unary([&](auto d, auto a) {
++                if (o.op == O::ShiftRightArithmetic32) {
++                    vpsrad(d, a, u8(std::min(count, 31u)));
++                } else if (count >= 32) {
++                    vpxor(d, d, d);
++                } else if (o.op == O::ShiftLeftLogical32) {
++                    vpslld(d, a, u8(count));
+                 } else {
+-                    source = id ^ index, in_bounds = s32(source) <= s32(max_id);
++                    vpsrld(d, a, u8(count));
+                 }
+-                const bool exists = io.quads ? source < LANES : source == 0;
+-                d.w[0][i] = in_bounds && exists ? a.w[0][io.quads ? INVOCATION_LANE[source] : i] : a.w[0][i];
+-                d.w[1][i] = in_bounds ? 1 : 0;
+-            }
++            });
+             break;
+-        case O::QuadBroadcast: case O::QuadSwap: // value, the quad's lane; value, direction
+-            LANE_LOOP {
+-                if (!io.quads) {
+-                    d.w[0][i] = a.w[0][i];
+-                    continue;
+-                }
+-                const u32 id = INVOCATION_ID[i];
+-                const u32 source = o.op == O::QuadBroadcast ? (id & ~3u) | (b.w[0][i] & 3) : id ^ ((b.w[0][i] + 1) & 3);
+-                d.w[0][i] = a.w[0][INVOCATION_LANE[source]];
+-            }
++        }
++        case O::ConvertF32S32: unary([&](auto d, auto a) { vcvtdq2ps(d, a); }); break;
++        case O::ConvertF32U32: // the high and low halves converted (exactly), then added (rounded once)
++            unary([&](auto d, auto a) {
++                vpsrld(xmm13, a, 16);
++                vcvtdq2ps(xmm13, xmm13);
++                vmulps(xmm13, xmm13, Const(F65536));
++                vpand(d, a, Const(LOW16));
++                vcvtdq2ps(d, d);
++                vaddps(d, d, xmm13);
++            });
+             break;
+-        case O::FSwizzleAdd: { // each lane's mode by its place in its quad
+-            static constexpr f32 modifier_a[4] = {1.0f, -1.0f, 1.0f, 0.0f};
+-            static constexpr f32 modifier_b[4] = {1.0f, 1.0f, -1.0f, 1.0f};
+-            LANE_LOOP {
+-                const u32 id = io.quads ? INVOCATION_ID[i] : 0;
+-                const u32 mode = (e.w[0][i] >> ((id & 3) * 2)) & 3;
+-                SetFl(d, i, Fl(a, i) * modifier_a[mode] + Fl(b, i) * modifier_b[mode]);
++        case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
++            for (u32 k = 0; k < 4; ++k) {
++                const Xbyak::Xmm d = Alloc();
++                vpxor(d, d, d);
++                Def(o.dest, k, d);
+             }
+             break;
++        default:
++            break;
+         }
+-        case O::IAbs64: LANE_LOOP SetU64l(d, i, s64(U64l(a, i)) < 0 ? 0 - U64l(a, i) : U64l(a, i)); break;
+-        case O::LoadStorageU8: case O::LoadStorageS8: case O::LoadStorageU16: case O::LoadStorageS16:
+-        case O::LoadStorage32: case O::LoadStorage64: case O::LoadStorage128: {
+-            const u32 bytes = AccessBytes(o.op);
+-            const bool sign = o.op == O::LoadStorageS8 || o.op == O::LoadStorageS16;
+-            IO_LOOP {
+-                GPUVAddr address;
+-                if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
+-                    ReadMemory(io, address, bytes, sign, d, i);
+-                } else {
+-                    d.w[0][i] = d.w[1][i] = d.w[2][i] = d.w[3][i] = 0;
++    }
++
++    const SoftwareDraw::Program& program;
++    const std::vector<bool>& written;
++    Cache cache;
++};
++
++bool ShaderJit::Compile(SoftwareDraw::Program& program) {
++    if (full) {
++        return false;
++    }
++    const std::vector<Op>& ops = program.ops;
++    // the cells no instruction writes: constants
++    std::vector<bool> written(program.cells.size());
++    for (const Op& o : ops) {
++        if (o.kind == Kind::Ir || o.kind == Kind::Move) {
++            written[o.dest] = true;
++        }
++    }
++    // the runs worth compiling: two or more instructions done natively
++    std::vector<std::pair<u32, u32>> runs;
++    for (u32 pc = 0; pc < ops.size();) {
++        if (UseOf(ops[pc], written) == JitUse::End) {
++            ++pc;
++            continue;
++        }
++        u32 end = pc, native = 0;
++        for (; end < ops.size() && UseOf(ops[end], written) != JitUse::End; ++end) {
++            native += UseOf(ops[end], written) != JitUse::Call ? 1 : 0;
++        }
++        if (native >= 2) {
++            runs.emplace_back(pc, end);
++        }
++        pc = end;
++    }
++    if (runs.empty()) {
++        return false;
++    }
++    // the ops with a Kind::Native op before each run; jumps to a run's start go to it
++    std::vector<Op> out;
++    std::vector<u32> moved(ops.size() + 1);
++    std::vector<u32> natives; // where each Native op is
++    size_t next_run = 0;
++    for (u32 pc = 0; pc < ops.size(); ++pc) {
++        if (next_run < runs.size() && runs[next_run].first == pc) {
++            natives.push_back(u32(out.size()));
++            moved[pc] = u32(out.size());
++            out.push_back(Op{Kind::Native, {}, u16(next_run), {}, 0});
++            ++next_run;
++        } else {
++            moved[pc] = u32(out.size());
++        }
++        out.push_back(ops[pc]);
++    }
++    moved[ops.size()] = u32(out.size());
++    for (Op& o : out) {
++        if (o.kind == Kind::Jump || o.kind == Kind::JumpIfTrue || o.kind == Kind::JumpIfFalse) {
++            o.extra = moved[o.extra];
++        }
++    }
++    for (size_t r = 0; r < runs.size(); ++r) {
++        out[natives[r]].extra = moved[runs[r].second];
++    }
++    // each run's code, calling out with the new ops' addresses
++    std::vector<void*> functions;
++    for (size_t r = 0; r < runs.size(); ++r) {
++        const u32 first = natives[r] + 1, last = natives[r] + 1 + (runs[r].second - runs[r].first);
++        u8* const at = memory + used;
++        try {
++            RunEmitter emitter(at, MEMORY_SIZE - used, program, written);
++            emitter.Emit(out.data(), first, last);
++            used += (emitter.getSize() + 63) & ~size_t{63};
++        } catch (const std::exception&) { // (Xbyak's: out of room)
++            full = true;
++            LogOnce("native code memory full: software shaders interpreted from here on");
++            return false;
++        }
++        functions.push_back(at);
++    }
++    program.ops = std::move(out);
++    program.native = std::move(functions);
++    return true;
++}
++#endif
++
++template <bool Wide>
++void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
++    using O = IR::Opcode;
++    const Op* const ops = program.ops.data();
++    constexpr u32 lanes = Wide ? LANES : 1;
++    // (plain values, never referred to: the compiler would reload what's referred to after every
++    // write to the lanes)
++    u32 pc = 0;
++    u32 exec = Wide ? io.run : 1; // the lanes running the instruction at pc
++    u32 waiting = 0;              // the lanes waiting, each at its own instruction (all after pc)
++    u32 next_join = ~0u;          // the earliest of those
++    Branches branches;
++    Lanes saved;
++    if (io.resume && io.resume->suspended) { // on from a barrier
++        const RunState& state = *io.resume;
++        pc = state.pc, exec = state.exec, waiting = state.waiting, next_join = state.next_join;
++        branches.lane_pc = state.lane_pc;
++        io.resume->suspended = false;
++    }
++#define SET_STATE(state)                                                                          \
++    do {                                                                                          \
++        const Branches::State s_ = (state);                                                       \
++        pc = s_.pc, exec = s_.exec, waiting = s_.waiting, next_join = s_.next_join;                \
++    } while (false)
++#define JOIN() SET_STATE(branches.Join({pc, exec, waiting, next_join}))
++#define PICK() SET_STATE(branches.Pick(waiting))
++    for (;;) {
++        const Op& o = ops[pc];
++        switch (o.kind) {
++        case Kind::Move: // (the words the value takes: 'extra')
++            if (waiting) {
++                EXEC_LOOP(exec) {
++                    for (u32 k = 0; k < o.extra; ++k) {
++                        c[o.dest].w[k][i] = c[o.a[0]].w[k][i];
++                    }
++                }
++            } else {
++                for (u32 k = 0; k < o.extra; ++k) {
++                    std::memcpy(c[o.dest].w[k], c[o.a[0]].w[k], lanes * sizeof(u32));
+                 }
+             }
+-            break;
+-        }
+-        case O::WriteStorageU8: case O::WriteStorageS8: case O::WriteStorageU16: case O::WriteStorageS16:
+-        case O::WriteStorage32: case O::WriteStorage64: case O::WriteStorage128: {
+-            const u32 bytes = AccessBytes(o.op);
+-            EXEC_LOOP(exec & io.live) {
+-                GPUVAddr address;
+-                if (StorageAddress(io, a.w[0][i], b.w[0][i], bytes, address)) {
+-                    WriteMemory(io, address, bytes, e, i);
++            if (++pc == next_join) {
++                JOIN();
++            }
++            continue;
++        case Kind::Jump:
++            if (waiting) {
++                branches.Park(exec, o.extra);
++                waiting |= exec;
++                PICK();
++            } else {
++                pc = o.extra;
++            }
++            continue;
++        case Kind::JumpIfTrue:
++        case Kind::JumpIfFalse: {
++            const u32 want = o.kind == Kind::JumpIfTrue ? 1 : 0;
++            u32 taken = 0;
++            EXEC_LOOP(exec) {
++                if (u32(c[o.a[0]].w[0][i] != 0) == want) {
++                    taken |= 1u << i;
+                 }
+             }
+-            break;
++            if (!waiting && (taken == exec || taken == 0)) {
++                pc = taken != 0 ? o.extra : pc + 1;
++            } else {
++                branches.Park(taken, o.extra);
++                branches.Park(exec & ~taken, pc + 1);
++                waiting |= exec;
++                PICK();
++            }
++            continue;
+         }
+-        case O::LoadGlobalU8: case O::LoadGlobalS8: case O::LoadGlobalU16: case O::LoadGlobalS16:
+-        case O::LoadGlobal32: case O::LoadGlobal64: case O::LoadGlobal128: {
+-            const u32 bytes = AccessBytes(o.op);
+-            const bool sign = o.op == O::LoadGlobalS8 || o.op == O::LoadGlobalS16;
+-            EXEC_LOOP(exec) ReadMemory(io, U64l(a, i), bytes, sign, d, i);
++        case Kind::Return:
++            if (!waiting) {
++                return;
++            }
++            PICK();
++            continue;
++        case Kind::Barrier: // stopped here until the workgroup's other invocations get here
++            if (++pc == next_join) {
++                JOIN();
++            }
++            if (io.resume) {
++                *io.resume = {true, pc, exec, waiting, next_join, branches.lane_pc};
++                return;
++            }
++            continue;
++        case Kind::Native: // a run compiled to native code: run there when no lanes wait
++#ifdef SOFTWARE_JIT
++            if (Wide && !waiting && n == LANES && io.stride == LANES && io.lane == 0) {
++                reinterpret_cast<NativeFn>(program.native[o.dest])(c, &io, exec);
++                pc = o.extra;
++                continue;
++            }
++#endif
++            if (++pc == next_join) {
++                JOIN();
++            }
++            continue;
++        case Kind::Ir:
+             break;
+         }
+-        case O::WriteGlobalU8: case O::WriteGlobalS8: case O::WriteGlobalU16: case O::WriteGlobalS16:
+-        case O::WriteGlobal32: case O::WriteGlobal64: case O::WriteGlobal128: {
+-            const u32 bytes = AccessBytes(o.op);
+-            EXEC_LOOP(exec & io.live) WriteMemory(io, U64l(a, i), bytes, b, i);
+-            break;
++        Lanes& d = c[o.dest];
++        if (waiting) {
++            saved = d;
+         }
+-        default:
+-            break;
++        if (o.op == O::DemoteToHelperInvocation) { // the lanes that ran it are done
++            EXEC_LOOP(exec) io.discard[io.lane + i] = true;
++            if (!waiting) {
++                return;
++            }
++            PICK();
++            continue;
+         }
++        RunIr<Wide>(program, o, c, io, n, exec, waiting);
+         if (waiting) { // the waiting lanes' values kept
+             LANE_LOOP {
+                 if (((exec >> i) & 1) == 0) {
+@@ -3561,10 +4205,10 @@ void RunLanes(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+ #undef PICK
+ #undef JOIN
+ #undef SET_STATE
++}
+ #undef EXEC_LOOP
+ #undef IO_LOOP
+ #undef LANE_LOOP
+-}
+ 
+ void Run(const SoftwareDraw::Program& program, Lanes* c, Io& io, u32 n) {
+     if (n == 1) {
+@@ -4041,6 +4685,13 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+         const bool compute = ir.stage == Shader::Stage::Compute;
+         program->shared_bytes = ir.shared_memory_size;
+         program->ok = Flattener{*program, compute}.Run(ir);
++#ifdef SOFTWARE_JIT
++        if (program->ok && (ir.stage == Shader::Stage::Fragment || compute)) { // (the stages run 16 lanes wide)
++            if (ShaderJit* const jit = ShaderJit::Get()) {
++                jit->Compile(*program);
++            }
++        }
++#endif
+         program->has_barrier = std::ranges::any_of(program->ops, [](const Op& op) { return op.kind == Kind::Barrier; });
+         program->writes_memory = std::ranges::any_of(program->ops, [](const Op& op) {
+             return op.kind == Kind::Ir &&
+@@ -4060,7 +4711,8 @@ std::unique_ptr<SoftwareDraw::Program> SoftwareDraw::Translate(VideoCommon::Gene
+             return op.kind == Kind::Ir && op.op == IR::Opcode::DemoteToHelperInvocation;
+         });
+         if (std::getenv("EDEN_SW_DUMP")) { // what a program came to, for working on the interpreter
+-            static constexpr const char* kinds[] = {"ir", "move", "jump", "jump if", "jump unless", "return", "barrier"};
++            static constexpr const char* kinds[] = {"ir", "move", "jump", "jump if", "jump unless", "return", "barrier",
++                                                    "native"};
+             std::string text = fmt::format("program ({} ops, {} cells):", program->ops.size(), program->cells.size());
+             for (const Op& op : program->ops) {
+                 text += fmt::format("\n  {}{}{} -> {} ({} {} {} {}) {}", kinds[static_cast<u32>(op.kind)],
