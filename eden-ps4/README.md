@@ -340,9 +340,18 @@ Commercial games: the start page lists every `.nsp`, `.xci`, `.nso` and `.nro` i
 `title.keys`) and its firmware (the NCA files) in
 `/data/eden-ps4/user/nand/system/Contents/registered/`, dumped from your own Switch.
 
-Status: Mesa 26.0.8 and libdrm are cloned into `~/cemups4-build/src` with Crema's five patches
-applied; building them (and the PS4 package with patch 0043) needs permission in this build
-environment for building code from outside the repository.
+If Vulkan doesn't start (RADV can't open the GPU), the launcher keeps that boot's log as
+`log-vulkan.txt` and boots the program again with the software renderer, which it then keeps
+using until it is restarted. RADV's own log is in `/data/eden-ps4/gpu/radv-ps4.log` (with
+`gpu-hang.txt` and `gpu-fault.txt` there when the GPU hangs or faults).
+
+Status (03.00): Mesa 26.0.8 builds with Crema's patches, and the package links it (59 MB). In
+shadPS4 the launcher gets as far as creating the Vulkan instance and then falls back: shadPS4 has
+no `libSceGnmDriver.sprx` for the winsys to load (and it emulates the GPU from PSSL shaders, not
+the raw GCN code RADV writes), so RADV can only be tried on a console. To report how it went
+there, send `log-vulkan.txt` (or `log.txt`), `gpu/radv-ps4.log` and `crash.log` from
+`/data/eden-ps4`. Patch 0044 fixes a crash in Eden when a boot fails (the new process was
+destroyed after the kernel), which the fallback needs.
 
 ## What's next: the GPU
 
@@ -521,6 +530,7 @@ The patches are in `patches/`, made with `git format-patch` against Eden commit 
 | null renderer: multisampled texel fetches, varyings after the depth test, a native code self-test | above |
 | null renderer: software vertex shaders 16 vertices at a time, each distinct vertex once | above |
 | vulkan: the PS4's GPU through Mesa's RADV, after Eden4 | stage 5, above |
+| core: free the application's process before the kernel when loading fails | an upstream use-after-free on a failed boot: harmless with glibc, a crash on the PS4 (stage 5, above) |
 
 The PS4 memory changes, from what stage 1 measured:
 

@@ -137,6 +137,14 @@ public:
     // display takes it: Eden's Vulkan renderer. Open takes it back.
     void Release()
     {
+        // (once the last flip is on screen: none left pending on buffers about to go)
+        for (int tries = 0; handle >= 0 && flips > 0 && tries < 50; tries++)
+        {
+            OrbisVideoOutFlipStatus flip_status = {};
+            if (sceVideoOutGetFlipStatus(handle, &flip_status) < 0 || flip_status.flipArg >= int64_t(flips))
+                break;
+            usleep(2000);
+        }
         if (handle >= 0)
             sceVideoOutClose(handle);
         handle = -1;
@@ -846,7 +854,9 @@ void* Run(void*)
     // EDEN_PS4_RENDERER=null (the software renderer)
     const char* renderer = std::getenv("EDEN_PS4_RENDERER");
     const bool radv = vk_icdGetInstanceProcAddr(nullptr, "vkCreateInstance") != nullptr;
-    const bool gpu = radv && !(renderer && std::string_view{renderer} == "null");
+    bool gpu = radv && !(renderer && std::string_view{renderer} == "null");
+    // RADV's own log and its GPU hang and fault reports (port/mesa/ac_ps4_drm.c), here
+    setenv("RADV_PS4_DIR", (std::string(kDataDir) + "/gpu").c_str(), 0);
     Trace(fmt::format("renderer: {}", gpu    ? "Vulkan on the PS4's GPU (Mesa's RADV)"
                                       : radv ? "null (EDEN_PS4_RENDERER=null)"
                                              : "null (no RADV in this build)"));
@@ -868,16 +878,29 @@ void* Run(void*)
             std::lock_guard lock{g_mutex};
             g_screen.Release();
         }
-        const auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
-        g_running = false;
-        pthread_join(pad_thread, nullptr);
-        g_drawing = false;
+        auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
         if (gpu)
         {
             std::lock_guard lock{g_mutex};
             Trace(g_screen.Open() ? "screen open again" : "no screen (video out failed)");
             g_screen.Draw();
         }
+        if (gpu && result.status == Launcher::BootResult::Status::LoadFailed &&
+            result.detail == "the video core did not start")
+        {
+            // Vulkan didn't start (RADV couldn't open the GPU: this boot's log, kept as
+            // log-vulkan.txt, and gpu/radv-ps4.log say why): the software renderer, from now on
+            gpu = false;
+            Launcher::SetGpuDisplay(false);
+            rename(kLogFile, "/data/eden-ps4/log-vulkan.txt");
+            Trace("renderer: Vulkan did not start; the null renderer from now on");
+            ShowLine(Launcher::LineKind::Status,
+                     "Vulkan did not start (see log-vulkan.txt): booting again with the software renderer");
+            result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
+        }
+        g_running = false;
+        pthread_join(pad_thread, nullptr);
+        g_drawing = false;
         Trace(fmt::format("boot returned: status {}", int(result.status)));
         if (FILE* f = std::fopen(kLogFile, "a"))
         {

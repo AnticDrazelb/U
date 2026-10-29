@@ -33,6 +33,24 @@
 #include <unistd.h>
 #include <emmintrin.h>
 
+/* Where the winsys writes its log and its GPU hang and fault reports: /data/Crema/gpu, or the
+ * folder RADV_PS4_DIR names (an app that isn't Crema: Eden for PS4 sets /data/eden-ps4/gpu). */
+static const char *ps4_gpu_dir(void)
+{
+   const char *dir = getenv("RADV_PS4_DIR");
+   return dir && dir[0] ? dir : "/data/Crema/gpu";
+}
+
+/* A file in that folder (a few calls' worth of paths kept, for each thread). */
+static const char *ps4_gpu_file(const char *name)
+{
+   static __thread char paths[4][256];
+   static __thread unsigned next;
+   char *path = paths[next++ % 4];
+   snprintf(path, sizeof(paths[0]), "%s/%s", ps4_gpu_dir(), name);
+   return path;
+}
+
 /* libkernel (declared here rather than through the OpenOrbis headers, which clash with Mesa's). */
 int sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t len, size_t align,
                                   int type, off_t *phys);
@@ -254,8 +272,8 @@ ps4_log(const char *fmt, ...)
    static int fd = -2;
    int current = __atomic_load_n(&fd, __ATOMIC_ACQUIRE);
    if (current == -2) {
-      mkdir("/data/Crema/gpu", 0777);
-      int opened = open("/data/Crema/gpu/radv-ps4.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      mkdir(ps4_gpu_dir(), 0777);
+      int opened = open(ps4_gpu_file("radv-ps4.log"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
       int expected = -2;
       if (__atomic_compare_exchange_n(&fd, &expected, opened, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
          current = opened;
@@ -468,10 +486,10 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
    dev->hang_reported = true;
    const uint64_t completed = ps4_completed(dev);
    ps4_log("radv/ps4: GPU hang? waiting for %llu, completed %llu, submitted %llu - writing "
-           "/data/Crema/gpu/gpu-hang.txt\n",
+           "%s\n",
            (unsigned long long)waited_seq, (unsigned long long)completed,
-           (unsigned long long)dev->last_seq);
-   FILE *f = fopen("/data/Crema/gpu/gpu-hang.txt", "w");
+           (unsigned long long)dev->last_seq, ps4_gpu_file("gpu-hang.txt"));
+   FILE *f = fopen(ps4_gpu_file("gpu-hang.txt"), "w");
    if (!f)
       return;
    fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
@@ -684,7 +702,7 @@ static int
 ps4_coredump_handler(void *arg)
 {
    (void)arg;
-   FILE *f = fopen("/data/Crema/gpu/gpu-fault.txt", "w");
+   FILE *f = fopen(ps4_gpu_file("gpu-fault.txt"), "w");
    if (f) {
       fprintf(f, "==== core dump handler (the system is killing the app)\n");
       ps4_dump_state(f, ps4_fault_dev);
@@ -701,7 +719,7 @@ ps4_gpu_exception_thread(void *eq)
       int n = 0;
       if (sceKernelWaitEqueue(eq, ev, 4, &n, NULL) || n <= 0)
          continue;
-      FILE *f = fopen("/data/Crema/gpu/gpu-fault.txt", "a");
+      FILE *f = fopen(ps4_gpu_file("gpu-fault.txt"), "a");
       for (int i = 0; i < n; i++) {
          ps4_log("radv/ps4: GPU EXCEPTION event: ident %#llx filter/flags/fflags %#llx data %#llx "
                  "udata %#llx\n", (unsigned long long)ev[i][0], (unsigned long long)ev[i][1],
@@ -924,7 +942,7 @@ ps4_record_descriptors(void *const *dcb, const uint32_t *dcb_sizes, unsigned num
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_collect_user_data(dcb[i], dcb_sizes[i] / 4, values, &count, ARRAY_SIZE(values), 0);
    char path[64];
-   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/mem-%u.bin", (unsigned)(seq % 8));
+   snprintf(path, sizeof(path), "%s/flight/mem-%u.bin", ps4_gpu_dir(), (unsigned)(seq % 8));
    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (fd < 0)
       return;
@@ -975,7 +993,7 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
    if (ps4_progress_fd < 0)
       return;
    char path[64];
-   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/ib-%u.bin", (unsigned)(seq % 8));
+   snprintf(path, sizeof(path), "%s/flight/ib-%u.bin", ps4_gpu_dir(), (unsigned)(seq % 8));
    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (fd < 0)
       return;
@@ -991,14 +1009,14 @@ ps4_start_flight_recorder(ac_drm_device *dev)
 {
    if (!getenv("RADV_PS4_TRACE") || ps4_progress_fd >= 0)
       return;
-   mkdir("/data/Crema/gpu", 0777);
-   mkdir("/data/Crema/gpu/flight", 0777);
-   ps4_progress_fd = open("/data/Crema/gpu/flight/progress.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   mkdir(ps4_gpu_dir(), 0777);
+   mkdir(ps4_gpu_file("flight"), 0777);
+   ps4_progress_fd = open(ps4_gpu_file("flight/progress.log"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
    if (ps4_progress_fd < 0)
       return;
    pthread_t t;
    pthread_create(&t, NULL, ps4_progress_thread, dev);
-   ps4_log("radv/ps4: flight recorder on (/data/Crema/gpu/flight)\n");
+   ps4_log("radv/ps4: flight recorder on (%s)\n", ps4_gpu_file("flight"));
 }
 
 static void
@@ -2480,7 +2498,7 @@ ps4_check_ib_chain(ac_drm_device *dev, const uint32_t *ib, unsigned num_dw, uint
          if (ps4_corrupt_reports++ < 4) {
             ps4_log("radv/ps4: submission %llu: IB %p (%u dwords) %s (first dword %#x) - see "
                     "ib-corrupt.txt\n", (unsigned long long)seq, (void *)ib, num_dw, problem, ib[0]);
-            FILE *f = fopen("/data/Crema/gpu/ib-corrupt.txt", "a");
+            FILE *f = fopen(ps4_gpu_file("ib-corrupt.txt"), "a");
             if (f) {
                fprintf(f, "==== submission %llu, chain link %u: IB %p, %u dwords, %s\n",
                        (unsigned long long)seq, link, (void *)ib, num_dw, problem);

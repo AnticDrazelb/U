@@ -112,16 +112,20 @@ void OnLog(Common::Log::Class log_class, Common::Log::Level level, std::string_v
         Output(LineKind::Error, line);
     } else if (level == Common::Log::Level::Warning) {
         Output(LineKind::Warning, line);
-    } else if (g_sink) {
-        // only with a log filter below Warning (EDEN_PS4_LOG); not in log.txt
-        g_sink(LineKind::Info, line);
+    } else {
+        // what a log filter lets through below Warning (the GPU display's own, or EDEN_PS4_LOG)
+        Output(LineKind::Info, line);
     }
 }
 
 void ApplyLauncherSettings() {
     // Eden's log filter (e.g. "*:Info Service.VI:Debug"); by default warnings and errors only
+    // (with the GPU display, the Vulkan renderer's and GPU memory's progress too: what the console
+    // shows of them is only in log.txt)
     const char* filter = std::getenv("EDEN_PS4_LOG");
-    Settings::values.log_filter = filter ? filter : "*:Warning Debug.Emulated:Info";
+    Settings::values.log_filter = filter         ? filter
+                                  : g_gpu_display ? "*:Warning Debug.Emulated:Info Render.Vulkan:Info HW.GPU:Info HW.Memory:Info"
+                                                  : "*:Warning Debug.Emulated:Info";
     // The null renderer composes frames on the CPU and drops GPU work; EDEN_PS4_RENDERER=vulkan
     // runs Eden's Vulkan renderer without a window (its frames read back), for GPU-drawn programs.
     const char* renderer = std::getenv("EDEN_PS4_RENDERER");

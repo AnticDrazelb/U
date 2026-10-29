@@ -38,7 +38,9 @@ Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
  .../vulkan_common/vulkan_memory_allocator.cpp | 112 +++++++-
  .../vulkan_common/vulkan_memory_allocator.h   |  12 +
  .../vulkan_common/vulkan_surface.cpp          |   4 +
- 21 files changed, 671 insertions(+), 14 deletions(-)
+ .../vulkan_common/vulkan_wrapper.cpp          |   1 +
+ src/video_core/vulkan_common/vulkan_wrapper.h |   4 +
+ 23 files changed, 676 insertions(+), 14 deletions(-)
  create mode 100644 src/common/ps4_diagnostics.h
  create mode 100644 src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
 
@@ -1226,3 +1228,37 @@ index d938fdf27..da5c2845e 100644
  }
  
  } // namespace Vulkan
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index bb43fe399..23ba2c830 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -219,6 +219,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
+     X(vkGetEventStatus);
+     X(vkGetFenceStatus);
+     X(vkGetImageMemoryRequirements);
++    X(vkGetImageSubresourceLayout);
+     X(vkGetPipelineCacheData);
+     X(vkGetMemoryFdKHR);
+ #ifdef _WIN32
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index 97d2ba370..b188e6545 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -335,6 +335,7 @@ struct DeviceDispatch : InstanceDispatch {
+     PFN_vkGetEventStatus vkGetEventStatus{};
+     PFN_vkGetFenceStatus vkGetFenceStatus{};
+     PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements{};
++    PFN_vkGetImageSubresourceLayout vkGetImageSubresourceLayout{};
+     PFN_vkGetPipelineCacheData vkGetPipelineCacheData{};
+     PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR{};
+ #ifdef _WIN32
+@@ -1044,6 +1045,9 @@ class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
+     using Handle<VkDevice, NoOwner, DeviceDispatch>::Handle;
+ 
+ public:
++    const DeviceDispatch& Dispatch() const noexcept {
++        return *dld;
++    }
+     [[nodiscard]] static Device Create(VkPhysicalDevice physical_device,
+                                        Span<VkDeviceQueueCreateInfo> queues_ci,
+                                        Span<const char*> enabled_extensions, const void* next,

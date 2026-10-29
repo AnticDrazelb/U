@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 07:30:34 +0000
+Subject: [PATCH] core: free the application's process before the kernel when
+ loading fails
+
+When the ROM or the system (the GPU, say) fails to load, Load shut the
+kernel down and only then, returning, destroyed the Service::Process
+holding the new KProcess: its finalization ran on the dead kernel (its
+scheduler lock, slab heaps and page tables). glibc lets a destroyed mutex
+be locked; the PS4's libc++ and pthreads don't ("mutex lock failed:
+Invalid argument", then std::terminate), so a failed boot took the
+emulator down instead of returning an error. The process is now freed
+first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7DVAudgDzMpBqJZHAz
+---
+ src/core/core.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index 046ee5334..c9aefcf02 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -330,6 +330,7 @@ struct System::Impl {
+         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
+         if (load_result != Loader::ResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
++            process.reset(); // (its kernel process, before the kernel that owns it goes)
+             ShutdownMainProcess();
+             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
+         }
+@@ -363,6 +364,7 @@ struct System::Impl {
+         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
+         if (init_result != SystemResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
++            process.reset(); // (its kernel process, before the kernel that owns it goes)
+             ShutdownMainProcess();
+             return init_result;
+         }
