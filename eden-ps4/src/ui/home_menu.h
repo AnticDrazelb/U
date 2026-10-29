@@ -53,6 +53,7 @@ struct MenuSettings
     bool white_theme = false;
     bool software_renderer = false;
     bool docked = false;
+    int resolution = 100; // what games render at, in percent of the console mode's: 100, 75 or 50
 };
 
 // One line of the Games and Keys screen: something found (or not), and where

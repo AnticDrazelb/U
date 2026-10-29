@@ -410,8 +410,12 @@ the Switch's (`src/ui/`, since 03.20):
   (whether `prod.keys`, `title.keys` and the firmware are where they should be, the games found,
   and where things go), **Controllers** (the PS4 buttons each Switch button is, and Test Input
   Devices: the controller test), **System Settings** (Themes: Basic Black or Basic White; Graphics:
-  Vulkan on the PS4's GPU or the software renderer, and which one is in use; Console: handheld,
-  1280x720, the default, or docked, 1920x1080; About) and **Power** (closes the app).
+  Vulkan on the PS4's GPU or the software renderer, and which one is in use, and the resolution
+  games render at, 100%, 75% or 50% of the console mode's; Console: handheld, 1280x720, the
+  default, or docked, 1920x1080; About) and **Power** (closes the app). A lower resolution takes
+  less of the PS4's GPU memory (480 MiB once the Switch's 4 GiB are mapped; a quarter at 50%) and
+  less GPU work, but doesn't speed up a game held back by the CPU, which most are (stage 1 measured
+  a PS4 core at 15-25% of a busy Switch core's speed).
 - The user's icon and the time at the top; the controller and the buttons' hints at the bottom.
 - A game without the keys: a dialog says where they go, instead of a loader error. After a run that
   didn't finish: its report first (the end of `log.txt`, `crash.log` and its last steps), to

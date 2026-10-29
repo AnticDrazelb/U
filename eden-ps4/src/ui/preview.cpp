@@ -121,6 +121,8 @@ int main(int argc, char** argv)
     Shot(menu, "settings");
     Press(menu, kDown);
     Press(menu, kRight);
+    Press(menu, kDown);
+    Press(menu, kCross);
     Shot(menu, "settings-graphics");
     Press(menu, kCircle);
     Press(menu, kCircle);

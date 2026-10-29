@@ -338,7 +338,7 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
                 screen = Screen::Home;
             return {};
         }
-        const int items = settings_category < 3 ? 1 : 0;
+        const int items = settings_category == 1 ? 2 : settings_category < 3 ? 1 : 0;
         if (!settings_items)
         {
             if (moves & kUp)
@@ -357,12 +357,18 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
             settings_items = false;
             return {};
         }
+        if (moves & kUp)
+            settings_item = std::max(0, settings_item - 1);
+        if (moves & kDown)
+            settings_item = std::min(items - 1, settings_item + 1);
         if (pressed & kCross)
         {
             if (settings_category == 0)
                 settings.white_theme = !settings.white_theme;
-            else if (settings_category == 1)
+            else if (settings_category == 1 && settings_item == 0)
                 settings.software_renderer = !settings.software_renderer;
+            else if (settings_category == 1)
+                settings.resolution = settings.resolution == 100 ? 75 : settings.resolution == 75 ? 50 : 100;
             else if (settings_category == 2)
                 settings.docked = !settings.docked;
             return {MenuAction::Kind::SettingsChanged, {}};
@@ -619,14 +625,23 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
         items = {{"Theme", settings.white_theme ? "Basic White" : "Basic Black"}};
         description = "The HOME menu's colours, as the Switch's two themes.";
         break;
-    case 1:
-        items = {{"Renderer", settings.software_renderer ? "Software (the PS4's CPU)" : "Vulkan (the PS4's GPU)"}};
+    case 1: {
+        const int width = (settings.docked ? 1920 : 1280) * settings.resolution / 100;
+        const int height = (settings.docked ? 1080 : 720) * settings.resolution / 100;
+        items = {{"Renderer", settings.software_renderer ? "Software (the PS4's CPU)" : "Vulkan (the PS4's GPU)"},
+                 {"Resolution", std::to_string(settings.resolution) + "%  (" + std::to_string(width) + "x" +
+                                    std::to_string(height) + ")"}};
         description = "Vulkan draws the Switch's GPU work with the PS4's GPU, through Mesa's RADV driver" +
                       std::string(radv_linked ? "." : " (not in this build).") +
                       " The software renderer draws it with the CPU: every title works the same, but 3D games are "
-                      "far too slow to play. If Vulkan doesn't start, the software renderer takes over.\n\nNow: " +
+                      "far too slow to play. If Vulkan doesn't start, the software renderer takes over.\n\n"
+                      "Resolution: games draw at this share of the console mode's resolution, then scaled up. Less "
+                      "of the PS4's GPU memory (a quarter at 50%) and less GPU work, at the cost of sharpness. It "
+                      "doesn't speed up a game held back by the CPU, as most are. Some games show glitches below "
+                      "100%.\n\nNow: " +
                       renderer + ".";
         break;
+    }
     case 2:
         items = {{"Console Mode", settings.docked ? "Docked (TV, 1920x1080)" : "Handheld (1280x720)"}};
         description = "Games run as on a Switch in handheld mode, at 1280x720, or docked, at 1920x1080. Handheld "

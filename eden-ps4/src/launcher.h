@@ -65,6 +65,10 @@ void SetGpuDisplay(bool on);
 /// 1280x720). Docked unless set. Set it before Boot.
 void SetDocked(bool docked);
 
+/// What games render at, in percent of the console mode's resolution: 100 (the default), 75 or
+/// 50 (Eden's resolution scaler, then scaled up for the screen). Set it before Boot.
+void SetResolution(int percent);
+
 /// Where Boot keeps what it learned of a program that loaded (for a menu to show next time):
 /// data_dir/cache/titles/<hash of its path>.<extension>, "jpg" its icon, "txt" its title and
 /// publisher (a line each).

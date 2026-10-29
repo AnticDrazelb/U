@@ -83,6 +83,7 @@ public:
 
 bool g_gpu_display = false;
 bool g_docked = true;
+int g_resolution = 100;
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
 // while a program runs.
@@ -133,6 +134,9 @@ void ApplyLauncherSettings() {
     // runs Eden's Vulkan renderer without a window (its frames read back), for GPU-drawn programs.
     Settings::values.use_docked_mode.SetValue(g_docked ? Settings::ConsoleMode::Docked
                                                        : Settings::ConsoleMode::Handheld);
+    Settings::values.resolution_setup.SetValue(g_resolution <= 50   ? Settings::ResolutionSetup::Res1_2X
+                                               : g_resolution <= 75 ? Settings::ResolutionSetup::Res3_4X
+                                                                    : Settings::ResolutionSetup::Res1X);
     const char* renderer = std::getenv("EDEN_PS4_RENDERER");
     const bool vulkan = g_gpu_display || (renderer && std::string_view{renderer} == "vulkan");
     Settings::values.renderer_backend.SetValue(vulkan ? Settings::RendererBackend::Vulkan
@@ -187,6 +191,10 @@ const char* LoadError(Core::SystemResultStatus status) {
 
 void SetDocked(bool docked) {
     g_docked = docked;
+}
+
+void SetResolution(int percent) {
+    g_resolution = percent;
 }
 
 std::filesystem::path TitleCachePath(const std::filesystem::path& data_dir, std::string_view program,

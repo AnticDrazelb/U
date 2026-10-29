@@ -849,6 +849,10 @@ Ui::MenuSettings LoadMenuSettings()
             settings.software_renderer = true;
         else if (line == "mode=docked")
             settings.docked = true;
+        else if (line == "resolution=75")
+            settings.resolution = 75;
+        else if (line == "resolution=50")
+            settings.resolution = 50;
     }
     return settings;
 }
@@ -857,8 +861,9 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
 {
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
-        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\n", settings.white_theme ? "white" : "black",
-                     settings.software_renderer ? "software" : "vulkan", settings.docked ? "docked" : "handheld");
+        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\n", settings.white_theme ? "white" : "black",
+                     settings.software_renderer ? "software" : "vulkan", settings.docked ? "docked" : "handheld",
+                     settings.resolution);
         std::fclose(f);
     }
 }
@@ -1045,10 +1050,10 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         {
             choice.settings = menu.Settings();
             SaveMenuSettings(choice.settings);
-            Trace(fmt::format("start page: settings: theme {}, renderer {}, {}",
+            Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%",
                               choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
-                              choice.settings.docked ? "docked" : "handheld"));
+                              choice.settings.docked ? "docked" : "handheld", choice.settings.resolution));
         }
         menu.Draw(canvas, now);
         g_screen.DrawFrame({canvas.Pixels(), size_t(canvas.Width()) * canvas.Height()}, uint32_t(canvas.Width()),
@@ -1273,8 +1278,10 @@ void* Run(void*)
         gpu = choose_renderer();
         Launcher::SetGpuDisplay(gpu);
         Launcher::SetDocked(settings.docked);
+        Launcher::SetResolution(settings.resolution);
         NoteRecent(program);
-        Trace(fmt::format("renderer: {}; console mode: {}", g_renderer_label, settings.docked ? "docked" : "handheld"));
+        Trace(fmt::format("renderer: {}; console mode: {}; resolution {}%", g_renderer_label,
+                          settings.docked ? "docked" : "handheld", settings.resolution));
         {
             std::lock_guard lock{g_mutex};
             g_screen.SetStatus(fmt::format("booting {}", program));
