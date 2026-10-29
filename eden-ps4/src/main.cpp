@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
+#include "core/file_sys/control_metadata.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/emu_window.h"
@@ -28,6 +29,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/loader/loader.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "launcher.h"
@@ -80,6 +82,7 @@ public:
 };
 
 bool g_gpu_display = false;
+bool g_docked = true;
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
 // while a program runs.
@@ -128,6 +131,8 @@ void ApplyLauncherSettings() {
                                                   : "*:Warning Debug.Emulated:Info";
     // The null renderer composes frames on the CPU and drops GPU work; EDEN_PS4_RENDERER=vulkan
     // runs Eden's Vulkan renderer without a window (its frames read back), for GPU-drawn programs.
+    Settings::values.use_docked_mode.SetValue(g_docked ? Settings::ConsoleMode::Docked
+                                                       : Settings::ConsoleMode::Handheld);
     const char* renderer = std::getenv("EDEN_PS4_RENDERER");
     const bool vulkan = g_gpu_display || (renderer && std::string_view{renderer} == "vulkan");
     Settings::values.renderer_backend.SetValue(vulkan ? Settings::RendererBackend::Vulkan
@@ -179,6 +184,18 @@ const char* LoadError(Core::SystemResultStatus status) {
 }
 
 } // namespace
+
+void SetDocked(bool docked) {
+    g_docked = docked;
+}
+
+std::filesystem::path TitleCachePath(const std::filesystem::path& data_dir, std::string_view program,
+                                     std::string_view extension) {
+    uint64_t hash = 1469598103934665603ull; // FNV-1a
+    for (const char c : program)
+        hash = (hash ^ uint8_t(c)) * 1099511628211ull;
+    return data_dir / "cache" / "titles" / fmt::format("{:016x}.{}", hash, extension);
+}
 
 void SetGpuDisplay(bool on) {
     g_gpu_display = on;
@@ -249,6 +266,31 @@ void Stop() {
     }
 }
 
+// What a program that loaded is called, who made it, and its icon, for the HOME menu: a game's
+// can't be read without the keys that loading it just used.
+void CacheTitle(Core::System& system, const std::filesystem::path& data_dir, const std::string& program) {
+    Loader::AppLoader& loader = system.GetAppLoader();
+    std::string title, publisher;
+    void(loader.ReadTitle(title));
+    FileSys::NACP control;
+    if (loader.ReadControlData(control) == Loader::ResultStatus::Success)
+        publisher = control.GetDeveloperName();
+    std::vector<u8> icon;
+    void(loader.ReadIcon(icon));
+    std::error_code ec;
+    std::filesystem::create_directories(TitleCachePath(data_dir, program, "txt").parent_path(), ec);
+    if (std::FILE* f = std::fopen(TitleCachePath(data_dir, program, "txt").c_str(), "w")) {
+        std::fprintf(f, "%s\n%s\n", title.c_str(), publisher.c_str());
+        std::fclose(f);
+    }
+    if (!icon.empty()) {
+        if (std::FILE* f = std::fopen(TitleCachePath(data_dir, program, "jpg").c_str(), "wb")) {
+            std::fwrite(icon.data(), 1, icon.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
 BootResult Boot(const std::filesystem::path& program, const std::filesystem::path& data_dir,
                 LineSink sink, FrameSink frames, std::chrono::milliseconds timeout) {
     // Eden's data folders (NAND, SD card, keys...) in data_dir/user.
@@ -310,6 +352,7 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             if (status != Core::SystemResultStatus::Success) {
                 result = {BootResult::Status::LoadFailed, LoadError(status)};
             } else {
+                CacheTitle(system, data_dir, program.string());
                 system.GPU().Start();
                 system.GetCpuManager().OnGpuReady();
                 std::unique_lock lock{g_run_mutex};

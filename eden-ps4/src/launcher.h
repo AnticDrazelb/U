@@ -61,6 +61,16 @@ void SetPad(const PadState& state);
 /// Set it before Boot.
 void SetGpuDisplay(bool on);
 
+/// The Switch's console mode: docked (games render for a TV, up to 1920x1080) or handheld (up to
+/// 1280x720). Docked unless set. Set it before Boot.
+void SetDocked(bool docked);
+
+/// Where Boot keeps what it learned of a program that loaded (for a menu to show next time):
+/// data_dir/cache/titles/<hash of its path>.<extension>, "jpg" its icon, "txt" its title and
+/// publisher (a line each).
+std::filesystem::path TitleCachePath(const std::filesystem::path& data_dir, std::string_view program,
+                                     std::string_view extension);
+
 /// A sound output: 48 kHz, signed 16-bit samples, channels interleaved.
 class AudioOutput {
 public:

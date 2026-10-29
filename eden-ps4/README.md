@@ -396,8 +396,31 @@ speaks GNM, through Sony's libraries. The ways there, roughly by size:
 
 ## The PS4 app
 
-`out/EdenPS4.pkg` (title ID EDNP00001, version in `VERSION`). It opens on a start page with a list
-of programs: the D-pad chooses, X boots.
+`out/EdenPS4.pkg` (title ID EDNP00001, version in `VERSION`). It opens on a HOME menu laid out as
+the Switch's (`src/ui/`, since 03.20):
+
+- **The row**: your software as tiles, the most recently played first (the first 12), the selected
+  one framed (a pulsing cyan border) with its name above it, and **All Software** at the end (a grid
+  of everything, with names). X starts a title; OPTIONS shows what it is and where (size, folder or
+  USB drive, path). A homebrew program's name and icon come from the `.nro` itself; a game's from
+  what its first boot learned (reading them takes the keys), kept in `/data/eden-ps4/cache/titles`;
+  until then its tile is a cover made from its file's name. The package's programs have their own
+  art.
+- **The round buttons** below: **News** (what's new, how to report problems), **Games and Keys**
+  (whether `prod.keys`, `title.keys` and the firmware are where they should be, the games found,
+  and where things go), **Controllers** (the PS4 buttons each Switch button is, and Test Input
+  Devices: the controller test), **System Settings** (Themes: Basic Black or Basic White; Graphics:
+  Vulkan on the PS4's GPU or the software renderer, and which one is in use; Console: handheld,
+  1280x720, the default, or docked, 1920x1080; About) and **Power** (closes the app).
+- The user's icon and the time at the top; the controller and the buttons' hints at the bottom.
+- A game without the keys: a dialog says where they go, instead of a loader error. After a run that
+  didn't finish: its report first (the end of `log.txt`, `crash.log` and its last steps), to
+  photograph.
+
+Its settings are in `/data/eden-ps4/menu.txt`, the order played in `recent.txt`. The text is Inter
+(`ui-fonts/`, SIL Open Font License); everything else is drawn by `src/ui/canvas.cpp` (anti-aliased
+shapes from their signed distances, at 1920x1080 in the Switch's 1280x720 units). `ui-preview.sh`
+draws each screen to a PNG on the desktop, with sample titles.
 
 - **Breakout** (`breakout.nro`, in the package). Left stick or D-pad to move, X to launch the ball,
   OPTIONS to quit.
@@ -413,12 +436,11 @@ of programs: the D-pad chooses, X boots.
   controller test) works with either renderer; what draws with the GPU (games, deko3d, OpenGL)
   needs the Vulkan renderer on the PS4's GPU, or is drawn (slowly) by the software renderer.
 
-When the program ends, the start page comes back. Both sticks pressed in (L3 + R3) for a second stop
+When the program ends, the HOME menu comes back. Both sticks pressed in (L3 + R3) for a second stop
 a program, for one without a way to quit or one that hangs; where its threads were goes to
-`log.txt`. Without a controller, the test program boots after a countdown; pressing up or down stops
-it. If the last run didn't finish, the page first shows what that run left behind: the end of its
-output (`log.txt`), its crash report (`crash.log`) and the last steps of its boot trace. With a
-controller connected, it then waits for a button, so a photo of it can come first. Stack addresses
+`log.txt`. Without a controller, the test program boots after a countdown. If the last run didn't
+finish, the menu first shows what that run left behind: the end of its output (`log.txt`), its
+crash report (`crash.log`) and the last steps of its boot trace, until X is pressed. Stack addresses
 are ELF addresses: symbolize them with `llvm-symbolizer --obj=<that build's ELF> 0x...`.
 `build.sh ps4` keeps every build's ELF in `~/eden-ps4-elves`.
 
@@ -430,7 +452,7 @@ Nothing is written outside `/data/eden-ps4`.
 
 Nothing in stage 2 or 3 has run on a console yet. What to try, and what tells the most:
 
-1. Install `out/EdenPS4.pkg` and start it. The start page should list five programs. If the app
+1. Install `out/EdenPS4.pkg` and start it. The HOME menu should show five programs. If the app
    closes or freezes before that, `/data/eden-ps4/boot-trace.log` has its last steps and
    `crash.log` its crash report (next start, the start page shows both: a photo is enough).
 2. **The test program** (stage 2's checks): every line should end with "passed" or a result, and

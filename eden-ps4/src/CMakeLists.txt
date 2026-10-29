@@ -27,7 +27,18 @@ if (PS4)
         COMPILE_DEFINITIONS PS4_SYSTEM_HEAP_MAX_MB=384
         INCLUDE_DIRECTORIES ${EDEN_PS4_REPO}/port)
 
-    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp ${EDEN_PS4_RUNTIME_SOURCES})
+    # The HOME menu (ui/), with its fonts (../ui-fonts) included whole
+    set(EDEN_PS4_UI_SOURCES ui/canvas.cpp ui/fonts.cpp ui/art.cpp ui/home_menu.cpp ui/nro.cpp)
+    set(EDEN_PS4_UI_FONTS ${CMAKE_CURRENT_LIST_DIR}/../ui-fonts)
+    set_source_files_properties(ui/fonts.cpp PROPERTIES
+        COMPILE_DEFINITIONS EDEN_PS4_UI_FONTS="${EDEN_PS4_UI_FONTS}"
+        OBJECT_DEPENDS "${EDEN_PS4_UI_FONTS}/Inter-Regular.otf;${EDEN_PS4_UI_FONTS}/Inter-SemiBold.otf")
+    # (stb's single-file libraries, compiled in canvas.cpp, aren't warning-clean)
+    set_source_files_properties(ui/canvas.cpp PROPERTIES COMPILE_OPTIONS
+        "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")
+
+    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp ${EDEN_PS4_UI_SOURCES} ${EDEN_PS4_RUNTIME_SOURCES})
+    target_include_directories(eden-ps4 PRIVATE ${CMAKE_CURRENT_LIST_DIR})
     target_compile_definitions(eden-ps4 PRIVATE EDEN_PS4_VERSION="${EDEN_PS4_VERSION}")
     target_link_libraries(eden-ps4 PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut
         SceAudioOut ScePad SceNet

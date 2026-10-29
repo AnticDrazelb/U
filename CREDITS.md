@@ -49,6 +49,7 @@ GPU and much of the PS4 runtime.
 | [PacBrew](https://github.com/PacBrew) | The PS4 toolchain distribution used for builds | see project |
 | [LLVM](https://llvm.org) | clang, lld and libc++ | Apache-2.0 with LLVM exception |
 | [love-ps4](https://github.com/Mari0/love-ps4) | Reference for linking, runtime and packaging on the PS4 | see project |
+| [stb](https://github.com/nothings/stb) by Sean Barrett | Eden for PS4's HOME menu: fonts (stb_truetype), icons (stb_image) | public domain / MIT |
 
 ## Data and services
 
@@ -66,6 +67,8 @@ All under the SIL Open Font License; the licence texts are in
 - [Questrial](https://fonts.google.com/specimen/Questrial)
 - [Michroma](https://fonts.google.com/specimen/Michroma)
 - [Noto Sans JP, KR and SC](https://fonts.google.com/noto) (Japanese, Korean and Chinese menus)
+- [Inter](https://rsms.me/inter) (Eden for PS4's HOME menu; its licence is in
+  [`eden-ps4/ui-fonts`](eden-ps4/ui-fonts))
 
 ## Sounds and artwork
 

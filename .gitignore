@@ -4,3 +4,4 @@ modules/
 *.oelf
 tests/out/
 out/
+eden-ps4/ui-preview-out/

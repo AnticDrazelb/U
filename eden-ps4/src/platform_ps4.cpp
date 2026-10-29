@@ -39,6 +39,9 @@
 
 #include "common/ps4_diagnostics.h"
 #include "launcher.h"
+#include "ui/canvas.h"
+#include "ui/home_menu.h"
+#include "ui/nro.h"
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes
 // (as in port/ps4_runtime.cpp).
@@ -60,6 +63,8 @@ int32_t scePthreadSetprio(void* thread, int32_t priority);
 void ps4_boot_trace(const char* stage);
 // Mesa's RADV (or ps4_stubs.cpp's stand-in, without it)
 void* vk_icdGetInstanceProcAddr(void* instance, const char* name);
+// libSceSystemService: "exit" closes the app (back to the PS4's home screen)
+int sceSystemServiceLoadExec(const char* path, char* const argv[]);
 // port/ps4_runtime.cpp: direct memory the C heap's overflow leaves for the GPU
 void ps4_heap_set_overflow_gpu_reserve(size_t bytes);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
@@ -656,42 +661,129 @@ void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height
     }
 }
 
-// The programs on the start page: the package's, then every program (.nro, .nso) and game (.nsp,
-// .xci) in the data folder and at the top of a USB drive (/mnt/usb0 to /mnt/usb7).
-struct Program {
-    std::string path;
-    std::string label;
-};
+// The HOME menu's titles: the package's programs, then every program (.nro, .nso) and game (.nsp,
+// .xci) in the data folder and at the top of a USB drive (/mnt/usb0 to /mnt/usb7), the most
+// recently played first. A homebrew program's name and icon come from its assets; a game's from
+// what Launcher::Boot kept the first time it booted (reading them takes the keys), else its cover
+// shows its file's name.
+constexpr const char* kRecentFile = "/data/eden-ps4/recent.txt";
+constexpr const char* kMenuFile = "/data/eden-ps4/menu.txt";
+constexpr const char* kKeysFile = "/data/eden-ps4/user/keys/prod.keys";
+constexpr const char* kTitleKeysFile = "/data/eden-ps4/user/keys/title.keys";
+constexpr const char* kFirmwareDir = "/data/eden-ps4/user/nand/system/Contents/registered";
+
+std::string Lower(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return text;
+}
 
 bool IsGame(const std::string& path)
 {
-    std::string extension = std::filesystem::path(path).extension().string();
-    std::transform(extension.begin(), extension.end(), extension.begin(),
-                   [](unsigned char c) { return char(std::tolower(c)); });
+    const std::string extension = Lower(std::filesystem::path(path).extension().string());
     return extension == ".nsp" || extension == ".xci";
 }
 
-std::vector<Program> ListPrograms()
+std::string SizeText(uintmax_t size)
 {
-    std::vector<Program> programs = {
-        {"/app0/breakout.nro", "Breakout (a game: stick or D-pad to move, X to launch, OPTIONS to quit)"},
-        {"/app0/blocks.nro", "Blocks (a game: D-pad to move, X / O to rotate, up to drop, OPTIONS to quit)"},
-        {"/app0/padtest.nro", "Controller test (OPTIONS + touchpad click to quit)"},
-        {"/app0/gputest.nro", "GPU test (drawn with the Switch's GPU, as clears: OPTIONS to quit)"},
-        {kTestProgram, "The test program (hello.nro: text only)"},
+    return size >= 1024 * MB ? fmt::format("{:.1f} GB", double(size) / (1024 * MB))
+                             : fmt::format("{} MB", (size + MB - 1) / MB);
+}
+
+// "Some Game [0100ABCD00000000][v0] (USA).nsp" -> "Some Game"
+std::string NameFromFile(const std::filesystem::path& path)
+{
+    std::string name = path.stem().string();
+    std::string out;
+    int depth = 0;
+    for (const char c : name)
+    {
+        if (c == '[' || c == '(')
+            depth++;
+        else if ((c == ']' || c == ')') && depth > 0)
+            depth--;
+        else if (depth == 0)
+            out += c == '_' ? ' ' : c;
+    }
+    while (!out.empty() && out.back() == ' ')
+        out.pop_back();
+    while (!out.empty() && out.front() == ' ')
+        out.erase(out.begin());
+    return out.empty() ? name : out;
+}
+
+std::vector<std::string> ReadRecent()
+{
+    return ReadLines(kRecentFile);
+}
+
+void NoteRecent(const std::string& program)
+{
+    std::vector<std::string> recent = ReadRecent();
+    std::erase(recent, program);
+    recent.insert(recent.begin(), program);
+    if (recent.size() > 100)
+        recent.resize(100);
+    if (FILE* f = std::fopen(kRecentFile, "w"))
+    {
+        for (const std::string& path : recent)
+            std::fprintf(f, "%s\n", path.c_str());
+        std::fclose(f);
+    }
+}
+
+std::vector<uint8_t> ReadFile(const std::string& path)
+{
+    std::vector<uint8_t> data;
+    if (FILE* f = std::fopen(path.c_str(), "rb"))
+    {
+        uint8_t buffer[16384];
+        for (size_t n; (n = std::fread(buffer, 1, sizeof(buffer), f)) > 0;)
+            data.insert(data.end(), buffer, buffer + n);
+        std::fclose(f);
+    }
+    return data;
+}
+
+std::vector<Ui::Title> LoadTitles()
+{
+    struct BuiltIn
+    {
+        const char* path;
+        const char* name;
+        Ui::Art art;
     };
+    const BuiltIn built_in[] = {
+        {"/app0/breakout.nro", "Breakout", Ui::Art::Breakout},
+        {"/app0/blocks.nro", "Blocks", Ui::Art::Blocks},
+        {"/app0/padtest.nro", "Controller test", Ui::Art::Controller},
+        {"/app0/gputest.nro", "GPU test", Ui::Art::Gpu},
+        {kTestProgram, "The test program", Ui::Art::Terminal},
+    };
+    std::vector<Ui::Title> titles;
+    std::error_code ec;
+    for (const BuiltIn& program : built_in)
+    {
+        Ui::Title title;
+        title.path = program.path;
+        title.name = program.name;
+        title.publisher = "Eden for PS4";
+        title.location = "in the package";
+        title.kind = "NRO";
+        title.art = program.art;
+        const uintmax_t size = std::filesystem::file_size(program.path, ec);
+        title.size = ec ? "" : SizeText(size);
+        titles.push_back(std::move(title));
+    }
     std::vector<std::pair<std::string, std::string>> folders = {{kDataDir, "data folder"}};
     for (int i = 0; i < 8; i++)
         folders.push_back({fmt::format("/mnt/usb{}", i), fmt::format("USB {}", i)});
     for (const auto& [folder, where] : folders)
     {
         std::vector<std::filesystem::path> found;
-        std::error_code ec;
         for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
         {
-            std::string extension = it->path().extension().string();
-            std::transform(extension.begin(), extension.end(), extension.begin(),
-                           [](unsigned char c) { return char(std::tolower(c)); });
+            const std::string extension = Lower(it->path().extension().string());
             if ((extension == ".nro" || extension == ".nso" || extension == ".nsp" || extension == ".xci") &&
                 it->is_regular_file(ec))
                 found.push_back(it->path());
@@ -699,147 +791,278 @@ std::vector<Program> ListPrograms()
         std::sort(found.begin(), found.end());
         for (const std::filesystem::path& path : found)
         {
+            Ui::Title title;
+            title.path = path.string();
+            title.location = where;
+            title.kind = Lower(path.extension().string()).substr(1);
+            std::transform(title.kind.begin(), title.kind.end(), title.kind.begin(),
+                           [](unsigned char c) { return char(std::toupper(c)); });
+            title.game = IsGame(title.path);
             const uintmax_t size = std::filesystem::file_size(path, ec);
-            const std::string amount = ec ? "?"
-                                     : size >= 1024 * MB ? fmt::format("{:.1f} GB", double(size) / (1024 * MB))
-                                                         : fmt::format("{} MB", (size + MB - 1) / MB);
-            programs.push_back({path.string(), fmt::format("{}  ({}, {})", path.filename().string(), where, amount)});
+            title.size = ec ? "" : SizeText(size);
+            // what its last boot learned, else (homebrew) its assets, else its file's name
+            const std::vector<std::string> cached = ReadLines(Launcher::TitleCachePath(kDataDir, title.path, "txt").c_str());
+            std::vector<uint8_t> icon;
+            if (!cached.empty() && !cached[0].empty())
+            {
+                title.name = cached[0];
+                title.publisher = cached.size() > 1 ? cached[1] : "";
+                icon = ReadFile(Launcher::TitleCachePath(kDataDir, title.path, "jpg").string());
+            }
+            else if (title.kind == "NRO")
+            {
+                Ui::NroInfo info;
+                if (Ui::ReadNroInfo(title.path, info))
+                {
+                    title.name = info.name;
+                    title.publisher = info.publisher;
+                    icon = std::move(info.icon);
+                }
+            }
+            if (title.name.empty())
+                title.name = NameFromFile(path);
+            if (!icon.empty())
+                title.icon = Ui::DecodeImage(icon.data(), icon.size());
+            titles.push_back(std::move(title));
         }
     }
-    return programs;
+    // the most recently played first, in the order they were played; the rest as found
+    const std::vector<std::string> recent = ReadRecent();
+    std::stable_sort(titles.begin(), titles.end(), [&](const Ui::Title& a, const Ui::Title& b) {
+        const auto rank = [&](const Ui::Title& t) {
+            const auto it = std::find(recent.begin(), recent.end(), t.path);
+            return it == recent.end() ? recent.size() : size_t(it - recent.begin());
+        };
+        return rank(a) < rank(b);
+    });
+    return titles;
 }
 
-// Shows the start page and waits for a choice. On the first one, without a controller or after a
-// finished run, the test program boots after a countdown; later ones wait for a button.
-std::string StartPage(bool first)
+Ui::MenuSettings LoadMenuSettings()
+{
+    Ui::MenuSettings settings;
+    for (const std::string& line : ReadLines(kMenuFile))
+    {
+        if (line == "theme=white")
+            settings.white_theme = true;
+        else if (line == "renderer=software")
+            settings.software_renderer = true;
+        else if (line == "mode=docked")
+            settings.docked = true;
+    }
+    return settings;
+}
+
+void SaveMenuSettings(const Ui::MenuSettings& settings)
+{
+    if (FILE* f = std::fopen(kMenuFile, "w"))
+    {
+        std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\n", settings.white_theme ? "white" : "black",
+                     settings.software_renderer ? "software" : "vulkan", settings.docked ? "docked" : "handheld");
+        std::fclose(f);
+    }
+}
+
+// The Games and Keys screen: the keys, the firmware and the games found
+std::vector<Ui::StatusRow> GamesStatus(const std::vector<Ui::Title>& titles)
+{
+    std::vector<Ui::StatusRow> rows;
+    std::error_code ec;
+    const bool keys = std::filesystem::exists(kKeysFile, ec);
+    rows.push_back({"Keys (prod.keys)", keys ? fmt::format("Found: {}", kKeysFile)
+                                             : fmt::format("Not found: copy it to {}", kKeysFile), keys});
+    const bool title_keys = std::filesystem::exists(kTitleKeysFile, ec);
+    rows.push_back({"Title keys (title.keys)",
+                    title_keys ? fmt::format("Found: {}", kTitleKeysFile)
+                               : fmt::format("Not found ({}): some games need it", kTitleKeysFile),
+                    title_keys});
+    size_t firmware = 0;
+    for (std::filesystem::directory_iterator it(kFirmwareDir, ec), end; !ec && it != end; it.increment(ec))
+        firmware++;
+    rows.push_back({"Firmware", firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
+                                         : fmt::format("None in {}: copy your Switch's firmware (.nca files) there",
+                                                       kFirmwareDir),
+                    firmware > 0});
+    size_t games = 0, on_usb = 0, homebrew = 0;
+    for (const Ui::Title& title : titles)
+    {
+        if (title.location == "in the package")
+            continue;
+        if (title.game)
+        {
+            games++;
+            on_usb += title.location.starts_with("USB") ? 1 : 0;
+        }
+        else
+        {
+            homebrew++;
+        }
+    }
+    rows.push_back({"Software",
+                    fmt::format("{} game{} ({} on USB drives) and {} homebrew program{}", games, games == 1 ? "" : "s",
+                                on_usb, homebrew, homebrew == 1 ? "" : "s"),
+                    games + homebrew > 0});
+    return rows;
+}
+
+std::vector<std::pair<std::string, std::string>> News()
+{
+    return {
+        {"Eden for PS4 " EDEN_PS4_VERSION,
+         "A HOME menu laid out as the Switch's. Your software is in the row, the most recently played first, and "
+         "All Software at its end has everything. Below: News, Games and Keys (what's found, and where things go), "
+         "Controllers, System Settings (theme, renderer, console mode) and Power. OPTIONS on a title shows where it "
+         "is."},
+        {"Games",
+         "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive, with the keys and firmware of the "
+         "Switch they were dumped from (Games and Keys says where). A game's icon and name appear once it has booted "
+         "once."},
+        {"The PS4's GPU",
+         "Games are drawn with the PS4's GPU through Mesa's RADV. If Vulkan doesn't start, the software renderer "
+         "takes over (System Settings, Graphics, says so) and log-vulkan.txt and gpu/radv-ps4.log in /data/eden-ps4 "
+         "say why."},
+        {"If something goes wrong",
+         "In a game, L3 + R3 held for a second stops it. If it froze, hang.log has where its threads were; if it "
+         "crashed, this menu shows its report when it comes back. Send log.txt, crash.log, hang.log and "
+         "gpu/radv-ps4.log from /data/eden-ps4."},
+    };
+}
+
+// The pad's buttons for the menu, with the left stick as the D-pad (past a third of its travel)
+uint32_t MenuPad()
+{
+    union {
+        OrbisPadData data;
+        unsigned char room[512];
+    } state{};
+    if (g_pad < 0 || scePadReadState(g_pad, &state.data) != 0 || !state.data.connected)
+        return 0;
+    uint32_t buttons = state.data.buttons;
+    const int x = int(state.data.leftStick.x) - 128, y = int(state.data.leftStick.y) - 128;
+    if (x < -80)
+        buttons |= ORBIS_PAD_BUTTON_LEFT;
+    else if (x > 80)
+        buttons |= ORBIS_PAD_BUTTON_RIGHT;
+    if (y < -80)
+        buttons |= ORBIS_PAD_BUTTON_UP;
+    else if (y > 80)
+        buttons |= ORBIS_PAD_BUTTON_DOWN;
+    return buttons;
+}
+
+uint32_t MenuButtons(uint32_t pad)
+{
+    uint32_t held = 0;
+    const struct { uint32_t pad, menu; } map[] = {
+        {ORBIS_PAD_BUTTON_UP, Ui::kUp},           {ORBIS_PAD_BUTTON_DOWN, Ui::kDown},
+        {ORBIS_PAD_BUTTON_LEFT, Ui::kLeft},       {ORBIS_PAD_BUTTON_RIGHT, Ui::kRight},
+        {ORBIS_PAD_BUTTON_CROSS, Ui::kCross},     {ORBIS_PAD_BUTTON_CIRCLE, Ui::kCircle},
+        {ORBIS_PAD_BUTTON_TRIANGLE, Ui::kTriangle}, {ORBIS_PAD_BUTTON_SQUARE, Ui::kSquare},
+        {ORBIS_PAD_BUTTON_OPTIONS, Ui::kOptions}, {ORBIS_PAD_BUTTON_L1, Ui::kL1},
+        {ORBIS_PAD_BUTTON_R1, Ui::kR1},
+    };
+    for (const auto& m : map)
+        held |= (pad & m.pad) ? m.menu : 0;
+    return held;
+}
+
+std::string ClockText()
+{
+    const time_t now = time(nullptr);
+    tm local{};
+    localtime_r(&now, &local);
+    return fmt::format("{}:{:02}", local.tm_hour, local.tm_min);
+}
+
+// What the HOME menu said to do: boot `program`, with these settings
+struct MenuChoice
+{
+    std::string program;
+    Ui::MenuSettings settings;
+};
+
+// The HOME menu, until a title is chosen. On the first one, without a controller, the test
+// program boots after a countdown. After a run that didn't finish, its report comes first.
+MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
 {
     const std::vector<std::string> log = ReadLines(kLogFile);
     const std::vector<std::string> crash = ReadLines(kCrashFile);
     const std::vector<std::string> trace = ReadLines(kLastTraceFile);
     const bool unfinished = first && (!crash.empty() || (!log.empty() && log.back() != kFinishedLine));
-    const std::vector<Program> programs = ListPrograms();
-    static size_t selected = 0; // kept between runs
-    if (selected >= programs.size())
-        selected = 0;
-    std::string notice; // why the chosen program didn't boot
+    static Ui::HomeMenu menu; // (kept between runs: its place in the row, its screen)
+    static Ui::Canvas canvas(Screen::kWidth, Screen::kHeight, Screen::kWidth / 1280.0f);
 
-    std::lock_guard lock{g_mutex};
+    std::unique_lock lock{g_mutex};
     if (first)
         OpenPad();
-    const auto page = [&] {
-        g_screen.Clear();
-        g_screen.SetScale(1.75f);
-        g_screen.Add("Eden for PS4 " EDEN_PS4_VERSION ": the Switch emulator Eden; the Switch's GPU through " +
-                         g_renderer_label, kGreen, false);
-        if (unfinished)
-        {
-            g_screen.Add("The last run didn't finish. What it left behind is below: take a photo of this screen first.",
-                         kRed, false);
-            g_screen.Add("", kWhite, false);
-            g_screen.Add("the end of its output (log.txt):", kYellow, false);
-            if (log.empty())
-                g_screen.Add("   (none: it stopped before its program printed anything)", kWhite, false);
-            for (const std::string& l : Last(log, 12))
-                g_screen.Add("   " + l, kWhite, false);
-            g_screen.Add("its crash report (crash.log):", kYellow, false);
-            const std::vector<std::string> report = LastCrash(crash);
-            if (report.empty())
-                g_screen.Add("   (none)", kWhite, false);
-            for (const std::string& l : report)
-                g_screen.Add(l, kRed, false);
-            g_screen.Add("its last steps (boot-trace):", kYellow, false);
-            if (trace.empty())
-                g_screen.Add("   (none)", kWhite, false);
-            for (const std::string& l : Last(trace, 12))
-                g_screen.Add("   " + l, kWhite, false);
-        }
-        else if (!first)
-        {
-            g_screen.Add("The program ended; its output is in /data/eden-ps4/log.txt.", kWhite, false);
-        }
-        g_screen.Add("", kWhite, false);
-        g_screen.Add("Choose a program with the D-pad, X to boot it. Games (.nsp, .xci) and homebrew (.nro) go in "
-                     "/data/eden-ps4 or at the top of a USB drive.", kYellow, false);
-        g_screen.Add("In a program, both sticks pressed in (L3 + R3) for a second stop it.", kGrey, false);
-        if (!notice.empty())
-            g_screen.Add(notice, kRed, false);
-        // (a window of the list around the choice, when it is long)
-        constexpr size_t kShown = 16;
-        const size_t first_shown = programs.size() <= kShown ? 0
-                                   : std::min(selected > kShown / 2 ? selected - kShown / 2 : 0, programs.size() - kShown);
-        const size_t end_shown = std::min(programs.size(), first_shown + kShown);
-        if (first_shown > 0)
-            g_screen.Add(fmt::format("      ({} more above)", first_shown), kGrey, false);
-        for (size_t i = first_shown; i < end_shown; i++)
-            g_screen.Add((i == selected ? "  >  " : "      ") + programs[i].label, i == selected ? kGreen : kWhite,
-                         false);
-        if (end_shown < programs.size())
-            g_screen.Add(fmt::format("      ({} more below)", programs.size() - end_shown), kGrey, false);
-    };
-    page();
+    std::vector<Ui::Title> titles = LoadTitles();
+    menu.SetGamesStatus(GamesStatus(titles), "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or at "
+                                             "the top of a USB drive (FTP, or a USB drive formatted exFAT). A game "
+                                             "needs the keys and firmware of the Switch it was dumped from.");
+    const size_t count = titles.size();
+    menu.SetTitles(std::move(titles));
+    menu.SetSettings(settings);
+    menu.SetInfo(EDEN_PS4_VERSION, g_renderer_label, radv);
+    std::error_code ec;
+    menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec));
+    menu.SetNews(News());
+    menu.SetControllerTest("/app0/padtest.nro");
+    if (unfinished)
+        menu.ShowReport({Last(log, 40), LastCrash(crash), Last(trace, 24)});
     Trace(fmt::format("start page: last run {}, pad {}, {} programs", unfinished ? "unfinished" : "finished or none",
-                      g_pad, programs.size()));
+                      g_pad, count));
 
-    // with a controller after an unfinished run, or after this session's first run: wait for the
-    // choice (the photo comes first)
-    bool wait = g_pad >= 0 && (unfinished || !first);
-    if (!first && g_pad < 0)
-    {
-        g_screen.SetStatus("no controller: close the app (PS button)");
-        for (;;)
-            sleep(1);
-    }
-    const int countdown = g_pad < 0 ? 60 : 15;
+    menu.SetHeld(MenuButtons(MenuPad())); // (a button still held from the game doesn't count)
     const double start = Seconds();
-    uint32_t previous = PadButtons(); // a button still held from before doesn't count
-    std::string program = kTestProgram;
-    for (int last_shown = -1;;)
+    const int countdown = 60;
+    MenuChoice choice{kTestProgram, settings};
+    for (;;)
     {
-        const uint32_t buttons = PadButtons();
-        const uint32_t pressed = buttons & ~previous;
-        previous = buttons;
-        if (pressed & ORBIS_PAD_BUTTON_CROSS)
+        const double now = Seconds();
+        const uint32_t pad = MenuPad();
+        menu.SetClock(ClockText());
+        menu.SetController(g_pad >= 0);
+        if (g_pad < 0)
         {
-            // a game needs the keys of the Switch it was dumped from
-            const std::string keys = std::string(kDataDir) + "/user/keys/prod.keys";
-            std::error_code ec;
-            if (!IsGame(programs[selected].path) || std::filesystem::exists(keys, ec))
-            {
-                program = programs[selected].path;
+            const int left = countdown - int(now - start);
+            menu.SetCountdown(first ? std::max(left, 0) : -1);
+            if (first && left <= 0)
                 break;
-            }
-            notice = "No keys: a game (.nsp, .xci) needs prod.keys (and title.keys) from your Switch in "
-                     "/data/eden-ps4/user/keys/, and its firmware in /data/eden-ps4/user/nand/system/Contents/registered/.";
-            Trace("start page: no " + keys + " for " + programs[selected].path);
-            wait = true;
-            page();
         }
-        if (pressed & (ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN))
+        const Ui::MenuAction action = menu.Update(MenuButtons(pad), now);
+        if (action.kind == Ui::MenuAction::Kind::Boot)
         {
-            selected = (selected + (pressed & ORBIS_PAD_BUTTON_UP ? programs.size() - 1 : 1)) % programs.size();
-            wait = true; // a choice is being made: no countdown
-            last_shown = -1;
-            page();
-        }
-        const int left = countdown - int(Seconds() - start);
-        if (!wait && left <= 0)
+            choice.program = action.path;
             break;
-        if (!wait && left != last_shown)
-        {
-            last_shown = left;
-            g_screen.SetStatus(fmt::format("{}the test program boots in {} s", g_pad < 0 ? "no controller found: " : "",
-                                           left));
         }
-        else if (wait && last_shown != 0)
+        if (action.kind == Ui::MenuAction::Kind::Quit)
         {
-            last_shown = 0;
-            g_screen.SetStatus("waiting for a button");
+            Trace("start page: closing the app");
+            sceSystemServiceLoadExec("exit", nullptr);
+            _exit(0);
         }
-        g_mutex.unlock();
-        usleep(50 * 1000);
-        g_mutex.lock();
+        if (action.kind == Ui::MenuAction::Kind::SettingsChanged)
+        {
+            choice.settings = menu.Settings();
+            SaveMenuSettings(choice.settings);
+            Trace(fmt::format("start page: settings: theme {}, renderer {}, {}",
+                              choice.settings.white_theme ? "white" : "black",
+                              choice.settings.software_renderer ? "software" : "vulkan",
+                              choice.settings.docked ? "docked" : "handheld"));
+        }
+        menu.Draw(canvas, now);
+        g_screen.DrawFrame({canvas.Pixels(), size_t(canvas.Width()) * canvas.Height()}, uint32_t(canvas.Width()),
+                           uint32_t(canvas.Height()));
+        // about 30 frames a second
+        lock.unlock();
+        const double spent = Seconds() - now;
+        if (spent < 1.0 / 30)
+            usleep(useconds_t((1.0 / 30 - spent) * 1e6));
+        lock.lock();
     }
-    Trace("start page: booting " + program);
+    menu.SetCountdown(-1);
+    choice.settings = menu.Settings();
+    Trace("start page: booting " + choice.program);
 
     // the last run's files are kept, under other names
     rename(kLogFile, "/data/eden-ps4/log-previous.txt");
@@ -847,7 +1070,7 @@ std::string StartPage(bool first)
     rename(kHangFile, "/data/eden-ps4/hang-previous.log");
     g_screen.Clear();
     g_screen.SetScale(2.0f);
-    return program;
+    return choice;
 }
 
 void ShowLine(Launcher::LineKind kind, std::string_view text)
@@ -1021,21 +1244,37 @@ void* Run(void*)
     setenv("EDEN_SW_STATS", "1", 0);
     setenv("EDEN_SW_THREADS", "4", 0);
     Launcher::SetAudio(MakeAudioOutput);
-    // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless settings.txt says
-    // EDEN_PS4_RENDERER=null (the software renderer)
+    // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless System Settings
+    // (or settings.txt, EDEN_PS4_RENDERER=null) chose the software renderer, or Vulkan didn't
+    // start this session
     const char* renderer = std::getenv("EDEN_PS4_RENDERER");
     const bool radv = vk_icdGetInstanceProcAddr(nullptr, "vkCreateInstance") != nullptr;
-    bool gpu = radv && !(renderer && std::string_view{renderer} == "null");
+    const bool forced_null = renderer && std::string_view{renderer} == "null";
+    bool vulkan_failed = false;
     // RADV's own log and its GPU hang and fault reports (port/mesa/ac_ps4_drm.c), here
     setenv("RADV_PS4_DIR", (std::string(kDataDir) + "/gpu").c_str(), 0);
-    Trace(fmt::format("renderer: {}", gpu    ? "Vulkan on the PS4's GPU (Mesa's RADV)"
-                                      : radv ? "null (EDEN_PS4_RENDERER=null)"
-                                             : "null (no RADV in this build)"));
-    Launcher::SetGpuDisplay(gpu);
-    g_renderer_label = gpu ? "Vulkan on the PS4's GPU (Mesa's RADV)" : "the software renderer";
+    Ui::MenuSettings settings = LoadMenuSettings();
+    const auto choose_renderer = [&] {
+        const bool use_gpu = radv && !forced_null && !settings.software_renderer && !vulkan_failed;
+        g_renderer_label = use_gpu        ? "Vulkan on the PS4's GPU (Mesa's RADV)"
+                           : vulkan_failed ? "the software renderer (Vulkan didn't start: see log-vulkan.txt)"
+                           : !radv         ? "the software renderer (no RADV in this build)"
+                           : forced_null   ? "the software renderer (EDEN_PS4_RENDERER=null)"
+                                           : "the software renderer (chosen in System Settings)";
+        return use_gpu;
+    };
+    bool gpu = choose_renderer();
+    Trace("renderer: " + g_renderer_label);
     for (bool first = true;; first = false)
     {
-        const std::string program = StartPage(first);
+        const MenuChoice choice = ShowHomeMenu(first, radv, settings);
+        const std::string& program = choice.program;
+        settings = choice.settings;
+        gpu = choose_renderer();
+        Launcher::SetGpuDisplay(gpu);
+        Launcher::SetDocked(settings.docked);
+        NoteRecent(program);
+        Trace(fmt::format("renderer: {}; console mode: {}", g_renderer_label, settings.docked ? "docked" : "handheld"));
         {
             std::lock_guard lock{g_mutex};
             g_screen.SetStatus(fmt::format("booting {}", program));
@@ -1068,10 +1307,10 @@ void* Run(void*)
         {
             // Vulkan didn't start (RADV couldn't open the GPU: this boot's log, kept as
             // log-vulkan.txt, and gpu/radv-ps4.log say why): the software renderer, from now on
-            gpu = false;
+            vulkan_failed = true;
+            gpu = choose_renderer();
             Launcher::SetGpuDisplay(false);
             rename(kLogFile, "/data/eden-ps4/log-vulkan.txt");
-            g_renderer_label = "the software renderer (Vulkan didn't start: see log-vulkan.txt)";
             Trace("renderer: Vulkan did not start; the null renderer from now on");
             ShowLine(Launcher::LineKind::Status,
                      "Vulkan did not start (see log-vulkan.txt): booting again with the software renderer");
