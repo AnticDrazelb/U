@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -940,6 +942,56 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
 }
 
 // The Games and Keys screen: the keys, the firmware and the games found
+// What the app itself sees at the USB drives' mount points (/mnt/usb0-7): whether each is there for
+// it, whether it can be opened (the system's reason if not), and what's at its top. The system's
+// own package installer reading a drive doesn't mean an app may.
+std::string UsbReport(bool* readable = nullptr)
+{
+    if (readable)
+        *readable = false; // (set when a drive could be opened and has something on it)
+    std::vector<std::string> seen;
+    for (int i = 0; i < 8; i++)
+    {
+        const std::string path = fmt::format("/mnt/usb{}", i);
+        struct stat status{};
+        if (stat(path.c_str(), &status) != 0)
+        {
+            if (errno != ENOENT)
+                seen.push_back(fmt::format("{}: can't be looked at ({})", path, std::strerror(errno)));
+            continue;
+        }
+        DIR* folder = opendir(path.c_str());
+        if (!folder)
+        {
+            seen.push_back(fmt::format("{}: there, but can't be opened ({})", path, std::strerror(errno)));
+            continue;
+        }
+        size_t entries = 0, games = 0;
+        bool keys = false;
+        while (const dirent* entry = readdir(folder))
+        {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..")
+                continue;
+            entries++;
+            const std::string extension = Lower(std::filesystem::path(name).extension().string());
+            games += extension == ".nsp" || extension == ".xci" || extension == ".nro" || extension == ".nso";
+            keys |= name == "prod.keys";
+        }
+        closedir(folder);
+        if (readable && entries > 0)
+            *readable = true;
+        seen.push_back(fmt::format("{}: {} entries at its top, {} games{}", path, entries, games,
+                                   keys ? ", prod.keys" : ""));
+    }
+    if (seen.empty())
+        return "none of /mnt/usb0 to /mnt/usb7 is there for the app";
+    std::string text;
+    for (const std::string& line : seen)
+        text += (text.empty() ? "" : "; ") + line;
+    return text;
+}
+
 std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
 {
     std::vector<Ui::StatusRow> rows;
@@ -961,6 +1013,9 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
                                                        "(.nca files) there",
                                                        kFirmwareDir),
                     firmware > 0});
+    bool readable = false;
+    const std::string usb = UsbReport(&readable);
+    rows.push_back({"USB drives, as the app sees them", usb, readable});
     return rows;
 }
 
@@ -1006,7 +1061,8 @@ struct UsbImportJob
 std::string UsbImportReport(const Launcher::UsbImport& r)
 {
     if (r.keys_folder.empty() && r.firmware_folder.empty())
-        return "No prod.keys and no firmware on a USB drive. Put prod.keys and title.keys at the top of the drive (or "
+        return "No prod.keys and no firmware on a USB drive (the app sees: " + UsbReport() + "). Put prod.keys and "
+               "title.keys at the top of the drive (or "
                "in its switch folder), and the firmware on it: its .zip as it came, or its .nca files in a folder "
                "(Firmware 19.0.1, say). The drive must be exFAT or FAT32.";
     std::string text;
@@ -1038,7 +1094,10 @@ std::vector<std::pair<std::string, std::string>> News()
          "03.71: firmware as it comes, a .zip: send it from the browser page as it is, or put it on a USB drive "
          "for Import from USB. The PS4 unpacks it, checks every file, and keeps the firmware it had if the zip "
          "turns out damaged. Fixed with it: firmware sent before was added to the old one instead of replacing "
-         "it (the PS4 couldn't delete folders); send yours once more to be sure."},
+         "it (the PS4 couldn't delete folders); send yours once more to be sure.\n"
+         "03.72: Games and Keys shows what the app itself sees of each USB drive (whether it may open it at "
+         "all, and what's at its top), as the boot trace does: the system installing packages from a drive "
+         "doesn't mean an app is allowed to read it."},
         {"Before: 03.60",
          "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
          "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
@@ -1244,6 +1303,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         menu.ShowMessage(fmt::format("{} didn't start.", g_load_failure_name), why);
         g_load_failure.clear();
     }
+    Trace("usb: " + UsbReport());
     Trace(fmt::format("start page: last run {}, pad {}, {} programs", unfinished ? "unfinished" : "finished or none",
                       g_pad, count));
 
