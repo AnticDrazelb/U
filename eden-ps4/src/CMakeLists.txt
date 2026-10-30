@@ -38,6 +38,7 @@ if (PS4)
         "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")
 
     add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp usb_import.cpp web_server.cpp log_tools.cpp
+                            firmware_zip.cpp
                             ${EDEN_PS4_UI_SOURCES}
                             ${EDEN_PS4_RUNTIME_SOURCES})
     target_include_directories(eden-ps4 PRIVATE ${CMAKE_CURRENT_LIST_DIR})
@@ -45,7 +46,9 @@ if (PS4)
     target_link_libraries(eden-ps4 PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut
         SceAudioOut ScePad SceNet
         # the runtime's network file system wraps (port/ps4_netfs.cpp)
-        ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a)
+        ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a
+        # firmware zips (firmware_zip.cpp)
+        ${PS4_SYSROOT}/lib/libz.a)
     # the runtime's __real_gethostbyname: LLD 12's --wrap doesn't fetch libc.a's gethostbyname for
     # it alone, and create-fself can't import it
     target_link_options(eden-ps4 PRIVATE --undefined=gethostbyname)

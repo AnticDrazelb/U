@@ -54,8 +54,10 @@ constexpr std::string_view kWebPage = R"PAGE(<!doctype html>
 
   <section>
     <h2>Firmware</h2>
-    <p>That Switch's firmware: a folder of .nca files. It replaces the firmware on the PS4.</p>
-    <label class="button">Choose the folder<input type="file" id="fw-folder" webkitdirectory directory multiple></label>
+    <p>That Switch's firmware: its .zip as it came (the PS4 unpacks it), or the folder of .nca files.
+       It replaces the firmware on the PS4.</p>
+    <label class="button">Choose the .zip<input type="file" id="fw-zip" accept=".zip"></label>
+    <label class="button">or the folder<input type="file" id="fw-folder" webkitdirectory directory multiple></label>
     <label class="button">or its .nca files<input type="file" id="fw-files" multiple accept=".nca"></label>
     <div class="bar" id="fw-bar"><div></div></div><div class="msg" id="fw-msg"></div>
   </section>
@@ -117,13 +119,14 @@ function put(kind, file, onProgress) {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", "/upload/" + kind + "/" + encodeURIComponent(file.name));
     xhr.upload.onprogress = (e) => onProgress(e.loaded);
-    xhr.onload = () => xhr.status === 200 ? resolve() : reject(new Error(xhr.responseText.trim() || ("HTTP " + xhr.status)));
+    xhr.onload = () => xhr.status === 200 ? resolve(xhr.responseText) : reject(new Error(xhr.responseText.trim() || ("HTTP " + xhr.status)));
     xhr.onerror = () => reject(new Error("the connection to the PS4 broke"));
     xhr.send(file);
   });
 }
 
-async function uploadAll(prefix, kind, files) {
+// `after`: what to say once the last byte is sent and the PS4 is still working on it
+async function uploadAll(prefix, kind, files, after) {
   if (busy) { alert("Another upload is still running."); return false; }
   busy = true;
   const bar = $(prefix + "-bar"), fill = bar.firstElementChild, msg = $(prefix + "-msg");
@@ -132,17 +135,21 @@ async function uploadAll(prefix, kind, files) {
   const start = Date.now();
   bar.style.display = "block"; msg.className = "msg";
   try {
+    let reply = "";
     for (const [i, f] of files.entries()) {
-      await put(kind, f, (loaded) => {
+      reply = await put(kind, f, (loaded) => {
         const now = done + loaded, seconds = (Date.now() - start) / 1000;
         fill.style.width = (100 * now / Math.max(total, 1)) + "%";
-        msg.textContent = `${files.length > 1 ? `File ${i + 1} of ${files.length}: ` : ""}${f.name}\n` +
+        msg.textContent = after && now >= total ? after :
+          `${files.length > 1 ? `File ${i + 1} of ${files.length}: ` : ""}${f.name}\n` +
           `${size(now)} of ${size(total)}` + (seconds > 2 ? ` · ${size(now / seconds)}/s` : "");
       });
       done += f.size;
     }
     fill.style.width = "100%";
-    msg.textContent = files.length === 1 ? `${files[0].name} is on the PS4.` : `All ${files.length} files are on the PS4.`;
+    const detail = reply.split("\n").slice(1).join(" ").trim(); // (the PS4's own words, if any)
+    msg.textContent = detail ? detail :
+      files.length === 1 ? `${files[0].name} is on the PS4.` : `All ${files.length} files are on the PS4.`;
     return true;
   } catch (e) {
     msg.className = "msg err"; msg.textContent = "Stopped: " + e.message;
@@ -159,14 +166,22 @@ $("keys").onchange = (e) => {
   e.target.value = "";
 };
 async function firmware(e) {
-  const files = [...e.target.files].filter((f) => f.name.toLowerCase().endsWith(".nca"));
+  const chosen = [...e.target.files];
   e.target.value = "";
-  if (!files.length) { $("fw-msg").textContent = "No .nca files there."; return; }
+  const zip = chosen.find((f) => /\.zip$/i.test(f.name));
+  if (zip) {
+    if (!confirm(`Replace the firmware on the PS4 with the one in ${zip.name}?`)) return;
+    uploadAll("fw", "firmware", [zip], "Unpacking it on the PS4 (this takes a minute)…");
+    return;
+  }
+  const files = chosen.filter((f) => f.name.toLowerCase().endsWith(".nca"));
+  if (!files.length) { $("fw-msg").textContent = "No .nca files or firmware .zip there."; return; }
   if (!confirm(`Replace the firmware on the PS4 with these ${files.length} files?`)) return;
   const r = await fetch("/api/firmware/clear", {method: "POST"});
   if (!r.ok) { $("fw-msg").textContent = "The PS4 couldn't clear its old firmware."; return; }
   uploadAll("fw", "firmware", files);
 }
+$("fw-zip").onchange = firmware;
 $("fw-folder").onchange = firmware;
 $("fw-files").onchange = firmware;
 $("games").onchange = (e) => {

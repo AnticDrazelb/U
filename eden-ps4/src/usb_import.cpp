@@ -2,6 +2,7 @@
 // the launcher reads and writes them on the PS4.
 
 #include "usb_import.h"
+#include "firmware_zip.h"
 
 #include <algorithm>
 #include <cctype>
@@ -19,11 +20,16 @@ namespace fs = std::filesystem;
 
 constexpr size_t kMinFirmwareFiles = 10; // fewer .nca files than this in a folder: not a firmware
 
-bool IsNca(const fs::path& path)
+bool HasExtension(const fs::path& path, const char* extension)
 {
     std::string ext = path.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    return ext == ".nca";
+    return ext == extension;
+}
+
+bool IsNca(const fs::path& path)
+{
+    return HasExtension(path, ".nca");
 }
 
 std::vector<fs::path> NcaFiles(const fs::path& folder)
@@ -142,14 +148,44 @@ fs::path FindFirmware(const fs::path& drive, size_t& count)
     return best;
 }
 
+// A firmware's .zip at the drive's top or in a folder there, the one with the most .nca files
+fs::path FindFirmwareZip(const fs::path& drive, size_t& count)
+{
+    fs::path best;
+    count = 0;
+    const auto consider = [&](const fs::path& folder) {
+        std::error_code ec;
+        for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
+        {
+            if (!HasExtension(it->path(), ".zip") || !it->is_regular_file(ec))
+                continue;
+            const size_t n = CountZipNcas(it->path());
+            if (n > count)
+            {
+                count = n;
+                best = it->path();
+            }
+        }
+    };
+    consider(drive);
+    for (const fs::path& folder : Folders(drive))
+        consider(folder);
+    if (count < kMinFirmwareFiles)
+    {
+        count = 0;
+        return {};
+    }
+    return best;
+}
+
 } // namespace
 
 UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::string& user_dir,
                         const std::function<void(size_t, size_t)>& progress)
 {
     UsbImport result;
-    fs::path keys, firmware;
-    size_t firmware_count = 0;
+    fs::path keys, firmware, firmware_zip;
+    size_t firmware_count = 0, zip_count = 0;
     for (const std::string& drive_name : drives)
     {
         const fs::path drive{drive_name};
@@ -164,6 +200,14 @@ UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::strin
         {
             firmware = folder;
             firmware_count = count;
+        }
+        // a firmware still in its zip, as most come, if no drive has it unpacked
+        size_t in_zip = 0;
+        const fs::path zip = FindFirmwareZip(drive, in_zip);
+        if (in_zip > zip_count)
+        {
+            firmware_zip = zip;
+            zip_count = in_zip;
         }
     }
     std::error_code ec;
@@ -181,12 +225,21 @@ UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::strin
             result.title_keys = true;
         }
     }
+    if (firmware.empty() && !firmware_zip.empty())
+    {
+        const fs::path registered = fs::path{user_dir} / "nand" / "system" / "Contents" / "registered";
+        const ZipExtract extracted = InstallFirmwareZip(firmware_zip, registered, progress);
+        result.firmware_folder = firmware_zip.string();
+        result.firmware_files = extracted.files;
+        result.error = extracted.error;
+        return result;
+    }
     if (!firmware.empty())
     {
         // the firmware that was there goes (two versions mixed don't work), as Eden's own firmware
         // install does
         const fs::path registered = fs::path{user_dir} / "nand" / "system" / "Contents" / "registered";
-        fs::remove_all(registered, ec);
+        RemoveFolder(registered); // (not std::filesystem::remove_all: see firmware_zip.h)
         fs::create_directories(registered, ec);
         const std::vector<fs::path> files = NcaFiles(firmware);
         result.firmware_folder = firmware.string();

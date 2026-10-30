@@ -377,6 +377,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.71: **firmware zips.** Firmware usually comes as a `.zip` of its `.nca` files; the web page now
+takes it as it is and the PS4 unpacks it (`src/firmware_zip.cpp`, with zlib from the sysroot): the
+zip's central directory, stored and deflated entries, ZIP64, `.nca` files from any folder in it,
+"archive bit" folders (`x.nca/00`, `01`...) joined into one file, every file checked against its
+CRC, and nothing written outside the firmware folder whatever the zip's paths say. It unpacks
+beside the firmware there and swaps it in only when every file came out right, so a damaged
+download leaves the old firmware working. Import from USB does the same with a firmware zip on the
+drive when no drive has it unpacked. Tested on the desktop with zips Python made (stored, deflated,
+ZIP64, archive bit, `../` paths, a damaged one, one with 3 files: refused as no firmware), through
+the server, its page in Chromium, and the USB import.
+
+Found testing it in shadPS4: `std::filesystem::remove_all` has never removed anything on the PS4.
+libc++ walks the tree with `unlinkat`, which the PS4's C library has only as a stub that fails with
+ENOSYS. So the firmware a USB import (03.40) or the web page (03.60) replaced was never cleared: a
+second firmware was mixed into the first. The launcher removes folders entry by entry now
+(`RemoveFolder`, with `unlink` and `rmdir`, which the system has), and so does Eden's
+`RemoveDirRecursively` on the PS4 (patch 0061: a game deleting a save folder, Eden clearing its
+temporary storage).
+
 03.70: **the Switch's RAM on demand, so the GPU gets the memory games don't use.** Eden mapped
 the Switch's 4 GiB of DRAM onto 4 GiB of the PS4's 4.5 GiB of direct memory as a program started,
 leaving about 480 MiB for RADV (textures, buffers, command buffers) and the C heap's overflow;

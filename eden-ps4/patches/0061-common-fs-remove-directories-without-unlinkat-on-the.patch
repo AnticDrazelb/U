@@ -1,0 +1,77 @@
+From aaabd30aa0ee079b1173323fa972efcc3e9f4032 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 18:41:37 +0000
+Subject: [PATCH] common/fs: remove directories without unlinkat on the PS4
+
+std::filesystem::remove_all goes through unlinkat, which the PS4's C library
+has only as a stub failing with ENOSYS: nothing was ever removed (a game
+deleting a save folder, Eden clearing its temporary storage). On the PS4,
+RemoveDirRecursively walks the tree and removes each entry with unlink and
+rmdir, which the system has.
+---
+ src/common/fs/fs.cpp | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/common/fs/fs.cpp b/src/common/fs/fs.cpp
+index 90cef1500..4256755e0 100644
+--- a/src/common/fs/fs.cpp
++++ b/src/common/fs/fs.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <vector>
++
+ #include "common/fs/file.h"
+ #include "common/fs/fs.h"
+ #ifdef __ANDROID__
+@@ -272,6 +274,34 @@ bool RemoveDir(const fs::path& path) {
+     return true;
+ }
+ 
++#ifdef __OPENORBIS__
++namespace {
++// std::filesystem::remove_all needs unlinkat, which the PS4's C library has only as a stub (it
++// fails with ENOSYS, so nothing was ever removed): one entry at a time, with unlink and rmdir
++void RemoveTree(const fs::path& path, std::error_code& ec) {
++    std::vector<fs::path> children;
++    for (fs::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
++        children.push_back(it->path());
++    }
++    if (ec) {
++        return;
++    }
++    for (const fs::path& child : children) {
++        std::error_code status_ec;
++        if (fs::is_directory(fs::symlink_status(child, status_ec))) {
++            RemoveTree(child, ec);
++        } else {
++            fs::remove(child, ec);
++        }
++        if (ec) {
++            return;
++        }
++    }
++    fs::remove(path, ec);
++}
++} // namespace
++#endif
++
+ bool RemoveDirRecursively(const fs::path& path) {
+     if (!ValidatePath(path)) {
+         LOG_ERROR(Common_Filesystem, "Input path is not valid, path={}", PathToUTF8String(path));
+@@ -292,7 +322,11 @@ bool RemoveDirRecursively(const fs::path& path) {
+ 
+     std::error_code ec;
+ 
++#ifdef __OPENORBIS__
++    RemoveTree(path, ec);
++#else
+     fs::remove_all(path, ec);
++#endif
+ 
+     if (ec) {
+         LOG_ERROR(Common_Filesystem,
+-- 
+2.43.0
+

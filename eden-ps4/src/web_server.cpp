@@ -8,13 +8,15 @@
 //                                 named, samples.log summed up: log_tools.h)
 //   GET  /api/profile             samples.log summed up
 //   GET  /files/<path>            one log (the data folder's .log and .txt files, and gpu/)
-//   PUT  /upload/<kind>/<name>    kind keys (*.keys), firmware (*.nca), games (.nsp .xci .nro .nso)
+//   PUT  /upload/<kind>/<name>    kind keys (*.keys), firmware (*.nca, or a .zip of them: unpacked
+//                                 here, replacing the firmware), games (.nsp .xci .nro .nso)
 //                                 or updates (updates and DLC, .nsp: applied as their game boots)
 //   POST /api/firmware/clear      removes the firmware (before a new one is uploaded)
 //   DELETE /files/<name>          removes a game from the data folder
 //   DELETE /updates/<name>        removes an update or DLC
 
 #include "web_server.h"
+#include "firmware_zip.h"
 #include "log_tools.h"
 
 #include <algorithm>
@@ -50,6 +52,7 @@ constexpr size_t kMaxHead = 16 * 1024;
 constexpr int kMaxConnections = 6;
 constexpr size_t kLogLimit = size_t(8) << 20; // per file in the log bundle (its end)
 constexpr size_t kLogLimitWhileRunning = size_t(2) << 20; // (the program needs the memory)
+constexpr size_t kMinFirmwareFiles = 10; // fewer .nca files than this in a zip: not a firmware
 
 std::atomic<int> g_connections{0};
 
@@ -481,10 +484,13 @@ private:
         const std::string kind = rest.substr(0, slash);
         const std::string name = slash == std::string::npos ? std::string() : UrlDecode(rest.substr(slash + 1));
         fs::path folder;
+        const bool firmware_zip = kind == "firmware" && EndsWith(name, ".zip");
         if (kind == "keys" && EndsWith(name, ".keys"))
             folder = data / "user" / "keys";
         else if (kind == "firmware" && EndsWith(name, ".nca"))
             folder = Registered();
+        else if (firmware_zip)
+            folder = data / "tmp";
         else if (kind == "games" && IsGame(name))
             folder = data;
         else if (kind == "updates" && EndsWith(name, ".nsp"))
@@ -501,7 +507,7 @@ private:
         }
         std::error_code ec;
         fs::create_directories(folder, ec);
-        const fs::path target = folder / name;
+        const fs::path target = folder / (firmware_zip ? std::string("firmware.zip") : name);
         const fs::path partial = target.string() + ".part";
         std::unique_ptr<std::FILE, int (*)(std::FILE*)> out{std::fopen(partial.c_str(), "wb"), std::fclose};
         if (!out)
@@ -537,14 +543,47 @@ private:
             return;
         }
         Log("uploaded " + target.string() + " (" + std::to_string(request.content_length) + " bytes)");
+        if (firmware_zip)
+        {
+            InstallFirmwareZip(connection, target, name);
+            return;
+        }
         Changed();
         connection.Respond(200, "OK", "text/plain; charset=utf-8", "ok\n");
+    }
+
+    // A firmware's zip, just uploaded: its .nca files replace the firmware there, then it goes
+    void InstallFirmwareZip(Connection& connection, const fs::path& zip, const std::string& name)
+    {
+        std::error_code ec;
+        const size_t ncas = CountZipNcas(zip);
+        if (ncas < kMinFirmwareFiles)
+        {
+            fs::remove(zip, ec);
+            connection.Error(400, "Bad Request",
+                             ncas ? name + " has only " + std::to_string(ncas) + " .nca files: that isn't a firmware."
+                                  : name + " isn't a zip this can read, or has no .nca files in it.");
+            return;
+        }
+        const ZipExtract result = Launcher::InstallFirmwareZip(zip, Registered());
+        fs::remove(zip, ec);
+        Changed();
+        if (!result.error.empty())
+        {
+            Log("firmware from " + name + ": stopped after " + std::to_string(result.files) + " files: " + result.error);
+            connection.Error(500, "Internal Server Error",
+                             "Stopped after " + std::to_string(result.files) + " files: " + result.error);
+            return;
+        }
+        Log("firmware from " + name + ": " + std::to_string(result.files) + " files");
+        connection.Respond(200, "OK", "text/plain; charset=utf-8",
+                           "ok\nThe firmware is installed: " + std::to_string(result.files) + " files.\n");
     }
 
     void ClearFirmware(Connection& connection)
     {
         std::error_code ec;
-        const uintmax_t removed = fs::remove_all(Registered(), ec);
+        const uintmax_t removed = RemoveFolder(Registered());
         fs::create_directories(Registered(), ec);
         Log("firmware cleared (" + std::to_string(removed) + " entries)");
         Changed();

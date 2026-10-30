@@ -990,7 +990,8 @@ Ui::StatusRow SoftwareStatus(const std::vector<Ui::Title>& titles)
 constexpr const char* kGamesHelp =
     "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or at the top of a USB drive (exFAT or FAT32). A "
     "game needs the keys and firmware of the Switch it was dumped from: put prod.keys and title.keys at the top of a "
-    "USB drive (or in its switch folder) and the firmware's .nca files in a folder on it, then Import from USB. Or "
+    "USB drive (or in its switch folder) and the firmware on it (its .zip, or its .nca files in a folder), then "
+    "Import from USB. Or "
     "send all of them from a browser: the address is at the top of the HOME menu.";
 
 // Import from USB (Games and Keys): the copy runs on its own thread, its progress in a message
@@ -1006,8 +1007,8 @@ std::string UsbImportReport(const Launcher::UsbImport& r)
 {
     if (r.keys_folder.empty() && r.firmware_folder.empty())
         return "No prod.keys and no firmware on a USB drive. Put prod.keys and title.keys at the top of the drive (or "
-               "in its switch folder), and the firmware's .nca files in a folder on it (Firmware 19.0.1, say). The "
-               "drive must be exFAT or FAT32.";
+               "in its switch folder), and the firmware on it: its .zip as it came, or its .nca files in a folder "
+               "(Firmware 19.0.1, say). The drive must be exFAT or FAT32.";
     std::string text;
     if (!r.keys_folder.empty())
         text += fmt::format("prod.keys{} from {}.\n", r.title_keys ? " and title.keys" : "", r.keys_folder);
@@ -1033,7 +1034,11 @@ std::vector<std::pair<std::string, std::string>> News()
          "System Settings, System, Switch Memory turns this off.\n"
          "Updates and DLC: .nsp files sent from the browser page (or put in /data/eden-ps4/updates) are applied "
          "as their game starts. Many games need their latest update.\n"
-         "Every 30 seconds while a game runs, boot-trace.log notes its frame rate and where the memory went."},
+         "Every 30 seconds while a game runs, boot-trace.log notes its frame rate and where the memory went.\n"
+         "03.71: firmware as it comes, a .zip: send it from the browser page as it is, or put it on a USB drive "
+         "for Import from USB. The PS4 unpacks it, checks every file, and keeps the firmware it had if the zip "
+         "turns out damaged. Fixed with it: firmware sent before was added to the old one instead of replacing "
+         "it (the PS4 couldn't delete folders); send yours once more to be sure."},
         {"Before: 03.60",
          "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
          "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
@@ -1064,7 +1069,8 @@ std::vector<std::pair<std::string, std::string>> News()
          "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive, or send them from a browser (the "
          "address at the top of the HOME menu). They need the keys and firmware of the Switch they were dumped "
          "from: send them from the browser too, or put prod.keys and title.keys at the top of a USB drive (or in "
-         "its switch folder) and the firmware's .nca files in a folder on it, then Import from USB in Games and "
+         "its switch folder) and the firmware (its .zip, or its .nca files in a folder) on it, then Import from USB "
+         "in Games and "
          "Keys. A game's icon and name appear once it has booted once."},
         {"The HOME menu",
          "Your software is in the row, the most recently played first, and All Software at its end has everything. "

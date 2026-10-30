@@ -165,8 +165,8 @@ MenuAction HomeMenu::Start(size_t index)
         dialog.title = "The keys of your Switch are needed.";
         dialog.text = web_address.empty()
             ? "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
-              "that Switch's firmware. Put them on a USB drive (the keys at the top, the firmware's .nca "
-              "files in a folder), then Import from USB (Square) in Games and Keys."
+              "that Switch's firmware. Put them on a USB drive (the keys at the top, the firmware's .zip or "
+              "its .nca files in a folder), then Import from USB (Square) in Games and Keys."
             : "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
               "that Switch's firmware. Open " + web_address + " in a browser on a PC or phone on the same "
               "network to send them, or put them on a USB drive and Import from USB in Games and Keys.";
