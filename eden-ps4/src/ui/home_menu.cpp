@@ -196,7 +196,14 @@ MenuAction HomeMenu::ChooseDialog(int button)
             return {MenuAction::Kind::Quit, {}};
         break;
     case DialogKind::TitleInfo:
-        if (button == 1)
+        if (dialog.offers_copy && button == 1 && dialog.title_index < titles.size())
+        {
+            MenuAction action;
+            action.kind = MenuAction::Kind::CopyToPs4;
+            action.path = titles[dialog.title_index].path;
+            return action;
+        }
+        if (button == (dialog.offers_copy ? 2 : 1))
             return Start(dialog.title_index);
         break;
     case DialogKind::Message:
@@ -204,6 +211,20 @@ MenuAction HomeMenu::ChooseDialog(int button)
         break;
     }
     return {};
+}
+
+void HomeMenu::OpenTitleInfo(size_t index)
+{
+    Dialog dialog;
+    dialog.kind = DialogKind::TitleInfo;
+    dialog.title_index = index;
+    // a game on a USB drive or in the Game Folder can be copied to the PS4's own storage
+    dialog.offers_copy = index < titles.size() && titles[index].game && titles[index].location != "data folder" &&
+                         titles[index].location != "in the package";
+    dialog.buttons = dialog.offers_copy ? std::vector<std::string>{"Close", "Copy to the PS4", "Start"}
+                                        : std::vector<std::string>{"Close", "Start"};
+    dialog.selected = int(dialog.buttons.size()) - 1;
+    OpenDialog(std::move(dialog));
 }
 
 MenuAction HomeMenu::Update(uint32_t held, double now)
@@ -265,14 +286,7 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
                 return Start(home_tile);
             }
             if ((pressed & kOptions) && home_tile < HomeCount())
-            {
-                Dialog dialog;
-                dialog.kind = DialogKind::TitleInfo;
-                dialog.title_index = home_tile;
-                dialog.buttons = {"Close", "Start"};
-                dialog.selected = 1;
-                OpenDialog(std::move(dialog));
-            }
+                OpenTitleInfo(home_tile);
         }
         else
         {
@@ -336,14 +350,7 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
         if (pressed & kCross)
             return Start(grid_index);
         if (pressed & kOptions)
-        {
-            Dialog dialog;
-            dialog.kind = DialogKind::TitleInfo;
-            dialog.title_index = grid_index;
-            dialog.buttons = {"Close", "Start"};
-            dialog.selected = 1;
-            OpenDialog(std::move(dialog));
-        }
+            OpenTitleInfo(grid_index);
         return {};
     }
 
@@ -770,6 +777,10 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "New shaders are built in the background instead of stopping the game while they compile (slow on "
              "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",
              [](MenuSettings& s) { s.async_shaders = !s.async_shaders; }},
+            {"FPS Counter", on_off(settings.fps_overlay),
+             "The frames shown each second, top left of the picture while a game runs (a game's own target is "
+             "usually 30 or 60).",
+             [](MenuSettings& s) { s.fps_overlay = !s.fps_overlay; }},
             {"GPU Accuracy", settings.gpu_high ? "High" : "Normal",
              "How closely the CPU waits for the GPU. High reads back what the GPU drew whenever the game's CPU code "
              "might look at it, and makes the CPU's every access to such memory take a slow path: needed by a few "

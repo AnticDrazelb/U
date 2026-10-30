@@ -297,4 +297,50 @@ UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::strin
     return result;
 }
 
+bool CopyWithProgress(const std::string& from, const std::string& to, std::string& error,
+                      const std::function<void(uint64_t, uint64_t)>& progress)
+{
+    const fs::path partial = to + ".part";
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> in{std::fopen(from.c_str(), "rb"), std::fclose};
+    if (!in)
+    {
+        error = "could not read " + from;
+        return false;
+    }
+    std::error_code ec;
+    const uint64_t total = fs::file_size(from, ec);
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> out{std::fopen(partial.c_str(), "wb"), std::fclose};
+    const auto fail = [&](std::string what) {
+        out.reset();
+        fs::remove(partial, ec);
+        error = std::move(what);
+        return false;
+    };
+    if (!out)
+        return fail("could not write " + partial.string());
+    std::vector<char> buffer(size_t(4) << 20);
+    uint64_t copied = 0;
+    for (;;)
+    {
+        const size_t n = std::fread(buffer.data(), 1, buffer.size(), in.get());
+        if (n > 0 && std::fwrite(buffer.data(), 1, n, out.get()) != n)
+            return fail("could not write " + partial.string() + " (is the console's storage full?)");
+        copied += n;
+        if (progress)
+            progress(copied, total);
+        if (n < buffer.size())
+        {
+            if (std::ferror(in.get()))
+                return fail("could not read " + from + " (was the drive unplugged?)");
+            break;
+        }
+    }
+    if (std::fclose(out.release()) != 0)
+        return fail("could not write " + partial.string());
+    fs::rename(partial, to, ec);
+    if (ec)
+        return fail("could not rename " + partial.string() + ": " + ec.message());
+    return true;
+}
+
 } // namespace Launcher

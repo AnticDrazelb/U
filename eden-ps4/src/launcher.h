@@ -78,6 +78,8 @@ void SetCpuUnsafe(bool on);
 /// Eden's High GPU accuracy, with reactive flushing (GPU-written memory read back when the CPU
 /// touches it); off: Low, without, as Eden's phone builds default to. Set it before Boot.
 void SetGpuAccuracyHigh(bool on);
+// The frames presented a second, top left of the picture (System Settings, Graphics, FPS Counter)
+void SetFpsOverlay(bool on);
 
 /// Keys and firmware used where they are (a USB drive), not copied: Eden reads prod.keys and
 /// title.keys from `keys_dir` instead of data_dir/user/keys, and the firmware's .nca files from

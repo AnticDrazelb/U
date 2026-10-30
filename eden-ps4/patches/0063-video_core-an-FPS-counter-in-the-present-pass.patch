@@ -1,0 +1,166 @@
+From a492afecaed2e27791c5430aa154bf05f6fabeb6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 22:31:44 +0000
+Subject: [PATCH] video_core: an FPS counter in the present pass
+
+Settings::values.show_fps_overlay (the PS4 frontend's System Settings,
+Graphics, FPS Counter): the frames presented each second, top left of the
+picture, as seven-segment digits drawn with vkCmdClearAttachments in the
+window adapt pass, after the layers - a dark box, then the digits' segments,
+sized from the render area. No pipeline, shader or texture of its own.
+---
+ src/common/settings.h                         |   2 +
+ .../present/window_adapt_pass.cpp             | 103 ++++++++++++++++++
+ 2 files changed, 105 insertions(+)
+
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 0506aa36d..d7f43dca6 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -493,6 +493,8 @@ struct Values {
+                                                             true,
+                                                             true};
+ 
++    // The frames presented a second, top left of the picture (the PS4 frontend's FPS counter)
++    Setting<bool> show_fps_overlay{linkage, false, "show_fps_overlay", Category::Renderer};
+     SwitchableSetting<u8, false> bg_red{
+                                         linkage, 0, "bg_red", Category::Renderer, Specialization::Default, true, true};
+     SwitchableSetting<u8, false> bg_green{
+diff --git a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+index 549b0660c..ab387c6f8 100644
+--- a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
++++ b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+@@ -4,6 +4,12 @@
+ // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <chrono>
++#include <string>
++#include <vector>
++
++#include "common/settings.h"
+ #include "core/frontend/framebuffer_layout.h"
+ #include "video_core/framebuffer_config.h"
+ #include "video_core/host_shaders/vulkan_present_vert_spv.h"
+@@ -18,6 +24,84 @@
+ 
+ namespace Vulkan {
+ 
++namespace {
++
++// The FPS counter (Settings::values.show_fps_overlay): the game's frames each second, as
++// seven-segment digits drawn with clears in the present pass - no pipeline or texture of its own. A
++// frame counts when the picture comes from another of the game's buffers than the last: a frame
++// presented again (the game slower than the display, or presented twice for a capture) doesn't.
++struct FpsCounter {
++    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    u32 frames = 0;
++    u32 shown = 0;
++    u64 last_buffer = 0;
++};
++FpsCounter fps_counter;
++
++// Counts this presentation (of the game's buffer at `buffer`); the rate over the last second or so
++u32 CountFrame(u64 buffer) {
++    if (buffer != fps_counter.last_buffer) {
++        fps_counter.frames++;
++        fps_counter.last_buffer = buffer;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    const double seconds = std::chrono::duration<double>(now - fps_counter.start).count();
++    if (seconds >= 1.0) {
++        fps_counter.shown = static_cast<u32>(fps_counter.frames / seconds + 0.5);
++        fps_counter.frames = 0;
++        fps_counter.start = now;
++    }
++    return fps_counter.shown;
++}
++
++// The counter's rectangles: a dark box, and the digits' segments
++void FpsRects(u32 value, VkExtent2D area, std::vector<VkClearRect>& box, std::vector<VkClearRect>& digits) {
++    // segments a b c d e f g, from the top clockwise, then the middle
++    static constexpr u8 kSegments[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
++    const s32 height = std::max<s32>(static_cast<s32>(area.height) / 24, 14);
++    const s32 width = height / 2;
++    const s32 thick = std::max(width / 5, 2);
++    const s32 gap = thick * 2;
++    const s32 pad = thick * 2;
++    const std::string text = std::to_string(std::min<u32>(value, 999));
++    const s32 count = static_cast<s32>(text.size());
++    const s32 x0 = pad * 2, y0 = pad * 2;
++    const auto rect = [&](s32 x, s32 y, s32 w, s32 h) {
++        const s32 right = std::min<s32>(x + w, static_cast<s32>(area.width));
++        const s32 bottom = std::min<s32>(y + h, static_cast<s32>(area.height));
++        if (right <= x || bottom <= y) {
++            return VkClearRect{};
++        }
++        return VkClearRect{.rect = {.offset = {x, y},
++                                    .extent = {static_cast<u32>(right - x), static_cast<u32>(bottom - y)}},
++                           .baseArrayLayer = 0,
++                           .layerCount = 1};
++    };
++    box.push_back(rect(x0 - pad, y0 - pad, count * width + (count - 1) * gap + pad * 2, height + pad * 2));
++    for (s32 i = 0; i < count; i++) {
++        const u8 on = kSegments[text[static_cast<size_t>(i)] - '0'];
++        const s32 x = x0 + i * (width + gap);
++        const s32 half = height / 2;
++        const VkClearRect segments[7] = {
++            rect(x, y0, width, thick),                           // a
++            rect(x + width - thick, y0, thick, half),            // b
++            rect(x + width - thick, y0 + half, thick, half),     // c
++            rect(x, y0 + height - thick, width, thick),          // d
++            rect(x, y0 + half, thick, half),                     // e
++            rect(x, y0, thick, half),                            // f
++            rect(x, y0 + half - thick / 2, width, thick),        // g
++        };
++        for (int s = 0; s < 7; s++) {
++            if ((on & (1 << s)) && segments[s].rect.extent.width != 0) {
++                digits.push_back(segments[s]);
++            }
++        }
++    }
++    std::erase_if(box, [](const VkClearRect& r) { return r.rect.extent.width == 0; });
++}
++
++} // namespace
++
+ WindowAdaptPass::WindowAdaptPass(const Device& device, VkFormat frame_format, vk::Sampler&& sampler_, vk::ShaderModule&& fragment_shader_)
+     : sampler(std::move(sampler_))
+     , fragment_shader(std::move(fragment_shader_))
+@@ -69,6 +153,12 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+         layer_it++;
+     }
+ 
++    std::vector<VkClearRect> fps_box, fps_digits;
++    if (Settings::values.show_fps_overlay.GetValue()) {
++        const u64 buffer = configs.empty() ? 0 : configs[0].address + configs[0].offset;
++        FpsRects(CountFrame(buffer), render_area, fps_box, fps_digits);
++    }
++
+     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+         const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
+         const f32 bg_green = Settings::values.bg_green.GetValue() / 255.0f;
+@@ -103,6 +193,19 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+             cmdbuf.Draw(4, 1, 0, 0);
+         }
+ 
++        if (!fps_box.empty()) {
++            const VkClearAttachment dark{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                                         .colorAttachment = 0,
++                                         .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}}};
++            const VkClearAttachment light{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                                          .colorAttachment = 0,
++                                          .clearValue = {.color = {.float32 = {1.0f, 1.0f, 0.3f, 1.0f}}}};
++            cmdbuf.ClearAttachments({dark}, fps_box);
++            if (!fps_digits.empty()) {
++                cmdbuf.ClearAttachments({light}, fps_digits);
++            }
++        }
++
+         cmdbuf.EndRenderPass();
+     });
+ }
+-- 
+2.43.0
+

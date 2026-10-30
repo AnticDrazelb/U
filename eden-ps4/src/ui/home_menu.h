@@ -61,6 +61,7 @@ struct MenuSettings
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
     bool profiler = false;     // samples.log: where a game's busy threads spend their time
     bool ram_on_demand = true; // the Switch's RAM taken from the PS4's as the game uses it
+    bool fps_overlay = false;  // the frames presented a second, top left
     std::string games_folder;  // Game Folder: games, keys and firmware also looked for here, in all its
                                // folders (as Crema's): a USB drive or any folder (empty: none)
 };
@@ -80,8 +81,8 @@ struct Report
 
 struct MenuAction
 {
-    enum class Kind { None, Boot, Quit, SettingsChanged, ImportUsb } kind = Kind::None;
-    std::string path; // Boot: what to boot
+    enum class Kind { None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4 } kind = Kind::None;
+    std::string path; // Boot: what to boot; CopyToPs4: the game to copy into the data folder
 };
 
 class HomeMenu
@@ -132,6 +133,7 @@ private:
         std::vector<std::string> buttons;
         int selected = 0;
         size_t title_index = 0;
+        bool offers_copy = false; // TitleInfo: a game on a drive, "Copy to the PS4" its middle button
         double opened = 0;
     };
     struct Theme;
@@ -157,6 +159,8 @@ private:
     const Image& Tile(size_t index, int pixels);
     MenuAction Start(size_t index);
     void OpenDialog(Dialog dialog);
+    // OPTIONS on a title: where it is, Start, and for a game on a drive "Copy to the PS4"
+    void OpenTitleInfo(size_t index);
     MenuAction Navigate(uint32_t pressed, uint32_t moves);
     MenuAction ChooseDialog(int button);
 

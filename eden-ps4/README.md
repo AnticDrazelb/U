@@ -411,6 +411,17 @@ logs Eden's own measure every 10 s: `speed: the game N fps, emulation at N% of f
 work a frame` (`System::GetAndResetPerfStats`), in log.txt and the boot trace. In shadPS4: Breakout
 at 46-48 fps, 100%, and the file written to its USB drive at start and after the game.
 
+03.77: **an FPS counter, and copying games to the PS4.** Celeste plays smoothly on a console from
+the drive (03.75's Game Folder) once its first start (shaders, JIT) is over. System Settings,
+Graphics, **FPS Counter** draws the game's frame rate in the top left corner: patch 0063
+(`show_fps_overlay`, `window_adapt_pass.cpp`) counts the frames whose image changed in each second
+(a game presenting one image twice counts once, so it matches Eden's own measure), drawn as
+seven-segment digits with two `vkCmdClearAttachments` lists in the present pass, nothing new to
+compile. A game's Options (from the Game Folder, a USB drive or the import folder) now offers
+**Copy to the PS4**: copied to the data folder `/data/eden-ps4` in 4 MiB pieces through a `.part` name, on its
+own thread with its progress on screen, only if the PS4's drive keeps 1 GB spare afterwards. The
+list shows a game once, from the PS4's drive, when both have it.
+
 03.73: **USB drives.** On a console the app listed nothing from an exFAT drive the package had been
 installed from, though Crema, on the same runtime, lists Wii U games from USB drives on the same
 console. Three things in the launcher's own scan, none a matter of permissions: the game list was

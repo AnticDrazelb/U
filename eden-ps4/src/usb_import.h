@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -42,5 +43,11 @@ UsbKeysAndFirmware FindKeysAndFirmware(const std::vector<std::string>& drives);
 // <user_dir>/nand/system/Contents/registered. progress(copied, total) after each firmware file.
 UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::string& user_dir,
                         const std::function<void(size_t, size_t)>& progress);
+
+// Copies a file of any size (a game of several GB) through a ".part" name, so that a copy cut short
+// leaves nothing behind; `progress` gets the bytes copied and the total. False, with `error` set, if
+// it stopped.
+bool CopyWithProgress(const std::string& from, const std::string& to, std::string& error,
+                      const std::function<void(uint64_t, uint64_t)>& progress);
 
 } // namespace Launcher

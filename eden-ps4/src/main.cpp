@@ -88,7 +88,7 @@ public:
 bool g_gpu_display = false;
 bool g_docked = true;
 int g_resolution = 100;
-bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false;
+bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false, g_fps_overlay = false;
 std::string g_keys_dir, g_firmware_dir; // (empty: the user folder's)
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
@@ -176,6 +176,7 @@ void ApplyLauncherSettings() {
     // the CPU and marks it so that every guest access to it takes the slow path (no fastmem here)
     Settings::values.gpu_accuracy.SetValue(g_gpu_high ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);
     Settings::values.use_reactive_flushing.SetValue(g_gpu_high);
+    Settings::values.show_fps_overlay.SetValue(g_fps_overlay);
     // GPU macros (MME: games' draws and state changes go through them, on the GPU thread) compiled
     // to x86 code (on the PS4 into memory mapped executable from the start, patch 0051), not
     // interpreted; EDEN_PS4_MACRO_JIT=0 interprets them
@@ -294,6 +295,10 @@ void SetCpuUnsafe(bool on) {
 
 void SetGpuAccuracyHigh(bool on) {
     g_gpu_high = on;
+}
+
+void SetFpsOverlay(bool on) {
+    g_fps_overlay = on;
 }
 
 void SetKeysAndFirmware(std::string keys_dir, std::string firmware_dir) {

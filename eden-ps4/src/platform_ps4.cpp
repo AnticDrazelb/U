@@ -913,16 +913,23 @@ std::vector<Ui::Title> LoadTitles()
     if (!g_games_folder.empty())
         folders.insert(folders.begin(), {g_games_folder, "Game Folder", kGameFolderDepth});
     std::set<std::string> seen;
+    // a game copied to the PS4 (Copy to the PS4) starts from there: its copy on a drive isn't listed
+    std::set<std::string> in_data_folder;
+    for (const std::filesystem::path& path : GameFiles(kDataDir, 0))
+        in_data_folder.insert(path.filename().string());
     for (const auto& [folder, where, depth] : folders)
     {
         const std::vector<std::filesystem::path> found = GameFiles(folder, depth);
         for (const std::filesystem::path& path : found)
         {
+            const bool in_data = path.lexically_normal().parent_path() == std::filesystem::path(kDataDir);
+            if (!in_data && in_data_folder.count(path.filename().string()))
+                continue;
             if (!seen.insert(path.lexically_normal().string()).second)
                 continue;
             Ui::Title title;
             title.path = path.string();
-            title.location = where;
+            title.location = in_data ? "data folder" : where;
             title.kind = Lower(path.extension().string()).substr(1);
             std::transform(title.kind.begin(), title.kind.end(), title.kind.begin(),
                            [](unsigned char c) { return char(std::toupper(c)); });
@@ -994,6 +1001,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.seventh_core = false;
         else if (line == "profiler=on")
             settings.profiler = true;
+        else if (line == "fps=on")
+            settings.fps_overlay = true;
         else if (line == "ram=reserved")
             settings.ram_on_demand = false;
         else if (line.starts_with("games_folder="))
@@ -1007,13 +1016,13 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
-                     settings.games_folder.c_str());
+                     settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off");
         std::fclose(f);
     }
 }
@@ -1179,6 +1188,22 @@ struct UsbImportJob
     Launcher::UsbImport result;
 };
 
+// Copy to the PS4 (OPTIONS on a game on a drive): the game copied into the data folder, on its own
+// thread, its progress in a message
+struct CopyJob
+{
+    std::thread thread;
+    std::atomic<bool> done{false};
+    std::atomic<uint64_t> copied{0}, total{0};
+    std::string name, error;
+    bool ok = false;
+};
+
+std::string GigabytesText(uint64_t bytes)
+{
+    return fmt::format("{:.2f} GB", double(bytes) / 1e9);
+}
+
 std::string UsbImportReport(const Launcher::UsbImport& r)
 {
     if (r.keys_folder.empty() && r.firmware_folder.empty())
@@ -1205,6 +1230,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.77: an FPS counter in the top left corner while a game runs (System Settings, Graphics, FPS "
+         "Counter): the frames the game itself drew in the last second.\n"
+         "Copy to the PS4: in a game's Options from a USB drive (or another folder), \"Copy to the PS4\" copies "
+         "it to the PS4's own drive (/data/eden-ps4), with its progress; it then starts from there, faster "
+         "than from the USB drive, and the list shows it once.\n"
          "03.76: with a Game Folder chosen, every log goes there as one file, eden-ps4-logs.txt, as the app "
          "starts and after each game: take it away on the USB drive, no network needed. While a game runs, the "
          "boot trace notes its speed every 10 seconds (its frames a second, and how close to full speed).\n"
@@ -1463,6 +1493,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                       g_pad, count));
 
     static std::unique_ptr<UsbImportJob> import_job; // (none while a program runs: a boot waits for it)
+    static std::unique_ptr<CopyJob> copy_job;
     menu.SetHeld(MenuButtons(MenuPad())); // (a button still held from the game doesn't count)
     const double start = Seconds();
     const int countdown = 60;
@@ -1509,6 +1540,59 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                 break;
         }
         const Ui::MenuAction action = menu.Update(MenuButtons(pad), now);
+        if (action.kind == Ui::MenuAction::Kind::CopyToPs4 && copy_job)
+            menu.ShowMessage("Copy to the PS4", "Still copying the last one: wait for it to finish.");
+        else if (action.kind == Ui::MenuAction::Kind::CopyToPs4)
+        {
+            const std::filesystem::path from{action.path};
+            const std::string to = std::string(kDataDir) + "/" + from.filename().string();
+            std::error_code ec;
+            const uint64_t size = std::filesystem::file_size(from, ec);
+            const std::filesystem::space_info space = std::filesystem::space(kDataDir, ec);
+            if (std::filesystem::exists(to, ec))
+                menu.ShowMessage("Copy to the PS4", from.filename().string() + " is already in /data/eden-ps4.");
+            else if (!ec && space.available < size + (uint64_t(1) << 30))
+                menu.ShowMessage("Copy to the PS4",
+                                 fmt::format("Not enough room on the PS4: {} is {}, {} is free (and 1 GB is kept spare).",
+                                             from.filename().string(), GigabytesText(size),
+                                             GigabytesText(space.available)));
+            else
+            {
+                Trace("start page: copying " + action.path + " to " + to);
+                copy_job = std::make_unique<CopyJob>();
+                copy_job->name = from.filename().string();
+                copy_job->total = size;
+                menu.ShowMessage("Copy to the PS4", "Copying " + copy_job->name + "...");
+                copy_job->thread = std::thread([job = copy_job.get(), path = action.path, to] {
+                    job->ok = Launcher::CopyWithProgress(path, to, job->error, [job](uint64_t copied, uint64_t total) {
+                        job->copied = copied;
+                        job->total = total;
+                    });
+                    job->done = true;
+                });
+            }
+        }
+        if (copy_job && copy_job->done)
+        {
+            copy_job->thread.join();
+            const std::string report =
+                copy_job->ok ? copy_job->name + " is on the PS4 now, in /data/eden-ps4: it starts from there (the "
+                                                "copy on the drive can go)."
+                             : "Copying " + copy_job->name + " stopped: " + copy_job->error;
+            Trace("start page: copy: " + report);
+            if (!menu.UpdateMessage("Copy to the PS4", report))
+                menu.ShowMessage("Copy to the PS4", report);
+            copy_job.reset();
+            g_files_changed = true;
+        }
+        else if (copy_job && copy_job->total)
+        {
+            menu.UpdateMessage("Copy to the PS4",
+                               fmt::format("Copying {}: {} of {}...", copy_job->name,
+                                           GigabytesText(copy_job->copied.load()), GigabytesText(copy_job->total.load())));
+        }
+        if (action.kind == Ui::MenuAction::Kind::Boot && copy_job)
+            menu.ShowMessage("Copy to the PS4", "Still copying: start it again once the copy is done.");
         if (action.kind == Ui::MenuAction::Kind::ImportUsb && !import_job)
         {
             Trace("start page: importing keys and firmware from USB");
@@ -1546,7 +1630,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         }
         if (action.kind == Ui::MenuAction::Kind::Boot && import_job)
             menu.ShowMessage("Import", "Still copying: start it again once the import is done.");
-        if (action.kind == Ui::MenuAction::Kind::Boot && !import_job)
+        if (action.kind == Ui::MenuAction::Kind::Boot && !import_job && !copy_job)
         {
             choice.program = action.path;
             break;
@@ -1845,6 +1929,7 @@ void* Run(void*)
         Launcher::SetAsyncShaders(settings.async_shaders);
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
+        Launcher::SetFpsOverlay(settings.fps_overlay);
         {
             // keys and firmware on a USB drive are used from there, else the user folder's
             const Launcher::UsbKeysAndFirmware usb = KeysAndFirmwareOnUsb();
