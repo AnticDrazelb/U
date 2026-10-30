@@ -1049,7 +1049,7 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
     std::error_code ec;
     const bool keys = std::filesystem::exists(kKeysFile, ec);
     rows.push_back({"Keys (prod.keys)", keys ? fmt::format("Found: {}", kKeysFile)
-                                             : fmt::format("Not found: Import from USB, or copy it to {}", kKeysFile),
+                                             : fmt::format("Not found: put it in /data/eden-ps4/import and Import, or send it from a browser"),
                     keys});
     const bool title_keys = std::filesystem::exists(kTitleKeysFile, ec);
     rows.push_back({"Title keys (title.keys)",
@@ -1060,8 +1060,9 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
     for (std::filesystem::directory_iterator it(kFirmwareDir, ec), end; !ec && it != end; it.increment(ec))
         firmware++;
     rows.push_back({"Firmware", firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
-                                         : fmt::format("None in {}: Import from USB, or copy your Switch's firmware "
-                                                       "(.nca files) there",
+                                         : fmt::format("None in {}: put your Switch's firmware (its .zip, or its .nca "
+                                                       "files) in /data/eden-ps4/import and Import, or send it from a "
+                                                       "browser",
                                                        kFirmwareDir),
                     firmware > 0});
     bool readable = false;
@@ -1094,11 +1095,10 @@ Ui::StatusRow SoftwareStatus(const std::vector<Ui::Title>& titles)
 }
 
 constexpr const char* kGamesHelp =
-    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or at the top of a USB drive (exFAT or FAT32). A "
-    "game needs the keys and firmware of the Switch it was dumped from: put prod.keys and title.keys at the top of a "
-    "USB drive (or in its switch folder) and the firmware on it (its .zip, or its .nca files in a folder), then "
-    "Import from USB. Or "
-    "send all of them from a browser: the address is at the top of the HOME menu.";
+    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4. From a USB drive, copy them there with a file "
+    "manager such as PS4-Xplorer, and prod.keys, title.keys and the firmware (its .zip, or its folder of .nca "
+    "files) into /data/eden-ps4/import, then Import (Square). Or send all of them from a browser: the address is "
+    "at the top of the HOME menu.";
 
 // Import from USB (Games and Keys): the copy runs on its own thread, its progress in a message
 struct UsbImportJob
@@ -1112,10 +1112,10 @@ struct UsbImportJob
 std::string UsbImportReport(const Launcher::UsbImport& r)
 {
     if (r.keys_folder.empty() && r.firmware_folder.empty())
-        return "No prod.keys and no firmware on a USB drive (the app sees: " + UsbReport() + "). Put prod.keys and "
-               "title.keys at the top of the drive (or "
-               "in its switch folder), and the firmware on it: its .zip as it came, or its .nca files in a folder "
-               "(Firmware 19.0.1, say). The drive must be exFAT or FAT32.";
+        return "No prod.keys and no firmware in /data/eden-ps4/import or on a USB drive (the app sees: " +
+               UsbReport() + "). Copy prod.keys, title.keys and the firmware (its .zip as it came, or its folder of "
+               ".nca files) from the USB drive into /data/eden-ps4/import with a file manager such as PS4-Xplorer, "
+               "then Import again.";
     std::string text;
     if (!r.keys_folder.empty())
         text += fmt::format("prod.keys{} from {}.\n", r.title_keys ? " and title.keys" : "", r.keys_folder);
@@ -1179,11 +1179,10 @@ std::vector<std::pair<std::string, std::string>> News()
          "per program), and keys and firmware from a USB drive: Games and Keys, Import from USB "
          "(Square)."},
         {"Games",
-         "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive, or send them from a browser (the "
-         "address at the top of the HOME menu). They need the keys and firmware of the Switch they were dumped "
-         "from: send them from the browser too, or put prod.keys and title.keys at the top of a USB drive (or in "
-         "its switch folder) and the firmware (its .zip, or its .nca files in a folder) on it, then Import from USB "
-         "in Games and "
+         "Put games (.nsp, .xci) in /data/eden-ps4, or send them from a browser (the address at the top of the "
+         "HOME menu). They need the keys and firmware of the Switch they were dumped from: send them from the "
+         "browser too, or copy prod.keys, title.keys and the firmware (its .zip, or its folder of .nca files) from "
+         "a USB drive into /data/eden-ps4/import with a file manager such as PS4-Xplorer, then Import in Games and "
          "Keys. A game's icon and name appear once it has booted once."},
         {"The HOME menu",
          "Your software is in the row, the most recently played first, and All Software at its end has everything. "
@@ -1411,10 +1410,13 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         if (action.kind == Ui::MenuAction::Kind::ImportUsb && !import_job)
         {
             Trace("start page: importing keys and firmware from USB");
-            menu.ShowMessage("Import from USB", "Looking for prod.keys, title.keys and firmware on the USB drives...");
+            menu.ShowMessage("Import", "Looking for prod.keys, title.keys and firmware in /data/eden-ps4/import and "
+                                       "on the USB drives...");
             import_job = std::make_unique<UsbImportJob>();
             import_job->thread = std::thread([job = import_job.get()] {
-                std::vector<std::string> drives;
+                // the import folder (filled from a USB drive with a file manager such as PS4-Xplorer),
+                // then the drives themselves
+                std::vector<std::string> drives{std::string(kDataDir) + "/import"};
                 for (int i = 0; i < 8; i++)
                     drives.push_back(fmt::format("/mnt/usb{}", i));
                 job->result = Launcher::ImportFromUsb(drives, std::string(kDataDir) + "/user",
@@ -1430,18 +1432,18 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
             import_job->thread.join();
             const std::string report = UsbImportReport(import_job->result);
             Trace("start page: USB import: " + report);
-            if (!menu.UpdateMessage("Import from USB", report))
-                menu.ShowMessage("Import from USB", report);
+            if (!menu.UpdateMessage("Import", report))
+                menu.ShowMessage("Import", report);
             set_games_status();
             import_job.reset();
         }
         else if (import_job && import_job->total)
         {
-            menu.UpdateMessage("Import from USB", fmt::format("Copying the firmware: {} of {} files...",
+            menu.UpdateMessage("Import", fmt::format("Copying the firmware: {} of {} files...",
                                                               import_job->copied.load(), import_job->total.load()));
         }
         if (action.kind == Ui::MenuAction::Kind::Boot && import_job)
-            menu.ShowMessage("Import from USB", "Still copying: start it again once the import is done.");
+            menu.ShowMessage("Import", "Still copying: start it again once the import is done.");
         if (action.kind == Ui::MenuAction::Kind::Boot && !import_job)
         {
             choice.program = action.path;
@@ -1703,6 +1705,9 @@ void* Run(void*)
     const bool forced_null = renderer && std::string_view{renderer} == "null";
     bool vulkan_failed = false;
     Ui::MenuSettings settings = LoadMenuSettings();
+    // where Import (Games and Keys) looks first: filled from a USB drive with a file manager
+    std::error_code import_ec;
+    std::filesystem::create_directories(std::string(kDataDir) + "/import", import_ec);
     StartWebServer();
     // the threads the profiler samples (System Settings, CPU, Profiler): the emulated CPU cores, the
     // GPU thread (Maxwell commands) and the Vulkan thread (recording and submitting)
