@@ -5,12 +5,16 @@
 // What the program prints, and Eden's warnings and errors, go to the platform's sink and to
 // log.txt.
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <system_error>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -43,6 +47,73 @@
 namespace Launcher {
 namespace {
 
+/// The FPS counter (System Settings, Graphics) on the null renderer's frames, as the Vulkan
+/// renderer's present pass draws it (patch 0063): the frames of the last second, seven-segment
+/// digits in a dark box at the top left, drawn into a copy of the frame. Each frame the null
+/// renderer composes is one the game presented.
+class FpsCounter {
+public:
+    std::span<const u32> Draw(std::span<const u32> pixels, u32 width, u32 height) {
+        frames++;
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - start).count();
+        if (seconds >= 1.0) {
+            shown = static_cast<u32>(frames / seconds + 0.5);
+            frames = 0;
+            start = now;
+        }
+        if (pixels.size() < size_t(width) * height) {
+            return pixels;
+        }
+        copy.assign(pixels.begin(), pixels.end());
+        const auto fill = [&](s32 x, s32 y, s32 w, s32 h, u32 color) {
+            const s32 left = std::max(x, 0), right = std::min<s32>(x + w, static_cast<s32>(width));
+            const s32 bottom = std::min<s32>(y + h, static_cast<s32>(height));
+            for (s32 row = std::max(y, 0); row < bottom && left < right; row++) {
+                const auto line = copy.begin() + static_cast<ptrdiff_t>(row) * width;
+                std::fill(line + left, line + right, color);
+            }
+        };
+        // segments a b c d e f g, from the top clockwise, then the middle (pixels are R in the
+        // low byte: black, and a light yellow)
+        static constexpr u8 kSegments[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+        constexpr u32 kDark = 0xFF000000, kLight = 0xFF4DFFFF;
+        const s32 digit_height = std::max<s32>(static_cast<s32>(height) / 24, 14);
+        const s32 digit_width = digit_height / 2;
+        const s32 thick = std::max(digit_width / 5, 2);
+        const s32 gap = thick * 2, pad = thick * 2, half = digit_height / 2;
+        const std::string text = std::to_string(std::min<u32>(shown, 999));
+        const s32 count = static_cast<s32>(text.size());
+        const s32 x0 = pad * 2, y0 = pad * 2;
+        fill(x0 - pad, y0 - pad, count * digit_width + (count - 1) * gap + pad * 2, digit_height + pad * 2,
+             kDark);
+        for (s32 i = 0; i < count; i++) {
+            const u8 on = kSegments[text[static_cast<size_t>(i)] - '0'];
+            const s32 x = x0 + i * (digit_width + gap);
+            const s32 segments[7][4] = {
+                {x, y0, digit_width, thick},                                // a
+                {x + digit_width - thick, y0, thick, half},                 // b
+                {x + digit_width - thick, y0 + half, thick, half},          // c
+                {x, y0 + digit_height - thick, digit_width, thick},         // d
+                {x, y0 + half, thick, half},                                // e
+                {x, y0, thick, half},                                       // f
+                {x, y0 + half - thick / 2, digit_width, thick},             // g
+            };
+            for (int s = 0; s < 7; s++) {
+                if (on & (1 << s)) {
+                    fill(segments[s][0], segments[s][1], segments[s][2], segments[s][3], kLight);
+                }
+            }
+        }
+        return copy;
+    }
+
+private:
+    std::vector<u32> copy;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    u32 frames = 0, shown = 0;
+};
+
 /// A window without a GPU behind it: the null renderer composes frames drawn by the CPU, which
 /// go to the platform's frame sink.
 class HeadlessWindow final : public Core::Frontend::EmuWindow {
@@ -60,11 +131,13 @@ public:
         return frames != nullptr;
     }
     void OnSoftwareFrame(std::span<const u32> pixels, u32 width, u32 height) override {
-        frames(pixels, width, height);
+        frames(Settings::values.show_fps_overlay.GetValue() ? fps.Draw(pixels, width, height) : pixels, width,
+               height);
     }
 
 private:
     FrameSink frames;
+    FpsCounter fps;
 };
 
 /// The PS4's screen, for Eden's Vulkan renderer: its swapchain (vk_swapchain_ps4.cpp) opens the

@@ -71,6 +71,22 @@ check "exits on +" code breakout 0
 check "A launches the ball" says breakout "breakout: ball launched"
 check "draws 640x360 frames" drew breakout "640 360"
 check "beeps (audout)" loud breakout 0.2
+# the FPS Counter setting: its yellow digits at the top left of the frame, only when it's on
+run breakout_fps "$work/breakout.nro" 6 "" EDEN_PS4_FPS=1
+fps_digits() {
+    python3 - "$work/$1-frames/last.ppm" "$2" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+header = data.split(b'\n', 3)
+width = int(header[1].split()[0])
+pixels = header[3]
+lit = sum(1 for y in range(40) for x in range(60)
+          if pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] == bytes((255, 255, 77)))
+sys.exit(0 if (lit >= 30) == (sys.argv[2] == "on") else 1)
+PY
+}
+check "FPS Counter: digits at the top left" fps_digits breakout_fps on
+check "FPS Counter: none when it's off" fps_digits breakout off
 
 echo "blocks.nro: picture, sound, the SD card"
 run blocks "$work/blocks.nro" 20 "1:Up,1.1:,1.6:Up,1.7:,2.2:Up,2.3:,5:Plus,5.3:"
