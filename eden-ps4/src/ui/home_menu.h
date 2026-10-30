@@ -61,6 +61,8 @@ struct MenuSettings
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
     bool profiler = false;     // samples.log: where a game's busy threads spend their time
     bool ram_on_demand = true; // the Switch's RAM taken from the PS4's as the game uses it
+    std::string games_folder;  // Game Folder: games, keys and firmware also looked for here, in all its
+                               // folders (as Crema's): a USB drive or any folder (empty: none)
 };
 
 // One line of the Games and Keys screen: something found (or not), and where
@@ -108,6 +110,9 @@ public:
     void ShowMessage(std::string title, std::string text);
     // Changes the message on top (a copy's progress, then its result); false if none is open
     bool UpdateMessage(std::string title, std::string text);
+    // Game Folder's places: where browsing starts (the data folder, the USB drives...), those that
+    // exist shown
+    void SetFolderPlaces(std::vector<std::string> places) { folder_places = std::move(places); }
     // "No controller: the test program starts in N s" (negative: hidden)
     void SetCountdown(int seconds) { countdown = seconds; }
 
@@ -118,7 +123,7 @@ public:
     void Draw(Canvas& canvas, double now);
 
 private:
-    enum class Screen { Home, AllSoftware, Settings, News, Games, Controllers, Report };
+    enum class Screen { Home, AllSoftware, Settings, News, Games, Controllers, Report, Folder };
     enum class DialogKind { Message, Quit, TitleInfo, NoKeys };
     struct Dialog
     {
@@ -136,6 +141,16 @@ private:
         void (*change)(MenuSettings&);
     };
     std::vector<SettingItem> SettingItems(int category) const;
+    // Game Folder's browser: a row is a heading, a folder to open ("" the places), using the folder
+    // shown, or no game folder
+    struct FolderRow
+    {
+        enum class Kind { Heading, Open, Use, Clear } kind = Kind::Heading;
+        std::string label, detail, target;
+    };
+    void OpenFolder(const std::string& path);
+    // Where ".." and Circle go from `path`: its parent, or the places from a place or the root ("")
+    std::string FolderParent(const std::string& path) const;
 
     const Theme& CurrentTheme() const;
     size_t HomeCount() const;
@@ -152,6 +167,7 @@ private:
     void DrawGames(Canvas& c);
     void DrawControllers(Canvas& c, double now);
     void DrawReport(Canvas& c);
+    void DrawFolder(Canvas& c, double now);
     void DrawDialog(Canvas& c, double now);
     void DrawHeader(Canvas& c, Icon icon, uint32_t icon_color, const std::string& text);
     void DrawBottomBar(Canvas& c, const std::vector<std::pair<Glyph, std::string>>& hints);
@@ -182,6 +198,12 @@ private:
     bool settings_items = false;
     // News and Games: scrolled this far
     float page_scroll = 0;
+    // Game Folder: the folder shown ("" the places), its rows, the selected one
+    std::vector<std::string> folder_places;
+    std::string browse_dir;
+    std::vector<FolderRow> folder_rows;
+    int folder_selected = 0;
+    float folder_scroll = 0;
     // Buttons held before, and when a held direction repeats
     uint32_t held_before = 0;
     double repeat_at = 0, last_draw = 0;

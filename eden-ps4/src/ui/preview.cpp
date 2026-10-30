@@ -79,6 +79,7 @@ HomeMenu MakeMenu(bool white)
     menu.SetWebAddress("http://192.168.1.23:8080");
     menu.SetKeysPresent(false);
     menu.SetControllerTest("/app0/padtest.nro");
+    menu.SetFolderPlaces({"/data/eden-ps4", "/mnt/usb0", "/mnt/usb1", "/mnt/ext0", "/mnt/ext1", "/mnt"});
     menu.SetNews({{"Eden for PS4 03.20", "A HOME menu laid out as the Switch's: your software in a row, All Software "
                                          "for everything, and the system's round buttons below.\nGames on USB drives "
                                          "appear here too."},
@@ -141,6 +142,12 @@ int main(int argc, char** argv)
     Press(menu, kRight);
     Press(menu, kCross);
     Shot(menu, "games");
+    Press(menu, kTriangle); // Game Folder: its places (those that exist where the preview runs)
+    Shot(menu, "game-folder");
+    Press(menu, kCross); // the first place, opened
+    Shot(menu, "game-folder-opened");
+    Press(menu, kCircle);
+    Press(menu, kCircle);
     Press(menu, kCircle);
     Press(menu, kRight);
     Press(menu, kCross);

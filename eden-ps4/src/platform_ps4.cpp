@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -727,6 +728,10 @@ constexpr const char* kMenuFile = "/data/eden-ps4/menu.txt";
 constexpr const char* kKeysFile = "/data/eden-ps4/user/keys/prod.keys";
 constexpr const char* kTitleKeysFile = "/data/eden-ps4/user/keys/title.keys";
 constexpr const char* kFirmwareDir = "/data/eden-ps4/user/nand/system/Contents/registered";
+// Games and Keys, Game Folder (Ui::MenuSettings::games_folder): searched for games, keys and firmware
+// in all its folders, as Crema's game folder is (empty: none)
+std::string g_games_folder;
+constexpr int kGameFolderDepth = 6;
 
 std::string Lower(std::string text)
 {
@@ -856,6 +861,17 @@ std::string UsbSignature()
         closedir(directory);
         signature += fmt::format("{}:{};", i, entries);
     }
+    if (!g_games_folder.empty())
+    {
+        size_t entries = 0;
+        if (DIR* directory = opendir(g_games_folder.c_str()))
+        {
+            while (readdir(directory))
+                entries++;
+            closedir(directory);
+        }
+        signature += fmt::format("folder:{};", entries);
+    }
     return signature;
 }
 
@@ -893,11 +909,17 @@ std::vector<Ui::Title> LoadTitles()
     std::vector<std::tuple<std::string, std::string, int>> folders = {{kDataDir, "data folder", 0}};
     for (int i = 0; i < 8; i++)
         folders.push_back({fmt::format("/mnt/usb{}", i), fmt::format("USB {}", i), 1});
+    // the Game Folder first: a drive's game found there and on the drive shows once, as the folder's
+    if (!g_games_folder.empty())
+        folders.insert(folders.begin(), {g_games_folder, "Game Folder", kGameFolderDepth});
+    std::set<std::string> seen;
     for (const auto& [folder, where, depth] : folders)
     {
         const std::vector<std::filesystem::path> found = GameFiles(folder, depth);
         for (const std::filesystem::path& path : found)
         {
+            if (!seen.insert(path.lexically_normal().string()).second)
+                continue;
             Ui::Title title;
             title.path = path.string();
             title.location = where;
@@ -974,6 +996,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.profiler = true;
         else if (line == "ram=reserved")
             settings.ram_on_demand = false;
+        else if (line.starts_with("games_folder="))
+            settings.games_folder = line.substr(13);
     }
     return settings;
 }
@@ -983,12 +1007,13 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
-                     settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved");
+                     settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
+                     settings.games_folder.c_str());
         std::fclose(f);
     }
 }
@@ -1043,11 +1068,13 @@ std::string UsbReport(bool* readable = nullptr)
     return text;
 }
 
-// Keys and firmware on a USB drive (/mnt/usb0-7), which games use from there, before the ones in
-// the user folder (Launcher::SetKeysAndFirmware)
+// Keys and firmware in the Game Folder or on a USB drive (/mnt/usb0-7), which games use from there,
+// before the ones in the user folder (Launcher::SetKeysAndFirmware)
 Launcher::UsbKeysAndFirmware KeysAndFirmwareOnUsb()
 {
     std::vector<std::string> drives;
+    if (!g_games_folder.empty())
+        drives.push_back(g_games_folder);
     for (int i = 0; i < 8; i++)
         drives.push_back(fmt::format("/mnt/usb{}", i));
     return Launcher::FindKeysAndFirmware(drives);
@@ -1060,16 +1087,16 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
     const Launcher::UsbKeysAndFirmware on_usb = KeysAndFirmwareOnUsb();
     const bool keys = !on_usb.keys_folder.empty() || std::filesystem::exists(kKeysFile, ec);
     rows.push_back({"Keys (prod.keys)",
-                    !on_usb.keys_folder.empty() ? fmt::format("On the USB drive, used from there: {}/prod.keys", on_usb.keys_folder)
+                    !on_usb.keys_folder.empty() ? fmt::format("Used from where it is: {}/prod.keys", on_usb.keys_folder)
                     : keys ? fmt::format("Found: {}", kKeysFile)
                            : fmt::format("Not found: put it on a USB drive (at its top, or in a folder there such as "
                                          "switch), or in /data/eden-ps4/import and Import, or send it from a browser"),
                     keys});
     const bool title_keys = on_usb.title_keys || (on_usb.keys_folder.empty() && std::filesystem::exists(kTitleKeysFile, ec));
     rows.push_back({"Title keys (title.keys)",
-                    on_usb.title_keys ? fmt::format("On the USB drive, used from there: {}/title.keys", on_usb.keys_folder)
+                    on_usb.title_keys ? fmt::format("Used from where it is: {}/title.keys", on_usb.keys_folder)
                     : !on_usb.keys_folder.empty()
-                        ? fmt::format("Not next to prod.keys on the USB drive ({}): some games need it", on_usb.keys_folder)
+                        ? fmt::format("Not next to prod.keys ({}): some games need it", on_usb.keys_folder)
                     : title_keys ? fmt::format("Found: {}", kTitleKeysFile)
                                  : fmt::format("Not found ({}): some games need it", kTitleKeysFile),
                     title_keys});
@@ -1078,7 +1105,7 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
         firmware++;
     rows.push_back({"Firmware",
                     !on_usb.firmware_folder.empty()
-                        ? fmt::format("On the USB drive, used from there: {} files in {}", on_usb.firmware_files,
+                        ? fmt::format("Used from where it is: {} files in {}", on_usb.firmware_files,
                                       on_usb.firmware_folder)
                     : firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
                                : fmt::format("None in {}: put your Switch's firmware (its folder of .nca files) on a "
@@ -1086,6 +1113,26 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
                                              "Import, or send it from a browser",
                                              kFirmwareDir),
                     !on_usb.firmware_folder.empty() || firmware > 0});
+    if (!g_games_folder.empty())
+    {
+        struct stat status{};
+        const bool there = stat(g_games_folder.c_str(), &status) == 0 && S_ISDIR(status.st_mode);
+        rows.push_back({"Game Folder",
+                        there ? fmt::format("{}: games, keys and firmware are looked for in it and its folders "
+                                            "(Triangle to change it)",
+                                            g_games_folder)
+                              : fmt::format("{} isn't there now (a USB drive not plugged in?): Triangle to choose "
+                                            "another",
+                                            g_games_folder),
+                        there});
+    }
+    else
+    {
+        rows.push_back({"Game Folder",
+                        "None: Triangle to choose one, on a USB drive or anywhere (games, keys and firmware are "
+                        "looked for in all its folders)",
+                        true});
+    }
     bool readable = false;
     const std::string usb = UsbReport(&readable);
     rows.push_back({"USB drives, as the app sees them", usb, readable});
@@ -1116,7 +1163,8 @@ Ui::StatusRow SoftwareStatus(const std::vector<Ui::Title>& titles)
 }
 
 constexpr const char* kGamesHelp =
-    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or on a USB drive. prod.keys, title.keys and the "
+    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4, on a USB drive, or in a Game Folder (Triangle: "
+    "any folder, on a drive or elsewhere, searched through all its folders). prod.keys, title.keys and the "
     "firmware (its folder of .nca files) on a USB drive are used from there: the keys at the drive's top or in a "
     "folder there (switch), the firmware in a folder. Or copy them, or the firmware's .zip, into "
     "/data/eden-ps4/import with a file manager such as PS4-Xplorer, then Import (Square). Or send all of them from "
@@ -1176,7 +1224,10 @@ std::vector<std::pair<std::string, std::string>> News()
          "started), and Import from USB finds Prod.keys in any case.\n"
          "03.74: keys and firmware on a USB drive are used from there, without importing: prod.keys and "
          "title.keys at the drive's top or in a folder there (switch), the firmware's .nca files in a folder. "
-         "Games and Keys says which keys and firmware games will use. A firmware .zip still needs Import."},
+         "Games and Keys says which keys and firmware games will use. A firmware .zip still needs Import.\n"
+         "03.75: Game Folder (Games and Keys, Triangle), as in Crema: choose any folder, on a USB drive or "
+         "anywhere the console shows (/mnt/usb0-7, /mnt/ext0, /mnt/ext1, /mnt, or from /), and its games, keys "
+         "and firmware are found in it and its folders, six deep."},
         {"Before: 03.60",
          "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
          "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
@@ -1331,6 +1382,15 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     std::unique_lock lock{g_mutex};
     if (first)
         OpenPad();
+    g_games_folder = settings.games_folder;
+    {
+        // Game Folder's places, as Crema's: the data folder, the USB drives, extended storage, /mnt
+        std::vector<std::string> places{kDataDir};
+        for (int i = 0; i < 8; i++)
+            places.push_back(fmt::format("/mnt/usb{}", i));
+        places.insert(places.end(), {"/mnt/ext0", "/mnt/ext1", "/mnt"});
+        menu.SetFolderPlaces(std::move(places));
+    }
     std::vector<Ui::Title> titles = LoadTitles();
     Ui::StatusRow software_status = SoftwareStatus(titles);
     std::string web_url = WebUrl();
@@ -1484,6 +1544,13 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         {
             choice.settings = menu.Settings();
             SaveMenuSettings(choice.settings);
+            if (choice.settings.games_folder != g_games_folder)
+            {
+                g_games_folder = choice.settings.games_folder;
+                Trace("start page: game folder " + (g_games_folder.empty() ? std::string("none") : g_games_folder));
+                usb_signature = UsbSignature();
+                g_files_changed = true;
+            }
             Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
                               "asynchronous shaders {}, GPU accuracy {}, CPU {}, {} cores, profiler {}",
                               choice.settings.white_theme ? "white" : "black",

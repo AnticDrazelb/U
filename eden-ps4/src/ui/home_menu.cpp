@@ -3,7 +3,11 @@
 #include "ui/home_menu.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
 
 namespace Ui {
 
@@ -390,6 +394,12 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
             screen = Screen::Home;
         if (screen == Screen::Games && (pressed & kSquare))
             return {MenuAction::Kind::ImportUsb, {}};
+        if (screen == Screen::Games && (pressed & kTriangle))
+        {
+            OpenFolder("");
+            screen = Screen::Folder;
+            return {};
+        }
         if (moves & kDown)
             page_scroll += 60;
         if (moves & kUp)
@@ -407,8 +417,124 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
         if (pressed & (kCross | kCircle))
             screen = Screen::Home;
         return {};
+
+    case Screen::Folder: {
+        const auto selectable = [&](int i) { return folder_rows[size_t(i)].kind != FolderRow::Kind::Heading; };
+        const int count = int(folder_rows.size());
+        if (moves & kUp)
+            for (int i = folder_selected - 1; i >= 0; i--)
+                if (selectable(i))
+                {
+                    folder_selected = i;
+                    break;
+                }
+        if (moves & kDown)
+            for (int i = folder_selected + 1; i < count; i++)
+                if (selectable(i))
+                {
+                    folder_selected = i;
+                    break;
+                }
+        if (pressed & kCircle)
+        {
+            // up a folder, from the places back to Games and Keys
+            if (browse_dir.empty())
+                screen = Screen::Games;
+            else
+                OpenFolder(FolderParent(browse_dir));
+            return {};
+        }
+        if ((pressed & kCross) && folder_selected < count)
+        {
+            const FolderRow row = folder_rows[size_t(folder_selected)];
+            switch (row.kind)
+            {
+            case FolderRow::Kind::Open:
+                OpenFolder(row.target);
+                return {};
+            case FolderRow::Kind::Use:
+            case FolderRow::Kind::Clear:
+                settings.games_folder = row.kind == FolderRow::Kind::Use ? browse_dir : std::string();
+                screen = Screen::Games;
+                page_scroll = 0;
+                return {MenuAction::Kind::SettingsChanged, {}};
+            case FolderRow::Kind::Heading:
+                break;
+            }
+        }
+        return {};
+    }
     }
     return {};
+}
+
+std::string HomeMenu::FolderParent(const std::string& path) const
+{
+    if (path == "/" || std::find(folder_places.begin(), folder_places.end(), path) != folder_places.end())
+        return {};
+    return path.substr(0, std::max<size_t>(path.rfind('/'), 1));
+}
+
+// Game Folder's browser at `path` ("" the places): "Use This Folder", "..", and its folders
+void HomeMenu::OpenFolder(const std::string& path)
+{
+    browse_dir = path;
+    folder_rows.clear();
+    folder_selected = 0;
+    folder_scroll = 0;
+    struct stat status{};
+    if (path.empty())
+    {
+        folder_rows.push_back({FolderRow::Kind::Heading, "Places", "", ""});
+        for (const std::string& place : folder_places)
+        {
+            if (stat(place.c_str(), &status) == 0 && S_ISDIR(status.st_mode))
+                folder_rows.push_back({FolderRow::Kind::Open, place, "", place});
+        }
+        folder_rows.push_back({FolderRow::Kind::Open, "/", "The console's root, to find a drive elsewhere", "/"});
+        folder_rows.push_back({FolderRow::Kind::Clear, "No Game Folder",
+                               "Games only in /data/eden-ps4 and on the USB drives' tops and folders", ""});
+    }
+    else
+    {
+        folder_rows.push_back({FolderRow::Kind::Heading, path, "", ""});
+        folder_rows.push_back({FolderRow::Kind::Use, "Use This Folder",
+                               "Games, prod.keys, title.keys and the firmware are looked for in it and its folders", ""});
+        const std::string parent = FolderParent(path);
+        folder_rows.push_back({FolderRow::Kind::Open, "..", parent.empty() ? "Places" : parent, parent});
+        std::vector<std::string> folders;
+        std::string error;
+        if (DIR* directory = opendir(path.c_str()))
+        {
+            while (const dirent* entry = readdir(directory))
+            {
+                const std::string name = entry->d_name;
+                if (name.empty() || name[0] == '.')
+                    continue;
+                const std::string full = (path == "/" ? "" : path) + "/" + name;
+                if (stat(full.c_str(), &status) == 0 && S_ISDIR(status.st_mode))
+                    folders.push_back(name);
+            }
+            closedir(directory);
+        }
+        else
+        {
+            error = std::string("This folder can't be opened: ") + std::strerror(errno);
+        }
+        std::sort(folders.begin(), folders.end());
+        if (!error.empty())
+            folder_rows.push_back({FolderRow::Kind::Heading, error, "", ""});
+        for (const std::string& name : folders)
+            folder_rows.push_back({FolderRow::Kind::Open, name + "/", "", (path == "/" ? "" : path) + "/" + name});
+    }
+    for (size_t i = 0; i < folder_rows.size(); i++)
+    {
+        if (folder_rows[i].kind != FolderRow::Kind::Heading)
+        {
+            folder_selected = int(i);
+            break;
+        }
+    }
 }
 
 uint32_t HomeMenu::Cursor(double now) const
@@ -448,6 +574,9 @@ void HomeMenu::Draw(Canvas& c, double now)
         break;
     case Screen::Report:
         DrawReport(c);
+        break;
+    case Screen::Folder:
+        DrawFolder(c, now);
         break;
     }
     if (countdown >= 0)
@@ -789,7 +918,42 @@ void HomeMenu::DrawGames(Canvas& c)
     if (end - page_scroll < kBottomLine - 40 && page_scroll > 0)
         page_scroll = std::max(0.0f, end - (kBottomLine - 40));
     c.ResetClip();
-    DrawBottomBar(c, {{Glyph::Square, "Import"}, {Glyph::Circle, "Back"}});
+    DrawBottomBar(c, {{Glyph::Triangle, "Game Folder"}, {Glyph::Square, "Import"}, {Glyph::Circle, "Back"}});
+}
+
+void HomeMenu::DrawFolder(Canvas& c, double now)
+{
+    const Theme& t = CurrentTheme();
+    DrawHeader(c, Icon::Games, t.orange, "Game Folder");
+    constexpr float kTop = 124, kRow = 56;
+    // the selected row kept on the screen
+    const float selected_y = kTop + float(folder_selected) * kRow;
+    if (selected_y - folder_scroll > kBottomLine - kRow - 10)
+        folder_scroll = selected_y - (kBottomLine - kRow - 10);
+    if (selected_y - folder_scroll < kTop)
+        folder_scroll = std::max(0.0f, selected_y - kTop);
+    c.Clip(0, kHeaderLine + 1, 1280, kBottomLine - kHeaderLine - 2);
+    for (size_t i = 0; i < folder_rows.size(); i++)
+    {
+        const FolderRow& row = folder_rows[i];
+        const float y = kTop + float(i) * kRow - folder_scroll;
+        if (y < kHeaderLine - kRow || y > kBottomLine)
+            continue;
+        if (row.kind == FolderRow::Kind::Heading)
+        {
+            c.Text(80, y + 34, row.label, 20, Weight::SemiBold, t.dim);
+            continue;
+        }
+        const bool current = int(i) == folder_selected;
+        if (current)
+            c.RoundRect(64, y + 4, 1152, kRow - 8, 6, Fade(Cursor(now), 0.25f));
+        c.Text(88, y + 35, row.label, 20, current ? Weight::SemiBold : Weight::Regular,
+               row.kind == FolderRow::Kind::Use ? t.accent : t.text);
+        if (!row.detail.empty())
+            c.Text(1192, y + 35, row.detail, 16, Weight::Regular, t.dim, Align::Right);
+    }
+    c.ResetClip();
+    DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "OK"}});
 }
 
 void HomeMenu::DrawControllers(Canvas& c, double now)

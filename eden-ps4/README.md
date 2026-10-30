@@ -377,6 +377,17 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.75: **Game Folder**, after Crema's. Crema finds games anywhere because the player chooses
+where: its Game Folder setting browses from a list of places (the data folder, `/mnt/usb0-7`,
+`/mnt/ext0`, `/mnt/ext1`, `/mnt`, `/`) and the folder chosen is searched through. Games and Keys
+now has the same (Triangle): a browser over the same places (`HomeMenu::OpenFolder`; "Use This
+Folder", "..", the folders in it, "No Game Folder"), the choice kept in `menu.txt`
+(`games_folder=`). The folder is searched six folders deep for games (listed as "Game Folder",
+before the drives', a file found twice shown once), and for `prod.keys`, `title.keys` and the
+firmware as a drive is (03.74), before the drives; its entries join the 3-second check, so a game
+added there shows. A drive the launcher doesn't look at by itself (mounted somewhere other than
+`/mnt/usbN`) can be reached this way. `ui-preview.sh` draws the browser.
+
 03.74: **keys and firmware used from the USB drive.** `prod.keys`, `title.keys` and the firmware on
 a USB drive no longer need importing: before each boot the launcher looks for them on
 `/mnt/usb0-7` as Import does (`Launcher::FindKeysAndFirmware`: `prod.keys` at a drive's top, in a
