@@ -14,6 +14,8 @@
 // The screen, controller and start page are switch-bench's (../../switch-bench/src/platform_ps4.cpp).
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +46,8 @@
 #include "ui/home_menu.h"
 #include "ui/nro.h"
 #include "usb_import.h"
+#include "log_tools.h"
+#include "web_server.h"
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes
 // (as in port/ps4_runtime.cpp).
@@ -76,6 +80,11 @@ void ps4_heap_usage(size_t* in_use, size_t* size);
 int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
 void ps4_dump_thread_stacks(const char* path, const char* reason);
+// port/ps4_sampler.cpp: the profiler (samples.log), the threads it samples (by name), and a line
+// in samples.log
+void ps4_sampler_sample_threads(const char* names);
+void ps4_sampler_set_enabled(int on);
+void ps4_sampler_note(const char* text);
 }
 
 namespace {
@@ -86,6 +95,8 @@ constexpr const char* kDataDir = "/data/eden-ps4";
 constexpr const char* kLogFile = "/data/eden-ps4/log.txt";
 constexpr const char* kCrashFile = "/data/eden-ps4/crash.log";
 constexpr const char* kHangFile = "/data/eden-ps4/hang.log";
+// The app's function names (build.sh, from the ELF): the logs name the code they point at
+constexpr const char* kSymbolsFile = "/app0/symbols.zst";
 // The last run's boot trace: Crema's runtime renames boot-trace.log to this as the app starts.
 constexpr const char* kLastTraceFile = "/data/eden-ps4/boot-trace-launcher.log";
 constexpr const char* kTestProgram = "/app0/hello.nro";
@@ -448,8 +459,9 @@ std::vector<std::string> Last(const std::vector<std::string>& lines, size_t n)
 }
 
 // crash.log's last report, compacted: its header, rip and registers, the code addresses found on
-// the stack (several to a line), and the threads named in the dump that follows it.
-std::vector<std::string> LastCrash(const std::vector<std::string>& log)
+// the stack (several to a line, or with symbols the first functions, one a line), and the threads
+// named in the dump that follows it.
+std::vector<std::string> LastCrash(const std::vector<std::string>& log, const Launcher::Symbols& symbols)
 {
     size_t start = log.size();
     for (size_t i = log.size(); i-- > 0;)
@@ -459,9 +471,12 @@ std::vector<std::string> LastCrash(const std::vector<std::string>& log)
             break;
         }
     std::vector<std::string> out;
-    std::string addresses;
-    int address_count = 0, threads = 0;
+    std::string addresses, last_function;
+    int address_count = 0, threads = 0, named = 0;
     bool in_dump = false;
+    const auto name_of = [&](const std::string& line) {
+        return symbols.Empty() ? line : Launcher::SymbolizeLog(line, symbols);
+    };
     for (size_t i = start; i < log.size(); i++)
     {
         const std::string& l = log[i];
@@ -475,12 +490,30 @@ std::vector<std::string> LastCrash(const std::vector<std::string>& log)
         if (in_dump)
         {
             if (l.rfind("-- ", 0) == 0 && threads++ < 8)
-                out.push_back("   thread " + l.substr(3));
+                out.push_back("   thread " + name_of(l.substr(3)));
             continue;
         }
         if (l.empty() || l.rfind("code addresses", 0) == 0)
             continue;
         const size_t bracket = l.find("] 0x");
+        if (l.rfind("  [rsp+", 0) == 0 && bracket != std::string::npos && !symbols.Empty())
+        {
+            // "  [rsp+0x18] 0x1234  = Kernel::KThread::Run(...)+0x10": a function once in a row
+            const std::string line = name_of(l);
+            const size_t equals = line.find("  = ");
+            if (equals == std::string::npos || named >= 12)
+                continue;
+            std::string function = line.substr(equals + 4);
+            const std::string base = function.substr(0, function.rfind("+0x"));
+            if (base == last_function)
+                continue;
+            last_function = base;
+            if (function.size() > 110)
+                function = function.substr(0, 107) + "...";
+            out.push_back("   " + l.substr(bracket + 2) + "  " + function);
+            named++;
+            continue;
+        }
         if (l.rfind("  [rsp+", 0) == 0 && bracket != std::string::npos)
         {
             if (address_count < 40)
@@ -492,7 +525,7 @@ std::vector<std::string> LastCrash(const std::vector<std::string>& log)
             }
             continue;
         }
-        out.push_back("   " + l);
+        out.push_back("   " + name_of(l));
     }
     if (!addresses.empty())
         out.push_back("   stack: " + addresses);
@@ -608,6 +641,8 @@ std::unique_ptr<Launcher::AudioOutput> MakeAudioOutput()
 // While a program runs: the pad, read every 4 ms, as player 1's controller. Both sticks pressed
 // in (L3 + R3) for a second stop the program.
 std::atomic<bool> g_running{false};
+// The last program that didn't load, and why (the HOME menu says so when it comes back)
+std::string g_load_failure_name, g_load_failure;
 void* PadThread(void*)
 {
     // above the emulation's busy threads (650): a poll is a moment's work, and with all seven
@@ -878,6 +913,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.gpu_high = true;
         else if (line == "cores=6")
             settings.seventh_core = false;
+        else if (line == "profiler=on")
+            settings.profiler = true;
     }
     return settings;
 }
@@ -887,11 +924,12 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
-                     settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6);
+                     settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
+                     settings.profiler ? "on" : "off");
         std::fclose(f);
     }
 }
@@ -947,7 +985,8 @@ Ui::StatusRow SoftwareStatus(const std::vector<Ui::Title>& titles)
 constexpr const char* kGamesHelp =
     "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or at the top of a USB drive (exFAT or FAT32). A "
     "game needs the keys and firmware of the Switch it was dumped from: put prod.keys and title.keys at the top of a "
-    "USB drive (or in its switch folder) and the firmware's .nca files in a folder on it, then Import from USB.";
+    "USB drive (or in its switch folder) and the firmware's .nca files in a folder on it, then Import from USB. Or "
+    "send all of them from a browser: the address is at the top of the HOME menu.";
 
 // Import from USB (Games and Keys): the copy runs on its own thread, its progress in a message
 struct UsbImportJob
@@ -983,6 +1022,16 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
+         "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
+         "in one file: no FTP, no USB drive, no photos of the screen. Anyone on your network can reach it while "
+         "the app is open.\n"
+         "The logs name the code they point at: crash reports, hang reports and the error screen show the app's "
+         "function names, read from the package itself.\n"
+         "New in System Settings, CPU: Profiler. While a game runs, where the emulated CPU cores, the GPU thread "
+         "and the Vulkan thread spend their time: the web page's Profile summary shows it per function. Send it "
+         "when a game is slow."},
+        {"Before: 03.51",
          "Sound: Breakout and Blocks were closed by the console as they started, because the app never "
          "loaded the PS4's audio module. Fixed.\n"
          "From 03.50: faster on the PS4's CPU: reads of memory the GPU caches no longer take a slow path (without "
@@ -999,10 +1048,11 @@ std::vector<std::pair<std::string, std::string>> News()
          "per program), and keys and firmware from a USB drive: Games and Keys, Import from USB "
          "(Square)."},
         {"Games",
-         "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive. They need the keys and firmware of "
-         "the Switch they were dumped from: put prod.keys and title.keys at the top of a USB drive (or in its switch "
-         "folder) and the firmware's .nca files in a folder on it, then Import from USB in Games and Keys. A game's "
-         "icon and name appear once it has booted once."},
+         "Put games (.nsp, .xci) in /data/eden-ps4 or at the top of a USB drive, or send them from a browser (the "
+         "address at the top of the HOME menu). They need the keys and firmware of the Switch they were dumped "
+         "from: send them from the browser too, or put prod.keys and title.keys at the top of a USB drive (or in "
+         "its switch folder) and the firmware's .nca files in a folder on it, then Import from USB in Games and "
+         "Keys. A game's icon and name appear once it has booted once."},
         {"The HOME menu",
          "Your software is in the row, the most recently played first, and All Software at its end has everything. "
          "Below: News, Games and Keys (what's found, and where things go), Controllers, System Settings (theme, "
@@ -1064,6 +1114,46 @@ std::string ClockText()
     return fmt::format("{}:{:02}", local.tm_hour, local.tm_min);
 }
 
+// The web server (web_server.h): started once, its port; set when a browser added or removed files
+bool g_web_started = false;
+uint16_t g_web_port = 8080;
+std::atomic<bool> g_files_changed{false};
+
+// Where a browser reaches the web server ("" without a network, or if it didn't start)
+std::string WebUrl()
+{
+    if (!g_web_started)
+        return {};
+    const std::string address = Launcher::LocalAddress();
+    return address.empty() ? std::string() : fmt::format("http://{}:{}", address, g_web_port);
+}
+
+void StartWebServer()
+{
+    Launcher::WebServerConfig web;
+    web.data_dir = kDataDir;
+    if (const char* port = std::getenv("EDEN_PS4_WEB_PORT"); port && std::atoi(port) > 0)
+        g_web_port = uint16_t(std::atoi(port));
+    web.port = g_web_port;
+    web.version = EDEN_PS4_VERSION;
+    web.status = [] {
+        std::string label;
+        {
+            std::lock_guard lock{g_mutex};
+            label = g_renderer_label;
+        }
+        std::erase_if(label, [](char c) { return c == '"' || c == '\\' || uint8_t(c) < 0x20; });
+        return "\"renderer\":\"" + label + "\"";
+    };
+    web.changed = [] { g_files_changed = true; };
+    web.log = [](const std::string& line) { Trace(line); };
+    web.symbols_path = kSymbolsFile;
+    web.program_running = [] { return g_running.load(); };
+    g_web_started = Launcher::StartWebServer(std::move(web));
+    if (!g_web_started)
+        Trace(fmt::format("web: port {} can't be opened", g_web_port));
+}
+
 // What the HOME menu said to do: boot `program`, with these settings
 struct MenuChoice
 {
@@ -1086,10 +1176,19 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     if (first)
         OpenPad();
     std::vector<Ui::Title> titles = LoadTitles();
-    const Ui::StatusRow software_status = SoftwareStatus(titles);
+    Ui::StatusRow software_status = SoftwareStatus(titles);
+    std::string web_url = WebUrl();
+    menu.SetWebAddress(web_url);
     const auto set_games_status = [&] {
         std::vector<Ui::StatusRow> rows = KeysAndFirmwareStatus();
         rows.push_back(software_status);
+        rows.push_back({"From a PC or phone",
+                        web_url.empty() ? std::string("No network: connected, the PS4 takes keys, firmware and games "
+                                                      "from a browser, and gives it every log")
+                                        : fmt::format("Open {} in a browser on the same network: keys, firmware, "
+                                                      "games, and every log in one file",
+                                                      web_url),
+                        !web_url.empty()});
         menu.SetGamesStatus(std::move(rows), kGamesHelp);
         std::error_code ec;
         menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec));
@@ -1102,7 +1201,21 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     menu.SetNews(News());
     menu.SetControllerTest("/app0/padtest.nro");
     if (unfinished)
-        menu.ShowReport({Last(log, 40), LastCrash(crash), Last(trace, 24)});
+    {
+        Launcher::Symbols symbols; // (~11 MiB, for this only)
+        symbols.Load(kSymbolsFile);
+        menu.ShowReport({Last(log, 40), LastCrash(crash, symbols), Last(trace, 24)});
+    }
+    else if (!g_load_failure.empty())
+    {
+        std::string why = g_load_failure;
+        if (!why.empty())
+            why[0] = char(std::toupper(static_cast<unsigned char>(why[0])));
+        if (!why.ends_with('.') && !why.ends_with(".)"))
+            why += '.';
+        menu.ShowMessage(fmt::format("{} didn't start.", g_load_failure_name), why);
+        g_load_failure.clear();
+    }
     Trace(fmt::format("start page: last run {}, pad {}, {} programs", unfinished ? "unfinished" : "finished or none",
                       g_pad, count));
 
@@ -1111,11 +1224,31 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     const double start = Seconds();
     const int countdown = 60;
     MenuChoice choice{kTestProgram, settings};
+    double web_checked = start;
     for (;;)
     {
         const double now = Seconds();
         const uint32_t pad = MenuPad();
         menu.SetClock(ClockText());
+        if (now - web_checked >= 3)
+        {
+            // (the network may come up after the app; a new address shows)
+            web_checked = now;
+            if (std::string url = WebUrl(); url != web_url)
+            {
+                web_url = std::move(url);
+                menu.SetWebAddress(web_url);
+                set_games_status();
+            }
+        }
+        if (g_files_changed.exchange(false))
+        {
+            // a browser added or removed keys, firmware or games
+            std::vector<Ui::Title> fresh = LoadTitles();
+            software_status = SoftwareStatus(fresh);
+            menu.SetTitles(std::move(fresh));
+            set_games_status();
+        }
         menu.SetController(g_pad >= 0);
         if (g_pad < 0)
         {
@@ -1175,13 +1308,13 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
             choice.settings = menu.Settings();
             SaveMenuSettings(choice.settings);
             Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
-                              "asynchronous shaders {}, GPU accuracy {}, CPU {}, {} cores",
+                              "asynchronous shaders {}, GPU accuracy {}, CPU {}, {} cores, profiler {}",
                               choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
                               choice.settings.docked ? "docked" : "handheld", choice.settings.resolution,
                               choice.settings.shader_cache ? "on" : "off", choice.settings.async_shaders ? "on" : "off",
                               choice.settings.gpu_high ? "high" : "normal", choice.settings.cpu_unsafe ? "unsafe" : "auto",
-                              choice.settings.seventh_core ? 7 : 6));
+                              choice.settings.seventh_core ? 7 : 6, choice.settings.profiler ? "on" : "off"));
         }
         menu.Draw(canvas, now);
         g_screen.DrawFrame({canvas.Pixels(), size_t(canvas.Width()) * canvas.Height()}, uint32_t(canvas.Width()),
@@ -1403,6 +1536,10 @@ void* Run(void*)
     const bool forced_null = renderer && std::string_view{renderer} == "null";
     bool vulkan_failed = false;
     Ui::MenuSettings settings = LoadMenuSettings();
+    StartWebServer();
+    // the threads the profiler samples (System Settings, CPU, Profiler): the emulated CPU cores, the
+    // GPU thread (Maxwell commands) and the Vulkan thread (recording and submitting)
+    ps4_sampler_sample_threads("CPUCore_,CPUThread,GPU,VulkanWorker");
     const auto choose_renderer = [&] {
         const bool use_gpu = radv && !forced_null && !settings.software_renderer && !vulkan_failed;
         g_renderer_label = use_gpu        ? "Vulkan on the PS4's GPU (Mesa's RADV)"
@@ -1429,12 +1566,19 @@ void* Run(void*)
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
         ps4_set_app_cores(settings.seventh_core ? 0x7F : 0x3F);
         NoteRecent(program);
-        Trace(fmt::format("renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
-                          "GPU accuracy {}; CPU {}, {} cores",
-                          g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
-                          settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
-                          settings.gpu_high ? "high" : "normal", settings.cpu_unsafe ? "unsafe" : "auto",
-                          settings.seventh_core ? 7 : 6));
+        const std::string setup = fmt::format(
+            "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
+            "GPU accuracy {}; CPU {}, {} cores{}",
+            g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
+            settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
+            settings.gpu_high ? "high" : "normal", settings.cpu_unsafe ? "unsafe" : "auto",
+            settings.seventh_core ? 7 : 6, settings.profiler ? "; profiler on" : "");
+        Trace(setup);
+        if (settings.profiler)
+        {
+            ps4_sampler_set_enabled(1);
+            ps4_sampler_note(fmt::format("{} ({})", program, setup).c_str());
+        }
         {
             std::lock_guard lock{g_mutex};
             g_screen.SetStatus(fmt::format("booting {}", program));
@@ -1481,6 +1625,12 @@ void* Run(void*)
             watchdog.Stop();
         }
         MemoryTrace("after the program");
+        ps4_sampler_set_enabled(0);
+        if (result.status == Launcher::BootResult::Status::LoadFailed)
+        {
+            g_load_failure_name = std::filesystem::path(program).stem().string();
+            g_load_failure = result.detail;
+        }
         g_running = false;
         pthread_join(pad_thread, nullptr);
         g_drawing = false;
@@ -1500,6 +1650,8 @@ int main()
 {
     mkdir(kDataDir, 0777);
     Trace("started");
+    // a browser that goes away mid-transfer would otherwise end the app (the web server)
+    std::signal(SIGPIPE, SIG_IGN);
     LoadSystemModules();
     Trace(g_screen.Open() ? "screen open" : "no screen (video out failed)");
 

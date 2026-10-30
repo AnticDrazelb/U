@@ -70,6 +70,11 @@ ps4)
     stage="$build/stage"
     rm -rf "$stage" && mkdir -p "$stage/sce_sys"
     cp "$build/extra_frontend/eden-ps4_eboot/eboot.bin" "$stage/"
+    # The app's function names (src/log_tools.h): its logs name the code their addresses point at,
+    # without the ELF of this exact build. "<address> <size> <name>", sorted, relative to .text.
+    llvm-nm-21 --defined-only -S -C -n "$elf" |
+        sed -nE 's/^([0-9a-f]+) ([0-9a-f]+) [tTwW] (.{1,240}).*$/\1 \2 \3/p' |
+        zstd -19 -T0 -q -o "$stage/symbols.zst"
     cp "$HERE/sce_sys/icon0.png" "$stage/sce_sys/"
     OUT="$stage" "$HERE/hello/build.sh" >/dev/null
     OUT="$stage" "$HERE/game/build.sh" >/dev/null

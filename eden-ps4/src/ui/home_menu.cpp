@@ -163,9 +163,13 @@ MenuAction HomeMenu::Start(size_t index)
         Dialog dialog;
         dialog.kind = DialogKind::NoKeys;
         dialog.title = "The keys of your Switch are needed.";
-        dialog.text = "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
-                      "that Switch's firmware. Put them on a USB drive (the keys at the top, the firmware's .nca "
-                      "files in a folder), then Import from USB (Square) in Games and Keys.";
+        dialog.text = web_address.empty()
+            ? "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
+              "that Switch's firmware. Put them on a USB drive (the keys at the top, the firmware's .nca "
+              "files in a folder), then Import from USB (Square) in Games and Keys."
+            : "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
+              "that Switch's firmware. Open " + web_address + " in a browser on a PC or phone on the same "
+              "network to send them, or put them on a USB drive and Import from USB in Games and Keys.";
         dialog.buttons = {"OK"};
         OpenDialog(std::move(dialog));
         return {};
@@ -488,6 +492,9 @@ void HomeMenu::DrawHome(Canvas& c, double now)
     c.Circle(66, 52, 25, Rgb(0x4FA3E8));
     DrawIcon(c, Icon::User, 66, 54, 36, Rgb(0xFFFFFF));
     c.Ring(66, 52, 25, 1.5f, Fade(Rgb(0xFFFFFF), 0.5f));
+    // where a browser on the network reaches the app's web page (keys, firmware, games, logs)
+    if (!web_address.empty())
+        c.Text(108, 60, "From a PC or phone: " + web_address, 19, Weight::Regular, t.dim);
     c.Text(1188, 62, clock, 22, Weight::SemiBold, t.text, Align::Right);
     DrawIcon(c, Icon::WiFi, 1219, 52, 26, t.text);
 
@@ -653,6 +660,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "
              "system needs its core.",
              [](MenuSettings& s) { s.seventh_core = !s.seventh_core; }},
+            {"Profiler", on_off(settings.profiler),
+             "While a game runs, where the emulated CPU cores, the GPU thread and the Vulkan thread spend their "
+             "time: each is looked at 1000 times a second, and every 10 seconds the counts go to samples.log. "
+             "The web page's Profile summary sums them up by function, and Download all logs includes them: "
+             "what to send when a game is slow. It costs a little speed itself.",
+             [](MenuSettings& s) { s.profiler = !s.profiler; }},
         };
     case 3:
         return {{"Console Mode", settings.docked ? "Docked (TV, 1920x1080)" : "Handheld (1280x720)",
@@ -827,8 +840,13 @@ void HomeMenu::DrawReport(Canvas& c)
     c.Text(68, 70, "!", 24, Weight::SemiBold, Rgb(0xFFFFFF), Align::Center);
     c.Text(100, 72, "The software was closed because an error occurred.", 25, Weight::SemiBold, t.text);
     c.Line(30, kHeaderLine, 1250, kHeaderLine, 1.2f, t.line);
-    c.Text(60, 136, "Take a photo of this screen to report it: the end of its output, its crash report and its "
-           "last steps.", 17, Weight::Regular, t.dim, Align::Left, 1160);
+    c.Text(60, 136,
+           web_address.empty()
+               ? std::string("Take a photo of this screen to report it: the end of its output, its crash report and "
+                             "its last steps.")
+               : "Every log, to send: open " + web_address + " in a browser on the same network and choose "
+                 "Download all logs. Or take a photo of this screen.",
+           17, Weight::Regular, t.dim, Align::Left, 1160);
     const auto column = [&](float x, float y, float bottom, const std::string& heading,
                             const std::vector<std::string>& lines, uint32_t color) {
         c.Text(x, y, heading, 17, Weight::SemiBold, t.accent);

@@ -204,7 +204,9 @@ void ApplyLauncherSettings() {
     }
 }
 
-const char* LoadError(Core::SystemResultStatus status) {
+// Why a game didn't load, in words that say what to do about it: the keys and the firmware
+// first (a commercial game's first boot fails there most), else the loader's own message
+std::string LoadError(Core::SystemResultStatus status) {
     switch (status) {
     case Core::SystemResultStatus::ErrorGetLoader:
         return "no loader for this file";
@@ -213,8 +215,56 @@ const char* LoadError(Core::SystemResultStatus status) {
     case Core::SystemResultStatus::ErrorVideoCore:
         return "the video core did not start";
     default:
-        return "the loader failed";
+        break;
     }
+    if (u32(status) < u32(Core::SystemResultStatus::ErrorLoader))
+        return "the system failed to load it";
+    using Loader::ResultStatus;
+    const auto loader = ResultStatus(u32(status) - u32(Core::SystemResultStatus::ErrorLoader));
+    const char* advice = nullptr;
+    switch (loader) {
+    case ResultStatus::ErrorMissingProductionKeyFile:
+        advice = "prod.keys is missing: send it from the web page (the address at the top of the HOME menu) "
+                 "or import it from a USB drive";
+        break;
+    case ResultStatus::ErrorMissingHeaderKey:
+    case ResultStatus::ErrorIncorrectHeaderKey:
+        advice = "prod.keys has no right header_key: dump the keys again from your Switch";
+        break;
+    case ResultStatus::ErrorMissingTitlekey:
+        advice = "this game's title key isn't in title.keys: a downloaded game needs title.keys dumped from "
+                 "the Switch it's installed on";
+        break;
+    case ResultStatus::ErrorMissingTitlekek:
+    case ResultStatus::ErrorMissingKeyAreaKey:
+        advice = "your prod.keys are older than this game: dump them again from a Switch updated to at least "
+                 "the firmware the game needs, and send that firmware too";
+        break;
+    case ResultStatus::ErrorIncorrectKeyAreaKey:
+    case ResultStatus::ErrorIncorrectTitlekeyOrTitlekek:
+        advice = "the keys don't decrypt this game: prod.keys and title.keys must come from the Switch it was "
+                 "dumped from (or the file is damaged)";
+        break;
+    case ResultStatus::ErrorNSPMissingProgramNCA:
+    case ResultStatus::ErrorXCIMissingProgramNCA:
+        advice = "no program found in it: usually the keys can't decrypt it (prod.keys missing, or older than "
+                 "the game), else it's an update or DLC, which goes with the base game";
+        break;
+    case ResultStatus::ErrorNoExeFS:
+    case ResultStatus::ErrorMissingNPDM:
+        advice = "this file has no program: it may be an update or DLC, which goes with the base game";
+        break;
+    case ResultStatus::ErrorIntegrityVerificationFailed:
+    case ResultStatus::ErrorBadNCAHeader:
+    case ResultStatus::ErrorBadPFSHeader:
+    case ResultStatus::ErrorBadXCIHeader:
+        advice = "the file looks damaged: copy or dump it again";
+        break;
+    default:
+        break;
+    }
+    const std::string message = Loader::GetResultStatusString(loader);
+    return advice ? fmt::format("{} ({})", advice, message) : message;
 }
 
 } // namespace

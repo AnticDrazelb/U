@@ -991,6 +991,7 @@ extern "C" void scePthreadSetaffinity();  // libkernel: (ScePthread, SceKernelCp
 extern "C" void scePthreadGetaffinity();  // libkernel: (ScePthread, SceKernelCpumask*)
 extern "C" void ps4_boot_trace(const char* stage);
 extern "C" void ps4_watch_thread(const char* name);  // port/ps4_sampler.cpp
+extern "C" void ps4_thread_ended();                  // port/ps4_sampler.cpp
 extern "C" void ps4_install_signal_stack();        // port/ps4_crashlog.cpp
 
 // Crema setting core_layout (src/gui/ps4/launcher/CremaSettings.cpp), set before the game's threads
@@ -1043,7 +1044,10 @@ void* startOnAppCores(void* raw) {
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name
     ps4_watch_thread("(unnamed)");
-    return start.start(start.arg);
+    void* const result = start.start(start.arg);
+    // (a thread that calls pthread_exit stays in the lists: its slot isn't reused)
+    ps4_thread_ended();
+    return result;
 }
 }  // namespace
 

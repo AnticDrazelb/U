@@ -377,6 +377,33 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.60: **files and logs over the network, and readable logs.** The app runs a small web server
+(`src/web_server.cpp`, port 8080; `EDEN_PS4_WEB_PORT` changes it) and shows its address at the top
+of the HOME menu. From a browser on the same network, its page uploads `prod.keys`/`title.keys`,
+a firmware (a whole folder of `.nca` files at once, replacing the one there) and games, streamed to
+disk with progress (a 1.5 GB game in 8 s on the desktop), and downloads every log as one file.
+It has no password: anyone on the network can reach it while the app is open (it never sends the
+keys back, only logs). The calls it makes (`socket`, `bind`, `listen`, `accept`) are libkernel's,
+loaded in every app; in shadPS4 the page, the uploads and the log bundle all worked.
+
+The package now carries `symbols.zst`: the ELF's function names (`build.sh`, from `llvm-nm`), 0.75
+MB compressed. The log bundle names every code address in `crash.log`, `hang.log`, `samples.log`
+and the boot trace's `callers` lists, and the error screen after a crash shows the functions on the
+crashed thread's stack: no ELF of the exact build is needed to read them any more
+(`src/log_tools.cpp`). While a program runs the bundle skips the names (they take about 11 MiB of
+memory to load) and sends at most each log's last 2 MiB.
+
+System Settings, CPU, **Profiler** turns on Crema's sampler (`port/ps4_sampler.cpp`) while a
+program runs: 1000 times a second it records where the emulated CPU cores (`CPUCore_*`), the GPU
+thread and `VulkanWorker` are, and every 10 s writes the counts to `samples.log`, with a `## `
+line naming each program. The web page's Profile summary (`/api/profile`) sums them up per program
+and thread: the share in the game's translated code (JIT), waiting in system calls, in other system
+library code and in the app's own code, and its busiest functions by name. For Eden, which runs one
+program after another, the sampler now takes threads by name (`ps4_sampler_sample_threads`), and a
+thread that ends leaves its slots in the sampler and the hang dump's list (`ps4_thread_ended`), so
+the next program's threads take them; each window's header also says how many samples were in
+system calls (in the kernel, nearly always waiting).
+
 03.51: **every program that plays sound was killed on a console** as it opened its audio output:
 the launcher never loaded the AudioOut system module (Crema's list has it), and a PS4 kills an app
 that calls into a library whose module isn't loaded, without a signal, so without a crash log.
@@ -606,8 +633,15 @@ After a run, `/data/eden-ps4/log.txt` has the program's output and Eden's warnin
 If a program's frames stop for 20 s after they had started, or none comes 90 s after it booted (a
 game frozen, or stuck loading), the hang watchdog writes every thread's stack, each thread by name,
 to `hang.log` (once, until frames come again): send it with `log.txt` when a game freezes.
-Stack addresses in a crash report are symbolized with that build's ELF (kept next to the package in
-`out/` when it's sent, and in `~/eden-ps4-elves`).
+Since 03.60 the logs name the code they point at themselves (the package's `symbols.zst`); the
+build's ELF (kept next to the package in `out/` when it's sent, and in `~/eden-ps4-elves`) is still
+what `llvm-symbolizer` takes for line numbers.
+
+The easiest way to move files: open the address shown at the top of the HOME menu
+(`http://<the PS4's address>:8080`) in a browser on a PC or phone on the same network. It takes
+keys, firmware and games, and **Download all logs** gives every log above in one file, code
+addresses named, to send instead of photos. **Profile summary** shows where a game's time went
+when System Settings, CPU, Profiler is on.
 
 ## Testing in shadPS4
 

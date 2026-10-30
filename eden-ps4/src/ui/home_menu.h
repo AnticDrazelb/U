@@ -59,6 +59,7 @@ struct MenuSettings
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
     bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
+    bool profiler = false;     // samples.log: where a game's busy threads spend their time
 };
 
 // One line of the Games and Keys screen: something found (or not), and where
@@ -97,6 +98,8 @@ public:
     // News: headings and their text
     void SetNews(std::vector<std::pair<std::string, std::string>> sections) { news = std::move(sections); }
     void SetGamesStatus(std::vector<StatusRow> rows, std::string help);
+    // Where a browser reaches the app's web server ("http://...:8080", or empty without a network)
+    void SetWebAddress(std::string url) { web_address = std::move(url); }
     // Controllers' "Test Input Devices" boots this (none: no such button)
     void SetControllerTest(std::string path) { controller_test = std::move(path); }
     // Shown first, until dismissed
@@ -156,7 +159,7 @@ private:
     std::vector<Title> titles;
     std::map<int, std::vector<Image>> tiles; // by size in pixels: each title's tile, made when first drawn
     MenuSettings settings;
-    std::string version, renderer, clock = "0:00", controller_test, games_help;
+    std::string version, renderer, clock = "0:00", controller_test, games_help, web_address;
     bool radv_linked = false, controller = true, keys_present = false;
     std::vector<std::pair<std::string, std::string>> news;
     std::vector<StatusRow> games_status;

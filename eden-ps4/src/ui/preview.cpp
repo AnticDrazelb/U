@@ -76,6 +76,7 @@ HomeMenu MakeMenu(bool white)
     menu.SetSettings(settings);
     menu.SetInfo("03.20", "Vulkan on the PS4's GPU (Mesa's RADV)", true);
     menu.SetClock("9:27");
+    menu.SetWebAddress("http://192.168.1.23:8080");
     menu.SetKeysPresent(false);
     menu.SetControllerTest("/app0/padtest.nro");
     menu.SetNews({{"Eden for PS4 03.20", "A HOME menu laid out as the Switch's: your software in a row, All Software "

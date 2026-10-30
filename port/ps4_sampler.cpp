@@ -11,7 +11,9 @@
 // Common/JitRegister).
 //
 // Started by ps4_sampler_start() (DolphinNoGUI, ps4.ini profile=on); threads register
-// themselves with ps4_sampler_register_thread().
+// themselves with ps4_sampler_register_thread(), or by name (ps4_sampler_sample_threads: a
+// program whose busy threads are a library's, as Eden's CPU cores are). A thread that ends
+// leaves the sampler (ps4_thread_ended), so a program run after another samples its own.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -39,13 +41,16 @@ constexpr int kRipIndex = 20, kRspIndex = 23;
 // Samples in system libraries (libkernel/libc at 0x800000000+) are attributed to the eboot
 // function that called into them: the first eboot code address on the stack, tagged.
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kCallerTag = 1ULL << 62;
+// A system library sample at a system call ("syscall" just before or at the interrupted
+// instruction): the thread was in the kernel, almost always waiting.
+constexpr uint64_t kSyscallTag = 1ULL << 61;
 constexpr uintptr_t kTextWindow = 0x4000000;
-constexpr int kMaxThreads = 5;  // Crema: the GPU thread, the 3 emulated cores, the recompiler
+constexpr int kMaxThreads = 8;  // Crema: the GPU thread, the 3 emulated cores, the recompiler
 constexpr int kMaxSamples = 16384;  // per thread and window (10 s at 1 kHz fits)
 
 struct ThreadSamples {
-    std::atomic<pthread_t> thread{};
-    const char* name = nullptr;
+    std::atomic<pthread_t> thread{};  // none once the thread ended (its slot is reused)
+    char name[32] = {};
     uint64_t samples[kMaxSamples];
     std::atomic<int> count{0};
 };
@@ -68,8 +73,16 @@ void profHandler(int, siginfo_t*, void* context) {
             // top of samples.log maps it to a module offset, which the decrypted modules' symbol
             // tables name. (Blaming "the first eboot address on the stack" picked up stale
             // values and named the wrong callers.)
-            if (sample >= kSystemLibs && sample < 2 * kSystemLibs)
+            if (sample >= kSystemLibs && sample < 2 * kSystemLibs) {
+                // (the kernel leaves an interrupted wait either after its syscall instruction or,
+                // to restart it, at it; the bytes read stay in the address's page)
+                const auto* code = reinterpret_cast<const uint8_t*>(sample);
+                const uint64_t in_page = sample & 0xFFF;
+                if ((in_page >= 2 && code[-2] == 0x0f && code[-1] == 0x05) ||
+                    (in_page <= 0xFFE && code[0] == 0x0f && code[1] == 0x05))
+                    sample |= kSyscallTag;
                 sample |= kCallerTag;
+            }
             t.samples[n] = sample;
             t.count.store(n + 1, std::memory_order_release);
         }
@@ -107,7 +120,12 @@ void report(int fd, ThreadSamples& t, double window_start) {
 
     // Eboot and JIT code: bucket by 16 bytes (eboot addresses relative to .text; JIT addresses
     // tagged with bit 63).
+    int syscall_samples = 0;
     for (int i = 0; i < n; i++) {
+        if (s[i] & kSyscallTag) {
+            syscall_samples++;
+            s[i] &= ~kSyscallTag;
+        }
         if (s[i] & kCallerTag) {
             s[i] &= ~0xFULL;  // system module address (see the module list)
             continue;
@@ -131,8 +149,9 @@ void report(int fd, ThreadSamples& t, double window_start) {
     std::sort(entries, entries + unique, [](const Entry& a, const Entry& b) { return a.count > b.count; });
 
     char line[256];
-    snprintf(line, sizeof(line), "== %.0f s, %s: %d samples, %d in eboot code (%.0f%%)\n",
-             window_start, t.name, n, eboot_samples, 100.0 * eboot_samples / n);
+    snprintf(line, sizeof(line), "== %.0f s, %s: %d samples, %d in eboot code (%.0f%%), %d in system calls (%.0f%%)\n",
+             window_start, t.name, n, eboot_samples, 100.0 * eboot_samples / n, syscall_samples,
+             100.0 * syscall_samples / n);
     writeLine(fd, line);
     // Every bucket seen at least twice (up to 1500): a function spread over many 16-byte buckets
     // fell below a top-60 cut, hiding about half of a busy thread. Aggregated per function
@@ -349,11 +368,10 @@ void dumpJitCode() {
 }
 
 std::atomic<bool> g_sampler_on{false};
+std::atomic<int> g_samples_fd{-1};  // samples.log (opened by ps4_sampler_start)
 
 void* samplerThread(void*) {
-    const int fd = open("/data/Crema/samples.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0)
-        return nullptr;
+    const int fd = g_samples_fd.load();
     writeModuleList(fd);
     const double start = now();
     double window_start = start, last_dump = start;
@@ -367,8 +385,11 @@ void* samplerThread(void*) {
         }
         nanosleep(&period, nullptr);
         const int threads = g_thread_count.load(std::memory_order_acquire);
-        for (int i = 0; i < threads; i++)
-            pthread_kill(g_threads[i].thread.load(std::memory_order_relaxed), kSigProf);
+        for (int i = 0; i < threads; i++) {
+            const pthread_t thread = g_threads[i].thread.load(std::memory_order_relaxed);
+            if (thread)
+                pthread_kill(thread, kSigProf);
+        }
         if (now() - window_start >= 10.0) {
             writeModuleList(fd);
             for (int i = 0; i < threads; i++)
@@ -420,6 +441,8 @@ struct WatchedThread {
 };
 WatchedThread g_watched[kMaxWatched];
 std::atomic<int> g_watched_count{0};
+// each watched thread's CPU time, as it reports it (ps4_thread_cpu_tick)
+std::atomic<uint64_t> g_watched_cpu_ns[kMaxWatched];
 
 void dumpHandler(int, siginfo_t*, void* context) {
     const pthread_t self = pthread_self();
@@ -496,10 +519,75 @@ void installDumpHandler() {
 
 extern "C" void ps4_heap_private_arena(const char* name);  // ps4_runtime.cpp
 
+namespace {
+// ps4_sampler_sample_threads: comma-separated names; one ending in '_' is a prefix
+char g_sample_names[256];
+
+bool sampledByName(const char* name) {
+    for (const char* p = g_sample_names; *p;) {
+        const char* end = strchr(p, ',');
+        const size_t length = end ? size_t(end - p) : strlen(p);
+        if (length && strncmp(name, p, length) == 0 && (p[length - 1] == '_' || name[length] == 0))
+            return true;
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    return false;
+}
+
+// Into a slot of the sampler: the one of an ended thread of the same name (a program run after
+// another), else a free one, else a new one
+void sampleThread(const char* name, pthread_t self) {
+    int slot = -1;
+    const int count = g_thread_count.load(std::memory_order_acquire);
+    for (int i = 0; i < count; i++) {
+        const pthread_t thread = g_threads[i].thread.load();
+        if (thread == self)
+            return;
+        if (!thread && (slot < 0 || strcmp(g_threads[i].name, name) == 0))
+            slot = i;
+    }
+    if (slot < 0) {
+        if (count >= kMaxThreads)
+            return;
+        slot = count;
+    }
+    ThreadSamples& t = g_threads[slot];
+    snprintf(t.name, sizeof(t.name), "%s", name);
+    t.count.store(0);
+    t.thread.store(self);
+    if (slot == count)
+        g_thread_count.store(count + 1, std::memory_order_release);
+}
+}  // namespace
+
+// Threads that name themselves one of these names are sampled ("CPUCore_,GPU": the GPU thread
+// and every thread whose name starts with CPUCore_)
+extern "C" void ps4_sampler_sample_threads(const char* prefixes) {
+    snprintf(g_sample_names, sizeof(g_sample_names), "%s", prefixes ? prefixes : "");
+}
+
+// The calling thread ends (port/ps4_runtime.cpp, as its start function returns): its slots, in
+// the sampler and the watched threads, are free for threads to come
+extern "C" void ps4_thread_ended() {
+    const pthread_t self = pthread_self();
+    for (int i = 0; i < g_thread_count.load(std::memory_order_acquire); i++) {
+        if (g_threads[i].thread.load() == self)
+            g_threads[i].thread.store(pthread_t{});
+    }
+    for (int i = 0; i < std::min(g_watched_count.load(), kMaxWatched); i++) {
+        if (g_watched[i].thread.load() == self)
+            g_watched[i].thread.store(pthread_t{});
+    }
+}
+
 extern "C" void ps4_watch_thread(const char* name) {
     installDumpHandler();
     ps4_heap_private_arena(name);
     const pthread_t self = pthread_self();
+    if (name && g_sample_names[0] && sampledByName(name))
+        sampleThread(name, self);
     for (int i = 0; i < std::min(g_watched_count.load(), kMaxWatched); i++) {
         if (g_watched[i].thread.load() == self) {
             // already watched (every thread is, from its start): the name it gives itself
@@ -508,9 +596,18 @@ extern "C" void ps4_watch_thread(const char* name) {
             return;
         }
     }
-    const int index = g_watched_count.fetch_add(1);
+    // the slot of a thread that ended, else a new one
+    int index = -1;
+    for (int i = 0; i < std::min(g_watched_count.load(), kMaxWatched) && index < 0; i++) {
+        pthread_t none{};
+        if (g_watched[i].thread.compare_exchange_strong(none, self))
+            index = i;
+    }
+    if (index < 0)
+        index = g_watched_count.fetch_add(1);
     if (index >= kMaxWatched)
         return;
+    g_watched_cpu_ns[index].store(0, std::memory_order_relaxed);
     snprintf(g_watched[index].name, sizeof(g_watched[index].name), "%s", name ? name : "?");
     // Up to and including this function's own return address (frame + 16): threads that register
     // first thing (e.g. the analytics reporter) sit within 256 bytes of their stack's top, and a
@@ -563,7 +660,10 @@ extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
     for (int i = 0; i < count; i++) {
         WatchedThread& t = g_watched[i];
         t.done.store(0);
-        if (pthread_kill(t.thread.load(), kSigDump) != 0) {
+        const pthread_t thread = t.thread.load();
+        if (!thread)
+            continue;  // ended (port/ps4_runtime.cpp: ps4_thread_ended)
+        if (pthread_kill(thread, kSigDump) != 0) {
             snprintf(line, sizeof(line), "-- %s: signal failed (thread gone?)\n", t.name);
             writeLine(fd, line);
             continue;
@@ -650,10 +750,6 @@ extern "C" double ps4_thread_cpu_seconds(int slot) {
 // The PS4 doesn't let a thread read another thread's CPU clock (pthread_getcpuclockid fails), so
 // busy threads report their own: ps4_thread_cpu_tick() in their loops stores the thread's CPU
 // time in its watched slot, at most every ~10 ms (rdtsc check; the clock read is a system call).
-namespace {
-std::atomic<uint64_t> g_watched_cpu_ns[kMaxWatched];
-}  // namespace
-
 extern "C" void ps4_thread_cpu_tick() {
     static thread_local int t_slot = -2;
     static thread_local uint64_t t_last = 0;
@@ -693,6 +789,10 @@ extern "C" void ps4_thread_busy_report(char* out, size_t size, int min_percent) 
     for (int i = 0; i < count; i++) {
         percents[i] = -1;
         uint64_t ns = g_watched_cpu_ns[i].load(std::memory_order_relaxed);
+        if (!g_watched[i].thread.load()) {
+            s_prev_cpu[i] = 0;  // ended: the slot's next thread starts afresh
+            continue;
+        }
         if (ns == 0) {
             clockid_t clock;
             timespec cpu;
@@ -725,7 +825,7 @@ extern "C" void ps4_sampler_register_thread(const char* name) {
     const int index = g_thread_count.load();
     if (index >= kMaxThreads)
         return;
-    g_threads[index].name = name;
+    snprintf(g_threads[index].name, sizeof(g_threads[index].name), "%s", name ? name : "?");
     g_threads[index].thread.store(pthread_self());
     g_thread_count.store(index + 1, std::memory_order_release);
 }
@@ -743,9 +843,26 @@ extern "C" void ps4_sampler_start() {
     sigemptyset(&action.sa_mask);
     sigaction(kSigProf, &action, nullptr);
 
+    // (here rather than in the thread: a note right after the start goes into it)
+    const int fd = open("/data/Crema/samples.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        ps4_boot_trace("sampler: cannot open /data/Crema/samples.log");
+        return;
+    }
+    g_samples_fd.store(fd);
     pthread_t thread;
     if (pthread_create(&thread, nullptr, samplerThread, nullptr) == 0)
         ps4_boot_trace("sampler: started, writing /data/Crema/samples.log every 10 s");
+}
+
+// A "## <text>" line in samples.log (which program the windows after it sampled), if it's open
+extern "C" void ps4_sampler_note(const char* text) {
+    const int fd = g_samples_fd.load();
+    if (fd < 0)
+        return;
+    char line[300];
+    snprintf(line, sizeof(line), "## %s\n", text);
+    writeLine(fd, line);
 }
 
 // The menus' Profiler switch: starts the sampler the first time, then pauses / resumes it.

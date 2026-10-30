@@ -37,7 +37,8 @@ if (PS4)
     set_source_files_properties(ui/canvas.cpp PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")
 
-    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp usb_import.cpp ${EDEN_PS4_UI_SOURCES}
+    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp usb_import.cpp web_server.cpp log_tools.cpp
+                            ${EDEN_PS4_UI_SOURCES}
                             ${EDEN_PS4_RUNTIME_SOURCES})
     target_include_directories(eden-ps4 PRIVATE ${CMAKE_CURRENT_LIST_DIR})
     target_compile_definitions(eden-ps4 PRIVATE EDEN_PS4_VERSION="${EDEN_PS4_VERSION}")
@@ -63,6 +64,9 @@ endif()
 
 target_link_libraries(eden-ps4 PRIVATE common core audio_core video_core hid_core input_common
     frontend_common network Threads::Threads)
+if (PS4)
+    target_link_libraries(eden-ps4 PRIVATE zstd::zstd) # log_tools.cpp: symbols.zst
+endif()
 # vma.h (the Vulkan memory allocator, compiled in main.cpp) isn't warning-clean.
 set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS
     "-Wno-conversion;-Wno-unused-variable;-Wno-unused-parameter;-Wno-missing-field-initializers")
