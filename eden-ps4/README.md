@@ -377,6 +377,18 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.73: **USB drives.** On a console the app listed nothing from an exFAT drive the package had been
+installed from, though Crema, on the same runtime, lists Wii U games from USB drives on the same
+console. Three things in the launcher's own scan, none a matter of permissions: the game list was
+made once, as the app started, so a drive the system mounted after that (or plugged in later) never
+showed; only a drive's top was searched, not its folders; and Import from USB wanted `prod.keys`
+in exactly that case. Now the drives are checked every 3 s and the list is made again when one
+changes, games are found at the top and one folder down (system and hidden folders left out), with
+`opendir`/`stat` as Crema-style scans do, and the keys' names match in any case. Games and Keys (and
+the boot trace) say what the app sees on each drive, down to the names at its top. In shadPS4 (its
+`/mnt/usb0` is `user/mnt/usb0`): a drive filled after the start page was up showed its game from
+`switch/` within 3 s, and Import from USB took `Prod.keys` and the firmware zip from a folder.
+
 03.71: **firmware zips.** Firmware usually comes as a `.zip` of its `.nca` files; the web page now
 takes it as it is and the PS4 unpacks it (`src/firmware_zip.cpp`, with zlib from the sysroot): the
 zip's central directory, stored and deflated entries, ZIP64, `.nca` files from any folder in it,

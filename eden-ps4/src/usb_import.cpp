@@ -58,10 +58,20 @@ std::vector<fs::path> Folders(const fs::path& folder)
     return folders;
 }
 
-bool IsFile(const fs::path& path)
+// The file in `folder` with this name in any case (Prod.keys, PROD.KEYS), or none
+fs::path FindFile(const fs::path& folder, const std::string& name)
 {
+    const auto lower = [](std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return text;
+    };
     std::error_code ec;
-    return fs::is_regular_file(path, ec);
+    for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
+    {
+        if (lower(it->path().filename().string()) == name && it->is_regular_file(ec))
+            return it->path();
+    }
+    return {};
 }
 
 // Copies through a temporary name, so that a copy cut short leaves no truncated file behind
@@ -105,16 +115,17 @@ bool CopyFile(const fs::path& from, const fs::path& to, std::string& error)
     return true;
 }
 
-// Where prod.keys is on a drive: its top, a folder at its top, or that folder's keys folder
+// Where prod.keys is on a drive (its name in any case): its top, a folder at its top, or that
+// folder's keys folder
 fs::path FindKeys(const fs::path& drive)
 {
-    if (IsFile(drive / "prod.keys"))
+    if (!FindFile(drive, "prod.keys").empty())
         return drive;
     for (const fs::path& folder : Folders(drive))
     {
-        if (IsFile(folder / "prod.keys"))
+        if (!FindFile(folder, "prod.keys").empty())
             return folder;
-        if (IsFile(folder / "keys" / "prod.keys"))
+        if (!FindFile(folder / "keys", "prod.keys").empty())
             return folder / "keys";
     }
     return {};
@@ -215,12 +226,12 @@ UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::strin
     {
         const fs::path keys_dir = fs::path{user_dir} / "keys";
         fs::create_directories(keys_dir, ec);
-        if (!CopyFile(keys / "prod.keys", keys_dir / "prod.keys", result.error))
+        if (!CopyFile(FindFile(keys, "prod.keys"), keys_dir / "prod.keys", result.error))
             return result;
         result.keys_folder = keys.string();
-        if (IsFile(keys / "title.keys"))
+        if (const fs::path title_keys = FindFile(keys, "title.keys"); !title_keys.empty())
         {
-            if (!CopyFile(keys / "title.keys", keys_dir / "title.keys", result.error))
+            if (!CopyFile(title_keys, keys_dir / "title.keys", result.error))
                 return result;
             result.title_keys = true;
         }

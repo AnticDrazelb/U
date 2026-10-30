@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <dirent.h>
@@ -800,6 +801,64 @@ std::vector<uint8_t> ReadFile(const std::string& path)
     return data;
 }
 
+bool IsGameFileName(const std::string& name)
+{
+    const std::string extension = Lower(std::filesystem::path(name).extension().string());
+    return extension == ".nro" || extension == ".nso" || extension == ".nsp" || extension == ".xci";
+}
+
+// The game files in `folder` and, `depth` folders down, in its folders (a USB drive's switch or
+// games folder), sorted: the system's own folders and hidden ones left out
+std::vector<std::filesystem::path> GameFiles(const std::string& folder, int depth)
+{
+    std::vector<std::filesystem::path> found;
+    std::vector<std::string> folders;
+    DIR* directory = opendir(folder.c_str());
+    if (!directory)
+        return found;
+    while (const dirent* entry = readdir(directory))
+    {
+        const std::string name = entry->d_name;
+        if (name.empty() || name[0] == '.' || name[0] == '$' || name == "System Volume Information")
+            continue;
+        const std::string path = folder + "/" + name;
+        struct stat status{};
+        if (stat(path.c_str(), &status) != 0)
+            continue;
+        if (S_ISREG(status.st_mode) && IsGameFileName(name))
+            found.push_back(path);
+        else if (S_ISDIR(status.st_mode) && depth > 0)
+            folders.push_back(path);
+    }
+    closedir(directory);
+    std::sort(found.begin(), found.end());
+    std::sort(folders.begin(), folders.end());
+    for (const std::string& inner : folders)
+        for (std::filesystem::path& path : GameFiles(inner, depth - 1))
+            found.push_back(std::move(path));
+    return found;
+}
+
+// Which USB drives are there and what's at their tops, in short: the game list is made again when
+// it changes (a drive plugged in, or mounted after the app started)
+std::string UsbSignature()
+{
+    std::string signature;
+    for (int i = 0; i < 8; i++)
+    {
+        const std::string path = fmt::format("/mnt/usb{}", i);
+        DIR* directory = opendir(path.c_str());
+        if (!directory)
+            continue;
+        size_t entries = 0;
+        while (readdir(directory))
+            entries++;
+        closedir(directory);
+        signature += fmt::format("{}:{};", i, entries);
+    }
+    return signature;
+}
+
 std::vector<Ui::Title> LoadTitles()
 {
     struct BuiltIn
@@ -830,20 +889,13 @@ std::vector<Ui::Title> LoadTitles()
         title.size = ec ? "" : SizeText(size);
         titles.push_back(std::move(title));
     }
-    std::vector<std::pair<std::string, std::string>> folders = {{kDataDir, "data folder"}};
+    // the data folder's top (its folders are the app's own), and each USB drive's top and folders
+    std::vector<std::tuple<std::string, std::string, int>> folders = {{kDataDir, "data folder", 0}};
     for (int i = 0; i < 8; i++)
-        folders.push_back({fmt::format("/mnt/usb{}", i), fmt::format("USB {}", i)});
-    for (const auto& [folder, where] : folders)
+        folders.push_back({fmt::format("/mnt/usb{}", i), fmt::format("USB {}", i), 1});
+    for (const auto& [folder, where, depth] : folders)
     {
-        std::vector<std::filesystem::path> found;
-        for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec))
-        {
-            const std::string extension = Lower(it->path().extension().string());
-            if ((extension == ".nro" || extension == ".nso" || extension == ".nsp" || extension == ".xci") &&
-                it->is_regular_file(ec))
-                found.push_back(it->path());
-        }
-        std::sort(found.begin(), found.end());
+        const std::vector<std::filesystem::path> found = GameFiles(folder, depth);
         for (const std::filesystem::path& path : found)
         {
             Ui::Title title;
@@ -966,23 +1018,22 @@ std::string UsbReport(bool* readable = nullptr)
             seen.push_back(fmt::format("{}: there, but can't be opened ({})", path, std::strerror(errno)));
             continue;
         }
-        size_t entries = 0, games = 0;
-        bool keys = false;
+        size_t entries = 0;
+        std::string names; // the first few, as the app reads them
         while (const dirent* entry = readdir(folder))
         {
             const std::string name = entry->d_name;
             if (name == "." || name == "..")
                 continue;
-            entries++;
-            const std::string extension = Lower(std::filesystem::path(name).extension().string());
-            games += extension == ".nsp" || extension == ".xci" || extension == ".nro" || extension == ".nso";
-            keys |= name == "prod.keys";
+            if (++entries <= 8)
+                names += (names.empty() ? "" : ", ") + name;
         }
         closedir(folder);
         if (readable && entries > 0)
             *readable = true;
-        seen.push_back(fmt::format("{}: {} entries at its top, {} games{}", path, entries, games,
-                                   keys ? ", prod.keys" : ""));
+        const size_t games = GameFiles(path, 1).size();
+        seen.push_back(fmt::format("{}: {} games (top and one folder down); at its top: {}{}", path, games,
+                                   names.empty() ? std::string("nothing") : names, entries > 8 ? ", ..." : ""));
     }
     if (seen.empty())
         return "none of /mnt/usb0 to /mnt/usb7 is there for the app";
@@ -1097,7 +1148,10 @@ std::vector<std::pair<std::string, std::string>> News()
          "it (the PS4 couldn't delete folders); send yours once more to be sure.\n"
          "03.72: Games and Keys shows what the app itself sees of each USB drive (whether it may open it at "
          "all, and what's at its top), as the boot trace does: the system installing packages from a drive "
-         "doesn't mean an app is allowed to read it."},
+         "doesn't mean an app is allowed to read it.\n"
+         "03.73: USB drives: games are found in any folder on the drive too (switch, games...), the list is "
+         "made again when a drive is plugged in or mounted after the app started (it was only made as the app "
+         "started), and Import from USB finds Prod.keys in any case."},
         {"Before: 03.60",
          "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
          "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
@@ -1313,6 +1367,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     const int countdown = 60;
     MenuChoice choice{kTestProgram, settings};
     double web_checked = start;
+    std::string usb_signature = UsbSignature();
     for (;;)
     {
         const double now = Seconds();
@@ -1320,8 +1375,15 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         menu.SetClock(ClockText());
         if (now - web_checked >= 3)
         {
-            // (the network may come up after the app; a new address shows)
+            // (the network may come up after the app; a new address shows; a USB drive may be
+            // plugged in, or mounted after the app started: its games show)
             web_checked = now;
+            if (std::string usb = UsbSignature(); usb != usb_signature)
+            {
+                usb_signature = std::move(usb);
+                Trace("usb: " + UsbReport());
+                g_files_changed = true;
+            }
             if (std::string url = WebUrl(); url != web_url)
             {
                 web_url = std::move(url);
