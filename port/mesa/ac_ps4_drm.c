@@ -1132,6 +1132,16 @@ static ac_drm_device *ps4_last_device;
 static pthread_mutex_t ps4_device_lock = PTHREAD_MUTEX_INITIALIZER;
 static ac_drm_device *ps4_device;
 static unsigned ps4_device_users;
+
+/* Direct memory the GPU's buffers hold now, frees still waiting for the GPU included (Eden's
+ * caches size their garbage collection from it: Vulkan::Device::GetDeviceMemoryUsage). */
+uint64_t ac_ps4_gpu_bytes(void);
+uint64_t
+ac_ps4_gpu_bytes(void)
+{
+   ac_drm_device *dev = __atomic_load_n(&ps4_device, __ATOMIC_ACQUIRE);
+   return dev ? __atomic_load_n(&dev->bo_bytes, __ATOMIC_RELAXED) : 0;
+}
 static bool ps4_jobs_idle(void);
 
 /* Logs the first memory operations (bring-up). */

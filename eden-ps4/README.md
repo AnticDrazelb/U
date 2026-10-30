@@ -377,6 +377,39 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.70: **the Switch's RAM on demand, so the GPU gets the memory games don't use.** Eden mapped
+the Switch's 4 GiB of DRAM onto 4 GiB of the PS4's 4.5 GiB of direct memory as a program started,
+leaving about 480 MiB for RADV (textures, buffers, command buffers) and the C heap's overflow;
+Eden4 lists running out of it as the way large games fail. Now (patch 0058, `common/orbis_memory`)
+the DRAM range is only reserved, and a fault handler maps a 2 MiB chunk of direct memory the first
+time anything touches it: zeroed at an address the kernel picks first, then mapped in place (mapped
+first and zeroed there, another thread touching the same chunk could see it half cleared or have
+its write wiped: a desktop test of the mechanism against a fake of the PS4's direct memory caught
+exactly that, and runs 16 threads onto fresh chunks 50 times now). A zero fill of chunks never
+touched, as a new heap gets, leaves them alone, so a game's heap takes memory only as it's used.
+Direct memory run out makes the fault wait up to 4 s for the GPU's caches to give some back before
+it is a crash. `IOFile` touches a large buffer before the C library passes it to `read()` or
+`write()`, as the kernel's own accesses don't fault into the handler (they fail with EFAULT).
+System Settings, System, Switch Memory (`EDEN_PS4_DRAM_ON_DEMAND=0`) maps it all up front as before.
+
+The texture and buffer caches' garbage collection follows: on the PS4 their memory use is what the
+GPU's buffers hold (the winsys's own count, `ac_ps4_gpu_bytes`), scaled against the free direct
+memory plus that, less 384 MiB kept for the DRAM to grow into. As a game's RAM grows, the GPU's share
+shrinks and the caches collect harder, handing direct memory back. dynarmic's POSIX fault handler is
+no longer built for the PS4: with no fastmem it registered no code, and logged every fault (from the
+signal handler) before passing it on to the page table's and now the DRAM's handlers.
+
+Bug found on the way (patch 0060): a file no loader takes (one that isn't there, or not a game)
+left the kernel initialized, and destroying the system after it crashed (AddressSanitizer: the
+kernel's object list still held objects the slab heaps had freed). Every other failed load shut the
+kernel down first; this one does too now, and `test.sh` checks both kinds of failure.
+
+Updates and DLC: `.nsp` files in `/data/eden-ps4/updates`, sent from the web page's new section or
+copied there, are applied to their game as it boots (Eden's external content, nothing installed).
+Every 30 s while a program runs, the boot trace has a line with its frame rate and the memory: the
+Switch's RAM in use (and its peak), the GPU's buffers, the C heap, and the largest free block of
+direct memory, which says how much a game really needs on the console.
+
 03.60: **files and logs over the network, and readable logs.** The app runs a small web server
 (`src/web_server.cpp`, port 8080; `EDEN_PS4_WEB_PORT` changes it) and shows its address at the top
 of the HOME menu. From a browser on the same network, its page uploads `prod.keys`/`title.keys`,

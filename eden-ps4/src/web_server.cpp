@@ -8,9 +8,11 @@
 //                                 named, samples.log summed up: log_tools.h)
 //   GET  /api/profile             samples.log summed up
 //   GET  /files/<path>            one log (the data folder's .log and .txt files, and gpu/)
-//   PUT  /upload/<kind>/<name>    kind keys (*.keys), firmware (*.nca) or games (.nsp .xci .nro .nso)
+//   PUT  /upload/<kind>/<name>    kind keys (*.keys), firmware (*.nca), games (.nsp .xci .nro .nso)
+//                                 or updates (updates and DLC, .nsp: applied as their game boots)
 //   POST /api/firmware/clear      removes the firmware (before a new one is uploaded)
 //   DELETE /files/<name>          removes a game from the data folder
+//   DELETE /updates/<name>        removes an update or DLC
 
 #include "web_server.h"
 #include "log_tools.h"
@@ -300,6 +302,8 @@ public:
             ClearFirmware(connection);
         else if (request.method == "DELETE" && path.starts_with("/files/"))
             DeleteGame(connection, UrlDecode(path.substr(7)));
+        else if (request.method == "DELETE" && path.starts_with("/updates/"))
+            DeleteUpdate(connection, UrlDecode(path.substr(9)));
         else
             connection.Error(404, "Not Found", "Nothing here.");
     }
@@ -352,6 +356,16 @@ private:
                          ",\"size\":" + std::to_string(it->file_size(ec)) + "}";
         }
         games += "]";
+        std::string updates = "[";
+        for (fs::directory_iterator it(data / "updates", ec), end; !ec && it != end; it.increment(ec))
+        {
+            const std::string name = it->path().filename().string();
+            if (it->is_regular_file(ec) && EndsWith(name, ".nsp"))
+                updates += (updates.size() > 1 ? "," : "") + std::string("{\"name\":") + JsonString(name) +
+                           ",\"size\":" + std::to_string(it->file_size(ec)) + "}";
+        }
+        ec.clear();
+        updates += "]";
         std::string logs = "[";
         for (const auto& [name, size] : Logs())
             logs += (logs.size() > 1 ? "," : "") + std::string("{\"name\":") + JsonString(name) +
@@ -360,7 +374,8 @@ private:
         std::string json = "{\"version\":" + JsonString(config.version) +
                            ",\"keys\":" + (fs::exists(data / "user/keys/prod.keys", ec) ? "true" : "false") +
                            ",\"title_keys\":" + (fs::exists(data / "user/keys/title.keys", ec) ? "true" : "false") +
-                           ",\"firmware\":" + std::to_string(firmware) + ",\"games\":" + games + ",\"logs\":" + logs;
+                           ",\"firmware\":" + std::to_string(firmware) + ",\"games\":" + games +
+                           ",\"updates\":" + updates + ",\"logs\":" + logs;
         if (config.status)
         {
             const std::string extra = config.status();
@@ -472,6 +487,8 @@ private:
             folder = Registered();
         else if (kind == "games" && IsGame(name))
             folder = data;
+        else if (kind == "updates" && EndsWith(name, ".nsp"))
+            folder = data / "updates";
         if (folder.empty() || !SafeName(name))
         {
             connection.Error(400, "Bad Request", "Not a file that goes there: " + name);
@@ -530,6 +547,21 @@ private:
         const uintmax_t removed = fs::remove_all(Registered(), ec);
         fs::create_directories(Registered(), ec);
         Log("firmware cleared (" + std::to_string(removed) + " entries)");
+        Changed();
+        connection.Respond(200, "OK", "text/plain; charset=utf-8", "ok\n");
+    }
+
+    void DeleteUpdate(Connection& connection, const std::string& name)
+    {
+        std::error_code ec;
+        const fs::path file = data / "updates" / name;
+        if (!SafeName(name) || !EndsWith(name, ".nsp") || !fs::is_regular_file(file, ec))
+        {
+            connection.Error(404, "Not Found", "No such update or DLC.");
+            return;
+        }
+        fs::remove(file, ec);
+        Log("removed " + file.string());
         Changed();
         connection.Respond(200, "OK", "text/plain; charset=utf-8", "ok\n");
     }

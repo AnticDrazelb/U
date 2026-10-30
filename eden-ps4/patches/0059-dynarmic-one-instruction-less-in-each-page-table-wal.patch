@@ -1,0 +1,63 @@
+From fa5c401d67a2bcf485a1f5a5b466dc4aa59d9e06 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 14:45:27 +0000
+Subject: [PATCH] dynarmic: one instruction less in each page table walk with
+ sign extension
+
+With the entries sign-extended from a bit (the PS4, where the emulated DRAM
+lies below 2^39), the shl/sar drop the bits above it, so the pointer mask
+may have them set: Eden's mask then becomes an AND with a 32-bit immediate
+(-4096), instead of a 64-bit constant loaded into a register (a 10-byte
+instruction) and an AND, in every guest memory access's walk.
+---
+ .../dynarmic/backend/x64/emit_x64_memory.h    | 20 +++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index 724e8d233..88aa5c94a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -73,6 +73,18 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
+     }
+ }
+ 
++// The page table entries' pointer mask as far as it matters: with sign extension from a bit
++// (shl/sar below), the bits above it are shifted out anyway, so they may as well be set - which
++// for Eden's mask leaves only the low attribute bits to clear, an AND with a 32-bit immediate
++// (-4096) instead of a 64-bit constant loaded into a register first (the PS4, every access).
++template<typename Config>
++u64 EffectivePointerMask(const Config& conf) {
++    if (!conf.page_table_sign_extension || *conf.page_table_sign_extension >= 63) {
++        return conf.page_table_pointer_mask;
++    }
++    return conf.page_table_pointer_mask | ~((u64(2) << *conf.page_table_sign_extension) - 1);
++}
++
+ template<typename EmitContext>
+ Xbyak::RegExp EmitVAddrLookup(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool is_read);
+ 
+@@ -101,8 +113,8 @@ template<>
+     // mask away attributes
+     if (ctx.conf.page_table_pointer_mask == 0) {
+         code.test(page, page);
+-    } else if (std::in_range<s32>(ctx.conf.page_table_pointer_mask)) {
+-        code.and_(page, ctx.conf.page_table_pointer_mask);
++    } else if (std::in_range<s32>(s64(EffectivePointerMask(ctx.conf)))) {
++        code.and_(page, u32(s32(EffectivePointerMask(ctx.conf)))); // (sign-extended)
+     } else {
+         code.mov(tmp, ctx.conf.page_table_pointer_mask);
+         code.and_(page, tmp);
+@@ -176,8 +188,8 @@ template<>
+     // mask away attributes
+     if (ctx.conf.page_table_pointer_mask == 0) {
+         code.test(page, page);
+-    } else if (std::in_range<s32>(ctx.conf.page_table_pointer_mask)) {
+-        code.and_(page, ctx.conf.page_table_pointer_mask);
++    } else if (std::in_range<s32>(s64(EffectivePointerMask(ctx.conf)))) {
++        code.and_(page, u32(s32(EffectivePointerMask(ctx.conf)))); // (sign-extended)
+     } else {
+         code.mov(tmp, ctx.conf.page_table_pointer_mask);
+         code.and_(page, tmp);
+-- 
+2.43.0
+

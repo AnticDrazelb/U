@@ -410,6 +410,10 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
     g_log_bytes = 0;
 
     ApplyLauncherSettings();
+    // Updates and DLC (.nsp) in data_dir/updates, applied to their game as it boots, without
+    // installing them (Eden's external content)
+    std::filesystem::create_directories(data_dir / "updates", ec);
+    Settings::values.external_content_dirs = {(data_dir / "updates").string()};
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(false);
     Common::Log::SetCallback(OnLog);

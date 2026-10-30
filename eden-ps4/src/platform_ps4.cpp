@@ -40,6 +40,7 @@
 #include <orbis/VideoOut.h>
 #include <stb/stb_easy_font.h>
 
+#include "common/orbis_memory.h"
 #include "common/ps4_diagnostics.h"
 #include "launcher.h"
 #include "ui/canvas.h"
@@ -80,6 +81,8 @@ void ps4_heap_usage(size_t* in_use, size_t* size);
 int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
 void ps4_dump_thread_stacks(const char* path, const char* reason);
+// Mesa's PS4 winsys (port/mesa/ac_ps4_drm.c; ps4_stubs.cpp without it): the GPU buffers' memory
+uint64_t ac_ps4_gpu_bytes();
 // port/ps4_sampler.cpp: the profiler (samples.log), the threads it samples (by name), and a line
 // in samples.log
 void ps4_sampler_sample_threads(const char* names);
@@ -915,6 +918,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.seventh_core = false;
         else if (line == "profiler=on")
             settings.profiler = true;
+        else if (line == "ram=reserved")
+            settings.ram_on_demand = false;
     }
     return settings;
 }
@@ -924,12 +929,12 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
-                     settings.profiler ? "on" : "off");
+                     settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved");
         std::fclose(f);
     }
 }
@@ -1022,6 +1027,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "More memory for games' graphics: the Switch's 4 GB of RAM no longer take 4 GB of the PS4's memory as a "
+         "game starts, only what the game actually uses, 2 MB at a time. The rest goes to the PS4's GPU, which "
+         "had about half a GB left for textures before; its caches now give memory back as the game's grows. "
+         "System Settings, System, Switch Memory turns this off.\n"
+         "Updates and DLC: .nsp files sent from the browser page (or put in /data/eden-ps4/updates) are applied "
+         "as their game starts. Many games need their latest update.\n"
+         "Every 30 seconds while a game runs, boot-trace.log notes its frame rate and where the memory went."},
+        {"Before: 03.60",
          "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
          "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
          "in one file: no FTP, no USB drive, no photos of the screen. Anyone on your network can reach it while "
@@ -1182,6 +1195,16 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     const auto set_games_status = [&] {
         std::vector<Ui::StatusRow> rows = KeysAndFirmwareStatus();
         rows.push_back(software_status);
+        size_t updates = 0;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(std::string(kDataDir) + "/updates", ec), end; !ec && it != end;
+             it.increment(ec))
+            updates += it->path().extension() == ".nsp";
+        rows.push_back({"Updates and DLC",
+                        updates ? fmt::format("{} in /data/eden-ps4/updates, applied as their game starts", updates)
+                                : std::string("None: .nsp files in /data/eden-ps4/updates (or sent from a browser) "
+                                              "are applied as their game starts"),
+                        updates > 0});
         rows.push_back({"From a PC or phone",
                         web_url.empty() ? std::string("No network: connected, the PS4 takes keys, firmware and games "
                                                       "from a browser, and gives it every log")
@@ -1190,7 +1213,6 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                                                       web_url),
                         !web_url.empty()});
         menu.SetGamesStatus(std::move(rows), kGamesHelp);
-        std::error_code ec;
         menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec));
     };
     set_games_status();
@@ -1398,6 +1420,20 @@ void ReadSettings()
 // until frames move again: what to send when a game freezes on the console. It allocates nothing
 // before the dump, which then still happens when the hang is in the heap. EDEN_PS4_HANG_SECONDS
 // in settings.txt changes the 20 (and the 90 with it, 4.5 times as long).
+// Where the memory is: the Switch's RAM (direct memory taken as the game touches it), the GPU's
+// buffers, the C heap, and what's left
+std::string MemoryLine()
+{
+    size_t in_use = 0, size = 0, flexible = 0;
+    ps4_heap_usage(&in_use, &size);
+    sceKernelAvailableFlexibleMemorySize(&flexible);
+    return fmt::format("the Switch's RAM {} MiB (at most {}), the GPU's buffers {} MiB, C heap {} of {} MiB in use, "
+                       "{} MiB of flexible memory free, largest free block of direct memory {} MiB",
+                       Common::Orbis::OnDemandBytes() / MB, Common::Orbis::OnDemandPeakBytes() / MB,
+                       ac_ps4_gpu_bytes() / MB, in_use / MB, size / MB, flexible / MB,
+                       Common::PS4Diagnostics::LargestFreeDirect() / MB);
+}
+
 class HangWatchdog
 {
 public:
@@ -1430,12 +1466,20 @@ private:
         uint64_t last = base;
         int seconds = 0, stale = 0;
         bool dumped = false;
+        uint64_t reported = base;
         while (!stop)
         {
             for (int i = 0; i < 10 && !stop; i++)
                 usleep(100 * 1000);
             seconds++;
             const uint64_t frames = Frames();
+            if (seconds % 30 == 0)
+            {
+                // how it runs: the frame rate, and the memory (what a game needs, on the console)
+                Trace(fmt::format("running {} s: {:.1f} frames a second; {}", seconds,
+                                  double(frames - reported) / 30.0, MemoryLine()));
+                reported = frames;
+            }
             if (frames != last)
             {
                 last = frames;
@@ -1472,12 +1516,7 @@ private:
 // up as the next one starts (the first console run ran out after two programs)
 void MemoryTrace(const char* when)
 {
-    size_t in_use = 0, size = 0, flexible = 0;
-    ps4_heap_usage(&in_use, &size);
-    sceKernelAvailableFlexibleMemorySize(&flexible);
-    Trace(fmt::format("memory {}: C heap {} of {} MiB in use, {} MiB of flexible memory free, largest free "
-                      "block of direct memory {} MiB",
-                      when, in_use / MB, size / MB, flexible / MB, Common::PS4Diagnostics::LargestFreeDirect() / MB));
+    Trace(fmt::format("memory {}: {}", when, MemoryLine()));
 }
 
 // EDEN_PS4_HEAP_TEST=<MiB> in settings.txt: with 4 GiB of direct memory taken first (as the
@@ -1565,14 +1604,17 @@ void* Run(void*)
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
         ps4_set_app_cores(settings.seventh_core ? 0x7F : 0x3F);
+        // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
+        setenv("EDEN_PS4_DRAM_ON_DEMAND", settings.ram_on_demand ? "1" : "0", 1);
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}; CPU {}, {} cores{}",
+            "GPU accuracy {}; CPU {}, {} cores; the Switch's RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.cpu_unsafe ? "unsafe" : "auto",
-            settings.seventh_core ? 7 : 6, settings.profiler ? "; profiler on" : "");
+            settings.seventh_core ? 7 : 6, settings.ram_on_demand ? "on demand" : "all up front",
+            settings.profiler ? "; profiler on" : "");
         Trace(setup);
         if (settings.profiler)
         {

@@ -60,6 +60,7 @@ struct MenuSettings
     bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
     bool profiler = false;     // samples.log: where a game's busy threads spend their time
+    bool ram_on_demand = true; // the Switch's RAM taken from the PS4's as the game uses it
 };
 
 // One line of the Games and Keys screen: something found (or not), and where

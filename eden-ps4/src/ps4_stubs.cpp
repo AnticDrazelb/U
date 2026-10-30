@@ -31,6 +31,10 @@ int ac_ps4_submit_flip(int, unsigned, unsigned, int64_t)
 {
     return -1;
 }
+uint64_t ac_ps4_gpu_bytes()
+{
+    return 0;
+}
 #endif
 
 void ps4_crash_guest_info() {}

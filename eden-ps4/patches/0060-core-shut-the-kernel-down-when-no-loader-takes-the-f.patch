@@ -1,0 +1,33 @@
+From ddaa9541dee00e778f35cfd118aab9fe02e441c8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 15:00:45 +0000
+Subject: [PATCH] core: shut the kernel down when no loader takes the file
+
+System::Load initializes the kernel before it looks for a loader. A file
+no loader takes (one that isn't there, or isn't a game) returned without
+shutting it down, unlike every other failed load: the kernel's object list
+then still held objects that the slab heaps, destroyed first, had freed, and
+destroying the system crashed (AddressSanitizer: in ~KAutoObjectWithList-
+Container). The PS4 launcher destroys the system after every boot.
+---
+ src/core/core.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index c9aefcf02..dad4706e9 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -337,6 +337,10 @@ struct System::Impl {
+ 
+         if (!app_loader) {
+             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
++            // as for a load that failed above: the kernel it initialized goes down now, or its
++            // object list still holds objects the slab heaps free first (a crash at exit)
++            process.reset();
++            ShutdownMainProcess();
+             return SystemResultStatus::ErrorGetLoader;
+         }
+ 
+-- 
+2.43.0
+

@@ -356,5 +356,14 @@ start=$(date +%s)
 run fullheap "$work/fullheap.nro" 60 ""
 check "starts and exits in under 15 s" bash -c "grep -q 'fullheap: started' '$work/fullheap.log' && [ \$(( \$(date +%s) - $start )) -lt 15 ]"
 
+echo "the launcher: files that don't load say why, and leave cleanly (a crash at exit before 03.70)"
+head -c 200000 /dev/urandom >"$work/broken.nsp"
+run noloader "$work/no-such-file.nro" 20 ""
+check "no loader: exit code 1, no crash" code noloader 1
+check "says why" says noloader "no loader for this file"
+run broken "$work/broken.nsp" 20 ""
+check "a damaged game: exit code 1, no crash" code broken 1
+check "says it's the keys or the file" says broken "usually the keys can't decrypt it"
+
 echo "$failed failed"
 exit "$failed"

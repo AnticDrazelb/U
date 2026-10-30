@@ -1,0 +1,472 @@
+From 99ba5fee6841ec3f983cd67cedb5d09780025c03 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 14:32:18 +0000
+Subject: [PATCH] common: the PS4's emulated DRAM on demand, and a GPU budget
+ that follows it
+
+The Switch's 4 GiB of DRAM took 4 GiB of the PS4's 4.5 GiB of direct memory
+up front, leaving the GPU about 480 MiB. It now comes in 2 MiB chunks as the
+game first touches them (a fault handler maps each, zeroed elsewhere first
+so that no thread sees it half cleared), and a zero clear of chunks never
+touched (a new heap) leaves them alone. EDEN_PS4_DRAM_ON_DEMAND=0 takes it
+all up front as before. IOFile touches a large buffer before the C library
+hands it to read() or write(): the kernel's accesses don't fault into the
+handler, they fail.
+
+The caches' GPU usage on the PS4 is now what the GPU's buffers hold (the
+winsys's count), scaled against what is free plus that, less a 384 MiB
+reserve for the DRAM to grow into: their garbage collection tightens as the
+game's memory grows and hands direct memory back to it.
+
+dynarmic's POSIX exception handler is no longer built for the PS4 (no
+fastmem there): with no code registered it logged every fault, from a
+signal handler, before passing it on.
+---
+ src/common/fs/file.h                          |  18 ++
+ src/common/host_memory.cpp                    |  30 ++-
+ src/common/host_memory.h                      |   1 +
+ src/common/orbis_memory.cpp                   | 193 ++++++++++++++++++
+ src/common/orbis_memory.h                     |  15 ++
+ src/dynarmic/src/dynarmic/CMakeLists.txt      |   5 +
+ .../vulkan_common/vulkan_device.cpp           |  20 +-
+ 7 files changed, 273 insertions(+), 9 deletions(-)
+
+diff --git a/src/common/fs/file.h b/src/common/fs/file.h
+index b1ccfbd18..f8b9c11c5 100644
+--- a/src/common/fs/file.h
++++ b/src/common/fs/file.h
+@@ -285,6 +285,7 @@ public:
+         if (!IsOpen()) {
+             return 0;
+         }
++        TouchForKernel(data.data(), data.size_bytes());
+         return std::fread(data.data(), sizeof(T), data.size(), file);
+     }
+ 
+@@ -311,6 +312,7 @@ public:
+             return 0;
+         }
+ 
++        TouchForKernel(data.data(), data.size_bytes());
+         return std::fwrite(data.data(), sizeof(T), data.size(), file);
+     }
+ 
+@@ -450,6 +452,22 @@ public:
+     [[nodiscard]] s64 Tell() const;
+ 
+ private:
++    /// The PS4's emulated DRAM gets its memory as it's first touched (common/orbis_memory.h), by a
++    /// fault handler, which the kernel's own accesses don't reach: a large read() or write()
++    /// straight from such a buffer (the C library's, past its buffer size) would fail. One read in
++    /// each MiB maps it first; elsewhere this does nothing.
++    static void TouchForKernel([[maybe_unused]] const void* data, [[maybe_unused]] size_t size) {
++#ifdef __OPENORBIS__
++        const auto* bytes = static_cast<const volatile char*>(data);
++        for (size_t offset = 0; offset < size; offset += size_t(1) << 20) {
++            (void)bytes[offset];
++        }
++        if (size != 0) {
++            (void)bytes[size - 1];
++        }
++#endif
++    }
++
+     std::filesystem::path file_path;
+     FileAccessMode file_access_mode{};
+     FileType file_type{};
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 3bcab8dcc..7e6d5805a 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -52,6 +52,7 @@
+ 
+ #endif // ^^^ POSIX ^^^
+ 
++#include <cstdlib>
+ #include <mutex>
+ #include <random>
+ 
+@@ -711,11 +712,23 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+ {
+ #if defined(__OPENORBIS__)
+     // No fastmem: the PS4 can't map the same memory twice for an app. The emulated DRAM comes
+-    // from direct memory: flexible memory, behind mmap, has well under 1 GiB.
++    // from direct memory (flexible memory, behind mmap, has well under 1 GiB), 2 MiB at a time
++    // as the game touches it: what it doesn't use is left to the GPU. EDEN_PS4_DRAM_ON_DEMAND=0
++    // takes all of it up front instead.
+     using namespace Common::Literals;
+-    if (void* range = Orbis::ReserveRange(backing_size, 2_MiB); range && Orbis::MapDirectMemory(range, backing_size))
+-        backing_base = static_cast<u8*>(range);
++    const char* on_demand_setting = std::getenv("EDEN_PS4_DRAM_ON_DEMAND");
++    const bool want_on_demand = !(on_demand_setting && on_demand_setting[0] == '0');
++    if (void* range = Orbis::ReserveRange(backing_size, 2_MiB)) {
++        if (want_on_demand && Orbis::ReserveOnDemand(range, backing_size)) {
++            backing_base = static_cast<u8*>(range);
++            on_demand = true;
++        } else if (Orbis::MapDirectMemory(range, backing_size)) {
++            backing_base = static_cast<u8*>(range);
++        }
++    }
+     ASSERT_MSG(backing_base, "Can't map {} MiB of direct memory for the emulated DRAM", backing_size >> 20);
++    LOG_INFO(HW_Memory, "Emulated DRAM: {} MiB of direct memory, {}", backing_size >> 20,
++             on_demand ? "taken as the game touches it" : "all taken now");
+     virtual_base = nullptr;
+ #elif defined(__managarm__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
+@@ -744,7 +757,9 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+ 
+ HostMemory::~HostMemory() {
+ #if defined(__OPENORBIS__)
+-    if (backing_base) {
++    if (backing_base && on_demand) {
++        Orbis::ReleaseOnDemand(backing_base, backing_size);
++    } else if (backing_base) {
+         Orbis::UnmapDirectMemory(backing_base, backing_size);
+     }
+ #elif defined(_WIN32)
+@@ -804,7 +819,12 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission
+ }
+ 
+ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+-#if defined(__linux__)
++#if defined(__OPENORBIS__)
++    if (on_demand) {
++        Orbis::ClearOnDemand(physical_offset, length, static_cast<unsigned char>(fill_value));
++        return;
++    }
++#elif defined(__linux__)
+     // Zeros by dropping the pages, which then read as zeros, rather than by writing them: a
+     // program's new heap of a few GiB (libnx's takes all the memory there is) would otherwise
+     // fault in every page of it.
+diff --git a/src/common/host_memory.h b/src/common/host_memory.h
+index a7fd0532b..5ece8bf64 100644
+--- a/src/common/host_memory.h
++++ b/src/common/host_memory.h
+@@ -86,6 +86,7 @@ private:
+     size_t virtual_base_offset{};
+     // Windows requires it for kernels whom lack proper support for some functions!
+     bool fallback_buffer{false};
++    bool on_demand{false}; ///< The PS4's DRAM taken as it's touched (Common::Orbis::ReserveOnDemand)
+ };
+ 
+ } // namespace Common
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 2ea633dfd..5e8c8edf7 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -3,9 +3,16 @@
+ 
+ #ifdef __OPENORBIS__
+ 
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <cstring>
+ #include <mutex>
+ #include <vector>
+ 
++#include <sched.h>
++#include <signal.h>
++#include <time.h>
+ #include <sys/types.h>
+ 
+ #include "common/literals.h"
+@@ -24,6 +31,8 @@ int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t
+ int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
+ int32_t sceKernelMapNamedFlexibleMemory(void** addr, size_t len, int32_t prot, int32_t flags,
+                                         const char* name);
++// Crema's runtime (port/ps4_crashlog.cpp): a line in boot-trace.log, safe in a signal handler
++__attribute__((weak)) void ps4_boot_trace(const char* stage);
+ }
+ 
+ namespace Common::Orbis {
+@@ -54,6 +63,138 @@ void ReleasePieces(void* base) {
+     });
+ }
+ 
++// ReserveOnDemand's range. A chunk is free (no memory: an access faults), busy (a thread is
++// mapping it; others wait for it) or mapped. What the fault handler touches is fixed while the
++// range is registered (base nonzero), and it only uses atomics and system calls.
++enum : u8 { ChunkFree, ChunkBusy, ChunkMapped };
++struct OnDemandRange {
++    std::atomic<uintptr_t> base{0};
++    size_t size = 0;
++    size_t direct_size = 0;
++    std::atomic<u8>* state = nullptr;
++    off_t* phys = nullptr;
++    std::atomic<size_t> bytes{0};
++    std::atomic<size_t> peak{0};
++};
++OnDemandRange on_demand;
++struct sigaction previous_segv, previous_bus;
++
++void Trace(const char* line) {
++    if (ps4_boot_trace)
++        ps4_boot_trace(line);
++}
++
++// Maps a chunk of direct memory at chunk `index`, zeroed. Direct memory run out (the GPU's caches
++// hold it: they give it back as the RAM grows, see Vulkan::Device::GetDeviceMemoryUsage) is
++// waited for, up to about 4 s.
++bool CommitChunk(size_t index) noexcept {
++    std::atomic<u8>& state = on_demand.state[index];
++    for (;;) {
++        u8 expected = ChunkFree;
++        if (state.compare_exchange_weak(expected, ChunkBusy, std::memory_order_acquire))
++            break;
++        if (expected == ChunkMapped)
++            return true;
++        sched_yield(); // another thread is mapping it
++    }
++    char* const at = reinterpret_cast<char*>(on_demand.base.load(std::memory_order_relaxed)) +
++                     index * OnDemandChunk;
++    off_t phys = 0;
++    size_t alignment = OnDemandChunk; // (large pages), else any
++    bool allocated = false;
++    for (int attempt = 0; attempt < 2000 && !allocated; attempt++) {
++        for (const size_t align : {OnDemandChunk, size_t(64_KiB)}) {
++            if (sceKernelAllocateDirectMemory(0, on_demand.direct_size, OnDemandChunk, align,
++                                              MemoryTypeWriteBack, &phys) == 0) {
++                alignment = align;
++                allocated = true;
++                break;
++            }
++        }
++        if (!allocated) {
++            if (attempt == 0)
++                Trace("eden: the emulated RAM is out of direct memory: waiting for the GPU's to come back");
++            const timespec pause{0, 2000000};
++            nanosleep(&pause, nullptr);
++        }
++    }
++    if (!allocated) {
++        state.store(ChunkFree, std::memory_order_release);
++        return false;
++    }
++    // Zeroed before it appears in the range (reused direct memory isn't): once mapped there,
++    // other threads touching the chunk don't fault, and would see it - or write to it - while it
++    // was cleared. So it's cleared where the kernel puts it first, then moved (one mapping at a
++    // time: an app can't map memory twice).
++    void* scratch = nullptr;
++    bool zeroed = false;
++    if (sceKernelMapDirectMemory(&scratch, OnDemandChunk, ProtCpuReadWrite, 0, phys, alignment) == 0) {
++        std::memset(scratch, 0, OnDemandChunk);
++        sceKernelMunmap(scratch, OnDemandChunk);
++        zeroed = true;
++    }
++    void* mapped = at;
++    if (sceKernelMapDirectMemory(&mapped, OnDemandChunk, ProtCpuReadWrite, MapFixed, phys,
++                                 alignment) != 0 ||
++        mapped != at) {
++        sceKernelReleaseDirectMemory(phys, OnDemandChunk);
++        state.store(ChunkFree, std::memory_order_release);
++        return false;
++    }
++    if (!zeroed)
++        std::memset(at, 0, OnDemandChunk); // (no room elsewhere: here, as the next best thing)
++    on_demand.phys[index] = phys;
++    const size_t bytes = on_demand.bytes.fetch_add(OnDemandChunk) + OnDemandChunk;
++    size_t peak = on_demand.peak.load();
++    while (bytes > peak && !on_demand.peak.compare_exchange_weak(peak, bytes)) {
++    }
++    state.store(ChunkMapped, std::memory_order_release);
++    return true;
++}
++
++uintptr_t FaultAddress(siginfo_t* info) {
++#ifdef __linux__
++    return reinterpret_cast<uintptr_t>(info->si_addr); // (the desktop test)
++#else
++    // FreeBSD's offset (the musl headers have Linux's siginfo layout)
++    return *reinterpret_cast<const uintptr_t*>(reinterpret_cast<char*>(info) + 24);
++#endif
++}
++
++void ChainSignal(const struct sigaction& previous, int sig, siginfo_t* info, void* context) {
++    if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction) {
++        previous.sa_sigaction(sig, info, context);
++    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN) {
++        previous.sa_handler(sig);
++    } else {
++        signal(sig, SIG_DFL); // the default action: on return the access faults again
++    }
++}
++
++void OnDemandFaultHandler(int sig, siginfo_t* info, void* context) {
++    const uintptr_t address = FaultAddress(info);
++    const uintptr_t base = on_demand.base.load(std::memory_order_acquire);
++    if (base && address >= base && address - base < on_demand.size) {
++        const int saved_errno = errno; // (the code it interrupted may be about to read it)
++        const bool committed = CommitChunk((address - base) / OnDemandChunk);
++        errno = saved_errno;
++        if (committed)
++            return; // the access runs again, now with memory there
++        Trace("eden: the emulated RAM couldn't get direct memory (all of it is in use)");
++    }
++    ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
++}
++
++void InstallOnDemandFaultHandler() {
++    struct sigaction action;
++    std::memset(&action, 0, sizeof(action));
++    action.sa_sigaction = OnDemandFaultHandler;
++    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
++    sigemptyset(&action.sa_mask);
++    sigaction(SIGSEGV, &action, &previous_segv);
++    sigaction(SIGBUS, &action, &previous_bus);
++}
++
+ } // namespace
+ 
+ void* ReserveRange(size_t size, size_t alignment) {
+@@ -115,6 +256,58 @@ bool MapFlexibleMemory(void* address, size_t size) {
+            at == address;
+ }
+ 
++bool ReserveOnDemand(void* base, size_t size) {
++    if (on_demand.base.load() != 0 || size % OnDemandChunk != 0)
++        return false;
++    const size_t chunks = size / OnDemandChunk;
++    on_demand.state = new std::atomic<u8>[chunks]{};
++    on_demand.phys = new off_t[chunks]{};
++    on_demand.size = size;
++    on_demand.direct_size = sceKernelGetDirectMemorySize();
++    on_demand.bytes = 0;
++    on_demand.peak = 0;
++    static std::once_flag handler_once;
++    std::call_once(handler_once, InstallOnDemandFaultHandler);
++    on_demand.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_release);
++    return true;
++}
++
++void ReleaseOnDemand(void* base, size_t size) {
++    on_demand.base.store(0, std::memory_order_release); // (faults there aren't ours any more)
++    sceKernelMunmap(base, size);
++    for (size_t i = 0; i < on_demand.size / OnDemandChunk; i++) {
++        if (on_demand.state[i].load() == ChunkMapped)
++            sceKernelReleaseDirectMemory(on_demand.phys[i], OnDemandChunk);
++    }
++    delete[] on_demand.state;
++    delete[] on_demand.phys;
++    on_demand.state = nullptr;
++    on_demand.phys = nullptr;
++    on_demand.size = 0;
++    on_demand.bytes = 0;
++}
++
++void ClearOnDemand(size_t offset, size_t length, unsigned char fill) {
++    char* const base = reinterpret_cast<char*>(on_demand.base.load(std::memory_order_acquire));
++    for (size_t at = offset; at < offset + length;) {
++        const size_t index = at / OnDemandChunk;
++        const size_t end = std::min(offset + length, (index + 1) * OnDemandChunk);
++        // A chunk not mapped yet reads as zeros already. (One a fault is mapping right now is
++        // zeroed whole before anyone writes to it: this range of it stays zeros.)
++        if (fill != 0 || on_demand.state[index].load(std::memory_order_acquire) != ChunkFree)
++            std::memset(base + at, fill, end - at);
++        at = end;
++    }
++}
++
++size_t OnDemandBytes() {
++    return on_demand.bytes.load(std::memory_order_relaxed);
++}
++
++size_t OnDemandPeakBytes() {
++    return on_demand.peak.load(std::memory_order_relaxed);
++}
++
+ } // namespace Common::Orbis
+ 
+ #endif
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index 64c14f964..6d39483b9 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -32,6 +32,21 @@ void UnmapDirectMemory(void* base, std::size_t size);
+ /// call from a signal handler.
+ bool MapFlexibleMemory(void* address, std::size_t size);
+ 
++/// The emulated DRAM on demand: a range from ReserveRange whose direct memory is taken a chunk
++/// (OnDemandChunk) at a time, the first time the chunk is touched (a fault handler maps it, filled
++/// with zeros). A game that touches 1.5 of the 4 GiB leaves the rest to the GPU. One such range at
++/// a time.
++constexpr std::size_t OnDemandChunk = std::size_t(2) << 20;
++bool ReserveOnDemand(void* base, std::size_t size);
++/// Unmaps the range and gives back every chunk taken.
++void ReleaseOnDemand(void* base, std::size_t size);
++/// Fills [offset, offset + length) of the range with `fill`, leaving chunks never touched alone
++/// when it's zeros (they read as zeros already): a game's new heap takes no memory until it's used.
++void ClearOnDemand(std::size_t offset, std::size_t length, unsigned char fill);
++/// Bytes of direct memory the range holds now, and the most it has held
++std::size_t OnDemandBytes();
++std::size_t OnDemandPeakBytes();
++
+ } // namespace Common::Orbis
+ 
+ #endif
+diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
+index cc1cbcbe3..4b11ab324 100644
+--- a/src/dynarmic/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/src/dynarmic/CMakeLists.txt
+@@ -363,6 +363,11 @@ elseif (APPLE)
+             backend/exception_handler_macos_mig.c
+         )
+     endif()
++elseif (PS4)
++    # No fastmem on the PS4 (an app can't map memory twice), so no handler: the POSIX one, with no
++    # code registered, logged every fault (from a signal handler) before the PS4 port's handlers
++    # (lazily committed page tables and RAM) got them
++    target_sources(dynarmic PRIVATE backend/exception_handler_generic.cpp)
+ elseif (UNIX AND NOT HAIKUOS)
+     # Haiku lacks <ucontext.h>
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 9a51389fe..49caef391 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -31,7 +31,10 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
+ #include "common/ps4_diagnostics.h"
++// Mesa's PS4 winsys (port/mesa/ac_ps4_drm.c): direct memory the GPU's buffers hold
++extern "C" u64 ac_ps4_gpu_bytes();
+ #endif
+ 
+ #if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+@@ -1612,10 +1615,18 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
+ 
+ u64 Device::GetDeviceMemoryUsage() const {
+ #ifdef __OPENORBIS__
+-    // Every GPU allocation (and some CPU ones) comes out of the same ~0.5 GiB of direct memory;
+-    // RADV's heaps claim 1 + 2 GiB. Usage = what has gone since the device was created.
++    // Every GPU allocation comes out of direct memory (RADV's heaps claim 1 + 2 GiB), and so does
++    // the emulated DRAM as the game touches it (Common::Orbis::ReserveOnDemand). The caches compare
++    // this with fractions of device_access_memory, the free direct memory when the device was made:
++    // what the GPU's buffers hold, scaled by how much smaller its share is now - what is free, plus
++    // what it holds, less a reserve for the DRAM to grow into. So their garbage collection tightens
++    // as the game's memory grows, and gives direct memory back for it.
++    constexpr u64 DramReserve = 384_MiB;
++    const u64 gpu = ac_ps4_gpu_bytes();
+     const u64 free = Common::PS4Diagnostics::LargestFreeDirect();
+-    return free < device_access_memory ? device_access_memory - free : 0;
++    const u64 share = std::max<u64>(free + gpu > DramReserve ? free + gpu - DramReserve : 0, 64_MiB);
++    return static_cast<u64>(static_cast<double>(gpu) * static_cast<double>(device_access_memory) /
++                            static_cast<double>(share));
+ #endif
+     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget;
+     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+@@ -1674,7 +1685,8 @@ void Device::CollectPhysicalMemoryInfo() {
+     // The caches size their garbage collection from this; the real limit is the free direct memory
+     // left after the 4 GiB of guest RAM (00.16: Clubhouse Games ran it out with 3 GiB "reported").
+     device_access_memory = Common::PS4Diagnostics::LargestFreeDirect();
+-    LOG_INFO(Render_Vulkan, "PS4 GPU memory budget: {} MiB of free direct memory", device_access_memory >> 20);
++    LOG_INFO(Render_Vulkan, "PS4 GPU memory budget: {} MiB of free direct memory (the emulated DRAM holds {} MiB)",
++             device_access_memory >> 20, Common::Orbis::OnDemandBytes() >> 20);
+ #endif
+ }
+ 
+-- 
+2.43.0
+

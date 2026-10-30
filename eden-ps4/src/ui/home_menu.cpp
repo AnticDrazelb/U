@@ -671,7 +671,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
         return {{"Console Mode", settings.docked ? "Docked (TV, 1920x1080)" : "Handheld (1280x720)",
                  "Games run as on a Switch in handheld mode, at 1280x720, or docked, at 1920x1080. Handheld asks "
                  "less of the PS4's GPU.",
-                 [](MenuSettings& s) { s.docked = !s.docked; }}};
+                 [](MenuSettings& s) { s.docked = !s.docked; }},
+                {"Switch Memory", settings.ram_on_demand ? "As the game uses it" : "All 4 GB up front",
+                 "The Switch's 4 GB of RAM come out of the PS4's memory as the game first uses them, so what it "
+                 "doesn't use is left to the PS4's GPU for textures and buffers: often a few GB instead of about "
+                 "half of one. All 4 GB up front is how it was before 03.70: try it if a game fails with this on.",
+                 [](MenuSettings& s) { s.ram_on_demand = !s.ram_on_demand; }}};
     default:
         return {};
     }

@@ -69,6 +69,14 @@ constexpr std::string_view kWebPage = R"PAGE(<!doctype html>
   </section>
 
   <section>
+    <h2>Updates and DLC</h2>
+    <p>A game's update and DLC (.nsp), applied as the game starts: many games need their latest update.</p>
+    <label class="button">Choose updates or DLC<input type="file" id="updates" multiple accept=".nsp"></label>
+    <div class="bar" id="updates-bar"><div></div></div><div class="msg" id="updates-msg"></div>
+    <ul id="update-list"></ul>
+  </section>
+
+  <section>
     <h2>Logs</h2>
     <p>Everything the app recorded, in one file to send when something goes wrong.</p>
     <a class="button" href="/api/logs" download style="text-decoration:none"><label class="button" style="margin:0">Download all logs</label></a>
@@ -93,6 +101,9 @@ async function refresh() {
     $("game-list").innerHTML = s.games.map((g) =>
       `<li><span>${esc(g.name)}</span><span class="size">${size(g.size)}
        <button class="quiet" onclick="removeGame('${encodeURIComponent(g.name)}')">Remove</button></span></li>`).join("");
+    $("update-list").innerHTML = (s.updates || []).map((u) =>
+      `<li><span>${esc(u.name)}</span><span class="size">${size(u.size)}
+       <button class="quiet" onclick="removeUpdate('${encodeURIComponent(u.name)}')">Remove</button></span></li>`).join("");
     $("log-list").innerHTML = s.logs.map((l) =>
       `<li><a href="/files/${encodeURI(l.name)}" target="_blank">${esc(l.name)}</a><span class="size">${size(l.size)}</span></li>`).join("");
   } catch (e) {
@@ -163,6 +174,16 @@ $("games").onchange = (e) => {
   if (files.length) uploadAll("games", "games", files); else $("games-msg").textContent = "Those aren't games (.nsp, .xci, .nro).";
   e.target.value = "";
 };
+$("updates").onchange = (e) => {
+  const files = [...e.target.files].filter((f) => /\.nsp$/i.test(f.name));
+  if (files.length) uploadAll("updates", "updates", files); else $("updates-msg").textContent = "Updates and DLC are .nsp files.";
+  e.target.value = "";
+};
+async function removeUpdate(name) {
+  if (!confirm("Remove " + decodeURIComponent(name) + " from the PS4?")) return;
+  await fetch("/updates/" + name, {method: "DELETE"});
+  refresh();
+}
 async function removeGame(name) {
   if (!confirm("Remove " + decodeURIComponent(name) + " from the PS4?")) return;
   await fetch("/files/" + name, {method: "DELETE"});
