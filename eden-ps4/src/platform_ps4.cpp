@@ -1205,6 +1205,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.76: with a Game Folder chosen, every log goes there as one file, eden-ps4-logs.txt, as the app "
+         "starts and after each game: take it away on the USB drive, no network needed. While a game runs, the "
+         "boot trace notes its speed every 10 seconds (its frames a second, and how close to full speed).\n"
          "More memory for games' graphics: the Switch's 4 GB of RAM no longer take 4 GB of the PS4's memory as a "
          "game starts, only what the game actually uses, 2 MB at a time. The rest goes to the PS4's GPU, which "
          "had about half a GB left for textures before; its caches now give memory back as the game's grows. "
@@ -1361,6 +1364,19 @@ void StartWebServer()
         Trace(fmt::format("web: port {} can't be opened", g_web_port));
 }
 
+// The logs as one file in the Game Folder, eden-ps4-logs.txt (what the web page's "Download all logs"
+// gives, code addresses named): taken away on its USB drive, without a network. As the app starts
+// (the last session's, a crash's included) and when a program has ended.
+void ExportLogs(const char* when)
+{
+    struct stat status{};
+    if (g_games_folder.empty() || stat(g_games_folder.c_str(), &status) != 0 || !S_ISDIR(status.st_mode))
+        return;
+    const std::string file = g_games_folder + "/eden-ps4-logs.txt";
+    const bool written = Launcher::WriteLogBundle(kDataDir, EDEN_PS4_VERSION, kSymbolsFile, file);
+    Trace(fmt::format("logs {}: {} {}", when, written ? "written to" : "could not be written to", file));
+}
+
 // What the HOME menu said to do: boot `program`, with these settings
 struct MenuChoice
 {
@@ -1383,6 +1399,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     if (first)
         OpenPad();
     g_games_folder = settings.games_folder;
+    ExportLogs(first ? "of the last session" : "after the program");
     {
         // Game Folder's places, as Crema's: the data folder, the USB drives, extended storage, /mnt
         std::vector<std::string> places{kDataDir};

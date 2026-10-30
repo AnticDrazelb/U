@@ -276,6 +276,69 @@ bool ParseHead(const std::string& head, Request& request)
     return true;
 }
 
+// The data folder's logs, and gpu/'s (relative paths), and their sizes
+std::vector<std::pair<std::string, uintmax_t>> ListLogs(const fs::path& data)
+{
+    std::vector<std::pair<std::string, uintmax_t>> logs;
+    for (const char* folder : {"", "gpu", "gpu/flight"})
+    {
+        std::error_code ec;
+        for (fs::directory_iterator it(data / folder, ec), end; !ec && it != end; it.increment(ec))
+        {
+            const std::string name = it->path().filename().string();
+            if (it->is_regular_file(ec) && IsLog(name))
+                logs.emplace_back((*folder ? std::string(folder) + "/" : std::string()) + name, it->file_size(ec));
+        }
+    }
+    std::sort(logs.begin(), logs.end());
+    return logs;
+}
+
+// The end of a file, at most `limit` bytes
+std::string ReadEnd(const fs::path& path, size_t limit)
+{
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> f{std::fopen(path.c_str(), "rb"), std::fclose};
+    if (!f)
+        return {};
+    std::fseek(f.get(), 0, SEEK_END);
+    const long size = std::ftell(f.get());
+    const long start = size > long(limit) ? size - long(limit) : 0;
+    std::fseek(f.get(), start, SEEK_SET);
+    std::string text(size_t(size - start), '\0');
+    text.resize(std::fread(text.data(), 1, text.size(), f.get()));
+    return text;
+}
+
+// Every log, one after another, each read and handed to `write` on its own, with the app's function
+// names for the code addresses in them (unless `symbols` is empty) and samples.log summed up
+bool WriteBundle(const fs::path& data, const std::string& version, const Symbols& symbols, bool running,
+                 const std::function<bool(std::string_view)>& write)
+{
+    const size_t limit = running ? kLogLimitWhileRunning : kLogLimit;
+    std::string head = "Eden for PS4 " + version + ": every log in " + data.string() + "\n";
+    if (running)
+        head += "(a program is running: each log's last 2 MiB, code addresses without names; for names, "
+                "download them again from the HOME menu)\n";
+    else if (symbols.Empty())
+        head += "(no symbols.zst in this build: code addresses without names)\n";
+    if (!write(head))
+        return false;
+    for (const auto& [name, size] : ListLogs(data))
+    {
+        std::string text = ReadEnd(data / name, limit);
+        std::string part = "\n===== " + name + " (" + std::to_string(size) + " bytes" +
+                           (size > limit ? ", its last " + std::to_string(limit >> 20) + " MiB" : "") + ") =====\n";
+        if (name == "samples.log")
+            part += ProfileSummary(text, symbols) + "\n----- samples.log itself -----\n";
+        part += symbols.Empty() ? std::move(text) : SymbolizeLog(text, symbols);
+        if (!part.empty() && part.back() != '\n')
+            part += '\n';
+        if (!write(part))
+            return false;
+    }
+    return true;
+}
+
 class Server
 {
 public:
@@ -326,23 +389,7 @@ private:
     }
 
     // The data folder's logs, and gpu/'s (relative paths), and their sizes
-    std::vector<std::pair<std::string, uintmax_t>> Logs() const
-    {
-        std::vector<std::pair<std::string, uintmax_t>> logs;
-        for (const char* folder : {"", "gpu", "gpu/flight"})
-        {
-            std::error_code ec;
-            for (fs::directory_iterator it(data / folder, ec), end; !ec && it != end; it.increment(ec))
-            {
-                const std::string name = it->path().filename().string();
-                if (it->is_regular_file(ec) && IsLog(name))
-                    logs.emplace_back((*folder ? std::string(folder) + "/" : std::string()) + name,
-                                      it->file_size(ec));
-            }
-        }
-        std::sort(logs.begin(), logs.end());
-        return logs;
-    }
+    std::vector<std::pair<std::string, uintmax_t>> Logs() const { return ListLogs(data); }
 
     std::string Status() const
     {
@@ -388,21 +435,6 @@ private:
         return json + "}";
     }
 
-    // The end of a file, at most `limit` bytes
-    static std::string ReadEnd(const fs::path& path, size_t limit)
-    {
-        std::unique_ptr<std::FILE, int (*)(std::FILE*)> f{std::fopen(path.c_str(), "rb"), std::fclose};
-        if (!f)
-            return {};
-        std::fseek(f.get(), 0, SEEK_END);
-        const long size = std::ftell(f.get());
-        const long start = size > long(limit) ? size - long(limit) : 0;
-        std::fseek(f.get(), start, SEEK_SET);
-        std::string text(size_t(size - start), '\0');
-        text.resize(std::fread(text.data(), 1, text.size(), f.get()));
-        return text;
-    }
-
     bool ProgramRunning() const { return config.program_running && config.program_running(); }
 
     // Every log, one after another, each read and sent on its own (a program may be running).
@@ -412,7 +444,6 @@ private:
         connection.Begin(200, "OK", "text/plain; charset=utf-8",
                          "Content-Disposition: attachment; filename=\"eden-ps4-logs.txt\"\r\n");
         const bool running = ProgramRunning();
-        const size_t limit = running ? kLogLimitWhileRunning : kLogLimit;
         std::unique_lock lock{symbols_mutex, std::defer_lock}; // (one bundle with names at a time)
         Symbols symbols;
         if (!running && !config.symbols_path.empty())
@@ -420,28 +451,8 @@ private:
             lock.lock();
             symbols.Load(config.symbols_path);
         }
-        std::string head = "Eden for PS4 " + config.version + ": every log in " + config.data_dir + "\n";
-        if (running)
-            head += "(a program is running: each log's last 2 MiB, code addresses without names; for names, "
-                    "download them again from the HOME menu)\n";
-        else if (symbols.Empty())
-            head += "(no symbols.zst in this build: code addresses without names)\n";
-        if (!connection.Send(head))
-            return;
-        for (const auto& [name, size] : Logs())
-        {
-            std::string text = ReadEnd(data / name, limit);
-            std::string part = "\n===== " + name + " (" + std::to_string(size) + " bytes" +
-                               (size > limit ? ", its last " + std::to_string(limit >> 20) + " MiB" : "") +
-                               ") =====\n";
-            if (name == "samples.log")
-                part += ProfileSummary(text, symbols) + "\n----- samples.log itself -----\n";
-            part += symbols.Empty() ? std::move(text) : SymbolizeLog(text, symbols);
-            if (!part.empty() && part.back() != '\n')
-                part += '\n';
-            if (!connection.Send(part))
-                return;
-        }
+        WriteBundle(data, config.version, symbols, running,
+                    [&](std::string_view part) { return connection.Send(part); });
     }
 
     void SendProfile(Connection& connection)
@@ -637,6 +648,29 @@ void SetTimeouts(int fd, int seconds)
 }
 
 } // namespace
+
+bool WriteLogBundle(const std::string& data_dir, const std::string& version, const std::string& symbols_path,
+                   const std::filesystem::path& file)
+{
+    Symbols symbols; // (no program runs: the names are loaded, ~11 MiB, and go again)
+    if (!symbols_path.empty())
+        symbols.Load(symbols_path);
+    const fs::path partial = file.string() + ".part";
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> out{std::fopen(partial.c_str(), "wb"), std::fclose};
+    if (!out)
+        return false;
+    const bool written = WriteBundle(data_dir, version, symbols, false, [&](std::string_view part) {
+        return std::fwrite(part.data(), 1, part.size(), out.get()) == part.size();
+    });
+    std::error_code ec;
+    if (std::fclose(out.release()) != 0 || !written)
+    {
+        fs::remove(partial, ec);
+        return false;
+    }
+    fs::rename(partial, file, ec);
+    return !ec;
+}
 
 bool StartWebServer(WebServerConfig config)
 {

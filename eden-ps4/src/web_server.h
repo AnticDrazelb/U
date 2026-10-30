@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
 
@@ -30,6 +31,12 @@ struct WebServerConfig
 
 // Starts serving on its own threads; false if the port can't be opened.
 bool StartWebServer(WebServerConfig config);
+
+// Every log in data_dir as one file (what the page's "Download all logs" gives), code addresses
+// named: to take away without a network, on a USB drive. While no program runs. False if it couldn't
+// be written.
+bool WriteLogBundle(const std::string& data_dir, const std::string& version, const std::string& symbols_path,
+                    const std::filesystem::path& file);
 
 // The address other machines on the network reach this one at ("" without a network)
 std::string LocalAddress();

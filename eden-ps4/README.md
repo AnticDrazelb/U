@@ -402,6 +402,15 @@ Saves and everything else Eden writes stay in the user folder. A firmware still 
 can't be read in place: Import unpacks it as before. Games and Keys and the boot trace say which
 keys and firmware games use.
 
+03.76: **logs without a network, and the game's speed.** Celeste boots on a console (keys and
+firmware used from the drive, 03.74/03.75). The log bundle (the web page's "Download all logs":
+code addresses named, samples.log summed up) is now written as `eden-ps4-logs.txt` into the Game
+Folder as the app starts (the last session's) and after each program, for a console kept off the
+network; `WriteLogBundle` in `src/web_server.cpp`, shared with the page. While a program runs, Boot
+logs Eden's own measure every 10 s: `speed: the game N fps, emulation at N% of full speed, N ms of
+work a frame` (`System::GetAndResetPerfStats`), in log.txt and the boot trace. In shadPS4: Breakout
+at 46-48 fps, 100%, and the file written to its USB drive at start and after the game.
+
 03.73: **USB drives.** On a console the app listed nothing from an exFAT drive the package had been
 installed from, though Crema, on the same runtime, lists Wii U games from USB drives on the same
 console. Three things in the launcher's own scan, none a matter of permissions: the game list was

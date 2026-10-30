@@ -19,6 +19,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/perf_stats.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/control_metadata.h"
@@ -495,7 +496,25 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                 lock.unlock();
                 void(system.Run());
                 lock.lock();
-                g_run_cv.wait_for(lock, timeout, [&] { return exited || g_stop; });
+                // every 10 s while it runs, its speed as Eden measures it (the PS4's boot trace, log.txt)
+                const auto deadline = std::chrono::steady_clock::now() + timeout;
+                while (!exited && !g_stop) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline)
+                        break;
+                    const auto slice = std::min<std::chrono::steady_clock::duration>(std::chrono::seconds(10),
+                                                                                     deadline - now);
+                    if (g_run_cv.wait_for(lock, slice, [&] { return exited || g_stop; }))
+                        break;
+                    lock.unlock();
+                    const Core::PerfStatsResults stats = system.GetAndResetPerfStats();
+                    Output(LineKind::Status,
+                           fmt::format("speed: the game {:.1f} fps, emulation at {:.0f}% of full speed, {:.1f} ms "
+                                       "of work a frame",
+                                       stats.average_game_fps, stats.emulation_speed * 100.0,
+                                       stats.frametime * 1000.0));
+                    lock.lock();
+                }
                 if (exited)
                     result = {BootResult::Status::Exited, {}};
                 else if (g_stop)
