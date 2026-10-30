@@ -104,6 +104,16 @@ rm -rf "$NX_SRC/build-builtins"
 ninja -C "$NX_SRC/build-builtins" >/dev/null
 cp "$NX_SRC/build-builtins/lib/baremetal/libclang_rt.builtins-aarch64.a" "$DKA64/aarch64-none-elf/lib/"
 
+# elf2nro, nacptool, bin2s (host tools): before libnx, whose build runs bin2s
+T="$NX_PREFIX/tools/bin"
+mkdir -p "$T"
+(cd "$NX_SRC/switch-tools/src" &&
+    cc -O2 -DPACKAGE_STRING='"switch-tools"' -I"$EDEN_DEPS/lz4/lib" -o "$T/elf2nro" \
+        elf2nro.c romfs.c filepath.c "$EDEN_DEPS/lz4/lib/lz4.c" &&
+    cc -O2 -DPACKAGE_STRING='"switch-tools"' -o "$T/nacptool" nacptool.c)
+cc -O2 -DPACKAGE_STRING='"bin2s (general-tools)"' -o "$T/bin2s" "$NX_SRC/general-tools/bin2s.c"
+export PATH="$T:$PATH"
+
 # libnx, with clang's changes (libnx-clang.patch: thread pointer, atomics, arrays in structures,
 # a weak symbol)
 cp "$HERE/clang_atomics.h" "$HERE/crt_clang.c" "$HERE/nx-build" "$NX_PREFIX/libnx-clang/"
@@ -127,11 +137,4 @@ open(sys.argv[2], 'w').write(s)
 PY
 "$DKA64/bin/aarch64-none-elf-gcc" -O2 -c "$NX_PREFIX/libnx-clang/crt_clang.c" -o "$NX_PREFIX/libnx-clang/crt_clang.o"
 
-# elf2nro, nacptool, bin2s (host tools)
-T="$NX_PREFIX/tools/bin"
-(cd "$NX_SRC/switch-tools/src" &&
-    cc -O2 -DPACKAGE_STRING='"switch-tools"' -I"$EDEN_DEPS/lz4/lib" -o "$T/elf2nro" \
-        elf2nro.c romfs.c filepath.c "$EDEN_DEPS/lz4/lib/lz4.c" &&
-    cc -O2 -DPACKAGE_STRING='"switch-tools"' -o "$T/nacptool" nacptool.c)
-cc -O2 -DPACKAGE_STRING='"bin2s (general-tools)"' -o "$T/bin2s" "$NX_SRC/general-tools/bin2s.c"
 echo "$NX_PREFIX/libnx-clang/nx-build"
