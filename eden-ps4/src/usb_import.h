@@ -23,6 +23,20 @@ struct UsbImport
     std::string error;           // what failed (empty: nothing)
 };
 
+// Keys and firmware a drive has, to be used where they are (Launcher::SetKeysAndFirmware)
+struct UsbKeysAndFirmware
+{
+    std::string keys_folder;     // the folder with prod.keys (empty: none)
+    bool title_keys = false;     // title.keys is there too
+    std::string firmware_folder; // the folder with the firmware's .nca files (empty: none)
+    size_t firmware_files = 0;
+};
+
+// The first of `drives` with prod.keys (named so: Eden reads it by that name), and the folder of
+// .nca files with the most of them, as ImportFromUsb looks for them. A firmware still in its .zip
+// isn't one: Eden can't read it from there (ImportFromUsb unpacks it).
+UsbKeysAndFirmware FindKeysAndFirmware(const std::vector<std::string>& drives);
+
 // From `drives` (e.g. /mnt/usb0../mnt/usb7): the keys of the first that has them go to
 // <user_dir>/keys; the firmware (from whichever has the most .nca files) replaces what's in
 // <user_dir>/nand/system/Contents/registered. progress(copied, total) after each firmware file.

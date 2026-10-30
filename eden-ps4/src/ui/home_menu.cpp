@@ -165,11 +165,12 @@ MenuAction HomeMenu::Start(size_t index)
         dialog.title = "The keys of your Switch are needed.";
         dialog.text = web_address.empty()
             ? "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
-              "that Switch's firmware. Copy them into /data/eden-ps4/import (from a USB drive, with a file "
-              "manager such as PS4-Xplorer), then Import (Square) in Games and Keys."
+              "that Switch's firmware. Put them on a USB drive, where they're used from (the keys at its top "
+              "or in a folder there such as switch, the firmware's .nca files in a folder), or copy them into "
+              "/data/eden-ps4/import and Import (Square) in Games and Keys."
             : "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
               "that Switch's firmware. Open " + web_address + " in a browser on a PC or phone on the same "
-              "network to send them, or copy them into /data/eden-ps4/import and Import in Games and Keys.";
+              "network to send them, or put them on a USB drive, where they're used from.";
         dialog.buttons = {"OK"};
         OpenDialog(std::move(dialog));
         return {};

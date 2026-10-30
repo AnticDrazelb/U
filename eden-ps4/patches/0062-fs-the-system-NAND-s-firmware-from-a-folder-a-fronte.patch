@@ -1,0 +1,93 @@
+From 7233008cee2492a1b59191ae4feca927d85a0bb7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 30 Oct 2026 21:04:57 +0000
+Subject: [PATCH] fs: the system NAND's firmware from a folder a frontend names
+
+Settings::values.system_contents_dir, when set, is the folder the system
+NAND's registered content (the firmware's .nca files) is read from instead
+of nand/system/Contents/registered, read only: the PS4 launcher points it at
+a firmware folder on a USB drive, used where it is, without copying it.
+---
+ src/common/settings.h                          |  4 ++++
+ src/core/file_sys/bis_factory.cpp              |  6 ++++--
+ src/core/file_sys/bis_factory.h                |  5 ++++-
+ src/core/hle/service/filesystem/filesystem.cpp | 11 ++++++++++-
+ 4 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/src/common/settings.h b/src/common/settings.h
+index d1f891607..0506aa36d 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -863,6 +863,10 @@ struct Values {
+     Setting<bool> ext_content_from_game_dirs{linkage, true, "ext_content_from_game_dirs",
+                                              Category::DataStorage};
+     std::vector<std::string> external_content_dirs;
++    // The system NAND's registered content (the firmware) from this folder instead of
++    // nand/system/Contents/registered, read only (e.g. a firmware's .nca files on a USB drive);
++    // empty: the NAND's own
++    std::string system_contents_dir;
+ 
+     // Debugging
+     bool record_frame_times;
+diff --git a/src/core/file_sys/bis_factory.cpp b/src/core/file_sys/bis_factory.cpp
+index 6facd03f6..53e6f559c 100644
+--- a/src/core/file_sys/bis_factory.cpp
++++ b/src/core/file_sys/bis_factory.cpp
+@@ -13,11 +13,13 @@ constexpr u64 NAND_USER_SIZE = 0x680000000;  // 26624 MiB
+ constexpr u64 NAND_SYSTEM_SIZE = 0xA0000000; // 2560 MiB
+ constexpr u64 NAND_TOTAL_SIZE = 0x747C00000; // 29820 MiB
+ 
+-BISFactory::BISFactory(VirtualDir nand_root_, VirtualDir load_root_, VirtualDir dump_root_)
++BISFactory::BISFactory(VirtualDir nand_root_, VirtualDir load_root_, VirtualDir dump_root_,
++                       VirtualDir system_contents)
+     : nand_root(std::move(nand_root_)), load_root(std::move(load_root_)),
+       dump_root(std::move(dump_root_)),
+       sysnand_cache(std::make_unique<RegisteredCache>(
+-          GetOrCreateDirectoryRelative(nand_root, "/system/Contents/registered"))),
++          system_contents ? std::move(system_contents)
++                          : GetOrCreateDirectoryRelative(nand_root, "/system/Contents/registered"))),
+       usrnand_cache(std::make_unique<RegisteredCache>(
+           GetOrCreateDirectoryRelative(nand_root, "/user/Contents/registered"))),
+       sysnand_placeholder(std::make_unique<PlaceholderCache>(
+diff --git a/src/core/file_sys/bis_factory.h b/src/core/file_sys/bis_factory.h
+index 23680b60c..cbc3c1c98 100644
+--- a/src/core/file_sys/bis_factory.h
++++ b/src/core/file_sys/bis_factory.h
+@@ -35,7 +35,10 @@ class PlaceholderCache;
+ /// registered caches.
+ class BISFactory {
+ public:
+-    explicit BISFactory(VirtualDir nand_root, VirtualDir load_root, VirtualDir dump_root);
++    // system_contents: where the system NAND's registered content is read from instead of
++    // nand_root's (nullptr: nand_root's)
++    explicit BISFactory(VirtualDir nand_root, VirtualDir load_root, VirtualDir dump_root,
++                        VirtualDir system_contents = nullptr);
+     ~BISFactory();
+ 
+     VirtualDir GetSystemNANDContentDirectory() const;
+diff --git a/src/core/hle/service/filesystem/filesystem.cpp b/src/core/hle/service/filesystem/filesystem.cpp
+index 925af7b37..bec90b591 100644
+--- a/src/core/hle/service/filesystem/filesystem.cpp
++++ b/src/core/hle/service/filesystem/filesystem.cpp
+@@ -741,8 +741,17 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
+         vfs.OpenDirectory(Common::FS::GetEdenPathString(EdenPath::DumpDir), rw_mode);
+ 
+     if (bis_factory == nullptr) {
++        FileSys::VirtualDir system_contents;
++        if (!Settings::values.system_contents_dir.empty()) {
++            system_contents =
++                vfs.OpenDirectory(Settings::values.system_contents_dir, FileSys::OpenMode::Read);
++            if (system_contents == nullptr)
++                LOG_ERROR(Service_FS, "Failed to open the system contents directory {}",
++                          Settings::values.system_contents_dir);
++        }
+         bis_factory = std::make_unique<FileSys::BISFactory>(
+-            nand_directory, std::move(load_directory), std::move(dump_directory));
++            nand_directory, std::move(load_directory), std::move(dump_directory),
++            std::move(system_contents));
+         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SysNAND,
+                                        bis_factory->GetSystemNANDContents());
+         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,
+-- 
+2.43.0
+

@@ -191,6 +191,37 @@ fs::path FindFirmwareZip(const fs::path& drive, size_t& count)
 
 } // namespace
 
+UsbKeysAndFirmware FindKeysAndFirmware(const std::vector<std::string>& drives)
+{
+    UsbKeysAndFirmware result;
+    for (const std::string& drive_name : drives)
+    {
+        const fs::path drive{drive_name};
+        std::error_code ec;
+        if (!fs::is_directory(drive, ec))
+            continue;
+        if (result.keys_folder.empty())
+        {
+            // (Eden opens prod.keys and title.keys by those names: Prod.keys only on a drive that
+            // ignores case)
+            const fs::path keys = FindKeys(drive);
+            if (!keys.empty() && fs::is_regular_file(keys / "prod.keys", ec))
+            {
+                result.keys_folder = keys.string();
+                result.title_keys = fs::is_regular_file(keys / "title.keys", ec);
+            }
+        }
+        size_t count = 0;
+        const fs::path folder = FindFirmware(drive, count);
+        if (count > result.firmware_files)
+        {
+            result.firmware_folder = folder.string();
+            result.firmware_files = count;
+        }
+    }
+    return result;
+}
+
 UsbImport ImportFromUsb(const std::vector<std::string>& drives, const std::string& user_dir,
                         const std::function<void(size_t, size_t)>& progress)
 {

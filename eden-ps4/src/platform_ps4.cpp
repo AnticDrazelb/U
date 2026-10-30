@@ -1043,28 +1043,49 @@ std::string UsbReport(bool* readable = nullptr)
     return text;
 }
 
+// Keys and firmware on a USB drive (/mnt/usb0-7), which games use from there, before the ones in
+// the user folder (Launcher::SetKeysAndFirmware)
+Launcher::UsbKeysAndFirmware KeysAndFirmwareOnUsb()
+{
+    std::vector<std::string> drives;
+    for (int i = 0; i < 8; i++)
+        drives.push_back(fmt::format("/mnt/usb{}", i));
+    return Launcher::FindKeysAndFirmware(drives);
+}
+
 std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
 {
     std::vector<Ui::StatusRow> rows;
     std::error_code ec;
-    const bool keys = std::filesystem::exists(kKeysFile, ec);
-    rows.push_back({"Keys (prod.keys)", keys ? fmt::format("Found: {}", kKeysFile)
-                                             : fmt::format("Not found: put it in /data/eden-ps4/import and Import, or send it from a browser"),
+    const Launcher::UsbKeysAndFirmware on_usb = KeysAndFirmwareOnUsb();
+    const bool keys = !on_usb.keys_folder.empty() || std::filesystem::exists(kKeysFile, ec);
+    rows.push_back({"Keys (prod.keys)",
+                    !on_usb.keys_folder.empty() ? fmt::format("On the USB drive, used from there: {}/prod.keys", on_usb.keys_folder)
+                    : keys ? fmt::format("Found: {}", kKeysFile)
+                           : fmt::format("Not found: put it on a USB drive (at its top, or in a folder there such as "
+                                         "switch), or in /data/eden-ps4/import and Import, or send it from a browser"),
                     keys});
-    const bool title_keys = std::filesystem::exists(kTitleKeysFile, ec);
+    const bool title_keys = on_usb.title_keys || (on_usb.keys_folder.empty() && std::filesystem::exists(kTitleKeysFile, ec));
     rows.push_back({"Title keys (title.keys)",
-                    title_keys ? fmt::format("Found: {}", kTitleKeysFile)
-                               : fmt::format("Not found ({}): some games need it", kTitleKeysFile),
+                    on_usb.title_keys ? fmt::format("On the USB drive, used from there: {}/title.keys", on_usb.keys_folder)
+                    : !on_usb.keys_folder.empty()
+                        ? fmt::format("Not next to prod.keys on the USB drive ({}): some games need it", on_usb.keys_folder)
+                    : title_keys ? fmt::format("Found: {}", kTitleKeysFile)
+                                 : fmt::format("Not found ({}): some games need it", kTitleKeysFile),
                     title_keys});
     size_t firmware = 0;
     for (std::filesystem::directory_iterator it(kFirmwareDir, ec), end; !ec && it != end; it.increment(ec))
         firmware++;
-    rows.push_back({"Firmware", firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
-                                         : fmt::format("None in {}: put your Switch's firmware (its .zip, or its .nca "
-                                                       "files) in /data/eden-ps4/import and Import, or send it from a "
-                                                       "browser",
-                                                       kFirmwareDir),
-                    firmware > 0});
+    rows.push_back({"Firmware",
+                    !on_usb.firmware_folder.empty()
+                        ? fmt::format("On the USB drive, used from there: {} files in {}", on_usb.firmware_files,
+                                      on_usb.firmware_folder)
+                    : firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
+                               : fmt::format("None in {}: put your Switch's firmware (its folder of .nca files) on a "
+                                             "USB drive, or its .zip or .nca files in /data/eden-ps4/import and "
+                                             "Import, or send it from a browser",
+                                             kFirmwareDir),
+                    !on_usb.firmware_folder.empty() || firmware > 0});
     bool readable = false;
     const std::string usb = UsbReport(&readable);
     rows.push_back({"USB drives, as the app sees them", usb, readable});
@@ -1095,10 +1116,11 @@ Ui::StatusRow SoftwareStatus(const std::vector<Ui::Title>& titles)
 }
 
 constexpr const char* kGamesHelp =
-    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4. From a USB drive, copy them there with a file "
-    "manager such as PS4-Xplorer, and prod.keys, title.keys and the firmware (its .zip, or its folder of .nca "
-    "files) into /data/eden-ps4/import, then Import (Square). Or send all of them from a browser: the address is "
-    "at the top of the HOME menu.";
+    "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4 or on a USB drive. prod.keys, title.keys and the "
+    "firmware (its folder of .nca files) on a USB drive are used from there: the keys at the drive's top or in a "
+    "folder there (switch), the firmware in a folder. Or copy them, or the firmware's .zip, into "
+    "/data/eden-ps4/import with a file manager such as PS4-Xplorer, then Import (Square). Or send all of them from "
+    "a browser: the address is at the top of the HOME menu.";
 
 // Import from USB (Games and Keys): the copy runs on its own thread, its progress in a message
 struct UsbImportJob
@@ -1151,7 +1173,10 @@ std::vector<std::pair<std::string, std::string>> News()
          "doesn't mean an app is allowed to read it.\n"
          "03.73: USB drives: games are found in any folder on the drive too (switch, games...), the list is "
          "made again when a drive is plugged in or mounted after the app started (it was only made as the app "
-         "started), and Import from USB finds Prod.keys in any case."},
+         "started), and Import from USB finds Prod.keys in any case.\n"
+         "03.74: keys and firmware on a USB drive are used from there, without importing: prod.keys and "
+         "title.keys at the drive's top or in a folder there (switch), the firmware's .nca files in a folder. "
+         "Games and Keys says which keys and firmware games will use. A firmware .zip still needs Import."},
         {"Before: 03.60",
          "From a PC or phone: the address at the top of the HOME menu, opened in a browser on the same network, "
          "takes your keys, firmware (the whole folder at once) and games, with progress, and gives back every log "
@@ -1331,7 +1356,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                                                       web_url),
                         !web_url.empty()});
         menu.SetGamesStatus(std::move(rows), kGamesHelp);
-        menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec));
+        menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec) || !KeysAndFirmwareOnUsb().keys_folder.empty());
     };
     set_games_status();
     const size_t count = titles.size();
@@ -1736,6 +1761,17 @@ void* Run(void*)
         Launcher::SetAsyncShaders(settings.async_shaders);
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
+        {
+            // keys and firmware on a USB drive are used from there, else the user folder's
+            const Launcher::UsbKeysAndFirmware usb = KeysAndFirmwareOnUsb();
+            Launcher::SetKeysAndFirmware(usb.keys_folder, usb.firmware_folder);
+            Trace(fmt::format("keys: {}; firmware: {}",
+                              usb.keys_folder.empty() ? std::string("the user folder's")
+                                                      : usb.keys_folder + (usb.title_keys ? " (with title.keys)" : ""),
+                              usb.firmware_folder.empty()
+                                  ? std::string("the user folder's")
+                                  : fmt::format("{} ({} files)", usb.firmware_folder, usb.firmware_files)));
+        }
         ps4_set_app_cores(settings.seventh_core ? 0x7F : 0x3F);
         // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
         setenv("EDEN_PS4_DRAM_ON_DEMAND", settings.ram_on_demand ? "1" : "0", 1);

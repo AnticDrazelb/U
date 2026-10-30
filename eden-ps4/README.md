@@ -377,6 +377,20 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.74: **keys and firmware used from the USB drive.** `prod.keys`, `title.keys` and the firmware on
+a USB drive no longer need importing: before each boot the launcher looks for them on
+`/mnt/usb0-7` as Import does (`Launcher::FindKeysAndFirmware`: `prod.keys` at a drive's top, in a
+folder there such as `switch/`, or that folder's `keys/`; the firmware the folder, at most two
+down, with the most `.nca` files) and has Eden read them where they are
+(`Launcher::SetKeysAndFirmware`): its keys folder is set to the drive's, and the keys are read
+again at every boot (they were read once per app session), and patch 0062 has the system NAND's
+registered content, the firmware, come from a folder the frontend names
+(`Settings::values.system_contents_dir`, read only) instead of `nand/system/Contents/registered`.
+What's on a drive comes before the user folder's; without a drive, the user folder's as before.
+Saves and everything else Eden writes stay in the user folder. A firmware still in its `.zip`
+can't be read in place: Import unpacks it as before. Games and Keys and the boot trace say which
+keys and firmware games use.
+
 03.73: **USB drives.** On a console the app listed nothing from an exFAT drive the package had been
 installed from, though Crema, on the same runtime, lists Wii U games from USB drives on the same
 console. Three things in the launcher's own scan, none a matter of permissions: the game list was

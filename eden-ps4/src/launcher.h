@@ -79,6 +79,12 @@ void SetCpuUnsafe(bool on);
 /// touches it); off: Low, without, as Eden's phone builds default to. Set it before Boot.
 void SetGpuAccuracyHigh(bool on);
 
+/// Keys and firmware used where they are (a USB drive), not copied: Eden reads prod.keys and
+/// title.keys from `keys_dir` instead of data_dir/user/keys, and the firmware's .nca files from
+/// `firmware_dir` instead of data_dir/user/nand/system/Contents/registered. Either empty: the user
+/// folder's. Set them before Boot.
+void SetKeysAndFirmware(std::string keys_dir, std::string firmware_dir);
+
 /// Where Boot keeps what it learned of a program that loaded (for a menu to show next time):
 /// data_dir/cache/titles/<hash of its path>.<extension>, "jpg" its icon, "txt" its title and
 /// publisher (a line each).

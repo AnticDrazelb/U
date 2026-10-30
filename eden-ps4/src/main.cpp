@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
@@ -87,6 +88,7 @@ bool g_gpu_display = false;
 bool g_docked = true;
 int g_resolution = 100;
 bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false;
+std::string g_keys_dir, g_firmware_dir; // (empty: the user folder's)
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
 // while a program runs.
@@ -224,8 +226,8 @@ std::string LoadError(Core::SystemResultStatus status) {
     const char* advice = nullptr;
     switch (loader) {
     case ResultStatus::ErrorMissingProductionKeyFile:
-        advice = "prod.keys is missing: send it from the web page (the address at the top of the HOME menu) "
-                 "or import it from a USB drive";
+        advice = "prod.keys is missing: put it on a USB drive (at its top, or in a folder there such as switch), "
+                 "or send it from the web page (the address at the top of the HOME menu)";
         break;
     case ResultStatus::ErrorMissingHeaderKey:
     case ResultStatus::ErrorIncorrectHeaderKey:
@@ -291,6 +293,11 @@ void SetCpuUnsafe(bool on) {
 
 void SetGpuAccuracyHigh(bool on) {
     g_gpu_high = on;
+}
+
+void SetKeysAndFirmware(std::string keys_dir, std::string firmware_dir) {
+    g_keys_dir = std::move(keys_dir);
+    g_firmware_dir = std::move(firmware_dir);
 }
 
 std::filesystem::path TitleCachePath(const std::filesystem::path& data_dir, std::string_view program,
@@ -418,6 +425,13 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
     Common::Log::SetColorConsoleBackendEnabled(false);
     Common::Log::SetCallback(OnLog);
     Common::Log::Start();
+    // The keys where SetKeysAndFirmware said (a USB drive), else the user folder's, read again at
+    // each boot (once the log has started: it writes to it): keys added or a drive plugged in
+    // since the last boot count
+    if (!g_keys_dir.empty())
+        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, g_keys_dir);
+    Core::Crypto::KeyManager::Instance().ReloadKeys();
+    Settings::values.system_contents_dir = g_firmware_dir;
     // ENet and the multiplayer room, which the BSD sockets service expects
     Network::Init();
 
