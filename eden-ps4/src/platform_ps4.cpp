@@ -719,8 +719,8 @@ void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height
 }
 
 // The HOME menu's titles: the package's programs, then every program (.nro, .nso) and game (.nsp,
-// .xci) in the data folder and at the top of a USB drive (/mnt/usb0 to /mnt/usb7), the most
-// recently played first. A homebrew program's name and icon come from its assets; a game's from
+// .xci) in the data folder and at the top of a USB drive (UsbDrive: /mnt/usb0-7 or /usb0-7), the
+// most recently played first. A homebrew program's name and icon come from its assets; a game's from
 // what Launcher::Boot kept the first time it booted (reading them takes the keys), else its cover
 // shows its file's name.
 constexpr const char* kRecentFile = "/data/eden-ps4/recent.txt";
@@ -844,6 +844,18 @@ std::vector<std::filesystem::path> GameFiles(const std::string& folder, int dept
     return found;
 }
 
+// USB drive `i` (0-7) where the app sees it: /mnt/usbN, or /usbN, where some consoles show an
+// app its drives instead (a console's log: nothing at /mnt/usb0, the drive at /usb0)
+std::string UsbDrive(int i)
+{
+    const std::string mnt = fmt::format("/mnt/usb{}", i);
+    struct stat status{};
+    if (stat(mnt.c_str(), &status) == 0 && S_ISDIR(status.st_mode))
+        return mnt;
+    const std::string root = fmt::format("/usb{}", i);
+    return stat(root.c_str(), &status) == 0 && S_ISDIR(status.st_mode) ? root : mnt;
+}
+
 // Which USB drives are there and what's at their tops, in short: the game list is made again when
 // it changes (a drive plugged in, or mounted after the app started)
 std::string UsbSignature()
@@ -851,7 +863,7 @@ std::string UsbSignature()
     std::string signature;
     for (int i = 0; i < 8; i++)
     {
-        const std::string path = fmt::format("/mnt/usb{}", i);
+        const std::string path = UsbDrive(i);
         DIR* directory = opendir(path.c_str());
         if (!directory)
             continue;
@@ -908,7 +920,7 @@ std::vector<Ui::Title> LoadTitles()
     // the data folder's top (its folders are the app's own), and each USB drive's top and folders
     std::vector<std::tuple<std::string, std::string, int>> folders = {{kDataDir, "data folder", 0}};
     for (int i = 0; i < 8; i++)
-        folders.push_back({fmt::format("/mnt/usb{}", i), fmt::format("USB {}", i), 1});
+        folders.push_back({UsbDrive(i), fmt::format("USB {}", i), 1});
     // the Game Folder first: a drive's game found there and on the drive shows once, as the folder's
     if (!g_games_folder.empty())
         folders.insert(folders.begin(), {g_games_folder, "Game Folder", kGameFolderDepth});
@@ -1028,9 +1040,9 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
 }
 
 // The Games and Keys screen: the keys, the firmware and the games found
-// What the app itself sees at the USB drives' mount points (/mnt/usb0-7): whether each is there for
-// it, whether it can be opened (the system's reason if not), and what's at its top. The system's
-// own package installer reading a drive doesn't mean an app may.
+// What the app itself sees at the USB drives' mount points (/mnt/usb0-7, or /usb0-7: UsbDrive):
+// whether each is there for it, whether it can be opened (the system's reason if not), and what's
+// at its top. The system's own package installer reading a drive doesn't mean an app may.
 std::string UsbReport(bool* readable = nullptr)
 {
     if (readable)
@@ -1038,7 +1050,7 @@ std::string UsbReport(bool* readable = nullptr)
     std::vector<std::string> seen;
     for (int i = 0; i < 8; i++)
     {
-        const std::string path = fmt::format("/mnt/usb{}", i);
+        const std::string path = UsbDrive(i);
         struct stat status{};
         if (stat(path.c_str(), &status) != 0)
         {
@@ -1070,14 +1082,14 @@ std::string UsbReport(bool* readable = nullptr)
                                    names.empty() ? std::string("nothing") : names, entries > 8 ? ", ..." : ""));
     }
     if (seen.empty())
-        return "none of /mnt/usb0 to /mnt/usb7 is there for the app";
+        return "none of /mnt/usb0 to /mnt/usb7 (or /usb0 to /usb7) is there for the app";
     std::string text;
     for (const std::string& line : seen)
         text += (text.empty() ? "" : "; ") + line;
     return text;
 }
 
-// Keys and firmware in the Game Folder or on a USB drive (/mnt/usb0-7), which games use from there,
+// Keys and firmware in the Game Folder or on a USB drive (UsbDrive), which games use from there,
 // before the ones in the user folder (Launcher::SetKeysAndFirmware)
 Launcher::UsbKeysAndFirmware KeysAndFirmwareOnUsb()
 {
@@ -1085,7 +1097,7 @@ Launcher::UsbKeysAndFirmware KeysAndFirmwareOnUsb()
     if (!g_games_folder.empty())
         drives.push_back(g_games_folder);
     for (int i = 0; i < 8; i++)
-        drives.push_back(fmt::format("/mnt/usb{}", i));
+        drives.push_back(UsbDrive(i));
     return Launcher::FindKeysAndFirmware(drives);
 }
 
@@ -1434,7 +1446,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         // Game Folder's places, as Crema's: the data folder, the USB drives, extended storage, /mnt
         std::vector<std::string> places{kDataDir};
         for (int i = 0; i < 8; i++)
-            places.push_back(fmt::format("/mnt/usb{}", i));
+            places.push_back(UsbDrive(i));
         places.insert(places.end(), {"/mnt/ext0", "/mnt/ext1", "/mnt"});
         menu.SetFolderPlaces(std::move(places));
     }
@@ -1604,7 +1616,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                 // then the drives themselves
                 std::vector<std::string> drives{std::string(kDataDir) + "/import"};
                 for (int i = 0; i < 8; i++)
-                    drives.push_back(fmt::format("/mnt/usb{}", i));
+                    drives.push_back(UsbDrive(i));
                 job->result = Launcher::ImportFromUsb(drives, std::string(kDataDir) + "/user",
                                                       [job](size_t copied, size_t total) {
                                                           job->total = total;
