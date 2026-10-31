@@ -1,0 +1,134 @@
+From 5ac2395c3ecd215f336c82a19e8b7766ae374427 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:33:48 +0000
+Subject: [PATCH 70/70] PS4: idle time counted while a core is still idle; the
+ service table emptied each period
+
+An emulated core can sleep for minutes in one idle period: it was counted only when it ended (a
+core idle all along showed 0%, then several hundred percent). IdleSnapshot counts a period still
+going on up to now. The per-command service table kept every entry since the game's start and
+filled up with them (the busiest then showed as others): it's emptied each time it's taken.
+---
+ src/common/ps4_perf.h                 | 54 +++++++++++++++++----------
+ src/core/hle/kernel/physical_core.cpp |  6 +--
+ 2 files changed, 37 insertions(+), 23 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index f413d189f..2e3865f1c 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -60,40 +60,57 @@ inline uint64_t SlowMemoryAccesses() {
+ 
+ // The emulated cores' idle time (in PhysicalCore::Idle, spinning or asleep): each core's, and the
+ // time all four were idle at once (every thread of the game waiting: on the GPU, a vsync, a
+-// service). Kept under a small lock (a few thousand idle periods a second).
+-inline CoreCount core_idle_ns[4];
+-inline std::atomic<uint64_t> all_idle_ns{0};
++// service). Kept under a small lock (a few thousand idle periods a second); IdleSnapshot counts an
++// idle period still going on up to now (a core can sleep for minutes in one).
+ inline std::atomic_flag idle_lock = ATOMIC_FLAG_INIT;
+-inline uint32_t idle_mask = 0;      // (the cores idle now; under idle_lock)
+-inline uint64_t all_idle_since = 0; // (under idle_lock)
++inline uint32_t idle_mask = 0;          // (the cores idle now; this and the rest under idle_lock)
++inline uint64_t idle_since[4] = {};     // (when each idle core's period began)
++inline uint64_t core_idle_ns[4] = {};   // (finished periods)
++inline uint64_t all_idle_since = 0;
++inline uint64_t all_idle_ns = 0;
++
++inline void IdleLock() {
++    while (idle_lock.test_and_set(std::memory_order_acquire)) {
++    }
++}
+ 
+ inline void IdleBegin(size_t core, uint64_t now_ns) {
+     if (core >= 4) {
+         return;
+     }
+-    while (idle_lock.test_and_set(std::memory_order_acquire)) {
+-    }
++    IdleLock();
+     idle_mask |= 1u << core;
++    idle_since[core] = now_ns;
+     if (idle_mask == 0xF) {
+         all_idle_since = now_ns;
+     }
+     idle_lock.clear(std::memory_order_release);
+ }
+ 
+-inline void IdleEnd(size_t core, uint64_t begin_ns, uint64_t now_ns) {
++inline void IdleEnd(size_t core, uint64_t now_ns) {
+     if (core >= 4) {
+         return;
+     }
+-    while (idle_lock.test_and_set(std::memory_order_acquire)) {
+-    }
++    IdleLock();
+     if (idle_mask == 0xF && now_ns > all_idle_since) {
+-        all_idle_ns.fetch_add(now_ns - all_idle_since, std::memory_order_relaxed);
++        all_idle_ns += now_ns - all_idle_since;
++    }
++    if ((idle_mask & (1u << core)) && now_ns > idle_since[core]) {
++        core_idle_ns[core] += now_ns - idle_since[core];
+     }
+     idle_mask &= ~(1u << core);
+     idle_lock.clear(std::memory_order_release);
+-    if (now_ns > begin_ns) {
+-        core_idle_ns[core].n.fetch_add(now_ns - begin_ns, std::memory_order_relaxed);
++}
++
++// Each core's idle time and all four's at once since the start, up to now_ns (the wall clock's)
++inline void IdleSnapshot(uint64_t now_ns, uint64_t (&cores)[4], uint64_t& all) {
++    IdleLock();
++    for (size_t core = 0; core < 4; core++) {
++        cores[core] = core_idle_ns[core] +
++                      ((idle_mask & (1u << core)) && now_ns > idle_since[core] ? now_ns - idle_since[core] : 0);
+     }
++    all = all_idle_ns + (idle_mask == 0xF && now_ns > all_idle_since ? now_ns - all_idle_since : 0);
++    idle_lock.clear(std::memory_order_release);
+ }
+ 
+ // The game's frames: from its QueueBuffer to the composer taking the frame at a vsync (how long a
+@@ -144,17 +161,16 @@ inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns) {
+     service_lock.clear(std::memory_order_release);
+ }
+ 
+-// Copies the table out (up to max entries) and zeroes its counts; returns the entries copied
++// Copies the table out (up to max entries) and empties it, so that the next period's calls fill it
++// afresh (a game's start uses many services it never calls again); returns the entries copied
+ inline size_t TakeServiceCalls(ServiceCall* out, size_t max) {
+     while (service_lock.test_and_set(std::memory_order_acquire)) {
+     }
+     const size_t n = std::min(max, service_call_entries);
+-    for (size_t i = 0; i < service_call_entries; i++) {
+-        if (i < n) {
+-            out[i] = service_calls[i];
+-        }
+-        service_calls[i].count = service_calls[i].total_ns = service_calls[i].max_ns = 0;
++    for (size_t i = 0; i < n; i++) {
++        out[i] = service_calls[i];
+     }
++    service_call_entries = 0;
+     service_lock.clear(std::memory_order_release);
+     return n;
+ }
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index b001f61f0..1c85466da 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -229,11 +229,9 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
+ 
+ void PhysicalCore::Idle() {
+ #ifdef __OPENORBIS__
+-    const u64 idle_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+-    Common::PS4Perf::IdleBegin(m_core_index, idle_begin);
++    Common::PS4Perf::IdleBegin(m_core_index, static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()));
+     SCOPE_EXIT {
+-        Common::PS4Perf::IdleEnd(m_core_index, idle_begin,
+-                                 static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()));
++        Common::PS4Perf::IdleEnd(m_core_index, static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()));
+     };
+     // A core with nothing to run is usually handed work within microseconds (a thread another core
+     // made ready, a service's reply), and waking a sleeping host thread costs far more than that
+-- 
+2.43.0
+

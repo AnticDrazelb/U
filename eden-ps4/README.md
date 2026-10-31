@@ -377,6 +377,31 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.81: **one page table walk for A64 loads and stores sharing a base.** 03.80's log of Captain Toad:
+Treasure Tracker (64-bit) at 15 fps: emulated core 0 busy all the time, all cores idle at once 0-1%,
+finished frames waiting 8 ms for a vsync but the game never waiting for a buffer, so its main thread's
+own code is the limit (Frame Pacing can't help it); 100-600 slow memory accesses a second (03.80's
+inline exclusives at work in A64 too). Each A64 load and store walked the page table inline: a
+misalignment test, the index, the 39-bit range test, the entry, mask, sign extension, a branch (about
+12 instructions). LDP/STP were already one 128-bit access each.
+
+Patch 0069: `A64SharedWalkPass`, the A64 version of 03.79's A32 pass, with `A64HostPointer` (the range
+test included) and `A64ReadMemoryVia*` / `A64WriteMemoryVia*` (8 to 128 bits, XMM values for 128):
+loads and stores through one base register value plus constants within a block (at most 256 bytes;
+not acquire/release) share one walk, each then a test, a branch and one host load or store, and its own
+walk and the fallbacks when the shared walk failed. The base is followed through chains of constant
+adds and subtracts, so a prologue's pre-indexed `stp x29, x30, [sp, #-N]!`, the stores after it on the
+new SP and the epilogue's loads are one group. In the A64 harness: a call with a prologue, an epilogue
+and seven struct accesses 27-28.5 ns -> 11.7-12.1 ns. 1,500 random A64 programs (every size, LDUR/STUR,
+signed loads, LDP/STP of W, X, D and Q, pre- and post-index, register offsets, SIMD, prologues on SP, a
+load into its own base, a store of the base itself; at page boundaries, on the marked page, next to
+and on the unmapped one, outside the address space) give the same registers, vectors, SP and memory
+with and without it; the A32 and exclusive suites still pass.
+
+Patch 0070: idle time counted up to now for a core still idle (a core asleep for minutes showed 0%,
+then 488%), and the per-command service table emptied each period (it had filled with the services a
+game uses only at its start, the busiest then showing as "others").
+
 03.80: **exclusive loads and stores inline, a cheaper DMB, and where the idle time goes.** 03.79's
 log (Mario Kart 8 Deluxe, 15-18 fps in races): 370,000 memory accesses a second left the recompiled
 code, half of them writes. Without fastmem, every exclusive load and store (LDREX/STREX and sizes,

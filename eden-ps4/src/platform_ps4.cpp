@@ -44,6 +44,7 @@
 #include <orbis/VideoOut.h>
 #include <stb/stb_easy_font.h>
 
+#include "common/cpu_features.h"
 #include "common/orbis_memory.h"
 #include "common/ps4_diagnostics.h"
 #include "common/ps4_perf.h"
@@ -1252,6 +1253,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.81: faster 64-bit games. 03.80's log of Captain Toad: Treasure Tracker showed its main thread "
+         "busy all the time at 15 fps (the vsync wasn't holding it back; Frame Pacing won't change it): the "
+         "game's own code is the limit. Most Switch games are 64-bit, and their every load and store walked "
+         "the memory table here (about 12 instructions); now the loads and stores of a function's start and "
+         "end, and of an object's fields, share one walk, as 03.79 did for 32-bit games. On a PC with the PS4's "
+         "setup, a call that saves registers and reads and writes a few fields takes 12 ns instead of 27. "
+         "Also fixed: the log's idle times (a core asleep for minutes showed 0%, then hundreds of percent) "
+         "and its list of busiest services.\n"
          "03.80: atomic operations run inline. 03.79's log still had 370,000 memory accesses a second leaving "
          "the recompiled code, half of them writes: the game's atomic operations (LDREX/STREX, behind every "
          "lock and reference count), each a call into the emulator and its exclusive monitor. They now go "
@@ -1847,6 +1856,8 @@ std::string PerfLine(double seconds)
         uint64_t idle_ns[4], all_idle_ns, presents, present_ns, dequeues, dequeue_ns;
     };
     static Totals last{};
+    uint64_t idle_ns[4], all_idle_ns;
+    P::IdleSnapshot(static_cast<uint64_t>(Common::g_wall_clock.GetTimeNS().count()), idle_ns, all_idle_ns);
     const Totals now{P::idle_spin_wakes.load(std::memory_order_relaxed),
                      P::idle_sleep_wakes.count.load(std::memory_order_relaxed),
                      P::idle_sleep_wakes.total_ns.load(std::memory_order_relaxed),
@@ -1859,9 +1870,8 @@ std::string PerfLine(double seconds)
                      P::jit_range_flushes.load(std::memory_order_relaxed),
                      P::SlowMemoryAccesses(),
                      P::Total(P::slow_memory_writes),
-                     {P::core_idle_ns[0].n.load(std::memory_order_relaxed), P::core_idle_ns[1].n.load(std::memory_order_relaxed),
-                      P::core_idle_ns[2].n.load(std::memory_order_relaxed), P::core_idle_ns[3].n.load(std::memory_order_relaxed)},
-                     P::all_idle_ns.load(std::memory_order_relaxed),
+                     {idle_ns[0], idle_ns[1], idle_ns[2], idle_ns[3]},
+                     all_idle_ns,
                      P::present_wait.count.load(std::memory_order_relaxed),
                      P::present_wait.total_ns.load(std::memory_order_relaxed),
                      P::dequeue_wait.count.load(std::memory_order_relaxed),

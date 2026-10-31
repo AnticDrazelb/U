@@ -1,0 +1,521 @@
+From 65e010cecabf93c449209c19271a4a938815f55f Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 14:33:48 +0000
+Subject: [PATCH 69/70] dynarmic: one page table walk for A64 loads and stores
+ that share a base (page table without fastmem)
+
+A64 version of A32SharedWalkPass: loads and stores (8 to 128 bits, LDP/STP's 128-bit accesses
+included; not acquire/release) through one base register value plus constants within a block,
+spanning at most 256 bytes, share one walk (A64HostPointer at the first: the host address of the
+span, or 0 when it crosses a page, is outside the address space, is unmapped, or is marked and one
+of them writes). Each becomes A64ReadMemoryVia*/A64WriteMemoryVia*: a test, a branch and one host
+load or store; when the shared walk failed, its own walk and then the same fallbacks as before.
+The base is followed through chains of constant adds and subtracts, so a pre-indexed STP's new SP
+and the stores after it, and the epilogue's loads, are one group.
+(UserConfig::page_table_shared_walk, on by default.)
+
+Host harness (Eden's page table configuration, a 32-bit space, block ids above 511): a call with
+a prologue, an epilogue and seven struct accesses 27-28.5 ns -> 11.7-12.1 ns. 1,500 random A64
+programs (every size, LDUR/STUR, signed loads, LDP/STP of W, X, D and Q with offsets, pre- and
+post-index, register offsets, SIMD, prologues on SP, a load into its own base, a store of the base
+itself; at page boundaries, on a marked page, next to and on an unmapped one, outside the address
+space) give the same registers, vectors, SP and memory with and without it.
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |   4 +
+ .../backend/x64/a64_emit_x64_memory.cpp       | 268 ++++++++++++++++++
+ .../src/dynarmic/interface/A64/config.h       |   8 +
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |  10 +
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |  11 +
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 108 +++++++
+ 6 files changed, 409 insertions(+)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 5905a9b29..4d0edaf95 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -108,6 +108,10 @@ public:
+     void EmitExclusiveWriteMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
+     bool UsePageTableExclusives() const;
+     template<size_t bitsize>
++    void EmitReadMemoryVia(A64EmitContext& ctx, IR::Inst* inst);
++    template<size_t bitsize>
++    void EmitWriteMemoryVia(A64EmitContext& ctx, IR::Inst* inst);
++    template<size_t bitsize>
+     void EmitExclusiveReadMemoryPageTable(A64EmitContext& ctx, IR::Inst* inst);
+     template<size_t bitsize>
+     void EmitExclusiveWriteMemoryPageTable(A64EmitContext& ctx, IR::Inst* inst);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index bd96365ae..726a02e65 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -446,4 +446,272 @@ void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::La
+     code.L(skip);
+ }
+ 
++namespace {
++// The A64 page table walk in pieces, as EmitVAddrLookup<A64EmitContext>: the page index of `vaddr`
++// into `tmp` (or a jump to `fail` when vaddr is outside the table's address space) ...
++void EmitA64PageIndex(BlockOfCode& code, const A64::UserConfig& conf, Xbyak::Reg64 tmp, Xbyak::Reg64 vaddr, Xbyak::Label& fail) {
++    const size_t valid_page_index_bits = conf.page_table_address_space_bits - page_table_const_bits;
++    const size_t unused_top_bits = 64 - conf.page_table_address_space_bits;
++    code.mov(tmp, vaddr);
++    if (unused_top_bits == 0) {
++        code.shr(tmp, int(page_table_const_bits));
++    } else if (conf.silently_mirror_page_table) {
++        if (valid_page_index_bits >= 32) {
++            code.shl(tmp, int(unused_top_bits));
++            code.shr(tmp, int(unused_top_bits + page_table_const_bits));
++        } else {
++            code.shr(tmp, int(page_table_const_bits));
++            code.and_(tmp, u32((1 << valid_page_index_bits) - 1));
++        }
++    } else {
++        ASSERT(valid_page_index_bits < 32);
++        code.shr(tmp, int(page_table_const_bits));
++        code.test(tmp, u32(-(1 << valid_page_index_bits)));
++        code.jnz(fail, code.T_NEAR);
++    }
++}
++
++// ... and the entry for that index (in `tmp`, which this clobbers) into `page`: its host page,
++// without the attribute bits, or a jump to `fail` when it's unmapped, or marked and a write (or a
++// read, with page_table_marked_bit_reads)
++void EmitA64PageEntry(BlockOfCode& code, const A64::UserConfig& conf, Xbyak::Reg64 page, Xbyak::Reg64 tmp, bool is_write,
++                      Xbyak::Label& fail) {
++    if (conf.page_table_log2_stride > 3) {
++        code.shl(tmp, int(conf.page_table_log2_stride));
++        code.mov(page, qword[r14 + tmp]);
++    } else {
++        code.mov(page, qword[r14 + tmp * int(1 << conf.page_table_log2_stride)]);
++    }
++    if (conf.page_table_marked_bit && (is_write || conf.page_table_marked_bit_reads)) {
++        code.bt(page, *conf.page_table_marked_bit);
++        code.jc(fail, code.T_NEAR);
++    }
++    if (conf.page_table_pointer_mask == 0) {
++        code.test(page, page);
++    } else if (std::in_range<s32>(s64(EffectivePointerMask(conf)))) {
++        code.and_(page, u32(s32(EffectivePointerMask(conf))));
++    } else {
++        code.mov(tmp, conf.page_table_pointer_mask);
++        code.and_(page, tmp);
++    }
++    if (conf.page_table_sign_extension) {
++        code.shl(page, 63 - int(*conf.page_table_sign_extension));
++        code.sar(page, 63 - int(*conf.page_table_sign_extension));
++    }
++    code.jz(fail, code.T_NEAR);
++}
++
++// A load (zero-extended) or store of `bitsize` bits between value (a general register, or for
++// 128 bits an XMM register, by index) and host memory at `where`
++void EmitA64HostMov(BlockOfCode& code, size_t bitsize, bool is_write, int value_idx, const Xbyak::RegExp& where) {
++    const Xbyak::Reg64 value{value_idx};
++    switch (bitsize) {
++    case 8:
++        is_write ? code.mov(code.byte[where], value.cvt8()) : code.movzx(value.cvt32(), code.byte[where]);
++        break;
++    case 16:
++        is_write ? code.mov(code.word[where], value.cvt16()) : code.movzx(value.cvt32(), code.word[where]);
++        break;
++    case 32:
++        is_write ? code.mov(code.dword[where], value.cvt32()) : code.mov(value.cvt32(), code.dword[where]);
++        break;
++    case 64:
++        is_write ? code.mov(code.qword[where], value) : code.mov(value, code.qword[where]);
++        break;
++    default:
++        is_write ? code.movups(code.xword[where], Xbyak::Xmm{value_idx}) : code.movups(Xbyak::Xmm{value_idx}, code.xword[where]);
++        break;
++    }
++}
++
++// The slow path of an access of a group whose shared walk failed (A64HostPointer gave 0): its own
++// walk (in two registers saved on the stack meanwhile), and if that fails too the fallback (the
++// memory callbacks). `start` holds the access's address meanwhile (start + offset, taken off again
++// after: the fallbacks keep every register but a load's value).
++void EmitA64ViaSlowPath(BlockOfCode& code, const A64::UserConfig& conf, size_t bitsize, Xbyak::Reg64 start, int value_idx,
++                        Xbyak::Reg64 host, bool is_write, void (*fallback)(), u32 offset, Xbyak::Label& end) {
++    const bool value_is_gpr = bitsize != 128;
++    const auto avoid = [&](const Xbyak::Reg64& r) {
++        return r.getIdx() == start.getIdx() || r.getIdx() == host.getIdx() || (value_is_gpr && r.getIdx() == value_idx);
++    };
++    Xbyak::Reg64 regs[2];
++    size_t found = 0;
++    for (const Xbyak::Reg64& r : {code.rax, code.rcx, code.rdx, code.rbx, code.rsi, code.rdi, code.r8, code.r9}) {
++        if (found < 2 && !avoid(r)) {
++            regs[found++] = r;
++        }
++    }
++    const Xbyak::Reg64 page = regs[0], tmp = regs[1];
++    Xbyak::Label callback;
++    if (offset != 0) {
++        code.add(start, offset);
++    }
++    code.push(page);
++    code.push(tmp);
++    // an access that would cross into the next page goes to the callbacks
++    if (bitsize > 8) {
++        code.mov(tmp.cvt32(), start.cvt32());
++        code.and_(tmp.cvt32(), u32(page_table_const_mask));
++        code.cmp(tmp.cvt32(), u32(page_table_const_size - bitsize / 8));
++        code.ja(callback, code.T_NEAR);
++    }
++    EmitA64PageIndex(code, conf, tmp, start, callback);
++    EmitA64PageEntry(code, conf, page, tmp, is_write, callback);
++    if (conf.absolute_offset_page_table) {
++        code.add(page, start);
++    } else {
++        code.mov(tmp, start);
++        code.and_(tmp, u32(page_table_const_mask));
++        code.add(page, tmp);
++    }
++    EmitA64HostMov(code, bitsize, is_write, value_idx, page);
++    code.pop(tmp);
++    code.pop(page);
++    if (offset != 0) {
++        code.sub(start, offset);
++    }
++    code.jmp(end, code.T_NEAR);
++
++    code.L(callback);
++    code.pop(tmp);
++    code.pop(page);
++    code.call(fallback);
++    if (offset != 0) {
++        code.sub(start, offset);
++    }
++    code.jmp(end, code.T_NEAR);
++}
++}  // namespace
++
++// One page table walk for a group of loads and stores sharing a base (A64SharedWalkPass): the host
++// address of [vaddr, vaddr + span), or 0 when any of them would leave the inline walk (the span
++// crosses into the next page, is outside the address space, the page is unmapped, or it's marked
++// and one of them writes)
++void A64EmitX64::EmitA64HostPointer(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u32 span = args[1].GetImmediateU32();
++    const bool is_write = args[2].GetImmediateU1();
++    ASSERT(conf.page_table && span >= 1 && span <= page_table_const_size);
++
++    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[0]);
++    const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
++    const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
++    Xbyak::Label fail, done;
++
++    code.mov(tmp.cvt32(), vaddr.cvt32());
++    code.and_(tmp.cvt32(), u32(page_table_const_mask));
++    code.cmp(tmp.cvt32(), u32(page_table_const_size - span));
++    code.ja(fail, code.T_NEAR);
++    EmitA64PageIndex(code, conf, tmp, vaddr, fail);
++    EmitA64PageEntry(code, conf, page, tmp, is_write, fail);
++    if (conf.absolute_offset_page_table) {
++        code.add(page, vaddr);
++    } else {
++        code.mov(tmp, vaddr);
++        code.and_(tmp, u32(page_table_const_mask));
++        code.add(page, tmp);
++    }
++    code.jmp(done, code.T_NEAR);
++    code.L(fail);
++    code.xor_(page.cvt32(), page.cvt32());
++    code.L(done);
++
++    ctx.reg_alloc.DefineValue(code, inst, page);
++}
++
++// An access of such a group through its host address (A64HostPointer); or, when that is 0, its own
++// walk and if need be the callbacks (EmitA64ViaSlowPath), for its address: the start (args[1], the
++// whole group's) plus its offset
++template<size_t bitsize>
++void A64EmitX64::EmitReadMemoryVia(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u32 offset = args[2].GetImmediateU32();
++    const Xbyak::Reg64 host = ctx.reg_alloc.UseGpr(code, args[0]);
++    const Xbyak::Reg64 start = ctx.reg_alloc.UseGpr(code, args[1]);
++    const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm(code).getIdx() : ctx.reg_alloc.ScratchGpr(code).getIdx();
++    const auto wrapped_fn = read_fallbacks[std::make_tuple(false, bitsize, start.getIdx(), value_idx)];
++
++    SharedLabel slow = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
++    code.test(host, host);
++    code.jz(*slow, code.T_NEAR);
++    EmitA64HostMov(code, bitsize, false, value_idx, host + s32(offset));
++    code.L(*end);
++    ctx.deferred_emits.emplace_back([=, this] {
++        code.L(*slow);
++        EmitA64ViaSlowPath(code, conf, bitsize, start, value_idx, host, false, wrapped_fn, offset, *end);
++    });
++
++    if constexpr (bitsize == 128) {
++        ctx.reg_alloc.DefineValue(code, inst, Xbyak::Xmm{value_idx});
++    } else {
++        ctx.reg_alloc.DefineValue(code, inst, Xbyak::Reg64{value_idx});
++    }
++}
++
++template<size_t bitsize>
++void A64EmitX64::EmitWriteMemoryVia(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u32 offset = args[3].GetImmediateU32();
++    const Xbyak::Reg64 host = ctx.reg_alloc.UseGpr(code, args[0]);
++    Xbyak::Reg64 start = ctx.reg_alloc.UseGpr(code, args[1]);
++    const int value_idx = bitsize == 128 ? ctx.reg_alloc.UseXmm(code, args[2]).getIdx() : ctx.reg_alloc.UseGpr(code, args[2]).getIdx();
++    if (bitsize != 128 && start.getIdx() == value_idx) {
++        // (storing the base register itself: the slow path's offset mustn't change the value)
++        const Xbyak::Reg64 copy = ctx.reg_alloc.ScratchGpr(code);
++        code.mov(copy, start);
++        start = copy;
++    }
++    const auto wrapped_fn = write_fallbacks[std::make_tuple(false, bitsize, start.getIdx(), value_idx)];
++
++    SharedLabel slow = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
++    code.test(host, host);
++    code.jz(*slow, code.T_NEAR);
++    EmitA64HostMov(code, bitsize, true, value_idx, host + s32(offset));
++    code.L(*end);
++    ctx.deferred_emits.emplace_back([=, this] {
++        code.L(*slow);
++        EmitA64ViaSlowPath(code, conf, bitsize, start, value_idx, host, true, wrapped_fn, offset, *end);
++    });
++}
++
++void A64EmitX64::EmitA64ReadMemoryVia8(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<8>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64ReadMemoryVia16(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<16>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64ReadMemoryVia32(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<32>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64ReadMemoryVia64(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<64>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64ReadMemoryVia128(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<128>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64WriteMemoryVia8(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<8>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64WriteMemoryVia16(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<16>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64WriteMemoryVia32(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<32>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64WriteMemoryVia64(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<64>(ctx, inst);
++}
++
++void A64EmitX64::EmitA64WriteMemoryVia128(A64EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<128>(ctx, inst);
++}
++
+ }  // namespace Dynarmic::Backend::X64
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 0e84c9dcd..866162ebd 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -309,6 +309,14 @@ struct UserConfig {
+     /// takes the callbacks. Used with a page table and without fastmem.
+     bool page_table_inline_exclusives = true;
+ 
++    /// Loads and stores through one base register value plus constants within a block (an
++    /// object's fields, the stack) share one page table walk (A64HostPointer, at the first of
++    /// them) instead of one each, when they span at most 256 bytes; each then is a test, a branch
++    /// and one host load or store, its own walk and the callbacks only when the shared one failed
++    /// (the span crosses a page, the page is unmapped, or marked and one of them writes). Used with
++    /// a page table and without fastmem.
++    bool page_table_shared_walk = true;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index ff5a898b7..c8f10d1a3 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -101,6 +101,11 @@ constexpr bool IsSharedMemoryRead(const Opcode op) noexcept {
+     case Opcode::A64ReadMemory32:
+     case Opcode::A64ReadMemory64:
+     case Opcode::A64ReadMemory128:
++    case Opcode::A64ReadMemoryVia8:
++    case Opcode::A64ReadMemoryVia16:
++    case Opcode::A64ReadMemoryVia32:
++    case Opcode::A64ReadMemoryVia64:
++    case Opcode::A64ReadMemoryVia128:
+         return true;
+ 
+     default:
+@@ -124,6 +129,11 @@ constexpr bool IsSharedMemoryWrite(const Opcode op) noexcept {
+     case Opcode::A64WriteMemory32:
+     case Opcode::A64WriteMemory64:
+     case Opcode::A64WriteMemory128:
++    case Opcode::A64WriteMemoryVia8:
++    case Opcode::A64WriteMemoryVia16:
++    case Opcode::A64WriteMemoryVia32:
++    case Opcode::A64WriteMemoryVia64:
++    case Opcode::A64WriteMemoryVia128:
+         return true;
+ 
+     default:
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index 35e78d145..810b92acf 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -707,6 +707,17 @@ A64OPC(WriteMemory16,                                       Void,           U64,
+ A64OPC(WriteMemory32,                                       Void,           U64,            U64,            U32,            AccType         )
+ A64OPC(WriteMemory64,                                       Void,           U64,            U64,            U64,            AccType         )
+ A64OPC(WriteMemory128,                                      Void,           U64,            U64,            U128,           AccType         )
++A64OPC(HostPointer,                                         U64,            U64,            U32,            U1              )
++A64OPC(ReadMemoryVia8,                                      U8,             U64,            U64,            U32             )
++A64OPC(ReadMemoryVia16,                                     U16,            U64,            U64,            U32             )
++A64OPC(ReadMemoryVia32,                                     U32,            U64,            U64,            U32             )
++A64OPC(ReadMemoryVia64,                                     U64,            U64,            U64,            U32             )
++A64OPC(ReadMemoryVia128,                                    U128,           U64,            U64,            U32             )
++A64OPC(WriteMemoryVia8,                                     Void,           U64,            U64,            U8,             U32             )
++A64OPC(WriteMemoryVia16,                                    Void,           U64,            U64,            U16,            U32             )
++A64OPC(WriteMemoryVia32,                                    Void,           U64,            U64,            U32,            U32             )
++A64OPC(WriteMemoryVia64,                                    Void,           U64,            U64,            U64,            U32             )
++A64OPC(WriteMemoryVia128,                                   Void,           U64,            U64,            U128,           U32             )
+ A64OPC(ExclusiveWriteMemory8,                               U32,            U64,            U64,            U8,             AccType         )
+ A64OPC(ExclusiveWriteMemory16,                              U32,            U64,            U64,            U16,            AccType         )
+ A64OPC(ExclusiveWriteMemory32,                              U32,            U64,            U64,            U32,            AccType         )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index bc68b6849..412eebe79 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -189,6 +189,110 @@ static void A32SharedWalkPass(IR::Block& block) {
+     }
+ }
+ 
++// A64: loads and stores through one base register value plus constants within a block share one
++// page table walk (A64HostPointer before the first of them), as A32SharedWalkPass. The base is
++// followed through chains of constant adds and subtracts (a pre-indexed STP's new SP, then the
++// stores after it), so the accesses of a function's prologue and epilogue form one group.
++static void A64SharedWalkPass(IR::Block& block) {
++    struct Member {
++        IR::Block::iterator it;
++        s64 offset;
++        s64 bytes;
++        IR::Opcode via;
++        bool write;
++    };
++    struct Group {
++        IR::Inst* base;
++        std::vector<Member> members;
++    };
++    const auto resolve = [](IR::Value v) {
++        while (v.IsIdentity()) {
++            v = v.GetInst()->GetArg(0);
++        }
++        return v;
++    };
++    std::vector<Group> groups;
++    for (auto it = block.instructions.begin(); it != block.instructions.end(); ++it) {
++        IR::Opcode via;
++        s64 bytes;
++        bool write;
++        switch (it->GetOpcode()) {
++        case IR::Opcode::A64ReadMemory8: via = IR::Opcode::A64ReadMemoryVia8, bytes = 1, write = false; break;
++        case IR::Opcode::A64ReadMemory16: via = IR::Opcode::A64ReadMemoryVia16, bytes = 2, write = false; break;
++        case IR::Opcode::A64ReadMemory32: via = IR::Opcode::A64ReadMemoryVia32, bytes = 4, write = false; break;
++        case IR::Opcode::A64ReadMemory64: via = IR::Opcode::A64ReadMemoryVia64, bytes = 8, write = false; break;
++        case IR::Opcode::A64ReadMemory128: via = IR::Opcode::A64ReadMemoryVia128, bytes = 16, write = false; break;
++        case IR::Opcode::A64WriteMemory8: via = IR::Opcode::A64WriteMemoryVia8, bytes = 1, write = true; break;
++        case IR::Opcode::A64WriteMemory16: via = IR::Opcode::A64WriteMemoryVia16, bytes = 2, write = true; break;
++        case IR::Opcode::A64WriteMemory32: via = IR::Opcode::A64WriteMemoryVia32, bytes = 4, write = true; break;
++        case IR::Opcode::A64WriteMemory64: via = IR::Opcode::A64WriteMemoryVia64, bytes = 8, write = true; break;
++        case IR::Opcode::A64WriteMemory128: via = IR::Opcode::A64WriteMemoryVia128, bytes = 16, write = true; break;
++        default:
++            continue;
++        }
++        const auto acc = it->GetArg(write ? 3 : 2).GetAccType();
++        if (acc != IR::AccType::NORMAL && acc != IR::AccType::VEC && acc != IR::AccType::STREAM && acc != IR::AccType::VECSTREAM) {
++            continue;
++        }
++        IR::Value base = resolve(it->GetArg(1));
++        s64 offset = 0;
++        for (int depth = 0; depth < 8 && !base.IsImmediate(); depth++) {
++            IR::Inst* address = base.GetInst();
++            if (address->GetOpcode() == IR::Opcode::Add64 && address->GetArg(1).IsImmediate() && address->GetArg(2).IsImmediate() &&
++                !address->GetArg(2).GetU1()) {
++                offset += s64(address->GetArg(1).GetU64());
++            } else if (address->GetOpcode() == IR::Opcode::Sub64 && address->GetArg(1).IsImmediate() &&
++                       address->GetArg(2).IsImmediate() && address->GetArg(2).GetU1()) {
++                offset -= s64(address->GetArg(1).GetU64());
++            } else {
++                break;
++            }
++            base = resolve(address->GetArg(0));
++        }
++        if (base.IsImmediate() || offset < -(s64(1) << 20) || offset > (s64(1) << 20)) {
++            continue;
++        }
++        auto group = std::find_if(groups.begin(), groups.end(), [&](const Group& g) { return g.base == base.GetInst(); });
++        if (group == groups.end()) {
++            groups.push_back({base.GetInst(), {}});
++            group = groups.end() - 1;
++        }
++        group->members.push_back({it, offset, bytes, via, write});
++    }
++    for (Group& group : groups) {
++        if (group.members.size() < 2) {
++            continue;
++        }
++        s64 lowest = group.members[0].offset, end = lowest;
++        bool any_write = false;
++        for (const Member& m : group.members) {
++            lowest = std::min(lowest, m.offset);
++            end = std::max(end, m.offset + m.bytes);
++            any_write |= m.write;
++        }
++        const s64 span = end - lowest;
++        if (span > 256) {
++            continue;
++        }
++        const auto first = group.members[0].it;
++        IR::Value start{group.base};
++        if (lowest != 0) {
++            start = IR::Value{&*block.PrependNewInst(first, IR::Opcode::Add64, {start, IR::Value{u64(lowest)}, IR::Value{false}})};
++        }
++        const IR::Value host{&*block.PrependNewInst(first, IR::Opcode::A64HostPointer, {start, IR::Value{u32(span)}, IR::Value{any_write}})};
++        for (const Member& m : group.members) {
++            const IR::Value offset{u32(m.offset - lowest)};
++            if (m.write) {
++                block.PrependNewInst(m.it, m.via, {host, start, m.it->GetArg(2), offset});
++                m.it->Invalidate();
++            } else {
++                const auto read = block.PrependNewInst(m.it, m.via, {host, start, offset});
++                m.it->ReplaceUsesWith(IR::Value{&*read});
++            }
++        }
++    }
++}
++
+ static void FlagsPass(IR::Block& block) {
+     using Iterator = typename std::reverse_iterator<IR::Block::iterator>;
+ 
+@@ -1581,6 +1685,10 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+         Optimization::ConstantPropagation(block);
+         Optimization::DeadCodeElimination(block);
+     }
++    if (conf.page_table_shared_walk && conf.page_table && !conf.fastmem_pointer && !conf.check_halt_on_memory_access) {
++        Optimization::A64SharedWalkPass(block);
++        Optimization::DeadCodeElimination(block);
++    }
+     Optimization::IdentityRemovalPass(block);
+     if (!conf.HasOptimization(OptimizationFlag::DisableVerification)) {
+         Optimization::VerificationPass(block);
+-- 
+2.43.0
+
