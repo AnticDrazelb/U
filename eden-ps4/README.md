@@ -377,6 +377,16 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.82: **Game Speed: 1.0x, 1.5x, 2.0x** (System Settings, Graphics; `speed=` in the menu file,
+`EDEN_PS4_SPEED` on the desktop). Eden's speed limit at 100, 150 or 200%: its conductor's vsyncs come
+that much more often (`vi/conductor.cpp`), so a game that reaches its full frame rate runs that much
+faster, a game stepping by frames faster in game time, one stepping by the clock only smoother (the
+guest's CNTPCT isn't scaled; `sync_core_speed` stays off). Each composite waits for the one before it
+(`HardwareComposer::ComposeLocked`), and the PS4's display flips at the TV's vsync, which would cap it at
+60 again: above 100% `vsync_mode` is Immediate, so `vk_swapchain_ps4.cpp` flips at the next scanline
+(`ORBIS_VIDEO_OUT_FLIP_HSYNC`), tearing possible. It can't make a CPU-bound scene faster. Frame Pacing:
+Unlocked (no speed limit) overrides it.
+
 03.81: **one page table walk for A64 loads and stores sharing a base.** 03.80's log of Captain Toad:
 Treasure Tracker (64-bit) at 15 fps: emulated core 0 busy all the time, all cores idle at once 0-1%,
 finished frames waiting 8 ms for a vsync but the game never waiting for a buffer, so its main thread's

@@ -64,6 +64,7 @@ struct MenuSettings
     bool ram_on_demand = true; // the Switch's RAM taken from the PS4's as the game uses it
     bool fps_overlay = false;  // the frames presented a second, top left
     bool unlocked_frames = false; // frames shown as soon as they're done, not at the next 60 Hz vsync
+    int speed = 100;              // game speed in percent of the Switch's: 100, 150 or 200
     std::string games_folder;  // Game Folder: games, keys and firmware also looked for here, in all its
                                // folders (as Crema's): a USB drive or any folder (empty: none)
 };

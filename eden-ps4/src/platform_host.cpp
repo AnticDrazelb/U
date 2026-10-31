@@ -254,6 +254,9 @@ int main(int argc, char** argv) {
     Launcher::SetGpuAccuracyHigh(flag("EDEN_PS4_GPU_HIGH"));
     Launcher::SetFpsOverlay(flag("EDEN_PS4_FPS"));
     Launcher::SetUnlockedFrames(flag("EDEN_PS4_UNLOCKED"));
+    if (const char* speed = std::getenv("EDEN_PS4_SPEED")) {
+        Launcher::SetSpeedPercent(std::atoi(speed));
+    }
     if (const char* env = std::getenv("EDEN_PS4_INPUT")) {
         input = std::thread(PlayInput, std::string(env), &done);
     }

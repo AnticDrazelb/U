@@ -83,6 +83,9 @@ void SetFpsOverlay(bool on);
 // Frame pacing: frames shown at the Switch's 60 Hz vsync (Eden's speed limit at 100%), or each the
 // moment the game finishes it (unlocked: no speed limit)
 void SetUnlockedFrames(bool on);
+// Game speed, in percent of the Switch's (100, 150 or 200): Eden's speed limit, its vsyncs that
+// much more often; above 100 the PS4's display flips don't wait for the TV's vsync
+void SetSpeedPercent(int percent);
 
 /// Keys and firmware used where they are (a USB drive), not copied: Eden reads prod.keys and
 /// title.keys from `keys_dir` instead of data_dir/user/keys, and the firmware's .nca files from

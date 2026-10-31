@@ -1027,6 +1027,10 @@ Ui::MenuSettings LoadMenuSettings()
             settings.pin_threads = false;
         else if (line == "pacing=unlocked")
             settings.unlocked_frames = true;
+        else if (line == "speed=150")
+            settings.speed = 150;
+        else if (line == "speed=200")
+            settings.speed = 200;
         else if (line.starts_with("games_folder="))
             settings.games_folder = line.substr(13);
     }
@@ -1038,14 +1042,14 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
-                     settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz");
+                     settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed);
         std::fclose(f);
     }
 }
@@ -1253,6 +1257,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.82: System Settings, Graphics, Game Speed: 1.0x, 1.5x or 2.0x. The Switch's vsyncs come that much "
+         "more often, so a game that has room to spare runs faster (up to 90 or 120 frames a second): one "
+         "that moves by the frame speeds up, one that moves by the clock looks smoother. It raises the "
+         "limit, not the PS4's power: a scene the PS4 can only run at 15 fps stays at 15. Above 1.0x the "
+         "display doesn't wait for the TV's refresh (the picture may tear), and sound may lag behind.\n"
          "03.81: faster 64-bit games. 03.80's log of Captain Toad: Treasure Tracker showed its main thread "
          "busy all the time at 15 fps (the vsync wasn't holding it back; Frame Pacing won't change it): the "
          "game's own code is the limit. Most Switch games are 64-bit, and their every load and store walked "
@@ -1709,13 +1718,14 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                 g_files_changed = true;
             }
             Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
-                              "asynchronous shaders {}, GPU accuracy {}, frame pacing {}, CPU {}, {} cores, profiler {}",
+                              "asynchronous shaders {}, GPU accuracy {}, frame pacing {}, speed {}%, CPU {}, {} cores, "
+                              "profiler {}",
                               choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
                               choice.settings.docked ? "docked" : "handheld", choice.settings.resolution,
                               choice.settings.shader_cache ? "on" : "off", choice.settings.async_shaders ? "on" : "off",
                               choice.settings.gpu_high ? "high" : "normal",
-                              choice.settings.unlocked_frames ? "unlocked" : "60 Hz",
+                              choice.settings.unlocked_frames ? "unlocked" : "60 Hz", choice.settings.speed,
                               choice.settings.cpu_unsafe ? "unsafe" : "auto",
                               choice.settings.seventh_core ? 7 : 6, choice.settings.profiler ? "on" : "off"));
         }
@@ -2100,6 +2110,7 @@ void* Run(void*)
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
         Launcher::SetFpsOverlay(settings.fps_overlay);
         Launcher::SetUnlockedFrames(settings.unlocked_frames);
+        Launcher::SetSpeedPercent(settings.speed);
         {
             // keys and firmware on a USB drive are used from there, else the user folder's
             const Launcher::UsbKeysAndFirmware usb = KeysAndFirmwareOnUsb();
@@ -2119,10 +2130,10 @@ void* Run(void*)
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}, frame pacing {}; CPU {}, {} cores, threads {}; the Switch's RAM {}{}",
+            "GPU accuracy {}, frame pacing {}, game speed {}%; CPU {}, {} cores, threads {}; the Switch's RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
-            settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz",
+            settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
             settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
             settings.pin_threads ? "pinned" : "free", settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");

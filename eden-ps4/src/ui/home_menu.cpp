@@ -787,6 +787,14 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "below 60 loses no time waiting. A game whose speed follows its frames may run faster than it should "
              "where it can go above 60 (menus). The log's 30-second line says how long frames waited.",
              [](MenuSettings& s) { s.unlocked_frames = !s.unlocked_frames; }},
+            {"Game Speed", settings.speed == 200 ? "2.0x" : settings.speed == 150 ? "1.5x" : "1.0x",
+             "How fast the Switch's clock of frames runs: at 1.5x or 2.0x its vsyncs come that much more often, "
+             "so a game with room to spare (one that already reaches its full frame rate) runs faster, up to "
+             "90 or 120 frames a second; games that move by the frame speed up, games that move by the clock "
+             "just look smoother. It can't make a slow scene faster than the PS4 can run it. Above 1.0x the "
+             "picture may tear (frames aren't held for the TV's refresh), and sound may not keep up. Frame "
+             "Pacing: Unlocked has no limit at all and overrides this.",
+             [](MenuSettings& s) { s.speed = s.speed == 100 ? 150 : s.speed == 150 ? 200 : 100; }},
             {"GPU Accuracy", settings.gpu_high ? "High" : "Normal",
              "How closely the CPU waits for the GPU. High reads back what the GPU drew whenever the game's CPU code "
              "might look at it, and makes the CPU's every access to such memory take a slow path: needed by a few "

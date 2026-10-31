@@ -163,6 +163,7 @@ bool g_docked = true;
 int g_resolution = 100;
 bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false, g_fps_overlay = false;
 bool g_unlocked_frames = false;
+int g_speed_percent = 100;
 std::string g_keys_dir, g_firmware_dir; // (empty: the user folder's)
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
@@ -255,6 +256,12 @@ void ApplyLauncherSettings() {
     // a game that misses one waits for the next, 30, 20, 15 fps); unlocked, its vsyncs come 100 times
     // as often, so each frame is shown as soon as it's done (and a game that could go above 60 does)
     Settings::values.use_speed_limit.SetValue(!g_unlocked_frames);
+    // Game speed: the speed limit scales how often Eden's vsyncs come (vi/conductor.cpp), so a game
+    // with room to spare runs that much faster. A composite waits for the one before it to be shown,
+    // and the PS4's display flips at the TV's 60 Hz vsync: above 100% they flip at the next
+    // scanline instead (Immediate, vk_swapchain_ps4.cpp), or the TV's 60 Hz would cap it again.
+    Settings::values.speed_limit.SetValue(static_cast<u16>(g_speed_percent));
+    Settings::values.vsync_mode.SetValue(g_speed_percent > 100 ? Settings::VSyncMode::Immediate : Settings::VSyncMode::Fifo);
     // GPU macros (MME: games' draws and state changes go through them, on the GPU thread) compiled
     // to x86 code (on the PS4 into memory mapped executable from the start, patch 0051), not
     // interpreted; EDEN_PS4_MACRO_JIT=0 interprets them
@@ -381,6 +388,10 @@ void SetFpsOverlay(bool on) {
 
 void SetUnlockedFrames(bool on) {
     g_unlocked_frames = on;
+}
+
+void SetSpeedPercent(int percent) {
+    g_speed_percent = percent == 150 || percent == 200 ? percent : 100;
 }
 
 void SetKeysAndFirmware(std::string keys_dir, std::string firmware_dir) {
