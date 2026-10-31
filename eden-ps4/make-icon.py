@@ -1,3 +1,5 @@
+# sce_sys/icon0.png is now a picture of two Joy-Con (given, not drawn here): running this replaces
+# it with the earlier drawn icon.
 # Builds sce_sys/icon0.png (512x512, the PS4 app icon): a Switch's two Joy-Con around a terminal,
 # the text-only Switch program this stage runs. Drawn at 2x and scaled down for smooth edges.
 # Needs Pillow and the DejaVu fonts.
