@@ -17,6 +17,8 @@
 #include <cctype>
 #include <cerrno>
 #include <csignal>
+#include <setjmp.h>
+#include <signal.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1257,6 +1259,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.83: every memory access of the game's code is shorter. The table the recompiled code looks up "
+         "for each load and store now holds the PS4 address whole, so the lookup is one instruction instead "
+         "of three; a chain of loads (following pointers, as games do all the time) runs about 20% faster on "
+         "a PC with the PS4's setup. And the start of the log now says whether the PS4 lets this app map the "
+         "same memory twice, using two kernel calls found in the PS4's system library that allow it "
+         "(sceKernelEnableDmemAliasing). If it does, the next version can use fastmem: the game's loads and "
+         "stores as single instructions, the biggest speedup left. Just opening the app and sending the log "
+         "answers it.\n"
          "03.82: System Settings, Graphics, Game Speed: 1.0x, 1.5x or 2.0x. The Switch's vsyncs come that much "
          "more often, so a game that has room to spare runs faster (up to 90 or 120 frames a second): one "
          "that moves by the frame speeds up, one that moves by the clock looks smoother. It raises the "
@@ -2214,9 +2224,71 @@ void* Run(void*)
 // reading and writing guest memory without walking a page table) needs the emulated RAM mapped
 // twice. Tried once with 64 KiB: both mappings, a word written through one and read through the
 // other; the boot trace says what happened. Nothing else depends on it yet.
+bool g_dmem_aliasing = false; // (ProbeDoubleMapping: the same direct memory maps at two addresses)
+
+// Whether the PS4 lets this app map the same direct memory at two addresses, which fastmem needs
+// (the Switch's memory at its own addresses, beside Eden's view of it): plainly, which it refused
+// in 03.79 (EBUSY), and after libkernel's sceKernelEnableDmemAliasing / ...2 (exported, not in
+// the SDK's headers) and through sceKernelMapDirectMemory2. Each read and write test runs under a
+// temporary fault guard, so a mapping that isn't what it seems is reported, not a crash. Aliasing,
+// once enabled, stays enabled (fastmem will want it).
+extern "C" int32_t sceKernelEnableDmemAliasing(void);
+extern "C" int32_t sceKernelEnableDmemAliasing2(void);
+extern "C" int32_t sceKernelMapDirectMemory2(void** addr, size_t len, int32_t type, int32_t prot, int32_t flags, off_t phys,
+                                            size_t alignment);
+
+namespace
+{
+sigjmp_buf g_probe_jump;
+volatile sig_atomic_t g_probe_guarded = 0;
+
+void ProbeFault(int sig, siginfo_t*, void*)
+{
+    if (g_probe_guarded)
+        siglongjmp(g_probe_jump, sig);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// The same memory at a and b? (the guard catches a fault, as "faulted")
+std::string SameMemory(void* a, void* b)
+{
+    volatile uint32_t* x = static_cast<volatile uint32_t*>(a);
+    volatile uint32_t* y = static_cast<volatile uint32_t*>(b);
+    const int sig = sigsetjmp(g_probe_jump, 1);
+    if (sig != 0)
+    {
+        g_probe_guarded = 0;
+        return fmt::format("a read or write faulted (signal {})", sig);
+    }
+    g_probe_guarded = 1;
+    x[100] = 0x5EEDF00Du;
+    const uint32_t seen = y[100];
+    y[(1 << 20) / 4] = 0x0DDBA11u; // (a megabyte in)
+    const uint32_t back = x[(1 << 20) / 4];
+    g_probe_guarded = 0;
+    return seen == 0x5EEDF00Du && back == 0x0DDBA11u ? "yes, the same memory at two addresses"
+                                                     : fmt::format("mapped twice, but not the same memory "
+                                                                   "(read back {:#x}, {:#x})", seen, back);
+}
+
+// Maps phys a second time (map2: through sceKernelMapDirectMemory2) beside `first`: the outcome
+std::string SecondMapping(void* first, off_t phys, size_t size, bool map2)
+{
+    void* second = nullptr;
+    const int32_t r = map2 ? sceKernelMapDirectMemory2(&second, size, 0, 0x03, 0, phys, size)
+                           : sceKernelMapDirectMemory(&second, size, 0x03, 0, phys, size);
+    if (r != 0)
+        return fmt::format("refused ({:#x})", uint32_t(r));
+    std::string result = SameMemory(first, second) + fmt::format(" (at {} and {})", first, second);
+    sceKernelMunmap(second, size);
+    return result;
+}
+} // namespace
+
 static void ProbeDoubleMapping()
 {
-    constexpr size_t kSize = 64 * 1024;
+    constexpr size_t kSize = 2 * 1024 * 1024; // (the on-demand DRAM's chunk, a large page)
     off_t phys = 0;
     int32_t r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kSize, kSize, 0, &phys);
     if (r != 0)
@@ -2225,7 +2297,6 @@ static void ProbeDoubleMapping()
         return;
     }
     void* first = nullptr;
-    void* second = nullptr;
     r = sceKernelMapDirectMemory(&first, kSize, 0x03, 0, phys, kSize);
     if (r != 0)
     {
@@ -2233,28 +2304,39 @@ static void ProbeDoubleMapping()
         sceKernelReleaseDirectMemory(phys, kSize);
         return;
     }
-    const int32_t r2 = sceKernelMapDirectMemory(&second, kSize, 0x03, 0, phys, kSize);
-    if (r2 != 0)
+    struct sigaction guard {}, old_segv {}, old_bus {};
+    guard.sa_sigaction = ProbeFault;
+    guard.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&guard.sa_mask);
+    sigaction(SIGSEGV, &guard, &old_segv);
+    sigaction(SIGBUS, &guard, &old_bus);
+
+    std::string report = "plainly: " + SecondMapping(first, phys, kSize, false);
+    bool done = report.find("yes,") != std::string::npos;
+    if (!done)
     {
-        Trace(fmt::format("double mapping: no, the second mapping of the same memory failed ({:#x}); fastmem "
-                          "would need another way", uint32_t(r2)));
+        const int32_t e1 = sceKernelEnableDmemAliasing();
+        const std::string again = SecondMapping(first, phys, kSize, false);
+        report += fmt::format("; after sceKernelEnableDmemAliasing ({:#x}): {}", uint32_t(e1), again);
+        done = again.find("yes,") != std::string::npos;
     }
-    else
+    if (!done)
     {
-        volatile uint32_t* a = static_cast<volatile uint32_t*>(first);
-        volatile uint32_t* b = static_cast<volatile uint32_t*>(second);
-        a[100] = 0x5EEDF00Du;
-        const uint32_t seen = b[100];
-        b[200] = 0x0DDBA11u;
-        const uint32_t back = a[200];
-        Trace(fmt::format("double mapping: {} (first at {}, second at {}; read back {:#x} and {:#x})",
-                          seen == 0x5EEDF00Du && back == 0x0DDBA11u ? "yes, the same memory at two addresses"
-                                                                     : "mapped twice, but not the same memory",
-                          first, second, seen, back));
-        sceKernelMunmap(second, kSize);
+        const int32_t e2 = sceKernelEnableDmemAliasing2();
+        const std::string again = SecondMapping(first, phys, kSize, false);
+        report += fmt::format("; after sceKernelEnableDmemAliasing2 ({:#x}): {}", uint32_t(e2), again);
+        done = again.find("yes,") != std::string::npos;
     }
+    if (!done)
+        report += "; through sceKernelMapDirectMemory2: " + SecondMapping(first, phys, kSize, true);
+
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
     sceKernelMunmap(first, kSize);
     sceKernelReleaseDirectMemory(phys, kSize);
+    g_dmem_aliasing = report.find("yes,") != std::string::npos;
+    Trace(fmt::format("double mapping: {} -> {}", report,
+                      g_dmem_aliasing ? "fastmem is possible" : "no way found yet"));
 }
 
 int main()

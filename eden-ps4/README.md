@@ -377,6 +377,23 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.83: **page table entries with the whole offset, and a probe for direct memory aliasing.**
+
+Patch 0071: on the PS4 (`EDEN_PAGE_ENTRY_FULL_OFFSET`, `common/page_table.h`) an entry keeps the host
+offset whole in bits 12-63 (the block id keeps its low 9 bits: it's only ever read back to be stored
+again, `core/memory.cpp`), so `ATTRIBUTE_MASK` is `~0xFFF` and the recompilers get no sign extension:
+their walk is `and page, -4096` instead of that plus `shl`/`sar` by 8, on every load and store not in a
+shared-walk group (2 instructions fewer, 2 cycles fewer from the entry's load to the access). A packing
+test (2,000,000 random entries, negative offsets, marked bits, block ids) and the harnesses built both
+ways (the same random A32, Thumb and A64 programs, loads and stores and exclusives, 1,400 of them) give
+identical results; four dependent A64 loads 19.6-20.8 ns -> 16.0-16.5 ns.
+
+The boot trace's double-mapping probe (2 MiB, the on-demand DRAM's chunk) now also tries libkernel's
+`sceKernelEnableDmemAliasing` and `sceKernelEnableDmemAliasing2` (exported by `libkernel.sprx`, absent
+from the SDK's headers; a `libkernel_dmem_aliasing2_for_dev` variant exists too) before mapping again,
+and `sceKernelMapDirectMemory2`, each read/write test under a temporary SIGSEGV/SIGBUS guard. Fastmem
+needs exactly this: the Switch's memory at its own addresses beside Eden's view of it.
+
 03.82: **Game Speed: 1.0x, 1.5x, 2.0x** (System Settings, Graphics; `speed=` in the menu file,
 `EDEN_PS4_SPEED` on the desktop). Eden's speed limit at 100, 150 or 200%: its conductor's vsyncs come
 that much more often (`vi/conductor.cpp`), so a game that reaches its full frame rate runs that much
