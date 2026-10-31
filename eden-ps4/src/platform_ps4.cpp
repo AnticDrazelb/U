@@ -85,8 +85,12 @@ void ps4_heap_usage(size_t* in_use, size_t* size);
 int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
 void ps4_dump_thread_stacks(const char* path, const char* reason);
-// Mesa's PS4 winsys (port/mesa/ac_ps4_drm.c; ps4_stubs.cpp without it): the GPU buffers' memory
+// Mesa's PS4 winsys (port/mesa/ac_ps4_drm.c; ps4_stubs.cpp without it): the GPU buffers' memory,
+// and the GPU's statistics since it started (busy and span in GPU clock ticks, submissions, and
+// the CPU's waits for the GPU's work: how many, and how long in all)
 uint64_t ac_ps4_gpu_bytes();
+void ac_ps4_get_gpu_stats(uint64_t* busy_ticks, uint64_t* span_ticks, uint64_t* submits, uint64_t* waits,
+                          uint64_t* wait_ns);
 // port/ps4_sampler.cpp: the profiler (samples.log), the threads it samples (by name), and a line
 // in samples.log
 void ps4_sampler_sample_threads(const char* names);
@@ -1769,6 +1773,34 @@ std::string MemoryLine()
                        Common::PS4Diagnostics::LargestFreeDirect() / MB);
 }
 
+// What the GPU did since the last call: how busy it was, its submissions a second, and how often
+// and how long the CPU waited for it. A slow game whose GPU is busy most of the time is held up by
+// the GPU; one whose GPU is mostly idle, with the CPU waiting for each submission, by the waits.
+std::string GpuLine(double seconds)
+{
+    static uint64_t last_busy, last_span, last_submits, last_waits, last_wait_ns;
+    uint64_t busy = 0, span = 0, submits = 0, waits = 0, wait_ns = 0;
+    ac_ps4_get_gpu_stats(&busy, &span, &submits, &waits, &wait_ns);
+    // (a new boot's device starts the counts again)
+    if (submits < last_submits || span < last_span)
+        last_busy = last_span = last_submits = 0;
+    if (waits < last_waits)
+        last_waits = last_wait_ns = 0;
+    const uint64_t d_busy = busy - last_busy, d_span = span - last_span, d_waits = waits - last_waits;
+    const double d_wait_ms = double(wait_ns - last_wait_ns) / 1e6;
+    std::string line = fmt::format("the PS4's GPU busy {:.0f}% of the time, {:.0f} submissions a second; the CPU "
+                                   "waited for it {:.0f} times a second, {:.1f} ms each, {:.0f}% of the time",
+                                   d_span ? 100.0 * double(d_busy) / double(d_span) : 0.0,
+                                   double(submits - last_submits) / seconds, double(d_waits) / seconds,
+                                   d_waits ? d_wait_ms / double(d_waits) : 0.0, d_wait_ms / (seconds * 10.0));
+    last_busy = busy;
+    last_span = span;
+    last_submits = submits;
+    last_waits = waits;
+    last_wait_ns = wait_ns;
+    return line;
+}
+
 class HangWatchdog
 {
 public:
@@ -1811,8 +1843,8 @@ private:
             if (seconds % 30 == 0)
             {
                 // how it runs: the frame rate, and the memory (what a game needs, on the console)
-                Trace(fmt::format("running {} s: {:.1f} frames a second; {}", seconds,
-                                  double(frames - reported) / 30.0, MemoryLine()));
+                Trace(fmt::format("running {} s: {:.1f} frames a second; {}; {}", seconds,
+                                  double(frames - reported) / 30.0, GpuLine(30.0), MemoryLine()));
                 reported = frames;
             }
             if (frames != last)

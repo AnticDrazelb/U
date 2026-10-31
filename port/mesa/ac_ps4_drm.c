@@ -541,6 +541,10 @@ static struct {
    uint64_t waits, wait_ns, sleeps, timeouts, since_ns;
 } s_wait_stats;
 
+/* What the CPU spent waiting for the GPU's work in Vulkan fences and semaphores (ps4_wait_common),
+ * for the launcher's statistics (ac_ps4_get_gpu_stats): waits that had to wait, and their time. */
+static uint64_t s_fence_waits, s_fence_wait_ns;
+
 static void
 ps4_wait_stats_report(int64_t now)
 {
@@ -2664,6 +2668,21 @@ ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks)
    simple_mtx_unlock(&dev->lock);
 }
 
+/* The GPU's statistics since the device was made, for the launcher to difference: busy and span
+ * as ac_ps4_get_gpu_busy, submissions made, and the CPU's waits for the GPU (ps4_wait_common). */
+void ac_ps4_get_gpu_stats(uint64_t *busy_ticks, uint64_t *span_ticks, uint64_t *submits,
+                          uint64_t *waits, uint64_t *wait_ns);
+void
+ac_ps4_get_gpu_stats(uint64_t *busy_ticks, uint64_t *span_ticks, uint64_t *submits,
+                     uint64_t *waits, uint64_t *wait_ns)
+{
+   ac_ps4_get_gpu_busy(busy_ticks, span_ticks);
+   ac_drm_device *dev = ps4_last_device;
+   *submits = dev ? __atomic_load_n(&dev->last_seq, __ATOMIC_RELAXED) : 0;
+   *waits = __atomic_load_n(&s_fence_waits, __ATOMIC_RELAXED);
+   *wait_ns = __atomic_load_n(&s_fence_wait_ns, __ATOMIC_RELAXED);
+}
+
 /* ---------------------------------------------------------------------------------------------
  * Submission thread. sceGnmSubmitCommandBuffers is a kernel call of ~0.4 ms, and the GPU thread
  * of an emulator submits ~230 times a second (Breath of the Wild: ~9% of Cemu's GPU thread). The
@@ -3177,6 +3196,15 @@ ps4_import_sync_file(struct util_sync_provider *p, uint32_t handle, int fd)
    return -ENOSYS;
 }
 
+static void
+ps4_note_fence_wait(int64_t wait_start)
+{
+   if (!wait_start)
+      return;
+   __atomic_add_fetch(&s_fence_waits, 1, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&s_fence_wait_ns, (uint64_t)(os_time_get_nano() - wait_start), __ATOMIC_RELAXED);
+}
+
 /* Waits on handles/points; `points` NULL = binary. */
 static int
 ps4_wait_common(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigned count,
@@ -3220,10 +3248,13 @@ ps4_wait_common(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigne
       if (all ? done == count : done > 0) {
          if (first)
             *first = first_done == ~0u ? 0 : first_done;
+         ps4_note_fence_wait(wait_start);
          return 0;
       }
-      if (abs_timeout <= 0 || (abs_timeout != INT64_MAX && os_time_get_nano() >= abs_timeout))
+      if (abs_timeout <= 0 || (abs_timeout != INT64_MAX && os_time_get_nano() >= abs_timeout)) {
+         ps4_note_fence_wait(wait_start);
          return -ETIME;
+      }
       if (!wait_start)
          wait_start = os_time_get_nano();
       else if (os_time_get_nano() - wait_start > 2000000000ll && ps4_completed(dev) < dev->last_seq)
