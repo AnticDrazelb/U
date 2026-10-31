@@ -781,6 +781,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "The frames shown each second, top left of the picture while a game runs (a game's own target is "
              "usually 30 or 60).",
              [](MenuSettings& s) { s.fps_overlay = !s.fps_overlay; }},
+            {"Frame Pacing", settings.unlocked_frames ? "Unlocked" : "60 Hz",
+             "60 Hz: as the Switch, a finished frame is shown at the next vsync, so a game that misses one waits "
+             "for the next (60, 30, 20, 15 fps). Unlocked: each frame is shown the moment it's done, so a game "
+             "below 60 loses no time waiting. A game whose speed follows its frames may run faster than it should "
+             "where it can go above 60 (menus). The log's 30-second line says how long frames waited.",
+             [](MenuSettings& s) { s.unlocked_frames = !s.unlocked_frames; }},
             {"GPU Accuracy", settings.gpu_high ? "High" : "Normal",
              "How closely the CPU waits for the GPU. High reads back what the GPU drew whenever the game's CPU code "
              "might look at it, and makes the CPU's every access to such memory take a slow path: needed by a few "

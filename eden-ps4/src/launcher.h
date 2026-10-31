@@ -80,6 +80,9 @@ void SetCpuUnsafe(bool on);
 void SetGpuAccuracyHigh(bool on);
 // The frames presented a second, top left of the picture (System Settings, Graphics, FPS Counter)
 void SetFpsOverlay(bool on);
+// Frame pacing: frames shown at the Switch's 60 Hz vsync (Eden's speed limit at 100%), or each the
+// moment the game finishes it (unlocked: no speed limit)
+void SetUnlockedFrames(bool on);
 
 /// Keys and firmware used where they are (a USB drive), not copied: Eden reads prod.keys and
 /// title.keys from `keys_dir` instead of data_dir/user/keys, and the firmware's .nca files from

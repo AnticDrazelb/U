@@ -1,0 +1,243 @@
+From 35f34b2ad99b3828281682e519396158eabdf36c Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:14:10 +0000
+Subject: [PATCH 68/68] PS4: emulated cores' idle time, frames' wait for a
+ vsync, the game's wait for a buffer, time per service command
+
+For the launcher's 30-second line: each emulated core's idle time and the time all four were idle
+at once; how long a finished frame waited for the vsync that shows it, and the game's
+DequeueBuffer calls and their waits; and the HLE services' own handling time per service and
+command (the busiest of them).
+---
+ src/common/ps4_perf.h                         | 101 ++++++++++++++++++
+ src/core/hle/kernel/physical_core.cpp         |   6 ++
+ .../nvnflinger/buffer_queue_producer.cpp      |  13 +++
+ .../service/nvnflinger/hardware_composer.cpp  |  11 ++
+ src/core/hle/service/service.cpp              |  10 ++
+ 5 files changed, 141 insertions(+)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index a4653c790..f413d189f 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -58,4 +58,105 @@ inline uint64_t SlowMemoryAccesses() {
+     return Total(slow_memory_accesses);
+ }
+ 
++// The emulated cores' idle time (in PhysicalCore::Idle, spinning or asleep): each core's, and the
++// time all four were idle at once (every thread of the game waiting: on the GPU, a vsync, a
++// service). Kept under a small lock (a few thousand idle periods a second).
++inline CoreCount core_idle_ns[4];
++inline std::atomic<uint64_t> all_idle_ns{0};
++inline std::atomic_flag idle_lock = ATOMIC_FLAG_INIT;
++inline uint32_t idle_mask = 0;      // (the cores idle now; under idle_lock)
++inline uint64_t all_idle_since = 0; // (under idle_lock)
++
++inline void IdleBegin(size_t core, uint64_t now_ns) {
++    if (core >= 4) {
++        return;
++    }
++    while (idle_lock.test_and_set(std::memory_order_acquire)) {
++    }
++    idle_mask |= 1u << core;
++    if (idle_mask == 0xF) {
++        all_idle_since = now_ns;
++    }
++    idle_lock.clear(std::memory_order_release);
++}
++
++inline void IdleEnd(size_t core, uint64_t begin_ns, uint64_t now_ns) {
++    if (core >= 4) {
++        return;
++    }
++    while (idle_lock.test_and_set(std::memory_order_acquire)) {
++    }
++    if (idle_mask == 0xF && now_ns > all_idle_since) {
++        all_idle_ns.fetch_add(now_ns - all_idle_since, std::memory_order_relaxed);
++    }
++    idle_mask &= ~(1u << core);
++    idle_lock.clear(std::memory_order_release);
++    if (now_ns > begin_ns) {
++        core_idle_ns[core].n.fetch_add(now_ns - begin_ns, std::memory_order_relaxed);
++    }
++}
++
++// The game's frames: from its QueueBuffer to the composer taking the frame at a vsync (how long a
++// finished frame waited for one), and the game's DequeueBuffer calls (a buffer to draw the next
++// frame in: these wait when none has come back from the screen yet)
++inline std::atomic<uint64_t> frame_queued_ns{0};
++inline Counter present_wait;
++inline Counter dequeue_wait;
++
++// The HLE services' handling of the game's requests, per service and command (from taking the
++// service's lock to the reply written): which of them the service calls' round trips spend their
++// time in. A small table under a lock (hundreds of calls a second); the launcher takes it.
++struct ServiceCall {
++    const char* name;  // (the service's, static; nullptr: the table was full)
++    uint32_t command;
++    uint64_t count, total_ns, max_ns;
++};
++inline constexpr size_t MaxServiceCalls = 64;
++inline ServiceCall service_calls[MaxServiceCalls];
++inline size_t service_call_entries = 0;
++inline std::atomic_flag service_lock = ATOMIC_FLAG_INIT;
++
++inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns) {
++    while (service_lock.test_and_set(std::memory_order_acquire)) {
++    }
++    ServiceCall* entry = nullptr;
++    for (size_t i = 0; i < service_call_entries; i++) {
++        if (service_calls[i].name == name && service_calls[i].command == command) {
++            entry = &service_calls[i];
++            break;
++        }
++    }
++    if (!entry) {
++        if (service_call_entries < MaxServiceCalls - 1) {
++            entry = &service_calls[service_call_entries++];
++            *entry = {name, command, 0, 0, 0};
++        } else {
++            entry = &service_calls[MaxServiceCalls - 1];
++            if (service_call_entries < MaxServiceCalls) {
++                service_call_entries = MaxServiceCalls;
++                *entry = {nullptr, 0, 0, 0, 0};
++            }
++        }
++    }
++    entry->count++;
++    entry->total_ns += ns;
++    entry->max_ns = std::max(entry->max_ns, ns);
++    service_lock.clear(std::memory_order_release);
++}
++
++// Copies the table out (up to max entries) and zeroes its counts; returns the entries copied
++inline size_t TakeServiceCalls(ServiceCall* out, size_t max) {
++    while (service_lock.test_and_set(std::memory_order_acquire)) {
++    }
++    const size_t n = std::min(max, service_call_entries);
++    for (size_t i = 0; i < service_call_entries; i++) {
++        if (i < n) {
++            out[i] = service_calls[i];
++        }
++        service_calls[i].count = service_calls[i].total_ns = service_calls[i].max_ns = 0;
++    }
++    service_lock.clear(std::memory_order_release);
++    return n;
++}
++
+ } // namespace Common::PS4Perf
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index 511a0fba0..b001f61f0 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -229,6 +229,12 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
+ 
+ void PhysicalCore::Idle() {
+ #ifdef __OPENORBIS__
++    const u64 idle_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    Common::PS4Perf::IdleBegin(m_core_index, idle_begin);
++    SCOPE_EXIT {
++        Common::PS4Perf::IdleEnd(m_core_index, idle_begin,
++                                 static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()));
++    };
+     // A core with nothing to run is usually handed work within microseconds (a thread another core
+     // made ready, a service's reply), and waking a sleeping host thread costs far more than that
+     // on the PS4: every handoff between the game's threads paid it. So an idle core spins for a
+diff --git a/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp b/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp
+index c3eb2796e..947f22685 100644
+--- a/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp
++++ b/src/core/hle/service/nvnflinger/buffer_queue_producer.cpp
+@@ -11,6 +11,8 @@
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "common/cpu_features.h"
++#include "common/ps4_perf.h"
++#include "common/scope_exit.h"
+ #include "core/hle/kernel/k_event.h"
+ #include "core/hle/kernel/k_readable_event.h"
+ #include "core/hle/kernel/kernel.h"
+@@ -229,6 +231,13 @@ Status BufferQueueProducer::WaitForFreeSlotThenRelock(bool async, s32* found, St
+ 
+ Status BufferQueueProducer::DequeueBuffer(s32* out_slot, Fence* out_fence, bool async, u32 width,
+                                           u32 height, PixelFormat format, u32 usage) {
++#ifdef __OPENORBIS__
++    const u64 dequeue_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    SCOPE_EXIT {
++        const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++        Common::PS4Perf::dequeue_wait.Add(now > dequeue_begin ? now - dequeue_begin : 0);
++    };
++#endif
+     LOG_DEBUG(Service_Nvnflinger, "async={} w={} h={} format={}, usage={}",
+               async ? "true" : "false", width, height, format, usage);
+ 
+@@ -535,6 +544,10 @@ Status BufferQueueProducer::QueueBuffer(s32 slot, const QueueBufferInput& input,
+ 
+         core->buffer_has_been_queued = true;
+         core->SignalDequeueCondition();
++#ifdef __OPENORBIS__
++        Common::PS4Perf::frame_queued_ns.store(
++            static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()), std::memory_order_relaxed);
++#endif
+ 
+         output->Inflate(core->default_width, core->default_height, core->transform_hint, static_cast<u32>(core->queue.size()));
+     }
+diff --git a/src/core/hle/service/nvnflinger/hardware_composer.cpp b/src/core/hle/service/nvnflinger/hardware_composer.cpp
+index 9ac56e17b..cd5dcc135 100644
+--- a/src/core/hle/service/nvnflinger/hardware_composer.cpp
++++ b/src/core/hle/service/nvnflinger/hardware_composer.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
+ #include <optional>
+ 
+ #include <boost/container/small_vector.hpp>
+@@ -224,6 +226,15 @@ bool HardwareComposer::TryAcquireFramebufferLocked(Layer& layer, Framebuffer& fr
+     framebuffer.release_frame_number = m_frame_number + swap_interval;
+     framebuffer.last_acquire_frame = m_frame_number;
+     framebuffer.is_acquired = true;
++#ifdef __OPENORBIS__
++    if (!layer.is_overlay) {
++        const u64 queued = Common::PS4Perf::frame_queued_ns.exchange(0, std::memory_order_relaxed);
++        const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++        if (queued != 0 && now > queued) {
++            Common::PS4Perf::present_wait.Add(now - queued);
++        }
++    }
++#endif
+ 
+     return true;
+ }
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index 225b92a78..90e4a5694 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -4,6 +4,9 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
++#include "common/scope_exit.h"
+ #include <chrono>
+ #include <fmt/ranges.h>
+ #include <string_view>
+@@ -112,6 +115,13 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
+ 
+ Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
+                                                HLERequestContext& ctx) {
++#ifdef __OPENORBIS__
++    const u64 call_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    SCOPE_EXIT {
++        const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++        Common::PS4Perf::AddServiceCall(service_name, ctx.GetCommand(), now > call_begin ? now - call_begin : 0);
++    };
++#endif
+     const auto guard = LockService();
+ 
+     Result result = ResultSuccess;
+-- 
+2.43.0
+

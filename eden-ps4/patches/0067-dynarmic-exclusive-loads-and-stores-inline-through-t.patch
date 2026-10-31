@@ -1,0 +1,411 @@
+From de681dd0ad37f76f1d156f05ee405156903a02dd Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:14:10 +0000
+Subject: [PATCH 67/68] dynarmic: exclusive loads and stores inline through the
+ page table; a locked no-op for DMB
+
+Without fastmem, every exclusive load and store (LDREX/STREX, LDXR/STXR and their sizes) was a
+call into the global monitor and the memory callbacks, its lock taken even with
+Unsafe_IgnoreGlobalMonitor (which only the inline fastmem path honoured). They now go inline
+through the page table walk, as the fastmem path does through fastmem: the monitor's address and
+value stored, the load read through the walk, the store a lock cmpxchg against the value loaded.
+An access the walk can't do (unmapped, across a page, a store to a marked page) takes the same
+fallbacks the fastmem path uses. 128-bit exclusives keep the monitor path.
+(UserConfig::page_table_inline_exclusives, on by default; with a page table and without fastmem.)
+
+DMB was an mfence; a locked OR of zero into the stack's top is as strong a barrier for ordinary
+memory, and about half the cost (as Linux's smp_mb on x86-64). DSB keeps mfence and lfence.
+
+Host harness (A32 and A64, Eden's page table configuration): an atomic increment and decrement
+with barriers 316-423 ns -> 79-98 ns (A32), 360-450 -> 53-68 ns (A64); random programs of
+exclusives on ordinary, marked and unmapped pages give the same registers and memory both ways
+(A32: 2800, A64: 1040).
+---
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |   7 +-
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |   5 +
+ .../backend/x64/a32_emit_x64_memory.cpp       |  16 +++
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |   7 +-
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |   5 +
+ .../backend/x64/a64_emit_x64_memory.cpp       |  16 +++
+ .../backend/x64/emit_x64_memory.cpp.inc       | 107 ++++++++++++++++++
+ .../src/dynarmic/interface/A32/config.h       |   7 ++
+ .../src/dynarmic/interface/A64/config.h       |   7 ++
+ 9 files changed, 175 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 5c6a90e15..f9eb53a21 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -696,7 +696,12 @@ void A32EmitX64::EmitA32DataSynchronizationBarrier(A32EmitContext&, IR::Inst*) {
+ }
+ 
+ void A32EmitX64::EmitA32DataMemoryBarrier(A32EmitContext&, IR::Inst*) {
+-    code.mfence();
++    // A locked no-op on the stack's top (a line of its own, hot): a full barrier for ordinary
++    // (write-back) memory as mfence is, at a fraction of its cost (Linux's smp_mb on x86-64 does
++    // the same). Guest memory is ordinary memory; the JIT has no non-temporal stores to order.
++    // Clobbers the flags, which no IR instruction keeps live across another.
++    code.lock();
++    code.or_(code.dword[rsp], 0);
+ }
+ 
+ void A32EmitX64::EmitA32InstructionSynchronizationBarrier(A32EmitContext& ctx, IR::Inst*) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index f5dd3be41..63e1d3ae3 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -75,6 +75,11 @@ public:
+     void EmitReadMemoryVia(A32EmitContext& ctx, IR::Inst* inst);
+     template<size_t bitsize>
+     void EmitWriteMemoryVia(A32EmitContext& ctx, IR::Inst* inst);
++    bool UsePageTableExclusives() const;
++    template<size_t bitsize>
++    void EmitExclusiveReadMemoryPageTable(A32EmitContext& ctx, IR::Inst* inst);
++    template<size_t bitsize>
++    void EmitExclusiveWriteMemoryPageTable(A32EmitContext& ctx, IR::Inst* inst);
+     void GenTerminalHandlers();
+ 
+     // Microinstruction emitters
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+index 6c082bdb6..5ede1758b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+@@ -434,6 +434,8 @@ void A32EmitX64::EmitA32ClearExclusive(A32EmitContext&, IR::Inst*) {
+ void A32EmitX64::EmitA32ExclusiveReadMemory8(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<8, &A32::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<8>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<8, &A32::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -442,6 +444,8 @@ void A32EmitX64::EmitA32ExclusiveReadMemory8(A32EmitContext& ctx, IR::Inst* inst
+ void A32EmitX64::EmitA32ExclusiveReadMemory16(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<16, &A32::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<16>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<16, &A32::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -450,6 +454,8 @@ void A32EmitX64::EmitA32ExclusiveReadMemory16(A32EmitContext& ctx, IR::Inst* ins
+ void A32EmitX64::EmitA32ExclusiveReadMemory32(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<32, &A32::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<32>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<32, &A32::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -458,6 +464,8 @@ void A32EmitX64::EmitA32ExclusiveReadMemory32(A32EmitContext& ctx, IR::Inst* ins
+ void A32EmitX64::EmitA32ExclusiveReadMemory64(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<64, &A32::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<64>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<64, &A32::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -466,6 +474,8 @@ void A32EmitX64::EmitA32ExclusiveReadMemory64(A32EmitContext& ctx, IR::Inst* ins
+ void A32EmitX64::EmitA32ExclusiveWriteMemory8(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<8, &A32::UserCallbacks::MemoryWriteExclusive8>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<8>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<8, &A32::UserCallbacks::MemoryWriteExclusive8>(ctx, inst);
+     }
+@@ -474,6 +484,8 @@ void A32EmitX64::EmitA32ExclusiveWriteMemory8(A32EmitContext& ctx, IR::Inst* ins
+ void A32EmitX64::EmitA32ExclusiveWriteMemory16(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<16, &A32::UserCallbacks::MemoryWriteExclusive16>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<16>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<16, &A32::UserCallbacks::MemoryWriteExclusive16>(ctx, inst);
+     }
+@@ -482,6 +494,8 @@ void A32EmitX64::EmitA32ExclusiveWriteMemory16(A32EmitContext& ctx, IR::Inst* in
+ void A32EmitX64::EmitA32ExclusiveWriteMemory32(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<32, &A32::UserCallbacks::MemoryWriteExclusive32>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<32>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<32, &A32::UserCallbacks::MemoryWriteExclusive32>(ctx, inst);
+     }
+@@ -490,6 +504,8 @@ void A32EmitX64::EmitA32ExclusiveWriteMemory32(A32EmitContext& ctx, IR::Inst* in
+ void A32EmitX64::EmitA32ExclusiveWriteMemory64(A32EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<64, &A32::UserCallbacks::MemoryWriteExclusive64>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<64>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<64, &A32::UserCallbacks::MemoryWriteExclusive64>(ctx, inst);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 71e5e62cd..54ab16212 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -540,7 +540,12 @@ void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
+ }
+ 
+ void A64EmitX64::EmitA64DataMemoryBarrier(A64EmitContext&, IR::Inst*) {
+-    code.mfence();
++    // A locked no-op on the stack's top (a line of its own, hot): a full barrier for ordinary
++    // (write-back) memory as mfence is, at a fraction of its cost (Linux's smp_mb on x86-64 does
++    // the same). Guest memory is ordinary memory; the JIT has no non-temporal stores to order.
++    // Clobbers the flags, which no IR instruction keeps live across another.
++    code.lock();
++    code.or_(code.dword[rsp], 0);
+ }
+ 
+ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, IR::Inst*) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 1310b4ad3..5905a9b29 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -106,6 +106,11 @@ public:
+     void EmitExclusiveReadMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
+     template<std::size_t bitsize, auto callback>
+     void EmitExclusiveWriteMemoryInline(A64EmitContext& ctx, IR::Inst* inst);
++    bool UsePageTableExclusives() const;
++    template<size_t bitsize>
++    void EmitExclusiveReadMemoryPageTable(A64EmitContext& ctx, IR::Inst* inst);
++    template<size_t bitsize>
++    void EmitExclusiveWriteMemoryPageTable(A64EmitContext& ctx, IR::Inst* inst);
+ 
+     // Terminal instruction emitters
+     bool EmitLeafTerminal(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept override;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 8bb2fcfa5..bd96365ae 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -332,6 +332,8 @@ void A64EmitX64::EmitA64ClearExclusive(A64EmitContext&, IR::Inst*) {
+ void A64EmitX64::EmitA64ExclusiveReadMemory8(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<8, &A64::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<8>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<8, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -340,6 +342,8 @@ void A64EmitX64::EmitA64ExclusiveReadMemory8(A64EmitContext& ctx, IR::Inst* inst
+ void A64EmitX64::EmitA64ExclusiveReadMemory16(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<16, &A64::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<16>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<16, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -348,6 +352,8 @@ void A64EmitX64::EmitA64ExclusiveReadMemory16(A64EmitContext& ctx, IR::Inst* ins
+ void A64EmitX64::EmitA64ExclusiveReadMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<32, &A64::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<32>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<32, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -356,6 +362,8 @@ void A64EmitX64::EmitA64ExclusiveReadMemory32(A64EmitContext& ctx, IR::Inst* ins
+ void A64EmitX64::EmitA64ExclusiveReadMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveReadMemoryInline<64, &A64::UserCallbacks::MemoryRead>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveReadMemoryPageTable<64>(ctx, inst);
+     } else {
+         EmitExclusiveReadMemory<64, &A64::UserCallbacks::MemoryRead>(ctx, inst);
+     }
+@@ -372,6 +380,8 @@ void A64EmitX64::EmitA64ExclusiveReadMemory128(A64EmitContext& ctx, IR::Inst* in
+ void A64EmitX64::EmitA64ExclusiveWriteMemory8(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<8, &A64::UserCallbacks::MemoryWriteExclusive8>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<8>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<8, &A64::UserCallbacks::MemoryWriteExclusive8>(ctx, inst);
+     }
+@@ -380,6 +390,8 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory8(A64EmitContext& ctx, IR::Inst* ins
+ void A64EmitX64::EmitA64ExclusiveWriteMemory16(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<16, &A64::UserCallbacks::MemoryWriteExclusive16>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<16>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<16, &A64::UserCallbacks::MemoryWriteExclusive16>(ctx, inst);
+     }
+@@ -388,6 +400,8 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory16(A64EmitContext& ctx, IR::Inst* in
+ void A64EmitX64::EmitA64ExclusiveWriteMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<32, &A64::UserCallbacks::MemoryWriteExclusive32>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<32>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<32, &A64::UserCallbacks::MemoryWriteExclusive32>(ctx, inst);
+     }
+@@ -396,6 +410,8 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory32(A64EmitContext& ctx, IR::Inst* in
+ void A64EmitX64::EmitA64ExclusiveWriteMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+     if (conf.fastmem_exclusive_access) {
+         EmitExclusiveWriteMemoryInline<64, &A64::UserCallbacks::MemoryWriteExclusive64>(ctx, inst);
++    } else if (UsePageTableExclusives()) {
++        EmitExclusiveWriteMemoryPageTable<64>(ctx, inst);
+     } else {
+         EmitExclusiveWriteMemory<64, &A64::UserCallbacks::MemoryWriteExclusive64>(ctx, inst);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 527a8f392..8a0ec57ca 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -522,6 +522,113 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+     EmitCheckMemoryAbort(ctx, inst);
+ }
+ 
++// Exclusive loads and stores inline through the page table (UserConfig::page_table_inline_exclusives):
++// as EmitExclusiveReadMemoryInline and EmitExclusiveWriteMemoryInline do through fastmem, with the
++// page table walk (EmitVAddrLookup) for the host address, and the fallbacks when it fails. Without
++// fastmem each of them was a call into the global monitor (its lock even with
++// Unsafe_IgnoreGlobalMonitor, which only the inline paths honour) and the memory callbacks.
++bool AxxEmitX64::UsePageTableExclusives() const {
++    return conf.page_table_inline_exclusives && conf.page_table && !conf.fastmem_pointer && !conf.check_halt_on_memory_access &&
++           conf.global_monitor;
++}
++
++template<size_t bitsize>
++void AxxEmitX64::EmitExclusiveReadMemoryPageTable(AxxEmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    constexpr bool ordered = true;
++
++    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
++    const int value_idx = ctx.reg_alloc.ScratchGpr(code).getIdx();
++    const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
++    const Xbyak::Reg64 tmp2 = ctx.reg_alloc.ScratchGpr(code);
++    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
++
++    EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
++
++    code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
++    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
++    code.mov(qword[tmp], vaddr);
++
++    SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
++    const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, true);
++    EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
++    code.L(*end);
++    ctx.deferred_emits.emplace_back([=, this] {
++        code.L(*abort);
++        code.call(wrapped_fn);
++        code.jmp(*end, code.T_NEAR);
++    });
++
++    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
++    EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
++
++    EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
++
++    ctx.reg_alloc.DefineValue(code, inst, Xbyak::Reg64{value_idx});
++}
++
++template<size_t bitsize>
++void AxxEmitX64::EmitExclusiveWriteMemoryPageTable(AxxEmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    constexpr bool ordered = true;
++
++    ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);  // (the expected value, for cmpxchg and the fallback)
++    const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[2]);
++    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
++    const Xbyak::Reg32 status = ctx.reg_alloc.ScratchGpr(code).cvt32();
++    const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
++    const Xbyak::Reg64 tmp2 = ctx.reg_alloc.ScratchGpr(code);
++    const auto wrapped_fn = exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value.getIdx())];
++
++    EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
++
++    SharedLabel end = ctx.GenSharedLabel(), abort = ctx.GenSharedLabel();
++
++    code.mov(status, u32(1));
++    code.movzx(tmp.cvt32(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
++    code.test(tmp.cvt8(), tmp.cvt8());
++    code.je(*end, code.T_NEAR);
++    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
++    code.cmp(qword[tmp], vaddr);
++    code.jne(*end, code.T_NEAR);
++
++    EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
++
++    code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(0));
++    code.mov(tmp, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
++    EmitReadMemoryMov<bitsize>(code, rax.getIdx(), tmp, false);
++
++    const auto dest_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, false);
++    code.lock();
++    switch (bitsize) {
++    case 8:
++        code.cmpxchg(code.byte[dest_ptr], value.cvt8());
++        break;
++    case 16:
++        code.cmpxchg(word[dest_ptr], value.cvt16());
++        break;
++    case 32:
++        code.cmpxchg(dword[dest_ptr], value.cvt32());
++        break;
++    default:
++        code.cmpxchg(qword[dest_ptr], value.cvt64());
++        break;
++    }
++    code.setnz(status.cvt8());
++    ctx.deferred_emits.emplace_back([=, this] {
++        code.L(*abort);
++        code.call(wrapped_fn);
++        code.xor_(status.cvt32(), status.cvt32());  // dep-break
++        code.test(code.al, code.al);
++        code.setz(status.cvt8());
++        code.jmp(*end, code.T_NEAR);
++    });
++
++    code.L(*end);
++    EmitExclusiveUnlock(code, conf, tmp, eax);
++    ctx.reg_alloc.DefineValue(code, inst, status);
++}
++
+ #undef AxxEmitX64
+ #undef AxxEmitContext
+ #undef AxxJitState
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 39ab18339..d9140bd59 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -216,6 +216,13 @@ struct UserConfig {
+     /// through the memory callbacks). Used with a page table and without fastmem.
+     bool page_table_single_walk_multiple = true;
+ 
++    /// Exclusive loads and stores (LDREX, STREX and their sizes) inline through the page table, as
++    /// fastmem_exclusive_access does through fastmem, instead of a call into the global monitor and
++    /// the callbacks each. With Unsafe_IgnoreGlobalMonitor, without the monitor's lock as well. An
++    /// access the walk can't do (unmapped, across a page, a store to a marked page) takes the
++    /// callbacks. Used with a page table and without fastmem.
++    bool page_table_inline_exclusives = true;
++
+     /// Determines if instructions that pagefault should cause recompilation of that block
+     /// with fastmem disabled.
+     /// Recompiled code will use the page_table if this is available, otherwise memory
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 215d29268..0e84c9dcd 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -302,6 +302,13 @@ struct UserConfig {
+     /// for exit after every data memory access by the emulated program.
+     bool check_halt_on_memory_access = false;
+ 
++    /// Exclusive loads and stores (LDXR, STXR and their sizes but 128 bits) inline through the page
++    /// table, as fastmem_exclusive_access does through fastmem, instead of a call into the global
++    /// monitor and the callbacks each. With Unsafe_IgnoreGlobalMonitor, without the monitor's lock
++    /// as well. An access the walk can't do (unmapped, across a page, a store to a marked page)
++    /// takes the callbacks. Used with a page table and without fastmem.
++    bool page_table_inline_exclusives = true;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+-- 
+2.43.0
+

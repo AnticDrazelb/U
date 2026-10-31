@@ -377,6 +377,44 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.80: **exclusive loads and stores inline, a cheaper DMB, and where the idle time goes.** 03.79's
+log (Mario Kart 8 Deluxe, 15-18 fps in races): 370,000 memory accesses a second left the recompiled
+code, half of them writes. Without fastmem, every exclusive load and store (LDREX/STREX and sizes,
+LDXR/STXR and sizes) was a call into the global monitor and the memory callbacks, its spinlock taken even
+with `Unsafe_IgnoreGlobalMonitor` (which only the inline fastmem path honours): an atomic's load and its
+store were a slow read and a slow write each. Its profile (the Profiler on): the emulated cores ran the
+game's code 57-66% of the time and slept 27-38%, the GPU thread was busy 39%; no thread was saturated.
+
+Patch 0067:
+
+- `EmitExclusiveReadMemoryPageTable` / `EmitExclusiveWriteMemoryPageTable` (shared by A32 and A64): as
+  the fastmem inline path, the monitor's address and value stored and the load read inline, the store a
+  `lock cmpxchg` against the value loaded, but the host address from the page table walk; an access the
+  walk can't do (unmapped, across a page, a store to a marked page) takes the same fallbacks. 128-bit
+  exclusives keep the monitor path. `UserConfig::page_table_inline_exclusives`, on by default, with a page
+  table and without fastmem.
+- DMB: `lock or dword [rsp], 0` instead of `mfence` (a full barrier for ordinary memory, as Linux's
+  `smp_mb` on x86-64; 7-9 ns against 17 on the build machine). DSB keeps `mfence; lfence`.
+
+In the host harness (now also an A64 one, `dynbench64`, with Eden's packed entries and block ids above
+511): an atomic increment and decrement with barriers 316-423 ns -> 79-98 ns (A32), 360-450 -> 53-68 ns
+(A64). Random programs of exclusives (every size, acquire/release forms, pairs, CLREX, a store with no
+load, to another granule, a plain store between, twice; on ordinary, marked and unmapped pages) give the
+same registers and memory inline as through the monitor: 2,800 A32/Thumb, 1,040 A64. The earlier suites
+still pass.
+
+Patch 0068, for the 30-second line: each emulated core's idle time and the time all four were idle at
+once; how long a finished frame waited for the vsync that showed it (QueueBuffer to the composer's
+acquire); the game's DequeueBuffer calls and their waits; and the HLE services' own handling time per
+service and command, the five busiest. These separate the remaining causes: the game's own code, a
+global wait (a vsync, the GPU thread), or a service.
+
+System Settings, Graphics, Frame Pacing (`pacing=` in the menu file; `EDEN_PS4_UNLOCKED=1` on the
+desktop): 60 Hz is Eden's speed limit at 100%, its composer showing a frame at the next 60 Hz vsync, so a
+game double-buffered at 50 ms a frame shows 15 fps; Unlocked turns the speed limit off (Eden's vsyncs 100
+times as often), each frame shown when it's done. Races at 15-18 fps with every thread idle a third of the
+time fit frames waiting for vsyncs; the 30-second line now measures it.
+
 03.79: **one page table walk for many accesses, and pinned threads.** 03.78's counters (Mario Kart
 8 Deluxe at 13-14 fps in races): idle cores woken in 14 us, service calls 130 us each 470 times a
 second, timers on time, no code cache flushes, 330,000 slow memory accesses a second. What's left is the

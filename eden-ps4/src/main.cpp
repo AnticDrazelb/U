@@ -162,6 +162,7 @@ bool g_gpu_display = false;
 bool g_docked = true;
 int g_resolution = 100;
 bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false, g_fps_overlay = false;
+bool g_unlocked_frames = false;
 std::string g_keys_dir, g_firmware_dir; // (empty: the user folder's)
 
 // Player 1's controller: Eden's virtual gamepad (the engine Android's touch overlay drives),
@@ -250,6 +251,10 @@ void ApplyLauncherSettings() {
     Settings::values.gpu_accuracy.SetValue(g_gpu_high ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);
     Settings::values.use_reactive_flushing.SetValue(g_gpu_high);
     Settings::values.show_fps_overlay.SetValue(g_fps_overlay);
+    // Frame pacing: Eden's composer shows a frame at the next 60 Hz vsync (the speed limit at 100%:
+    // a game that misses one waits for the next, 30, 20, 15 fps); unlocked, its vsyncs come 100 times
+    // as often, so each frame is shown as soon as it's done (and a game that could go above 60 does)
+    Settings::values.use_speed_limit.SetValue(!g_unlocked_frames);
     // GPU macros (MME: games' draws and state changes go through them, on the GPU thread) compiled
     // to x86 code (on the PS4 into memory mapped executable from the start, patch 0051), not
     // interpreted; EDEN_PS4_MACRO_JIT=0 interprets them
@@ -372,6 +377,10 @@ void SetGpuAccuracyHigh(bool on) {
 
 void SetFpsOverlay(bool on) {
     g_fps_overlay = on;
+}
+
+void SetUnlockedFrames(bool on) {
+    g_unlocked_frames = on;
 }
 
 void SetKeysAndFirmware(std::string keys_dir, std::string firmware_dir) {

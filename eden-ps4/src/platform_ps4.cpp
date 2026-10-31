@@ -1024,6 +1024,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.ram_on_demand = false;
         else if (line == "threads=free")
             settings.pin_threads = false;
+        else if (line == "pacing=unlocked")
+            settings.unlocked_frames = true;
         else if (line.starts_with("games_folder="))
             settings.games_folder = line.substr(13);
     }
@@ -1035,14 +1037,14 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
-                     settings.pin_threads ? "pinned" : "free");
+                     settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz");
         std::fclose(f);
     }
 }
@@ -1250,6 +1252,17 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.80: atomic operations run inline. 03.79's log still had 370,000 memory accesses a second leaving "
+         "the recompiled code, half of them writes: the game's atomic operations (LDREX/STREX, behind every "
+         "lock and reference count), each a call into the emulator and its exclusive monitor. They now go "
+         "through the same inline table walk as ordinary loads and stores (32- and 64-bit games): on a PC with "
+         "the PS4's setup, an atomic increment and decrement takes a quarter of the time or less. A memory "
+         "barrier (DMB) costs half what it did. The 30-second line in the log now says how long each emulated "
+         "core sits idle and how long all of them are idle at once, how long a finished frame waits for the "
+         "next vsync, how long the game waits for a buffer to draw in, and which services the game's service "
+         "calls spend their time in. New: System Settings, Graphics, Frame Pacing. At 60 Hz (as before) a frame "
+         "that misses a vsync waits for the next one, so 50 ms of work shows as 15 fps; Unlocked shows each frame "
+         "the moment it's done. A race with each, the Profiler off, and the log, shows what's next.\n"
          "03.79: the game's own code runs faster. Every memory access of the Switch's CPU walks a table here "
          "(the PS4 can't do it the way PCs do), and a function's start and end save and restore up to 17 "
          "registers, each with its own walk: now one walk does for all of them, and for a run of loads and "
@@ -1687,12 +1700,14 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
                 g_files_changed = true;
             }
             Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
-                              "asynchronous shaders {}, GPU accuracy {}, CPU {}, {} cores, profiler {}",
+                              "asynchronous shaders {}, GPU accuracy {}, frame pacing {}, CPU {}, {} cores, profiler {}",
                               choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
                               choice.settings.docked ? "docked" : "handheld", choice.settings.resolution,
                               choice.settings.shader_cache ? "on" : "off", choice.settings.async_shaders ? "on" : "off",
-                              choice.settings.gpu_high ? "high" : "normal", choice.settings.cpu_unsafe ? "unsafe" : "auto",
+                              choice.settings.gpu_high ? "high" : "normal",
+                              choice.settings.unlocked_frames ? "unlocked" : "60 Hz",
+                              choice.settings.cpu_unsafe ? "unsafe" : "auto",
                               choice.settings.seventh_core ? 7 : 6, choice.settings.profiler ? "on" : "off"));
         }
         menu.Draw(canvas, now);
@@ -1829,6 +1844,7 @@ std::string PerfLine(double seconds)
     struct Totals
     {
         uint64_t spins, sleeps, sleep_ns, ipcs, ipc_ns, events, late_ns, blocks, full, ranges, slow, slow_writes;
+        uint64_t idle_ns[4], all_idle_ns, presents, present_ns, dequeues, dequeue_ns;
     };
     static Totals last{};
     const Totals now{P::idle_spin_wakes.load(std::memory_order_relaxed),
@@ -1842,11 +1858,20 @@ std::string PerfLine(double seconds)
                      P::jit_full_flushes.load(std::memory_order_relaxed),
                      P::jit_range_flushes.load(std::memory_order_relaxed),
                      P::SlowMemoryAccesses(),
-                     P::Total(P::slow_memory_writes)};
+                     P::Total(P::slow_memory_writes),
+                     {P::core_idle_ns[0].n.load(std::memory_order_relaxed), P::core_idle_ns[1].n.load(std::memory_order_relaxed),
+                      P::core_idle_ns[2].n.load(std::memory_order_relaxed), P::core_idle_ns[3].n.load(std::memory_order_relaxed)},
+                     P::all_idle_ns.load(std::memory_order_relaxed),
+                     P::present_wait.count.load(std::memory_order_relaxed),
+                     P::present_wait.total_ns.load(std::memory_order_relaxed),
+                     P::dequeue_wait.count.load(std::memory_order_relaxed),
+                     P::dequeue_wait.total_ns.load(std::memory_order_relaxed)};
     // (the maxima since the last call)
     const uint64_t sleep_max = P::idle_sleep_wakes.max_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t ipc_max = P::ipc.max_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t late_max = P::timer_late.max_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t dequeue_max = P::dequeue_wait.max_ns.exchange(0, std::memory_order_relaxed);
+    P::present_wait.max_ns.store(0, std::memory_order_relaxed);
     const auto rate = [&](uint64_t a, uint64_t b) { return double(a - b) / seconds; };
     const auto average_us = [](uint64_t ns, uint64_t count) { return count ? double(ns) / double(count) / 1000.0 : 0.0; };
     std::string line = fmt::format(
@@ -1862,6 +1887,30 @@ std::string PerfLine(double seconds)
         double(late_max) / 1000.0, double(P::timer_overshoot_ns.load(std::memory_order_relaxed)) / 1000.0,
         rate(now.blocks, last.blocks), now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow),
         rate(now.slow_writes, last.slow_writes));
+    // Where the game's time goes besides running: each emulated core idle (no thread of the game
+    // to run), all at once (every thread waiting: on the GPU, a vsync, a service), a finished
+    // frame waiting for the next vsync to be shown, the game waiting for a buffer to draw in
+    const auto percent = [&](uint64_t a, uint64_t b) { return double(a - b) / (seconds * 1e9) * 100.0; };
+    line += fmt::format(
+        "; emulated cores idle {:.0f}%, {:.0f}%, {:.0f}%, {:.0f}% of the time, all four at once {:.0f}%; a finished "
+        "frame waited {:.1f} ms for the next vsync ({:.0f} frames a second); the game asked for a buffer to draw in "
+        "{:.0f} times a second, waiting {:.2f} ms each (at most {:.1f})",
+        percent(now.idle_ns[0], last.idle_ns[0]), percent(now.idle_ns[1], last.idle_ns[1]),
+        percent(now.idle_ns[2], last.idle_ns[2]), percent(now.idle_ns[3], last.idle_ns[3]),
+        percent(now.all_idle_ns, last.all_idle_ns),
+        average_us(now.present_ns - last.present_ns, now.presents - last.presents) / 1000.0,
+        rate(now.presents, last.presents), rate(now.dequeues, last.dequeues),
+        average_us(now.dequeue_ns - last.dequeue_ns, now.dequeues - last.dequeues) / 1000.0, double(dequeue_max) / 1e6);
+    // The services the game's calls spent their time in, the five busiest
+    P::ServiceCall calls[P::MaxServiceCalls];
+    const size_t n = P::TakeServiceCalls(calls, P::MaxServiceCalls);
+    std::sort(calls, calls + n, [](const P::ServiceCall& a, const P::ServiceCall& b) { return a.total_ns > b.total_ns; });
+    line += "; the services' own handling of the calls, the five busiest:";
+    for (size_t i = 0; i < std::min<size_t>(n, 5) && calls[i].count; i++) {
+        line += fmt::format("{} {} command {}: {:.0f} a second, {:.0f} us each (at most {:.0f})", i ? "," : "",
+                            calls[i].name ? calls[i].name : "(others)", calls[i].command, double(calls[i].count) / seconds,
+                            average_us(calls[i].total_ns, calls[i].count), double(calls[i].max_ns) / 1000.0);
+    }
     last = now;
     return line;
 }
@@ -2040,6 +2089,7 @@ void* Run(void*)
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
         Launcher::SetFpsOverlay(settings.fps_overlay);
+        Launcher::SetUnlockedFrames(settings.unlocked_frames);
         {
             // keys and firmware on a USB drive are used from there, else the user folder's
             const Launcher::UsbKeysAndFirmware usb = KeysAndFirmwareOnUsb();
@@ -2059,12 +2109,12 @@ void* Run(void*)
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}; CPU {}, {} cores, threads {}; the Switch's RAM {}{}",
+            "GPU accuracy {}, frame pacing {}; CPU {}, {} cores, threads {}; the Switch's RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
-            settings.gpu_high ? "high" : "normal", settings.cpu_unsafe ? "unsafe" : "auto",
-            settings.seventh_core ? 7 : 6, settings.pin_threads ? "pinned" : "free",
-            settings.ram_on_demand ? "on demand" : "all up front",
+            settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz",
+            settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
+            settings.pin_threads ? "pinned" : "free", settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
         if (settings.profiler)
