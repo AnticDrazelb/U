@@ -377,6 +377,31 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.78: **where Mario Kart 8 Deluxe's race frames go, and the first fixes.** Its races ran at 12 fps on
+a console, its menus at 50-60. The boot trace's new GPU line (03.77) settled the GPU: busy 2-5% of the
+time, and the CPU waited for it 5%. The profile: in races the emulated cores ran the game's code 49-59%
+of the time and slept 26-45% (all of it the condition variable wait in `PhysicalCore::Idle`), Eden's GPU
+thread was busy 35% (command processing, about 29 ms a frame, which the game waits for: with Low GPU
+accuracy a syncpoint is signalled when the GPU thread reaches it), and no thread was busy all the time:
+time lost to handoffs. Patch 0064:
+
+- an idle emulated core spins up to 50 us before it sleeps, so work handed to it (a thread another core
+  made ready, a service's reply) doesn't wait for a sleeping host thread to be woken;
+- the services that run on host threads (nvdrv, vi, audio, FS: every GPU submission and sync wait is
+  a call to one) spin the same way before they sleep waiting for the next call;
+- the timing thread learns how much its timed waits overshoot (the PS4's kernel timers) and waits that
+  much less, at most 1 ms, spinning the rest, so the game's timers, vsync and audio fire on time;
+- dynarmic's A32 `DecodeVFP` and `DecodeASIMD`, which every ordinary ARM instruction went through first
+  (10-15% of an emulated core whenever code is translated), reject encodings outside their spaces with
+  one test (checked against every pattern);
+- the boot trace's 30-second line says, from `common/ps4_perf.h`: idle cores woken while spinning or
+  after sleeping and the wake-up's delay, the game's service calls (`svcSendSyncRequest`) and their
+  round trips, timer events' lateness and the learned overshoot, the recompiler's translations and
+  cache flushes, and memory accesses that left its inline page table walk.
+
+The Profiler (on in that run) interrupts the profiled threads 1000 times a second with a signal: off
+for playing. On a PS4 Pro, the system's Boost Mode runs the CPU at 2.13 GHz instead of 1.6.
+
 03.75: **Game Folder**, after Crema's. Crema finds games anywhere because the player chooses
 where: its Game Folder setting browses from a list of places (the data folder, `/mnt/usb0-7`,
 `/mnt/ext0`, `/mnt/ext1`, `/mnt`, `/`) and the folder chosen is searched through. Games and Keys

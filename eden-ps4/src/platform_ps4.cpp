@@ -46,6 +46,7 @@
 
 #include "common/orbis_memory.h"
 #include "common/ps4_diagnostics.h"
+#include "common/ps4_perf.h"
 #include "launcher.h"
 #include "ui/canvas.h"
 #include "ui/home_menu.h"
@@ -1246,6 +1247,12 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.78: faster games. An emulated CPU core with nothing to run waits a moment before it sleeps, "
+         "so a game's threads hand work to each other without waking a sleeping thread each time; the "
+         "Switch's timers fire on time; and the game's ARM code is translated faster (loading, new areas). "
+         "Drives at /usb0 are found without a Game Folder. Turn the Profiler off for playing: it interrupts "
+         "the emulated cores 1000 times a second. On a PS4 Pro, Boost Mode (Settings, System) makes the CPU "
+         "a third faster.\n"
          "03.77: an FPS counter in the top left corner while a game runs (System Settings, Graphics, FPS "
          "Counter): the frames the game itself drew in the last second.\n"
          "Copy to the PS4: in a game's Options from a USB drive (or another folder), \"Copy to the PS4\" copies "
@@ -1801,6 +1808,51 @@ std::string GpuLine(double seconds)
     return line;
 }
 
+// Where the emulated cores' time went since the last call (common/ps4_perf.h): idle cores woken
+// while they spun or after sleeping (and how long that wake-up took), the game's service calls,
+// how late the timing thread's events fired, the recompiler's translations and cache flushes, and
+// memory accesses that left its inline page table walk
+std::string PerfLine(double seconds)
+{
+    namespace P = Common::PS4Perf;
+    struct Totals
+    {
+        uint64_t spins, sleeps, sleep_ns, ipcs, ipc_ns, events, late_ns, blocks, full, ranges, slow;
+    };
+    static Totals last{};
+    const Totals now{P::idle_spin_wakes.load(std::memory_order_relaxed),
+                     P::idle_sleep_wakes.count.load(std::memory_order_relaxed),
+                     P::idle_sleep_wakes.total_ns.load(std::memory_order_relaxed),
+                     P::ipc.count.load(std::memory_order_relaxed),
+                     P::ipc.total_ns.load(std::memory_order_relaxed),
+                     P::timer_late.count.load(std::memory_order_relaxed),
+                     P::timer_late.total_ns.load(std::memory_order_relaxed),
+                     P::jit_blocks.load(std::memory_order_relaxed),
+                     P::jit_full_flushes.load(std::memory_order_relaxed),
+                     P::jit_range_flushes.load(std::memory_order_relaxed),
+                     P::SlowMemoryAccesses()};
+    // (the maxima since the last call)
+    const uint64_t sleep_max = P::idle_sleep_wakes.max_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t ipc_max = P::ipc.max_ns.exchange(0, std::memory_order_relaxed);
+    const uint64_t late_max = P::timer_late.max_ns.exchange(0, std::memory_order_relaxed);
+    const auto rate = [&](uint64_t a, uint64_t b) { return double(a - b) / seconds; };
+    const auto average_us = [](uint64_t ns, uint64_t count) { return count ? double(ns) / double(count) / 1000.0 : 0.0; };
+    std::string line = fmt::format(
+        "idle emulated cores woken {:.0f} times a second while spinning, {:.0f} after sleeping ({:.0f} us after the "
+        "signal, at most {:.0f}); service calls {:.0f} a second, {:.0f} us each (at most {:.0f}); timer events {:.0f} "
+        "a second, {:.0f} us late (at most {:.0f}; timed waits overshoot {:.0f} us); the recompiler translated {:.0f} "
+        "blocks a second, flushed its whole cache {} times and parts of it {} times; {:.0f} memory accesses a second "
+        "left the inline page table walk",
+        rate(now.spins, last.spins), rate(now.sleeps, last.sleeps),
+        average_us(now.sleep_ns - last.sleep_ns, now.sleeps - last.sleeps), double(sleep_max) / 1000.0,
+        rate(now.ipcs, last.ipcs), average_us(now.ipc_ns - last.ipc_ns, now.ipcs - last.ipcs), double(ipc_max) / 1000.0,
+        rate(now.events, last.events), average_us(now.late_ns - last.late_ns, now.events - last.events),
+        double(late_max) / 1000.0, double(P::timer_overshoot_ns.load(std::memory_order_relaxed)) / 1000.0,
+        rate(now.blocks, last.blocks), now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow));
+    last = now;
+    return line;
+}
+
 class HangWatchdog
 {
 public:
@@ -1845,6 +1897,7 @@ private:
                 // how it runs: the frame rate, and the memory (what a game needs, on the console)
                 Trace(fmt::format("running {} s: {:.1f} frames a second; {}; {}", seconds,
                                   double(frames - reported) / 30.0, GpuLine(30.0), MemoryLine()));
+                Trace(fmt::format("running {} s: {}", seconds, PerfLine(30.0)));
                 reported = frames;
             }
             if (frames != last)

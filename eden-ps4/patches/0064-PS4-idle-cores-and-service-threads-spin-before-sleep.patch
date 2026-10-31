@@ -1,0 +1,503 @@
+From 128b399f43a999cbd455bc72bdd7daef56b3d2a8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 10:05:16 +0000
+Subject: [PATCH] PS4: idle cores and service threads spin before sleeping,
+ on-time timers, faster ARM decoding, and where a frame's time goes
+
+A console's Mario Kart 8 Deluxe ran its races at 12 fps with the PS4's GPU
+2-5% busy and no thread busy all the time: the emulated cores slept 26-45%
+of the time in condition variable waits, between handoffs.
+
+- PhysicalCore::Idle spins up to 50 us before it sleeps (m_is_interrupted
+  atomic): work handed to an idle core (a thread another core made ready, a
+  service's reply) usually comes within that, and waking a sleeping host
+  thread costs more on the PS4.
+- Host threads waiting for the game (the services on host threads: nvdrv,
+  vi, audio, FS) spin up to 50 us too before sleeping (KThread's dummy
+  thread wait; m_dummy_thread_runnable atomic): a service call wakes one.
+- The timing thread learns how much its timed waits overshoot and waits
+  that much less (at most 1 ms), spinning the rest, so the game's timers,
+  vsync and audio fire on time (a new event ends the spin).
+- DecodeVFP and DecodeASIMD reject encodings outside their spaces with one
+  test before trying their ~60 and ~150 matchers (every pattern checked):
+  every ordinary ARM instruction went through both lists first, 10-15% of
+  an emulated core whenever code is translated.
+- common/ps4_perf.h counts, for the launcher's 30-second line: idle cores
+  woken while spinning or after sleeping (and that wake-up's delay), the
+  game's service calls and their round trips, timer events' lateness and the
+  learned overshoot, blocks translated and cache flushes, and memory accesses
+  that left the inline page table walk (per core).
+---
+ src/common/ps4_perf.h                         | 57 +++++++++++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  4 ++
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  4 ++
+ src/core/core_timing.cpp                      | 37 ++++++++++++
+ src/core/hle/kernel/k_thread.cpp              | 20 ++++++-
+ src/core/hle/kernel/k_thread.h                |  3 +-
+ src/core/hle/kernel/physical_core.cpp         | 42 +++++++++++++-
+ src/core/hle/kernel/physical_core.h           |  6 +-
+ src/core/hle/kernel/svc/svc_ipc.cpp           | 10 ++++
+ .../dynarmic/backend/x64/a32_interface.cpp    |  4 ++
+ .../dynarmic/backend/x64/a64_interface.cpp    |  4 ++
+ .../src/dynarmic/frontend/A32/decoder/asimd.h |  5 ++
+ .../src/dynarmic/frontend/A32/decoder/vfp.h   |  4 ++
+ 13 files changed, 196 insertions(+), 4 deletions(-)
+ create mode 100644 src/common/ps4_perf.h
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+new file mode 100644
+index 000000000..9fdc81a7d
+--- /dev/null
++++ b/src/common/ps4_perf.h
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// Where an emulated frame's time goes on the PS4, counted as it happens and read by the launcher
++// every 30 s (the boot trace): the emulated cores' sleeps and how long a wake-up took, the
++// game's calls to the HLE services and their round trips, how late the timing thread fired its
++// events, the recompiler's translations and cache flushes, and guest memory accesses that left
++// the recompiler's inline page table walk. Relaxed atomics: totals since the program started,
++// which the reader differences.
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++
++namespace Common::PS4Perf {
++
++struct Counter {
++    std::atomic<uint64_t> count{0}, total_ns{0}, max_ns{0};
++
++    void Add(uint64_t ns) {
++        count.fetch_add(1, std::memory_order_relaxed);
++        total_ns.fetch_add(ns, std::memory_order_relaxed);
++        uint64_t max = max_ns.load(std::memory_order_relaxed);
++        while (ns > max && !max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
++        }
++    }
++};
++
++// An emulated core that had nothing to run: woken while it still spun (no host sleep), or after
++// sleeping (the time from the interrupt to running again)
++inline std::atomic<uint64_t> idle_spin_wakes{0};
++inline Counter idle_sleep_wakes;
++// svcSendSyncRequest: from the call to the reply
++inline Counter ipc;
++// The timing thread's events: how late each fired; and its timed waits' overshoot, which it
++// learns and wakes that much early for (in ns, an average)
++inline Counter timer_late;
++inline std::atomic<int64_t> timer_overshoot_ns{0};
++// The recompiler: blocks translated, whole-cache flushes (a full cache, or asked for) and range
++// invalidations
++inline std::atomic<uint64_t> jit_blocks{0}, jit_full_flushes{0}, jit_range_flushes{0};
++// Guest memory accesses through the recompiler's callbacks instead of its inline page table walk,
++// per emulated core (a cache line each: a busy count shared by the cores would cost time itself)
++struct alignas(64) CoreCount {
++    std::atomic<uint64_t> n{0};
++};
++inline CoreCount slow_memory_accesses[4];
++inline uint64_t SlowMemoryAccesses() {
++    uint64_t total = 0;
++    for (const CoreCount& core : slow_memory_accesses) {
++        total += core.n.load(std::memory_order_relaxed);
++    }
++    return total;
++}
++
++} // namespace Common::PS4Perf
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 30f41efcd..2c2be2937 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_32.h"
+@@ -115,6 +116,9 @@ u64 DynarmicCallbacks32::GetTicksRemaining() {
+ }
+ 
+ bool DynarmicCallbacks32::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::slow_memory_accesses[m_parent.m_core_index & 3].n.fetch_add(1, std::memory_order_relaxed);
++#endif
+     if (!m_check_memory_access) {
+         return true;
+     }
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index a3bbc4ada..84e5ec02b 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_64.h"
+@@ -158,6 +159,9 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
+ }
+ 
+ bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::slow_memory_accesses[m_parent.m_core_index & 3].n.fetch_add(1, std::memory_order_relaxed);
++#endif
+     if (!m_check_memory_access) {
+         return true;
+     }
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index dbf2f9fb6..1f6217e07 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -15,10 +15,15 @@
+ #include "common/windows/timer_resolution.h"
+ #endif
+ 
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+ #include "core/hardware_properties.h"
+ 
++#ifdef __OPENORBIS__
++#include <immintrin.h>
++#endif
++
+ namespace Core::Timing {
+ 
+ constexpr s64 MAX_SLICE_LENGTH = 10000;
+@@ -86,7 +91,33 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
+                         // There are more events left in the queue, wait until the next event.
+                         auto const wait_time = *next_time - GetGlobalTimeNs().count();
+                         if (wait_time > 0) {
++#ifdef __OPENORBIS__
++                            // The PS4's timed waits can wake late (its kernel's timer ticks), and
++                            // every event behind them (the game's timers and sleeps, vsync, audio)
++                            // with them. So this waits for less, by the overshoot learned so far
++                            // (at most 1 ms), and spins the rest; a new event ends the spin too.
++                            const s64 overshoot =
++                                Common::PS4Perf::timer_overshoot_ns.load(std::memory_order_relaxed);
++                            const s64 margin = std::min<s64>(overshoot + overshoot / 4, 1'000'000);
++                            bool signalled = false;
++                            if (wait_time > margin) {
++                                const s64 sleep = wait_time - margin;
++                                const s64 before = GetGlobalTimeNs().count();
++                                signalled = event.WaitFor(std::chrono::nanoseconds(sleep));
++                                if (!signalled) {
++                                    const s64 over = std::max<s64>(
++                                        GetGlobalTimeNs().count() - before - sleep, 0);
++                                    Common::PS4Perf::timer_overshoot_ns.store(
++                                        overshoot + (over - overshoot) / 8, std::memory_order_relaxed);
++                                }
++                            }
++                            while (!signalled && !event.IsSet() &&
++                                   GetGlobalTimeNs().count() < *next_time) {
++                                _mm_pause();
++                            }
++#else
+                             event.WaitFor(std::chrono::nanoseconds(wait_time));
++#endif
+                         }
+                     } else {
+                         // Queue is empty, wait until another event is scheduled and signals us to
+@@ -254,6 +285,12 @@ std::optional<s64> CoreTiming::Advance() {
+             const auto evt_time = evt.time;
+             const auto evt_sequence_num = event_type->sequence_number;
+ 
++#ifdef __OPENORBIS__
++            if (is_multicore) {
++                const s64 late = GetGlobalTimeNs().count() - evt_time;
++                Common::PS4Perf::timer_late.Add(static_cast<u64>(std::max<s64>(late, 0)));
++            }
++#endif
+             if (evt.reschedule_time == 0) {
+                 event_queue.pop();
+ 
+diff --git a/src/core/hle/kernel/k_thread.cpp b/src/core/hle/kernel/k_thread.cpp
+index b499bd407..e7014a0a3 100644
+--- a/src/core/hle/kernel/k_thread.cpp
++++ b/src/core/hle/kernel/k_thread.cpp
+@@ -13,10 +13,15 @@
+ #include <vector>
+ #include <array>
+ 
++#ifdef __OPENORBIS__
++#include <immintrin.h>
++#endif
++
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
++#include "common/cpu_features.h"
+ #include "common/fiber.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+@@ -1326,9 +1331,22 @@ namespace Kernel {
+             return;
+         }
+ 
++#ifdef __OPENORBIS__
++        // A host thread waiting for the game (a service for its next request) is usually woken
++        // within microseconds, and waking a sleeping host thread costs more than that on the PS4,
++        // on every service call: it spins for a while first (as an idle emulated core does).
++        constexpr auto SpinTime = std::chrono::microseconds(50);
++        const auto spin_end = Common::g_wall_clock.GetTimeNS() + SpinTime;
++        while (!m_dummy_thread_runnable.load(std::memory_order_acquire) &&
++               Common::g_wall_clock.GetTimeNS() < spin_end) {
++            for (int i = 0; i < 16; i++) {
++                _mm_pause();
++            }
++        }
++#endif
+         // Block until runnable is no longer false.
+         std::unique_lock lock{m_dummy_thread_mutex};
+-        m_dummy_thread_cv.wait(lock, [this] { return m_dummy_thread_runnable; });
++        m_dummy_thread_cv.wait(lock, [this] { return m_dummy_thread_runnable.load(); });
+     }
+ 
+     void KThread::DummyThreadEndWait(KernelCore& kernel) {
+diff --git a/src/core/hle/kernel/k_thread.h b/src/core/hle/kernel/k_thread.h
+index 0ee5f72c8..200e34076 100644
+--- a/src/core/hle/kernel/k_thread.h
++++ b/src/core/hle/kernel/k_thread.h
+@@ -925,7 +925,8 @@ private:
+     std::shared_ptr<Common::Fiber> m_host_context{};
+     ThreadType m_thread_type{};
+     StepState m_step_state{};
+-    bool m_dummy_thread_runnable{true};
++    // (atomic: a host thread on the PS4 spins on it before it takes the mutex and sleeps)
++    std::atomic<bool> m_dummy_thread_runnable{true};
+     std::mutex m_dummy_thread_mutex{};
+     std::condition_variable m_dummy_thread_cv{};
+ 
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index c5236c64e..511a0fba0 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -14,6 +16,10 @@
+ #include "core/hle/kernel/physical_core.h"
+ #include "core/hle/kernel/svc.h"
+ 
++#ifdef __OPENORBIS__
++#include <immintrin.h>
++#endif
++
+ namespace Kernel {
+ 
+ PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
+@@ -222,8 +228,37 @@ void PhysicalCore::LogBacktrace(KernelCore& kernel) {
+ }
+ 
+ void PhysicalCore::Idle() {
++#ifdef __OPENORBIS__
++    // A core with nothing to run is usually handed work within microseconds (a thread another core
++    // made ready, a service's reply), and waking a sleeping host thread costs far more than that
++    // on the PS4: every handoff between the game's threads paid it. So an idle core spins for a
++    // while first (a core of the PS4's seven the game isn't using), then sleeps.
++    constexpr auto SpinTime = std::chrono::microseconds(50);
++    const auto spin_end = Common::g_wall_clock.GetTimeNS() + SpinTime;
++    while (!m_is_interrupted.load(std::memory_order_acquire)) {
++        for (int i = 0; i < 16; i++) {
++            _mm_pause();
++        }
++        if (Common::g_wall_clock.GetTimeNS() >= spin_end) {
++            break;
++        }
++    }
++    if (m_is_interrupted.load(std::memory_order_acquire)) {
++        Common::PS4Perf::idle_spin_wakes.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++#endif
+     std::unique_lock lk{m_guard};
+-    m_on_interrupt.wait(lk, [this] { return m_is_interrupted; });
++#ifdef __OPENORBIS__
++    const bool sleeps = !m_is_interrupted;
++#endif
++    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
++#ifdef __OPENORBIS__
++    if (sleeps) {
++        const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++        Common::PS4Perf::idle_sleep_wakes.Add(now > m_interrupt_ns ? now - m_interrupt_ns : 0);
++    }
++#endif
+ }
+ 
+ bool PhysicalCore::IsInterrupted() const {
+@@ -239,6 +274,11 @@ void PhysicalCore::Interrupt() {
+     auto* thread = m_current_thread;
+ 
+     // Add interrupt flag.
++#ifdef __OPENORBIS__
++    if (!m_is_interrupted) {
++        m_interrupt_ns = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    }
++#endif
+     m_is_interrupted = true;
+ 
+     // Interrupt ourselves.
+diff --git a/src/core/hle/kernel/physical_core.h b/src/core/hle/kernel/physical_core.h
+index b92201204..14e627a3c 100644
+--- a/src/core/hle/kernel/physical_core.h
++++ b/src/core/hle/kernel/physical_core.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <memory>
+@@ -71,7 +72,10 @@ private:
+     std::condition_variable m_on_interrupt;
+     Core::ArmInterface* m_arm_interface{};
+     KThread* m_current_thread{};
+-    bool m_is_interrupted{};
++    // (atomic: an idle core on the PS4 spins on it before it takes m_guard and sleeps)
++    std::atomic<bool> m_is_interrupted{};
++    // When the interrupt that ended the last idle came (ns, the wall clock), for the PS4's statistics
++    u64 m_interrupt_ns{};
+     bool m_is_single_core{};
+ };
+ 
+diff --git a/src/core/hle/kernel/svc/svc_ipc.cpp b/src/core/hle/kernel/svc/svc_ipc.cpp
+index 875590d6f..fff0208c4 100644
+--- a/src/core/hle/kernel/svc/svc_ipc.cpp
++++ b/src/core/hle/kernel/svc/svc_ipc.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
+ #include "common/scope_exit.h"
+ #include "common/scratch_buffer.h"
+ #include "core/core.h"
+@@ -30,6 +32,14 @@ Result SendSyncRequestImpl(KernelCore& kernel, uintptr_t message, size_t buffer_
+     ASSERT(parent.IsNotNull());
+ 
+     // Send the request.
++#ifdef __OPENORBIS__
++    // How long the game's thread waits for a service's reply (the PS4's statistics: the services
++    // that run on host threads cost two thread handoffs a call)
++    const auto start = Common::g_wall_clock.GetTimeNS();
++    SCOPE_EXIT {
++        Common::PS4Perf::ipc.Add(static_cast<u64>((Common::g_wall_clock.GetTimeNS() - start).count()));
++    };
++#endif
+     R_RETURN(session->SendSyncRequest(kernel, message, buffer_size));
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 72627b9e1..aef7f99a1 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -13,6 +13,7 @@
+ #include <boost/icl/interval_set.hpp>
+ #include <fmt/format.h>
+ #include "common/assert.h"
++#include "common/ps4_perf.h"
+ #include <bit>
+ #include "common/common_types.h"
+ #include "dynarmic/common/llvm_disassemble.h"
+@@ -202,6 +203,7 @@ private:
+         // LocationDescriptor ctor() does important ops (like tflags) do not skip
+         auto const arch_descriptor = A32::LocationDescriptor{descriptor};
+         ir_block.Reset(arch_descriptor);
++        ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
+         A32::Translate(ir_block, arch_descriptor, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         return emitter.Emit(ir_block);
+@@ -219,9 +221,11 @@ private:
+ 
+             jit_state.ResetRSB();
+             if (invalidate_entire_cache) {
++                ::Common::PS4Perf::jit_full_flushes.fetch_add(1, std::memory_order_relaxed);
+                 block_of_code.ClearCache();
+                 emitter.ClearCache();
+             } else {
++                ::Common::PS4Perf::jit_range_flushes.fetch_add(1, std::memory_order_relaxed);
+                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
+             }
+             invalid_cache_ranges.clear();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index bb072129e..ffbeb7544 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <boost/icl/interval_set.hpp>
+ #include "common/assert.h"
++#include "common/ps4_perf.h"
+ #include "dynarmic/common/fp/fpcr.h"
+ #include "dynarmic/common/llvm_disassemble.h"
+ #include <bit>
+@@ -258,6 +259,7 @@ private:
+         // LocationDescriptor ctor() does important ops (like tflags) do not skip
+         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
+         ir_block.Reset(arch_descriptor);
++        ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
+         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         return emitter.Emit(ir_block).entrypoint;
+@@ -275,9 +277,11 @@ private:
+ 
+             jit_state.ResetRSB();
+             if (invalidate_entire_cache) {
++                ::Common::PS4Perf::jit_full_flushes.fetch_add(1, std::memory_order_relaxed);
+                 block_of_code.ClearCache();
+                 emitter.ClearCache();
+             } else {
++                ::Common::PS4Perf::jit_range_flushes.fetch_add(1, std::memory_order_relaxed);
+                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
+             }
+             invalid_cache_ranges.clear();
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/decoder/asimd.h b/src/dynarmic/src/dynarmic/frontend/A32/decoder/asimd.h
+index 4feae6f47..a366d6d4f 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/decoder/asimd.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/decoder/asimd.h
+@@ -28,6 +28,11 @@ using ASIMDMatcher = Decoder::Matcher<Visitor, u32>;
+ 
+ template<typename V, typename ReturnType>
+ static std::optional<ReturnType> DecodeASIMD(V& visitor, u32 instruction) noexcept {
++    // Every ASIMD encoding starts 1111001 (data processing) or 11110100 (element and structure
++    // loads and stores): anything else (most instructions, which come here second) skips the
++    // matchers below.
++    if ((instruction >> 25) != 0b1111001 && (instruction >> 24) != 0b11110100)
++        return std::nullopt;
+ #define INST(fn, name, bitstring) \
+     do { \
+         auto const [mask, expect] = DYNARMIC_DECODER_GET_MATCHER(ASIMDMatcher, fn, name, Decoder::detail::StringToArray<32>(bitstring)); \
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/decoder/vfp.h b/src/dynarmic/src/dynarmic/frontend/A32/decoder/vfp.h
+index 8703aa24b..ddeec876d 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/decoder/vfp.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/decoder/vfp.h
+@@ -25,6 +25,10 @@ using VFPMatcher = Decoder::Matcher<Visitor, u32>;
+ 
+ template<typename V, typename ReturnType>
+ static std::optional<ReturnType> DecodeVFP(V& visitor, u32 instruction) {
++    // Every VFP encoding has bits 27:26 = 11 and coprocessor bits 11:9 = 101 (cp10/cp11): anything
++    // else (most instructions, which come here first) skips the matchers below.
++    if ((instruction & 0x0C000E00) != 0x0C000A00)
++        return std::nullopt;
+     bool const i_uncond = (instruction & 0xF0000000) == 0xF0000000;
+ #define INST(fn, name, bitstring) \
+     do { \
+-- 
+2.43.0
+

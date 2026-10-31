@@ -805,7 +805,8 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "While a game runs, where the emulated CPU cores, the GPU thread and the Vulkan thread spend their "
              "time: each is looked at 1000 times a second, and every 10 seconds the counts go to samples.log. "
              "The web page's Profile summary sums them up by function, and Download all logs includes them: "
-             "what to send when a game is slow. It costs a little speed itself.",
+             "what to send when a game is slow. It slows games itself (it interrupts the emulated cores 1000 "
+             "times a second): off for playing.",
              [](MenuSettings& s) { s.profiler = !s.profiler; }},
         };
     case 3:
