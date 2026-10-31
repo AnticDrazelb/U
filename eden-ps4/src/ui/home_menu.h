@@ -59,6 +59,7 @@ struct MenuSettings
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
     bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
+    bool pin_threads = true;   // the emulated CPU cores and the GPU thread each on a core of their own
     bool profiler = false;     // samples.log: where a game's busy threads spend their time
     bool ram_on_demand = true; // the Switch's RAM taken from the PS4's as the game uses it
     bool fps_overlay = false;  // the frames presented a second, top left

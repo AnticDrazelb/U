@@ -1155,6 +1155,27 @@ extern "C" void ps4_boost_thread() {
         reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), kModule0Cores);
 }
 
+// Eden for PS4's thread placement (Common::SetCurrentThreadName calls this with the thread's name;
+// EDEN_PS4_PIN_THREADS=0 leaves every thread on all of the app's cores, as Crema's Spread). The three
+// emulated CPU cores a Switch game runs on (CPUCore_0-2) each get a core of module 0 to themselves,
+// and the GPU thread, which takes their work, its fourth: the game's threads and the GPU thread share
+// one L2 cache and are never moved off a warm core. Every other thread Eden names (the fourth
+// emulated core, which runs the system's services, the Vulkan worker, the services on host threads,
+// audio, timing) goes to module 1, out of their way.
+extern "C" void ps4_place_thread(const char* name) {
+    const char* setting = getenv("EDEN_PS4_PIN_THREADS");
+    if (!name || (setting && setting[0] == '0'))
+        return;
+    uint64_t mask;
+    if (strncmp(name, "CPUCore_", 8) == 0 && name[8] >= '0' && name[8] <= '2' && name[9] == '\0')
+        mask = 1ull << (name[8] - '0');
+    else if (strcmp(name, "GPU") == 0)
+        mask = 1ull << 3;
+    else
+        mask = (g_app_cores & kModule1Cores) ? (g_app_cores & kModule1Cores) : g_app_cores;
+    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), mask);
+}
+
 // Eden's thread priorities (Common::SetCurrentThreadPriority: 0 Low .. 4 Critical) as the PS4's,
 // after the above. Critical, the emulated CPU cores, the GPU thread and the Vulkan worker: boosted
 // (650). High, audio rendering, GPU fences and presentation: as busy at times, so the same (a

@@ -1,0 +1,977 @@
+From 2bf952ab816d2ab472aec6265daf4d9752b7fccb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 12:00:30 +0000
+Subject: [PATCH 65/66] dynarmic: one page table walk for loads and stores that
+ share a base (A32, page table without fastmem)
+
+Without fastmem every guest load and store walks the page table inline,
+about 13 instructions. A32 code does many through one base: a function's
+PUSH {r4-r11, lr} and VPUSH {d8-d15} are 17 stores, their POPs 17 loads,
+each with its own walk. On the host, with the PS4's configuration, a call
+with such a prologue and epilogue cost 71-124 ns, the same without them 6.
+
+- A32HostPointer(start, span, is_write) walks once for [start, start+span):
+  the host address of start, or 0 when the span crosses into the next
+  page, the page is unmapped, or it's marked and a write is among them.
+- A32ReadMemoryVia{8,16,32,64} and A32WriteMemoryVia{8,16,32,64} use it:
+  test, branch, one host load or store. Their slow path (out of line) is
+  the access's own walk, with two registers saved on the host stack, and
+  only if that fails the memory callbacks; its address is the start plus
+  its offset, so the fast path computes no addresses.
+- The translator uses them for LDM, STM, PUSH, POP (ARM, Thumb, Thumb-2),
+  VLDM, VSTM, VPUSH, VPOP and a double's VLDR and VSTR
+  (A32::IREmitter::BeginMultipleAccess), and A32SharedWalkPass groups any
+  other loads and stores of one base register value plus constants within
+  a block (spanning at most 256 bytes).
+- UserConfig::page_table_single_walk_multiple (default on) enables both,
+  with a page table, without fastmem and without check_halt_on_memory_access.
+
+Host harness (the PS4's page table configuration, shuffled host pages, a
+marked and an unmapped page): calls 71-124 -> 32-42 ns, push/pop 68-86 ->
+26-36 ns, a page-crossing push/pop 75 -> 66 ns, struct accesses through one
+base 14-22 -> 8.4-9.6 ns; random ARM and Thumb programs at page boundaries
+give the same registers and memory either way.
+---
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |   4 +
+ .../backend/x64/a32_emit_x64_memory.cpp       | 258 ++++++++++++++++++
+ .../dynarmic/backend/x64/a32_interface.cpp    |   4 +-
+ .../dynarmic/frontend/A32/a32_ir_emitter.cpp  |  23 ++
+ .../dynarmic/frontend/A32/a32_ir_emitter.h    |  18 ++
+ .../frontend/A32/translate/a32_translate.h    |   5 +
+ .../A32/translate/impl/a32_translate_impl.h   |   4 +-
+ .../A32/translate/impl/load_store.cpp         |  14 +-
+ .../frontend/A32/translate/impl/thumb16.cpp   |  22 +-
+ .../impl/thumb32_load_store_multiple.cpp      |  12 +-
+ .../frontend/A32/translate/impl/vfp.cpp       |  56 ++--
+ .../src/dynarmic/interface/A32/config.h       |   6 +
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |   8 +
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |   9 +
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 108 ++++++++
+ 15 files changed, 521 insertions(+), 30 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index a106bb648..f5dd3be41 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -71,6 +71,10 @@ public:
+     static constexpr size_t fast_dispatch_table_size = 0x10000;
+     void ClearFastDispatchTable();
+     void GenFastmemFallbacks();
++    template<size_t bitsize>
++    void EmitReadMemoryVia(A32EmitContext& ctx, IR::Inst* inst);
++    template<size_t bitsize>
++    void EmitWriteMemoryVia(A32EmitContext& ctx, IR::Inst* inst);
+     void GenTerminalHandlers();
+ 
+     // Microinstruction emitters
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+index e866b2acd..6c082bdb6 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+@@ -169,6 +169,264 @@ void A32EmitX64::EmitA32WriteMemory64(A32EmitContext& ctx, IR::Inst* inst) {
+     EmitMemoryWrite<64, &A32::UserCallbacks::MemoryWrite>(ctx, inst);
+ }
+ 
++namespace {
++// The slow path of a word of a multiple access whose shared walk failed (A32HostPointer gave 0):
++// its own walk, as an ordinary access's (in two registers saved on the stack meanwhile), and only
++// if that fails too the memory callbacks. `start` is the access's address for the time being (the
++// caller adds and takes off the offset); `value` is loaded (read) or stored (write).
++// A load (`is_write` false) or store of `bitsize` bits at `address`, zero-extending a load
++void EmitHostMov(BlockOfCode& code, size_t bitsize, bool is_write, Xbyak::Reg64 value, const Xbyak::Address& address) {
++    switch (bitsize) {
++    case 8:
++        is_write ? code.mov(address, value.cvt8()) : code.movzx(value.cvt32(), address);
++        break;
++    case 16:
++        is_write ? code.mov(address, value.cvt16()) : code.movzx(value.cvt32(), address);
++        break;
++    case 32:
++        is_write ? code.mov(address, value.cvt32()) : code.mov(value.cvt32(), address);
++        break;
++    default:
++        is_write ? code.mov(address, value) : code.mov(value, address);
++        break;
++    }
++}
++
++Xbyak::Address HostOperand(BlockOfCode& code, size_t bitsize, const Xbyak::RegExp& where) {
++    switch (bitsize) {
++    case 8:
++        return code.byte[where];
++    case 16:
++        return code.word[where];
++    case 32:
++        return code.dword[where];
++    default:
++        return code.qword[where];
++    }
++}
++
++void EmitViaSlowPath(BlockOfCode& code, const A32::UserConfig& conf, size_t bitsize, Xbyak::Reg64 start, Xbyak::Reg64 value,
++                     Xbyak::Reg64 host, bool is_write, void (*fallback)(), u32 offset, Xbyak::Label& end) {
++    const auto avoid = [&](const Xbyak::Reg64& r) {
++        return r.getIdx() == start.getIdx() || r.getIdx() == value.getIdx() || r.getIdx() == host.getIdx();
++    };
++    Xbyak::Reg64 regs[2];
++    size_t found = 0;
++    for (const Xbyak::Reg64& r : {code.rax, code.rcx, code.rdx, code.rbx, code.rsi, code.rdi, code.r8, code.r9}) {
++        if (found < 2 && !avoid(r)) {
++            regs[found++] = r;
++        }
++    }
++    const Xbyak::Reg64 page = regs[0], tmp = regs[1];
++    Xbyak::Label callback;
++    if (offset != 0) {
++        code.add(start.cvt32(), offset);
++    }
++    code.push(page);
++    code.push(tmp);
++    // an access that would cross into the next page goes to the callbacks
++    if (bitsize > 8) {
++        code.mov(tmp.cvt32(), start.cvt32());
++        code.and_(tmp.cvt32(), u32(page_table_const_mask));
++        code.cmp(tmp.cvt32(), u32(page_table_const_size - bitsize / 8));
++        code.ja(callback, code.T_NEAR);
++    }
++    code.mov(tmp, start);
++    code.shr(tmp, int(page_table_const_bits));
++    if (conf.page_table_log2_stride > 3) {
++        code.shl(tmp, int(conf.page_table_log2_stride));
++        code.mov(page, qword[r14 + tmp]);
++    } else {
++        code.mov(page, qword[r14 + tmp * int(1 << conf.page_table_log2_stride)]);
++    }
++    if (conf.page_table_marked_bit && (is_write || conf.page_table_marked_bit_reads)) {
++        code.bt(page, *conf.page_table_marked_bit);
++        code.jc(callback, code.T_NEAR);
++    }
++    if (conf.page_table_pointer_mask == 0) {
++        code.test(page, page);
++    } else if (std::in_range<s32>(s64(EffectivePointerMask(conf)))) {
++        code.and_(page, u32(s32(EffectivePointerMask(conf))));
++    } else {
++        code.mov(tmp, conf.page_table_pointer_mask);
++        code.and_(page, tmp);
++    }
++    if (conf.page_table_sign_extension) {
++        code.shl(page, 63 - int(*conf.page_table_sign_extension));
++        code.sar(page, 63 - int(*conf.page_table_sign_extension));
++    }
++    code.jz(callback, code.T_NEAR);
++    if (!conf.absolute_offset_page_table) {
++        code.mov(tmp, start);
++        code.and_(tmp, u32(page_table_const_mask));
++        code.add(page, tmp);
++    } else {
++        code.add(page, start);
++    }
++    EmitHostMov(code, bitsize, is_write, value, HostOperand(code, bitsize, page));
++    code.pop(tmp);
++    code.pop(page);
++    if (offset != 0) {
++        code.sub(start.cvt32(), offset);
++    }
++    code.jmp(end, code.T_NEAR);
++
++    code.L(callback);
++    code.pop(tmp);
++    code.pop(page);
++    code.call(fallback);
++    if (offset != 0) {
++        code.sub(start.cvt32(), offset);
++    }
++    code.jmp(end, code.T_NEAR);
++}
++}  // namespace
++
++// One page table walk for a load or store of several words (frontend: BeginMultipleAccess): the host
++// address of the first, or 0 when any of them would leave the inline walk (the words cross into the
++// next page, or the page is unmapped, or marked and this is a write). As EmitVAddrLookup, once.
++void A32EmitX64::EmitA32HostPointer(A32EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u32 span = args[1].GetImmediateU32();
++    const bool is_write = args[2].GetImmediateU1();
++    ASSERT(conf.page_table && span >= 1 && span <= page_table_const_size);
++
++    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[0]);
++    const Xbyak::Reg64 page = ctx.reg_alloc.ScratchGpr(code);
++    const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
++    Xbyak::Label fail, done;
++
++    // all of [vaddr, vaddr + span) in vaddr's page
++    code.mov(tmp.cvt32(), vaddr.cvt32());
++    code.and_(tmp.cvt32(), u32(page_table_const_mask));
++    code.cmp(tmp.cvt32(), u32(page_table_const_size - span));
++    code.ja(fail, code.T_NEAR);
++
++    code.mov(tmp, vaddr);
++    code.shr(tmp, int(page_table_const_bits));
++    if (conf.page_table_log2_stride > 3) {
++        code.shl(tmp, int(conf.page_table_log2_stride));
++        code.mov(page, qword[r14 + tmp]);
++    } else {
++        code.mov(page, qword[r14 + tmp * int(1 << conf.page_table_log2_stride)]);
++    }
++    if (conf.page_table_marked_bit && (is_write || conf.page_table_marked_bit_reads)) {
++        code.bt(page, *conf.page_table_marked_bit);
++        code.jc(fail, code.T_NEAR);
++    }
++    if (conf.page_table_pointer_mask == 0) {
++        code.test(page, page);
++    } else if (std::in_range<s32>(s64(EffectivePointerMask(conf)))) {
++        code.and_(page, u32(s32(EffectivePointerMask(conf))));
++    } else {
++        code.mov(tmp, conf.page_table_pointer_mask);
++        code.and_(page, tmp);
++    }
++    if (conf.page_table_sign_extension) {
++        code.shl(page, 63 - int(*conf.page_table_sign_extension));
++        code.sar(page, 63 - int(*conf.page_table_sign_extension));
++    }
++    code.jz(fail, code.T_NEAR);
++    if (conf.absolute_offset_page_table) {
++        code.add(page, vaddr);
++    } else {
++        code.mov(tmp, vaddr);
++        code.and_(tmp, u32(page_table_const_mask));
++        code.add(page, tmp);
++    }
++    code.jmp(done, code.T_NEAR);
++    code.L(fail);
++    code.xor_(page.cvt32(), page.cvt32());
++    code.L(done);
++
++    ctx.reg_alloc.DefineValue(code, inst, page);
++}
++
++// An access of a multiple access, or of a group sharing a base register (A32SharedWalkPass), through
++// its host address (A32HostPointer); or, when that is 0, its own walk and if need be the memory
++// callbacks (EmitViaSlowPath), for its address: the start (args[1], the same for the whole group)
++// plus its offset, put in the start's register meanwhile and taken off again after (the fallbacks
++// keep every register but the value's)
++template<size_t bitsize>
++void A32EmitX64::EmitReadMemoryVia(A32EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u32 offset = args[2].GetImmediateU32();
++    const Xbyak::Reg64 host = ctx.reg_alloc.UseGpr(code, args[0]);
++    const Xbyak::Reg64 start = ctx.reg_alloc.UseGpr(code, args[1]);
++    const Xbyak::Reg64 value = ctx.reg_alloc.ScratchGpr(code);
++    const auto wrapped_fn = read_fallbacks[std::make_tuple(false, bitsize, start.getIdx(), value.getIdx())];
++
++    SharedLabel slow = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
++    code.test(host, host);
++    code.jz(*slow, code.T_NEAR);
++    EmitHostMov(code, bitsize, false, value, HostOperand(code, bitsize, host + s32(offset)));
++    code.L(*end);
++    ctx.deferred_emits.emplace_back([=, this] {
++        code.L(*slow);
++        EmitViaSlowPath(code, conf, bitsize, start, value, host, false, wrapped_fn, offset, *end);
++    });
++
++    ctx.reg_alloc.DefineValue(code, inst, value);
++}
++
++template<size_t bitsize>
++void A32EmitX64::EmitWriteMemoryVia(A32EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u32 offset = args[3].GetImmediateU32();
++    const Xbyak::Reg64 host = ctx.reg_alloc.UseGpr(code, args[0]);
++    Xbyak::Reg64 start = ctx.reg_alloc.UseGpr(code, args[1]);
++    const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[2]);
++    if (start.getIdx() == value.getIdx()) {
++        // (storing the base register itself: the slow path's offset mustn't change the value)
++        const Xbyak::Reg64 copy = ctx.reg_alloc.ScratchGpr(code);
++        code.mov(copy.cvt32(), start.cvt32());
++        start = copy;
++    }
++    const auto wrapped_fn = write_fallbacks[std::make_tuple(false, bitsize, start.getIdx(), value.getIdx())];
++
++    SharedLabel slow = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
++    code.test(host, host);
++    code.jz(*slow, code.T_NEAR);
++    EmitHostMov(code, bitsize, true, value, HostOperand(code, bitsize, host + s32(offset)));
++    code.L(*end);
++    ctx.deferred_emits.emplace_back([=, this] {
++        code.L(*slow);
++        EmitViaSlowPath(code, conf, bitsize, start, value, host, true, wrapped_fn, offset, *end);
++    });
++}
++
++void A32EmitX64::EmitA32ReadMemoryVia8(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<8>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32ReadMemoryVia16(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<16>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32ReadMemoryVia32(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<32>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32ReadMemoryVia64(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitReadMemoryVia<64>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32WriteMemoryVia8(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<8>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32WriteMemoryVia16(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<16>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32WriteMemoryVia32(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<32>(ctx, inst);
++}
++
++void A32EmitX64::EmitA32WriteMemoryVia64(A32EmitContext& ctx, IR::Inst* inst) {
++    EmitWriteMemoryVia<64>(ctx, inst);
++}
++
+ void A32EmitX64::EmitA32ClearExclusive(A32EmitContext&, IR::Inst*) {
+     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(A32JitState, exclusive_state)], u8(0));
+ }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index aef7f99a1..8b5ad2c0b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -204,7 +204,9 @@ private:
+         auto const arch_descriptor = A32::LocationDescriptor{descriptor};
+         ir_block.Reset(arch_descriptor);
+         ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
+-        A32::Translate(ir_block, arch_descriptor, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions});
++        A32::Translate(ir_block, arch_descriptor, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions,
++                                                                   conf.page_table_single_walk_multiple && conf.page_table && !conf.fastmem_pointer &&
++                                                                       !conf.check_halt_on_memory_access});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         return emitter.Emit(ir_block);
+     }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp
+index 784853918..3ec5e2fb3 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp
+@@ -319,6 +319,29 @@ void IREmitter::WriteMemory32(const IR::U32& vaddr, const IR::U32& value, IR::Ac
+     }
+ }
+ 
++IREmitter::MultipleAccess IREmitter::BeginMultipleAccess(const IR::U32& start, size_t bytes, bool is_write) {
++    // (one word: nothing to share; more than a page: never in one)
++    if (!single_walk_multiple || bytes < 8 || bytes > 4096) {
++        return {};
++    }
++    return {Inst<IR::U64>(Opcode::A32HostPointer, start, Imm32(u32(bytes)), Imm1(is_write)), start};
++}
++
++IR::U32 IREmitter::ReadMemory32(const MultipleAccess& access, const IR::U32& vaddr, u32 offset, IR::AccType acc_type) {
++    if (!access.host) {
++        return ReadMemory32(vaddr, acc_type);
++    }
++    const auto value = Inst<IR::U32>(Opcode::A32ReadMemoryVia32, *access.host, *access.start, Imm32(offset));
++    return current_location.EFlag() ? ByteReverseWord(value) : value;
++}
++
++void IREmitter::WriteMemory32(const MultipleAccess& access, const IR::U32& vaddr, const IR::U32& value, u32 offset, IR::AccType acc_type) {
++    if (!access.host) {
++        return WriteMemory32(vaddr, value, acc_type);
++    }
++    Inst(Opcode::A32WriteMemoryVia32, *access.host, *access.start, current_location.EFlag() ? ByteReverseWord(value) : value, Imm32(offset));
++}
++
+ void IREmitter::WriteMemory64(const IR::U32& vaddr, const IR::U64& value, IR::AccType acc_type) {
+     if (current_location.EFlag()) {
+         const auto v = ByteReverseDual(value);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
+index 5529c8b72..7dacc9452 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <utility>
+ 
+ #include "common/common_types.h"
+@@ -96,6 +97,22 @@ public:
+     void WriteMemory8(const IR::U32& vaddr, const IR::U8& value, IR::AccType acc_type);
+     void WriteMemory16(const IR::U32& vaddr, const IR::U16& value, IR::AccType acc_type);
+     void WriteMemory32(const IR::U32& vaddr, const IR::U32& value, IR::AccType acc_type);
++
++    /// A load or store of several words from `start` (LDM, STM, PUSH, POP, VLDM, VSTM...): with
++    /// single_walk_multiple, one page table walk for all of them (A32HostPointer), which each
++    /// access then uses (A32ReadMemoryVia32, A32WriteMemoryVia32); an access whose walk failed
++    /// (the words cross into another page, or it's unmapped, or marked for a write) takes the
++    /// memory callbacks. Otherwise (`host` empty) each access walks the page table itself, as
++    /// ReadMemory32 and WriteMemory32 do. With a walk, `vaddr` isn't used: the access's address is
++    /// `start` plus `offset`, computed only if it takes the callbacks (the translator's address
++    /// arithmetic is then dead, and removed).
++    struct MultipleAccess {
++        std::optional<IR::U64> host;
++        std::optional<IR::U32> start;  // (each access's address: start plus its offset)
++    };
++    MultipleAccess BeginMultipleAccess(const IR::U32& start, size_t bytes, bool is_write);
++    IR::U32 ReadMemory32(const MultipleAccess& access, const IR::U32& vaddr, u32 offset, IR::AccType acc_type);
++    void WriteMemory32(const MultipleAccess& access, const IR::U32& vaddr, const IR::U32& value, u32 offset, IR::AccType acc_type);
+     void WriteMemory64(const IR::U32& vaddr, const IR::U64& value, IR::AccType acc_type);
+     IR::U32 ExclusiveWriteMemory8(const IR::U32& vaddr, const IR::U8& value, IR::AccType acc_type);
+     IR::U32 ExclusiveWriteMemory16(const IR::U32& vaddr, const IR::U16& value, IR::AccType acc_type);
+@@ -112,6 +129,7 @@ public:
+ public:
+     LocationDescriptor current_location;
+     enum ArchVersion arch_version;
++    bool single_walk_multiple = false;  // (TranslationOptions::single_walk_multiple)
+ };
+ 
+ }  // namespace Dynarmic::A32
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h b/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h
+index d39e80a54..7ed5d13df 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h
+@@ -32,6 +32,11 @@ struct TranslationOptions {
+     /// If this is false, we treat the instruction as a NOP.
+     /// If this is true, we emit an ExceptionRaised instruction.
+     bool hook_hint_instructions = true;
++
++    /// Loads and stores of several registers (LDM, STM, PUSH, POP, VLDM, VSTM, VPUSH, VPOP) walk the
++    /// page table once for all of them (A32HostPointer) instead of once for each, when they stay
++    /// within one page. Only with a page table and without fastmem.
++    bool single_walk_multiple = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index dd88b7923..3aa76b6aa 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -26,7 +26,9 @@ struct TranslatorVisitor final {
+     using instruction_return_type = bool;
+ 
+     explicit TranslatorVisitor(IR::Block& block, LocationDescriptor descriptor, const TranslationOptions& options)
+-            : ir(block, descriptor, options.arch_version), options(options) {}
++            : ir(block, descriptor, options.arch_version), options(options) {
++        ir.single_walk_multiple = options.single_walk_multiple;
++    }
+ 
+     A32::IREmitter ir;
+     ConditionalState cond_state = ConditionalState::None;
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/load_store.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/load_store.cpp
+index 208e7d112..afe7dea78 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/load_store.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/load_store.cpp
+@@ -776,18 +776,21 @@ bool TranslatorVisitor::arm_STRH_reg(Cond cond, bool P, bool U, bool W, Reg n, R
+ }
+ 
+ static bool LDMHelper(A32::IREmitter& ir, bool W, Reg n, RegList list, IR::U32 start_address, IR::U32 writeback_address) {
++    const auto access = ir.BeginMultipleAccess(start_address, size_t(std::popcount(list)) * 4, false);
+     auto address = start_address;
++    u32 offset = 0;
+     for (size_t i = 0; i <= 14; i++) {
+         if (mcl::bit::get_bit(i, list)) {
+-            ir.SetRegister(static_cast<Reg>(i), ir.ReadMemory32(address, IR::AccType::ATOMIC));
++            ir.SetRegister(static_cast<Reg>(i), ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC));
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+     if (W && !mcl::bit::get_bit(RegNumber(n), list)) {
+         ir.SetRegister(n, writeback_address);
+     }
+     if (mcl::bit::get_bit<15>(list)) {
+-        ir.LoadWritePC(ir.ReadMemory32(address, IR::AccType::ATOMIC));
++        ir.LoadWritePC(ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC));
+         if (n == Reg::R13)
+             ir.SetTerm(IR::Term::PopRSBHint{});
+         else
+@@ -878,18 +881,21 @@ bool TranslatorVisitor::arm_LDM_eret() {
+ }
+ 
+ static bool STMHelper(A32::IREmitter& ir, bool W, Reg n, RegList list, IR::U32 start_address, IR::U32 writeback_address) {
++    const auto access = ir.BeginMultipleAccess(start_address, size_t(std::popcount(list)) * 4, true);
+     auto address = start_address;
++    u32 offset = 0;
+     for (size_t i = 0; i <= 14; i++) {
+         if (mcl::bit::get_bit(i, list)) {
+-            ir.WriteMemory32(address, ir.GetRegister(static_cast<Reg>(i)), IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, ir.GetRegister(static_cast<Reg>(i)), offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+     if (W) {
+         ir.SetRegister(n, writeback_address);
+     }
+     if (mcl::bit::get_bit<15>(list)) {
+-        ir.WriteMemory32(address, ir.Imm32(ir.PC()), IR::AccType::ATOMIC);
++        ir.WriteMemory32(access, address, ir.Imm32(ir.PC()), offset, IR::AccType::ATOMIC);
+     }
+     return true;
+ }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp
+index 082cd30db..feb052cd2 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp
+@@ -744,13 +744,16 @@ bool TranslatorVisitor::thumb16_PUSH(bool M, RegList reg_list) {
+ 
+     const u32 num_bytes_to_push = static_cast<u32>(4 * std::popcount(reg_list));
+     const auto final_address = ir.Sub(ir.GetRegister(Reg::SP), ir.Imm32(num_bytes_to_push));
++    const auto access = ir.BeginMultipleAccess(final_address, num_bytes_to_push, true);
+     auto address = final_address;
++    u32 offset = 0;
+     for (size_t i = 0; i < 16; i++) {
+         if (mcl::bit::get_bit(i, reg_list)) {
+             // TODO: Deal with alignment
+             const auto Ri = ir.GetRegister(static_cast<Reg>(i));
+-            ir.WriteMemory32(address, Ri, IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, Ri, offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+ 
+@@ -769,18 +772,21 @@ bool TranslatorVisitor::thumb16_POP(bool P, RegList reg_list) {
+     }
+ 
+     auto address = ir.GetRegister(Reg::SP);
++    const auto access = ir.BeginMultipleAccess(address, size_t(std::popcount(reg_list)) * 4, false);
++    u32 offset = 0;
+     for (size_t i = 0; i < 15; i++) {
+         if (mcl::bit::get_bit(i, reg_list)) {
+             // TODO: Deal with alignment
+-            const auto data = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++            const auto data = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
+             ir.SetRegister(static_cast<Reg>(i), data);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+ 
+     if (mcl::bit::get_bit<15>(reg_list)) {
+         // TODO(optimization): Possible location for an RSB pop.
+-        const auto data = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++        const auto data = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
+         ir.UpdateUpperLocationDescriptor();
+         ir.LoadWritePC(data);
+         address = ir.Add(address, ir.Imm32(4));
+@@ -859,11 +865,14 @@ bool TranslatorVisitor::thumb16_STMIA(Reg n, RegList reg_list) {
+     }
+ 
+     auto address = ir.GetRegister(n);
++    const auto access = ir.BeginMultipleAccess(address, size_t(std::popcount(reg_list)) * 4, true);
++    u32 offset = 0;
+     for (size_t i = 0; i < 8; i++) {
+         if (mcl::bit::get_bit(i, reg_list)) {
+             const auto Ri = ir.GetRegister(static_cast<Reg>(i));
+-            ir.WriteMemory32(address, Ri, IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, Ri, offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+ 
+@@ -879,12 +888,15 @@ bool TranslatorVisitor::thumb16_LDMIA(Reg n, RegList reg_list) {
+ 
+     const bool write_back = !mcl::bit::get_bit(static_cast<size_t>(n), reg_list);
+     auto address = ir.GetRegister(n);
++    const auto access = ir.BeginMultipleAccess(address, size_t(std::popcount(reg_list)) * 4, false);
++    u32 offset = 0;
+ 
+     for (size_t i = 0; i < 8; i++) {
+         if (mcl::bit::get_bit(i, reg_list)) {
+-            const auto data = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++            const auto data = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
+             ir.SetRegister(static_cast<Reg>(i), data);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+ 
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb32_load_store_multiple.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb32_load_store_multiple.cpp
+index e829c6fb4..f6e0bdf29 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb32_load_store_multiple.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/thumb32_load_store_multiple.cpp
+@@ -14,11 +14,14 @@
+ namespace Dynarmic::A32 {
+ 
+ static bool LDMHelper(A32::IREmitter& ir, bool W, Reg n, u32 list, const IR::U32& start_address, const IR::U32& writeback_address) {
++    const auto access = ir.BeginMultipleAccess(start_address, size_t(std::popcount(list)) * 4, false);
+     auto address = start_address;
++    u32 offset = 0;
+     for (size_t i = 0; i <= 14; i++) {
+         if (mcl::bit::get_bit(i, list)) {
+-            ir.SetRegister(static_cast<Reg>(i), ir.ReadMemory32(address, IR::AccType::ATOMIC));
++            ir.SetRegister(static_cast<Reg>(i), ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC));
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+     if (W && !mcl::bit::get_bit(RegNumber(n), list)) {
+@@ -26,7 +29,7 @@ static bool LDMHelper(A32::IREmitter& ir, bool W, Reg n, u32 list, const IR::U32
+     }
+     if (mcl::bit::get_bit<15>(list)) {
+         ir.UpdateUpperLocationDescriptor();
+-        ir.LoadWritePC(ir.ReadMemory32(address, IR::AccType::ATOMIC));
++        ir.LoadWritePC(ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC));
+         if (n == Reg::R13) {
+             ir.SetTerm(IR::Term::PopRSBHint{});
+         } else {
+@@ -38,11 +41,14 @@ static bool LDMHelper(A32::IREmitter& ir, bool W, Reg n, u32 list, const IR::U32
+ }
+ 
+ static bool STMHelper(A32::IREmitter& ir, bool W, Reg n, u32 list, const IR::U32& start_address, const IR::U32& writeback_address) {
++    const auto access = ir.BeginMultipleAccess(start_address, size_t(std::popcount(list)) * 4, true);
+     auto address = start_address;
++    u32 offset = 0;
+     for (size_t i = 0; i <= 14; i++) {
+         if (mcl::bit::get_bit(i, list)) {
+-            ir.WriteMemory32(address, ir.GetRegister(static_cast<Reg>(i)), IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, ir.GetRegister(static_cast<Reg>(i)), offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+     if (W) {
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/vfp.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+index 794d24792..f756d8593 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+@@ -1187,20 +1187,24 @@ bool TranslatorVisitor::vfp_VPOP(Cond cond, bool D, size_t Vd, bool sz, Imm<8> i
+     auto address = ir.GetRegister(Reg::SP);
+     ir.SetRegister(Reg::SP, ir.Add(address, ir.Imm32(imm32)));
+ 
++    const auto access = ir.BeginMultipleAccess(address, regs * (sz ? 8 : 4), false);
++    u32 offset = 0;
+     for (size_t i = 0; i < regs; ++i) {
+         if (sz) {
+-            auto lo = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++            auto lo = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
+-            auto hi = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++            auto hi = ir.ReadMemory32(access, address, offset + 4, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 8;
+             if (ir.current_location.EFlag()) {
+                 std::swap(lo, hi);
+             }
+             ir.SetExtendedRegister(d + i, ir.Pack2x32To1x64(lo, hi));
+         } else {
+-            const auto res = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++            const auto res = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
+             ir.SetExtendedRegister(d + i, res);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+ 
+@@ -1228,6 +1232,8 @@ bool TranslatorVisitor::vfp_VPUSH(Cond cond, bool D, size_t Vd, bool sz, Imm<8>
+     auto address = ir.Sub(ir.GetRegister(Reg::SP), ir.Imm32(imm32));
+     ir.SetRegister(Reg::SP, address);
+ 
++    const auto access = ir.BeginMultipleAccess(address, regs * (sz ? 8 : 4), true);
++    u32 offset = 0;
+     for (size_t i = 0; i < regs; ++i) {
+         if (sz) {
+             const auto reg_d = ir.GetExtendedRegister(d + i);
+@@ -1235,13 +1241,15 @@ bool TranslatorVisitor::vfp_VPUSH(Cond cond, bool D, size_t Vd, bool sz, Imm<8>
+             auto hi = ir.MostSignificantWord(reg_d).result;
+             if (ir.current_location.EFlag())
+                 std::swap(lo, hi);
+-            ir.WriteMemory32(address, lo, IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, lo, offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
+-            ir.WriteMemory32(address, hi, IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, hi, offset + 4, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 8;
+         } else {
+-            ir.WriteMemory32(address, ir.GetExtendedRegister(d + i), IR::AccType::ATOMIC);
++            ir.WriteMemory32(access, address, ir.GetExtendedRegister(d + i), offset, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
++            offset += 4;
+         }
+     }
+ 
+@@ -1261,8 +1269,9 @@ bool TranslatorVisitor::vfp_VLDR(Cond cond, bool U, bool D, Reg n, size_t Vd, bo
+     const auto address = U ? ir.Add(base, ir.Imm32(imm32)) : ir.Sub(base, ir.Imm32(imm32));
+ 
+     if (sz) {
+-        auto lo = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+-        auto hi = ir.ReadMemory32(ir.Add(address, ir.Imm32(4)), IR::AccType::ATOMIC);
++        const auto access = ir.BeginMultipleAccess(address, 8, false);
++        auto lo = ir.ReadMemory32(access, address, 0, IR::AccType::ATOMIC);
++        auto hi = ir.ReadMemory32(access, ir.Add(address, ir.Imm32(4)), 4, IR::AccType::ATOMIC);
+         if (ir.current_location.EFlag()) {
+             std::swap(lo, hi);
+         }
+@@ -1292,8 +1301,9 @@ bool TranslatorVisitor::vfp_VSTR(Cond cond, bool U, bool D, Reg n, size_t Vd, bo
+         if (ir.current_location.EFlag()) {
+             std::swap(lo, hi);
+         }
+-        ir.WriteMemory32(address, lo, IR::AccType::ATOMIC);
+-        ir.WriteMemory32(ir.Add(address, ir.Imm32(4)), hi, IR::AccType::ATOMIC);
++        const auto access = ir.BeginMultipleAccess(address, 8, true);
++        ir.WriteMemory32(access, address, lo, 0, IR::AccType::ATOMIC);
++        ir.WriteMemory32(access, ir.Add(address, ir.Imm32(4)), hi, 4, IR::AccType::ATOMIC);
+     } else {
+         ir.WriteMemory32(address, ir.GetExtendedRegister(d), IR::AccType::ATOMIC);
+     }
+@@ -1335,6 +1345,8 @@ bool TranslatorVisitor::vfp_VSTM_a1(Cond cond, bool p, bool u, bool D, bool w, R
+     if (w) {
+         ir.SetRegister(n, u ? IR::U32(ir.Add(address, ir.Imm32(imm32))) : address);
+     }
++    const auto access = ir.BeginMultipleAccess(address, regs * 8, true);
++    u32 offset = 0;
+     for (size_t i = 0; i < regs; i++) {
+         const auto value = ir.GetExtendedRegister(d + i);
+         auto word1 = ir.LeastSignificantWord(value);
+@@ -1344,9 +1356,11 @@ bool TranslatorVisitor::vfp_VSTM_a1(Cond cond, bool p, bool u, bool D, bool w, R
+             std::swap(word1, word2);
+         }
+ 
+-        ir.WriteMemory32(address, word1, IR::AccType::ATOMIC);
++        ir.WriteMemory32(access, address, word1, offset, IR::AccType::ATOMIC);
++        offset += 4;
+         address = ir.Add(address, ir.Imm32(4));
+-        ir.WriteMemory32(address, word2, IR::AccType::ATOMIC);
++        ir.WriteMemory32(access, address, word2, offset, IR::AccType::ATOMIC);
++        offset += 4;
+         address = ir.Add(address, ir.Imm32(4));
+     }
+ 
+@@ -1387,9 +1401,12 @@ bool TranslatorVisitor::vfp_VSTM_a2(Cond cond, bool p, bool u, bool D, bool w, R
+     if (w) {
+         ir.SetRegister(n, u ? IR::U32(ir.Add(address, ir.Imm32(imm32))) : address);
+     }
++    const auto access = ir.BeginMultipleAccess(address, regs * 4, true);
++    u32 offset = 0;
+     for (size_t i = 0; i < regs; i++) {
+         const auto word = ir.GetExtendedRegister(d + i);
+-        ir.WriteMemory32(address, word, IR::AccType::ATOMIC);
++        ir.WriteMemory32(access, address, word, offset, IR::AccType::ATOMIC);
++        offset += 4;
+         address = ir.Add(address, ir.Imm32(4));
+     }
+ 
+@@ -1430,10 +1447,14 @@ bool TranslatorVisitor::vfp_VLDM_a1(Cond cond, bool p, bool u, bool D, bool w, R
+     if (w) {
+         ir.SetRegister(n, u ? IR::U32(ir.Add(address, ir.Imm32(imm32))) : address);
+     }
++    const auto access = ir.BeginMultipleAccess(address, regs * 8, false);
++    u32 offset = 0;
+     for (size_t i = 0; i < regs; i++) {
+-        auto word1 = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++        auto word1 = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
++        offset += 4;
+         address = ir.Add(address, ir.Imm32(4));
+-        auto word2 = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++        auto word2 = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
++        offset += 4;
+         address = ir.Add(address, ir.Imm32(4));
+ 
+         if (ir.current_location.EFlag()) {
+@@ -1480,8 +1501,11 @@ bool TranslatorVisitor::vfp_VLDM_a2(Cond cond, bool p, bool u, bool D, bool w, R
+     if (w) {
+         ir.SetRegister(n, u ? IR::U32(ir.Add(address, ir.Imm32(imm32))) : address);
+     }
++    const auto access = ir.BeginMultipleAccess(address, regs * 4, false);
++    u32 offset = 0;
+     for (size_t i = 0; i < regs; i++) {
+-        const auto word = ir.ReadMemory32(address, IR::AccType::ATOMIC);
++        const auto word = ir.ReadMemory32(access, address, offset, IR::AccType::ATOMIC);
++        offset += 4;
+         address = ir.Add(address, ir.Imm32(4));
+         ir.SetExtendedRegister(d + i, word);
+     }
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 225914cf3..39ab18339 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -210,6 +210,12 @@ struct UserConfig {
+     /// page boundary.
+     bool only_detect_misalignment_via_page_table_on_page_boundary = false;
+ 
++    /// Loads and stores of several words (LDM, STM, PUSH, POP, VLDM, VSTM, VPUSH, VPOP, a double's
++    /// VLDR and VSTR) walk the page table once for all of them instead of once for each, when they
++    /// stay within a page (else, or when that page is unmapped or marked for a write, each goes
++    /// through the memory callbacks). Used with a page table and without fastmem.
++    bool page_table_single_walk_multiple = true;
++
+     /// Determines if instructions that pagefault should cause recompilation of that block
+     /// with fastmem disabled.
+     /// Recompiled code will use the page_table if this is available, otherwise memory
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index f975896a6..ff5a898b7 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -92,6 +92,10 @@ constexpr bool IsSharedMemoryRead(const Opcode op) noexcept {
+     case Opcode::A32ReadMemory16:
+     case Opcode::A32ReadMemory32:
+     case Opcode::A32ReadMemory64:
++    case Opcode::A32ReadMemoryVia8:
++    case Opcode::A32ReadMemoryVia16:
++    case Opcode::A32ReadMemoryVia32:
++    case Opcode::A32ReadMemoryVia64:
+     case Opcode::A64ReadMemory8:
+     case Opcode::A64ReadMemory16:
+     case Opcode::A64ReadMemory32:
+@@ -111,6 +115,10 @@ constexpr bool IsSharedMemoryWrite(const Opcode op) noexcept {
+     case Opcode::A32WriteMemory16:
+     case Opcode::A32WriteMemory32:
+     case Opcode::A32WriteMemory64:
++    case Opcode::A32WriteMemoryVia8:
++    case Opcode::A32WriteMemoryVia16:
++    case Opcode::A32WriteMemoryVia32:
++    case Opcode::A32WriteMemoryVia64:
+     case Opcode::A64WriteMemory8:
+     case Opcode::A64WriteMemory16:
+     case Opcode::A64WriteMemory32:
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index b1ba5b299..35e78d145 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -764,6 +764,15 @@ A32OPC(WriteMemory8,                                        Void,           U64,
+ A32OPC(WriteMemory16,                                       Void,           U64,            U32,            U16,            AccType         )
+ A32OPC(WriteMemory32,                                       Void,           U64,            U32,            U32,            AccType         )
+ A32OPC(WriteMemory64,                                       Void,           U64,            U32,            U64,            AccType         )
++A32OPC(HostPointer,                                         U64,            U32,            U32,            U1                              )
++A32OPC(ReadMemoryVia8,                                      U8,             U64,            U32,            U32                             )
++A32OPC(ReadMemoryVia16,                                     U16,            U64,            U32,            U32                             )
++A32OPC(ReadMemoryVia32,                                     U32,            U64,            U32,            U32                             )
++A32OPC(ReadMemoryVia64,                                     U64,            U64,            U32,            U32                             )
++A32OPC(WriteMemoryVia8,                                     Void,           U64,            U32,            U8,             U32             )
++A32OPC(WriteMemoryVia16,                                    Void,           U64,            U32,            U16,            U32             )
++A32OPC(WriteMemoryVia32,                                    Void,           U64,            U32,            U32,            U32             )
++A32OPC(WriteMemoryVia64,                                    Void,           U64,            U32,            U64,            U32             )
+ A32OPC(ExclusiveWriteMemory8,                               U32,            U64,            U32,            U8,             AccType         )
+ A32OPC(ExclusiveWriteMemory16,                              U32,            U64,            U32,            U16,            AccType         )
+ A32OPC(ExclusiveWriteMemory32,                              U32,            U64,            U32,            U32,            AccType         )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index b32bbd517..bc68b6849 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -85,6 +85,110 @@ static void ConstantMemoryReads(IR::Block& block, A32::UserCallbacks* cb) {
+     }
+ }
+ 
++// Loads and stores through one base register value (the same IR value, plus or minus a constant)
++// within a block share one page table walk, as loads and stores of several registers do
++// (A32::IREmitter::BeginMultipleAccess): one A32HostPointer before the first, and each becomes an
++// A32ReadMemoryVia* or A32WriteMemoryVia* (whose slow path is the access's own walk). Only groups
++// spanning at most 256 bytes: one that crosses into the next page at run time costs that walk again.
++static void A32SharedWalkPass(IR::Block& block) {
++    struct Member {
++        IR::Block::iterator it;
++        s64 offset;
++        s64 bytes;
++        IR::Opcode via;
++        bool write;
++    };
++    struct Group {
++        IR::Inst* base;
++        std::vector<Member> members;
++    };
++    std::vector<Group> groups;
++    for (auto it = block.instructions.begin(); it != block.instructions.end(); ++it) {
++        const auto op = it->GetOpcode();
++        IR::Opcode via;
++        s64 bytes;
++        bool write;
++        switch (op) {
++        case IR::Opcode::A32ReadMemory8: via = IR::Opcode::A32ReadMemoryVia8, bytes = 1, write = false; break;
++        case IR::Opcode::A32ReadMemory16: via = IR::Opcode::A32ReadMemoryVia16, bytes = 2, write = false; break;
++        case IR::Opcode::A32ReadMemory32: via = IR::Opcode::A32ReadMemoryVia32, bytes = 4, write = false; break;
++        case IR::Opcode::A32ReadMemory64: via = IR::Opcode::A32ReadMemoryVia64, bytes = 8, write = false; break;
++        case IR::Opcode::A32WriteMemory8: via = IR::Opcode::A32WriteMemoryVia8, bytes = 1, write = true; break;
++        case IR::Opcode::A32WriteMemory16: via = IR::Opcode::A32WriteMemoryVia16, bytes = 2, write = true; break;
++        case IR::Opcode::A32WriteMemory32: via = IR::Opcode::A32WriteMemoryVia32, bytes = 4, write = true; break;
++        case IR::Opcode::A32WriteMemory64: via = IR::Opcode::A32WriteMemoryVia64, bytes = 8, write = true; break;
++        default:
++            continue;
++        }
++        const auto acc = it->GetArg(write ? 3 : 2).GetAccType();
++        if (acc == IR::AccType::ORDERED || acc == IR::AccType::ORDEREDRW || acc == IR::AccType::LIMITEDORDERED) {
++            continue;
++        }
++        // (values replaced by others are Identity until IdentityRemovalPass: look through them)
++        const auto resolve = [](IR::Value v) {
++            while (v.IsIdentity()) {
++                v = v.GetInst()->GetArg(0);
++            }
++            return v;
++        };
++        IR::Value base = resolve(it->GetArg(1));
++        s64 offset = 0;
++        if (!base.IsImmediate()) {
++            IR::Inst* address = base.GetInst();
++            if (address->GetOpcode() == IR::Opcode::Add32 && address->GetArg(1).IsImmediate() && address->GetArg(2).IsImmediate() &&
++                !address->GetArg(2).GetU1()) {
++                base = resolve(address->GetArg(0));
++                offset = s64(s32(address->GetArg(1).GetU32()));
++            } else if (address->GetOpcode() == IR::Opcode::Sub32 && address->GetArg(1).IsImmediate() &&
++                       address->GetArg(2).IsImmediate() && address->GetArg(2).GetU1()) {
++                base = resolve(address->GetArg(0));
++                offset = -s64(s32(address->GetArg(1).GetU32()));
++            }
++        }
++        if (base.IsImmediate()) {
++            continue;
++        }
++        auto group = std::find_if(groups.begin(), groups.end(), [&](const Group& g) { return g.base == base.GetInst(); });
++        if (group == groups.end()) {
++            groups.push_back({base.GetInst(), {}});
++            group = groups.end() - 1;
++        }
++        group->members.push_back({it, offset, bytes, via, write});
++    }
++    for (Group& group : groups) {
++        if (group.members.size() < 2) {
++            continue;
++        }
++        s64 lowest = group.members[0].offset, end = lowest;
++        bool any_write = false;
++        for (const Member& m : group.members) {
++            lowest = std::min(lowest, m.offset);
++            end = std::max(end, m.offset + m.bytes);
++            any_write |= m.write;
++        }
++        const s64 span = end - lowest;
++        if (span > 256) {
++            continue;
++        }
++        const auto first = group.members[0].it;
++        IR::Value start{group.base};
++        if (lowest != 0) {
++            start = IR::Value{&*block.PrependNewInst(first, IR::Opcode::Add32, {start, IR::Value{u32(lowest)}, IR::Value{false}})};
++        }
++        const IR::Value host{&*block.PrependNewInst(first, IR::Opcode::A32HostPointer, {start, IR::Value{u32(span)}, IR::Value{any_write}})};
++        for (const Member& m : group.members) {
++            const IR::Value offset{u32(m.offset - lowest)};
++            if (m.write) {
++                block.PrependNewInst(m.it, m.via, {host, start, m.it->GetArg(2), offset});
++                m.it->Invalidate();
++            } else {
++                const auto read = block.PrependNewInst(m.it, m.via, {host, start, offset});
++                m.it->ReplaceUsesWith(IR::Value{&*read});
++            }
++        }
++    }
++}
++
+ static void FlagsPass(IR::Block& block) {
+     using Iterator = typename std::reverse_iterator<IR::Block::iterator>;
+ 
+@@ -1455,6 +1559,10 @@ void Optimize(IR::Block& block, const A32::UserConfig& conf, const Optimization:
+         Optimization::ConstantPropagation(block);
+         Optimization::DeadCodeElimination(block);
+     }
++    if (conf.page_table_single_walk_multiple && conf.page_table && !conf.fastmem_pointer && !conf.check_halt_on_memory_access) {
++        Optimization::A32SharedWalkPass(block);
++        Optimization::DeadCodeElimination(block);
++    }
+     Optimization::IdentityRemovalPass(block);
+     if (!conf.HasOptimization(OptimizationFlag::DisableVerification)) {
+         Optimization::VerificationPass(block);
+-- 
+2.43.0
+

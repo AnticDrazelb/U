@@ -1022,6 +1022,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.fps_overlay = true;
         else if (line == "ram=reserved")
             settings.ram_on_demand = false;
+        else if (line == "threads=free")
+            settings.pin_threads = false;
         else if (line.starts_with("games_folder="))
             settings.games_folder = line.substr(13);
     }
@@ -1033,13 +1035,14 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
-                     settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off");
+                     settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
+                     settings.pin_threads ? "pinned" : "free");
         std::fclose(f);
     }
 }
@@ -1247,6 +1250,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.79: the game's own code runs faster. Every memory access of the Switch's CPU walks a table here "
+         "(the PS4 can't do it the way PCs do), and a function's start and end save and restore up to 17 "
+         "registers, each with its own walk: now one walk does for all of them, and for a run of loads and "
+         "stores through the same register (an object's fields, the stack). On a PC, with the PS4's setup, "
+         "calls take a third to a quarter of the time they did. And the emulated CPU cores and the GPU thread "
+         "now have a core each on the PS4's first module, sharing its cache (System Settings, CPU, Thread "
+         "Placement: Free puts them back). The boot trace says whether the PS4 can map memory twice, which "
+         "the next big step would need.\n"
          "03.78: faster games. An emulated CPU core with nothing to run waits a moment before it sleeps, "
          "so a game's threads hand work to each other without waking a sleeping thread each time; the "
          "Switch's timers fire on time; and the game's ARM code is translated faster (loading, new areas). "
@@ -1817,7 +1828,7 @@ std::string PerfLine(double seconds)
     namespace P = Common::PS4Perf;
     struct Totals
     {
-        uint64_t spins, sleeps, sleep_ns, ipcs, ipc_ns, events, late_ns, blocks, full, ranges, slow;
+        uint64_t spins, sleeps, sleep_ns, ipcs, ipc_ns, events, late_ns, blocks, full, ranges, slow, slow_writes;
     };
     static Totals last{};
     const Totals now{P::idle_spin_wakes.load(std::memory_order_relaxed),
@@ -1830,7 +1841,8 @@ std::string PerfLine(double seconds)
                      P::jit_blocks.load(std::memory_order_relaxed),
                      P::jit_full_flushes.load(std::memory_order_relaxed),
                      P::jit_range_flushes.load(std::memory_order_relaxed),
-                     P::SlowMemoryAccesses()};
+                     P::SlowMemoryAccesses(),
+                     P::Total(P::slow_memory_writes)};
     // (the maxima since the last call)
     const uint64_t sleep_max = P::idle_sleep_wakes.max_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t ipc_max = P::ipc.max_ns.exchange(0, std::memory_order_relaxed);
@@ -1842,13 +1854,14 @@ std::string PerfLine(double seconds)
         "signal, at most {:.0f}); service calls {:.0f} a second, {:.0f} us each (at most {:.0f}); timer events {:.0f} "
         "a second, {:.0f} us late (at most {:.0f}; timed waits overshoot {:.0f} us); the recompiler translated {:.0f} "
         "blocks a second, flushed its whole cache {} times and parts of it {} times; {:.0f} memory accesses a second "
-        "left the inline page table walk",
+        "left the inline page table walk ({:.0f} of them writes)",
         rate(now.spins, last.spins), rate(now.sleeps, last.sleeps),
         average_us(now.sleep_ns - last.sleep_ns, now.sleeps - last.sleeps), double(sleep_max) / 1000.0,
         rate(now.ipcs, last.ipcs), average_us(now.ipc_ns - last.ipc_ns, now.ipcs - last.ipcs), double(ipc_max) / 1000.0,
         rate(now.events, last.events), average_us(now.late_ns - last.late_ns, now.events - last.events),
         double(late_max) / 1000.0, double(P::timer_overshoot_ns.load(std::memory_order_relaxed)) / 1000.0,
-        rate(now.blocks, last.blocks), now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow));
+        rate(now.blocks, last.blocks), now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow),
+        rate(now.slow_writes, last.slow_writes));
     last = now;
     return line;
 }
@@ -2041,14 +2054,17 @@ void* Run(void*)
         ps4_set_app_cores(settings.seventh_core ? 0x7F : 0x3F);
         // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
         setenv("EDEN_PS4_DRAM_ON_DEMAND", settings.ram_on_demand ? "1" : "0", 1);
+        // read by the runtime as Eden's threads name themselves (port/ps4_runtime.cpp, ps4_place_thread)
+        setenv("EDEN_PS4_PIN_THREADS", settings.pin_threads ? "1" : "0", 1);
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}; CPU {}, {} cores; the Switch's RAM {}{}",
+            "GPU accuracy {}; CPU {}, {} cores, threads {}; the Switch's RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.cpu_unsafe ? "unsafe" : "auto",
-            settings.seventh_core ? 7 : 6, settings.ram_on_demand ? "on demand" : "all up front",
+            settings.seventh_core ? 7 : 6, settings.pin_threads ? "pinned" : "free",
+            settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
         if (settings.profiler)
@@ -2123,10 +2139,58 @@ void* Run(void*)
 
 } // namespace
 
+// Can the PS4 map the same direct memory at two addresses for this app? Fastmem (Eden's recompiler
+// reading and writing guest memory without walking a page table) needs the emulated RAM mapped
+// twice. Tried once with 64 KiB: both mappings, a word written through one and read through the
+// other; the boot trace says what happened. Nothing else depends on it yet.
+static void ProbeDoubleMapping()
+{
+    constexpr size_t kSize = 64 * 1024;
+    off_t phys = 0;
+    int32_t r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kSize, kSize, 0, &phys);
+    if (r != 0)
+    {
+        Trace(fmt::format("double mapping: allocating direct memory failed ({:#x})", uint32_t(r)));
+        return;
+    }
+    void* first = nullptr;
+    void* second = nullptr;
+    r = sceKernelMapDirectMemory(&first, kSize, 0x03, 0, phys, kSize);
+    if (r != 0)
+    {
+        Trace(fmt::format("double mapping: the first mapping failed ({:#x})", uint32_t(r)));
+        sceKernelReleaseDirectMemory(phys, kSize);
+        return;
+    }
+    const int32_t r2 = sceKernelMapDirectMemory(&second, kSize, 0x03, 0, phys, kSize);
+    if (r2 != 0)
+    {
+        Trace(fmt::format("double mapping: no, the second mapping of the same memory failed ({:#x}); fastmem "
+                          "would need another way", uint32_t(r2)));
+    }
+    else
+    {
+        volatile uint32_t* a = static_cast<volatile uint32_t*>(first);
+        volatile uint32_t* b = static_cast<volatile uint32_t*>(second);
+        a[100] = 0x5EEDF00Du;
+        const uint32_t seen = b[100];
+        b[200] = 0x0DDBA11u;
+        const uint32_t back = a[200];
+        Trace(fmt::format("double mapping: {} (first at {}, second at {}; read back {:#x} and {:#x})",
+                          seen == 0x5EEDF00Du && back == 0x0DDBA11u ? "yes, the same memory at two addresses"
+                                                                     : "mapped twice, but not the same memory",
+                          first, second, seen, back));
+        sceKernelMunmap(second, kSize);
+    }
+    sceKernelMunmap(first, kSize);
+    sceKernelReleaseDirectMemory(phys, kSize);
+}
+
 int main()
 {
     mkdir(kDataDir, 0777);
     Trace("started");
+    ProbeDoubleMapping();
     // a browser that goes away mid-transfer would otherwise end the app (the web server)
     std::signal(SIGPIPE, SIG_IGN);
     LoadSystemModules();

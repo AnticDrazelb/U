@@ -1,0 +1,95 @@
+From 53b1fd85a420607bafac8a76a41c547e347d6917 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 12:00:31 +0000
+Subject: [PATCH 66/66] PS4: threads placed by name, and slow memory writes
+ counted
+
+Common::SetCurrentThreadName calls the app's runtime (ps4_place_thread,
+weak), which pins the emulated CPU cores a game runs on and the GPU thread
+to the PS4's first Jaguar module (one core each) and moves Eden's other
+named threads to the second. The slow memory accesses
+(Common::PS4Perf::slow_memory_accesses) are split into writes too.
+---
+ src/common/ps4_perf.h                     | 8 ++++++--
+ src/common/thread.cpp                     | 5 +++++
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 3 +++
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 3 +++
+ 4 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 9fdc81a7d..a4653c790 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -46,12 +46,16 @@ struct alignas(64) CoreCount {
+     std::atomic<uint64_t> n{0};
+ };
+ inline CoreCount slow_memory_accesses[4];
+-inline uint64_t SlowMemoryAccesses() {
++inline CoreCount slow_memory_writes[4];  // (those of them that were writes)
++inline uint64_t Total(const CoreCount (&cores)[4]) {
+     uint64_t total = 0;
+-    for (const CoreCount& core : slow_memory_accesses) {
++    for (const CoreCount& core : cores) {
+         total += core.n.load(std::memory_order_relaxed);
+     }
+     return total;
+ }
++inline uint64_t SlowMemoryAccesses() {
++    return Total(slow_memory_accesses);
++}
+ 
+ } // namespace Common::PS4Perf
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 9e02d87bd..36346e5ea 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -27,6 +27,7 @@
+ #ifdef __OPENORBIS__
+ extern "C" __attribute__((weak)) void ps4_watch_thread(const char* name); // the PS4 app's runtime
+ extern "C" __attribute__((weak)) void ps4_set_thread_priority(int level); // 0 Low .. 4 Critical
++extern "C" __attribute__((weak)) void ps4_place_thread(const char* name); // the cores a thread may run on
+ #endif
+ #if defined(__FreeBSD__) && !defined(__OPENORBIS__) // the PS4 has neither header
+ #include <sys/cpuset.h>
+@@ -532,6 +533,10 @@ void SetCurrentThreadName(const char* name) {
+     // the busy ones get a heap arena of their own.
+     if (ps4_watch_thread)
+         ps4_watch_thread(name);
++    // and the cores it may run on follow from it (the emulated CPU cores and the GPU thread each on
++    // one of their own)
++    if (ps4_place_thread)
++        ps4_place_thread(name);
+ #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+     pthread_set_name_np(pthread_self(), name);
+ #elif defined(__NetBSD__)
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 2c2be2937..7df3138af 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -118,6 +118,9 @@ u64 DynarmicCallbacks32::GetTicksRemaining() {
+ bool DynarmicCallbacks32::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
+ #ifdef __OPENORBIS__
+     Common::PS4Perf::slow_memory_accesses[m_parent.m_core_index & 3].n.fetch_add(1, std::memory_order_relaxed);
++    if (type == Kernel::DebugWatchpointType::Write) {
++        Common::PS4Perf::slow_memory_writes[m_parent.m_core_index & 3].n.fetch_add(1, std::memory_order_relaxed);
++    }
+ #endif
+     if (!m_check_memory_access) {
+         return true;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 84e5ec02b..3ed79d369 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -161,6 +161,9 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
+ bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type) {
+ #ifdef __OPENORBIS__
+     Common::PS4Perf::slow_memory_accesses[m_parent.m_core_index & 3].n.fetch_add(1, std::memory_order_relaxed);
++    if (type == Kernel::DebugWatchpointType::Write) {
++        Common::PS4Perf::slow_memory_writes[m_parent.m_core_index & 3].n.fetch_add(1, std::memory_order_relaxed);
++    }
+ #endif
+     if (!m_check_memory_access) {
+         return true;
+-- 
+2.43.0
+

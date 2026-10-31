@@ -801,6 +801,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "
              "system needs its core.",
              [](MenuSettings& s) { s.seventh_core = !s.seventh_core; }},
+            {"Thread Placement", settings.pin_threads ? "Pinned" : "Free",
+             "Pinned: the three emulated CPU cores a game runs on and the GPU thread each have a core of the "
+             "PS4's first module (four cores sharing one cache) to themselves, and Eden's other threads run on "
+             "the second: the game's threads stay where their cache is warm. Free: every thread on any core, the "
+             "system's choice.",
+             [](MenuSettings& s) { s.pin_threads = !s.pin_threads; }},
             {"Profiler", on_off(settings.profiler),
              "While a game runs, where the emulated CPU cores, the GPU thread and the Vulkan thread spend their "
              "time: each is looked at 1000 times a second, and every 10 seconds the counts go to samples.log. "

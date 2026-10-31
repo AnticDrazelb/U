@@ -377,6 +377,34 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.79: **one page table walk for many accesses, and pinned threads.** 03.78's counters (Mario Kart
+8 Deluxe at 13-14 fps in races): idle cores woken in 14 us, service calls 130 us each 470 times a
+second, timers on time, no code cache flushes, 330,000 slow memory accesses a second. What's left is the
+game's own code. Stage 1 had measured why on a console: translated code is about 5x slower than
+native, calls 10x. Mario Kart 8 Deluxe is 32-bit ARM code, and without fastmem every load and store
+walks the page table inline (about 13 instructions); `PUSH {r4-r11, lr}` with `VPUSH {d8-d15}` is 17
+stores and as many walks, the POPs 17 more. A host harness (dynarmic built on its own, the PS4's page
+table configuration: absolute offsets, Eden's packed entries, sign extension from bit 55, shuffled host
+pages, a marked and an unmapped page) measured it: a call with that prologue and epilogue 71-124 ns,
+without them 6.
+
+Patch 0065: `A32HostPointer` walks once for a span (the host address of its start, or 0 when it crosses
+into the next page, the page is unmapped, or it's marked for a write), and `A32ReadMemoryVia*` /
+`A32WriteMemoryVia*` use it: test, branch, one host load or store; their out-of-line slow path is the
+access's own walk, then the callbacks. The translator uses them for LDM, STM, PUSH, POP, VLDM, VSTM,
+VPUSH, VPOP and a double's VLDR/VSTR, and `A32SharedWalkPass` groups other loads and stores through one
+base register value plus constants within a block (at most 256 bytes). In the harness: calls 32-42 ns,
+push/pop 26-36 (from 68-86), struct accesses 8.4-9.6 (from 14-22), a page-crossing push/pop 66 (75).
+Random ARM and Thumb programs (LDM/STM in every form, PUSH/POP, VPUSH/VPOP, VLDM/VSTM, VLDR/VSTR, LDR/STR
+of every size through shared bases, at page boundaries, on the marked page and next to the unmapped one)
+give the same registers and memory as before, thousands of them.
+
+Patch 0066 and `port/ps4_runtime.cpp` (`ps4_place_thread`): CPUCore_0-2 on cores 0-2, the GPU thread on
+core 3 (one Jaguar module, one L2), Eden's other named threads on the second module; System Settings,
+CPU, Thread Placement: Free leaves them all on any core. The boot trace now says whether the PS4 maps the
+same direct memory twice (`ProbeDoubleMapping`), what fastmem would need, and the 30-second line splits
+slow memory accesses into writes.
+
 03.78: **where Mario Kart 8 Deluxe's race frames go, and the first fixes.** Its races ran at 12 fps on
 a console, its menus at 50-60. The boot trace's new GPU line (03.77) settled the GPU: busy 2-5% of the
 time, and the CPU waited for it 5%. The profile: in races the emulated cores ran the game's code 49-59%
