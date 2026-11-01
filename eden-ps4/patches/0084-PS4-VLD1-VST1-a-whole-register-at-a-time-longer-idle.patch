@@ -1,0 +1,300 @@
+From 59673cb4617c3b1f659b048d9b36a88c408b4f58 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 21:48:41 +0000
+Subject: [PATCH] PS4: VLD1/VST1 a whole register at a time; longer idle spins
+ on pinned cores; SVC and ioctl timing
+
+- dynarmic A32: VLD1/VST1 (one element a structure, little-endian) as one 64-bit access a D
+  register, an even D register and the next as one Q value (Pack2x64To1x128 / SetVector,
+  GetVector / VectorGetElement64), instead of an access, shift and merge per element.
+- PhysicalCore::Idle: 1 ms spin on emulated cores 0-2 when threads are pinned (EDEN_PS4_PIN_THREADS),
+  50 us otherwise.
+- PS4Perf::svc_cores: each SVC's count and whole time by core (Svc::Call); nvdrv Ioctl1's own time
+  per ioctl in the service-call table.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/ps4_perf.h                         | 14 +++
+ src/core/hle/kernel/physical_core.cpp         | 18 +++-
+ src/core/hle/kernel/physical_core.h           |  5 ++
+ src/core/hle/kernel/svc.cpp                   | 14 +++
+ .../hle/service/nvdrv/nvdrv_interface.cpp     | 12 +++
+ .../impl/asimd_load_store_structures.cpp      | 89 ++++++++++++++-----
+ 6 files changed, 125 insertions(+), 27 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index ca6ff43b3..667712ced 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -49,6 +49,20 @@ inline std::atomic<uint64_t> jit_compile_ns{0};
+ // each emulated core's code cache: KiB of it free (after its last translation), and its whole flushes
+ inline std::atomic<uint32_t> jit_cache_free_kib[4];
+ inline std::atomic<uint64_t> jit_core_full_flushes[4];
++// The game's system calls by the emulated core their thread was on when it made them: how many,
++// and the time until each returned (a wait's whole length: what the core's threads waited on)
++inline constexpr size_t SvcIds = 0x80;
++struct alignas(64) SvcCore {
++    std::atomic<uint64_t> count[SvcIds];
++    std::atomic<uint64_t> total_ns[SvcIds];
++};
++inline SvcCore svc_cores[4];
++inline void AddSvc(size_t core, uint32_t id, uint64_t ns) {
++    if (core < 4 && id < SvcIds) {
++        svc_cores[core].count[id].fetch_add(1, std::memory_order_relaxed);
++        svc_cores[core].total_ns[id].fetch_add(ns, std::memory_order_relaxed);
++    }
++}
+ // The kernel's timer (KHardwareTimer: the game's threads' sleeps and timed waits ending), of the
+ // timer events
+ inline std::atomic<uint64_t> kernel_timer_tasks{0};
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index 1c85466da..dad976308 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++
+ #include "common/cpu_features.h"
+ #include "common/ps4_perf.h"
+ #include "common/scope_exit.h"
+@@ -26,6 +28,17 @@ PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
+     : m_core_index{core_index}
+ {
+     m_is_single_core = !kernel.IsMulticore();
++#ifdef __OPENORBIS__
++    // The cores the game runs on (0-2) have a core of the PS4 each when threads are pinned (the
++    // launcher's Thread Placement): theirs spin far longer, which takes nothing from any other
++    // thread, and catch nearly every wake-up without a sleep's latency (about 20 us after the
++    // signal) or the waking thread's system call. Core 3 shares its module with the services,
++    // audio and the Vulkan worker: a short spin.
++    const char* pinned = std::getenv("EDEN_PS4_PIN_THREADS");
++    if (core_index < 3 && (!pinned || pinned[0] != '0')) {
++        m_idle_spin = std::chrono::microseconds(1000);
++    }
++#endif
+ }
+ PhysicalCore::~PhysicalCore() = default;
+ 
+@@ -236,9 +249,8 @@ void PhysicalCore::Idle() {
+     // A core with nothing to run is usually handed work within microseconds (a thread another core
+     // made ready, a service's reply), and waking a sleeping host thread costs far more than that
+     // on the PS4: every handoff between the game's threads paid it. So an idle core spins for a
+-    // while first (a core of the PS4's seven the game isn't using), then sleeps.
+-    constexpr auto SpinTime = std::chrono::microseconds(50);
+-    const auto spin_end = Common::g_wall_clock.GetTimeNS() + SpinTime;
++    // while first (m_idle_spin), then sleeps.
++    const auto spin_end = Common::g_wall_clock.GetTimeNS() + m_idle_spin;
+     while (!m_is_interrupted.load(std::memory_order_acquire)) {
+         for (int i = 0; i < 16; i++) {
+             _mm_pause();
+diff --git a/src/core/hle/kernel/physical_core.h b/src/core/hle/kernel/physical_core.h
+index 14e627a3c..18252973f 100644
+--- a/src/core/hle/kernel/physical_core.h
++++ b/src/core/hle/kernel/physical_core.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <memory>
+@@ -74,6 +75,10 @@ private:
+     KThread* m_current_thread{};
+     // (atomic: an idle core on the PS4 spins on it before it takes m_guard and sleeps)
+     std::atomic<bool> m_is_interrupted{};
++#ifdef __OPENORBIS__
++    // how long Idle spins before it sleeps (see physical_core.cpp)
++    std::chrono::microseconds m_idle_spin{50};
++#endif
+     // When the interrupt that ended the last idle came (ns, the wall clock), for the PS4's statistics
+     u64 m_interrupt_ns{};
+     bool m_is_single_core{};
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 3542d5a3b..11ff1f3e4 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -8,6 +8,11 @@
+ 
+ #include <type_traits>
+ 
++#ifdef __OPENORBIS__
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
++#include "common/scope_exit.h"
++#endif
+ #include "core/arm/arm_interface.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -2499,6 +2504,15 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
+ void Call(Core::System& system, u32 imm) {
+     auto& kernel = system.Kernel();
+     auto& process = GetCurrentProcess(kernel);
++#ifdef __OPENORBIS__
++    // (the call's whole length, by the core its thread made it on)
++    const size_t ps4_core = kernel.CurrentPhysicalCoreIndex();
++    const u64 ps4_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    SCOPE_EXIT {
++        const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++        Common::PS4Perf::AddSvc(ps4_core, imm, now > ps4_begin ? now - ps4_begin : 0);
++    };
++#endif
+     std::array<uint64_t, 8> args;
+     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+     //kernel.EnterSVCProfile();
+diff --git a/src/core/hle/service/nvdrv/nvdrv_interface.cpp b/src/core/hle/service/nvdrv/nvdrv_interface.cpp
+index 5fae68adb..5f53c1be3 100644
+--- a/src/core/hle/service/nvdrv/nvdrv_interface.cpp
++++ b/src/core/hle/service/nvdrv/nvdrv_interface.cpp
+@@ -5,6 +5,10 @@
+ // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#ifdef __OPENORBIS__
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
++#endif
+ #include "common/logging.h"
+ #include "common/scope_exit.h"
+ #include "common/string_util.h"
+@@ -71,7 +75,15 @@ void NVDRV::Ioctl1(HLERequestContext& ctx) {
+     output_buffer.resize_destructive(ctx.GetWriteBufferSize(0));
+     const auto input_buffer = ctx.ReadBuffer(0);
+ 
++#ifdef __OPENORBIS__
++    // (each ioctl's own time, for the 30-second line's busiest calls)
++    const u64 ps4_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++#endif
+     const auto nv_result = nvdrv->Ioctl1(fd, command, input_buffer, output_buffer);
++#ifdef __OPENORBIS__
++    const u64 ps4_now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++    Common::PS4Perf::AddServiceCall("nvdrv ioctl", command.raw, ps4_now > ps4_begin ? ps4_now - ps4_begin : 0);
++#endif
+     if (command.is_out != 0) {
+         ctx.WriteBuffer(output_buffer);
+     }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp
+index 8d0f78396..d24b92275 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/asimd_load_store_structures.cpp
+@@ -6,6 +6,7 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <array>
+ #include <optional>
+ #include <tuple>
+ 
+@@ -100,16 +101,35 @@ bool TranslatorVisitor::v8_VST_multiple(bool D, Reg n, size_t Vd, Imm<4> type, s
+     const bool wback = m != Reg::R15;
+     const bool register_index = m != Reg::R15 && m != Reg::R13;
+ 
+-    IR::U32 address = ir.GetRegister(n);
+-    for (size_t r = 0; r < regs; r++) {
+-        for (size_t e = 0; e < elements; e++) {
+-            for (size_t i = 0; i < nelem; i++) {
+-                const ExtReg ext_reg = d + i * inc + r;
+-                const IR::U64 shifted_element = ir.LogicalShiftRight(ir.GetExtendedRegister(ext_reg), ir.Imm8(static_cast<u8>(e * ebytes * 8)));
+-                const IR::UAny element = ir.LeastSignificant(8 * ebytes, shifted_element);
+-                ir.WriteMemory(8 * ebytes, address, element, IR::AccType::NORMAL);
+-
+-                address = ir.Add(address, ir.Imm32(static_cast<u32>(ebytes)));
++    if (nelem == 1 && !ir.current_location.EFlag()) {
++        // VST1: the registers' bytes in order (little-endian), whatever the element size: one
++        // 64-bit store a D register, the two halves of a Q register taken from the one value
++        const IR::U32 base = ir.GetRegister(n);
++        const auto at = [&](size_t r) -> IR::U32 { return r == 0 ? base : IR::U32{ir.Add(base, ir.Imm32(static_cast<u32>(8 * r)))}; };
++        for (size_t r = 0; r < regs;) {
++            const ExtReg ext_reg = d + r;
++            if (RegNumber(ext_reg) % 2 == 0 && r + 1 < regs) {
++                const IR::U128 q = ir.GetVector(ExtReg::Q0 + RegNumber(ext_reg) / 2);
++                ir.WriteMemory64(at(r), IR::U64{ir.VectorGetElement(64, q, 0)}, IR::AccType::NORMAL);
++                ir.WriteMemory64(at(r + 1), IR::U64{ir.VectorGetElement(64, q, 1)}, IR::AccType::NORMAL);
++                r += 2;
++            } else {
++                ir.WriteMemory64(at(r), IR::U64{ir.GetExtendedRegister(ext_reg)}, IR::AccType::NORMAL);
++                r += 1;
++            }
++        }
++    } else {
++        IR::U32 address = ir.GetRegister(n);
++        for (size_t r = 0; r < regs; r++) {
++            for (size_t e = 0; e < elements; e++) {
++                for (size_t i = 0; i < nelem; i++) {
++                    const ExtReg ext_reg = d + i * inc + r;
++                    const IR::U64 shifted_element = ir.LogicalShiftRight(ir.GetExtendedRegister(ext_reg), ir.Imm8(static_cast<u8>(e * ebytes * 8)));
++                    const IR::UAny element = ir.LeastSignificant(8 * ebytes, shifted_element);
++                    ir.WriteMemory(8 * ebytes, address, element, IR::AccType::NORMAL);
++
++                    address = ir.Add(address, ir.Imm32(static_cast<u32>(ebytes)));
++                }
+             }
+         }
+     }
+@@ -149,24 +169,45 @@ bool TranslatorVisitor::v8_VLD_multiple(bool D, Reg n, size_t Vd, Imm<4> type, s
+     const bool wback = m != Reg::R15;
+     const bool register_index = m != Reg::R15 && m != Reg::R13;
+ 
+-    for (size_t r = 0; r < regs; r++) {
+-        for (size_t i = 0; i < nelem; i++) {
+-            const ExtReg ext_reg = d + i * inc + r;
+-            ir.SetExtendedRegister(ext_reg, ir.Imm64(0));
++    if (nelem == 1 && !ir.current_location.EFlag()) {
++        // VLD1: the registers' bytes in order (little-endian), whatever the element size: one
++        // 64-bit load a D register, two that make a Q register put together as one value (no
++        // element by element shifting and merging through the register file)
++        const IR::U32 base = ir.GetRegister(n);
++        std::array<IR::U64, 4> data{};
++        for (size_t r = 0; r < regs; r++) {
++            data[r] = ir.ReadMemory64(r == 0 ? base : IR::U32{ir.Add(base, ir.Imm32(static_cast<u32>(8 * r)))}, IR::AccType::NORMAL);
+         }
+-    }
+-
+-    IR::U32 address = ir.GetRegister(n);
+-    for (size_t r = 0; r < regs; r++) {
+-        for (size_t e = 0; e < elements; e++) {
++        for (size_t r = 0; r < regs;) {
++            const ExtReg ext_reg = d + r;
++            if (RegNumber(ext_reg) % 2 == 0 && r + 1 < regs) {
++                ir.SetVector(ExtReg::Q0 + RegNumber(ext_reg) / 2, ir.Pack2x64To1x128(data[r], data[r + 1]));
++                r += 2;
++            } else {
++                ir.SetExtendedRegister(ext_reg, data[r]);
++                r += 1;
++            }
++        }
++    } else {
++        for (size_t r = 0; r < regs; r++) {
+             for (size_t i = 0; i < nelem; i++) {
+-                const IR::U64 element = ir.ZeroExtendToLong(ir.ReadMemory(ebytes * 8, address, IR::AccType::NORMAL));
+-                const IR::U64 shifted_element = ir.LogicalShiftLeft(element, ir.Imm8(static_cast<u8>(e * ebytes * 8)));
+-
+                 const ExtReg ext_reg = d + i * inc + r;
+-                ir.SetExtendedRegister(ext_reg, ir.Or(ir.GetExtendedRegister(ext_reg), shifted_element));
++                ir.SetExtendedRegister(ext_reg, ir.Imm64(0));
++            }
++        }
++
++        IR::U32 address = ir.GetRegister(n);
++        for (size_t r = 0; r < regs; r++) {
++            for (size_t e = 0; e < elements; e++) {
++                for (size_t i = 0; i < nelem; i++) {
++                    const IR::U64 element = ir.ZeroExtendToLong(ir.ReadMemory(ebytes * 8, address, IR::AccType::NORMAL));
++                    const IR::U64 shifted_element = ir.LogicalShiftLeft(element, ir.Imm8(static_cast<u8>(e * ebytes * 8)));
++
++                    const ExtReg ext_reg = d + i * inc + r;
++                    ir.SetExtendedRegister(ext_reg, ir.Or(ir.GetExtendedRegister(ext_reg), shifted_element));
+ 
+-                address = ir.Add(address, ir.Imm32(static_cast<u32>(ebytes)));
++                    address = ir.Add(address, ir.Imm32(static_cast<u32>(ebytes)));
++                }
+             }
+         }
+     }
+-- 
+2.43.0
+

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -1302,6 +1303,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.97: faster vector loads and stores, and quicker hand-offs between the game's threads. 03.96 ran "
+         "Mario Kart's races at 25-29 fps. Its NEON loads and stores (VLD1, VST1: audio mixing, vector "
+         "maths, copies) were translated an element at a time, sixteen loads for one 16-byte register; "
+         "now one access per 8 bytes, a whole register at once (a copy loop 6 times faster in a test). "
+         "The three cores the game runs on now wait for work a millisecond before sleeping (they have a "
+         "PS4 core each), so a thread handed work rarely pays a sleeping core's wake-up. And the 30-second "
+         "lines say what each core's threads wait on, and which GPU driver calls take the time.\n"
          "03.96: games on the PS4 can be deleted, and the keys and firmware copied to it. OPTIONS on a game "
          "(or homebrew) on the PS4's own storage has Delete, which asks first; its saves stay. In Games and Keys, "
          "Square copies prod.keys, title.keys and the firmware from a USB drive to the PS4, after which the drive "
@@ -2111,6 +2119,45 @@ std::string PerfLine(double seconds)
         average_us(now.present_ns - last.present_ns, now.presents - last.presents) / 1000.0,
         rate(now.presents, last.presents), rate(now.dequeues, last.dequeues),
         average_us(now.dequeue_ns - last.dequeue_ns, now.dequeues - last.dequeues) / 1000.0, double(dequeue_max) / 1e6);
+    // The game's system calls by core: what each core's threads spent their time in (a wait's whole
+    // length), the four longest a core
+    {
+        static uint64_t last_count[4][P::SvcIds] = {}, last_ns[4][P::SvcIds] = {};
+        static const std::map<uint32_t, const char*> names = {
+            {0x01, "SetHeapSize"}, {0x06, "QueryMemory"}, {0x08, "CreateThread"}, {0x09, "StartThread"},
+            {0x0B, "SleepThread"}, {0x0D, "SetThreadPriority"}, {0x0F, "SetThreadCoreMask"},
+            {0x11, "SignalEvent"}, {0x12, "ClearEvent"}, {0x16, "CloseHandle"}, {0x17, "ResetSignal"},
+            {0x18, "WaitSynchronization"}, {0x19, "CancelSynchronization"}, {0x1A, "ArbitrateLock"},
+            {0x1B, "ArbitrateUnlock"}, {0x1C, "WaitProcessWideKeyAtomic"}, {0x1D, "SignalProcessWideKey"},
+            {0x1E, "GetSystemTick"}, {0x21, "SendSyncRequest"}, {0x22, "SendSyncRequestWithUserBuffer"},
+            {0x25, "GetThreadId"}, {0x26, "Break"}, {0x27, "OutputDebugString"}, {0x29, "GetInfo"},
+            {0x2C, "MapPhysicalMemory"}, {0x34, "WaitForAddress"}, {0x35, "SignalToAddress"},
+            {0x36, "SynchronizePreemptionState"}, {0x40, "CreateSession"}, {0x45, "CreateEvent"}};
+        line += "; the game's system calls, the time they took a second (waits included), by core:";
+        for (size_t core = 0; core < 3; core++) {
+            struct Entry {
+                uint32_t id;
+                uint64_t count, ns;
+            };
+            std::vector<Entry> entries;
+            for (uint32_t id = 0; id < P::SvcIds; id++) {
+                const uint64_t count = P::svc_cores[core].count[id].load(std::memory_order_relaxed);
+                const uint64_t ns = P::svc_cores[core].total_ns[id].load(std::memory_order_relaxed);
+                if (count > last_count[core][id])
+                    entries.push_back({id, count - last_count[core][id], ns - last_ns[core][id]});
+                last_count[core][id] = count;
+                last_ns[core][id] = ns;
+            }
+            std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.ns > b.ns; });
+            line += fmt::format("{} core {}:", core ? ";" : "", core);
+            for (size_t i = 0; i < std::min<size_t>(entries.size(), 4); i++) {
+                const auto name = names.find(entries[i].id);
+                line += fmt::format("{} {} {:.1f} ms ({:.0f} calls)", i ? "," : "",
+                                    name != names.end() ? std::string(name->second) : fmt::format("svc {:#x}", entries[i].id),
+                                    double(entries[i].ns) / 1e6 / seconds, double(entries[i].count) / seconds);
+            }
+        }
+    }
     // The kernel's timer, of the timer events (guest threads' sleeps and timed waits ending: each
     // can interrupt an emulated core)
     {
@@ -2164,7 +2211,9 @@ std::string PerfLine(double seconds)
     for (size_t i = 0; i < std::min<size_t>(n, 5) && calls[i].count; i++) {
         line += fmt::format("{} {} command {}: {:.0f} a second, {:.0f} us each (at most {:.0f}; {:.0f} us before its "
                             "thread took it)",
-                            i ? "," : "", calls[i].name ? calls[i].name : "(others)", calls[i].command,
+                            i ? "," : "", calls[i].name ? calls[i].name : "(others)",
+                            calls[i].command > 0xFFFF ? fmt::format("{:#x}", calls[i].command)
+                                                      : std::to_string(calls[i].command),
                             double(calls[i].count) / seconds, average_us(calls[i].total_ns, calls[i].count),
                             double(calls[i].max_ns) / 1000.0, average_us(calls[i].queue_ns, calls[i].count));
     }

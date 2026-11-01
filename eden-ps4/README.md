@@ -377,6 +377,31 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.97: **VLD1/VST1 a whole register at a time; longer idle spins on the game's cores; what the
+cores wait on.** 03.96 on a console (Mario Kart, 50%, Profiler off): races at 25-29 fps (34-40 ms
+of work a frame), from 20-23; fastmem's "pages not back to back" declines 0-1 a second (73 of 76
+aliases put on copies); core 0 idle 19%, cores 1 and 2 39% and 52%; the PS4's GPU busy 10%. The
+old profile's race windows: core 0's time spread over hundreds of blocks (no hot spot), its Eden
+code mostly the idle spin. In the hot blocks, VLD1/VST1 were translated element by element
+(`vld1.8` of a Q register: sixteen byte loads, shifted and ORed into the register file) and a
+`vld1.64 {d6, d7}` used by the next instruction as Q3 went through memory (two 64-bit stores, a
+128-bit load: a store-forwarding stall on Jaguar).
+
+- Patch 0084, dynarmic: `v8_VLD_multiple` / `v8_VST_multiple` with one element a structure
+  (VLD1/VST1 of 1-4 registers), little-endian: one 64-bit access a D register at base + 8r; an
+  even D register and the next as one Q value (`Pack2x64To1x128` into `SetVector`, `GetVector`
+  and `VectorGetElement64` out), so get/set elimination keeps it in a host register. Host
+  harness, a 4 KiB `vld1.8`/`vst1.8` copy plus 256 `vld1.32`/`vmla.f32`/`vst1.32` steps: 7.7 us
+  before, 2.1 now (1.3 with fastmem). `gen9.py` (random VLD1/VST1 of every size, register count,
+  start, alignment hint and writeback, at unaligned and page-crossing addresses, with VLD1 lanes,
+  VLD2-4, VLDM/VSTM, VLDR/VSTR and NEON/VFP arithmetic): old build vs new, 600 programs (ARM and
+  Thumb) and 400 with fastmem equal, single-stepped too; `gen7.py` 504 equal.
+- Patch 0084: `PhysicalCore::Idle` spins 1 ms on emulated cores 0-2 when threads are pinned (each
+  has a PS4 core to itself), 50 us on core 3 and when not pinned.
+- Patch 0084, diagnostics: `PS4Perf::svc_cores` counts each SVC's calls and whole time by the core
+  it was made on (`Svc::Call`); the 30-second line gives each of cores 0-2's four longest. nvdrv's
+  `Ioctl1` adds each ioctl (`nvdrv ioctl`, its command in hex) to the busiest calls.
+
 03.96: **delete games on the PS4; copy keys and firmware to it.**
 
 - OPTIONS on a title on the PS4's own storage (under `/data`: the data folder, or a Game Folder
