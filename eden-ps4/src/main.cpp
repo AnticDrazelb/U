@@ -238,6 +238,8 @@ void ApplyLauncherSettings() {
     // EDEN_PS4_FASTMEM=0: no fastmem on the desktop either, so that guest memory goes through the
     // recompiler's page table walk, as on the PS4 (which can't map memory twice): Debugging
     // accuracy, with the optimisations Auto has otherwise
+#ifndef __OPENORBIS__
+    // (on the PS4 the variable is the Fastmem setting itself, read by common/host_memory.cpp)
     if (const char* fastmem = std::getenv("EDEN_PS4_FASTMEM"); fastmem && std::string_view{fastmem} == "0") {
         if (g_cpu_unsafe) {
             Settings::values.cpuopt_unsafe_host_mmu.SetValue(false);
@@ -247,6 +249,7 @@ void ApplyLauncherSettings() {
             Settings::values.cpuopt_fastmem_exclusives.SetValue(false);
         }
     }
+#endif
     // Low GPU accuracy and no reactive flushing unless asked: High reads GPU-written memory back for
     // the CPU and marks it so that every guest access to it takes the slow path (no fastmem here)
     Settings::values.gpu_accuracy.SetValue(g_gpu_high ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);

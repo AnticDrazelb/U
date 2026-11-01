@@ -821,6 +821,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "the second: the game's threads stay where their cache is warm. Free: every thread on any core, the "
              "system's choice.",
              [](MenuSettings& s) { s.pin_threads = !s.pin_threads; }},
+            {"Fastmem", on_off(settings.fastmem),
+             "The Switch's memory mapped at its own addresses a second time (the PS4 allows it once asked, "
+             "sceKernelEnableDmemAliasing), so the game's loads and stores are single instructions instead of "
+             "a table lookup each: the biggest speedup there is for the game's own code. Off: the lookup, as "
+             "before 03.84 (if a game crashes or misbehaves with it on).",
+             [](MenuSettings& s) { s.fastmem = !s.fastmem; }},
             {"Profiler", on_off(settings.profiler),
              "While a game runs, where the emulated CPU cores, the GPU thread and the Vulkan thread spend their "
              "time: each is looked at 1000 times a second, and every 10 seconds the counts go to samples.log. "

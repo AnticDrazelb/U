@@ -377,6 +377,37 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.84: **fastmem.** 03.83's probe on a console: `plainly: refused (0x80020010); after
+sceKernelEnableDmemAliasing (0x0): yes, the same memory at two addresses`. Its log of Mario Kart 8
+Deluxe (races at 15-17 fps, Frame Pacing Unlocked changing nothing): emulated core 0 busy 85% of the
+time, cores never all idle at once, frames not waiting for vsyncs, services cheap (audio's
+RequestUpdate 189 a second at 90 us the most): the game's own code.
+
+Patch 0072:
+
+- `common/orbis_memory.cpp`: `EnableAliasing` (sceKernelEnableDmemAliasing, once),
+  `ReserveFastmemArena` (the largest of 2^39 down to 2^32 the kernel gives), `InvalidateArena`
+  (mprotect to nothing, 16 KiB pages), an arena lock, and `ResolveFault`, one resolver for every
+  lazily mapped range: a sparse vector's page (the page tables), an on-demand DRAM chunk, and an arena
+  page, mapped from the application's page table when its four 4 KiB guest pages are ordinary memory
+  back to back in the DRAM (`sceKernelMapDirectMemory`, MAP_FIXED, the DRAM chunk's direct memory,
+  committing it if need be), up to 512 KiB at a time. Anything else is declined.
+- `common/host_memory.cpp`: the arena reserved after the DRAM unless `EDEN_PS4_FASTMEM=0`; Map and
+  Unmap invalidate, Protect does when it takes rights away (the arena maps read/write, as the page
+  table walk treats memory); released before the DRAM. `Settings::IsFastmemEnabled` is "an arena of
+  2^32 or more".
+- `core/memory.cpp`: Map, Unmap, MarkRegionDebug and RasterizerMarkRegionCached hold the arena lock
+  across the page table change and the invalidation (`Orbis::ArenaUpdate`), so no fault maps a page
+  from entries about to change (a page the GPU starts caching mapped read/write would lose writes).
+- dynarmic: on the PS4 the POSIX exception handler, with the PS4's (FreeBSD's) signal context (the
+  machine context at 0x40, RIP and RSP at 20 and 23: measured by the port's crash logger), asking
+  `dynarmic_ps4_resolve_fault` first, treating only faults inside the arena as fastmem accesses (the
+  fallback, and the code recompiled without fastmem there), chaining the rest, logging nothing.
+  A64's `fastmem_address_space_bits` is held to the arena's.
+
+System Settings, CPU, Fastmem (on by default; `fastmem=` in the menu file). The 30-second line adds the
+MiB mapped in the arena and its faults resolved and declined.
+
 03.83: **page table entries with the whole offset, and a probe for direct memory aliasing.**
 
 Patch 0071: on the PS4 (`EDEN_PAGE_ENTRY_FULL_OFFSET`, `common/page_table.h`) an entry keeps the host

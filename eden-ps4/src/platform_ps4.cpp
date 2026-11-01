@@ -1029,6 +1029,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.pin_threads = false;
         else if (line == "pacing=unlocked")
             settings.unlocked_frames = true;
+        else if (line == "fastmem=off")
+            settings.fastmem = false;
         else if (line == "speed=150")
             settings.speed = 150;
         else if (line == "speed=200")
@@ -1044,14 +1046,15 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
-                     settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed);
+                     settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
+                     settings.fastmem ? "on" : "off");
         std::fclose(f);
     }
 }
@@ -1259,6 +1262,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.84: FASTMEM. 03.83's log said yes: after sceKernelEnableDmemAliasing the PS4 lets this app map "
+         "the same memory twice. So the Switch's memory now also sits at its own addresses, and the game's "
+         "loads and stores are single instructions instead of a table lookup each (about 10), as on a PC: "
+         "the biggest speedup there is for the game's own code, which is where Mario Kart's and Captain "
+         "Toad's frames go. Pages appear there as the game first touches them; one the GPU is caching, or "
+         "that isn't plain memory, keeps the lookup. System Settings, CPU, Fastmem turns it off if a game "
+         "crashes or misbehaves with it. The log's 30-second line says how much is mapped and how many "
+         "accesses were turned away.\n"
          "03.83: every memory access of the game's code is shorter. The table the recompiled code looks up "
          "for each load and store now holds the PS4 address whole, so the lookup is one instruction instead "
          "of three; a chain of loads (following pointers, as games do all the time) runs about 20% faster on "
@@ -1931,6 +1942,21 @@ std::string PerfLine(double seconds)
         average_us(now.present_ns - last.present_ns, now.presents - last.presents) / 1000.0,
         rate(now.presents, last.presents), rate(now.dequeues, last.dequeues),
         average_us(now.dequeue_ns - last.dequeue_ns, now.dequeues - last.dequeues) / 1000.0, double(dequeue_max) / 1e6);
+    // Fastmem: the arena's pages mapped, and its faults (resolved: a page mapped; declined: the
+    // recompiler's fallback took the access, and the code there was recompiled without fastmem)
+    {
+        static uint64_t last_resolved = 0, last_declined = 0;
+        const uint64_t resolved = Common::Orbis::FastmemFaultsResolved(), declined = Common::Orbis::FastmemFaultsDeclined();
+        if (Common::Orbis::FastmemArenaBits() != 0) {
+            line += fmt::format("; fastmem: {} MiB of the game's memory mapped at its own addresses, {:.0f} faults a "
+                                "second resolved, {:.0f} declined", Common::Orbis::FastmemMappedBytes() >> 20,
+                                double(resolved - last_resolved) / seconds, double(declined - last_declined) / seconds);
+        } else {
+            line += "; fastmem: off";
+        }
+        last_resolved = resolved;
+        last_declined = declined;
+    }
     // The services the game's calls spent their time in, the five busiest
     P::ServiceCall calls[P::MaxServiceCalls];
     const size_t n = P::TakeServiceCalls(calls, P::MaxServiceCalls);
@@ -2137,15 +2163,19 @@ void* Run(void*)
         setenv("EDEN_PS4_DRAM_ON_DEMAND", settings.ram_on_demand ? "1" : "0", 1);
         // read by the runtime as Eden's threads name themselves (port/ps4_runtime.cpp, ps4_place_thread)
         setenv("EDEN_PS4_PIN_THREADS", settings.pin_threads ? "1" : "0", 1);
+        // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
+        setenv("EDEN_PS4_FASTMEM", settings.fastmem ? "1" : "0", 1);
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}, frame pacing {}, game speed {}%; CPU {}, {} cores, threads {}; the Switch's RAM {}{}",
+            "GPU accuracy {}, frame pacing {}, game speed {}%; CPU {}, {} cores, threads {}, fastmem {}; the Switch's "
+            "RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
             settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
-            settings.pin_threads ? "pinned" : "free", settings.ram_on_demand ? "on demand" : "all up front",
+            settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
+            settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
         if (settings.profiler)

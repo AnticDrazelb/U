@@ -1,0 +1,767 @@
+From dc645a3dab207c9560b2d3329be433f9f5362ec3 Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 05:35:23 +0000
+Subject: [PATCH] PS4: fastmem, through direct memory aliasing
+
+The PS4 maps the same direct memory twice for an app once sceKernelEnableDmemAliasing has been
+called (03.83's probe on a console). The emulated DRAM gets a fastmem arena (the largest of 2^39
+down to 2^32 the kernel reserves), its pages mapped lazily: a fault there is resolved from the
+application's page table when the 16 KiB page's four guest pages are ordinary memory back to back
+in the DRAM (the DRAM chunk's direct memory mapped there, up to 512 KiB at a time), and declined
+otherwise (dynarmic's fallback, the code recompiled without fastmem there).
+
+- common/orbis_memory: the arena, its lock and invalidation, and ResolveFault, one resolver for
+  the sparse vectors' pages, the on-demand DRAM's chunks and the arena's pages.
+- common/host_memory: the arena reserved (EDEN_PS4_FASTMEM=0 goes without); Map, Unmap and
+  Protect taking rights away invalidate; released before the DRAM. IsFastmemEnabled: an arena.
+- core/memory: page table changes made with the arena locked, so no fault maps a page from
+  entries about to change.
+- dynarmic: the POSIX exception handler on the PS4, with its FreeBSD signal context, asking the
+  port's resolver first, treating only arena faults as fastmem accesses, logging nothing; A64's
+  fastmem_address_space_bits held to the arena's.
+---
+ src/common/host_memory.cpp                    |  43 +++-
+ src/common/orbis_memory.cpp                   | 232 +++++++++++++++++-
+ src/common/orbis_memory.h                     |  52 ++++
+ src/common/settings.cpp                       |   9 +-
+ src/common/sparse_large_vector.cpp            |  22 +-
+ src/common/sparse_large_vector.h              |   3 +
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |   9 +
+ src/core/memory.cpp                           |  22 ++
+ src/dynarmic/src/dynarmic/CMakeLists.txt      |   8 +-
+ .../backend/exception_handler_posix.cpp       |  61 ++++-
+ 10 files changed, 431 insertions(+), 30 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 7e6d5805a..83c2707f0 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -730,6 +730,25 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     LOG_INFO(HW_Memory, "Emulated DRAM: {} MiB of direct memory, {}", backing_size >> 20,
+              on_demand ? "taken as the game touches it" : "all taken now");
+     virtual_base = nullptr;
++    // Fastmem: the Switch's memory at its own addresses, the same direct memory a second time
++    // (sceKernelEnableDmemAliasing allows it), mapped as the game touches it (orbis_memory.cpp).
++    // EDEN_PS4_FASTMEM=0 goes without (System Settings, CPU, Fastmem).
++    const char* fastmem_setting = std::getenv("EDEN_PS4_FASTMEM");
++    if (!(fastmem_setting && fastmem_setting[0] == '0')) {
++        unsigned bits = 0;
++        unsigned max_bits = 0;
++        for (size_t size = virtual_size; size > 1; size >>= 1) {
++            max_bits++;
++        }
++        if (void* arena = Orbis::ReserveFastmemArena(max_bits, backing_base, backing_size, bits)) {
++            virtual_base = static_cast<u8*>(arena);
++            virtual_size = size_t(1) << bits;
++            LOG_INFO(HW_Memory, "Fastmem: a {} GiB arena at {} (the Switch's addresses below 2^{})",
++                     virtual_size >> 30, arena, bits);
++        } else {
++            LOG_WARNING(HW_Memory, "Fastmem: none (direct memory aliasing refused, or no address range)");
++        }
++    }
+ #elif defined(__managarm__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
+     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+@@ -757,6 +776,9 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+ 
+ HostMemory::~HostMemory() {
+ #if defined(__OPENORBIS__)
++    if (virtual_base) {
++        Orbis::ReleaseFastmemArena(); // (before the memory behind it is given back)
++    }
+     if (backing_base && on_demand) {
+         Orbis::ReleaseOnDemand(backing_base, backing_size);
+     } else if (backing_base) {
+@@ -778,7 +800,12 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
+ HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
+ 
+ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if defined(__OPENORBIS__)
++    // the arena's pages there are mapped again, from the page table, when next touched
++    if (virtual_base) {
++        Orbis::InvalidateArena(virtual_offset, length);
++    }
++#elif !defined(__managarm__)
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(host_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+@@ -792,7 +819,11 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
+ }
+ 
+ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if defined(__OPENORBIS__)
++    if (virtual_base) {
++        Orbis::InvalidateArena(virtual_offset, length);
++    }
++#elif !defined(__managarm__)
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+     ASSERT(virtual_offset + length <= virtual_size);
+@@ -804,7 +835,13 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
+ }
+ 
+ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if defined(__OPENORBIS__)
++    // The arena maps ordinary memory read/write (as the page table walk treats it); fewer rights
++    // (a page the GPU caches, a debug page) take its pages back: the page table decides again
++    if (virtual_base && !(True(perm & MemoryPermission::Read) && True(perm & MemoryPermission::Write))) {
++        Orbis::InvalidateArena(virtual_offset, length);
++    }
++#elif !defined(__managarm__)
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+     ASSERT(virtual_offset + length <= virtual_size);
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 5e8c8edf7..d91a7982e 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -18,6 +18,8 @@
+ #include "common/literals.h"
+ #include "common/logging.h"
+ #include "common/orbis_memory.h"
++#include "common/page_table.h"
++#include "common/sparse_large_vector.h"
+ 
+ // Declared here: the OpenOrbis headers give some of these other prototypes.
+ extern "C" {
+@@ -31,6 +33,8 @@ int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t
+ int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
+ int32_t sceKernelMapNamedFlexibleMemory(void** addr, size_t len, int32_t prot, int32_t flags,
+                                         const char* name);
++int32_t sceKernelMprotect(const void* addr, size_t len, int32_t prot);
++int32_t sceKernelEnableDmemAliasing(void);
+ // Crema's runtime (port/ps4_crashlog.cpp): a line in boot-trace.log, safe in a signal handler
+ __attribute__((weak)) void ps4_boot_trace(const char* stage);
+ }
+@@ -171,20 +175,128 @@ void ChainSignal(const struct sigaction& previous, int sig, siginfo_t* info, voi
+     }
+ }
+ 
+-void OnDemandFaultHandler(int sig, siginfo_t* info, void* context) {
+-    const uintptr_t address = FaultAddress(info);
++// A fault in the on-demand range: its chunk mapped (true), or not ours / no memory (false)
++bool ResolveOnDemandFault(uintptr_t address) noexcept {
+     const uintptr_t base = on_demand.base.load(std::memory_order_acquire);
+-    if (base && address >= base && address - base < on_demand.size) {
+-        const int saved_errno = errno; // (the code it interrupted may be about to read it)
+-        const bool committed = CommitChunk((address - base) / OnDemandChunk);
+-        errno = saved_errno;
+-        if (committed)
+-            return; // the access runs again, now with memory there
+-        Trace("eden: the emulated RAM couldn't get direct memory (all of it is in use)");
++    if (!base || address < base || address - base >= on_demand.size)
++        return false;
++    if (CommitChunk((address - base) / OnDemandChunk))
++        return true; // the access runs again, now with memory there
++    Trace("eden: the emulated RAM couldn't get direct memory (all of it is in use)");
++    return false;
++}
++
++// The fastmem arena (see orbis_memory.h). The resolver reads the game's page table (atomics) and
++// maps under arena_lock, which the page table's changes take too (ArenaUpdate in core/memory.cpp).
++struct FastmemArena {
++    std::atomic<uintptr_t> base{0};
++    size_t size = 0;
++    unsigned bits = 0;
++    uintptr_t backing = 0;
++    size_t backing_size = 0;
++    std::atomic<const Common::PageTable*> table{nullptr};
++    std::atomic<size_t> mapped{0}, resolved{0}, declined{0};
++};
++FastmemArena arena;
++std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
++constexpr size_t ArenaPage = 16_KiB;   // the PS4's page
++constexpr size_t GuestPage = 4_KiB;
++constexpr size_t MaxArenaRun = 512_KiB; // mapped at once when the pages after qualify too
++
++// The direct memory behind DRAM offset `offset` (16 KiB aligned), committing its chunk if the
++// game hasn't touched it yet; -1 if there's none
++off_t PhysOf(size_t offset) noexcept {
++    if (on_demand.base.load(std::memory_order_acquire) == arena.backing) {
++        const size_t index = offset / OnDemandChunk;
++        if (!CommitChunk(index))
++            return -1;
++        return on_demand.phys[index] + off_t(offset % OnDemandChunk);
+     }
++    size_t at = 0; // (all up front: MapDirectMemory's pieces, back to back)
++    for (const DirectPiece& piece : direct_pieces) {
++        if (reinterpret_cast<uintptr_t>(piece.base) != arena.backing)
++            continue;
++        if (offset < at + piece.size)
++            return piece.phys + off_t(offset - at);
++        at += piece.size;
++    }
++    return -1;
++}
++
++// The DRAM offset of the 16 KiB at guest address `va` (16 KiB aligned) if its four guest pages
++// are ordinary memory, back to back in the DRAM; else SIZE_MAX
++size_t ArenaPageSource(const Common::PageTable& table, u64 va) noexcept {
++    size_t source = SIZE_MAX;
++    for (size_t i = 0; i < ArenaPage / GuestPage; i++) {
++        const size_t index = (va >> 12) + i;
++        if (index >= table.entries.size())
++            return SIZE_MAX;
++        const auto [pointer, type, block] = table.entries.GetOrDefault(index).PointerTypeBlock(true);
++        (void)block;
++        if (type != Common::PageType::Memory || pointer == 0)
++            return SIZE_MAX;
++        const uintptr_t host = pointer + va + i * GuestPage;
++        if (host < arena.backing || host - arena.backing >= arena.backing_size)
++            return SIZE_MAX;
++        const size_t offset = host - arena.backing;
++        if (i == 0) {
++            if (offset % ArenaPage != 0)
++                return SIZE_MAX;
++            source = offset;
++        } else if (offset != source + i * GuestPage) {
++            return SIZE_MAX;
++        }
++    }
++    return source;
++}
++
++bool ResolveArenaFault(uintptr_t address) noexcept {
++    const uintptr_t base = arena.base.load(std::memory_order_acquire);
++    if (!base || address < base || address - base >= arena.size)
++        return false;
++    const Common::PageTable* table = arena.table.load(std::memory_order_acquire);
++    if (!table) {
++        arena.declined.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    LockArena();
++    const u64 va = (address - base) & ~u64(ArenaPage - 1);
++    const size_t source = ArenaPageSource(*table, va);
++    bool mapped = false;
++    if (source != SIZE_MAX) {
++        // and the pages after it, as far as they follow on in the DRAM, in the same chunk
++        size_t length = ArenaPage;
++        while (length < MaxArenaRun && (source + length) % OnDemandChunk != 0 && va + length < arena.size &&
++               ArenaPageSource(*table, va + length) == source + length) {
++            length += ArenaPage;
++        }
++        const off_t phys = PhysOf(source);
++        if (phys >= 0) {
++            void* at = reinterpret_cast<void*>(base + va);
++            mapped = sceKernelMapDirectMemory(&at, length, ProtCpuReadWrite, MapFixed, phys, ArenaPage) == 0 &&
++                     at == reinterpret_cast<void*>(base + va);
++            if (mapped)
++                arena.mapped.fetch_add(length, std::memory_order_relaxed);
++        }
++    }
++    UnlockArena();
++    (mapped ? arena.resolved : arena.declined).fetch_add(1, std::memory_order_relaxed);
++    return mapped;
++}
++
++void OnDemandFaultHandler(int sig, siginfo_t* info, void* context) {
++    const int saved_errno = errno; // (the code it interrupted may be about to read it)
++    const bool resolved = ResolveFault(FaultAddress(info));
++    errno = saved_errno;
++    if (resolved)
++        return;
+     ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
+ }
+ 
++// Installed once (on-demand DRAM or the fastmem arena, whichever comes first): installed twice it
++// would chain to itself
++std::once_flag fault_handler_once;
++
+ void InstallOnDemandFaultHandler() {
+     struct sigaction action;
+     std::memset(&action, 0, sizeof(action));
+@@ -266,8 +378,7 @@ bool ReserveOnDemand(void* base, size_t size) {
+     on_demand.direct_size = sceKernelGetDirectMemorySize();
+     on_demand.bytes = 0;
+     on_demand.peak = 0;
+-    static std::once_flag handler_once;
+-    std::call_once(handler_once, InstallOnDemandFaultHandler);
++    std::call_once(fault_handler_once, InstallOnDemandFaultHandler);
+     on_demand.base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_release);
+     return true;
+ }
+@@ -308,6 +419,105 @@ size_t OnDemandPeakBytes() {
+     return on_demand.peak.load(std::memory_order_relaxed);
+ }
+ 
++bool EnableAliasing() {
++    static const bool enabled = sceKernelEnableDmemAliasing() == 0;
++    return enabled;
++}
++
++void* ReserveFastmemArena(unsigned max_bits, void* backing, size_t backing_size, unsigned& bits) {
++    bits = 0;
++    if (!EnableAliasing())
++        return nullptr;
++    for (unsigned b = max_bits; b >= 32; b--) {
++        if (void* range = ReserveRange(size_t(1) << b, 2_MiB)) {
++            arena.size = size_t(1) << b;
++            arena.bits = b;
++            arena.backing = reinterpret_cast<uintptr_t>(backing);
++            arena.backing_size = backing_size;
++            arena.base.store(reinterpret_cast<uintptr_t>(range), std::memory_order_release);
++            // (faults outside recompiled code: the same resolver)
++            std::call_once(fault_handler_once, InstallOnDemandFaultHandler);
++            bits = b;
++            return range;
++        }
++    }
++    return nullptr;
++}
++
++void ReleaseFastmemArena() {
++    const uintptr_t base = arena.base.exchange(0, std::memory_order_acq_rel);
++    if (base)
++        sceKernelMunmap(reinterpret_cast<void*>(base), arena.size);
++    arena.table.store(nullptr, std::memory_order_release);
++    arena.bits = 0;
++}
++
++uintptr_t FastmemArenaBase() {
++    return arena.base.load(std::memory_order_acquire);
++}
++
++unsigned FastmemArenaBits() {
++    return arena.base.load(std::memory_order_acquire) ? arena.bits : 0;
++}
++
++void SetFastmemPageTable(const void* page_table) {
++    arena.table.store(static_cast<const Common::PageTable*>(page_table), std::memory_order_release);
++}
++
++void LockArena() {
++    while (arena_lock.test_and_set(std::memory_order_acquire)) {
++        sched_yield();
++    }
++}
++
++void UnlockArena() {
++    arena_lock.clear(std::memory_order_release);
++}
++
++void InvalidateArena(size_t offset, size_t length) {
++    const uintptr_t base = arena.base.load(std::memory_order_acquire);
++    if (!base || length == 0 || offset >= arena.size)
++        return;
++    const size_t begin = offset & ~(ArenaPage - 1);
++    const size_t end = std::min(arena.size, (offset + length + ArenaPage - 1) & ~(ArenaPage - 1));
++    sceKernelMprotect(reinterpret_cast<void*>(base + begin), end - begin, 0);
++}
++
++size_t FastmemMappedBytes() {
++    return arena.mapped.load(std::memory_order_relaxed);
++}
++
++size_t FastmemFaultsResolved() {
++    return arena.resolved.load(std::memory_order_relaxed);
++}
++
++size_t FastmemFaultsDeclined() {
++    return arena.declined.load(std::memory_order_relaxed);
++}
++
++bool ResolveFault(uintptr_t address) {
++    return ResolveVectorFault(address) || ResolveOnDemandFault(address) || ResolveArenaFault(address);
++}
++
++} // namespace Common::Orbis
++
++// dynarmic's fault handler (backend/exception_handler_posix.cpp, PS4) asks this first: a fault in
++// recompiled code may be a page table page, a DRAM chunk or a fastmem page to map, not a fastmem
++// access to send to its fallback
++extern "C" bool dynarmic_ps4_in_fastmem_arena(uintptr_t address) {
++    const uintptr_t base = Common::Orbis::FastmemArenaBase();
++    return base != 0 && address >= base && address - base < (std::size_t(1) << Common::Orbis::FastmemArenaBits());
++}
++
++extern "C" bool dynarmic_ps4_resolve_fault(uintptr_t address) {
++    const int saved_errno = errno;
++    const bool resolved = Common::Orbis::ResolveFault(address);
++    errno = saved_errno;
++    return resolved;
++}
++
++namespace Common::Orbis {
++
+ } // namespace Common::Orbis
+ 
+ #endif
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index 6d39483b9..d37217ec9 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -11,6 +11,7 @@
+ #ifdef __OPENORBIS__
+ 
+ #include <cstddef>
++#include <cstdint>
+ 
+ namespace Common::Orbis {
+ 
+@@ -47,6 +48,57 @@ void ClearOnDemand(std::size_t offset, std::size_t length, unsigned char fill);
+ std::size_t OnDemandBytes();
+ std::size_t OnDemandPeakBytes();
+ 
++/// Fastmem: the Switch's memory at its own addresses in an arena (a reserved range), each page
++/// there the same direct memory as its place in the emulated DRAM, which the PS4 allows once
++/// sceKernelEnableDmemAliasing has been called. Pages are mapped lazily: an access to one not
++/// mapped yet faults, and ResolveFault maps it if the game's page table says it's ordinary
++/// memory (else the recompiler's fallback takes the access, through the page table).
++/// Enables direct memory aliasing for the app (once; true if the kernel allows it).
++bool EnableAliasing();
++/// Reserves the arena, the largest of 2^max_bits down to 2^32 bytes the kernel gives, for the
++/// emulated DRAM at `backing` (its size `backing_size`). Returns the arena, or nullptr (bits 0).
++void* ReserveFastmemArena(unsigned max_bits, void* backing, std::size_t backing_size, unsigned& bits);
++/// Unmaps the arena (before the DRAM's memory is given back)
++void ReleaseFastmemArena();
++/// log2 of the arena's size, 0 without one; its address (0: none)
++unsigned FastmemArenaBits();
++std::uintptr_t FastmemArenaBase();
++/// The page table whose ordinary pages the arena maps (the application's; nullptr: none)
++void SetFastmemPageTable(const void* page_table);
++/// Takes back [offset, offset + length) of the arena (to be mapped again, from the page table,
++/// when next touched): its mappings or page types changed. Call between LockArena/UnlockArena,
++/// around the page table's change, so that no fault maps a page from the entries as they were.
++void InvalidateArena(std::size_t offset, std::size_t length);
++void LockArena();
++void UnlockArena();
++/// Fault counts: arena pages mapped (bytes), faults resolved and declined
++std::size_t FastmemMappedBytes();
++std::size_t FastmemFaultsResolved();
++std::size_t FastmemFaultsDeclined();
++
++/// For a fault at `address` (any thread, in a signal handler): maps what belongs there if it's
++/// memory the port maps lazily (a sparse vector's page, a DRAM chunk, a fastmem page). True if
++/// the access can run again.
++bool ResolveFault(std::uintptr_t address);
++
++/// RAII: the arena locked while the page table changes (fastmem only)
++class ArenaUpdate {
++public:
++    explicit ArenaUpdate(bool active) : active{active} {
++        if (active)
++            LockArena();
++    }
++    ~ArenaUpdate() {
++        if (active)
++            UnlockArena();
++    }
++    ArenaUpdate(const ArenaUpdate&) = delete;
++    ArenaUpdate& operator=(const ArenaUpdate&) = delete;
++
++private:
++    bool active;
++};
++
+ } // namespace Common::Orbis
+ 
+ #endif
+diff --git a/src/common/settings.cpp b/src/common/settings.cpp
+index 235d78a10..fd783297a 100644
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -19,6 +19,9 @@
+ #include <deque>
+ #include <fmt/core.h>
+ 
++#ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
++#endif
+ #include "common/settings_enums.h"
+ #include "common/assert.h"
+ #include "common/fs/fs_util.h"
+@@ -180,8 +183,10 @@ bool IsGPUFenceBehaviorAccurate() {
+ 
+ bool IsFastmemEnabled() {
+ #ifdef __OPENORBIS__
+-    // The PS4 can't map the same memory twice for an app.
+-    return false;
++    // With direct memory aliasing (sceKernelEnableDmemAliasing), when the emulated DRAM got its
++    // arena (common/host_memory.cpp; EDEN_PS4_FASTMEM=0 goes without): 2^32 at least, for a
++    // 32-bit game's whole address space
++    return Common::Orbis::FastmemArenaBits() >= 32;
+ #endif
+     if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
+         return bool(values.cpuopt_fastmem);
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index 48f4b51a5..095a375ce 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -165,15 +165,8 @@ void ChainSignal(const struct sigaction& previous, int sig, siginfo_t* info, voi
+ void VectorFaultHandler(int sig, siginfo_t* info, void* context) {
+     // si_addr at FreeBSD's offset (the musl headers have Linux's siginfo layout)
+     const uintptr_t address = *reinterpret_cast<const uintptr_t*>(reinterpret_cast<char*>(info) + 24);
+-    for (auto& region : vector_regions) {
+-        const uintptr_t base = region.base.load(std::memory_order_acquire);
+-        if (base && address >= base && address - base < region.size) {
+-            CommitLock lock;
+-            if (CommitLocked(base, region.committed, address & HostPageMask))
+-                return; // the access is retried, now with a page of zeros there
+-            break;
+-        }
+-    }
++    if (ResolveVectorFault(address))
++        return; // the access is retried, now with a page of zeros there
+     ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
+ }
+ 
+@@ -217,6 +210,17 @@ bool CommitVectorPage(void* base, std::atomic<u64>* committed, uintptr_t page) n
+     CommitLock lock;
+     return CommitLocked(reinterpret_cast<uintptr_t>(base), committed, page);
+ }
++
++bool ResolveVectorFault(uintptr_t address) noexcept {
++    for (auto& region : vector_regions) {
++        const uintptr_t base = region.base.load(std::memory_order_acquire);
++        if (base && address >= base && address - base < region.size) {
++            CommitLock lock;
++            return CommitLocked(base, region.committed, address & HostPageMask);
++        }
++    }
++    return false;
++}
+ #endif
+ 
+ #ifndef MAP_NOCORE
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 7957718b8..868a5a76f 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -46,6 +46,9 @@ void RegisterVectorRegion(void* base, std::size_t size, std::atomic<u64>* commit
+ void UnregisterVectorRegion(void* base) noexcept;
+ /// Maps memory at `page` of the vector at `base`, unless it is there already (committed bit set).
+ bool CommitVectorPage(void* base, std::atomic<u64>* committed, uintptr_t page) noexcept;
++/// A fault at `address`: if it's in a vector's range, its page mapped (true: the access can run
++/// again). Signal handlers (this file's and dynarmic's, through Orbis::ResolveFault) call it.
++bool ResolveVectorFault(uintptr_t address) noexcept;
+ #endif
+ 
+ /// A large page-aligned buffer that has optimized memory usage for zero-writes.
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index e2978a368..cb744c3f9 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -4,6 +4,9 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
++#endif
+ #include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+@@ -360,6 +363,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     default:
+         break;
+     }
++#ifdef __OPENORBIS__
++    // The arena covers 2^bits of the Switch's addresses (Auto's 64, no check, would reach past it)
++    config.fastmem_address_space_bits =
++        std::min<std::uint32_t>(config.fastmem_address_space_bits, Common::Orbis::FastmemArenaBits());
++    config.silently_mirror_fastmem = false;
++#endif
+     if (!Settings::IsFastmemEnabled()) {
+         config.fastmem_pointer = std::nullopt;
+         config.fastmem_exclusive_access = false;
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index eabc6dfcc..6eab86977 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -13,6 +13,9 @@
+ #include <type_traits>
+ #include <vector>
+ 
++#ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
++#endif
+ #include "common/assert.h"
+ #include "common/atomic_ops.h"
+ #include "common/common_types.h"
+@@ -52,6 +55,10 @@ struct Memory::Impl {
+ 
+         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
+             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
++#ifdef __OPENORBIS__
++            // the page table the arena's faults are resolved from (common/orbis_memory.cpp)
++            Common::Orbis::SetFastmemPageTable(current_page_table);
++#endif
+         } else {
+             current_page_table->fastmem_arena = nullptr;
+         }
+@@ -71,6 +78,10 @@ struct Memory::Impl {
+         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
+         ASSERT_MSG(target >= DramMemoryMap::Base, "Out of bounds target: {:016X}",
+                    GetInteger(target));
++#ifdef __OPENORBIS__
++        // (the arena's faults wait while the entries change: none maps a page from the old ones)
++        Common::Orbis::ArenaUpdate arena_update{current_page_table->fastmem_arena != nullptr};
++#endif
+         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
+                  Common::PageType::Memory);
+ 
+@@ -83,6 +94,9 @@ struct Memory::Impl {
+                      bool separate_heap) {
+         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
+         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
++#ifdef __OPENORBIS__
++        Common::Orbis::ArenaUpdate arena_update{current_page_table->fastmem_arena != nullptr};
++#endif
+         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
+                  Common::PageType::Unmapped);
+ 
+@@ -395,6 +409,9 @@ struct Memory::Impl {
+         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
+             return;
+         }
++#ifdef __OPENORBIS__
++        Common::Orbis::ArenaUpdate arena_update{current_page_table->fastmem_arena != nullptr};
++#endif
+ 
+         if (current_page_table->fastmem_arena) {
+             const auto perm{debug ? Common::MemoryPermission{}
+@@ -452,6 +469,11 @@ struct Memory::Impl {
+         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
+             return;
+         }
++#ifdef __OPENORBIS__
++        // the arena's pages taken back (Protect) and the entries changed with the arena locked: a
++        // fault in between would map a page the GPU now caches read/write from the old entries
++        Common::Orbis::ArenaUpdate arena_update{current_page_table->fastmem_arena != nullptr};
++#endif
+ 
+         if (current_page_table->fastmem_arena) {
+             Common::MemoryPermission perm{};
+diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
+index 4b11ab324..466475ee2 100644
+--- a/src/dynarmic/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/src/dynarmic/CMakeLists.txt
+@@ -364,10 +364,10 @@ elseif (APPLE)
+         )
+     endif()
+ elseif (PS4)
+-    # No fastmem on the PS4 (an app can't map memory twice), so no handler: the POSIX one, with no
+-    # code registered, logged every fault (from a signal handler) before the PS4 port's handlers
+-    # (lazily committed page tables and RAM) got them
+-    target_sources(dynarmic PRIVATE backend/exception_handler_generic.cpp)
++    # Fastmem on the PS4 (direct memory aliasing, see Eden's common/orbis_memory.cpp): the POSIX
++    # handler, with the PS4's (FreeBSD's) signal context, asking the port first about faults it
++    # maps lazily (page tables, the DRAM, the fastmem arena), and logging nothing itself
++    target_sources(dynarmic PRIVATE backend/exception_handler_posix.cpp)
+ elseif (UNIX AND NOT HAIKUOS)
+     # Haiku lacks <ucontext.h>
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+diff --git a/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp b/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
+index 24a059aee..9f33cf9c6 100644
+--- a/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
++++ b/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
+@@ -39,10 +39,33 @@
+ #    error "Invalid architecture"
+ #endif
+ 
++#ifdef __OPENORBIS__
++// Eden's PS4 port: maps what belongs at a faulting address if it's memory it maps lazily (a page
++// table page, a DRAM chunk, a fastmem page); true if the access can run again
++extern "C" __attribute__((weak)) bool dynarmic_ps4_resolve_fault(uintptr_t address);
++// ... and whether an address is in its fastmem arena: only a fault there is a fastmem access for
++// the fallback; any other fault in recompiled code goes on to the handlers before this one
++extern "C" __attribute__((weak)) bool dynarmic_ps4_in_fastmem_arena(uintptr_t address);
++#endif
++
+ namespace Dynarmic::Backend {
+ 
+ namespace {
+ 
++#ifdef __OPENORBIS__
++// The PS4 kernel's signal context is FreeBSD's (the SDK's musl headers describe Linux's): the
++// machine context at 0x40 in the ucontext, its registers in FreeBSD's order (measured on hardware:
++// the port's ps4_crashlog.cpp), and si_addr at 24 in the siginfo
++constexpr size_t Ps4McontextOffset = 0x40;
++constexpr size_t Ps4RipIndex = 20, Ps4RspIndex = 23;
++inline u64* Ps4Registers(void* raw_context) {
++    return reinterpret_cast<u64*>(static_cast<char*>(raw_context) + Ps4McontextOffset);
++}
++inline uintptr_t Ps4FaultAddress(siginfo_t* info) {
++    return *reinterpret_cast<const uintptr_t*>(reinterpret_cast<char*>(info) + 24);
++}
++#endif
++
+ struct CodeBlockInfo {
+     u64 size;
+     std::function<FakeCall(u64)> cb;
+@@ -71,9 +94,12 @@ public:
+         signal_stack.ss_size = stack_size;
+         signal_stack.ss_flags = 0;
+         if (sigaltstack(&signal_stack, nullptr) != 0) {
++#ifndef __OPENORBIS__
+             fmt::print(stderr, "dynarmic: POSIX SigHandler: init failure at sigaltstack\n");
+             supports_fast_mem = false;
+             return;
++#endif
++            // (the PS4: the faulting thread's own stack serves, as for the port's handlers)
+         }
+ 
+         struct sigaction sa{};
+@@ -86,7 +112,7 @@ public:
+             supports_fast_mem = false;
+             return;
+         }
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__OPENORBIS__)
+         if (sigaction(SIGBUS, &sa, &old_sa_bus) != 0) {
+             fmt::print(stderr, "dynarmic: POSIX SigHandler: could not set SIGBUS handler\n");
+             supports_fast_mem = false;
+@@ -122,6 +148,38 @@ void SigHandler::RegisterHandler() {
+ 
+ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
+     DEBUG_ASSERT(sig == SIGSEGV || sig == SIGBUS);
++#ifdef __OPENORBIS__
++    // Lazily mapped memory first (also from recompiled code: its page table walk reads the page
++    // table and the DRAM directly); then a fastmem access to send to its fallback; then the
++    // handlers before this one. Nothing logged here: this is a signal handler.
++    if (dynarmic_ps4_resolve_fault && dynarmic_ps4_resolve_fault(Ps4FaultAddress(info))) {
++        return;
++    }
++    if (!dynarmic_ps4_in_fastmem_arena || dynarmic_ps4_in_fastmem_arena(Ps4FaultAddress(info))) {
++        u64* const regs = Ps4Registers(raw_context);
++        u64& pc = regs[Ps4RipIndex];
++        u64& sp = regs[Ps4RspIndex];
++        std::shared_lock guard(sig_handler->code_block_infos_mutex);
++        if (auto const iter = sig_handler->FindCodeBlockInfo(pc); iter != sig_handler->code_block_infos.end()) {
++            FakeCall fc = iter->second.cb(pc);
++            sp -= sizeof(u64);
++            *std::bit_cast<u64*>(sp) = fc.ret_rip;
++            pc = fc.call_rip;
++            return;
++        }
++    }
++    {
++        struct sigaction* previous = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
++        if ((previous->sa_flags & SA_SIGINFO) && previous->sa_sigaction) {
++            previous->sa_sigaction(sig, info, raw_context);
++        } else if (previous->sa_handler != SIG_DFL && previous->sa_handler != SIG_IGN) {
++            previous->sa_handler(sig);
++        } else {
++            signal(sig, SIG_DFL); // (on return the access faults again, to the default action)
++        }
++        return;
++    }
++#else
+     CTX_DECLARE(raw_context);
+     {
+         std::shared_lock guard(sig_handler->code_block_infos_mutex);
+@@ -158,6 +216,7 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
+         return;
+     }
+     retry_sa->sa_handler(sig);
++#endif
+ }
+ 
+ }  // anonymous namespace
+-- 
+2.43.0
+
