@@ -377,6 +377,31 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.90: **predicated A32 instructions in place; float compares straight to the flags.**
+
+- Patch 0078, `inline_conditional_instructions` (A32, on in Eden): a conditional ARM instruction in
+  the middle of a block is translated in place; each register write becomes `ConditionalSelect`
+  (new value if the condition passes, else the value read before the instruction), and a write of
+  all four flags (CMP, CMN, ADDS...) a `ConditionalSelectNZCV` against a new `A32GetCpsrNZCV`. One
+  that touches memory, writes only some flags (TST, MOVS), branches, raises, or does floating
+  point or vector work has its IR undone and ends the block as before. It used to split the
+  code in three blocks (before, a conditional block, the rest) with links between them.
+- Patch 0078, `A32FpscrNZCVForwarding`: `VMRS APSR_nzcv` after a `VCMP` in the same block
+  stores the compare's flags (host format) straight to the CPSR, instead of through the FPSCR's
+  ARM format and back.
+- Patch 0078, `inline_fast_dispatch` (A32 and A64, on in Eden): an indirect jump
+  (`FastDispatchHint`: BLX/BLR through a register, jump tables) hashes into the fast dispatch
+  table and jumps in its own block, its miss path shared, instead of in the one handler all of
+  them share. Two alternating single-target call sites, 100,000 calls (callgrind's branch
+  simulator): indirect mispredicts 106,401 -> 6,405.
+- Host harness: A32 459k -> 449k host instructions a frame with both (game.c has few predicated
+  instructions; 03.88: 632k). gen7.py now also makes conditional compares, conditional VFP moves
+  and adds, and float compares (VCMP/VCMPE, with zero, double) with VMRS before branches and
+  conditional instructions, indirect calls; old build vs new with every option on, with and
+  without fastmem: 1,202 gen7 + 451 gen8 programs equal (and 3,016 A32 programs in the rounds
+  before); a generator bug (Thumb indirect calls into ARM state) failed 103 programs on both
+  builds alike, and those seeds pass once fixed.
+
 03.89: **leaner translated code; a profiler that names the game code.** The profile every log
 since 03.77 carried was one MK8 session recorded before 03.77, symbolized with each newer build's
 functions (its "hot" A32 translator functions were nonsense). Its useful part: MK8 Deluxe is A32,

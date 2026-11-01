@@ -1265,6 +1265,16 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.90: more of the same. 32-bit ARM code can make almost any instruction conditional (\"move if "
+         "not equal\"); each such instruction used to split the code around it into three pieces with "
+         "handovers in between. Now most stay in place as a choice between the old and new value, with "
+         "no jump at all. And a float comparison followed by a branch on its result (very common in "
+         "game physics) skips a round trip through memory and two conversions. Calls through pointers "
+         "(C++ virtual calls, everywhere in game engines) now each have their own jump the CPU can "
+         "predict, as returns got in 03.89: in a test, mispredicted jumps fell from 106,000 to 6,000 "
+         "per 100,000 calls, each one about 14 wasted cycles on the PS4's CPU. Together with 03.89: "
+         "Mario Kart-style 32-bit code runs 29% fewer instructions than in 03.88 (on a PC set up like "
+         "the PS4). Not yet tried on a console.\n"
          "03.89: leaner translated code. Mario Kart 8 Deluxe is a 32-bit game, and the translator split every "
          "loop's closing branch into a block of its own, with a handover between the two each time round; "
          "now the branch ends the block it is in. Each block also stopped saving and restoring a register "

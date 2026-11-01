@@ -1,0 +1,597 @@
+From 70221358a62cc080f3592d01da059e7980018382 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 10:47:39 +0000
+Subject: [PATCH] PS4 dynarmic: predicated A32 instructions in place, float
+ compares straight to the flags, per-site indirect jumps
+
+inline_conditional_instructions (A32; on in Eden): a conditional ARM instruction in the middle of
+a block (cond_state None, not Thumb) is translated in place. TranslateArm then checks its IR:
+register writes other than PC, writes of D/S registers and of all four flags become
+ConditionalSelect32/64/NZCV of the new value and the value read before the instruction (the
+flags' through a new A32GetCpsrNZCV, the stored host-format word; a CPSR reader for the get/set
+pass). Anything else (memory, partial flag writes as TST and MOVS, branches, exceptions, floating
+point or vector operations, which must not touch FPSCR's cumulative bits when not executed) has
+its IR undone, latest first, and the block ends before it as before. Before, each such
+instruction split its code into three linked blocks.
+
+A32FpscrNZCVForwarding: VMRS APSR_nzcv after VCMP in the same block stores the compare's NZCV
+(host format) straight to the CPSR instead of through FPSCR's ARM format and back. FPCompare's
+bits above 15 are not zero; every reader of cpsr_nzcv uses only AH and AL or masks (as A64's
+FCMP already relies on).
+
+inline_fast_dispatch (A32 and A64; on in Eden): a FastDispatchHint terminal hashes into the fast
+dispatch table and jumps in its own block (the miss path still shared), so each site's indirect
+jump is predicted on its own, as inline_rsb_pop does for returns. Two alternating single-target
+call sites, 100,000 calls, callgrind's branch simulator: indirect mispredicts 106,401 -> 6,405.
+
+A32 GetCpsrNZCV stubs for the arm64 (real) and riscv64 backends.
+
+Host harness (game-like image, PS4 CPU features): A32 470k -> 449k host instructions a frame
+(03.88: 632k). Differential tests, old build vs new with every option on, with and without
+fastmem: gen7.py (now also conditional compares, VFP moves and adds, VCMP/VCMPE + VMRS before
+branches and conditional instructions, indirect calls) and gen.py/gen3.py/gen4.py for A32;
+gen8.py (now with BLR) for A64. With every option on: 1,202 gen7 programs and 451 gen8 programs,
+all equal; earlier rounds with the options added one by one: 3,016 more A32 programs, equal. A
+generator bug (Thumb indirect calls into ARM state) made 103 Thumb programs fail on the old and
+new builds alike; fixed, those 103 seeds pass with and without fastmem.
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |   5 +
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |   2 +
+ .../dynarmic/backend/arm64/emit_arm64_a32.cpp |   8 ++
+ .../backend/riscv64/emit_riscv64_a32.cpp      |   5 +
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |  26 +++++
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |   1 +
+ .../dynarmic/backend/x64/a32_interface.cpp    |   3 +-
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |  21 ++++
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |   1 +
+ .../dynarmic/frontend/A32/a32_ir_emitter.cpp  |   4 +
+ .../dynarmic/frontend/A32/a32_ir_emitter.h    |   1 +
+ .../frontend/A32/translate/a32_translate.h    |   6 +
+ .../A32/translate/conditional_state.cpp       | 105 ++++++++++++++++++
+ .../A32/translate/conditional_state.h         |   5 +
+ .../A32/translate/impl/a32_translate_impl.h   |   7 ++
+ .../frontend/A32/translate/translate_arm.cpp  |   4 +
+ .../src/dynarmic/interface/A32/config.h       |  10 ++
+ .../src/dynarmic/interface/A64/config.h       |   5 +
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |   1 +
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |   1 +
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   |  28 +++++
+ 21 files changed, 248 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 9b53591db..9a4ee9006 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -219,6 +219,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.jit_frame_pointer = false;
+     config.link_forward_without_halt_check = true;
+     config.inline_rsb_pop = true;
++    // and each indirect jump (calls through registers, as C++ virtual calls; jump tables) too
++    config.inline_fast_dispatch = true;
++    // a conditional MOV, ADD, CMP, VMOV... in the middle of a block stays in it (conditional
++    // selects) instead of splitting the block in three
++    config.inline_conditional_instructions = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 44a201799..06d396f02 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -276,6 +276,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.jit_frame_pointer = false;
+     config.link_forward_without_halt_check = true;
+     config.inline_rsb_pop = true;
++    // and each indirect jump (calls through registers, as C++ virtual calls; jump tables) too
++    config.inline_fast_dispatch = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index b48ff057a..9ff4624aa 100644
+--- a/src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -516,6 +516,14 @@ void EmitIR<IR::Opcode::A32SetCpsrNZC>(oaknut::CodeGenerator& code, EmitContext&
+     }
+ }
+ 
++template<>
++void EmitIR<IR::Opcode::A32GetCpsrNZCV>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    auto Wnzcv = ctx.reg_alloc.WriteW(inst);
++    RegAlloc::Realize(Wnzcv);
++
++    code.LDR(Wnzcv, Xstate, offsetof(A32JitState, cpsr_nzcv));
++}
++
+ template<>
+ void EmitIR<IR::Opcode::A32GetCFlag>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+     auto Wflag = ctx.reg_alloc.WriteW(inst);
+diff --git a/src/dynarmic/src/dynarmic/backend/riscv64/emit_riscv64_a32.cpp b/src/dynarmic/src/dynarmic/backend/riscv64/emit_riscv64_a32.cpp
+index 36709c7db..fb52ddcb8 100644
+--- a/src/dynarmic/src/dynarmic/backend/riscv64/emit_riscv64_a32.cpp
++++ b/src/dynarmic/src/dynarmic/backend/riscv64/emit_riscv64_a32.cpp
+@@ -339,6 +339,11 @@ void EmitIR<IR::Opcode::A32SetCpsrNZC>(biscuit::Assembler& as, EmitContext& ctx,
+     as.SW(Xscratch0, offsetof(A32JitState, cpsr_nzcv), Xstate);
+ }
+ 
++template<>
++void EmitIR<IR::Opcode::A32GetCpsrNZCV>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
++    ASSERT(false && "Unimplemented instruction");
++}
++
+ template<>
+ void EmitIR<IR::Opcode::A32GetCFlag>(biscuit::Assembler&, EmitContext&, IR::Inst*) {
+     ASSERT(false && "Unimplemented instruction");
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index dbd9f3c8e..39a19e787 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -285,6 +285,7 @@ void A32EmitX64::GenTerminalHandlers() {
+         code.cmp(rbx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
+         code.jne(fast_dispatch_cache_miss, code.T_NEAR);
+         code.jmp(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
++        fast_dispatch_miss = code.getCurr<const void*>();
+         code.L(fast_dispatch_cache_miss);
+         code.mov(qword[r12 + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+         code.LookupBlock();
+@@ -529,6 +530,13 @@ void A32EmitX64::EmitA32SetCpsrNZCV(A32EmitContext& ctx, IR::Inst* inst) {
+     code.mov(dword[code.ABI_JIT_PTR + offsetof(A32JitState, cpsr_nzcv)], to_store);
+ }
+ 
++void A32EmitX64::EmitA32GetCpsrNZCV(A32EmitContext& ctx, IR::Inst* inst) {
++    // the flags as A32SetCpsrNZCV stores them (the host's format)
++    const Xbyak::Reg32 nzcv = ctx.reg_alloc.ScratchGpr(code).cvt32();
++    code.mov(nzcv, dword[code.ABI_JIT_PTR + offsetof(A32JitState, cpsr_nzcv)]);
++    ctx.reg_alloc.DefineValue(code, inst, nzcv);
++}
++
+ void A32EmitX64::EmitA32SetCpsrNZCVRaw(A32EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     if (args[0].IsImmediate()) {
+@@ -1262,6 +1270,24 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+     if (!e.conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
+         e.code.ReturnFromRunCode();
++    } else if (e.conf.inline_fast_dispatch) {
++        // terminal_handler_fast_dispatch_hint, here (its miss path shared): this site's own jump
++        auto& code = e.code;
++        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)]);
++        code.shl(rbx, 32);
++        code.mov(ecx, MJitStateReg(A32::Reg::PC));
++        code.mov(edi, ecx);
++        code.or_(rbx, rcx);
++        code.mov(r8, reinterpret_cast<u64>(e.fast_dispatch_table.data()));
++        code.mov(r12, rbx);
++        if (code.HasHostFeature(HostFeature::SSE42)) {
++            code.crc32(r12, r8);
++        }
++        code.and_(r12d, e.fast_dispatch_table_mask);
++        code.lea(r12, ptr[r8 + r12]);
++        code.cmp(rbx, qword[r12 + offsetof(A32EmitX64::FastDispatchEntry, location_descriptor)]);
++        code.jne(e.fast_dispatch_miss);
++        code.jmp(ptr[r12 + offsetof(A32EmitX64::FastDispatchEntry, code_ptr)]);
+     } else {
+         e.code.jmp(e.terminal_handler_fast_dispatch_hint);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index 63e1d3ae3..d6279286d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -146,6 +146,7 @@ public:
+     void (*memory_write_128)() = nullptr;  // Dummy
+     const void* terminal_handler_pop_rsb_hint;
+     const void* terminal_handler_fast_dispatch_hint = nullptr;
++    const void* fast_dispatch_miss = nullptr; // in that handler: r12 the entry, rbx the location
+     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+     A32::Jit* jit_interface;
+ };
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 8b5ad2c0b..6524482fe 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -206,7 +206,8 @@ private:
+         ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
+         A32::Translate(ir_block, arch_descriptor, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions,
+                                                                    conf.page_table_single_walk_multiple && conf.page_table && !conf.fastmem_pointer &&
+-                                                                       !conf.check_halt_on_memory_access});
++                                                                       !conf.check_halt_on_memory_access,
++                                                                   conf.inline_conditional_instructions});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         return emitter.Emit(ir_block);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index c0972c6a2..fd811bc28 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -246,6 +246,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         code.cmp(rbx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
+         code.jne(fast_dispatch_cache_miss, code.T_NEAR);
+         code.jmp(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
++        fast_dispatch_miss = code.getCurr<const void*>();
+         code.L(fast_dispatch_cache_miss);
+         code.mov(qword[r12 + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+         code.LookupBlock();
+@@ -726,6 +727,26 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+     if (!e.conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
+         e.code.ReturnFromRunCode();
++    } else if (e.conf.inline_fast_dispatch) {
++        // terminal_handler_fast_dispatch_hint, here (its miss path shared): this site's own jump
++        auto& code = e.code;
++        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++        code.mov(rcx, A64::LocationDescriptor::pc_mask);
++        code.and_(rcx, rdi);
++        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
++        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
++        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
++        code.or_(rbx, rcx);
++        code.mov(r8, u64(e.fast_dispatch_table.data()));
++        code.mov(r12, rbx);
++        if (code.HasHostFeature(HostFeature::SSE42)) {
++            code.crc32(r12, r8);
++        }
++        code.and_(r12d, e.fast_dispatch_table_mask);
++        code.lea(r12, ptr[r8 + r12]);
++        code.cmp(rbx, qword[r12 + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
++        code.jne(e.fast_dispatch_miss);
++        code.jmp(ptr[r12 + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]);
+     } else {
+         e.code.jmp(e.terminal_handler_fast_dispatch_hint);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 4d0edaf95..63b21eaba 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -140,6 +140,7 @@ public:
+     boost::container::stable_vector<Xbyak::Label> shared_labels;
+     const void* terminal_handler_pop_rsb_hint = nullptr;
+     const void* terminal_handler_fast_dispatch_hint = nullptr;
++    const void* fast_dispatch_miss = nullptr; // in that handler: r12 the entry, rbx the location
+     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+     A64::Jit* jit_interface = nullptr;
+     void (*memory_read_128)() = nullptr;
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp
+index 3ec5e2fb3..54742d5aa 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.cpp
+@@ -141,6 +141,10 @@ void IREmitter::SetCpsr(const IR::U32& value) {
+     Inst(Opcode::A32SetCpsr, value);
+ }
+ 
++IR::NZCV IREmitter::GetCpsrNZCV() {
++    return Inst<IR::NZCV>(Opcode::A32GetCpsrNZCV);
++}
++
+ void IREmitter::SetCpsrNZCV(const IR::NZCV& value) {
+     Inst(Opcode::A32SetCpsrNZCV, value);
+ }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
+index 7dacc9452..5aeb2210a 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
+@@ -60,6 +60,7 @@ public:
+     IR::U32 GetCpsr();
+     void SetCpsr(const IR::U32& value);
+     void SetCpsrNZCV(const IR::NZCV& value);
++    IR::NZCV GetCpsrNZCV();
+     void SetCpsrNZCVRaw(const IR::U32& value);
+     void SetCpsrNZCVQ(const IR::U32& value);
+     void SetCheckBit(const IR::U1& value);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h b/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h
+index 7ed5d13df..99969e983 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/a32_translate.h
+@@ -37,6 +37,12 @@ struct TranslationOptions {
+     /// page table once for all of them (A32HostPointer) instead of once for each, when they stay
+     /// within one page. Only with a page table and without fastmem.
+     bool single_walk_multiple = false;
++
++    /// A conditional ARM instruction in the middle of a block that only writes registers (a
++    /// conditional MOV, ADD, MVN, VMOV...) is translated in place, each write a conditional select
++    /// of the new value and the old, instead of ending the block before it for a conditional block
++    /// of its own. One that writes flags or memory, branches or raises still ends the block.
++    bool inline_conditionals = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.cpp
+index 64e6bf2c7..35a807c6b 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.cpp
+@@ -9,6 +9,9 @@
+ #include "dynarmic/frontend/A32/translate/conditional_state.h"
+ 
+ #include <algorithm>
++#include <iterator>
++#include <string_view>
++#include <vector>
+ 
+ #include "common/assert.h"
+ #include "common/common_types.h"
+@@ -17,6 +20,8 @@
+ #include "dynarmic/frontend/A32/translate/impl/a32_translate_impl.h"
+ #include "dynarmic/interface/A32/config.h"
+ #include "dynarmic/ir/cond.h"
++#include "dynarmic/ir/opcodes.h"
++#include "dynarmic/ir/terminal.h"
+ 
+ namespace Dynarmic::A32 {
+ 
+@@ -65,6 +70,14 @@ bool IsConditionPassed(TranslatorVisitor& v, IR::Cond cond) {
+ 
+     // non-AL cond
+ 
++    if (!v.ir.block.instructions.empty() && v.options.inline_conditionals && v.cond_state == ConditionalState::None
++        && !v.ir.current_location.TFlag() && !v.inline_cond) {
++        // Translated in place; TranslateArm makes its writes conditional, or undoes it
++        v.inline_cond = cond;
++        v.inline_before = std::prev(v.ir.block.instructions.end());
++        return true;
++    }
++
+     if (!v.ir.block.instructions.empty()) {
+         // We've already emitted instructions. Quit for now, we'll make a new block here later.
+         v.cond_state = ConditionalState::Break;
+@@ -82,4 +95,96 @@ bool IsConditionPassed(TranslatorVisitor& v, IR::Cond cond) {
+     return true;
+ }
+ 
++namespace {
++
++// What a conditional instruction translated in place may do: compute, read anything but memory,
++// write core registers other than PC, the VFP registers (D and S) and all four flags (CMP, CMN,
++// ADDS, SUBS...; one that sets only some of them, as TST or MOVS do, ends the block). Floating
++// point and vector operations are left out (one not executed must not touch the FPSCR's
++// cumulative flags).
++bool InlineConditionalAllowed(const IR::Inst& inst) {
++    const IR::Opcode op = inst.GetOpcode();
++    switch (op) {
++    case IR::Opcode::A32SetRegister:
++        return inst.GetArg(0).GetA32RegRef() != A32::Reg::PC;
++    case IR::Opcode::A32SetExtendedRegister32:
++    case IR::Opcode::A32SetExtendedRegister64:
++    case IR::Opcode::A32SetCpsrNZCV:
++        return true;
++    case IR::Opcode::A32GetVector:
++        return false;
++    default:
++        break;
++    }
++    if (IR::MayHaveSideEffects(op) || IR::IsMemoryRead(op))
++        return false;
++    const std::string_view name = IR::GetNameOf(op);
++    return !name.starts_with("FP") && !name.starts_with("Vector");
++}
++
++}  // namespace
++
++bool FinishInlineConditional(TranslatorVisitor& v, bool should_continue) {
++    const IR::Cond cond = *v.inline_cond;
++    v.inline_cond.reset();
++    IR::Block& block = v.ir.block;
++    const IR::Block::iterator first = std::next(v.inline_before);
++
++    bool allowed = should_continue && !block.HasTerminal() && v.cond_state == ConditionalState::None;
++    for (auto it = first; allowed && it != block.instructions.end(); ++it)
++        allowed = InlineConditionalAllowed(*it);
++
++    if (!allowed) {
++        // Its IR undone (latest first: each drops its uses of the earlier ones), and the block
++        // ended before it, as without inline_conditionals
++        while (std::next(v.inline_before) != block.instructions.end()) {
++            auto last = std::prev(block.instructions.end());
++            last->Invalidate();
++            block.instructions.erase(last);
++        }
++        v.cond_state = ConditionalState::Break;
++        if (block.HasTerminal())
++            block.ReplaceTerminal(IR::Term::LinkBlockFast{v.ir.current_location});
++        else
++            v.ir.SetTerm(IR::Term::LinkBlockFast{v.ir.current_location});
++        return false;
++    }
++
++    // Each write: the new value if the condition passes, else the register's value from before
++    // the instruction (read ahead of it)
++    std::vector<IR::Block::iterator> writes;
++    for (auto it = first; it != block.instructions.end(); ++it) {
++        const IR::Opcode op = it->GetOpcode();
++        if (op == IR::Opcode::A32SetRegister || op == IR::Opcode::A32SetExtendedRegister32 || op == IR::Opcode::A32SetExtendedRegister64
++            || op == IR::Opcode::A32SetCpsrNZCV)
++            writes.push_back(it);
++    }
++    for (const auto& write : writes) {
++        v.ir.SetInsertionPointBefore(first);
++        if (write->GetOpcode() == IR::Opcode::A32SetCpsrNZCV) {
++            // the flags as they were (the select reads them before this instruction's write)
++            const IR::NZCV old = v.ir.GetCpsrNZCV();
++            v.ir.SetInsertionPointBefore(write);
++            write->SetArg(0, v.ir.ConditionalSelect(cond, IR::NZCV{write->GetArg(0)}, old));
++            continue;
++        }
++        const IR::Value value = write->GetArg(1);
++        if (write->GetOpcode() == IR::Opcode::A32SetRegister) {
++            const IR::U32 old = v.ir.GetRegister(write->GetArg(0).GetA32RegRef());
++            v.ir.SetInsertionPointBefore(write);
++            write->SetArg(1, v.ir.ConditionalSelect(cond, IR::U32{value}, old));
++        } else {
++            const A32::ExtReg reg = write->GetArg(0).GetA32ExtRegRef();
++            const IR::U32U64 old = v.ir.GetExtendedRegister(reg);
++            v.ir.SetInsertionPointBefore(write);
++            if (write->GetOpcode() == IR::Opcode::A32SetExtendedRegister32)
++                write->SetArg(1, v.ir.ConditionalSelect(cond, IR::U32{value}, IR::U32{old}));
++            else
++                write->SetArg(1, v.ir.ConditionalSelect(cond, IR::U64{value}, IR::U64{old}));
++        }
++    }
++    v.ir.SetInsertionPointBefore(block.instructions.end());
++    return true;
++}
++
+ }  // namespace Dynarmic::A32
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.h b/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.h
+index 074e8da66..6b378e0da 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/conditional_state.h
+@@ -19,6 +19,11 @@ namespace Dynarmic::A32 {
+ class IREmitter;
+ struct TranslatorVisitor;
+ 
++/// After a conditional instruction translated in place (TranslatorVisitor::inline_cond): its writes
++/// to registers made conditional, or, if it does anything else, its IR removed and the block ended
++/// before it as usual. False then.
++bool FinishInlineConditional(TranslatorVisitor& v, bool should_continue);
++
+ enum class ConditionalState {
+     /// We haven't met any conditional instructions yet.
+     None,
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index 3aa76b6aa..a8b59ffb4 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -8,6 +8,8 @@
+ 
+ #pragma once
+ 
++#include <optional>
++
+ #include "common/assert.h"
+ #include "dynarmic/mcl/bit.hpp"
+ 
+@@ -34,6 +36,11 @@ struct TranslatorVisitor final {
+     ConditionalState cond_state = ConditionalState::None;
+     TranslationOptions options;
+ 
++    /// The condition of the conditional instruction being translated in place
++    /// (TranslationOptions::inline_conditionals), and the block's last instruction before it
++    std::optional<IR::Cond> inline_cond;
++    IR::Block::iterator inline_before;
++
+     size_t current_instruction_size;
+ 
+     bool ArmConditionPassed(Cond cond);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+index 6c89a4af3..8e5a0d54e 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+@@ -56,6 +56,10 @@ void TranslateArm(IR::Block& block, LocationDescriptor descriptor, TranslateCall
+             should_continue = visitor.RaiseException(Exception::NoExecuteFault);
+         }
+ 
++        if (visitor.inline_cond && !FinishInlineConditional(visitor, should_continue)) {
++            should_continue = false;
++        }
++
+         if (visitor.cond_state == ConditionalState::Break) {
+             break;
+         }
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 83063eeb5..ba70a1e7c 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -245,6 +245,16 @@ struct UserConfig {
+     /// About 60 bytes a returning block.
+     bool inline_rsb_pop = false;
+ 
++    /// An indirect jump (FastDispatchHint: calls through registers, jump tables) looks up the fast
++    /// dispatch table and jumps in its own block, instead of in the handler all of them share: the
++    /// host predicts each site's jump on its own. About 70 bytes a block that ends so.
++    bool inline_fast_dispatch = false;
++
++    /// A conditional ARM instruction in the middle of a block that only writes registers is
++    /// translated in place (each write a conditional select) instead of ending the block (see
++    /// TranslationOptions::inline_conditionals).
++    bool inline_conditional_instructions = false;
++
+     /// Determines if instructions that pagefault should cause recompilation of that block
+     /// with fastmem disabled.
+     /// Recompiled code will use the page_table if this is available, otherwise memory
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 89a03638a..74b7e9f12 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -339,6 +339,11 @@ struct UserConfig {
+     /// About 60 bytes a returning block.
+     bool inline_rsb_pop = false;
+ 
++    /// An indirect jump (FastDispatchHint: calls through registers, jump tables) looks up the fast
++    /// dispatch table and jumps in its own block, instead of in the handler all of them share: the
++    /// host predicts each site's jump on its own. About 70 bytes a block that ends so.
++    bool inline_fast_dispatch = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index c8f10d1a3..aff68451a 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -204,6 +204,7 @@ constexpr bool ReadsFromCPSR(const Opcode op) noexcept {
+     switch (op) {
+     case Opcode::A32GetCpsr:
+     case Opcode::A32GetCFlag:
++    case Opcode::A32GetCpsrNZCV:
+     case Opcode::A32GetGEFlags:
+     case Opcode::A32UpdateUpperLocationDescriptor:
+     case Opcode::A64GetCFlag:
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index 810b92acf..f1cda0300 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -745,6 +745,7 @@ A32OPC(SetCpsrNZCVQ,                                        Void,           U32
+ A32OPC(SetCpsrNZ,                                           Void,           NZCV                                                            )
+ A32OPC(SetCpsrNZC,                                          Void,           NZCV,           U1                                              )
+ A32OPC(GetCFlag,                                            U1,                                                                             )
++A32OPC(GetCpsrNZCV,                                         NZCV,                                                                           )
+ A32OPC(OrQFlag,                                             Void,           U1                                                              )
+ A32OPC(GetGEFlags,                                          U32,                                                                            )
+ A32OPC(SetGEFlags,                                          Void,           U32                                                             )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 3902d72f9..16dfdb43b 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -1399,6 +1399,33 @@ static void ConstantPropagation(IR::Block& block) {
+     }
+ }
+ 
++// VMRS APSR_nzcv after a VCMP in the same block (a float compare and branch): the compare's
++// flags go to the CPSR as they are (both hold the host's format), instead of through the FPSCR's
++// ARM format and back (a store, a load and two conversions)
++static void A32FpscrNZCVForwarding(IR::Block& block) {
++    IR::Value last;
++    for (auto it = block.instructions.begin(); it != block.instructions.end(); ++it) {
++        switch (it->GetOpcode()) {
++        case IR::Opcode::A32SetFpscrNZCV:
++            last = it->GetArg(0);
++            break;
++        case IR::Opcode::A32SetFpscr:
++            last = {};
++            break;
++        case IR::Opcode::A32SetCpsrNZCVRaw: {
++            const IR::Value arg = it->GetArg(0);
++            if (!last.IsEmpty() && !arg.IsImmediate() && arg.GetInstRecursive()->GetOpcode() == IR::Opcode::A32GetFpscrNZCV) {
++                block.PrependNewInst(it, IR::Opcode::A32SetCpsrNZCV, {last});
++                it->Invalidate();
++            }
++            break;
++        }
++        default:
++            break;
++        }
++    }
++}
++
+ static void DeadCodeElimination(IR::Block& block) {
+     // We iterate over the instructions in reverse order.
+     // This is because removing an instruction reduces the number of uses for earlier instructions.
+@@ -1656,6 +1683,7 @@ void Optimize(IR::Block& block, const A32::UserConfig& conf, const Optimization:
+     Optimization::NamingPass(block);
+     if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
+         Optimization::A32GetSetElimination(block, {.convert_nzc_to_nz = true});
++        Optimization::A32FpscrNZCVForwarding(block);
+         Optimization::DeadCodeElimination(block);
+     }
+     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
+-- 
+2.43.0
+
