@@ -377,6 +377,24 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.88: **a fresh process for every game; faults inside fault handlers reported.** 03.87 on a console:
+Mario Kart 8 Deluxe races at 16-19 fps (mostly 17.5-18.7; 03.85 15-18, 03.86 14-16), accesses through
+the callbacks 9,000-32,000 a second, nearly all writes to memory the GPU caches (03.86: 240,000-350,000),
+fastmem resolving about 300 faults a second and declining 8-34. Then Captain Toad, booted after it in
+the same session, was closed by the system while loading a level, no crash report, its GPU submissions
+all completing. Its start: `C heap 72 of 1116 MiB in use, 37 MiB of flexible memory free, largest free
+block of direct memory 1856 MiB` (a fresh app: 384 MiB, 364, 4608): the C heap keeps what a game took,
+much of it in direct memory. And fastmem declined 1,475 faults a second in it.
+
+- The launcher restarts the app after a game that ran (`sceSystemServiceLoadExec("/app0/eboot.bin")`;
+  if refused, it carries on as before): every game starts with all the memory there is.
+- Patch 0076: the fault handlers (dynarmic's on the PS4, the on-demand DRAM's, the sparse vectors')
+  run with SA_NODEFER and share a per-thread nesting count; a fault while one runs is passed down to the
+  crash logger untouched (resolving it could wait on a lock its own thread holds), so crash.log says
+  where, instead of the kernel ending the app as it does for a fault on a blocked signal.
+- The 30-second line splits fastmem's declines by reason: not plain memory, writes to memory the GPU
+  caches, 16 KiB pages whose guest pages aren't back to back in the DRAM, other.
+
 03.87: **exclusives that lose fastmem stay inline; GPU-cached pages readable through it.** 03.86 on a
 console, Mario Kart 8 Deluxe: fastmem in use (a 2^39 arena at 0x4800000000, 1.7-3.7 GiB mapped, tens
 of faults a second resolved, 60-320 declined), races at 14-16 fps (03.85: 15-18), and 240,000-350,000

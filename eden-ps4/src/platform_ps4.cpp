@@ -1262,6 +1262,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.88: a fresh start for every game. 03.87's log: Mario Kart races up to 18-19 fps with fastmem, its "
+         "slow memory accesses down from 280,000 to under 30,000 a second. But the app never gave back what "
+         "Mario Kart took: Captain Toad, started after it, had 1.8 GB of the PS4's 4.6 GB of memory and almost "
+         "no system memory, and was closed by the PS4 while loading a level. Now the app restarts itself "
+         "after each game (back to this page, all memory free). And if a crash ever happens inside the "
+         "emulator's memory handling, the log now says where instead of the app just vanishing; the log "
+         "also says why fastmem turns memory away, which Captain Toad did 1,500 times a second.\n"
          "03.87: fastmem without its catch. In 03.86 it worked (gigabytes mapped) but races weren't faster: "
          "every atomic operation that once touched memory fastmem couldn't map went back to the slowest path "
          "for good, 280,000 times a second, eating the gain. Those now keep the fast inline path. And memory "
@@ -1964,18 +1971,26 @@ std::string PerfLine(double seconds)
     // recompiler's fallback took the access, and the code there was recompiled without fastmem)
     {
         static uint64_t last_resolved = 0, last_declined = 0;
+        static size_t last_why[4] = {};
         const uint64_t resolved = Common::Orbis::FastmemFaultsResolved(), declined = Common::Orbis::FastmemFaultsDeclined();
+        size_t why[4];
+        Common::Orbis::FastmemDeclineReasons(why[0], why[1], why[2], why[3]);
+        const auto per_second = [&](size_t now, size_t before) { return double(now - before) / seconds; };
         if (Common::Orbis::FastmemArenaBits() != 0) {
             line += fmt::format("; fastmem (a 2^{} arena at {:#x}): {} MiB of the game's memory mapped at its own "
-                                "addresses, {:.0f} faults a second resolved, {:.0f} declined",
+                                "addresses, {:.0f} faults a second resolved, {:.0f} declined (not plain memory {:.0f}, "
+                                "writes to memory the GPU caches {:.0f}, pages not back to back {:.0f}, other {:.0f})",
                                 Common::Orbis::FastmemArenaBits(), Common::Orbis::FastmemArenaBase(),
                                 Common::Orbis::FastmemMappedBytes() >> 20,
-                                double(resolved - last_resolved) / seconds, double(declined - last_declined) / seconds);
+                                double(resolved - last_resolved) / seconds, double(declined - last_declined) / seconds,
+                                per_second(why[0], last_why[0]), per_second(why[1], last_why[1]),
+                                per_second(why[2], last_why[2]), per_second(why[3], last_why[3]));
         } else {
             line += "; fastmem: off";
         }
         last_resolved = resolved;
         last_declined = declined;
+        std::copy(std::begin(why), std::end(why), std::begin(last_why));
     }
     // The services the game's calls spent their time in, the five busiest
     P::ServiceCall calls[P::MaxServiceCalls];
@@ -2263,6 +2278,16 @@ void* Run(void*)
         {
             std::fprintf(f, "%s\n", kFinishedLine);
             std::fclose(f);
+        }
+        // A fresh process for the next game: the C heap never gives back what a game took (after
+        // Mario Kart 8 Deluxe it held 1.1 GiB, 72 MiB of it in use, and Captain Toad started with
+        // 1.8 of the 4.6 GiB of direct memory and 37 MiB of flexible memory, and was closed by the
+        // system). (Not after a game that didn't load: the start page says why.)
+        if (result.status != Launcher::BootResult::Status::LoadFailed)
+        {
+            Trace("restarting the app: a fresh process, with all its memory, for the next game");
+            const int restart = sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+            Trace(fmt::format("restart refused ({:#x}): carrying on in this process", uint32_t(restart)));
         }
     }
     return nullptr;

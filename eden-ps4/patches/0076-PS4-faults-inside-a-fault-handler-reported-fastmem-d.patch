@@ -1,0 +1,319 @@
+From ffc3bda6574dbf74c0133092b5abf26598f3f9ae Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 08:39:09 +0000
+Subject: [PATCH] PS4: faults inside a fault handler reported; fastmem declines
+ counted by reason
+
+03.87 on a console: Captain Toad (after Mario Kart in the same session) was closed by the system
+with no crash report while loading a level; its GPU submissions were all completing. A fault
+inside one of the fault handlers would do that: the signal is blocked there, so the kernel ends
+the app without running any handler. The handlers (dynarmic's on the PS4, the on-demand DRAM's,
+the sparse vectors') now run with SA_NODEFER and share a per-thread nesting count: a fault while
+one runs resolves nothing (it could wait on a lock its own thread holds) and goes down the chain
+to the crash logger, which writes crash.log with where it happened.
+
+Fastmem's declines are counted by reason (not plain memory, writes to memory the GPU caches,
+16 KiB pages whose guest pages aren't back to back, other): Toad declined 1,475 a second,
+Mario Kart 8-34.
+---
+ src/common/orbis_memory.cpp                   | 71 ++++++++++++++++---
+ src/common/orbis_memory.h                     |  8 +++
+ src/common/sparse_large_vector.cpp            | 12 +++-
+ .../backend/exception_handler_posix.cpp       | 57 ++++++++++++---
+ 4 files changed, 126 insertions(+), 22 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 0d7751e56..e6378d4a2 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -198,6 +198,9 @@ struct FastmemArena {
+     std::atomic<const Common::PageTable*> table{nullptr};
+     std::atomic<bool> cached_reads{false}; // pages the GPU caches readable (no reactive flushing)
+     std::atomic<size_t> mapped{0}, resolved{0}, declined{0};
++    // why declined: not memory (unmapped, a debug page), a write to a page the GPU caches, a 16 KiB
++    // page whose guest pages aren't back to back in the DRAM, anything else
++    std::atomic<size_t> declined_unmapped{0}, declined_cached_write{0}, declined_split{0}, declined_other{0};
+ };
+ FastmemArena arena;
+ std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
+@@ -228,32 +231,38 @@ off_t PhysOf(size_t offset) noexcept {
+ // The DRAM offset of the 16 KiB at guest address `va` (16 KiB aligned) if its four guest pages
+ // are memory back to back in the DRAM: ordinary memory, or (cached_reads) pages the GPU caches,
+ // which make it read-only (`read_only` set); else SIZE_MAX
+-size_t ArenaPageSource(const Common::PageTable& table, u64 va, bool& read_only) noexcept {
++enum class Decline { None, Unmapped, Split, Other };
++size_t ArenaPageSource(const Common::PageTable& table, u64 va, bool& read_only, Decline* why = nullptr) noexcept {
+     size_t source = SIZE_MAX;
+     read_only = false;
++    const auto fail = [why](Decline reason) {
++        if (why)
++            *why = reason;
++        return SIZE_MAX;
++    };
+     for (size_t i = 0; i < ArenaPage / GuestPage; i++) {
+         const size_t index = (va >> 12) + i;
+         if (index >= table.entries.size())
+-            return SIZE_MAX;
++            return fail(Decline::Other);
+         const auto [pointer, type, block] = table.entries.GetOrDefault(index).PointerTypeBlock(true);
+         (void)block;
+         if (type == Common::PageType::RasterizerCachedMemory && arena.cached_reads.load(std::memory_order_relaxed)) {
+             read_only = true;
+         } else if (type != Common::PageType::Memory) {
+-            return SIZE_MAX;
++            return fail(Decline::Unmapped);
+         }
+         if (pointer == 0)
+-            return SIZE_MAX;
++            return fail(Decline::Unmapped);
+         const uintptr_t host = pointer + va + i * GuestPage;
+         if (host < arena.backing || host - arena.backing >= arena.backing_size)
+-            return SIZE_MAX;
++            return fail(Decline::Other);
+         const size_t offset = host - arena.backing;
+         if (i == 0) {
+             if (offset % ArenaPage != 0)
+-                return SIZE_MAX;
++                return fail(Decline::Split);
+             source = offset;
+         } else if (offset != source + i * GuestPage) {
+-            return SIZE_MAX;
++            return fail(Decline::Split);
+         }
+     }
+     return source;
+@@ -271,7 +280,8 @@ bool ResolveArenaFault(uintptr_t address, bool write) noexcept {
+     LockArena();
+     const u64 va = (address - base) & ~u64(ArenaPage - 1);
+     bool read_only = false;
+-    const size_t source = ArenaPageSource(*table, va, read_only);
++    Decline why = Decline::None;
++    const size_t source = ArenaPageSource(*table, va, read_only, &why);
+     bool mapped = false;
+     // (a write to a page the GPU caches: declined, the write goes through the page table walk and
+     // the callbacks, which tell the GPU's caches)
+@@ -295,6 +305,13 @@ bool ResolveArenaFault(uintptr_t address, bool write) noexcept {
+     }
+     UnlockArena();
+     (mapped ? arena.resolved : arena.declined).fetch_add(1, std::memory_order_relaxed);
++    if (!mapped) {
++        (source != SIZE_MAX && write && read_only ? arena.declined_cached_write
++         : why == Decline::Unmapped               ? arena.declined_unmapped
++         : why == Decline::Split                  ? arena.declined_split
++                                                  : arena.declined_other)
++            .fetch_add(1, std::memory_order_relaxed);
++    }
+     return mapped;
+ }
+ 
+@@ -305,9 +322,17 @@ bool FaultWasWrite(void* context) {
+ }
+ 
+ void OnDemandFaultHandler(int sig, siginfo_t* info, void* context) {
++    if (FaultHandlerEnter() > 0) {
++        // (a fault inside a fault handler: straight down to the crash logger)
++        Trace("eden: a fault inside a fault handler (crash.log has where)");
++        FaultHandlerLeave();
++        ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
++        return;
++    }
+     const int saved_errno = errno; // (the code it interrupted may be about to read it)
+     const bool resolved = ResolveFault(FaultAddress(info), FaultWasWrite(context));
+     errno = saved_errno;
++    FaultHandlerLeave();
+     if (resolved)
+         return;
+     ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
+@@ -321,7 +346,9 @@ void InstallOnDemandFaultHandler() {
+     struct sigaction action;
+     std::memset(&action, 0, sizeof(action));
+     action.sa_sigaction = OnDemandFaultHandler;
+-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
++    // (SA_NODEFER: a fault inside the handler is delivered, and reported, rather than the kernel
++    // ending the app silently, as for a blocked signal)
++    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+     sigemptyset(&action.sa_mask);
+     sigaction(SIGSEGV, &action, &previous_segv);
+     sigaction(SIGBUS, &action, &previous_bus);
+@@ -535,6 +562,23 @@ size_t FastmemFaultsDeclined() {
+     return arena.declined.load(std::memory_order_relaxed);
+ }
+ 
++void FastmemDeclineReasons(size_t& unmapped, size_t& cached_write, size_t& split, size_t& other) {
++    unmapped = arena.declined_unmapped.load(std::memory_order_relaxed);
++    cached_write = arena.declined_cached_write.load(std::memory_order_relaxed);
++    split = arena.declined_split.load(std::memory_order_relaxed);
++    other = arena.declined_other.load(std::memory_order_relaxed);
++}
++
++thread_local int fault_handler_depth = 0;
++
++int FaultHandlerEnter() {
++    return fault_handler_depth++;
++}
++
++void FaultHandlerLeave() {
++    fault_handler_depth--;
++}
++
+ bool ResolveFault(uintptr_t address, bool write) {
+     return ResolveVectorFault(address) || ResolveOnDemandFault(address) || ResolveArenaFault(address, write);
+ }
+@@ -560,6 +604,15 @@ extern "C" bool dynarmic_ps4_resolve_fault(uintptr_t address, bool write) {
+     return resolved;
+ }
+ 
++// dynarmic's handler's nesting (it counts with Eden's handlers: a fault inside it is passed down)
++extern "C" int dynarmic_ps4_fault_enter() {
++    return Common::Orbis::FaultHandlerEnter();
++}
++
++extern "C" void dynarmic_ps4_fault_leave() {
++    Common::Orbis::FaultHandlerLeave();
++}
++
+ namespace Common::Orbis {
+ 
+ } // namespace Common::Orbis
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index 2e35f2d9e..db8716449 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -75,6 +75,14 @@ void UnlockArena();
+ std::size_t FastmemMappedBytes();
+ std::size_t FastmemFaultsResolved();
+ std::size_t FastmemFaultsDeclined();
++/// Declines by reason: not memory (unmapped, debug), writes to pages the GPU caches, 16 KiB pages
++/// whose guest pages aren't back to back in the DRAM, anything else
++void FastmemDeclineReasons(std::size_t& unmapped, std::size_t& cached_write, std::size_t& split, std::size_t& other);
++/// The fault handlers' nesting on this thread: a fault while one runs (a bug in a handler) must not
++/// be resolved again (it could wait on a lock its own thread holds), only passed down to the crash
++/// logger, which writes crash.log. FaultHandlerEnter returns the depth before.
++int FaultHandlerEnter();
++void FaultHandlerLeave();
+ 
+ /// For a fault at `address` (any thread, in a signal handler): maps what belongs there if it's
+ /// memory the port maps lazily (a sparse vector's page, a DRAM chunk, a fastmem page). True if
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index 095a375ce..f22663fa4 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -165,8 +165,14 @@ void ChainSignal(const struct sigaction& previous, int sig, siginfo_t* info, voi
+ void VectorFaultHandler(int sig, siginfo_t* info, void* context) {
+     // si_addr at FreeBSD's offset (the musl headers have Linux's siginfo layout)
+     const uintptr_t address = *reinterpret_cast<const uintptr_t*>(reinterpret_cast<char*>(info) + 24);
+-    if (ResolveVectorFault(address))
+-        return; // the access is retried, now with a page of zeros there
++    if (Orbis::FaultHandlerEnter() == 0) {
++        const bool resolved = ResolveVectorFault(address);
++        Orbis::FaultHandlerLeave();
++        if (resolved)
++            return; // the access is retried, now with a page of zeros there
++    } else {
++        Orbis::FaultHandlerLeave(); // (inside another handler: passed down to the crash logger)
++    }
+     ChainSignal(sig == SIGBUS ? previous_bus : previous_segv, sig, info, context);
+ }
+ 
+@@ -174,7 +180,7 @@ void InstallVectorFaultHandler() {
+     struct sigaction action;
+     std::memset(&action, 0, sizeof(action));
+     action.sa_sigaction = VectorFaultHandler;
+-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
++    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+     sigemptyset(&action.sa_mask);
+     sigaction(SIGSEGV, &action, &previous_segv);
+     sigaction(SIGBUS, &action, &previous_bus);
+diff --git a/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp b/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
+index e370ea947..ec8f00a26 100644
+--- a/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
++++ b/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
+@@ -46,6 +46,12 @@ extern "C" __attribute__((weak)) bool dynarmic_ps4_resolve_fault(uintptr_t addre
+ // ... and whether an address is in its fastmem arena: only a fault there is a fastmem access for
+ // the fallback; any other fault in recompiled code goes on to the handlers before this one
+ extern "C" __attribute__((weak)) bool dynarmic_ps4_in_fastmem_arena(uintptr_t address);
++// ... and the fault handlers' nesting on this thread (a fault inside a handler: passed down to the
++// crash logger, never resolved again: it could wait on a lock its own thread holds)
++extern "C" __attribute__((weak)) int dynarmic_ps4_fault_enter();
++extern "C" __attribute__((weak)) void dynarmic_ps4_fault_leave();
++// the port's boot trace (safe in a signal handler)
++extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage);
+ #endif
+ 
+ namespace Dynarmic::Backend {
+@@ -106,6 +112,10 @@ public:
+         sa.sa_handler = nullptr;
+         sa.sa_sigaction = &SigHandler::SigAction;
+         sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
++#ifdef __OPENORBIS__
++        // (a fault inside the handler delivered and reported, not the app ended silently)
++        sa.sa_flags |= SA_NODEFER;
++#endif
+         sigemptyset(&sa.sa_mask);
+         if (sigaction(SIGSEGV, &sa, &old_sa_segv) != 0) {
+             fmt::print(stderr, "dynarmic: POSIX SigHandler: could not set SIGSEGV handler\n");
+@@ -149,6 +159,37 @@ void SigHandler::RegisterHandler() {
+ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
+     DEBUG_ASSERT(sig == SIGSEGV || sig == SIGBUS);
+ #ifdef __OPENORBIS__
++    const auto chain = [&] {
++        struct sigaction* previous = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
++        if ((previous->sa_flags & SA_SIGINFO) && previous->sa_sigaction) {
++            previous->sa_sigaction(sig, info, raw_context);
++        } else if (previous->sa_handler != SIG_DFL && previous->sa_handler != SIG_IGN) {
++            previous->sa_handler(sig);
++        } else {
++            signal(sig, SIG_DFL); // (on return the access faults again, to the default action)
++        }
++    };
++    const int depth = dynarmic_ps4_fault_enter ? dynarmic_ps4_fault_enter() : 0;
++    if (depth > 0) {
++        // a fault inside a fault handler: down to the crash logger (crash.log: where), resolving
++        // nothing (the nesting count stays up, so the port's handlers pass it down too)
++        if (ps4_boot_trace) {
++            ps4_boot_trace("dynarmic: a fault inside a fault handler (crash.log has where)");
++        }
++        chain();
++        if (dynarmic_ps4_fault_leave) {
++            dynarmic_ps4_fault_leave();
++        }
++        return;
++    }
++    struct Leave {
++        bool active = true;
++        ~Leave() {
++            if (active && dynarmic_ps4_fault_leave) {
++                dynarmic_ps4_fault_leave();
++            }
++        }
++    } leave;
+     // Lazily mapped memory first (also from recompiled code: its page table walk reads the page
+     // table and the DRAM directly); then a fastmem access to send to its fallback; then the
+     // handlers before this one. Nothing logged here: this is a signal handler.
+@@ -169,17 +210,13 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
+             return;
+         }
+     }
+-    {
+-        struct sigaction* previous = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
+-        if ((previous->sa_flags & SA_SIGINFO) && previous->sa_sigaction) {
+-            previous->sa_sigaction(sig, info, raw_context);
+-        } else if (previous->sa_handler != SIG_DFL && previous->sa_handler != SIG_IGN) {
+-            previous->sa_handler(sig);
+-        } else {
+-            signal(sig, SIG_DFL); // (on return the access faults again, to the default action)
+-        }
+-        return;
++    // not ours: the handlers before this one, with the nesting count down (they may resolve it)
++    leave.active = false;
++    if (dynarmic_ps4_fault_leave) {
++        dynarmic_ps4_fault_leave();
+     }
++    chain();
++    return;
+ #else
+     CTX_DECLARE(raw_context);
+     {
+-- 
+2.43.0
+
