@@ -377,6 +377,26 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.87: **exclusives that lose fastmem stay inline; GPU-cached pages readable through it.** 03.86 on a
+console, Mario Kart 8 Deluxe: fastmem in use (a 2^39 arena at 0x4800000000, 1.7-3.7 GiB mapped, tens
+of faults a second resolved, 60-320 declined), races at 14-16 fps (03.85: 15-18), and 240,000-350,000
+accesses a second through the callbacks, half of them writes: 03.79's exclusive pairs again. Each
+declined fault recompiles its access without fastmem; for a load or store that's the inline page table
+walk, but dynarmic's fastmem exclusives then called the callbacks every time, and 03.80's page table
+exclusives were off whenever fastmem was on.
+
+Patch 0075: an exclusive recompiled without fastmem goes through the page table inline
+(`EmitExclusive*PageTable`, the monitor's state shared with fastmem's), and `UsePageTableExclusives` no
+longer needs fastmem off. The fault's error code (FreeBSD's mc_err, bit 1) reaches the resolver, which
+maps a 16 KiB page mixing ordinary memory and pages the GPU caches read-only when such pages may be read
+without the callbacks (no reactive flushing, as the page table walk), and declines a write there.
+
+The A32 harness gained fastmem too (memfd guest memory in a 4 GiB arena, the marked and unmapped pages
+left out). 2,100 random programs agree with the page table (A32/Thumb loads, stores, LDM/STM and
+exclusives; A64 loads, stores and exclusives). A32, fastmem against the page table with its shared walk
+and inline exclusives: calls 25.5 -> 24.4 ns, push/pop 27.8 -> 20.6, struct accesses 5.5 -> 3.8,
+atomics 78.8 -> 74.4.
+
 03.86: **fastmem in use.** 03.85 on a console: no more crash, and the 30-second line said `fastmem (a 2^38
 arena at 0x8000000000): 0 MiB ... mapped, 0 faults`: never used. With Unsafe CPU accuracy Eden drops the
 fastmem pointer unless `cpuopt_unsafe_host_mmu` is set, whose default is off on platforms it doesn't

@@ -1262,6 +1262,12 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.87: fastmem without its catch. In 03.86 it worked (gigabytes mapped) but races weren't faster: "
+         "every atomic operation that once touched memory fastmem couldn't map went back to the slowest path "
+         "for good, 280,000 times a second, eating the gain. Those now keep the fast inline path. And memory "
+         "the GPU is caching can now be read through fastmem too (only writes to it take the slow path, so "
+         "the GPU hears about them). On a PC with the PS4's setup, Mario Kart-style code runs 4-30% faster "
+         "with fastmem than without.\n"
          "03.86: fastmem, for real this time. 03.85 no longer crashed, but its log said fastmem mapped nothing: "
          "with CPU Accuracy Unsafe, Eden switches fastmem off unless a 'host MMU' option is on, and that option "
          "defaults to off on systems Eden doesn't know, like the PS4. Now it's on. Also: fastmem's memory "

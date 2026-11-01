@@ -1,0 +1,272 @@
+From e4831bcd70f9aea2693eba559d0ddbbecc078f4c Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 08:05:34 +0000
+Subject: [PATCH] PS4 fastmem: exclusives that lose fastmem stay inline; pages
+ the GPU caches mapped for reads
+
+03.86 on a console (Mario Kart 8 Deluxe, 32-bit): fastmem in use, 1.7-3.7 GiB mapped, races no
+faster (14-16 fps), and 240,000-350,000 memory accesses a second through the callbacks again, half
+of them writes: exclusive pairs. An exclusive whose fastmem access faulted on a page the arena
+couldn't map is recompiled without fastmem, and dynarmic's inline fastmem exclusives then called
+the callbacks every time (the page table's inline exclusives were off with fastmem).
+
+- dynarmic: such an exclusive goes through the page table inline (EmitExclusive*PageTable, which
+  shares the monitor's state); UsePageTableExclusives no longer requires no fastmem.
+- The fault's error code (mc_err, bit 1) reaches the resolver; a 16 KiB page mixing ordinary memory
+  and pages the GPU caches is mapped read-only when reads of those are allowed (no reactive
+  flushing, as the page table walk), a write there declined (the page table, the callbacks).
+
+Host harness, A32 and A64 with guest memory mapped into an arena (the marked and unmapped pages
+left out, so they fault): 2,100 random programs (LDM/STM, ARM and Thumb loads and stores,
+exclusives; A64 loads, stores and exclusives) agree with the page table. A32 with fastmem against
+the page table with its shared walk and inline exclusives: calls 25.5 -> 24.4 ns, push/pop 27.8
+-> 20.6, struct accesses 5.5 -> 3.8, atomics 78.8 -> 74.4.
+---
+ src/common/orbis_memory.cpp                   | 52 ++++++++++++++-----
+ src/common/orbis_memory.h                     |  5 +-
+ src/core/memory.cpp                           |  4 +-
+ .../backend/exception_handler_posix.cpp       |  7 +--
+ .../backend/x64/emit_x64_memory.cpp.inc       | 19 ++++++-
+ 5 files changed, 66 insertions(+), 21 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 59b727df3..0d7751e56 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -45,6 +45,7 @@ using namespace Common::Literals;
+ 
+ namespace {
+ 
++constexpr int32_t ProtCpuRead = 0x1;
+ constexpr int32_t ProtCpuReadWrite = 0x3;
+ constexpr int32_t MapFixed = 0x10;
+ constexpr int32_t MemoryTypeWriteBack = 0;
+@@ -195,6 +196,7 @@ struct FastmemArena {
+     uintptr_t backing = 0;
+     size_t backing_size = 0;
+     std::atomic<const Common::PageTable*> table{nullptr};
++    std::atomic<bool> cached_reads{false}; // pages the GPU caches readable (no reactive flushing)
+     std::atomic<size_t> mapped{0}, resolved{0}, declined{0};
+ };
+ FastmemArena arena;
+@@ -224,16 +226,23 @@ off_t PhysOf(size_t offset) noexcept {
+ }
+ 
+ // The DRAM offset of the 16 KiB at guest address `va` (16 KiB aligned) if its four guest pages
+-// are ordinary memory, back to back in the DRAM; else SIZE_MAX
+-size_t ArenaPageSource(const Common::PageTable& table, u64 va) noexcept {
++// are memory back to back in the DRAM: ordinary memory, or (cached_reads) pages the GPU caches,
++// which make it read-only (`read_only` set); else SIZE_MAX
++size_t ArenaPageSource(const Common::PageTable& table, u64 va, bool& read_only) noexcept {
+     size_t source = SIZE_MAX;
++    read_only = false;
+     for (size_t i = 0; i < ArenaPage / GuestPage; i++) {
+         const size_t index = (va >> 12) + i;
+         if (index >= table.entries.size())
+             return SIZE_MAX;
+         const auto [pointer, type, block] = table.entries.GetOrDefault(index).PointerTypeBlock(true);
+         (void)block;
+-        if (type != Common::PageType::Memory || pointer == 0)
++        if (type == Common::PageType::RasterizerCachedMemory && arena.cached_reads.load(std::memory_order_relaxed)) {
++            read_only = true;
++        } else if (type != Common::PageType::Memory) {
++            return SIZE_MAX;
++        }
++        if (pointer == 0)
+             return SIZE_MAX;
+         const uintptr_t host = pointer + va + i * GuestPage;
+         if (host < arena.backing || host - arena.backing >= arena.backing_size)
+@@ -250,7 +259,7 @@ size_t ArenaPageSource(const Common::PageTable& table, u64 va) noexcept {
+     return source;
+ }
+ 
+-bool ResolveArenaFault(uintptr_t address) noexcept {
++bool ResolveArenaFault(uintptr_t address, bool write) noexcept {
+     const uintptr_t base = arena.base.load(std::memory_order_acquire);
+     if (!base || address < base || address - base >= arena.size)
+         return false;
+@@ -261,19 +270,24 @@ bool ResolveArenaFault(uintptr_t address) noexcept {
+     }
+     LockArena();
+     const u64 va = (address - base) & ~u64(ArenaPage - 1);
+-    const size_t source = ArenaPageSource(*table, va);
++    bool read_only = false;
++    const size_t source = ArenaPageSource(*table, va, read_only);
+     bool mapped = false;
+-    if (source != SIZE_MAX) {
+-        // and the pages after it, as far as they follow on in the DRAM, in the same chunk
++    // (a write to a page the GPU caches: declined, the write goes through the page table walk and
++    // the callbacks, which tell the GPU's caches)
++    if (source != SIZE_MAX && !(write && read_only)) {
++        // and the pages after it, as far as they follow on in the DRAM, in the same chunk, alike
+         size_t length = ArenaPage;
++        bool next_read_only = false;
+         while (length < MaxArenaRun && (source + length) % OnDemandChunk != 0 && va + length < arena.size &&
+-               ArenaPageSource(*table, va + length) == source + length) {
++               ArenaPageSource(*table, va + length, next_read_only) == source + length && next_read_only == read_only) {
+             length += ArenaPage;
+         }
+         const off_t phys = PhysOf(source);
+         if (phys >= 0) {
+             void* at = reinterpret_cast<void*>(base + va);
+-            mapped = sceKernelMapDirectMemory(&at, length, ProtCpuReadWrite, MapFixed, phys, ArenaPage) == 0 &&
++            mapped = sceKernelMapDirectMemory(&at, length, read_only ? ProtCpuRead : ProtCpuReadWrite, MapFixed, phys,
++                                              ArenaPage) == 0 &&
+                      at == reinterpret_cast<void*>(base + va);
+             if (mapped)
+                 arena.mapped.fetch_add(length, std::memory_order_relaxed);
+@@ -284,9 +298,15 @@ bool ResolveArenaFault(uintptr_t address) noexcept {
+     return mapped;
+ }
+ 
++// A page fault's error code (FreeBSD's mc_err, in the PS4's signal context: the machine context at
++// 0x40, register 19; the port's ps4_crashlog.cpp measured the layout): bit 1, a write
++bool FaultWasWrite(void* context) {
++    return (reinterpret_cast<const u64*>(static_cast<char*>(context) + 0x40)[19] & 2) != 0;
++}
++
+ void OnDemandFaultHandler(int sig, siginfo_t* info, void* context) {
+     const int saved_errno = errno; // (the code it interrupted may be about to read it)
+-    const bool resolved = ResolveFault(FaultAddress(info));
++    const bool resolved = ResolveFault(FaultAddress(info), FaultWasWrite(context));
+     errno = saved_errno;
+     if (resolved)
+         return;
+@@ -515,8 +535,12 @@ size_t FastmemFaultsDeclined() {
+     return arena.declined.load(std::memory_order_relaxed);
+ }
+ 
+-bool ResolveFault(uintptr_t address) {
+-    return ResolveVectorFault(address) || ResolveOnDemandFault(address) || ResolveArenaFault(address);
++bool ResolveFault(uintptr_t address, bool write) {
++    return ResolveVectorFault(address) || ResolveOnDemandFault(address) || ResolveArenaFault(address, write);
++}
++
++void SetFastmemCachedReads(bool on) {
++    arena.cached_reads.store(on, std::memory_order_relaxed);
+ }
+ 
+ } // namespace Common::Orbis
+@@ -529,9 +553,9 @@ extern "C" bool dynarmic_ps4_in_fastmem_arena(uintptr_t address) {
+     return base != 0 && address >= base && address - base < (std::size_t(1) << Common::Orbis::FastmemArenaBits());
+ }
+ 
+-extern "C" bool dynarmic_ps4_resolve_fault(uintptr_t address) {
++extern "C" bool dynarmic_ps4_resolve_fault(uintptr_t address, bool write) {
+     const int saved_errno = errno;
+-    const bool resolved = Common::Orbis::ResolveFault(address);
++    const bool resolved = Common::Orbis::ResolveFault(address, write);
+     errno = saved_errno;
+     return resolved;
+ }
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index d37217ec9..2e35f2d9e 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -79,7 +79,10 @@ std::size_t FastmemFaultsDeclined();
+ /// For a fault at `address` (any thread, in a signal handler): maps what belongs there if it's
+ /// memory the port maps lazily (a sparse vector's page, a DRAM chunk, a fastmem page). True if
+ /// the access can run again.
+-bool ResolveFault(std::uintptr_t address);
++bool ResolveFault(std::uintptr_t address, bool write);
++/// Whether pages the GPU caches may be mapped in the arena for reads (without reactive flushing
++/// the page table walk reads them inline too)
++void SetFastmemCachedReads(bool on);
+ 
+ /// RAII: the arena locked while the page table changes (fastmem only)
+ class ArenaUpdate {
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 6eab86977..88885b133 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -56,8 +56,10 @@ struct Memory::Impl {
+         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
+             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
+ #ifdef __OPENORBIS__
+-            // the page table the arena's faults are resolved from (common/orbis_memory.cpp)
++            // the page table the arena's faults are resolved from (common/orbis_memory.cpp), and
++            // whether pages the GPU caches may be read there
+             Common::Orbis::SetFastmemPageTable(current_page_table);
++            Common::Orbis::SetFastmemCachedReads(!Settings::values.use_reactive_flushing.GetValue());
+ #endif
+         } else {
+             current_page_table->fastmem_arena = nullptr;
+diff --git a/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp b/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
+index 9f33cf9c6..e370ea947 100644
+--- a/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
++++ b/src/dynarmic/src/dynarmic/backend/exception_handler_posix.cpp
+@@ -42,7 +42,7 @@
+ #ifdef __OPENORBIS__
+ // Eden's PS4 port: maps what belongs at a faulting address if it's memory it maps lazily (a page
+ // table page, a DRAM chunk, a fastmem page); true if the access can run again
+-extern "C" __attribute__((weak)) bool dynarmic_ps4_resolve_fault(uintptr_t address);
++extern "C" __attribute__((weak)) bool dynarmic_ps4_resolve_fault(uintptr_t address, bool write);
+ // ... and whether an address is in its fastmem arena: only a fault there is a fastmem access for
+ // the fallback; any other fault in recompiled code goes on to the handlers before this one
+ extern "C" __attribute__((weak)) bool dynarmic_ps4_in_fastmem_arena(uintptr_t address);
+@@ -57,7 +57,7 @@ namespace {
+ // machine context at 0x40 in the ucontext, its registers in FreeBSD's order (measured on hardware:
+ // the port's ps4_crashlog.cpp), and si_addr at 24 in the siginfo
+ constexpr size_t Ps4McontextOffset = 0x40;
+-constexpr size_t Ps4RipIndex = 20, Ps4RspIndex = 23;
++constexpr size_t Ps4RipIndex = 20, Ps4RspIndex = 23, Ps4ErrIndex = 19; // (mc_err: the page fault's error code, bit 1 a write)
+ inline u64* Ps4Registers(void* raw_context) {
+     return reinterpret_cast<u64*>(static_cast<char*>(raw_context) + Ps4McontextOffset);
+ }
+@@ -152,7 +152,8 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
+     // Lazily mapped memory first (also from recompiled code: its page table walk reads the page
+     // table and the DRAM directly); then a fastmem access to send to its fallback; then the
+     // handlers before this one. Nothing logged here: this is a signal handler.
+-    if (dynarmic_ps4_resolve_fault && dynarmic_ps4_resolve_fault(Ps4FaultAddress(info))) {
++    if (dynarmic_ps4_resolve_fault &&
++        dynarmic_ps4_resolve_fault(Ps4FaultAddress(info), (Ps4Registers(raw_context)[Ps4ErrIndex] & 2) != 0)) {
+         return;
+     }
+     if (!dynarmic_ps4_in_fastmem_arena || dynarmic_ps4_in_fastmem_arena(Ps4FaultAddress(info))) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 65544c602..adb1ac461 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -341,6 +341,14 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
+         EmitExclusiveReadMemory<bitsize, callback>(ctx, inst);
+         return;
+     }
++    if constexpr (bitsize != 128) {
++        // an exclusive recompiled without fastmem (it faulted on a page the arena couldn't map):
++        // through the page table, inline, not the callbacks every time
++        if (!ShouldFastmem(ctx, inst) && UsePageTableExclusives()) {
++            EmitExclusiveReadMemoryPageTable<bitsize>(ctx, inst);
++            return;
++        }
++    }
+ 
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     constexpr bool ordered = true;
+@@ -418,6 +426,12 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+         EmitExclusiveWriteMemory<bitsize, callback>(ctx, inst);
+         return;
+     }
++    if constexpr (bitsize != 128) {
++        if (!ShouldFastmem(ctx, inst) && UsePageTableExclusives()) {
++            EmitExclusiveWriteMemoryPageTable<bitsize>(ctx, inst);
++            return;
++        }
++    }
+ 
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     constexpr bool ordered = true;
+@@ -546,8 +560,9 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+ // fastmem each of them was a call into the global monitor (its lock even with
+ // Unsafe_IgnoreGlobalMonitor, which only the inline paths honour) and the memory callbacks.
+ bool AxxEmitX64::UsePageTableExclusives() const {
+-    return conf.page_table_inline_exclusives && conf.page_table && !conf.fastmem_pointer && !conf.check_halt_on_memory_access &&
+-           conf.global_monitor;
++    // (with fastmem too: for an exclusive that lost fastmem - its page couldn't be mapped there once -
++    // instead of a call to the callbacks every time; it shares the monitor's state with fastmem's)
++    return conf.page_table_inline_exclusives && conf.page_table && !conf.check_halt_on_memory_access && conf.global_monitor;
+ }
+ 
+ template<size_t bitsize>
+-- 
+2.43.0
+
