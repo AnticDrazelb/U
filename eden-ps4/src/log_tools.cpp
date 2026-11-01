@@ -217,7 +217,7 @@ std::string ProfileSummary(std::string_view text, const Symbols& symbols, std::s
 {
     struct Thread
     {
-        double samples = 0, syscalls = 0, listed = 0;
+        double samples = 0, syscalls = 0, listed = 0, eboot = 0;
         std::map<std::string, double> keys;
         std::map<std::string, double> blocks; // JIT samples by guest block ("a32 0x...")
     };
@@ -256,6 +256,14 @@ std::string ProfileSummary(std::string_view text, const Symbols& symbols, std::s
             thread = &sections.back().threads[std::string(line.substr(comma + 4, colon - comma - 4))];
             window = std::atof(std::string(line.substr(colon + 2)).c_str());
             thread->samples += window;
+            // ", 1200 in eboot code": the app's own code, all of it (listed or not)
+            const size_t in_eboot = line.find(" in eboot code");
+            if (in_eboot != std::string_view::npos)
+            {
+                const size_t before = line.rfind(", ", in_eboot);
+                if (before != std::string_view::npos)
+                    thread->eboot += std::atof(std::string(line.substr(before + 2, in_eboot - before - 2)).c_str());
+            }
             const size_t calls = line.find(" in system calls");
             if (calls != std::string_view::npos)
             {
@@ -332,11 +340,16 @@ std::string ProfileSummary(std::string_view text, const Symbols& symbols, std::s
             const auto sys = t->keys.find("[system libraries]");
             const double jit_n = jit == t->keys.end() ? 0 : jit->second;
             const double sys_n = sys == t->keys.end() ? 0 : sys->second;
-            const double waiting = std::min(t->syscalls, sys_n);
+            (void)jit_n;
+            (void)sys_n;
+            // from the windows' own counts, every sample (the listed addresses leave out those seen
+            // once in a window, most of the JIT's): the rest is the game's code, with what little
+            // system library code runs outside calls
+            const double game = std::max(0.0, t->samples - t->eboot - t->syscalls);
             out += fmt::format("\n{}: {:.0f} samples (~{:.0f} s): {:.0f}% the game's code (JIT), {:.0f}% waiting in "
-                               "system calls, {:.0f}% other system library code, {:.0f}% the app's own code\n",
-                               name, t->samples, t->samples / 1000.0, share(jit_n), share(waiting),
-                               share(sys_n - waiting), share(t->listed - jit_n - sys_n));
+                               "system calls, {:.0f}% the app's own code\n",
+                               name, t->samples, t->samples / 1000.0, share(game), share(t->syscalls),
+                               share(t->eboot));
             std::vector<std::pair<double, std::string>> keys;
             for (const auto& [key, n] : t->keys)
                 keys.emplace_back(n, key);

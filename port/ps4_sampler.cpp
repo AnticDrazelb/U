@@ -884,7 +884,7 @@ extern "C" void ps4_sampler_note(const char* text) {
     const int fd = g_samples_fd.load();
     if (fd < 0)
         return;
-    char line[300];
+    char line[1024];  // (a session's settings run long)
     snprintf(line, sizeof(line), "## %s\n", text);
     writeLine(fd, line);
 }

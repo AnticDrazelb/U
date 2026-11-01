@@ -377,6 +377,36 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.93: **declined accesses share a walk; the profile read.** 03.92 on a console, Mario Kart with
+the Profiler on (resolution 100%): races at 19-20 fps; core 0 75% in JIT code, 9% the app's code, 16%
+in system calls (12-13% idle); a service call 250 us (about 130 until the service's thread took it,
+77 its handling, 38 back); the translator 15-40 blocks a second in races (120-190 us each),
+thousands a second while loading. hotblocks.log: memset and memcpy loops on top, then NEON code;
+in the 60 busiest blocks about 190 accesses walked the page table and 95 used fastmem. The walking
+ones: PUSH/POP and stack-frame stores, thread-local storage reads (`mrc p15` then
+`ldr [r0, #0x1fc]`), and the memset/memcpy stores. Fastmem declined about 240 accesses a second all
+race long, nearly all "pages not back to back": the 4 KiB guest pages under a 16 KiB host page not
+consecutive or not 16 KiB-aligned in the DRAM (thread stacks, local storage pages), so the arena
+can't map them; each such access was recompiled to walk the page table on its own.
+
+- Patch 0081: `fastmem_declined_shared_walk` (A32, on by default): the accesses fastmem was declined
+  for (their `do_not_fastmem` markers: the block's location and the IR name, which NamingPass gives
+  before any later pass changes the block) go through `A32SharedWalkPass` after Optimize, so those
+  through one base register value plus constants (a PUSH or POP, a stack frame, a copy loop) share
+  one `A32HostPointer` walk; every other access keeps fastmem. The emitter keeps the blocks with
+  declined accesses (`blocks_without_fastmem`).
+- Host harness `splitstack` (the stack's pages left out of the fastmem arena): calls.s (PUSH r4-r11,
+  lr; VPUSH d8-d15; and the pops, a call): 55.2 ns a call per-access walks, 21.1 shared, 18.1
+  fastmem, 24.5 without fastmem. Old build vs new, every option on: gen7, gen, gen3 (split stack),
+  gen4 (fastmem): 1,208 programs equal.
+- Patch 0081: the services on host threads (`RunHostThreadFunc`: audio, nvservices, FS, vi, bsdsocket,
+  ldn) run at VeryHigh (the PS4's 640): at the default (700) a woken one waited behind the emulated
+  cores' threads (650; the fourth spins 50 us when idle), the Vulkan thread and audio. The services
+  on the emulated fourth core (hid, nvnflinger...) are unchanged.
+- Profiler: the session line starts with the build (the sampler cut it at 300 characters, so
+  03.92's own samples were taken for an earlier build's); the summary's shares come from each
+  window's counts (the game's code was 7% of core 0 counting only addresses seen twice in a window).
+
 03.92: **diagnostics after 21 fps: a service call's wait split up, translation time, one more
 launcher trace.** 03.91 on a console: Mario Kart races at 21 fps (03.88: 16-19), about 500 s without
 a problem; Captain Toad ran too (03.89/03.90 had closed it as Mario Kart, the same `jmp(qword)` in

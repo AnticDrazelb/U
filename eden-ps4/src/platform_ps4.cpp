@@ -1265,6 +1265,17 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.93: function calls up to 2.6 times cheaper in Mario Kart. 03.92's profile showed where the "
+         "rest of the time goes: two thirds of the memory accesses in Mario Kart's busiest code went the "
+         "slow way, mostly each function's saving and restoring of registers on its stack. The PS4 maps "
+         "memory in 16 KiB pieces and the Switch in 4 KiB ones, and the game's stacks don't line up "
+         "with the PS4's pieces, so the fast way (fastmem) can't reach them; each of those accesses then "
+         "looked its page up on its own, nine look-ups to save nine registers. Now the accesses that can't "
+         "use fastmem share one look-up, as a function's whole save or restore. In a test of nothing but "
+         "calls on such a stack: 55 ns a call before, 21 now (18 where fastmem works). And the services that "
+         "run on threads of their own (audio, the GPU driver, files) now outrank the other threads: in "
+         "03.92 a call to one waited 130 us before the service even took it. The Profiler's summary also "
+         "names the app's code again and counts the game's code properly.\n"
          "03.92: measurements for the next step. 03.91 ran Mario Kart races at 21 fps (03.88: 16-19). "
          "To find the rest: the log's 30-second lines now say how long the game's threads wait for each "
          "call to a system service, split into waiting for the service, the service's work and getting "
@@ -2269,7 +2280,7 @@ void* Run(void*)
         {
             ps4_sampler_set_enabled(1);
             // the build that recorded it: the log bundle names its addresses only with its own symbols
-            ps4_sampler_note(fmt::format("{} ({}) [build {}]", program, setup, EDEN_PS4_VERSION).c_str());
+            ps4_sampler_note(fmt::format("[build {}] {} ({})", EDEN_PS4_VERSION, program, setup).c_str());
         }
         {
             std::lock_guard lock{g_mutex};
