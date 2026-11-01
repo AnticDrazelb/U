@@ -1,0 +1,74 @@
+From ae5e1be3d99cfe1ef16cc43f586e6493f6b79176 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 11:15:24 +0000
+Subject: [PATCH] PS4: the inline RSB pop's jump xbyak accepts; one set of
+ xbyak settings for the whole program
+
+03.89 on a console: Mario Kart closed while starting, "uncaught exception Xbyak::Error: bad mem
+size" on two cores, from A32EmitX64::EmitLeafTerminal. The inline RSB pop (inline_rsb_pop) ended
+with jmp(qword[...]); xbyak's jmp gives opMR a 32-bit register for it, so the strict mem/reg size
+check rejects the qword. dynarmic builds with that check off (XBYAK_STRICT_CHECK_MEM_REG_SIZE=0),
+but video_core's macro.cpp and renderer_null/software_draw.cpp, the only other files that include
+xbyak, had the default (on), and the linker keeps one copy of each of xbyak's inline functions:
+the PS4 build had the strict opMR (03.88 too).
+
+- A32 and A64 inline RSB pop: jmp(ptr[...]), as the shared handlers.
+- macro.cpp and software_draw.cpp: dynarmic's xbyak settings (XBYAK_STRICT_CHECK_MEM_REG_SIZE=0,
+  XBYAK_OLD_DISP_CHECK=1). The linked opMR has no strict check now.
+
+Host: a dynarmic build with the check forced on reproduced the throw (inline_rsb_pop only); with
+the fix, the A32 and A64 benchmarks and 6,600 runs of every generator's programs (every option,
+the PS4's CPU features, with and without fastmem, single-step) throw nothing. Old build vs new
+(lenient, every option): 242 A32 and 81 A64 programs, equal.
+---
+ src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp | 2 +-
+ src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp | 2 +-
+ src/video_core/CMakeLists.txt                          | 6 ++++++
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 39a19e787..7030cedf7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -1260,7 +1260,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+         } else {
+             code.jne(code.GetReturnFromRunCodeAddress());
+         }
+-        code.jmp(qword[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_codeptrs) + rax * sizeof(u64)]);
++        code.jmp(ptr[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_codeptrs) + rax * sizeof(u64)]); // (ptr: xbyak checks a qword jump against a 32-bit register)
+     } else {
+         e.code.jmp(e.terminal_handler_pop_rsb_hint);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index fd811bc28..14220f336 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -715,7 +715,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+         } else {
+             code.jne(code.GetReturnFromRunCodeAddress());
+         }
+-        code.jmp(qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
++        code.jmp(ptr[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]); // (ptr: xbyak checks a qword jump against a 32-bit register)
+     } else if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+         e.code.jmp(e.terminal_handler_pop_rsb_hint);
+     } else {
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index c5319f8f4..6883a11c6 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -475,6 +475,12 @@ endif()
+ 
+ if (ARCHITECTURE_x86_64)
+     target_link_libraries(video_core PUBLIC xbyak::xbyak)
++    # xbyak's settings as dynarmic's (src/dynarmic/src/dynarmic/CMakeLists.txt) in the files that
++    # include it here (the only ones outside dynarmic): its functions are inline and the linker
++    # keeps one copy of each for the whole program, so a strict copy from these made dynarmic's
++    # code throw "bad mem size" on the PS4 (03.89). A new file including xbyak needs them too.
++    set_source_files_properties(macro.cpp renderer_null/software_draw.cpp PROPERTIES
++        COMPILE_DEFINITIONS "XBYAK_STRICT_CHECK_MEM_REG_SIZE=0;XBYAK_OLD_DISP_CHECK=1")
+ endif()
+ 
+ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
+-- 
+2.43.0
+

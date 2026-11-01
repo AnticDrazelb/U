@@ -377,6 +377,24 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.91: **03.89's crash at Mario Kart's start fixed; one xbyak for the whole program.** 03.89 on a
+console: Mario Kart closed while starting, `uncaught exception Xbyak::Error: bad mem size` on two
+cores, thrown in `A32EmitX64::EmitLeafTerminal` (noexcept, so terminate). The inline RSB pop
+(patch 0077) ended with `jmp(qword[...])`; xbyak's `jmp` builds its operand register as 32 bits
+there, so its strict size check (`XBYAK_STRICT_CHECK_MEM_REG_SIZE`) rejects the qword. dynarmic
+compiles with the check off (its CMakeLists: newer xbyak's strict checks fail in dynarmic), and so
+did the host harness: never seen there. But `video_core/macro.cpp` and `renderer_null/software_draw.cpp`
+include xbyak with the default (on), and the linker keeps one copy of each of xbyak's inline
+functions for the whole program: the PS4 build (03.88 too) had the strict `opMR`.
+
+- Patch 0079: the inline RSB pop jumps through `ptr[...]` (as the shared handlers always did).
+- Patch 0079: those two video_core files get dynarmic's xbyak settings
+  (`XBYAK_STRICT_CHECK_MEM_REG_SIZE=0`, `XBYAK_OLD_DISP_CHECK=1`): one behaviour for every copy.
+- The host harness has a strict build now (`build-strict`, the check forced on), which reproduced
+  the throw (with the inline RSB pop only). Fixed: the A32 and A64 benchmarks and 6,600 runs of
+  every generator's programs, every option on, the PS4's CPU features, throw nothing; old build vs
+  new, 242 A32 and 81 A64 programs equal.
+
 03.90: **predicated A32 instructions in place; float compares straight to the flags.**
 
 - Patch 0078, `inline_conditional_instructions` (A32, on in Eden): a conditional ARM instruction in

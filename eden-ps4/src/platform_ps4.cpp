@@ -1265,6 +1265,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.91: fixes 03.89 and 03.90 closing Mario Kart as it started (\"bad mem size\"). The new "
+         "return jumps were written in a form that the code generator rejects when its strictest "
+         "checks are on. On a PC they are off, so testing there never saw it. On the PS4 they "
+         "were on, because the GPU's own small code generator brought its strict copy of the same "
+         "functions into the app. Both are fixed: the jumps use the accepted form, and the whole app "
+         "now uses the code generator's lenient settings, as the CPU translator always meant to. "
+         "Everything else from 03.89 and 03.90 is in.\n"
          "03.90: more of the same. 32-bit ARM code can make almost any instruction conditional (\"move if "
          "not equal\"); each such instruction used to split the code around it into three pieces with "
          "handovers in between. Now most stay in place as a choice between the old and new value, with "
