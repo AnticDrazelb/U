@@ -1265,6 +1265,16 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.95: thread stacks back on the fast path. 03.94 cut the stutters (far fewer translations in "
+         "races) but walked every stack access the slow way from the start, and races ran at 20-23 fps, "
+         "about 10% more work a frame on the busiest core than 03.93. Now the cause is gone instead: a "
+         "game's thread stacks are memory it maps a second time at an address it picks, which didn't line "
+         "up with the PS4's 16 KiB pages, so fastmem couldn't reach them. Eden's kernel now puts each such "
+         "stack on a copy of its memory that lines up (with spare pages at its ends), and copies it back "
+         "when the stack goes; the game's main stack lines up from the start. Stack accesses use fastmem "
+         "again, and the slow way is only used if stacks keep failing. Core 0, where Mario Kart runs its "
+         "main thread, also gets more room for translated code (48 MiB, from 40; it had 5 MiB left after "
+         "a few races). The 30-second lines say how many stacks were lined up.\n"
          "03.94: fewer stutters. 03.93 ran Mario Kart races at 22-24 fps. Its stutters came at the start "
          "of races and while loading: each time new game code ran, every stack access in it first failed "
          "the fast way and had the code translated again (up to 5,000 times a second while loading, "
@@ -2052,6 +2062,16 @@ std::string PerfLine(double seconds)
         average_us(now.present_ns - last.present_ns, now.presents - last.presents) / 1000.0,
         rate(now.presents, last.presents), rate(now.dequeues, last.dequeues),
         average_us(now.dequeue_ns - last.dequeue_ns, now.dequeues - last.dequeues) / 1000.0, double(dequeue_max) / 1e6);
+    // The kernel's timer, of the timer events (guest threads' sleeps and timed waits ending: each
+    // can interrupt an emulated core)
+    {
+        static uint64_t last_kernel_timer = 0;
+        const uint64_t kernel_timer = P::kernel_timer_tasks.load(std::memory_order_relaxed);
+        line += fmt::format("; of the timer events, the kernel's timer (the game's threads' sleeps and timeouts "
+                            "ending) {:.0f} a second",
+                            double(kernel_timer - last_kernel_timer) / seconds);
+        last_kernel_timer = kernel_timer;
+    }
     // Fastmem: the arena's pages mapped, and its faults (resolved: a page mapped; declined: the
     // recompiler's fallback took the access, and the code there was recompiled without fastmem)
     {
@@ -2070,6 +2090,16 @@ std::string PerfLine(double seconds)
                                 double(resolved - last_resolved) / seconds, double(declined - last_declined) / seconds,
                                 per_second(why[0], last_why[0]), per_second(why[1], last_why[1]),
                                 per_second(why[2], last_why[2]), per_second(why[3], last_why[3]));
+            // the game's aliased memory (thread stacks) lined up with the PS4's pages for it
+            const uint64_t aliases = P::aliases.load(std::memory_order_relaxed);
+            if (aliases != 0) {
+                line += fmt::format("; stacks and other aliased memory: {} so far, {} moved to line up with the "
+                                    "PS4's 16 KiB pages, {} left as they were (too large, or no memory); spare pages "
+                                    "beside them in {} 16 KiB pages, mapped {} times",
+                                    aliases, P::aliases_moved.load(std::memory_order_relaxed),
+                                    P::aliases_not_moved.load(std::memory_order_relaxed),
+                                    Common::Orbis::ArenaPaddingCount(), Common::Orbis::ArenaPaddedMaps());
+            }
         } else {
             line += "; fastmem: off";
         }
@@ -2083,9 +2113,11 @@ std::string PerfLine(double seconds)
     std::sort(calls, calls + n, [](const P::ServiceCall& a, const P::ServiceCall& b) { return a.total_ns > b.total_ns; });
     line += "; the services' own handling of the calls, the five busiest:";
     for (size_t i = 0; i < std::min<size_t>(n, 5) && calls[i].count; i++) {
-        line += fmt::format("{} {} command {}: {:.0f} a second, {:.0f} us each (at most {:.0f})", i ? "," : "",
-                            calls[i].name ? calls[i].name : "(others)", calls[i].command, double(calls[i].count) / seconds,
-                            average_us(calls[i].total_ns, calls[i].count), double(calls[i].max_ns) / 1000.0);
+        line += fmt::format("{} {} command {}: {:.0f} a second, {:.0f} us each (at most {:.0f}; {:.0f} us before its "
+                            "thread took it)",
+                            i ? "," : "", calls[i].name ? calls[i].name : "(others)", calls[i].command,
+                            double(calls[i].count) / seconds, average_us(calls[i].total_ns, calls[i].count),
+                            double(calls[i].max_ns) / 1000.0, average_us(calls[i].queue_ns, calls[i].count));
     }
     last = now;
     return line;

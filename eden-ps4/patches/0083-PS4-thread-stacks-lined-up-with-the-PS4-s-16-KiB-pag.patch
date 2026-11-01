@@ -1,0 +1,975 @@
+From 19c4ec4ba7a78a2dc779788697579d7adb739ebe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 18:23:32 +0000
+Subject: [PATCH] PS4: thread stacks lined up with the PS4's 16 KiB pages for
+ fastmem; code caches 48/40/32/8
+
+The PS4's fastmem arena maps 16 KiB at a time, each from 16 KiB of the DRAM, so guest pages must
+sit back to back there at their places in a 16 KiB page. A game's thread stacks are heap memory it
+aliases (svcMapMemory) at addresses it picks to 4 KiB: mostly not lined up, so every stack access
+declined fastmem and walked the page table.
+
+- KPageTableBase::MapMemory (PS4, and EDEN_TEST_ARENA_LINE_UP desktop builds): an alias of heap
+  memory up to 8 MiB goes on a copy of the source (CopyAliasForArena): whole 16 KiB from
+  AllocateAndOpenContinuous (the applet pool, at most 128 MiB: the application pool is all the
+  game's), the alias at its place in a 16 KiB page, the rest of its first and
+  last 16 KiB spare pages that become the arena's padding where their guest pages are free
+  (FinishAliasCopy). The source keeps its own pages, locked; UnmapMemory copies the alias's data
+  back to them (CopyBackAlias, in place of IsValidPageGroup) and frees the copy and its padding
+  (ForgetAliasCopy). Skipped when the source lines up already with nothing free beside the alias.
+- MapPages: a kernel-allocated stack of whole 16 KiB at a 16 KiB boundary; AllocateAndMapPagesImpl:
+  16 KiB-aligned mappings of whole 16 KiB up to 8 MiB on one piece of memory.
+- orbis_memory: arena padding (AddArenaPadding, RemoveArenaPadding, PopArenaPadding): a fixed
+  table the fault handler reads under arena_lock; ArenaPageSource takes a free guest page there as
+  its spare page.
+- dynarmic: proactive stack walks only after 32 stack declines on a core.
+- Code caches 48, 40, 32, 8 MiB.
+- dynarmic x64: DYNARMIC_HOST_FEATURES_MASK (hex) limits the host features, to measure on a desktop
+  the code the PS4's Jaguar gets.
+- PS4Perf: aliases, aliases_moved, aliases_not_moved, kernel_timer_tasks; per-service queue time
+  (request_queue_ns, ServiceCall::queue_ns).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/orbis_memory.cpp                   | 118 +++++-
+ src/common/orbis_memory.h                     |  17 +
+ src/common/ps4_perf.h                         |  18 +-
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |   7 +-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |   7 +-
+ src/core/hle/kernel/k_hardware_timer.cpp      |   6 +
+ src/core/hle/kernel/k_page_table_base.cpp     | 357 +++++++++++++++++-
+ src/core/hle/kernel/k_page_table_base.h       |  41 ++
+ src/core/hle/kernel/k_server_session.cpp      |   6 +
+ src/core/hle/service/service.cpp              |   4 +-
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |   3 +
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |   3 +
+ .../dynarmic/backend/x64/block_of_code.cpp    |   6 +
+ .../backend/x64/emit_x64_memory.cpp.inc       |   4 +-
+ 14 files changed, 572 insertions(+), 25 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index e6378d4a2..9075fad7a 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -228,11 +228,31 @@ off_t PhysOf(size_t offset) noexcept {
+     return -1;
+ }
+ 
++// Arena padding (orbis_memory.h): a fixed table (the fault handler reads it), under arena_lock
++struct Padding {
++    u64 group_va;       // 16 KiB aligned
++    size_t dram_offset; // where that 16 KiB is in the DRAM
++    unsigned mask;      // its spare 4 KiB pages
++};
++constexpr size_t MaxPaddings = 1024;
++Padding paddings[MaxPaddings];
++size_t padding_count = 0;
++std::atomic<size_t> padded_maps{0};
++
++const Padding* FindPadding(u64 group_va) noexcept {
++    for (size_t i = 0; i < padding_count; i++)
++        if (paddings[i].group_va == group_va)
++            return &paddings[i];
++    return nullptr;
++}
++
+ // The DRAM offset of the 16 KiB at guest address `va` (16 KiB aligned) if its four guest pages
+ // are memory back to back in the DRAM: ordinary memory, or (cached_reads) pages the GPU caches,
+-// which make it read-only (`read_only` set); else SIZE_MAX
++// which make it read-only (`read_only` set), or free pages with padding behind them; else
++// SIZE_MAX. (Under arena_lock.)
+ enum class Decline { None, Unmapped, Split, Other };
+-size_t ArenaPageSource(const Common::PageTable& table, u64 va, bool& read_only, Decline* why = nullptr) noexcept {
++size_t ArenaPageSource(const Common::PageTable& table, u64 va, bool& read_only, Decline* why = nullptr,
++                       bool* padded = nullptr) noexcept {
+     size_t source = SIZE_MAX;
+     read_only = false;
+     const auto fail = [why](Decline reason) {
+@@ -240,23 +260,32 @@ size_t ArenaPageSource(const Common::PageTable& table, u64 va, bool& read_only,
+             *why = reason;
+         return SIZE_MAX;
+     };
++    const Padding* const padding = padding_count != 0 ? FindPadding(va) : nullptr;
+     for (size_t i = 0; i < ArenaPage / GuestPage; i++) {
+         const size_t index = (va >> 12) + i;
+         if (index >= table.entries.size())
+             return fail(Decline::Other);
+         const auto [pointer, type, block] = table.entries.GetOrDefault(index).PointerTypeBlock(true);
+         (void)block;
+-        if (type == Common::PageType::RasterizerCachedMemory && arena.cached_reads.load(std::memory_order_relaxed)) {
+-            read_only = true;
+-        } else if (type != Common::PageType::Memory) {
+-            return fail(Decline::Unmapped);
++        size_t offset;
++        if (padding && ((padding->mask >> i) & 1) && type == Common::PageType::Unmapped) {
++            // a free page beside a lined up stack: its spare page
++            offset = padding->dram_offset + i * GuestPage;
++            if (padded)
++                *padded = true;
++        } else {
++            if (type == Common::PageType::RasterizerCachedMemory && arena.cached_reads.load(std::memory_order_relaxed)) {
++                read_only = true;
++            } else if (type != Common::PageType::Memory) {
++                return fail(Decline::Unmapped);
++            }
++            if (pointer == 0)
++                return fail(Decline::Unmapped);
++            const uintptr_t host = pointer + va + i * GuestPage;
++            if (host < arena.backing || host - arena.backing >= arena.backing_size)
++                return fail(Decline::Other);
++            offset = host - arena.backing;
+         }
+-        if (pointer == 0)
+-            return fail(Decline::Unmapped);
+-        const uintptr_t host = pointer + va + i * GuestPage;
+-        if (host < arena.backing || host - arena.backing >= arena.backing_size)
+-            return fail(Decline::Other);
+-        const size_t offset = host - arena.backing;
+         if (i == 0) {
+             if (offset % ArenaPage != 0)
+                 return fail(Decline::Split);
+@@ -279,9 +308,9 @@ bool ResolveArenaFault(uintptr_t address, bool write) noexcept {
+     }
+     LockArena();
+     const u64 va = (address - base) & ~u64(ArenaPage - 1);
+-    bool read_only = false;
++    bool read_only = false, padded = false;
+     Decline why = Decline::None;
+-    const size_t source = ArenaPageSource(*table, va, read_only, &why);
++    const size_t source = ArenaPageSource(*table, va, read_only, &why, &padded);
+     bool mapped = false;
+     // (a write to a page the GPU caches: declined, the write goes through the page table walk and
+     // the callbacks, which tell the GPU's caches)
+@@ -299,8 +328,11 @@ bool ResolveArenaFault(uintptr_t address, bool write) noexcept {
+             mapped = sceKernelMapDirectMemory(&at, length, read_only ? ProtCpuRead : ProtCpuReadWrite, MapFixed, phys,
+                                               ArenaPage) == 0 &&
+                      at == reinterpret_cast<void*>(base + va);
+-            if (mapped)
++            if (mapped) {
+                 arena.mapped.fetch_add(length, std::memory_order_relaxed);
++                if (padded)
++                    padded_maps.fetch_add(1, std::memory_order_relaxed);
++            }
+         }
+     }
+     UnlockArena();
+@@ -531,6 +563,62 @@ void SetFastmemPageTable(const void* page_table) {
+     arena.table.store(static_cast<const Common::PageTable*>(page_table), std::memory_order_release);
+ }
+ 
++bool AddArenaPadding(u64 group_va, unsigned mask, size_t dram_offset) {
++    if (group_va % ArenaPage != 0 || dram_offset % ArenaPage != 0 || mask == 0 || mask >= (1u << (ArenaPage / GuestPage)))
++        return false;
++    LockArena();
++    const bool added = padding_count < MaxPaddings && !FindPadding(group_va);
++    if (added) {
++        paddings[padding_count++] = {group_va, dram_offset, mask};
++        // (declined before, with free pages in it: mapped again when next touched)
++        InvalidateArena(group_va, ArenaPage);
++    }
++    UnlockArena();
++    return added;
++}
++
++unsigned RemoveArenaPadding(u64 group_va, size_t& dram_offset) {
++    unsigned mask = 0;
++    LockArena();
++    for (size_t i = 0; i < padding_count; i++) {
++        if (paddings[i].group_va != group_va)
++            continue;
++        mask = paddings[i].mask;
++        dram_offset = paddings[i].dram_offset;
++        paddings[i] = paddings[--padding_count];
++        // out of the arena before the caller frees the spare pages
++        InvalidateArena(group_va, ArenaPage);
++        break;
++    }
++    UnlockArena();
++    return mask;
++}
++
++unsigned PopArenaPadding(u64& group_va, size_t& dram_offset) {
++    unsigned mask = 0;
++    LockArena();
++    if (padding_count != 0) {
++        const Padding& last = paddings[--padding_count];
++        group_va = last.group_va;
++        dram_offset = last.dram_offset;
++        mask = last.mask;
++        InvalidateArena(group_va, ArenaPage);
++    }
++    UnlockArena();
++    return mask;
++}
++
++size_t ArenaPaddingCount() {
++    LockArena();
++    const size_t count = padding_count;
++    UnlockArena();
++    return count;
++}
++
++size_t ArenaPaddedMaps() {
++    return padded_maps.load(std::memory_order_relaxed);
++}
++
+ void LockArena() {
+     while (arena_lock.test_and_set(std::memory_order_acquire)) {
+         sched_yield();
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index db8716449..c9c9d78ef 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -92,6 +92,23 @@ bool ResolveFault(std::uintptr_t address, bool write);
+ /// the page table walk reads them inline too)
+ void SetFastmemCachedReads(bool on);
+ 
++/// Arena padding: the free guest pages beside a stack the kernel lined up with the PS4's 16 KiB
++/// pages (core/hle/kernel: a stack the game maps with svcMapMemory gets memory at the same place in
++/// a 16 KiB page as its address, with spare pages for the rest of its first and last 16 KiB). The
++/// arena maps such a 16 KiB page whole: its guest pages from the page table, its free ones (bit i
++/// of `mask`: the i-th 4 KiB) from the spare pages, which an access there (past the stack's ends,
++/// where the Switch would fault) reads and writes. The 16 KiB at `group_va` is at `dram_offset` in
++/// the DRAM. False if the table is full or has that 16 KiB already (the pages stay the caller's).
++bool AddArenaPadding(std::uint64_t group_va, unsigned mask, std::size_t dram_offset);
++/// Takes the padding of the 16 KiB at `group_va` out of the arena: its mask (0 if none) and DRAM
++/// offset, for the caller to free the spare pages
++unsigned RemoveArenaPadding(std::uint64_t group_va, std::size_t& dram_offset);
++/// Takes any padding out of the arena (the process ends): its mask (0 when there's none left)
++unsigned PopArenaPadding(std::uint64_t& group_va, std::size_t& dram_offset);
++/// The 16 KiB pages with padding now, and how many 16 KiB pages it has let the arena map
++std::size_t ArenaPaddingCount();
++std::size_t ArenaPaddedMaps();
++
+ /// RAII: the arena locked while the page table changes (fastmem only)
+ class ArenaUpdate {
+ public:
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 639cf28dc..ca6ff43b3 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -49,6 +49,13 @@ inline std::atomic<uint64_t> jit_compile_ns{0};
+ // each emulated core's code cache: KiB of it free (after its last translation), and its whole flushes
+ inline std::atomic<uint32_t> jit_cache_free_kib[4];
+ inline std::atomic<uint64_t> jit_core_full_flushes[4];
++// The kernel's timer (KHardwareTimer: the game's threads' sleeps and timed waits ending), of the
++// timer events
++inline std::atomic<uint64_t> kernel_timer_tasks{0};
++// Memory the game aliases (svcMapMemory: its threads' stacks) and the kernel lined up with the PS4's
++// 16 KiB pages for fastmem: aliases, those moved to memory that lines up (the rest did already, or
++// couldn't be: too large, no memory)
++inline std::atomic<uint64_t> aliases{0}, aliases_moved{0}, aliases_not_moved{0};
+ // Guest memory accesses through the recompiler's callbacks instead of its inline page table walk,
+ // per emulated core (a cache line each: a busy count shared by the cores would cost time itself)
+ struct alignas(64) CoreCount {
+@@ -136,13 +143,17 @@ struct ServiceCall {
+     const char* name;  // (the service's, static; nullptr: the table was full)
+     uint32_t command;
+     uint64_t count, total_ns, max_ns;
++    uint64_t queue_ns; // the calls' waits for the service's thread to take them (KServerSession)
+ };
++// A request's wait from the client's send until this thread (a service's) took it, for the call
++// it handles next
++inline thread_local uint64_t request_queue_ns = 0;
+ inline constexpr size_t MaxServiceCalls = 64;
+ inline ServiceCall service_calls[MaxServiceCalls];
+ inline size_t service_call_entries = 0;
+ inline std::atomic_flag service_lock = ATOMIC_FLAG_INIT;
+ 
+-inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns) {
++inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns, uint64_t queue_ns = 0) {
+     while (service_lock.test_and_set(std::memory_order_acquire)) {
+     }
+     ServiceCall* entry = nullptr;
+@@ -155,18 +166,19 @@ inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns) {
+     if (!entry) {
+         if (service_call_entries < MaxServiceCalls - 1) {
+             entry = &service_calls[service_call_entries++];
+-            *entry = {name, command, 0, 0, 0};
++            *entry = {name, command, 0, 0, 0, 0};
+         } else {
+             entry = &service_calls[MaxServiceCalls - 1];
+             if (service_call_entries < MaxServiceCalls) {
+                 service_call_entries = MaxServiceCalls;
+-                *entry = {nullptr, 0, 0, 0, 0};
++                *entry = {nullptr, 0, 0, 0, 0, 0};
+             }
+         }
+     }
+     entry->count++;
+     entry->total_ns += ns;
+     entry->max_ns = std::max(entry->max_ns, ns);
++    entry->queue_ns += queue_ns;
+     service_lock.clear(std::memory_order_release);
+ }
+ 
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 9a4ee9006..c4445a983 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -229,8 +229,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+ #if defined(__OPENORBIS__)
+     // The PS4 runs code only from its system memory pool, which the app's heap shares: 128 MiB in
+     // all, most of it for the three cores a Switch game runs on (a full cache is flushed and its
+-    // code compiled again, a stutter); the fourth is the system's, whose services are HLE.
+-    config.code_cache_size = std::uint32_t(m_core_index == 3 ? 8_MiB : 40_MiB);
++    // code compiled again, a stutter), the most for core 0, where games run their main thread
++    // (Mario Kart filled 35 of 40 MiB there in a few races); the fourth is the system's, whose
++    // services are HLE.
++    static constexpr std::size_t CodeCacheSizes[4] = {48_MiB, 40_MiB, 32_MiB, 8_MiB};
++    config.code_cache_size = std::uint32_t(CodeCacheSizes[m_core_index & 3]);
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 06d396f02..82b344900 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -283,8 +283,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+ #if defined(__OPENORBIS__)
+     // The PS4 runs code only from its system memory pool, which the app's heap shares: 128 MiB in
+     // all, most of it for the three cores a Switch game runs on (a full cache is flushed and its
+-    // code compiled again, a stutter); the fourth is the system's, whose services are HLE.
+-    config.code_cache_size = std::uint32_t(m_core_index == 3 ? 8_MiB : 40_MiB);
++    // code compiled again, a stutter), the most for core 0, where games run their main thread
++    // (Mario Kart filled 35 of 40 MiB there in a few races); the fourth is the system's, whose
++    // services are HLE.
++    static constexpr std::size_t CodeCacheSizes[4] = {48_MiB, 40_MiB, 32_MiB, 8_MiB};
++    config.code_cache_size = std::uint32_t(CodeCacheSizes[m_core_index & 3]);
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+diff --git a/src/core/hle/kernel/k_hardware_timer.cpp b/src/core/hle/kernel/k_hardware_timer.cpp
+index 019e709fb..31fb78011 100644
+--- a/src/core/hle/kernel/k_hardware_timer.cpp
++++ b/src/core/hle/kernel/k_hardware_timer.cpp
+@@ -4,6 +4,9 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifdef __OPENORBIS__
++#include "common/ps4_perf.h"
++#endif
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #include "core/hle/kernel/k_hardware_timer.h"
+@@ -27,6 +30,9 @@ void KHardwareTimer::Finalize() {
+ }
+ 
+ void KHardwareTimer::DoTask() {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::kernel_timer_tasks.fetch_add(1, std::memory_order_relaxed);
++#endif
+     // Handle the interrupt.
+     {
+         KScopedSchedulerLock slk{m_kernel};
+diff --git a/src/core/hle/kernel/k_page_table_base.cpp b/src/core/hle/kernel/k_page_table_base.cpp
+index 2a0a7d49d..d36602bd6 100644
+--- a/src/core/hle/kernel/k_page_table_base.cpp
++++ b/src/core/hle/kernel/k_page_table_base.cpp
+@@ -11,6 +11,57 @@
+ #include "core/hle/kernel/k_page_table_base.h"
+ #include "core/hle/kernel/k_scoped_resource_reservation.h"
+ #include "core/hle/kernel/k_system_resource.h"
++#ifdef EDEN_ARENA_LINE_UP
++#include <cstring>
++#include "core/device_memory.h"
++#ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
++#include "common/ps4_perf.h"
++#else
++#include <map>
++#include <mutex>
++#include "common/logging.h"
++// A desktop build's test of the lining up (EDEN_TEST_ARENA_LINE_UP): the arena's padding table
++// alone (common/orbis_memory.cpp's on the PS4)
++namespace Common::Orbis {
++namespace {
++std::mutex padding_mutex;
++std::map<u64, std::pair<unsigned, size_t>> paddings;
++} // namespace
++bool AddArenaPadding(u64 group_va, unsigned mask, size_t dram_offset) {
++    std::scoped_lock lk{padding_mutex};
++    const bool added = paddings.emplace(group_va, std::make_pair(mask, dram_offset)).second;
++    LOG_INFO(Kernel, "arena padding: +{:#x} mask {:#x} at DRAM {:#x}{} ({} now)", group_va, mask,
++             dram_offset, added ? "" : " (taken)", paddings.size());
++    return added;
++}
++unsigned RemoveArenaPadding(u64 group_va, size_t& dram_offset) {
++    std::scoped_lock lk{padding_mutex};
++    const auto it = paddings.find(group_va);
++    if (it == paddings.end()) {
++        return 0;
++    }
++    const unsigned mask = it->second.first;
++    dram_offset = it->second.second;
++    paddings.erase(it);
++    LOG_INFO(Kernel, "arena padding: -{:#x} mask {:#x} ({} now)", group_va, mask, paddings.size());
++    return mask;
++}
++unsigned PopArenaPadding(u64& group_va, size_t& dram_offset) {
++    std::scoped_lock lk{padding_mutex};
++    if (paddings.empty()) {
++        return 0;
++    }
++    const auto it = paddings.begin();
++    group_va = it->first;
++    const unsigned mask = it->second.first;
++    dram_offset = it->second.second;
++    paddings.erase(it);
++    return mask;
++}
++} // namespace Common::Orbis
++#endif
++#endif
+ 
+ namespace Kernel {
+ 
+@@ -482,6 +533,12 @@ void KPageTableBase::Finalize() {
+         m_memory_block_manager.Finalize(m_memory_block_slab_manager, std::move(BlockCallback));
+     }
+ 
++#ifdef EDEN_ARENA_LINE_UP
++    if (this->LinesUpForArena()) {
++        this->ReleaseAllArenaPadding();
++    }
++#endif
++
+     // Free any unsafe mapped memory.
+     if (m_mapped_unsafe_physical_memory) {
+         UNIMPLEMENTED();
+@@ -1076,6 +1133,27 @@ Result KPageTableBase::MapMemory(KProcessAddress dst_address, KProcessAddress sr
+         // Create the page group representing the source.
+         R_TRY(this->MakePageGroup(pg, src_address, num_pages));
+ 
++#ifdef EDEN_ARENA_LINE_UP
++        // (the PS4's fastmem: the alias on a copy of the source that lines up with the PS4's 16 KiB
++        // pages, the source's own pages locked as they'd be, given the alias's data when it's
++        // unmapped)
++        ArenaAliasCopy copy{};
++        KPageGroup copy_pg(m_system.Kernel(), m_block_info_manager);
++        if (this->LinesUpForArena() && src_state == KMemoryState::Normal &&
++            this->CopyAliasForArena(dst_address, pg, num_pages, copy)) {
++            R_ASSERT(copy_pg.AddBlock(copy.block + copy.head * PageSize, num_pages));
++        }
++        bool copy_mapped = false;
++        SCOPE_EXIT {
++            if (copy.block != 0 && !copy_mapped) {
++                m_system.Kernel().MemoryManager().Close(copy.block, copy.total_pages);
++            }
++        };
++        const KPageGroup& dst_pg = copy.block != 0 ? copy_pg : pg;
++#else
++        const KPageGroup& dst_pg = pg;
++#endif
++
+         // We're going to perform an update, so create a helper.
+         KScopedPageTableUpdater updater(this);
+ 
+@@ -1100,7 +1178,7 @@ Result KPageTableBase::MapMemory(KProcessAddress dst_address, KProcessAddress sr
+         // Map the alias pages.
+         const KPageProperties dst_map_properties = {KMemoryPermission::UserReadWrite, false, false,
+                                                     DisableMergeAttribute::DisableHead};
+-        R_TRY(this->MapPageGroupImpl(updater.GetPageList(), dst_address, pg, dst_map_properties,
++        R_TRY(this->MapPageGroupImpl(updater.GetPageList(), dst_address, dst_pg, dst_map_properties,
+                                      false));
+ 
+         // Apply the memory block updates.
+@@ -1112,6 +1190,13 @@ Result KPageTableBase::MapMemory(KProcessAddress dst_address, KProcessAddress sr
+             std::addressof(dst_allocator), dst_address, num_pages, KMemoryState::Stack,
+             KMemoryPermission::UserReadWrite, KMemoryAttribute::None,
+             KMemoryBlockDisableMergeAttribute::Normal, KMemoryBlockDisableMergeAttribute::None);
++
++#ifdef EDEN_ARENA_LINE_UP
++        if (copy.block != 0) {
++            copy_mapped = true;
++            this->FinishAliasCopy(dst_address, src_address, num_pages, copy);
++        }
++#endif
+     }
+ 
+     R_SUCCEED();
+@@ -1165,7 +1250,16 @@ Result KPageTableBase::UnmapMemory(KProcessAddress dst_address, KProcessAddress
+         R_TRY(this->MakePageGroup(pg, dst_address, num_pages));
+ 
+         // Ensure the page group is the valid for the source.
++#ifdef EDEN_ARENA_LINE_UP
++        // (or the alias is on a copy of it: the alias's data back to the source's own pages)
++        const bool copied_back = this->LinesUpForArena() &&
++                                 this->CopyBackAlias(dst_address, src_address, num_pages, pg);
++        if (!copied_back) {
++            R_UNLESS(this->IsValidPageGroup(pg, src_address, num_pages), ResultInvalidMemoryRegion);
++        }
++#else
+         R_UNLESS(this->IsValidPageGroup(pg, src_address, num_pages), ResultInvalidMemoryRegion);
++#endif
+ 
+         // We're going to perform an update, so create a helper.
+         KScopedPageTableUpdater updater(this);
+@@ -1196,6 +1290,13 @@ Result KPageTableBase::UnmapMemory(KProcessAddress dst_address, KProcessAddress
+             std::addressof(dst_allocator), dst_address, num_pages, KMemoryState::None,
+             KMemoryPermission::None, KMemoryAttribute::None,
+             KMemoryBlockDisableMergeAttribute::None, KMemoryBlockDisableMergeAttribute::Normal);
++
++#ifdef EDEN_ARENA_LINE_UP
++        // (the copy's spare pages beside the alias, if it had any)
++        if (copied_back) {
++            this->ForgetAliasCopy(dst_address, num_pages);
++        }
++#endif
+     }
+ 
+     R_SUCCEED();
+@@ -1636,6 +1737,19 @@ Result KPageTableBase::AllocateAndMapPagesImpl(PageLinkedList* page_list, KProce
+     KPageGroup pg(m_system.Kernel(), m_block_info_manager);
+ 
+     // Allocate the pages.
++#ifdef EDEN_ARENA_LINE_UP
++    // (at a 16 KiB boundary, whole 16 KiB: one piece of memory, which the PS4's fastmem maps)
++    constexpr size_t ArenaPages = 16_KiB / PageSize;
++    KPhysicalAddress continuous = 0;
++    if (this->LinesUpForArena() && Common::IsAligned(GetInteger(address), 16_KiB) &&
++        num_pages % ArenaPages == 0 && num_pages <= 8_MiB / PageSize) {
++        continuous = m_system.Kernel().MemoryManager().AllocateAndOpenContinuous(num_pages, ArenaPages,
++                                                                                 m_allocate_option);
++    }
++    if (continuous != 0) {
++        R_TRY(pg.AddBlock(continuous, num_pages));
++    } else
++#endif
+     R_TRY(
+         m_system.Kernel().MemoryManager().AllocateAndOpen(std::addressof(pg), num_pages, m_allocate_option));
+ 
+@@ -1693,6 +1807,240 @@ Result KPageTableBase::MapPageGroupImpl(PageLinkedList* page_list, KProcessAddre
+     R_SUCCEED();
+ }
+ 
++#ifdef EDEN_ARENA_LINE_UP
++// The PS4's fastmem arena maps the Switch's memory 16 KiB at a time (the PS4's page), each 16 KiB
++// from 16 KiB of the DRAM: four guest pages back to back there, at their places in a 16 KiB page.
++// A game's thread stacks are heap memory it aliases (svcMapMemory) at addresses it picks to 4 KiB,
++// which mostly don't line up: the arena can't map them, and the recompiler walks the page table
++// for the stack's accesses instead. So such an alias goes on a copy of its source's data, in
++// memory at the alias's place in a 16 KiB page, with spare pages for the rest of its first and
++// last 16 KiB, which the arena maps where the guest pages beside the alias are free (where the
++// Switch would fault). The source keeps its own pages (locked while the alias is there, as on the
++// Switch), and gets the alias's data back when it's unmapped: the heap there stays lined up.
++bool KPageTableBase::CopyAliasForArena(KProcessAddress dst_address, const KPageGroup& src_pg,
++                                       size_t num_pages, ArenaAliasCopy& out) {
++    constexpr size_t GroupPages = 16_KiB / PageSize;
++#ifdef __OPENORBIS__
++    Common::PS4Perf::aliases.fetch_add(1, std::memory_order_relaxed);
++    const auto not_copied = [] {
++        Common::PS4Perf::aliases_not_moved.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    };
++#else
++    const auto not_copied = [] { return false; };
++#endif
++    if (num_pages == 0 || num_pages > 8_MiB / PageSize) {
++        return not_copied();
++    }
++    const size_t head = (GetInteger(dst_address) / PageSize) % GroupPages;
++    const size_t total = Common::AlignUp(head + num_pages, GroupPages);
++    const size_t tail = total - head - num_pages;
++    const KProcessAddress first_group = dst_address - head * PageSize;
++
++    // The free guest pages in the alias's first and last 16 KiB (spare pages go there)
++    const auto is_free = [&](size_t index) {
++        const KProcessAddress address = first_group + index * PageSize;
++        return this->Contains(address, PageSize) &&
++               R_SUCCEEDED(this->CheckMemoryState(address, PageSize, KMemoryState::All,
++                                                  KMemoryState::Free, KMemoryPermission::None,
++                                                  KMemoryPermission::None, KMemoryAttribute::None,
++                                                  KMemoryAttribute::None));
++    };
++    unsigned first_mask = 0, last_mask = 0;
++    for (size_t i = 0; i < head; i++) {
++        first_mask |= is_free(i) ? 1u << i : 0u;
++    }
++    for (size_t i = GroupPages - tail; i < GroupPages; i++) {
++        last_mask |= is_free(total - GroupPages + i) ? 1u << i : 0u;
++    }
++
++    // The source lined up already, with nothing free beside the alias: the alias on its pages
++    size_t src_blocks = 0;
++    for ([[maybe_unused]] const auto& node : src_pg) {
++        src_blocks++;
++    }
++    const bool lined_up =
++        src_blocks == 1 &&
++        (GetInteger(src_pg.begin()->GetAddress()) - head * PageSize) % 16_KiB == 0;
++    if (lined_up && first_mask == 0 && last_mask == 0) {
++        return false;
++    }
++
++    // The copy: whole 16 KiB, the alias at its place in the first. From the applet pool, which
++    // the HLE applets leave unused: the application's pool is the game's own to the last page (its
++    // resource limit is the pool's size), and some games take all of it. At most 128 MiB.
++    constexpr size_t MaxCopyBytes = 128_MiB;
++    if (m_alias_copy_bytes + total * PageSize > MaxCopyBytes) {
++        return not_copied();
++    }
++    const KPhysicalAddress block = m_system.Kernel().MemoryManager().AllocateAndOpenContinuous(
++        total, GroupPages,
++        KMemoryManager::EncodeOption(KMemoryManager::Pool::Applet,
++                                     KMemoryManager::Direction::FromBack));
++    if (block == 0) {
++        return not_copied();
++    }
++#ifdef __OPENORBIS__
++    Common::PS4Perf::aliases_moved.fetch_add(1, std::memory_order_relaxed);
++#else
++    LOG_INFO(Kernel, "alias {:#x}+{:#x} on a copy at {:#x} ({} source blocks{}), spare {}/{}; "
++             "{:#x} bytes free in the pool before",
++             GetInteger(dst_address), num_pages * PageSize, GetInteger(block + head * PageSize),
++             src_blocks, lined_up ? ", lined up" : "", head, tail,
++             m_system.Kernel().MemoryManager().GetFreeSize(KMemoryManager::Pool::Applet) +
++                 total * PageSize);
++#endif
++    auto& device_memory = m_system.DeviceMemory();
++    u8* to = device_memory.GetPointer<u8>(block + head * PageSize);
++    for (const auto& node : src_pg) {
++        std::memcpy(to, device_memory.GetPointer<u8>(node.GetAddress()), node.GetSize());
++        to += node.GetSize();
++    }
++    if (head != 0) {
++        ClearBackingRegion(m_system, block, head * PageSize, 0);
++    }
++    if (tail != 0) {
++        ClearBackingRegion(m_system, block + (head + num_pages) * PageSize, tail * PageSize, 0);
++    }
++    out = {block, total, head, tail, first_mask, last_mask};
++    return true;
++}
++
++// The alias is mapped on the copy: the copy's spare pages are the arena's padding where their
++// guest pages are free (else freed), and the alias is noted, for its unmapping
++void KPageTableBase::FinishAliasCopy(KProcessAddress dst_address, KProcessAddress src_address,
++                                     size_t num_pages, const ArenaAliasCopy& copy) {
++    constexpr size_t GroupPages = 16_KiB / PageSize;
++    auto& memory_manager = m_system.Kernel().MemoryManager();
++    // (the alias's mapping holds its pages now; the allocation's reference goes)
++    memory_manager.Close(copy.block + copy.head * PageSize, num_pages);
++
++    const size_t groups = copy.total_pages / GroupPages;
++    const u64 first_group = GetInteger(dst_address) - copy.head * PageSize;
++    const size_t block_offset = GetInteger(copy.block) - Core::DramMemoryMap::Base;
++    const auto pad = [&](size_t group, unsigned mask) {
++        const bool padded =
++            mask != 0 && Common::Orbis::AddArenaPadding(first_group + group * 16_KiB, mask,
++                                                        block_offset + group * 16_KiB);
++        return padded ? mask : 0u;
++    };
++    unsigned kept_first, kept_last;
++    if (groups == 1) {
++        kept_first = kept_last = pad(0, copy.first_mask | copy.last_mask);
++    } else {
++        kept_first = pad(0, copy.first_mask);
++        kept_last = pad(groups - 1, copy.last_mask);
++    }
++    for (size_t i = 0; i < copy.head; i++) {
++        if (!((kept_first >> i) & 1)) {
++            memory_manager.Close(copy.block + i * PageSize, 1);
++        }
++    }
++    for (size_t i = GroupPages - copy.tail; i < GroupPages; i++) {
++        if (!((kept_last >> i) & 1)) {
++            memory_manager.Close(copy.block + (copy.total_pages - GroupPages + i) * PageSize, 1);
++        }
++    }
++    m_alias_copies[GetInteger(dst_address)] = {GetInteger(src_address), num_pages, num_pages,
++                                               copy.total_pages};
++    m_alias_copy_bytes += copy.total_pages * PageSize;
++}
++
++// An alias being unmapped (all of it or a part) that's on a copy of `src_address`'s pages: its
++// data (`dst_pg`, the alias's pages) back to them. False if it isn't.
++bool KPageTableBase::CopyBackAlias(KProcessAddress dst_address, KProcessAddress src_address,
++                                   size_t num_pages, const KPageGroup& dst_pg) {
++    const u64 dst = GetInteger(dst_address), src = GetInteger(src_address);
++    auto it = m_alias_copies.upper_bound(dst);
++    if (it == m_alias_copies.begin()) {
++        return false;
++    }
++    --it;
++    const u64 alias = it->first;
++    const AliasCopy& entry = it->second;
++    if (dst + num_pages * PageSize > alias + entry.num_pages * PageSize ||
++        src - entry.src != dst - alias) {
++        return false;
++    }
++    KPageGroup src_pg(m_system.Kernel(), m_block_info_manager);
++    if (R_FAILED(this->MakePageGroup(src_pg, src_address, num_pages)) ||
++        src_pg.GetNumPages() != num_pages || dst_pg.GetNumPages() != num_pages) {
++        return false;
++    }
++    std::vector<KPhysicalAddress> src_pages;
++    src_pages.reserve(num_pages);
++    for (const auto& node : src_pg) {
++        for (size_t i = 0; i < node.GetNumPages(); i++) {
++            src_pages.push_back(node.GetAddress() + i * PageSize);
++        }
++    }
++    auto& device_memory = m_system.DeviceMemory();
++    size_t page = 0;
++    for (const auto& node : dst_pg) {
++        for (size_t i = 0; i < node.GetNumPages(); i++) {
++            std::memcpy(device_memory.GetPointer<u8>(src_pages[page++]),
++                        device_memory.GetPointer<u8>(node.GetAddress() + i * PageSize), PageSize);
++        }
++    }
++    return true;
++}
++
++// An alias on a copy unmapped (all of it or a part): its spare pages out of the arena and freed
++// with its last page
++void KPageTableBase::ForgetAliasCopy(KProcessAddress dst_address, size_t num_pages) {
++    auto it = m_alias_copies.upper_bound(GetInteger(dst_address));
++    if (it == m_alias_copies.begin()) {
++        return;
++    }
++    --it;
++    const u64 alias = it->first;
++    AliasCopy& entry = it->second;
++    entry.mapped_pages -= (std::min)(entry.mapped_pages, num_pages);
++    if (entry.mapped_pages != 0) {
++        return;
++    }
++    const size_t pages = entry.num_pages;
++    m_alias_copy_bytes -= (std::min)(m_alias_copy_bytes, entry.total_pages * PageSize);
++    m_alias_copies.erase(it);
++    const u64 first = Common::AlignDown(alias, 16_KiB);
++    const u64 last = Common::AlignDown(alias + pages * PageSize - 1, 16_KiB);
++    for (const u64 group : {first, last}) {
++        size_t dram_offset = 0;
++        const unsigned mask = Common::Orbis::RemoveArenaPadding(group, dram_offset);
++        for (size_t i = 0; i < 16_KiB / PageSize; i++) {
++            if ((mask >> i) & 1) {
++                m_system.Kernel().MemoryManager().Close(
++                    Core::DramMemoryMap::Base + dram_offset + i * PageSize, 1);
++            }
++        }
++        if (first == last) {
++            break;
++        }
++    }
++#ifndef __OPENORBIS__
++    LOG_INFO(Kernel, "alias {:#x}+{:#x} unmapped; {:#x} bytes free in the pool", alias,
++             pages * PageSize,
++             m_system.Kernel().MemoryManager().GetFreeSize(KMemoryManager::Pool::Applet));
++#endif
++}
++
++// Every spare page (the process ends)
++void KPageTableBase::ReleaseAllArenaPadding() {
++    m_alias_copies.clear();
++    m_alias_copy_bytes = 0;
++    u64 group = 0;
++    size_t dram_offset = 0;
++    while (const unsigned mask = Common::Orbis::PopArenaPadding(group, dram_offset)) {
++        for (size_t i = 0; i < 16_KiB / PageSize; i++) {
++            if ((mask >> i) & 1) {
++                m_system.Kernel().MemoryManager().Close(
++                    Core::DramMemoryMap::Base + dram_offset + i * PageSize, 1);
++            }
++        }
++    }
++}
++#endif
++
+ void KPageTableBase::RemapPageGroup(PageLinkedList* page_list, KProcessAddress address, size_t size,
+                                     const KPageGroup& pg) {
+     ASSERT(this->IsLockedByCurrentThread());
+@@ -2765,6 +3113,13 @@ Result KPageTableBase::MapPages(KProcessAddress* out_addr, size_t num_pages, siz
+     KScopedLightLock lk(m_general_lock);
+ 
+     // Find a random address to map at.
++#ifdef EDEN_ARENA_LINE_UP
++    // (a stack of whole 16 KiB at a 16 KiB boundary: in memory the PS4's fastmem maps)
++    if (this->LinesUpForArena() && state == KMemoryState::Stack && !is_pa_valid &&
++        alignment == PageSize && num_pages % (16_KiB / PageSize) == 0) {
++        alignment = 16_KiB;
++    }
++#endif
+     KProcessAddress addr = this->FindFreeArea(region_start, region_num_pages, num_pages, alignment,
+                                               0, this->GetNumGuardPages());
+     R_UNLESS(addr != 0, ResultOutOfMemory);
+diff --git a/src/core/hle/kernel/k_page_table_base.h b/src/core/hle/kernel/k_page_table_base.h
+index 0c222910f..212b9a412 100644
+--- a/src/core/hle/kernel/k_page_table_base.h
++++ b/src/core/hle/kernel/k_page_table_base.h
+@@ -6,6 +6,13 @@
+ 
+ #pragma once
+ 
++// The PS4's fastmem: kernel mappings lined up with its 16 KiB pages (EDEN_TEST_ARENA_LINE_UP: the
++// same on a desktop build, for tests)
++#if defined(__OPENORBIS__) || defined(EDEN_TEST_ARENA_LINE_UP)
++#define EDEN_ARENA_LINE_UP 1
++#endif
++
++#include <map>
+ #include <memory>
+ #include <type_traits>
+ 
+@@ -438,6 +445,40 @@ private:
+ 
+     Result AllocateAndMapPagesImpl(PageLinkedList* page_list, KProcessAddress address,
+                                    size_t num_pages, KMemoryPermission perm);
++#ifdef EDEN_ARENA_LINE_UP
++    // The PS4's fastmem arena maps 16 KiB at a time (see k_page_table_base.cpp): aliases on a copy
++    // of their source that lines up with that
++    struct ArenaAliasCopy {
++        KPhysicalAddress block;    // the copy's memory (whole 16 KiB), 0: none
++        size_t total_pages;        // its pages
++        size_t head, tail;         // spare pages before and after the alias there
++        unsigned first_mask, last_mask; // those whose guest pages are free (padding)
++    };
++    struct AliasCopy {
++        u64 src;
++        size_t num_pages;    // the alias's
++        size_t mapped_pages; // those still mapped
++        size_t total_pages;  // the copy's, spare pages too
++    };
++    std::map<u64, AliasCopy> m_alias_copies; // by the alias's address
++    size_t m_alias_copy_bytes = 0;           // the copies' memory (the applet pool's)
++    // the application's page table, which the arena maps (a desktop test build: every one)
++    bool LinesUpForArena() const {
++#ifdef __OPENORBIS__
++        return m_impl.fastmem_arena != nullptr;
++#else
++        return true;
++#endif
++    }
++    bool CopyAliasForArena(KProcessAddress dst_address, const KPageGroup& src_pg, size_t num_pages,
++                           ArenaAliasCopy& out);
++    void FinishAliasCopy(KProcessAddress dst_address, KProcessAddress src_address,
++                         size_t num_pages, const ArenaAliasCopy& copy);
++    bool CopyBackAlias(KProcessAddress dst_address, KProcessAddress src_address, size_t num_pages,
++                       const KPageGroup& dst_pg);
++    void ForgetAliasCopy(KProcessAddress dst_address, size_t num_pages);
++    void ReleaseAllArenaPadding();
++#endif
+     Result MapPageGroupImpl(PageLinkedList* page_list, KProcessAddress address,
+                             const KPageGroup& pg, const KPageProperties properties, bool reuse_ll);
+ 
+diff --git a/src/core/hle/kernel/k_server_session.cpp b/src/core/hle/kernel/k_server_session.cpp
+index 37871cee7..9043460f0 100644
+--- a/src/core/hle/kernel/k_server_session.cpp
++++ b/src/core/hle/kernel/k_server_session.cpp
+@@ -9,6 +9,7 @@
+ 
+ #ifdef __OPENORBIS__
+ #include "common/cpu_features.h"
++#include "common/ps4_perf.h"
+ #endif
+ #include "common/assert.h"
+ #include "common/common_types.h"
+@@ -1132,6 +1133,11 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
+     m_current_request = request;
+ #ifdef __OPENORBIS__
+     request->ps4_received_ns = u64(Common::g_wall_clock.GetTimeNS().count());
++    // (for the service's statistics: this thread handles it next)
++    Common::PS4Perf::request_queue_ns =
++        request->ps4_sent_ns && request->ps4_received_ns > request->ps4_sent_ns
++            ? request->ps4_received_ns - request->ps4_sent_ns
++            : 0;
+ #endif
+ 
+     // Get the client address.
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index 90e4a5694..a9e153255 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -8,6 +8,7 @@
+ #include "common/ps4_perf.h"
+ #include "common/scope_exit.h"
+ #include <chrono>
++#include <utility>
+ #include <fmt/ranges.h>
+ #include <string_view>
+ #include <thread>
+@@ -119,7 +120,8 @@ Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
+     const u64 call_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+     SCOPE_EXIT {
+         const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+-        Common::PS4Perf::AddServiceCall(service_name, ctx.GetCommand(), now > call_begin ? now - call_begin : 0);
++        Common::PS4Perf::AddServiceCall(service_name, ctx.GetCommand(), now > call_begin ? now - call_begin : 0,
++                                        std::exchange(Common::PS4Perf::request_queue_ns, 0));
+     };
+ #endif
+     const auto guard = LockService();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index 3e605951a..72ec12a38 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -146,7 +146,10 @@ public:
+     ::Common::unordered_set<IR::LocationDescriptor> blocks_without_fastmem;
+     // fastmem declined for an access through the stack pointer, the thread pointer: from then on
+     // every such access is compiled to walk the page table (shared), none left to fault first
++    // (the stack's after a few: stacks are mostly where fastmem reaches, the kernel lines them up)
+     bool stack_walks = false, thread_local_walks = false;
++    unsigned stack_declines = 0;
++    static constexpr unsigned StackDeclinesBeforeWalks = 32;
+     bool HasAccessWithoutFastmem(IR::LocationDescriptor location) const {
+         return blocks_without_fastmem.count(location) > 0;
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 0d98c4748..fdf10d36c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -142,7 +142,10 @@ public:
+     ::Common::unordered_set<IR::LocationDescriptor> blocks_without_fastmem;
+     // fastmem declined for an access through the stack pointer, the thread pointer: from then on
+     // every such access is compiled to walk the page table (shared), none left to fault first
++    // (the stack's after a few: stacks are mostly where fastmem reaches, the kernel lines them up)
+     bool stack_walks = false, thread_local_walks = false;
++    unsigned stack_declines = 0;
++    static constexpr unsigned StackDeclinesBeforeWalks = 32;
+     bool HasAccessWithoutFastmem(IR::LocationDescriptor location) const {
+         return blocks_without_fastmem.count(location) > 0;
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+index 8de966090..8b06bb5e6 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+@@ -22,6 +22,7 @@
+ #endif
+ 
+ #include <array>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include "common/assert.h"
+@@ -120,6 +121,11 @@ static const HostFeature features = []() {
+             f |= HostFeature::FastBMI2;
+         }
+     }
++    // DYNARMIC_HOST_FEATURES_MASK (hex): only these features, to measure the code another CPU gets
++    // (the PS4's Jaguar: no FMA, BMI2 or AVX2) on this one
++    if (const char* mask = std::getenv("DYNARMIC_HOST_FEATURES_MASK")) {
++        f = static_cast<HostFeature>(static_cast<u64>(f) & std::strtoull(mask, nullptr, 16));
++    }
+     return f;
+ #endif
+ }();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 368805c55..a4138deee 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -41,7 +41,9 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+             const auto marker = iter->second.marker;
+             do_not_fastmem.insert(marker);
+             blocks_without_fastmem.insert(std::get<0>(marker));
+-            stack_walks |= iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::Stack);
++            if (iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::Stack)) {
++                stack_walks |= ++stack_declines >= StackDeclinesBeforeWalks;
++            }
+             thread_local_walks |= iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::ThreadLocal);
+             InvalidateBasicBlocks({std::get<0>(marker)});
+         }
+-- 
+2.43.0
+

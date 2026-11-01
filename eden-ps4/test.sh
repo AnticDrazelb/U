@@ -104,6 +104,11 @@ run padtest "$work/padtest.nro" 20 "1:A+Left,2:,3:Plus+Minus,3.3:"
 check "exits on + and -" code padtest 0
 check "draws 1280x720 frames (libnx's console)" drew padtest "1280 720"
 
+echo "stacktest.nro: aliased memory (thread stacks), lined up with the PS4's 16 KiB pages"
+run stacktest "$work/stacktest.nro" 60 ""
+check "exits" code stacktest 0
+check "all checks pass" says stacktest "stacktest: all checks passed"
+
 echo "gputest.nro: drawn with the GPU (clears, done in software by the null renderer)"
 run gputest "$work/gputest.nro" 20 "5:Plus,5.5:"
 check "exits on +" code gputest 0

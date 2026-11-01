@@ -377,6 +377,53 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.95: **thread stacks lined up with the PS4's pages, so fastmem reaches them; more code cache for
+core 0.** 03.94 on a console (Mario Kart, 50%, Profiler off): races at 20-23 fps against 03.93's
+22-24 (75%, Profiler on), core 0 busy 88% (40.9 ms a frame against 36.6), cores 1 and 2 5-7% more
+a frame; fastmem declines in races down to 5-30 a second from 60-90, translation 15-60 blocks a
+second; core 0's code cache 5 MiB free of 40 after 7 minutes (two whole flushes while loading),
+core 1's 6.6, core 2's 20, core 3's 8 never used. Walking every stack access from the start cost
+more than the declines it saved.
+
+- Patch 0083, kernel (`k_page_table_base.cpp`, the PS4 and `EDEN_TEST_ARENA_LINE_UP` desktop
+  builds): `MapMemory` of heap memory (`svcMapMemory`: nn::os and libnx thread stacks) up to 8 MiB
+  maps the alias on a copy of the source (`CopyAliasForArena`): memory from
+  `AllocateAndOpenContinuous` in whole 16 KiB, the alias at its own place in a 16 KiB page, the
+  rest of its first and last 16 KiB spare pages, zeroed. The copies come from the applet pool
+  (HLE applets leave it unused), at most 128 MiB: the application's pool is all the game's (its
+  `PhysicalMemoryMax` is the pool's size), and a game that takes all of it must still get it. The source keeps its pages (locked, as on
+  the Switch); `UnmapMemory` of the alias, or any part of it, copies its data back to them
+  (`CopyBackAlias`, in place of `IsValidPageGroup`), so the heap stays lined up for fastmem too.
+  Skipped when the source already lines up with nothing free beside the alias. A stack the
+  kernel allocates (`MapPages`, the main thread's) of whole 16 KiB goes at a 16 KiB boundary, on
+  one piece of memory (`AllocateAndMapPagesImpl`: `AllocateAndOpenContinuous` for 16 KiB-aligned
+  mappings of whole 16 KiB up to 8 MiB).
+- Patch 0083, the arena (`orbis_memory.cpp`): padding, a table of 16 KiB pages whose free guest
+  pages (bit mask) are the copy's spare pages: `ArenaPageSource` takes an unmapped guest page
+  there as that spare page, so the alias's first and last 16 KiB (a stack's top, its busiest part)
+  map too. The table is fixed (1,024 entries, read in the fault handler under `arena_lock`); the
+  kernel adds an alias's padding once it's mapped and takes it out (then frees the pages) when
+  the alias goes, or all of it when the process ends. A guest access past a stack's end, where the
+  Switch would fault, reaches the spare page instead.
+- Patch 0083, dynarmic: a declined stack access only counts; walking every stack access from the
+  start (03.94) begins after 32 on a core (`StackDeclinesBeforeWalks`). Thread-local accesses are
+  as 03.94 (their pages aren't lined up).
+- Patch 0083: code caches 48, 40, 32 and 8 MiB (still 128 in all).
+- The 30-second line: aliases so far, how many were put on a copy, how many couldn't be, the
+  padding entries and how many arena maps used one (`PS4Perf::aliases*`,
+  `Orbis::ArenaPaddingCount`, `ArenaPaddedMaps`); how many of the timer events (8,500 a second in
+  03.94's races) were the kernel's timer, guest threads' sleeps and timeouts ending
+  (`kernel_timer_tasks`); and each of the five busiest services' wait before its thread took the
+  call (`request_queue_ns`, set where `KServerSession` takes the request, added to
+  `ServiceCall::queue_ns`), to see which service the 80 us waits are in.
+- `game/stacktest.c` (in `test.sh`): `svcMapMemory` of 1 to 64 pages at each place in a 16 KiB
+  page and two aliases a page apart: the alias reads the source's data, its writes are back in the
+  source after `svcUnmapMemory`, the pages beside it stay free to `svcQueryMemory`; then 40 rounds
+  of 8 threads (libnx maps their stacks) recursing on their stacks. A desktop build with
+  `-DEDEN_TEST_ARENA_LINE_UP=1` (the kernel's side alone, a padding table that only logs): 362
+  aliases put on copies, every padding entry taken out again, the applet pool back to the same
+  free size after each alias; all checks pass, and `test.sh` passes (0 failed).
+
 03.94: **stack and thread-local accesses walk from the start once one is declined; code cache
 use per core.** 03.93 on a console (Mario Kart, 50%, Profiler off): races at 22-24 fps (42-48 ms of
 work a frame); a service call 160 us (80 until the service's thread took it, 50 handling, 25 back);
