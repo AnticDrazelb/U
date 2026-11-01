@@ -1,0 +1,195 @@
+From 1f856a526a2a6639a4c01a9665d9482baf81f8a5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 14:35:07 +0000
+Subject: [PATCH] PS4 statistics: a service call's wait split up; time spent
+ translating
+
+03.91 ran Mario Kart races at 21 fps. A synchronous call to a service took about 200 us of the
+caller's time on average, about 50 of it the services' own handling. KSessionRequest carries
+three host-clock stamps on the PS4 (sent in KClientSession::SendSyncRequest, taken in
+KServerSession::ReceiveRequest, answered in SendReply before the client's wait ends), and the
+client adds the three parts to PS4Perf::ipc_queue, ipc_handle and ipc_resume. Translating and
+emitting new blocks (A32 and A64 GetBasicBlock's compile path) is summed in jit_compile_ns, to
+see whether bursts of new code are what makes frames uneven.
+---
+ src/common/ps4_perf.h                            |  6 ++++++
+ src/core/hle/kernel/k_client_session.cpp         | 16 ++++++++++++++++
+ src/core/hle/kernel/k_server_session.cpp         |  9 +++++++++
+ src/core/hle/kernel/k_session_request.h          |  6 ++++++
+ .../src/dynarmic/backend/x64/a32_interface.cpp   |  8 +++++++-
+ .../src/dynarmic/backend/x64/a64_interface.cpp   |  8 +++++++-
+ 6 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 2e3865f1c..a6e88d651 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -33,6 +33,9 @@ inline std::atomic<uint64_t> idle_spin_wakes{0};
+ inline Counter idle_sleep_wakes;
+ // svcSendSyncRequest: from the call to the reply
+ inline Counter ipc;
++// a call's wait split up: until the service's thread took it, the service's handling, and from
++// its answer until the calling thread ran again
++inline Counter ipc_queue, ipc_handle, ipc_resume;
+ // The timing thread's events: how late each fired; and its timed waits' overshoot, which it
+ // learns and wakes that much early for (in ns, an average)
+ inline Counter timer_late;
+@@ -40,6 +43,9 @@ inline std::atomic<int64_t> timer_overshoot_ns{0};
+ // The recompiler: blocks translated, whole-cache flushes (a full cache, or asked for) and range
+ // invalidations
+ inline std::atomic<uint64_t> jit_blocks{0}, jit_full_flushes{0}, jit_range_flushes{0};
++// time spent translating and emitting those blocks (on the emulated cores' threads: a burst of new
++// code is a burst of slow frames)
++inline std::atomic<uint64_t> jit_compile_ns{0};
+ // Guest memory accesses through the recompiler's callbacks instead of its inline page table walk,
+ // per emulated core (a cache line each: a busy count shared by the cores would cost time itself)
+ struct alignas(64) CoreCount {
+diff --git a/src/core/hle/kernel/k_client_session.cpp b/src/core/hle/kernel/k_client_session.cpp
+index 95cb9896b..248b34a11 100644
+--- a/src/core/hle/kernel/k_client_session.cpp
++++ b/src/core/hle/kernel/k_client_session.cpp
+@@ -6,6 +6,10 @@
+ 
+ #include "common/scope_exit.h"
+ #include "core/hle/kernel/k_client_session.h"
++#ifdef __OPENORBIS__
++#include "common/ps4_perf.h"
++#include "common/cpu_features.h"
++#endif
+ #include "core/hle/kernel/k_server_session.h"
+ #include "core/hle/kernel/k_session.h"
+ #include "core/hle/kernel/k_thread.h"
+@@ -34,8 +38,20 @@ Result KClientSession::SendSyncRequest(KernelCore& kernel, uintptr_t address, si
+     // Initialize the request.
+     request->Initialize(kernel, nullptr, address, size);
+ 
++#ifdef __OPENORBIS__
++    request->ps4_sent_ns = u64(Common::g_wall_clock.GetTimeNS().count());
++    const Result result = m_parent->OnRequest(kernel, request);
++    if (request->ps4_received_ns && request->ps4_replied_ns) {
++        const u64 now = u64(Common::g_wall_clock.GetTimeNS().count());
++        Common::PS4Perf::ipc_queue.Add(request->ps4_received_ns - request->ps4_sent_ns);
++        Common::PS4Perf::ipc_handle.Add(request->ps4_replied_ns - request->ps4_received_ns);
++        Common::PS4Perf::ipc_resume.Add(now - request->ps4_replied_ns);
++    }
++    R_RETURN(result);
++#else
+     // Send the request.
+     R_RETURN(m_parent->OnRequest(kernel, request));
++#endif
+ }
+ 
+ Result KClientSession::SendAsyncRequest(KernelCore& kernel, KEvent* event, uintptr_t address, size_t size) {
+diff --git a/src/core/hle/kernel/k_server_session.cpp b/src/core/hle/kernel/k_server_session.cpp
+index 35b4e7853..37871cee7 100644
+--- a/src/core/hle/kernel/k_server_session.cpp
++++ b/src/core/hle/kernel/k_server_session.cpp
+@@ -7,6 +7,9 @@
+ #include <tuple>
+ #include <utility>
+ 
++#ifdef __OPENORBIS__
++#include "common/cpu_features.h"
++#endif
+ #include "common/assert.h"
+ #include "common/common_types.h"
+ #include "common/logging.h"
+@@ -1127,6 +1130,9 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
+ 
+     // Set the request as our current.
+     m_current_request = request;
++#ifdef __OPENORBIS__
++    request->ps4_received_ns = u64(Common::g_wall_clock.GetTimeNS().count());
++#endif
+ 
+     // Get the client address.
+     uint64_t client_message = request->GetAddress();
+@@ -1312,6 +1318,9 @@ Result KServerSession::SendReply(KernelCore& kernel, uintptr_t server_message, u
+             // End the client thread's wait.
+             KScopedSchedulerLock sl{kernel};
+ 
++#ifdef __OPENORBIS__
++            request->ps4_replied_ns = u64(Common::g_wall_clock.GetTimeNS().count());
++#endif
+             if (!client_thread->IsTerminationRequested()) {
+                 client_thread->EndWait(kernel, client_result);
+             }
+diff --git a/src/core/hle/kernel/k_session_request.h b/src/core/hle/kernel/k_session_request.h
+index 6665eca56..c69b3a82a 100644
+--- a/src/core/hle/kernel/k_session_request.h
++++ b/src/core/hle/kernel/k_session_request.h
+@@ -25,6 +25,12 @@ class KSessionRequest final : public KSlabAllocated<KSessionRequest>,
+     KERNEL_AUTOOBJECT_TRAITS(KSessionRequest, KAutoObject);
+ 
+ public:
++#ifdef __OPENORBIS__
++    // The PS4's statistics of a call to a service (host clock, ns): sent, taken by the service's
++    // thread, answered
++    u64 ps4_sent_ns = 0, ps4_received_ns = 0, ps4_replied_ns = 0;
++#endif
++
+     class SessionMappings {
+     private:
+         static constexpr size_t NumStaticMappings = 8;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 6524482fe..d33f92877 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -6,6 +6,7 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <chrono>
+ #include <functional>
+ #include <memory>
+ #include <mutex>
+@@ -204,12 +205,17 @@ private:
+         auto const arch_descriptor = A32::LocationDescriptor{descriptor};
+         ir_block.Reset(arch_descriptor);
+         ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
++        const auto compile_start = std::chrono::steady_clock::now();
+         A32::Translate(ir_block, arch_descriptor, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions,
+                                                                    conf.page_table_single_walk_multiple && conf.page_table && !conf.fastmem_pointer &&
+                                                                        !conf.check_halt_on_memory_access,
+                                                                    conf.inline_conditional_instructions});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+-        return emitter.Emit(ir_block);
++        auto block = emitter.Emit(ir_block);
++        ::Common::PS4Perf::jit_compile_ns.fetch_add(
++            u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()),
++            std::memory_order_relaxed);
++        return block;
+     }
+ 
+     void PerformRequestedCacheInvalidation(HaltReason hr) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index ffbeb7544..60cf576fc 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -6,6 +6,7 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <chrono>
+ #include <cstring>
+ #include <memory>
+ #include <mutex>
+@@ -260,9 +261,14 @@ private:
+         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
+         ir_block.Reset(arch_descriptor);
+         ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
++        const auto compile_start = std::chrono::steady_clock::now();
+         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+-        return emitter.Emit(ir_block).entrypoint;
++        const auto entrypoint = emitter.Emit(ir_block).entrypoint;
++        ::Common::PS4Perf::jit_compile_ns.fetch_add(
++            u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()),
++            std::memory_order_relaxed);
++        return entrypoint;
+     }
+ 
+     void PerformRequestedCacheInvalidation(HaltReason hr) {
+-- 
+2.43.0
+

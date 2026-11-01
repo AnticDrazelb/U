@@ -377,6 +377,19 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.92: **diagnostics after 21 fps: a service call's wait split up, translation time, one more
+launcher trace.** 03.91 on a console: Mario Kart races at 21 fps (03.88: 16-19), about 500 s without
+a problem; Captain Toad ran too (03.89/03.90 had closed it as Mario Kart, the same `jmp(qword)` in
+A64's inline RSB pop). Its launcher trace (the 30-second lines) was gone: each game runs in an app
+run of its own and the next run's start renamed its trace over it.
+
+- `port/ps4_crashlog.cpp`: the launcher trace the app's start renames away is kept as
+  `boot-trace-launcher-previous.log` (the game before the last one).
+- Patch 0080: a synchronous call to a service is stamped when sent, when the service's thread takes
+  it (`ReceiveRequest`) and when answered (`SendReply`); the 30-second line splits the average wait
+  (03.91's Mario Kart race: about 200 us a call, about 50 of it the services' own handling).
+- Patch 0080: the time dynarmic spends translating and emitting new blocks, per second.
+
 03.91: **03.89's crash at Mario Kart's start fixed; one xbyak for the whole program.** 03.89 on a
 console: Mario Kart closed while starting, `uncaught exception Xbyak::Error: bad mem size` on two
 cores, thrown in `A32EmitX64::EmitLeafTerminal` (noexcept, so terminate). The inline RSB pop

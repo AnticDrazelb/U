@@ -1265,6 +1265,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.92: measurements for the next step. 03.91 ran Mario Kart races at 21 fps (03.88: 16-19). "
+         "To find the rest: the log's 30-second lines now say how long the game's threads wait for each "
+         "call to a system service, split into waiting for the service, the service's work and getting "
+         "back to the game (in 03.91 a call took 200 us on average, of which the work was about 50), and "
+         "how much time the translator spends on new code each second (bursts of it are slow frames). "
+         "And the log of the game before the last one is kept too, so playing another game after Mario "
+         "Kart no longer replaces its numbers.\n"
          "03.91: fixes 03.89 and 03.90 closing Mario Kart as it started (\"bad mem size\"). The new "
          "return jumps were written in a form that the code generator rejects when its strictest "
          "checks are on. On a PC they are off, so testing there never saw it. On the PS4 they "
@@ -1941,6 +1948,7 @@ std::string PerfLine(double seconds)
     {
         uint64_t spins, sleeps, sleep_ns, ipcs, ipc_ns, events, late_ns, blocks, full, ranges, slow, slow_writes;
         uint64_t idle_ns[4], all_idle_ns, presents, present_ns, dequeues, dequeue_ns;
+        uint64_t ipc_queue_ns, ipc_handle_ns, ipc_resume_ns, ipc_split, compile_ns;
     };
     static Totals last{};
     uint64_t idle_ns[4], all_idle_ns;
@@ -1962,7 +1970,12 @@ std::string PerfLine(double seconds)
                      P::present_wait.count.load(std::memory_order_relaxed),
                      P::present_wait.total_ns.load(std::memory_order_relaxed),
                      P::dequeue_wait.count.load(std::memory_order_relaxed),
-                     P::dequeue_wait.total_ns.load(std::memory_order_relaxed)};
+                     P::dequeue_wait.total_ns.load(std::memory_order_relaxed),
+                     P::ipc_queue.total_ns.load(std::memory_order_relaxed),
+                     P::ipc_handle.total_ns.load(std::memory_order_relaxed),
+                     P::ipc_resume.total_ns.load(std::memory_order_relaxed),
+                     P::ipc_queue.count.load(std::memory_order_relaxed),
+                     P::jit_compile_ns.load(std::memory_order_relaxed)};
     // (the maxima since the last call)
     const uint64_t sleep_max = P::idle_sleep_wakes.max_ns.exchange(0, std::memory_order_relaxed);
     const uint64_t ipc_max = P::ipc.max_ns.exchange(0, std::memory_order_relaxed);
@@ -1973,16 +1986,23 @@ std::string PerfLine(double seconds)
     const auto average_us = [](uint64_t ns, uint64_t count) { return count ? double(ns) / double(count) / 1000.0 : 0.0; };
     std::string line = fmt::format(
         "idle emulated cores woken {:.0f} times a second while spinning, {:.0f} after sleeping ({:.0f} us after the "
-        "signal, at most {:.0f}); service calls {:.0f} a second, {:.0f} us each (at most {:.0f}); timer events {:.0f} "
+        "signal, at most {:.0f}); service calls {:.0f} a second, {:.0f} us each (at most {:.0f}; of that {:.0f} us "
+        "until the service's thread took the call, {:.0f} us its handling, {:.0f} us from its answer until the "
+        "caller ran again); timer events {:.0f} "
         "a second, {:.0f} us late (at most {:.0f}; timed waits overshoot {:.0f} us); the recompiler translated {:.0f} "
-        "blocks a second, flushed its whole cache {} times and parts of it {} times; {:.0f} memory accesses a second "
+        "blocks a second ({:.1f} ms of the emulated cores' time a second), flushed its whole cache {} times and "
+        "parts of it {} times; {:.0f} memory accesses a second "
         "left the inline page table walk ({:.0f} of them writes)",
         rate(now.spins, last.spins), rate(now.sleeps, last.sleeps),
         average_us(now.sleep_ns - last.sleep_ns, now.sleeps - last.sleeps), double(sleep_max) / 1000.0,
         rate(now.ipcs, last.ipcs), average_us(now.ipc_ns - last.ipc_ns, now.ipcs - last.ipcs), double(ipc_max) / 1000.0,
+        average_us(now.ipc_queue_ns - last.ipc_queue_ns, now.ipc_split - last.ipc_split),
+        average_us(now.ipc_handle_ns - last.ipc_handle_ns, now.ipc_split - last.ipc_split),
+        average_us(now.ipc_resume_ns - last.ipc_resume_ns, now.ipc_split - last.ipc_split),
         rate(now.events, last.events), average_us(now.late_ns - last.late_ns, now.events - last.events),
         double(late_max) / 1000.0, double(P::timer_overshoot_ns.load(std::memory_order_relaxed)) / 1000.0,
-        rate(now.blocks, last.blocks), now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow),
+        rate(now.blocks, last.blocks), double(now.compile_ns - last.compile_ns) / seconds / 1e6,
+        now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow),
         rate(now.slow_writes, last.slow_writes));
     // Where the game's time goes besides running: each emulated core idle (no thread of the game
     // to run), all at once (every thread waiting: on the GPU, a vsync, a service), a finished
