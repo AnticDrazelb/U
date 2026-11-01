@@ -1262,6 +1262,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.85: fastmem fixed. In 03.84 it closed games at their first picture: its address range (512 GiB, "
+         "only ever used by the CPU) was taken low in the PS4's address space, which pushed the GPU's own "
+         "ranges up to where the PS4's GPU can't reach, and the first thing the GPU drew killed the app. "
+         "The range now goes high up, above the GPU's part, which stays where it always was. Fastmem is "
+         "on again by default; System Settings, CPU, Fastmem still turns it off.\n"
          "03.84: FASTMEM. 03.83's log said yes: after sceKernelEnableDmemAliasing the PS4 lets this app map "
          "the same memory twice. So the Switch's memory now also sits at its own addresses, and the game's "
          "loads and stores are single instructions instead of a table lookup each (about 10), as on a PC: "
@@ -1948,8 +1953,10 @@ std::string PerfLine(double seconds)
         static uint64_t last_resolved = 0, last_declined = 0;
         const uint64_t resolved = Common::Orbis::FastmemFaultsResolved(), declined = Common::Orbis::FastmemFaultsDeclined();
         if (Common::Orbis::FastmemArenaBits() != 0) {
-            line += fmt::format("; fastmem: {} MiB of the game's memory mapped at its own addresses, {:.0f} faults a "
-                                "second resolved, {:.0f} declined", Common::Orbis::FastmemMappedBytes() >> 20,
+            line += fmt::format("; fastmem (a 2^{} arena at {:#x}): {} MiB of the game's memory mapped at its own "
+                                "addresses, {:.0f} faults a second resolved, {:.0f} declined",
+                                Common::Orbis::FastmemArenaBits(), Common::Orbis::FastmemArenaBase(),
+                                Common::Orbis::FastmemMappedBytes() >> 20,
                                 double(resolved - last_resolved) / seconds, double(declined - last_declined) / seconds);
         } else {
             line += "; fastmem: off";

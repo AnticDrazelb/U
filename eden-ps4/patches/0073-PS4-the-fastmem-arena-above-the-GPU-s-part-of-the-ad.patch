@@ -1,0 +1,54 @@
+From b1a188033ac57119d03c1276f4c4ddddb83f3eaf Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 06:03:50 +0000
+Subject: [PATCH] PS4: the fastmem arena above the GPU's part of the address
+ space
+
+Reserved first and low (68 to 580 GiB), the 512 GiB arena pushed the GPU address windows the port's
+Mesa reserves from 256 GiB up to 581 GiB and above, and the app was closed by the system at its
+first GPU submission (a GPU fault: no CPU signal, no crash report). The arena, only ever touched by
+the CPU, is reserved at 1 TiB or above, else 512 GiB or above, never lower; without such a place,
+no fastmem.
+---
+ src/common/orbis_memory.cpp | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index d91a7982e..f2de9fda7 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -424,12 +424,30 @@ bool EnableAliasing() {
+     return enabled;
+ }
+ 
++// Where the arena may go: above the GPU's part of the address space. The port's Mesa reserves its
++// GPU address windows from 256 GiB up (port/mesa/ac_ps4_drm.c); an arena reserved first, at 68 to
++// 580 GiB (03.84), pushed them above it, to 581 GiB and up, and the app was killed at its first
++// GPU submission (no CPU signal: a GPU fault). The arena is only ever touched by the CPU, so it
++// goes at 1 TiB or above where the kernel allows, else at 512 GiB or above; never lower.
++constexpr uintptr_t ArenaFloor = 0x8000000000ull;
++void* ReserveAboveGpu(size_t size) {
++    for (const uintptr_t hint : {0x10000000000ull, 0x20000000000ull, 0x40000000000ull, 0x8000000000ull}) {
++        void* address = reinterpret_cast<void*>(hint);
++        if (sceKernelReserveVirtualRange(&address, size, 0, 2_MiB) != 0)
++            continue;
++        if (reinterpret_cast<uintptr_t>(address) >= ArenaFloor)
++            return address;
++        sceKernelMunmap(address, size);
++    }
++    return nullptr;
++}
++
+ void* ReserveFastmemArena(unsigned max_bits, void* backing, size_t backing_size, unsigned& bits) {
+     bits = 0;
+     if (!EnableAliasing())
+         return nullptr;
+     for (unsigned b = max_bits; b >= 32; b--) {
+-        if (void* range = ReserveRange(size_t(1) << b, 2_MiB)) {
++        if (void* range = ReserveAboveGpu(size_t(1) << b)) {
+             arena.size = size_t(1) << b;
+             arena.bits = b;
+             arena.backing = reinterpret_cast<uintptr_t>(backing);
+-- 
+2.43.0
+

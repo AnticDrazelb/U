@@ -377,6 +377,16 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.85: **the fastmem arena above the GPU's addresses.** 03.84 on a console: with fastmem on, Celeste
+and Captain Toad were closed by the system at their first frame, no crash report; with it off they ran.
+The logs: the arena was reserved at 0x1118200000 (512 GiB, 68 to 580 GiB), and the port's Mesa, which
+reserves its GPU address windows from 256 GiB up, got 0x9164a00000 and 0x9600000000 instead of
+0x4000000000 and 0x4400000000; its first submission never completed (`submit 1 ... GPU completed 0`,
+then nothing): a GPU fault, which the system answers by closing the app, with no CPU signal. The arena
+(CPU only) is now reserved at 1 TiB or above, else 512 GiB or above (`ReserveAboveGpu`), never lower,
+so the GPU's windows stay at 256 GiB; without such a place, no fastmem. The 30-second line gives the
+arena's size and address.
+
 03.84: **fastmem.** 03.83's probe on a console: `plainly: refused (0x80020010); after
 sceKernelEnableDmemAliasing (0x0): yes, the same memory at two addresses`. Its log of Mario Kart 8
 Deluxe (races at 15-17 fps, Frame Pacing Unlocked changing nothing): emulated core 0 busy 85% of the
