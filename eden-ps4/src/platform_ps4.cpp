@@ -127,6 +127,25 @@ void Trace(const std::string& step)
     ps4_boot_trace(("eden-ps4: " + step).c_str());
 }
 
+// A long line in pieces at its "; " (the boot trace keeps 2 KiB of a line), each piece after the
+// first marked as the rest of it
+void TraceLong(const std::string& head, const std::string& text)
+{
+    constexpr size_t kPiece = 1800;
+    size_t at = 0;
+    for (int part = 0; at < text.size(); part++)
+    {
+        size_t end = text.size();
+        if (end - at > kPiece)
+        {
+            const size_t cut = text.rfind("; ", at + kPiece);
+            end = cut != std::string::npos && cut > at ? cut + 2 : at + kPiece;
+        }
+        Trace((part ? head + "(continued) " : head) + text.substr(at, end - at));
+        at = end;
+    }
+}
+
 double Seconds()
 {
     timespec ts;
@@ -1303,6 +1322,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.98: a look at which of the game's threads hold a frame up. 03.97's log showed Mario Kart's "
+         "main thread (core 0) waiting for other threads about 28% of the time, and a lock it and a "
+         "thread on core 2 take turns at about 1,100 times a second. The 30-second lines now list the "
+         "game's busiest threads: each one's time running and waiting, and on what (condition variables, "
+         "locks, objects, sleeps, service calls), to find the slowest step a frame goes through. Long "
+         "lines are kept whole now (03.97's were cut at 2 KiB). For the next log: turn Profiler on (System "
+         "Settings, CPU) and race the same track as before.\n"
          "03.97: faster vector loads and stores, and quicker hand-offs between the game's threads. 03.96 ran "
          "Mario Kart's races at 25-29 fps. Its NEON loads and stores (VLD1, VST1: audio mixing, vector "
          "maths, copies) were translated an element at a time, sixteen loads for one 16-byte register; "
@@ -2158,6 +2184,55 @@ std::string PerfLine(double seconds)
             }
         }
     }
+    // The game's busiest threads: each one's share of the period on its core, and in its waits
+    // (which threads a frame's time goes through, and what each waits on). A slot whose thread did
+    // nothing in the period is freed (a thread that has gone, or sleeps).
+    {
+        constexpr size_t kWaits = size_t(P::ThreadWait::Count);
+        struct Last {
+            uint64_t id = 0, run = 0, wait[kWaits] = {};
+        };
+        static Last last[P::MaxGuestThreads];
+        struct Row {
+            uint64_t id, run, wait[kWaits];
+            uint32_t core;
+            int32_t priority;
+        };
+        std::vector<Row> rows;
+        for (size_t i = 0; i < P::MaxGuestThreads; i++) {
+            P::GuestThread& t = P::guest_threads[i];
+            const uint64_t id = t.id.load(std::memory_order_acquire);
+            if (id == 0)
+                continue;
+            if (last[i].id != id)
+                last[i] = {id};
+            Row row{id, t.run_ns.load(std::memory_order_relaxed) - last[i].run, {}, t.core.load(std::memory_order_relaxed),
+                    t.priority.load(std::memory_order_relaxed)};
+            last[i].run += row.run;
+            bool active = row.run != 0;
+            for (size_t w = 0; w < kWaits; w++) {
+                row.wait[w] = t.wait_ns[w].load(std::memory_order_relaxed) - last[i].wait[w];
+                last[i].wait[w] += row.wait[w];
+                active |= row.wait[w] != 0;
+            }
+            if (!active) {
+                t.id.store(0, std::memory_order_release);
+                last[i] = {};
+                continue;
+            }
+            rows.push_back(row);
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.run > b.run; });
+        const auto share = [&](uint64_t ns) { return 100.0 * double(ns) / (seconds * 1e9); };
+        line += "; the busiest threads (on core, priority: running; waiting in condition variables, locks, on "
+                "objects, sleeps, service calls, addresses, in % of the time):";
+        for (size_t i = 0; i < std::min<size_t>(rows.size(), 8); i++) {
+            const Row& r = rows[i];
+            line += fmt::format("{} #{} core {} p{}: {:.0f}; {:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}, {:.0f}", i ? "," : "",
+                                r.id, r.core, r.priority, share(r.run), share(r.wait[0]), share(r.wait[1]),
+                                share(r.wait[2]), share(r.wait[3]), share(r.wait[4]), share(r.wait[5]));
+        }
+    }
     // The kernel's timer, of the timer events (guest threads' sleeps and timed waits ending: each
     // can interrupt an emulated core)
     {
@@ -2265,7 +2340,7 @@ private:
                 // how it runs: the frame rate, and the memory (what a game needs, on the console)
                 Trace(fmt::format("running {} s: {:.1f} frames a second; {}; {}", seconds,
                                   double(frames - reported) / 30.0, GpuLine(30.0), MemoryLine()));
-                Trace(fmt::format("running {} s: {}", seconds, PerfLine(30.0)));
+                TraceLong(fmt::format("running {} s: ", seconds), PerfLine(30.0));
                 reported = frames;
             }
             if (frames != last)

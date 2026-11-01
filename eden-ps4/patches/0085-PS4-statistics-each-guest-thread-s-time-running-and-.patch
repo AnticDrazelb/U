@@ -1,0 +1,158 @@
+From d056fb56387e02e8f146df0ba164fe1372f2cbbc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 22:32:15 +0000
+Subject: [PATCH] PS4 statistics: each guest thread's time running and waiting,
+ by kind
+
+PS4Perf::guest_threads: a table by thread id. KScheduler::SwitchThread adds the thread switched out
+its time on the core (wall clock, from the core's last switch); Svc::Call adds each call's whole
+time to its thread's waits by kind (condition variable, lock, synchronization, sleep, service
+call, address). The launcher lists the busiest threads and frees idle slots.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/ps4_perf.h               | 73 +++++++++++++++++++++++++++++
+ src/core/hle/kernel/k_scheduler.cpp | 15 ++++++
+ src/core/hle/kernel/svc.cpp         |  5 +-
+ 3 files changed, 92 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 667712ced..70f36fc0a 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -63,6 +63,79 @@ inline void AddSvc(size_t core, uint32_t id, uint64_t ns) {
+         svc_cores[core].total_ns[id].fetch_add(ns, std::memory_order_relaxed);
+     }
+ }
++// The game's threads (and the guest-core services'): each one's time on an emulated core (from the
++// scheduler's switches) and its waits in system calls, by kind, to find which threads a frame's
++// time goes through. A table by thread id; the launcher frees the slots of threads that did nothing
++// in a period (gone, or asleep: a sleeper gets a slot again when it next runs).
++enum class ThreadWait : uint32_t { Condition, Lock, Synchronization, Sleep, ServiceCall, Address, Count };
++inline constexpr size_t MaxGuestThreads = 128;
++struct alignas(64) GuestThread {
++    std::atomic<uint64_t> id{0}; // 0: free
++    std::atomic<uint64_t> run_ns{0};
++    std::atomic<uint32_t> core{0};
++    std::atomic<int32_t> priority{0};
++    std::atomic<uint64_t> wait_ns[size_t(ThreadWait::Count)]{};
++};
++inline GuestThread guest_threads[MaxGuestThreads];
++inline std::atomic_flag guest_threads_lock = ATOMIC_FLAG_INIT;
++// Each emulated core's last thread switch (only its own host thread writes it)
++inline std::atomic<uint64_t> core_switch_ns[4];
++inline GuestThread* FindGuestThread(uint64_t id) {
++    if (id == 0)
++        return nullptr;
++    for (GuestThread& t : guest_threads)
++        if (t.id.load(std::memory_order_acquire) == id)
++            return &t;
++    while (guest_threads_lock.test_and_set(std::memory_order_acquire)) {
++    }
++    GuestThread* found = nullptr;
++    for (GuestThread& t : guest_threads) {
++        if (t.id.load(std::memory_order_relaxed) == id) {
++            found = &t;
++            break;
++        }
++    }
++    if (!found) {
++        for (GuestThread& t : guest_threads) {
++            if (t.id.load(std::memory_order_relaxed) == 0) {
++                t.run_ns.store(0, std::memory_order_relaxed);
++                for (auto& w : t.wait_ns)
++                    w.store(0, std::memory_order_relaxed);
++                t.id.store(id, std::memory_order_release);
++                found = &t;
++                break;
++            }
++        }
++    }
++    guest_threads_lock.clear(std::memory_order_release);
++    return found;
++}
++inline void AddThreadRun(size_t core, uint64_t id, int32_t priority, uint64_t now_ns) {
++    if (core >= 4)
++        return;
++    const uint64_t since = core_switch_ns[core].exchange(now_ns, std::memory_order_relaxed);
++    if (since == 0 || now_ns <= since)
++        return;
++    if (GuestThread* t = FindGuestThread(id)) {
++        t->run_ns.fetch_add(now_ns - since, std::memory_order_relaxed);
++        t->core.store(uint32_t(core), std::memory_order_relaxed);
++        t->priority.store(priority, std::memory_order_relaxed);
++    }
++}
++inline void AddThreadWait(uint64_t id, uint32_t svc, uint64_t ns) {
++    ThreadWait kind;
++    switch (svc) {
++    case 0x1C: kind = ThreadWait::Condition; break;
++    case 0x1A: kind = ThreadWait::Lock; break;
++    case 0x18: kind = ThreadWait::Synchronization; break;
++    case 0x0B: kind = ThreadWait::Sleep; break;
++    case 0x21: case 0x22: kind = ThreadWait::ServiceCall; break;
++    case 0x34: kind = ThreadWait::Address; break;
++    default: return;
++    }
++    if (GuestThread* t = FindGuestThread(id))
++        t->wait_ns[size_t(kind)].fetch_add(ns, std::memory_order_relaxed);
++}
+ // The kernel's timer (KHardwareTimer: the game's threads' sleeps and timed waits ending), of the
+ // timer events
+ inline std::atomic<uint64_t> kernel_timer_tasks{0};
+diff --git a/src/core/hle/kernel/k_scheduler.cpp b/src/core/hle/kernel/k_scheduler.cpp
+index 3156a1706..ef862b402 100644
+--- a/src/core/hle/kernel/k_scheduler.cpp
++++ b/src/core/hle/kernel/k_scheduler.cpp
+@@ -10,6 +10,10 @@
+ #include "common/bit_util.h"
+ #include "common/fiber.h"
+ #include "common/logging.h"
++#ifdef __OPENORBIS__
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
++#endif
+ #include "core/arm/arm_interface.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+@@ -345,6 +349,17 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
+     ASSERT(next_thread->GetDisableDispatchCount() == 1);
+     ASSERT(!next_thread->IsDummyThread());
+ 
++#ifdef __OPENORBIS__
++    // (the thread switched out: its time on this core, for the 30-second line)
++    if (cur_thread->GetOwnerProcess() != nullptr) {
++        Common::PS4Perf::AddThreadRun(m_core_id, cur_thread->GetThreadId(), cur_thread->GetPriority(),
++                                      static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()));
++    } else {
++        Common::PS4Perf::core_switch_ns[m_core_id & 3].store(
++            static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()), std::memory_order_relaxed);
++    }
++#endif
++
+     // Update the CPU time tracking variables.
+     const s64 prev_tick = m_last_context_switch_time;
+     const s64 cur_tick = kernel.System().CoreTiming().GetClockTicks();
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 11ff1f3e4..d4483dffb 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -2507,10 +2507,13 @@ void Call(Core::System& system, u32 imm) {
+ #ifdef __OPENORBIS__
+     // (the call's whole length, by the core its thread made it on)
+     const size_t ps4_core = kernel.CurrentPhysicalCoreIndex();
++    const u64 ps4_thread = GetCurrentThread(kernel).GetThreadId();
+     const u64 ps4_begin = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+     SCOPE_EXIT {
+         const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+-        Common::PS4Perf::AddSvc(ps4_core, imm, now > ps4_begin ? now - ps4_begin : 0);
++        const u64 ns = now > ps4_begin ? now - ps4_begin : 0;
++        Common::PS4Perf::AddSvc(ps4_core, imm, ns);
++        Common::PS4Perf::AddThreadWait(ps4_thread, imm, ns);
+     };
+ #endif
+     std::array<uint64_t, 8> args;
+-- 
+2.43.0
+

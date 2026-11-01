@@ -377,6 +377,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.98: **which threads a frame waits on.** 03.97 on a console (Mario Kart, 50%, Profiler off): races
+at 24-28 fps, as 03.96 (a different track); core 0 idle 29%, cores 1 and 2 36% and 30%. Core 0's
+threads' system calls a second: `WaitProcessWideKeyAtomic` 281 ms (794 calls: the main thread
+waiting on a condition variable for other threads' work), `ArbitrateLock` 39 ms (1,091 calls,
+35 us each), `SendSyncRequest` 25 ms (80 calls, 306 us each), `ArbitrateUnlock` 23 ms (1,924
+calls); core 2's `ArbitrateLock` 1,169 a second too (a lock taken in turns with core 0). Writes to
+memory the GPU caches through the callbacks climbed from 1,000 to 51,000 a second in a race. Core
+0's code cache (48 MiB) filled after 6 minutes and was flushed during the next loading screen.
+The 30-second line was cut at 2 KiB by the boot trace (the busiest services were lost).
+
+- Patch 0085: `PS4Perf::guest_threads`, a table by thread id: `KScheduler::SwitchThread` adds the
+  thread switched out its time on the core since the core's last switch; `Svc::Call` adds each
+  call's whole time to its thread's waits, by kind (condition variable, lock, synchronization,
+  sleep, service call, address). The 30-second line lists the eight busiest threads (core,
+  priority, % running, % in each kind of wait); slots of threads that did nothing in the period
+  are freed.
+- The launcher writes the 30-second line in pieces of up to 1,800 characters, cut at "; ", each
+  after the first marked "(continued)".
+
 03.97: **VLD1/VST1 a whole register at a time; longer idle spins on the game's cores; what the
 cores wait on.** 03.96 on a console (Mario Kart, 50%, Profiler off): races at 25-29 fps (34-40 ms
 of work a frame), from 20-23; fastmem's "pages not back to back" declines 0-1 a second (73 of 76
