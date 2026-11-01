@@ -44,14 +44,10 @@ void ac_ps4_get_gpu_stats(uint64_t* busy_ticks, uint64_t* span_ticks, uint64_t* 
 
 void ps4_crash_guest_info() {}
 void ps4_crash_guest_regs(int) {}
-void ps4_crash_jit_info(int, uint64_t, int) {}
+// ps4_crash_jit_info, ps4_jit_owner and ps4_jit_dump_function: Eden's dynarmic
+// (backend/x64/ps4_block_map.cpp), the guest block of a JIT address while the profiler is on
 void ps4_crash_note() {}
 void ps4_crash_restart() {}
-int ps4_jit_owner(uint64_t, uint32_t*, uint64_t*)
-{
-    return 0;
-}
-void ps4_jit_dump_function(int, uint32_t, uint64_t, uint32_t) {}
 void ps4_recompiler_status(int) {}
 void ps4_hang_guest_threads(int) {}
 

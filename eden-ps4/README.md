@@ -377,6 +377,31 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.89: **leaner translated code; a profiler that names the game code.** The profile every log
+since 03.77 carried was one MK8 session recorded before 03.77, symbolized with each newer build's
+functions (its "hot" A32 translator functions were nonsense). Its useful part: MK8 Deluxe is A32,
+and in races core 0 spent 80-85% in JIT code. So the A32 output was taken apart on the host
+harness (a game-like image, the PS4's CPU features, instruction counts under callgrind).
+
+- Patch 0077, A32: `B<c>` ends its block with an `If` terminal (Thumb's already did) instead of
+  ending the block before it for a conditional block of its own, two linked blocks per loop turn.
+- Patch 0077, register allocator: a value in the way moves to an empty register (callee-saved
+  first; only those during a host call), not to the stack and back. It was what `UseScratch` of a
+  value used again, and every fixed-register scratch (`lahf`'s rax, shifts' rcx), cost.
+- Patch 0077, options Eden turns on: no per-block `%rbp` frame save/setup/restore (three
+  instructions a block, for host frame-pointer walks); no halt check on links to a higher address
+  than the block's start (every loop's way back still checks); each return checks the return
+  stack buffer and jumps in its own block (one shared indirect jump mispredicts whenever
+  consecutive returns differ).
+- Host harness, 200 frames: A32 632k -> 472k host instructions a frame (-25%), A64 513k -> 447k
+  (-13%). New random-program generators for control flow and flags (gen7.py A32/Thumb with
+  conditional instructions, IT blocks, loops, calls; gen8.py A64 with CSEL/CCMP/CBZ/TBZ, loops,
+  calls); old build vs new, every option on, with and without fastmem: 4,808 programs, all equal.
+- Profiler: the session line carries the build (`[build 03.89]`); a samples.log from another build
+  is summed up without names. JIT samples name their guest block (dynarmic's block map, kept while
+  the profiler is on), the summary lists the busiest blocks per thread, and every minute
+  hotblocks.log gets the 60 busiest blocks' guest words and host bytes (for disassembly).
+
 03.88: **a fresh process for every game; faults inside fault handlers reported.** 03.87 on a console:
 Mario Kart 8 Deluxe races at 16-19 fps (mostly 17.5-18.7; 03.85 15-18, 03.86 14-16), accesses through
 the callbacks 9,000-32,000 a second, nearly all writes to memory the GPU caches (03.86: 240,000-350,000),

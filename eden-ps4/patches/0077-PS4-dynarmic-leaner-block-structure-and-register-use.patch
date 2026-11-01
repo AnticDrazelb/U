@@ -1,0 +1,864 @@
+From 10da5f6daabc4220cdc5fa15349958f0eea65987 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 10:14:15 +0000
+Subject: [PATCH] PS4 dynarmic: leaner block structure and register use; the
+ profiler's block map
+
+Mario Kart 8 Deluxe runs the A32 translator, which ended a block before every conditional
+instruction, a conditional branch included: a loop's "cmp; bne" was two linked blocks a turn.
+ARM's B<c> now ends the block it is in with an If terminal, as Thumb's B<c> already did.
+
+- RegAlloc::MoveOutOfTheWay moves a value to an empty register (callee-saved first; during
+  HostCall only those) instead of spilling it to the stack, which UseScratch of a value used
+  again later, and every fixed-register scratch (lahf's rax, shifts' rcx), did.
+- jit_frame_pointer (default on, off in Eden): the per-block %rbp save, frame setup and restore,
+  there for host frame-pointer walks.
+- link_forward_without_halt_check (off; on in Eden): a link to a higher address than the block's
+  start skips the halt check; every loop links back at or below its start, which still checks.
+- inline_rsb_pop (off; on in Eden): a return checks the RSB and jumps in its own block instead of
+  through the shared handler's one indirect jump.
+
+On the host harness with the PS4's CPU features (game-like image, 200 frames): A32 632k -> 472k
+host instructions a frame, A64 513k -> 447k. Cross-build differential tests (old build vs new,
+every option on, with and without fastmem), all passing: random A32/Thumb control flow and flags
+(new generator) 1,700 programs, loads/stores, VFP lists and exclusives 1,400; A64 control flow
+(new generator) 950, loads/stores 550, exclusives 200.
+
+The PS4 profiler's map (backend/x64/ps4_block_map.cpp, PS4 builds, kept only while the launcher
+enables it): each code cache's blocks in address order (host offset, sizes, guest location), for
+the sampler's ps4_jit_block (the guest block of a JIT sample), ps4_jit_dump_function (the
+hottest blocks' guest words and host bytes, to hotblocks.log) and ps4_crash_jit_info. Guest words
+come from a new callback, PeekCode, side-effect free (Eden: GetPointerSilent), since
+MemoryReadCode keeps a per-core cached page the sampler thread must not touch.
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  17 ++
+ src/core/arm/dynarmic/arm_dynarmic_32.h       |   1 +
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  17 ++
+ src/core/arm/dynarmic/arm_dynarmic_64.h       |   1 +
+ src/dynarmic/src/dynarmic/CMakeLists.txt      |   2 +
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |  47 +++-
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |  51 +++-
+ .../dynarmic/backend/x64/ps4_block_map.cpp    | 233 ++++++++++++++++++
+ .../src/dynarmic/backend/x64/ps4_block_map.h  |  30 +++
+ .../src/dynarmic/backend/x64/reg_alloc.cpp    |  30 +++
+ .../src/dynarmic/backend/x64/reg_alloc.h      |   4 +
+ .../A32/translate/impl/a32_branch.cpp         |  13 +-
+ .../src/dynarmic/interface/A32/config.h       |  22 ++
+ .../src/dynarmic/interface/A64/config.h       |  22 ++
+ 14 files changed, 479 insertions(+), 11 deletions(-)
+ create mode 100644 src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.cpp
+ create mode 100644 src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.h
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 4182d87f2..9b53591db 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstring>
+ #include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+@@ -34,6 +35,15 @@ u64 DynarmicCallbacks32::MemoryRead(u32 vaddr, size_t size) {
+     }
+ }
+ 
++std::optional<u32> DynarmicCallbacks32::PeekCode(u32 vaddr) {
++    const u8* const pointer = m_memory.GetPointerSilent(vaddr);
++    if (!pointer || (vaddr & Core::Memory::YUZU_PAGEMASK) > Core::Memory::YUZU_PAGEMASK - 3)
++        return std::nullopt;
++    u32 word;
++    std::memcpy(&word, pointer, sizeof(word));
++    return word;
++}
++
+ std::optional<u32> DynarmicCallbacks32::MemoryReadCode(u32 vaddr) {
+     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
+         return std::nullopt;
+@@ -203,6 +213,13 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.wall_clock_cntpct = m_uses_wall_clock;
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
++    // Blocks without the frame pointer save and restore (a host profiler's frame walk is all it is
++    // for), links forward without the halt check (loops still check, on their way back), and each
++    // return with its own predictable jump
++    config.jit_frame_pointer = false;
++    config.link_forward_without_halt_check = true;
++    config.inline_rsb_pop = true;
++
+     // Code cache size
+ #if defined(__OPENORBIS__)
+     // The PS4 runs code only from its system memory pool, which the app's heap shares: 128 MiB in
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.h b/src/core/arm/dynarmic/arm_dynarmic_32.h
+index 22655dff4..936f11227 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.h
+@@ -32,6 +32,7 @@ public:
+     explicit DynarmicCallbacks32(ArmDynarmic32& parent, Kernel::KProcess* process);
+     u64 MemoryRead(u32 vaddr, size_t size) override;
+     std::optional<u32> MemoryReadCode(u32 vaddr) override;
++    std::optional<u32> PeekCode(u32 vaddr) override;
+     void InstructionSynchronizationBarrierRaised() override {
+         last_code_addr = u64(-1); //reset back, force refetch
+     }
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index cb744c3f9..44a201799 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #ifdef __OPENORBIS__
++#include <cstring>
+ #include "common/orbis_memory.h"
+ #endif
+ #include "common/ps4_perf.h"
+@@ -41,6 +42,15 @@ Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
+     return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+ }
+ 
++std::optional<u32> DynarmicCallbacks64::PeekCode(u64 vaddr) {
++    const u8* const pointer = m_memory.GetPointerSilent(vaddr);
++    if (!pointer || (vaddr & Core::Memory::YUZU_PAGEMASK) > Core::Memory::YUZU_PAGEMASK - 3)
++        return std::nullopt;
++    u32 word;
++    std::memcpy(&word, pointer, sizeof(word));
++    return word;
++}
++
+ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
+     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
+         return std::nullopt;
+@@ -260,6 +270,13 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.wall_clock_cntpct = m_uses_wall_clock;
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
++    // Blocks without the frame pointer save and restore (a host profiler's frame walk is all it is
++    // for), links forward without the halt check (loops still check, on their way back), and each
++    // return with its own predictable jump
++    config.jit_frame_pointer = false;
++    config.link_forward_without_halt_check = true;
++    config.inline_rsb_pop = true;
++
+     // Code cache size
+ #if defined(__OPENORBIS__)
+     // The PS4 runs code only from its system memory pool, which the app's heap shares: 128 MiB in
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.h b/src/core/arm/dynarmic/arm_dynarmic_64.h
+index 5ea5dde8a..26ac7ec1b 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.h
+@@ -40,6 +40,7 @@ public:
+     u64 MemoryRead(u64 vaddr, size_t size) override;
+     Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override;
+     std::optional<u32> MemoryReadCode(u64 vaddr) override;
++    std::optional<u32> PeekCode(u64 vaddr) override;
+     void InstructionSynchronizationBarrierRaised() override {
+         last_code_addr = u64(-1); //reset back, force refetch
+     }
+diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
+index 466475ee2..9c7a94cde 100644
+--- a/src/dynarmic/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/src/dynarmic/CMakeLists.txt
+@@ -368,6 +368,8 @@ elseif (PS4)
+     # handler, with the PS4's (FreeBSD's) signal context, asking the port first about faults it
+     # maps lazily (page tables, the DRAM, the fastmem arena), and logging nothing itself
+     target_sources(dynarmic PRIVATE backend/exception_handler_posix.cpp)
++    # the profiler's map of recompiled blocks (port/ps4_sampler.cpp: samples.log, hotblocks.log)
++    target_sources(dynarmic PRIVATE backend/x64/ps4_block_map.cpp backend/x64/ps4_block_map.h)
+ elseif (UNIX AND NOT HAIKUOS)
+     # Haiku lacks <ucontext.h>
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index f9eb53a21..dbd9f3c8e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -26,6 +26,7 @@
+ #include "dynarmic/backend/x64/emit_x64.h"
+ #include "dynarmic/backend/x64/nzcv_util.h"
+ #include "dynarmic/backend/x64/perf_map.h"
++#include "dynarmic/backend/x64/ps4_block_map.h"
+ #include "dynarmic/backend/x64/stack_layout.h"
+ #include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/frontend/A32/a32_types.h"
+@@ -93,9 +94,12 @@ A32EmitX64::A32EmitX64(BlockOfCode& code, A32::UserConfig conf, A32::Jit* jit_in
+             return FastmemCallback(rip_);
+         });
+     }
++    Ps4BlockMap::Attach(code.getCode(), 0, Ps4BlockMap::Kind::A32, this->conf.callbacks);
+ }
+ 
+-A32EmitX64::~A32EmitX64() = default;
++A32EmitX64::~A32EmitX64() {
++    Ps4BlockMap::Clear(code.getCode(), true);
++}
+ 
+ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
+     if (conf.very_verbose_debugging_output) {
+@@ -117,8 +121,10 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
+     // Start emitting.
+     code.align();
+     const u8* const entrypoint = code.getCurr();
+-    code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+-    code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
++    if (conf.jit_frame_pointer) {
++        code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
++        code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
++    }
+ 
+     EmitCondPrelude(ctx);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+@@ -174,7 +180,8 @@ finish_this_inst:
+ 
+     if (conf.enable_cycle_counting)
+         EmitAddCycles(block.CycleCount());
+-    code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
++    if (conf.jit_frame_pointer)
++        code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+     code.int3();
+ 
+@@ -191,6 +198,8 @@ finish_this_inst:
+     block_ranges.AddRange(range, descriptor);
+ 
+     auto const bdesc = RegisterBlock(descriptor, entrypoint, size);
++    Ps4BlockMap::Register(code.getCode(), entrypoint, size, IR::LocationDescriptor{descriptor}.Value(),
++                          size_t(end_location.PC() - descriptor.PC()));
+     code.DisableWriting();
+     shared_labels.clear();
+     return bdesc;
+@@ -198,6 +207,7 @@ finish_this_inst:
+ 
+ void A32EmitX64::ClearCache() {
+     EmitX64::ClearCache();
++    Ps4BlockMap::Clear(code.getCode(), false);
+     block_ranges.ClearCache();
+     ClearFastDispatchTable();
+     fastmem_patch_info.clear();
+@@ -1165,7 +1175,17 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::ReturnToDispatch, IR::LocationDes
+     return true;
+ }
+ 
++bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step);
++
+ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
++    // Forward, in the same mode: a loop's way back is a link to an address at or below its
++    // start, which checks
++    if (e.conf.link_forward_without_halt_check && !e.conf.enable_cycle_counting
++        && e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step
++        && A32::LocationDescriptor{terminal.next}.PC() > A32::LocationDescriptor{initial_location}.PC()
++        && (terminal.next.Value() >> 32) == (initial_location.Value() >> 32)) {
++        return EmitTerminalImpl(e, IR::Term::LinkBlockFast{terminal.next}, initial_location, is_single_step);
++    }
+     e.EmitSetUpperLocationDescriptor(terminal.next, initial_location);
+     if (!e.conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
+         e.code.mov(MJitStateReg(A32::Reg::PC), A32::LocationDescriptor{terminal.next}.PC());
+@@ -1214,6 +1234,25 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
+ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+     if (!e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) || is_single_step) {
+         e.code.ReturnFromRunCode();
++    } else if (e.conf.inline_rsb_pop) {
++        // terminal_handler_pop_rsb_hint, here: this return's own indirect jump, which the host's
++        // branch predictor learns on its own, instead of the one all returns share
++        auto& code = e.code;
++        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)]);
++        code.shl(rbx, 32);
++        code.mov(ecx, MJitStateReg(A32::Reg::PC));
++        code.or_(rbx, rcx);
++        code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_ptr)]);
++        code.sub(eax, 1);
++        code.and_(eax, u32(A32JitState::RSB_PTR_MASK));
++        code.mov(dword[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_ptr)], eax);
++        code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
++        if (e.conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            code.jne(e.terminal_handler_fast_dispatch_hint);
++        } else {
++            code.jne(code.GetReturnFromRunCodeAddress());
++        }
++        code.jmp(qword[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_codeptrs) + rax * sizeof(u64)]);
+     } else {
+         e.code.jmp(e.terminal_handler_pop_rsb_hint);
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 54ab16212..c0972c6a2 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -23,6 +23,7 @@
+ #include "dynarmic/backend/x64/emit_x64.h"
+ #include "dynarmic/backend/x64/nzcv_util.h"
+ #include "dynarmic/backend/x64/perf_map.h"
++#include "dynarmic/backend/x64/ps4_block_map.h"
+ #include "dynarmic/backend/x64/stack_layout.h"
+ #include "dynarmic/frontend/A64/a64_location_descriptor.h"
+ #include "dynarmic/frontend/A64/a64_types.h"
+@@ -68,9 +69,12 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
+             return FastmemCallback(rip_);
+         });
+     }
++    Ps4BlockMap::Attach(code.getCode(), 0, Ps4BlockMap::Kind::A64, this->conf.callbacks);
+ }
+ 
+-A64EmitX64::~A64EmitX64() = default;
++A64EmitX64::~A64EmitX64() {
++    Ps4BlockMap::Clear(code.getCode(), true);
++}
+ 
+ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     if (conf.very_verbose_debugging_output) [[unlikely]] {
+@@ -92,8 +96,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     // Start emitting.
+     code.align();
+     const auto* const entrypoint = code.getCurr();
+-    code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+-    code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
++    if (conf.jit_frame_pointer) {
++        code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
++        code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
++    }
+ 
+     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+@@ -147,7 +153,8 @@ finish_this_inst:
+     reg_alloc.AssertNoMoreUses();
+     if (conf.enable_cycle_counting)
+         EmitAddCycles(block.CycleCount());
+-    code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
++    if (conf.jit_frame_pointer)
++        code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+     code.int3();
+     for (auto& deferred_emit : ctx.deferred_emits)
+@@ -163,6 +170,8 @@ finish_this_inst:
+     block_ranges.AddRange(range, descriptor);
+ 
+     auto bdesc = RegisterBlock(descriptor, entrypoint, size);
++    Ps4BlockMap::Register(code.getCode(), entrypoint, size, IR::LocationDescriptor{descriptor}.Value(),
++                          size_t(end_location.PC() - descriptor.PC()));
+     code.DisableWriting();
+     shared_labels.clear();
+     return bdesc;
+@@ -170,6 +179,7 @@ finish_this_inst:
+ 
+ void A64EmitX64::ClearCache() {
+     EmitX64::ClearCache();
++    Ps4BlockMap::Clear(code.getCode(), false);
+     block_ranges.ClearCache();
+     ClearFastDispatchTable();
+     fastmem_patch_info.clear();
+@@ -628,9 +638,16 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::ReturnToDispatch, IR::LocationDes
+     return true;
+ }
+ 
+-bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
++bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step);
++
++bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+     // Used for patches and linking
+     if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
++        // Forward: a loop's way back is a link to an address at or below its start, which checks
++        if (e.conf.link_forward_without_halt_check && !e.conf.enable_cycle_counting
++            && A64::LocationDescriptor{terminal.next}.PC() > A64::LocationDescriptor{initial_location}.PC()) {
++            return EmitTerminalImpl(e, IR::Term::LinkBlockFast{terminal.next}, initial_location, is_single_step);
++        }
+         if (e.conf.enable_cycle_counting) {
+             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+             e.patch_information[terminal.next].jg.push_back(e.code.getCurr());
+@@ -676,7 +693,29 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
+ }
+ 
+ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+-    if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
++    if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step && e.conf.inline_rsb_pop) {
++        // terminal_handler_pop_rsb_hint, here: this return's own indirect jump, which the host's
++        // branch predictor learns on its own, instead of the one all returns share
++        auto& code = e.code;
++        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++        code.mov(rcx, A64::LocationDescriptor::pc_mask);
++        code.and_(rcx, rdi);
++        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
++        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
++        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
++        code.or_(rbx, rcx);
++        code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
++        code.sub(eax, 1);
++        code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
++        code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
++        code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
++        if (e.conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            code.jne(e.terminal_handler_fast_dispatch_hint);
++        } else {
++            code.jne(code.GetReturnFromRunCodeAddress());
++        }
++        code.jmp(qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
++    } else if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+         e.code.jmp(e.terminal_handler_pop_rsb_hint);
+     } else {
+         e.code.ReturnFromRunCode();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.cpp b/src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.cpp
+new file mode 100644
+index 000000000..f752f1834
+--- /dev/null
++++ b/src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.cpp
+@@ -0,0 +1,233 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// The PS4 profiler's map of recompiled blocks: port/ps4_sampler.cpp asks which guest block a
++// sampled host address is in (ps4_jit_block) and has the hottest written out (ps4_jit_dump_function,
++// to ps4_jit_dump_path's hotblocks.log, which the log bundle includes): each block's guest
++// location, its guest code (words, through the JIT's callbacks) and its host code (bytes), for
++// offline disassembly.
++
++#include "dynarmic/backend/x64/ps4_block_map.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++#include <unistd.h>
++
++#include "dynarmic/interface/A32/config.h"
++#include "dynarmic/interface/A64/config.h"
++
++namespace Dynarmic::Backend::X64::Ps4BlockMap {
++namespace {
++
++std::atomic<bool> enabled{false};
++
++struct Entry {
++    std::uint32_t offset;      // host code, from the cache's start
++    std::uint16_t host_size;   // bytes (at most 65535)
++    std::uint16_t guest_size;  // bytes (at most 65535)
++    std::uint64_t descriptor;  // the guest location (IR::LocationDescriptor's value)
++};
++
++struct Cache {
++    const std::uint8_t* base;
++    Kind kind;
++    void* callbacks;
++    std::vector<Entry> entries;  // in address order: a cache fills upwards until cleared
++};
++
++std::mutex mutex;
++std::vector<Cache> caches;
++
++Cache* Find(const void* cache) {
++    for (Cache& c : caches)
++        if (c.base == cache)
++            return &c;
++    return nullptr;
++}
++
++// The cache and block a host address is in
++bool Lookup(std::uint64_t rip, const Cache*& cache, const Entry*& entry) {
++    for (const Cache& c : caches) {
++        const std::uint64_t base = reinterpret_cast<std::uint64_t>(c.base);
++        if (rip < base || c.entries.empty())
++            continue;
++        const std::uint64_t offset = rip - base;
++        auto it = std::upper_bound(c.entries.begin(), c.entries.end(), offset,
++                                   [](std::uint64_t o, const Entry& e) { return o < e.offset; });
++        if (it == c.entries.begin())
++            continue;
++        --it;
++        if (offset < std::uint64_t(it->offset) + it->host_size) {
++            cache = &c;
++            entry = &*it;
++            return true;
++        }
++    }
++    return false;
++}
++
++void Write(int fd, const char* text, std::size_t length) {
++    while (length > 0) {
++        const ssize_t written = write(fd, text, length);
++        if (written <= 0)
++            return;
++        text += written;
++        length -= std::size_t(written);
++    }
++}
++
++}  // namespace
++
++void Attach(const void* cache, std::size_t, Kind kind, void* callbacks) {
++    std::lock_guard lock{mutex};
++    if (Cache* c = Find(cache)) {
++        c->kind = kind;
++        c->callbacks = callbacks;
++        c->entries.clear();
++        return;
++    }
++    caches.push_back({static_cast<const std::uint8_t*>(cache), kind, callbacks, {}});
++}
++
++void Clear(const void* cache, bool detach) {
++    std::lock_guard lock{mutex};
++    for (auto it = caches.begin(); it != caches.end(); ++it) {
++        if (it->base != cache)
++            continue;
++        if (detach)
++            caches.erase(it);
++        else
++            std::vector<Entry>{}.swap(it->entries);
++        return;
++    }
++}
++
++void Register(const void* cache, const void* host, std::size_t host_size, std::uint64_t descriptor,
++              std::size_t guest_size) {
++    if (!enabled.load(std::memory_order_relaxed))
++        return;
++    std::lock_guard lock{mutex};
++    Cache* c = Find(cache);
++    if (!c)
++        return;
++    const std::uint64_t offset = std::uint64_t(static_cast<const std::uint8_t*>(host) - c->base);
++    if (offset >> 32)
++        return;
++    // a block below the last: the cache was cleared and refilled (drop what it overwrote)
++    while (!c->entries.empty() && c->entries.back().offset >= offset)
++        c->entries.pop_back();
++    c->entries.push_back({std::uint32_t(offset), std::uint16_t(std::min<std::size_t>(host_size, 0xFFFF)),
++                          std::uint16_t(std::min<std::size_t>(guest_size, 0xFFFF)), descriptor});
++}
++
++}  // namespace Dynarmic::Backend::X64::Ps4BlockMap
++
++using namespace Dynarmic::Backend::X64::Ps4BlockMap;
++
++// The launcher: the map kept while the profiler is on (from before the program boots)
++extern "C" void dynarmic_ps4_block_map_enable(int on) {
++    enabled.store(on != 0);
++    if (!on) {
++        std::lock_guard lock{mutex};
++        for (Cache& c : caches)
++            std::vector<Entry>{}.swap(c.entries);
++    }
++}
++
++// The sampler: the guest block a JIT address is in (its location: an A32 PC in the low 32 bits,
++// the Thumb flag in bit 32; an A64 PC in the low 56), and where its host code starts
++extern "C" int ps4_jit_block(std::uint64_t rip, std::uint64_t* guest, std::uint64_t* host_start, int* kind) {
++    std::lock_guard lock{mutex};
++    const Cache* cache;
++    const Entry* entry;
++    if (!Lookup(rip, cache, entry))
++        return 0;
++    *guest = entry->descriptor;
++    *host_start = reinterpret_cast<std::uint64_t>(cache->base) + entry->offset;
++    *kind = int(cache->kind);
++    return 1;
++}
++
++// Older sampler builds: the same, the guest location cut to 32 bits
++extern "C" int ps4_jit_owner(std::uint64_t rip, std::uint32_t* guest, std::uint64_t* host_start) {
++    std::uint64_t g;
++    int kind;
++    if (!ps4_jit_block(rip, &g, host_start, &kind))
++        return 0;
++    *guest = std::uint32_t(g);
++    return 1;
++}
++
++extern "C" const char* ps4_jit_dump_path(void) {
++    return "/data/eden-ps4/hotblocks.log";
++}
++
++// One hot block, as text: its location and share, its guest code (32-bit words) and its host code
++// (bytes), 32 a line
++extern "C" void ps4_jit_dump_function(int fd, std::uint32_t, std::uint64_t host_start, std::uint32_t samples) {
++    std::lock_guard lock{mutex};
++    const Cache* cache;
++    const Entry* entry;
++    if (!Lookup(host_start, cache, entry))
++        return;
++    char line[160];
++    const bool a64 = cache->kind == Kind::A64;
++    const std::uint64_t pc = a64 ? (entry->descriptor & ((std::uint64_t(1) << 56) - 1)) : (entry->descriptor & 0xFFFFFFFF);
++    const bool thumb = !a64 && ((entry->descriptor >> 32) & 1);
++    int n = std::snprintf(line, sizeof(line), "\nblock %s pc 0x%llx%s: %u samples, %u guest bytes, %u host bytes at 0x%llx (location %016llx)\n",
++                          a64 ? "a64" : "a32", (unsigned long long)pc, thumb ? " thumb" : "", samples,
++                          unsigned(entry->guest_size), unsigned(entry->host_size), (unsigned long long)host_start,
++                          (unsigned long long)entry->descriptor);
++    Write(fd, line, std::size_t(n));
++    // the guest code (the instructions the block was recompiled from), as they read now
++    const std::size_t guest_words = std::min<std::size_t>((entry->guest_size + 3) / 4, 96);
++    for (std::size_t i = 0; i < guest_words; i += 8) {
++        n = std::snprintf(line, sizeof(line), "guest");
++        for (std::size_t j = i; j < std::min(guest_words, i + 8); j++) {
++            std::optional<std::uint32_t> word;
++            const std::uint64_t address = (pc & ~std::uint64_t(3)) + 4 * j;
++            if (a64)
++                word = static_cast<Dynarmic::A64::UserCallbacks*>(cache->callbacks)->PeekCode(address);
++            else
++                word = static_cast<Dynarmic::A32::UserCallbacks*>(cache->callbacks)->PeekCode(std::uint32_t(address));
++            n += std::snprintf(line + n, sizeof(line) - std::size_t(n), word ? " %08x" : " --------", word ? *word : 0u);
++        }
++        line[n++] = '\n';
++        Write(fd, line, std::size_t(n));
++    }
++    // the host code, through a copy (the kernel never reads JIT memory for the write)
++    const std::size_t host_bytes = std::min<std::size_t>(entry->host_size, 2048);
++    std::uint8_t copy[2048];
++    std::memcpy(copy, reinterpret_cast<const void*>(host_start), host_bytes);
++    for (std::size_t i = 0; i < host_bytes; i += 32) {
++        n = std::snprintf(line, sizeof(line), "host ");
++        for (std::size_t j = i; j < std::min(host_bytes, i + 32); j++)
++            n += std::snprintf(line + n, sizeof(line) - std::size_t(n), "%02x", copy[j]);
++        line[n++] = '\n';
++        Write(fd, line, std::size_t(n));
++    }
++}
++
++// The crash log and the hang dump (a thread stopped in JIT code): the guest block it is in, while
++// the profiler is on (the map is empty otherwise). From a signal handler: nothing if the map is busy.
++extern "C" void ps4_crash_jit_info(int fd, std::uint64_t rip, int brief) {
++    std::unique_lock lock{mutex, std::try_to_lock};
++    if (!lock.owns_lock())
++        return;
++    const Cache* cache;
++    const Entry* entry;
++    if (!Lookup(rip, cache, entry))
++        return;
++    const bool a64 = cache->kind == Kind::A64;
++    const std::uint64_t host = reinterpret_cast<std::uint64_t>(cache->base) + entry->offset;
++    char line[160];
++    const int n = std::snprintf(line, sizeof(line), "%sjit block: %s location %016llx, host code +0x%llx of %u bytes\n",
++                                brief ? "    " : "", a64 ? "a64" : "a32", (unsigned long long)entry->descriptor,
++                                (unsigned long long)(rip - host), unsigned(entry->host_size));
++    Write(fd, line, std::size_t(n));
++}
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.h b/src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.h
+new file mode 100644
+index 000000000..dfe818887
+--- /dev/null
++++ b/src/dynarmic/src/dynarmic/backend/x64/ps4_block_map.h
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// The PS4 profiler's map of recompiled blocks (port/ps4_sampler.cpp): which guest block a sampled
++// host address belongs to, and the hottest blocks' code, guest and host, for hotblocks.log. Kept
++// only while the profiler is on (dynarmic_ps4_block_map_enable).
++
++#include <cstddef>
++#include <cstdint>
++
++namespace Dynarmic::Backend::X64::Ps4BlockMap {
++
++enum class Kind : std::uint8_t { A32 = 0, A64 = 1 };
++
++#ifdef __OPENORBIS__
++/// A code cache's blocks from now on (its emitter's), whose guest code `callbacks` reads
++void Attach(const void* cache, std::size_t cache_size, Kind kind, void* callbacks);
++/// Its blocks forgotten (the cache cleared, or the emitter gone)
++void Clear(const void* cache, bool detach);
++void Register(const void* cache, const void* host, std::size_t host_size, std::uint64_t descriptor,
++              std::size_t guest_size);
++#else
++inline void Attach(const void*, std::size_t, Kind, void*) {}
++inline void Clear(const void*, bool) {}
++inline void Register(const void*, const void*, std::size_t, std::uint64_t, std::size_t) {}
++#endif
++
++}  // namespace Dynarmic::Backend::X64::Ps4BlockMap
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+index 5a828839c..de81ca3e1 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+@@ -340,6 +340,7 @@ void RegAlloc::HostCall(
+         return ret;
+     }();
+ 
++    in_host_call = true;
+     ScratchGpr(code, ABI_RETURN);
+     if (result_def)
+         DefineValueImpl(code, result_def, ABI_RETURN);
+@@ -358,6 +359,7 @@ void RegAlloc::HostCall(
+             LocInfo(HostLoc(i)).WriteLock();
+         }
+     }
++    in_host_call = false;
+     for (size_t i = 0; i < args.size(); i++) {
+         if (args[i] && !args[i]->get().IsVoid()) {
+             // LLVM puts the burden of zero-extension of 8 and 16 bit values on the caller instead of the callee
+@@ -516,10 +518,38 @@ void RegAlloc::Exchange(BlockOfCode& code, HostLoc a, HostLoc b) noexcept {
+ void RegAlloc::MoveOutOfTheWay(BlockOfCode& code, HostLoc reg) noexcept {
+     ASSERT(!LocInfo(reg).IsLocked());
+     if (!LocInfo(reg).IsEmpty()) {
++        // A register move rather than a store to the stack and a load back later
++        if (const auto free = FindFreeRegister(reg)) {
++            Move(code, *free, reg);
++            return;
++        }
+         SpillRegister(code, reg);
+     }
+ }
+ 
++std::optional<HostLoc> RegAlloc::FindFreeRegister(HostLoc reg) const noexcept {
++    const auto usable = [&](HostLoc i) {
++        return i != reg && LocInfo(i).IsEmpty();
++    };
++    if (HostLocIsGPR(reg)) {
++        // Callee-saved first: a value there stays through host calls
++        for (const HostLoc i : {HostLoc::RBX, HostLoc::R12})
++            if (gpr_order.test(size_t(i)) && usable(i))
++                return i;
++        if (in_host_call)
++            return std::nullopt;
++        for (const HostLoc i : {HostLoc::RCX, HostLoc::RDX, HostLoc::RSI, HostLoc::RDI, HostLoc::R8, HostLoc::R9,
++                                HostLoc::R10, HostLoc::R11, HostLoc::RAX})
++            if (gpr_order.test(size_t(i)) && usable(i))
++                return i;
++    } else if (HostLocIsXMM(reg) && !in_host_call) {
++        for (size_t n = size_t(HostLoc::XMM15); n >= size_t(HostLoc::XMM0); --n)
++            if (xmm_order.test(n) && usable(HostLoc(n)))
++                return HostLoc(n);
++    }
++    return std::nullopt;
++}
++
+ void RegAlloc::SpillRegister(BlockOfCode& code, HostLoc loc) noexcept {
+     ASSERT(HostLocIsRegister(loc) && "Only registers can be spilled");
+     ASSERT(!LocInfo(loc).IsEmpty() && "There is no need to spill unoccupied registers");
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+index 455c6a970..2c6409032 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+@@ -232,6 +232,8 @@ private:
+ 
+     void SpillRegister(BlockOfCode& code, HostLoc loc) noexcept;
+     HostLoc FindFreeSpill(bool is_xmm) const noexcept;
++    /// An empty register of reg's kind to move reg's values to instead of the stack, if any
++    std::optional<HostLoc> FindFreeRegister(HostLoc reg) const noexcept;
+ 
+     inline HostLocInfo& LocInfo(const HostLoc loc) noexcept {
+         DEBUG_ASSERT(loc != HostLoc::RSP && loc != ABI_JIT_PTR);
+@@ -250,6 +252,8 @@ private:
+     std::bitset<32> gpr_order;
+     std::bitset<32> xmm_order;
+     size_t reserved_stack_space = 0;
++    /// While HostCall clears the caller-saved registers: values move only to callee-saved ones
++    bool in_host_call = false;
+ };
+ 
+ }  // namespace Dynarmic::Backend::X64
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
+index 63b40b8c3..5dbdef4f9 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
+@@ -14,11 +14,22 @@ namespace Dynarmic::A32 {
+ 
+ // B <label>
+ bool TranslatorVisitor::arm_B(Cond cond, Imm<24> imm24) {
++    const u32 imm32 = mcl::bit::sign_extend<26, u32>(imm24.ZeroExtend() << 2) + 8;
++
++    // A conditional branch ends the block it is in with an If terminal, as Thumb's B<c> does,
++    // instead of ending the block before it to start a conditional block of its own: a loop's
++    // "cmp; bne" is then one block, not two linked ones
++    if (cond != Cond::AL && cond != Cond::NV && cond_state == ConditionalState::None) {
++        const auto then_location = ir.current_location.AdvancePC(imm32);
++        const auto else_location = ir.current_location.AdvancePC(4);
++        ir.SetTerm(IR::Term::If{cond, IR::Term::LinkBlock{then_location}, IR::Term::LinkBlock{else_location}});
++        return false;
++    }
++
+     if (!ArmConditionPassed(cond)) {
+         return true;
+     }
+ 
+-    const u32 imm32 = mcl::bit::sign_extend<26, u32>(imm24.ZeroExtend() << 2) + 8;
+     const auto new_location = ir.current_location.AdvancePC(imm32);
+     ir.SetTerm(IR::Term::LinkBlock{new_location});
+     return false;
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index d9140bd59..83063eeb5 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -70,6 +70,12 @@ struct UserCallbacks : public TranslateCallbacks {
+         return std::uint32_t(MemoryRead(vaddr, sizeof(std::uint32_t)));
+     }
+ 
++    // A code word read from any thread, without side effects (no caches, no halts, no counters),
++    // or nothing: for the PS4 profiler's dump of the hottest blocks
++    virtual std::optional<std::uint32_t> PeekCode(VAddr) {
++        return std::nullopt;
++    }
++
+     // This function is called before the instruction at pc is read.
+     // IR code can be emitted by the callee prior to instruction handling.
+     // By returning true the callee precludes the translation of the instruction;
+@@ -223,6 +229,22 @@ struct UserConfig {
+     /// callbacks. Used with a page table and without fastmem.
+     bool page_table_inline_exclusives = true;
+ 
++    /// Each block saves %rbp and points it at the JIT's stack frame on entry, restoring it on exit,
++    /// so that a host debugger or profiler walking frame pointers can step through the JIT's
++    /// frames. Three instructions a block; without them %rbp keeps its caller's value.
++    bool jit_frame_pointer = true;
++
++    /// A link to a block at a higher address than the linking block's start skips the check for
++    /// a halt request (enable_cycle_counting off): every loop has a link back to an address at or
++    /// below its own start, and that one still checks.
++    bool link_forward_without_halt_check = false;
++
++    /// A return (PopRSBHint) checks the return stack buffer and jumps in its own block, instead of
++    /// jumping to the handler all returns share: the host predicts each return's indirect jump on
++    /// its own (one shared jump mispredicts whenever consecutive returns go to different places).
++    /// About 60 bytes a returning block.
++    bool inline_rsb_pop = false;
++
+     /// Determines if instructions that pagefault should cause recompilation of that block
+     /// with fastmem disabled.
+     /// Recompiled code will use the page_table if this is available, otherwise memory
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 866162ebd..89a03638a 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -93,6 +93,12 @@ struct UserCallbacks {
+         return std::uint32_t(MemoryRead(vaddr, sizeof(std::uint32_t)));
+     }
+ 
++    // A code word read from any thread, without side effects (no caches, no halts, no counters),
++    // or nothing: for the PS4 profiler's dump of the hottest blocks
++    virtual std::optional<std::uint32_t> PeekCode(VAddr) {
++        return std::nullopt;
++    }
++
+     // Reads through these callbacks may not be aligned.
+     virtual std::uint64_t MemoryRead(VAddr vaddr, std::size_t size) = 0;
+     virtual Vector MemoryRead128(VAddr vaddr) = 0;
+@@ -317,6 +323,22 @@ struct UserConfig {
+     /// a page table and without fastmem.
+     bool page_table_shared_walk = true;
+ 
++    /// Each block saves %rbp and points it at the JIT's stack frame on entry, restoring it on exit,
++    /// so that a host debugger or profiler walking frame pointers can step through the JIT's
++    /// frames. Three instructions a block; without them %rbp keeps its caller's value.
++    bool jit_frame_pointer = true;
++
++    /// A link to a block at a higher address than the linking block's start skips the check for
++    /// a halt request (enable_cycle_counting off): every loop has a link back to an address at or
++    /// below its own start, and that one still checks.
++    bool link_forward_without_halt_check = false;
++
++    /// A return (PopRSBHint) checks the return stack buffer and jumps in its own block, instead of
++    /// jumping to the handler all returns share: the host predicts each return's indirect jump on
++    /// its own (one shared jump mispredicts whenever consecutive returns go to different places).
++    /// About 60 bytes a returning block.
++    bool inline_rsb_pop = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+-- 
+2.43.0
+

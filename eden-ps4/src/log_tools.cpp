@@ -213,12 +213,13 @@ std::string SymbolizeLog(std::string_view text, const Symbols& symbols)
     return out;
 }
 
-std::string ProfileSummary(std::string_view text, const Symbols& symbols)
+std::string ProfileSummary(std::string_view text, const Symbols& symbols, std::string_view note)
 {
     struct Thread
     {
         double samples = 0, syscalls = 0, listed = 0;
         std::map<std::string, double> keys;
+        std::map<std::string, double> blocks; // JIT samples by guest block ("a32 0x...")
     };
     struct Section
     {
@@ -282,7 +283,18 @@ std::string ProfileSummary(std::string_view text, const Symbols& symbols)
             continue;
         std::string key;
         if (kind == "jit")
+        {
             key = "[the game's code, translated (JIT)]";
+            // "jit 0x1118d6d410 guest a32 0x10000424 +40": the block it was recompiled from
+            const size_t guest = line.find(" guest ", p);
+            if (guest != std::string_view::npos)
+            {
+                const size_t start = guest + 7;
+                const size_t space = line.find(' ', start + 4);
+                thread->blocks[std::string(line.substr(start, space == std::string_view::npos ? std::string_view::npos
+                                                                                               : space - start))] += count;
+            }
+        }
         else if (kind == "sys")
             key = "[system libraries]";
         else if (kind == "elf")
@@ -297,7 +309,9 @@ std::string ProfileSummary(std::string_view text, const Symbols& symbols)
     }
 
     std::string out = "Profile: where each sampled thread's time went (the sampler's 1000 looks a second)\n";
-    if (symbols.Empty())
+    if (!note.empty())
+        out += std::string(note) + "\n";
+    else if (symbols.Empty())
         out += "(no symbols.zst: the app's functions by address only)\n";
     for (const Section& section : sections)
     {
@@ -332,6 +346,17 @@ std::string ProfileSummary(std::string_view text, const Symbols& symbols)
             if (t->samples > t->listed)
                 out += fmt::format("  {:5.1f}%  (addresses sampled only once in a window, not listed)\n",
                                    share(t->samples - t->listed));
+            if (!t->blocks.empty())
+            {
+                // the JIT share by the guest code it runs (hotblocks.log: the busiest blocks' code)
+                std::vector<std::pair<double, std::string>> blocks;
+                for (const auto& [block, n] : t->blocks)
+                    blocks.emplace_back(n, block);
+                std::sort(blocks.rbegin(), blocks.rend());
+                out += "  the game's code by recompiled block (guest location):\n";
+                for (size_t i = 0; i < blocks.size() && i < 20 && share(blocks[i].first) >= 0.2; i++)
+                    out += fmt::format("    {:5.1f}%  {}\n", share(blocks[i].first), blocks[i].second);
+            }
         }
     }
     return out;

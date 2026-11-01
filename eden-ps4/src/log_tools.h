@@ -41,6 +41,7 @@ std::string SymbolizeLog(std::string_view text, const Symbols& symbols);
 // samples.log summed up: for each program run while it sampled ("## " lines) and each thread,
 // where its time went: the game's code (JIT), waiting in system calls, and the app's busiest
 // functions
-std::string ProfileSummary(std::string_view text, const Symbols& symbols);
+// `note`, if any, replaces the line about missing symbols (samples another build recorded)
+std::string ProfileSummary(std::string_view text, const Symbols& symbols, std::string_view note = {});
 
 } // namespace Launcher

@@ -328,9 +328,16 @@ bool WriteBundle(const fs::path& data, const std::string& version, const Symbols
         std::string text = ReadEnd(data / name, limit);
         std::string part = "\n===== " + name + " (" + std::to_string(size) + " bytes" +
                            (size > limit ? ", its last " + std::to_string(limit >> 20) + " MiB" : "") + ") =====\n";
+        // samples.log stays until the profiler runs again, perhaps on an older build: its addresses
+        // are named only with the symbols of the build that recorded it ("[build 03.89]")
+        const bool other_build = name == "samples.log" && text.find("[build " + version + "]") == std::string::npos;
         if (name == "samples.log")
-            part += ProfileSummary(text, symbols) + "\n----- samples.log itself -----\n";
-        part += symbols.Empty() ? std::move(text) : SymbolizeLog(text, symbols);
+            part += (other_build ? ProfileSummary(text, Symbols{},
+                                                  "(recorded by an earlier build, not this one: its app addresses "
+                                                  "aren't named, this build's names wouldn't fit them)")
+                                 : ProfileSummary(text, symbols)) +
+                    "\n----- samples.log itself -----\n";
+        part += symbols.Empty() || other_build ? std::move(text) : SymbolizeLog(text, symbols);
         if (!part.empty() && part.back() != '\n')
             part += '\n';
         if (!write(part))
@@ -473,8 +480,13 @@ private:
             lock.lock();
             symbols.Load(config.symbols_path);
         }
+        const std::string text = ReadEnd(samples, running ? kLogLimitWhileRunning : kLogLimit);
+        const bool other_build = text.find("[build " + config.version + "]") == std::string::npos;
         connection.Respond(200, "OK", "text/plain; charset=utf-8",
-                           ProfileSummary(ReadEnd(samples, running ? kLogLimitWhileRunning : kLogLimit), symbols));
+                           other_build ? ProfileSummary(text, Symbols{},
+                                                        "(recorded by an earlier build, not this one: its app "
+                                                        "addresses aren't named)")
+                                       : ProfileSummary(text, symbols));
     }
 
     void SendLog(Connection& connection, const std::string& relative)

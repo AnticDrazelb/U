@@ -100,6 +100,9 @@ void ac_ps4_get_gpu_stats(uint64_t* busy_ticks, uint64_t* span_ticks, uint64_t* 
 void ps4_sampler_sample_threads(const char* names);
 void ps4_sampler_set_enabled(int on);
 void ps4_sampler_note(const char* text);
+// Eden's dynarmic (backend/x64/ps4_block_map.cpp): its map of recompiled blocks, which the profiler
+// names JIT samples with (the guest block) and dumps the hottest of (hotblocks.log)
+void dynarmic_ps4_block_map_enable(int on);
 }
 
 namespace {
@@ -1262,6 +1265,17 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.89: leaner translated code. Mario Kart 8 Deluxe is a 32-bit game, and the translator split every "
+         "loop's closing branch into a block of its own, with a handover between the two each time round; "
+         "now the branch ends the block it is in. Each block also stopped saving and restoring a register "
+         "that only a PC debugger uses, values that once went to memory to free a register now move to a "
+         "spare one, forward jumps skip a check that loops still make on their way back, and each "
+         "function return has its own jump the CPU can predict. On a PC set up like the PS4's CPU, "
+         "Mario Kart-style 32-bit code now runs 25% fewer instructions, 64-bit code 13% fewer. The "
+         "Profiler (System Settings) also works again: its report was an old session's, named with "
+         "a newer build's functions, so it made no sense. Now it says which game code the time goes "
+         "to, and hotblocks.log holds that code. A Mario Kart race with the Profiler on would show "
+         "where the next gains are.\n"
          "03.88: a fresh start for every game. 03.87's log: Mario Kart races up to 18-19 fps with fastmem, its "
          "slow memory accesses down from 280,000 to under 30,000 a second. But the app never gave back what "
          "Mario Kart took: Captain Toad, started after it, had 1.8 GB of the PS4's 4.6 GB of memory and almost "
@@ -2213,10 +2227,12 @@ void* Run(void*)
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
+        dynarmic_ps4_block_map_enable(settings.profiler ? 1 : 0);
         if (settings.profiler)
         {
             ps4_sampler_set_enabled(1);
-            ps4_sampler_note(fmt::format("{} ({})", program, setup).c_str());
+            // the build that recorded it: the log bundle names its addresses only with its own symbols
+            ps4_sampler_note(fmt::format("{} ({}) [build {}]", program, setup, EDEN_PS4_VERSION).c_str());
         }
         {
             std::lock_guard lock{g_mutex};
