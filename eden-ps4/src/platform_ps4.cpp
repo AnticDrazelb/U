@@ -1262,6 +1262,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.86: fastmem, for real this time. 03.85 no longer crashed, but its log said fastmem mapped nothing: "
+         "with CPU Accuracy Unsafe, Eden switches fastmem off unless a 'host MMU' option is on, and that option "
+         "defaults to off on systems Eden doesn't know, like the PS4. Now it's on. Also: fastmem's memory "
+         "range goes where it can be its full size (512 GiB) without crowding the GPU; addresses past it are "
+         "looked up inline instead of through the slow path; the check on each access is one instruction "
+         "fewer; and a run of loads and stores through one register (a function's start, an object's "
+         "fields) still shares one lookup. On a PC with the PS4's setup, chains of loads run twice as fast.\n"
          "03.85: fastmem fixed. In 03.84 it closed games at their first picture: its address range (512 GiB, "
          "only ever used by the CPU) was taken low in the PS4's address space, which pushed the GPU's own "
          "ranges up to where the PS4's GPU can't reach, and the first thing the GPU drew killed the app. "

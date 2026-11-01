@@ -1,0 +1,495 @@
+From 4c2acf6a385102abb3e2bf60982d0bffdb61932a Mon Sep 17 00:00:00 2001
+From: Eden PS4 <eden-ps4@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 07:23:30 +0000
+Subject: [PATCH] PS4 fastmem: an arena clear of the GPU windows, accesses past
+ it walked inline, a cheaper range check, groups with the shared walk
+
+03.85's arena (2^38 at 512 GiB: 2^39 didn't fit above it) went unused with Unsafe accuracy (the
+launcher now sets cpuopt_unsafe_host_mmu). Its arena is tried at 288 GiB first (the GPU windows
+take 256-288 GiB), for 2^39.
+
+dynarmic, A64 fastmem:
+- an access past the arena (a 2^38 arena, a 39-bit game) does the page table walk inline
+  (EmitA64FastmemRangeWalk, deferred), the fallback only if that fails, instead of calling the
+  callbacks every time;
+- the range check is one compare with the limit in the constant pool, not a copy, a shift and a
+  scratch register;
+- A64SharedWalkPass runs with fastmem too: a group of loads and stores through one base walks
+  once, a lone access uses fastmem (the walk and the arena reach the same memory).
+
+Host harness (memfd-backed guest memory mapped into a 2^32 arena, the marked and unmapped pages
+left out): four dependent loads 15.3-18.6 -> 7.4-7.9 ns, a call with a prologue and struct
+accesses 11.9 -> 11.1 ns; 700 random load/store and 500 exclusive programs agree with the page
+table, with every access in the arena or every access past it.
+---
+ src/common/host_memory.cpp                    |   3 +
+ src/common/orbis_memory.cpp                   |  16 +-
+ .../backend/x64/a64_emit_x64_memory.cpp       | 320 ++++++++++--------
+ .../backend/x64/emit_x64_memory.cpp.inc       |  19 ++
+ .../dynarmic/backend/x64/emit_x64_memory.h    |  11 +-
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   |   4 +-
+ 6 files changed, 222 insertions(+), 151 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 83c2707f0..bb07877f3 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -734,6 +734,9 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     // (sceKernelEnableDmemAliasing allows it), mapped as the game touches it (orbis_memory.cpp).
+     // EDEN_PS4_FASTMEM=0 goes without (System Settings, CPU, Fastmem).
+     const char* fastmem_setting = std::getenv("EDEN_PS4_FASTMEM");
++    // (Unsafe CPU accuracy drops fastmem unless cpuopt_unsafe_host_mmu is set, which defaults to
++    // off on platforms Eden doesn't list, the PS4 among them: 03.85 never used its arena. The
++    // launcher sets it, main.cpp.)
+     if (!(fastmem_setting && fastmem_setting[0] == '0')) {
+         unsigned bits = 0;
+         unsigned max_bits = 0;
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index f2de9fda7..59b727df3 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -424,14 +424,16 @@ bool EnableAliasing() {
+     return enabled;
+ }
+ 
+-// Where the arena may go: above the GPU's part of the address space. The port's Mesa reserves its
+-// GPU address windows from 256 GiB up (port/mesa/ac_ps4_drm.c); an arena reserved first, at 68 to
+-// 580 GiB (03.84), pushed them above it, to 581 GiB and up, and the app was killed at its first
+-// GPU submission (no CPU signal: a GPU fault). The arena is only ever touched by the CPU, so it
+-// goes at 1 TiB or above where the kernel allows, else at 512 GiB or above; never lower.
+-constexpr uintptr_t ArenaFloor = 0x8000000000ull;
++// Where the arena may go: clear of the GPU's address windows. The port's Mesa reserves them from
++// 256 GiB up (port/mesa/ac_ps4_drm.c: 16 GiB, and a 4 GiB-aligned 32-bit one: at 256 and 272 GiB
++// in every run that worked); an arena reserved first, at 68 to 580 GiB (03.84), pushed them to 581
++// GiB and up, and the app was killed at its first GPU submission (a GPU fault: no CPU signal). The
++// arena is only ever touched by the CPU: from 288 GiB up it leaves 256-288 GiB to the windows, and
++// the kernel places other mappings low (64 GiB up, first fit). Above 512 GiB, a 2^39 arena didn't
++// fit (03.85: 2^38 at 512 GiB did), so 288 GiB is tried first.
++constexpr uintptr_t ArenaFloor = 0x4800000000ull;
+ void* ReserveAboveGpu(size_t size) {
+-    for (const uintptr_t hint : {0x10000000000ull, 0x20000000000ull, 0x40000000000ull, 0x8000000000ull}) {
++    for (const uintptr_t hint : {0x4800000000ull, 0x8000000000ull, 0x10000000000ull}) {
+         void* address = reinterpret_cast<void*>(hint);
+         if (sceKernelReserveVirtualRange(&address, size, 0, 2_MiB) != 0)
+             continue;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 726a02e65..2a980789a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -281,6 +281,190 @@ void A64EmitX64::GenFastmemFallbacks() {
+     }
+ }
+ 
++namespace {
++// The A64 page table walk in pieces, as EmitVAddrLookup<A64EmitContext>: the page index of `vaddr`
++// into `tmp` (or a jump to `fail` when vaddr is outside the table's address space) ...
++void EmitA64PageIndex(BlockOfCode& code, const A64::UserConfig& conf, Xbyak::Reg64 tmp, Xbyak::Reg64 vaddr, Xbyak::Label& fail) {
++    const size_t valid_page_index_bits = conf.page_table_address_space_bits - page_table_const_bits;
++    const size_t unused_top_bits = 64 - conf.page_table_address_space_bits;
++    code.mov(tmp, vaddr);
++    if (unused_top_bits == 0) {
++        code.shr(tmp, int(page_table_const_bits));
++    } else if (conf.silently_mirror_page_table) {
++        if (valid_page_index_bits >= 32) {
++            code.shl(tmp, int(unused_top_bits));
++            code.shr(tmp, int(unused_top_bits + page_table_const_bits));
++        } else {
++            code.shr(tmp, int(page_table_const_bits));
++            code.and_(tmp, u32((1 << valid_page_index_bits) - 1));
++        }
++    } else {
++        ASSERT(valid_page_index_bits < 32);
++        code.shr(tmp, int(page_table_const_bits));
++        code.test(tmp, u32(-(1 << valid_page_index_bits)));
++        code.jnz(fail, code.T_NEAR);
++    }
++}
++
++// ... and the entry for that index (in `tmp`, which this clobbers) into `page`: its host page,
++// without the attribute bits, or a jump to `fail` when it's unmapped, or marked and a write (or a
++// read, with page_table_marked_bit_reads)
++void EmitA64PageEntry(BlockOfCode& code, const A64::UserConfig& conf, Xbyak::Reg64 page, Xbyak::Reg64 tmp, bool is_write,
++                      Xbyak::Label& fail) {
++    if (conf.page_table_log2_stride > 3) {
++        code.shl(tmp, int(conf.page_table_log2_stride));
++        code.mov(page, qword[r14 + tmp]);
++    } else {
++        code.mov(page, qword[r14 + tmp * int(1 << conf.page_table_log2_stride)]);
++    }
++    if (conf.page_table_marked_bit && (is_write || conf.page_table_marked_bit_reads)) {
++        code.bt(page, *conf.page_table_marked_bit);
++        code.jc(fail, code.T_NEAR);
++    }
++    if (conf.page_table_pointer_mask == 0) {
++        code.test(page, page);
++    } else if (std::in_range<s32>(s64(EffectivePointerMask(conf)))) {
++        code.and_(page, u32(s32(EffectivePointerMask(conf))));
++    } else {
++        code.mov(tmp, conf.page_table_pointer_mask);
++        code.and_(page, tmp);
++    }
++    if (conf.page_table_sign_extension) {
++        code.shl(page, 63 - int(*conf.page_table_sign_extension));
++        code.sar(page, 63 - int(*conf.page_table_sign_extension));
++    }
++    code.jz(fail, code.T_NEAR);
++}
++
++// A load (zero-extended) or store of `bitsize` bits between value (a general register, or for
++// 128 bits an XMM register, by index) and host memory at `where`
++void EmitA64HostMov(BlockOfCode& code, size_t bitsize, bool is_write, int value_idx, const Xbyak::RegExp& where) {
++    const Xbyak::Reg64 value{value_idx};
++    switch (bitsize) {
++    case 8:
++        is_write ? code.mov(code.byte[where], value.cvt8()) : code.movzx(value.cvt32(), code.byte[where]);
++        break;
++    case 16:
++        is_write ? code.mov(code.word[where], value.cvt16()) : code.movzx(value.cvt32(), code.word[where]);
++        break;
++    case 32:
++        is_write ? code.mov(code.dword[where], value.cvt32()) : code.mov(value.cvt32(), code.dword[where]);
++        break;
++    case 64:
++        is_write ? code.mov(code.qword[where], value) : code.mov(value, code.qword[where]);
++        break;
++    default:
++        is_write ? code.movups(code.xword[where], Xbyak::Xmm{value_idx}) : code.movups(Xbyak::Xmm{value_idx}, code.xword[where]);
++        break;
++    }
++}
++
++// The slow path of an access of a group whose shared walk failed (A64HostPointer gave 0): its own
++// walk (in two registers saved on the stack meanwhile), and if that fails too the fallback (the
++// memory callbacks). `start` holds the access's address meanwhile (start + offset, taken off again
++// after: the fallbacks keep every register but a load's value).
++void EmitA64ViaSlowPath(BlockOfCode& code, const A64::UserConfig& conf, size_t bitsize, Xbyak::Reg64 start, int value_idx,
++                        Xbyak::Reg64 host, bool is_write, void (*fallback)(), u32 offset, Xbyak::Label& end) {
++    const bool value_is_gpr = bitsize != 128;
++    const auto avoid = [&](const Xbyak::Reg64& r) {
++        return r.getIdx() == start.getIdx() || r.getIdx() == host.getIdx() || (value_is_gpr && r.getIdx() == value_idx);
++    };
++    Xbyak::Reg64 regs[2];
++    size_t found = 0;
++    for (const Xbyak::Reg64& r : {code.rax, code.rcx, code.rdx, code.rbx, code.rsi, code.rdi, code.r8, code.r9}) {
++        if (found < 2 && !avoid(r)) {
++            regs[found++] = r;
++        }
++    }
++    const Xbyak::Reg64 page = regs[0], tmp = regs[1];
++    Xbyak::Label callback;
++    if (offset != 0) {
++        code.add(start, offset);
++    }
++    code.push(page);
++    code.push(tmp);
++    // an access that would cross into the next page goes to the callbacks
++    if (bitsize > 8) {
++        code.mov(tmp.cvt32(), start.cvt32());
++        code.and_(tmp.cvt32(), u32(page_table_const_mask));
++        code.cmp(tmp.cvt32(), u32(page_table_const_size - bitsize / 8));
++        code.ja(callback, code.T_NEAR);
++    }
++    EmitA64PageIndex(code, conf, tmp, start, callback);
++    EmitA64PageEntry(code, conf, page, tmp, is_write, callback);
++    if (conf.absolute_offset_page_table) {
++        code.add(page, start);
++    } else {
++        code.mov(tmp, start);
++        code.and_(tmp, u32(page_table_const_mask));
++        code.add(page, tmp);
++    }
++    EmitA64HostMov(code, bitsize, is_write, value_idx, page);
++    code.pop(tmp);
++    code.pop(page);
++    if (offset != 0) {
++        code.sub(start, offset);
++    }
++    code.jmp(end, code.T_NEAR);
++
++    code.L(callback);
++    code.pop(tmp);
++    code.pop(page);
++    code.call(fallback);
++    if (offset != 0) {
++        code.sub(start, offset);
++    }
++    code.jmp(end, code.T_NEAR);
++}
++
++// A fastmem access past the arena (its address has bits above fastmem_address_space_bits: a
++// 39-bit game with a 2^38 arena): the page table walk, as without fastmem, rather than a call to
++// the callbacks each time; if the walk fails, the fallback is called and this falls through (the
++// caller jumps to `end` after it). Two registers saved on the stack meanwhile.
++void EmitA64FastmemRangeWalk(BlockOfCode& code, const A64::UserConfig& conf, size_t bitsize, Xbyak::Reg64 vaddr,
++                             int value_idx, bool is_write, bool ordered, void (*fallback)(), Xbyak::Label& end) {
++    const bool value_is_gpr = bitsize != 128;
++    Xbyak::Reg64 regs[2];
++    size_t found = 0;
++    for (const Xbyak::Reg64& r : {code.rax, code.rcx, code.rdx, code.rbx, code.rsi, code.rdi, code.r8, code.r9}) {
++        if (found < 2 && r.getIdx() != vaddr.getIdx() && !(value_is_gpr && r.getIdx() == value_idx)) {
++            regs[found++] = r;
++        }
++    }
++    const Xbyak::Reg64 page = regs[0], tmp = regs[1];
++    Xbyak::Label callback;
++    code.push(page);
++    code.push(tmp);
++    if (bitsize > 8) {
++        code.mov(tmp.cvt32(), vaddr.cvt32());
++        code.and_(tmp.cvt32(), u32(page_table_const_mask));
++        code.cmp(tmp.cvt32(), u32(page_table_const_size - bitsize / 8));
++        code.ja(callback, code.T_NEAR);
++    }
++    EmitA64PageIndex(code, conf, tmp, vaddr, callback);
++    EmitA64PageEntry(code, conf, page, tmp, is_write, callback);
++    if (conf.absolute_offset_page_table) {
++        code.add(page, vaddr);
++    } else {
++        code.mov(tmp, vaddr);
++        code.and_(tmp, u32(page_table_const_mask));
++        code.add(page, tmp);
++    }
++    EmitA64HostMov(code, bitsize, is_write, value_idx, page);
++    if (ordered && is_write) {
++        code.mfence();
++    }
++    code.pop(tmp);
++    code.pop(page);
++    code.jmp(end, code.T_NEAR);
++    code.L(callback);
++    code.pop(tmp);
++    code.pop(page);
++    code.call(fallback);
++}
++}  // namespace
++
++#define AXX_FASTMEM_RANGE_WALK 1
+ #define Axx A64
+ #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
+ #undef Axx
+@@ -446,142 +630,6 @@ void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::La
+     code.L(skip);
+ }
+ 
+-namespace {
+-// The A64 page table walk in pieces, as EmitVAddrLookup<A64EmitContext>: the page index of `vaddr`
+-// into `tmp` (or a jump to `fail` when vaddr is outside the table's address space) ...
+-void EmitA64PageIndex(BlockOfCode& code, const A64::UserConfig& conf, Xbyak::Reg64 tmp, Xbyak::Reg64 vaddr, Xbyak::Label& fail) {
+-    const size_t valid_page_index_bits = conf.page_table_address_space_bits - page_table_const_bits;
+-    const size_t unused_top_bits = 64 - conf.page_table_address_space_bits;
+-    code.mov(tmp, vaddr);
+-    if (unused_top_bits == 0) {
+-        code.shr(tmp, int(page_table_const_bits));
+-    } else if (conf.silently_mirror_page_table) {
+-        if (valid_page_index_bits >= 32) {
+-            code.shl(tmp, int(unused_top_bits));
+-            code.shr(tmp, int(unused_top_bits + page_table_const_bits));
+-        } else {
+-            code.shr(tmp, int(page_table_const_bits));
+-            code.and_(tmp, u32((1 << valid_page_index_bits) - 1));
+-        }
+-    } else {
+-        ASSERT(valid_page_index_bits < 32);
+-        code.shr(tmp, int(page_table_const_bits));
+-        code.test(tmp, u32(-(1 << valid_page_index_bits)));
+-        code.jnz(fail, code.T_NEAR);
+-    }
+-}
+-
+-// ... and the entry for that index (in `tmp`, which this clobbers) into `page`: its host page,
+-// without the attribute bits, or a jump to `fail` when it's unmapped, or marked and a write (or a
+-// read, with page_table_marked_bit_reads)
+-void EmitA64PageEntry(BlockOfCode& code, const A64::UserConfig& conf, Xbyak::Reg64 page, Xbyak::Reg64 tmp, bool is_write,
+-                      Xbyak::Label& fail) {
+-    if (conf.page_table_log2_stride > 3) {
+-        code.shl(tmp, int(conf.page_table_log2_stride));
+-        code.mov(page, qword[r14 + tmp]);
+-    } else {
+-        code.mov(page, qword[r14 + tmp * int(1 << conf.page_table_log2_stride)]);
+-    }
+-    if (conf.page_table_marked_bit && (is_write || conf.page_table_marked_bit_reads)) {
+-        code.bt(page, *conf.page_table_marked_bit);
+-        code.jc(fail, code.T_NEAR);
+-    }
+-    if (conf.page_table_pointer_mask == 0) {
+-        code.test(page, page);
+-    } else if (std::in_range<s32>(s64(EffectivePointerMask(conf)))) {
+-        code.and_(page, u32(s32(EffectivePointerMask(conf))));
+-    } else {
+-        code.mov(tmp, conf.page_table_pointer_mask);
+-        code.and_(page, tmp);
+-    }
+-    if (conf.page_table_sign_extension) {
+-        code.shl(page, 63 - int(*conf.page_table_sign_extension));
+-        code.sar(page, 63 - int(*conf.page_table_sign_extension));
+-    }
+-    code.jz(fail, code.T_NEAR);
+-}
+-
+-// A load (zero-extended) or store of `bitsize` bits between value (a general register, or for
+-// 128 bits an XMM register, by index) and host memory at `where`
+-void EmitA64HostMov(BlockOfCode& code, size_t bitsize, bool is_write, int value_idx, const Xbyak::RegExp& where) {
+-    const Xbyak::Reg64 value{value_idx};
+-    switch (bitsize) {
+-    case 8:
+-        is_write ? code.mov(code.byte[where], value.cvt8()) : code.movzx(value.cvt32(), code.byte[where]);
+-        break;
+-    case 16:
+-        is_write ? code.mov(code.word[where], value.cvt16()) : code.movzx(value.cvt32(), code.word[where]);
+-        break;
+-    case 32:
+-        is_write ? code.mov(code.dword[where], value.cvt32()) : code.mov(value.cvt32(), code.dword[where]);
+-        break;
+-    case 64:
+-        is_write ? code.mov(code.qword[where], value) : code.mov(value, code.qword[where]);
+-        break;
+-    default:
+-        is_write ? code.movups(code.xword[where], Xbyak::Xmm{value_idx}) : code.movups(Xbyak::Xmm{value_idx}, code.xword[where]);
+-        break;
+-    }
+-}
+-
+-// The slow path of an access of a group whose shared walk failed (A64HostPointer gave 0): its own
+-// walk (in two registers saved on the stack meanwhile), and if that fails too the fallback (the
+-// memory callbacks). `start` holds the access's address meanwhile (start + offset, taken off again
+-// after: the fallbacks keep every register but a load's value).
+-void EmitA64ViaSlowPath(BlockOfCode& code, const A64::UserConfig& conf, size_t bitsize, Xbyak::Reg64 start, int value_idx,
+-                        Xbyak::Reg64 host, bool is_write, void (*fallback)(), u32 offset, Xbyak::Label& end) {
+-    const bool value_is_gpr = bitsize != 128;
+-    const auto avoid = [&](const Xbyak::Reg64& r) {
+-        return r.getIdx() == start.getIdx() || r.getIdx() == host.getIdx() || (value_is_gpr && r.getIdx() == value_idx);
+-    };
+-    Xbyak::Reg64 regs[2];
+-    size_t found = 0;
+-    for (const Xbyak::Reg64& r : {code.rax, code.rcx, code.rdx, code.rbx, code.rsi, code.rdi, code.r8, code.r9}) {
+-        if (found < 2 && !avoid(r)) {
+-            regs[found++] = r;
+-        }
+-    }
+-    const Xbyak::Reg64 page = regs[0], tmp = regs[1];
+-    Xbyak::Label callback;
+-    if (offset != 0) {
+-        code.add(start, offset);
+-    }
+-    code.push(page);
+-    code.push(tmp);
+-    // an access that would cross into the next page goes to the callbacks
+-    if (bitsize > 8) {
+-        code.mov(tmp.cvt32(), start.cvt32());
+-        code.and_(tmp.cvt32(), u32(page_table_const_mask));
+-        code.cmp(tmp.cvt32(), u32(page_table_const_size - bitsize / 8));
+-        code.ja(callback, code.T_NEAR);
+-    }
+-    EmitA64PageIndex(code, conf, tmp, start, callback);
+-    EmitA64PageEntry(code, conf, page, tmp, is_write, callback);
+-    if (conf.absolute_offset_page_table) {
+-        code.add(page, start);
+-    } else {
+-        code.mov(tmp, start);
+-        code.and_(tmp, u32(page_table_const_mask));
+-        code.add(page, tmp);
+-    }
+-    EmitA64HostMov(code, bitsize, is_write, value_idx, page);
+-    code.pop(tmp);
+-    code.pop(page);
+-    if (offset != 0) {
+-        code.sub(start, offset);
+-    }
+-    code.jmp(end, code.T_NEAR);
+-
+-    code.L(callback);
+-    code.pop(tmp);
+-    code.pop(page);
+-    code.call(fallback);
+-    if (offset != 0) {
+-        code.sub(start, offset);
+-    }
+-    code.jmp(end, code.T_NEAR);
+-}
+-}  // namespace
+ 
+ // One page table walk for a group of loads and stores sharing a base (A64SharedWalkPass): the host
+ // address of [vaddr, vaddr + span), or 0 when any of them would leave the inline walk (the span
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 8a0ec57ca..65544c602 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -97,7 +97,16 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
++#ifdef AXX_FASTMEM_RANGE_WALK
++            // (only the range check jumps here: past the arena, the page table walk)
++            if (require_abort_handling && conf.page_table && !(ordered && bitsize == 128)) {
++                EmitA64FastmemRangeWalk(code, conf, bitsize, vaddr, value_idx, false, ordered, wrapped_fn, *end);
++            } else {
++                code.call(wrapped_fn);
++            }
++#else
+             code.call(wrapped_fn);
++#endif
+ 
+             fastmem_patch_info.emplace(
+                 std::bit_cast<u64>(location),
+@@ -184,7 +193,16 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
++#ifdef AXX_FASTMEM_RANGE_WALK
++            // (only the range check jumps here: past the arena, the page table walk)
++            if (require_abort_handling && conf.page_table && !(ordered && bitsize == 128)) {
++                EmitA64FastmemRangeWalk(code, conf, bitsize, vaddr, value_idx, true, ordered, wrapped_fn, *end);
++            } else {
++                code.call(wrapped_fn);
++            }
++#else
+             code.call(wrapped_fn);
++#endif
+ 
+             fastmem_patch_info.emplace(
+                 std::bit_cast<u64>(location),
+@@ -633,3 +651,4 @@ void AxxEmitX64::EmitExclusiveWriteMemoryPageTable(AxxEmitContext& ctx, IR::Inst
+ #undef AxxEmitContext
+ #undef AxxJitState
+ #undef AxxUserConfig
++#undef AXX_FASTMEM_RANGE_WALK
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index 88aa5c94a..8aa056f8b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -246,13 +246,10 @@ template<>
+             code.jnz(abort, code.T_NEAR);
+             require_abort_handling = true;
+         } else {
+-            // TODO: Consider having TEST as above but coalesce 64-bit constant in register allocator
+-            if (!tmp) {
+-                tmp = ctx.reg_alloc.ScratchGpr(code);
+-            }
+-            code.mov(*tmp, vaddr);
+-            code.shr(*tmp, int(ctx.conf.fastmem_address_space_bits));
+-            code.jnz(abort, code.T_NEAR);
++            // One compare with the limit in the constant pool (RIP-relative), not a copy, a shift
++            // and a scratch register: on every access of a game with a 2^36-2^39 arena (the PS4)
++            code.cmp(vaddr, code.Const(code.qword, u64(1) << ctx.conf.fastmem_address_space_bits));
++            code.jae(abort, code.T_NEAR);
+             require_abort_handling = true;
+         }
+         return r13 + vaddr;
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 412eebe79..3902d72f9 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -1685,7 +1685,9 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+         Optimization::ConstantPropagation(block);
+         Optimization::DeadCodeElimination(block);
+     }
+-    if (conf.page_table_shared_walk && conf.page_table && !conf.fastmem_pointer && !conf.check_halt_on_memory_access) {
++    // (with fastmem too: a group's one walk beats an address and a range check for each access,
++    // and a lone access still gets fastmem; the walk and the arena reach the same memory)
++    if (conf.page_table_shared_walk && conf.page_table && !conf.check_halt_on_memory_access) {
+         Optimization::A64SharedWalkPass(block);
+         Optimization::DeadCodeElimination(block);
+     }
+-- 
+2.43.0
+

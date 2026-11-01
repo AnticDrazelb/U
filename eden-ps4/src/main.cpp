@@ -238,7 +238,12 @@ void ApplyLauncherSettings() {
     // EDEN_PS4_FASTMEM=0: no fastmem on the desktop either, so that guest memory goes through the
     // recompiler's page table walk, as on the PS4 (which can't map memory twice): Debugging
     // accuracy, with the optimisations Auto has otherwise
-#ifndef __OPENORBIS__
+#ifdef __OPENORBIS__
+    // Fastmem (common/host_memory.cpp: an arena when the Fastmem setting is on) with Unsafe
+    // accuracy too: Eden drops it there unless "host MMU" is on, which defaults to off on platforms
+    // it doesn't list (03.85's arena went unused with CPU Unsafe)
+    Settings::values.cpuopt_unsafe_host_mmu.SetValue(true);
+#else
     // (on the PS4 the variable is the Fastmem setting itself, read by common/host_memory.cpp)
     if (const char* fastmem = std::getenv("EDEN_PS4_FASTMEM"); fastmem && std::string_view{fastmem} == "0") {
         if (g_cpu_unsafe) {

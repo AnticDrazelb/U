@@ -377,6 +377,30 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.86: **fastmem in use.** 03.85 on a console: no more crash, and the 30-second line said `fastmem (a 2^38
+arena at 0x8000000000): 0 MiB ... mapped, 0 faults`: never used. With Unsafe CPU accuracy Eden drops the
+fastmem pointer unless `cpuopt_unsafe_host_mmu` is set, whose default is off on platforms it doesn't
+list (the PS4); the launcher sets it (`main.cpp`). The 32-bit-only optimisations still running (they
+need no fastmem pointer) confirmed it.
+
+Patch 0074:
+
+- the arena is tried at 288 GiB first (the GPU windows take 256-288 GiB; the kernel places other
+  mappings from 64 GiB up), where 2^39 can fit; 03.85 got only 2^38 above 512 GiB;
+- A64, an access past the arena (a 39-bit game with a 2^38 arena): the page table walk inline,
+  deferred (`EmitA64FastmemRangeWalk`), the fallback only if it fails, not the callbacks every time;
+- A64, the range check: `cmp vaddr, [limit]` / `jae` (the limit in the constant pool), not a copy, a
+  shift and a scratch register;
+- `A64SharedWalkPass` with fastmem too: a group through one base walks once, a lone access uses
+  fastmem (both reach the same memory).
+
+The A64 harness gained guest memory in a memfd, mapped into a 2^32 arena at the guest's addresses
+(but the marked and unmapped pages, which fault: the fallback, and the code recompiled without
+fastmem there), and a 2^28 arena (every access past it). Four dependent loads 15.3-18.6 -> 7.4-7.9
+ns; a call with a prologue, an epilogue and struct accesses 11.9 -> 11.1 ns; atomics level. 700 random
+load/store and 500 exclusive programs give the same registers, vectors and memory in both modes as
+through the page table.
+
 03.85: **the fastmem arena above the GPU's addresses.** 03.84 on a console: with fastmem on, Celeste
 and Captain Toad were closed by the system at their first frame, no crash report; with it off they ran.
 The logs: the arena was reserved at 0x1118200000 (512 GiB, 68 to 580 GiB), and the port's Mesa, which
