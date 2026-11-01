@@ -377,6 +377,20 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.96: **delete games on the PS4; copy keys and firmware to it.**
+
+- OPTIONS on a title on the PS4's own storage (under `/data`: the data folder, or a Game Folder
+  there) offers Delete between Close and Start (a game on a drive still offers Copy to the PS4).
+  Delete asks first ("Delete <name>?", Cancel selected), the dialog holding the file's path (the
+  titles may be read again meanwhile); then the launcher removes the file (only a .nsp, .xci, .nro
+  or .nso under `/data`) and its cached name and icon, and says how much was freed. Saves stay.
+- Games and Keys: Square is "Copy keys and firmware to the PS4" (the import from USB drives and
+  `/data/eden-ps4/import` that was there, now said for what it does). Its rows say when the keys
+  or firmware are used from a drive whether the PS4 has its own copy, else that Square makes one;
+  the report says games start without the drive afterwards. With no drive plugged in, a boot
+  uses the PS4's copies (`SetAppDirectory` resets the keys folder at each boot).
+- `src/ui/preview.cpp`: the info dialog with Delete and its confirmation.
+
 03.95: **thread stacks lined up with the PS4's pages, so fastmem reaches them; more code cache for
 core 0.** 03.94 on a console (Mario Kart, 50%, Profiler off): races at 20-23 fps against 03.93's
 22-24 (75%, Profiler on), core 0 busy 88% (40.9 ms a frame against 36.6), cores 1 and 2 5-7% more

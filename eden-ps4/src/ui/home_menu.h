@@ -44,6 +44,7 @@ struct Title
     std::string size;      // "5.2 GB"
     std::string kind;      // "NSP", "XCI", "NRO", "NSO"
     bool game = false;     // needs the keys of the Switch it was dumped from
+    bool on_ps4 = false;   // a file on the PS4's own storage (not the package's): can be deleted
     Art art = Art::None;   // the built-in programs' art
     Image icon;            // its own icon, when known (else its art, else a cover)
 };
@@ -85,8 +86,10 @@ struct Report
 
 struct MenuAction
 {
-    enum class Kind { None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4 } kind = Kind::None;
-    std::string path; // Boot: what to boot; CopyToPs4: the game to copy into the data folder
+    enum class Kind { None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4, Delete } kind = Kind::None;
+    // Boot: what to boot; CopyToPs4: the game to copy into the data folder; Delete: the file on the
+    // PS4's storage to delete (confirmed)
+    std::string path;
 };
 
 class HomeMenu
@@ -129,7 +132,7 @@ public:
 
 private:
     enum class Screen { Home, AllSoftware, Settings, News, Games, Controllers, Report, Folder };
-    enum class DialogKind { Message, Quit, TitleInfo, NoKeys };
+    enum class DialogKind { Message, Quit, TitleInfo, NoKeys, ConfirmDelete };
     struct Dialog
     {
         DialogKind kind = DialogKind::Message;
@@ -137,7 +140,9 @@ private:
         std::vector<std::string> buttons;
         int selected = 0;
         size_t title_index = 0;
-        bool offers_copy = false; // TitleInfo: a game on a drive, "Copy to the PS4" its middle button
+        bool offers_copy = false;   // TitleInfo: a game on a drive, "Copy to the PS4" its middle button
+        bool offers_delete = false; // TitleInfo: a file on the PS4's storage, "Delete" its middle button
+        std::string path;           // ConfirmDelete: the file (the titles may be read again meanwhile)
         double opened = 0;
     };
     struct Theme;
@@ -163,7 +168,8 @@ private:
     const Image& Tile(size_t index, int pixels);
     MenuAction Start(size_t index);
     void OpenDialog(Dialog dialog);
-    // OPTIONS on a title: where it is, Start, and for a game on a drive "Copy to the PS4"
+    // OPTIONS on a title: where it is, Start, and for a game on a drive "Copy to the PS4", for one on
+    // the PS4's storage "Delete" (which asks first)
     void OpenTitleInfo(size_t index);
     MenuAction Navigate(uint32_t pressed, uint32_t moves);
     MenuAction ChooseDialog(int button);

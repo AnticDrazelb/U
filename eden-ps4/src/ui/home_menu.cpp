@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <dirent.h>
+#include <filesystem>
 #include <sys/stat.h>
 
 namespace Ui {
@@ -170,8 +171,8 @@ MenuAction HomeMenu::Start(size_t index)
         dialog.text = web_address.empty()
             ? "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
               "that Switch's firmware. Put them on a USB drive, where they're used from (the keys at its top "
-              "or in a folder there such as switch, the firmware's .nca files in a folder), or copy them into "
-              "/data/eden-ps4/import and Import (Square) in Games and Keys."
+              "or in a folder there such as switch, the firmware's .nca files in a folder); Square in Games "
+              "and Keys copies them to the PS4, after which the drive isn't needed."
             : "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
               "that Switch's firmware. Open " + web_address + " in a browser on a PC or phone on the same "
               "network to send them, or put them on a USB drive, where they're used from.";
@@ -203,8 +204,33 @@ MenuAction HomeMenu::ChooseDialog(int button)
             action.path = titles[dialog.title_index].path;
             return action;
         }
-        if (button == (dialog.offers_copy ? 2 : 1))
+        if (dialog.offers_delete && button == 1 && dialog.title_index < titles.size())
+        {
+            // asked first: Cancel is where the cursor starts
+            const Title& title = titles[dialog.title_index];
+            Dialog confirm;
+            confirm.kind = DialogKind::ConfirmDelete;
+            confirm.path = title.path;
+            confirm.title = "Delete " + title.name + "?";
+            confirm.text = std::filesystem::path(title.path).filename().string() +
+                           (title.size.empty() ? "" : " (" + title.size + ")") +
+                           " is deleted from the PS4's storage, for good. Its saves stay.";
+            confirm.buttons = {"Cancel", "Delete"};
+            confirm.selected = 0;
+            OpenDialog(std::move(confirm));
+            return {};
+        }
+        if (button == (dialog.offers_copy || dialog.offers_delete ? 2 : 1))
             return Start(dialog.title_index);
+        break;
+    case DialogKind::ConfirmDelete:
+        if (button == 1)
+        {
+            MenuAction action;
+            action.kind = MenuAction::Kind::Delete;
+            action.path = dialog.path;
+            return action;
+        }
         break;
     case DialogKind::Message:
     case DialogKind::NoKeys:
@@ -218,11 +244,14 @@ void HomeMenu::OpenTitleInfo(size_t index)
     Dialog dialog;
     dialog.kind = DialogKind::TitleInfo;
     dialog.title_index = index;
-    // a game on a USB drive or in the Game Folder can be copied to the PS4's own storage
-    dialog.offers_copy = index < titles.size() && titles[index].game && titles[index].location != "data folder" &&
-                         titles[index].location != "in the package";
-    dialog.buttons = dialog.offers_copy ? std::vector<std::string>{"Close", "Copy to the PS4", "Start"}
-                                        : std::vector<std::string>{"Close", "Start"};
+    // a game on a USB drive or in the Game Folder can be copied to the PS4's own storage; what's on
+    // that storage can be deleted
+    dialog.offers_delete = index < titles.size() && titles[index].on_ps4;
+    dialog.offers_copy = !dialog.offers_delete && index < titles.size() && titles[index].game &&
+                         titles[index].location != "data folder" && titles[index].location != "in the package";
+    dialog.buttons = dialog.offers_copy     ? std::vector<std::string>{"Close", "Copy to the PS4", "Start"}
+                     : dialog.offers_delete ? std::vector<std::string>{"Close", "Delete", "Start"}
+                                            : std::vector<std::string>{"Close", "Start"};
     dialog.selected = int(dialog.buttons.size()) - 1;
     OpenDialog(std::move(dialog));
 }
@@ -956,7 +985,8 @@ void HomeMenu::DrawGames(Canvas& c)
     if (end - page_scroll < kBottomLine - 40 && page_scroll > 0)
         page_scroll = std::max(0.0f, end - (kBottomLine - 40));
     c.ResetClip();
-    DrawBottomBar(c, {{Glyph::Triangle, "Game Folder"}, {Glyph::Square, "Import"}, {Glyph::Circle, "Back"}});
+    DrawBottomBar(c, {{Glyph::Triangle, "Game Folder"}, {Glyph::Square, "Copy keys and firmware to the PS4"},
+                      {Glyph::Circle, "Back"}});
 }
 
 void HomeMenu::DrawFolder(Canvas& c, double now)

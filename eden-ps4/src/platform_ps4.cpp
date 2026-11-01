@@ -953,6 +953,8 @@ std::vector<Ui::Title> LoadTitles()
             Ui::Title title;
             title.path = path.string();
             title.location = in_data ? "data folder" : where;
+            // on the PS4's own storage (the data folder, or a Game Folder there): Delete offered
+            title.on_ps4 = path.lexically_normal().string().starts_with("/data/");
             title.kind = Lower(path.extension().string()).substr(1);
             std::transform(title.kind.begin(), title.kind.end(), title.kind.begin(),
                            [](unsigned char c) { return char(std::toupper(c)); });
@@ -1131,17 +1133,21 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
     const Launcher::UsbKeysAndFirmware on_usb = KeysAndFirmwareOnUsb();
     const bool keys = !on_usb.keys_folder.empty() || std::filesystem::exists(kKeysFile, ec);
     rows.push_back({"Keys (prod.keys)",
-                    !on_usb.keys_folder.empty() ? fmt::format("Used from where it is: {}/prod.keys", on_usb.keys_folder)
-                    : keys ? fmt::format("Found: {}", kKeysFile)
+                    !on_usb.keys_folder.empty()
+                        ? fmt::format("Used from where it is: {}/prod.keys{}", on_usb.keys_folder,
+                                      std::filesystem::exists(kKeysFile, ec)
+                                          ? " (a copy is on the PS4 too)"
+                                          : ". Square copies it to the PS4, then the drive isn't needed")
+                    : keys ? fmt::format("On the PS4: {}", kKeysFile)
                            : fmt::format("Not found: put it on a USB drive (at its top, or in a folder there such as "
-                                         "switch), or in /data/eden-ps4/import and Import, or send it from a browser"),
+                                         "switch; Square then copies it to the PS4), or send it from a browser"),
                     keys});
     const bool title_keys = on_usb.title_keys || (on_usb.keys_folder.empty() && std::filesystem::exists(kTitleKeysFile, ec));
     rows.push_back({"Title keys (title.keys)",
                     on_usb.title_keys ? fmt::format("Used from where it is: {}/title.keys", on_usb.keys_folder)
                     : !on_usb.keys_folder.empty()
                         ? fmt::format("Not next to prod.keys ({}): some games need it", on_usb.keys_folder)
-                    : title_keys ? fmt::format("Found: {}", kTitleKeysFile)
+                    : title_keys ? fmt::format("On the PS4: {}", kTitleKeysFile)
                                  : fmt::format("Not found ({}): some games need it", kTitleKeysFile),
                     title_keys});
     size_t firmware = 0;
@@ -1149,12 +1155,15 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
         firmware++;
     rows.push_back({"Firmware",
                     !on_usb.firmware_folder.empty()
-                        ? fmt::format("Used from where it is: {} files in {}", on_usb.firmware_files,
-                                      on_usb.firmware_folder)
-                    : firmware ? fmt::format("{} files in {}", firmware, kFirmwareDir)
+                        ? fmt::format("Used from where it is: {} files in {}{}", on_usb.firmware_files,
+                                      on_usb.firmware_folder,
+                                      firmware ? fmt::format(" ({} files on the PS4 too)", firmware)
+                                               : std::string(". Square copies it to the PS4, then the drive isn't "
+                                                             "needed"))
+                    : firmware ? fmt::format("On the PS4: {} files in {}", firmware, kFirmwareDir)
                                : fmt::format("None in {}: put your Switch's firmware (its folder of .nca files) on a "
-                                             "USB drive, or its .zip or .nca files in /data/eden-ps4/import and "
-                                             "Import, or send it from a browser",
+                                             "USB drive, or its .zip (Square copies either to the PS4), or send "
+                                             "it from a browser",
                                              kFirmwareDir),
                     !on_usb.firmware_folder.empty() || firmware > 0});
     if (!g_games_folder.empty())
@@ -1210,9 +1219,12 @@ constexpr const char* kGamesHelp =
     "Games (.nsp, .xci) and homebrew (.nro) go in /data/eden-ps4, on a USB drive, or in a Game Folder (Triangle: "
     "any folder, on a drive or elsewhere, searched through all its folders). prod.keys, title.keys and the "
     "firmware (its folder of .nca files) on a USB drive are used from there: the keys at the drive's top or in a "
-    "folder there (switch), the firmware in a folder. Or copy them, or the firmware's .zip, into "
-    "/data/eden-ps4/import with a file manager such as PS4-Xplorer, then Import (Square). Or send all of them from "
-    "a browser: the address is at the top of the HOME menu.";
+    "folder there (switch), the firmware in a folder. Square copies them (or the firmware's .zip, unpacked) from "
+    "the drive to the PS4, after which the drive isn't needed; it also takes them from /data/eden-ps4/import, "
+    "where a file manager such as PS4-Xplorer can put them. Or send all of them from a browser: the address is at "
+    "the top of the HOME menu. OPTIONS on a game on the PS4 deletes it.";
+
+constexpr const char* kCopyKeysTitle = "Copy keys and firmware to the PS4";
 
 // Import from USB (Games and Keys): the copy runs on its own thread, its progress in a message
 struct UsbImportJob
@@ -1239,13 +1251,36 @@ std::string GigabytesText(uint64_t bytes)
     return fmt::format("{:.2f} GB", double(bytes) / 1e9);
 }
 
+// OPTIONS, Delete, on a title on the PS4's storage (confirmed): the file and what the launcher
+// keeps about it (its name and icon). Only a game or homebrew file under /data; its saves stay.
+std::string DeleteFromPs4(const std::string& path, const std::string& copying)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path file = fs::path(path).lexically_normal();
+    const std::string name = file.filename().string();
+    if (!file.string().starts_with("/data/") || !IsGameFileName(name) || !fs::is_regular_file(file, ec))
+        return name + " wasn't deleted: only a game or homebrew file on the PS4's storage can be.";
+    if (!copying.empty() && copying == name)
+        return name + " is being copied: delete it once the copy is done.";
+    const uintmax_t size = fs::file_size(file, ec);
+    if (!fs::remove(file, ec) || ec)
+        return name + " couldn't be deleted: " + (ec ? ec.message() : std::string("it's gone already"));
+    // (what the launcher learned about it: its name, its icon)
+    fs::remove(Launcher::TitleCachePath(kDataDir, path, "txt"), ec);
+    fs::remove(Launcher::TitleCachePath(kDataDir, path, "jpg"), ec);
+    const fs::space_info space = fs::space(kDataDir, ec);
+    return fmt::format("{} is deleted ({} freed{}).", name, GigabytesText(size),
+                       ec ? std::string() : ", " + GigabytesText(space.available) + " free now");
+}
+
 std::string UsbImportReport(const Launcher::UsbImport& r)
 {
     if (r.keys_folder.empty() && r.firmware_folder.empty())
-        return "No prod.keys and no firmware in /data/eden-ps4/import or on a USB drive (the app sees: " +
-               UsbReport() + "). Copy prod.keys, title.keys and the firmware (its .zip as it came, or its folder of "
-               ".nca files) from the USB drive into /data/eden-ps4/import with a file manager such as PS4-Xplorer, "
-               "then Import again.";
+        return "No prod.keys and no firmware on a USB drive or in /data/eden-ps4/import (the app sees: " +
+               UsbReport() + "). Put prod.keys and title.keys at the drive's top (or in a folder there, such as "
+               "switch) and the firmware (its .zip as it came, or its folder of .nca files) on it, then Square "
+               "again.";
     std::string text;
     if (!r.keys_folder.empty())
         text += fmt::format("prod.keys{} from {}.\n", r.title_keys ? " and title.keys" : "", r.keys_folder);
@@ -1258,6 +1293,8 @@ std::string UsbImportReport(const Launcher::UsbImport& r)
         text += "No firmware found (a folder of .nca files).\n";
     if (!r.error.empty())
         text += "Stopped: " + r.error + ".";
+    else
+        text += "They're on the PS4 now (/data/eden-ps4/user): games start without the USB drive.";
     return text;
 }
 
@@ -1265,6 +1302,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.96: games on the PS4 can be deleted, and the keys and firmware copied to it. OPTIONS on a game "
+         "(or homebrew) on the PS4's own storage has Delete, which asks first; its saves stay. In Games and Keys, "
+         "Square copies prod.keys, title.keys and the firmware from a USB drive to the PS4, after which the drive "
+         "isn't needed: games start with the PS4's copies when it's not plugged in. Games and Keys says which "
+         "copies are used, and whether the PS4 has its own.\n"
          "03.95: thread stacks back on the fast path. 03.94 cut the stutters (far fewer translations in "
          "races) but walked every stack access the slow way from the start, and races ran at 20-23 fps, "
          "about 10% more work a frame on the busiest core than 03.93. Now the cause is gone instead: a "
@@ -1772,11 +1814,18 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         }
         if (action.kind == Ui::MenuAction::Kind::Boot && copy_job)
             menu.ShowMessage("Copy to the PS4", "Still copying: start it again once the copy is done.");
+        if (action.kind == Ui::MenuAction::Kind::Delete)
+        {
+            const std::string report = DeleteFromPs4(action.path, copy_job ? copy_job->name : std::string());
+            Trace("start page: delete: " + report);
+            menu.ShowMessage("Delete", report);
+            g_files_changed = true;
+        }
         if (action.kind == Ui::MenuAction::Kind::ImportUsb && !import_job)
         {
             Trace("start page: importing keys and firmware from USB");
-            menu.ShowMessage("Import", "Looking for prod.keys, title.keys and firmware in /data/eden-ps4/import and "
-                                       "on the USB drives...");
+            menu.ShowMessage(kCopyKeysTitle, "Looking for prod.keys, title.keys and firmware on the USB drives and "
+                                             "in /data/eden-ps4/import...");
             import_job = std::make_unique<UsbImportJob>();
             import_job->thread = std::thread([job = import_job.get()] {
                 // the import folder (filled from a USB drive with a file manager such as PS4-Xplorer),
@@ -1797,18 +1846,18 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
             import_job->thread.join();
             const std::string report = UsbImportReport(import_job->result);
             Trace("start page: USB import: " + report);
-            if (!menu.UpdateMessage("Import", report))
-                menu.ShowMessage("Import", report);
+            if (!menu.UpdateMessage(kCopyKeysTitle, report))
+                menu.ShowMessage(kCopyKeysTitle, report);
             set_games_status();
             import_job.reset();
         }
         else if (import_job && import_job->total)
         {
-            menu.UpdateMessage("Import", fmt::format("Copying the firmware: {} of {} files...",
+            menu.UpdateMessage(kCopyKeysTitle, fmt::format("Copying the firmware: {} of {} files...",
                                                               import_job->copied.load(), import_job->total.load()));
         }
         if (action.kind == Ui::MenuAction::Kind::Boot && import_job)
-            menu.ShowMessage("Import", "Still copying: start it again once the import is done.");
+            menu.ShowMessage(kCopyKeysTitle, "Still copying: start it again once the copy is done.");
         if (action.kind == Ui::MenuAction::Kind::Boot && !import_job && !copy_job)
         {
             choice.program = action.path;

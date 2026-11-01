@@ -52,7 +52,9 @@ std::vector<Title> SampleTitles()
         t.size = std::move(size);
         t.game = game;
         t.art = art;
-        t.path = "/data/eden-ps4/" + t.name;
+        t.path = (t.location.starts_with("USB") ? "/mnt/usb0/" : "/data/eden-ps4/") + t.name + "." +
+                 (t.kind == "NRO" ? "nro" : t.kind == "XCI" ? "xci" : "nsp");
+        t.on_ps4 = t.location == "data folder";
         titles.push_back(std::move(t));
     };
     add("Breakout", "NRO", "in the package", "1 MB", false, Art::Breakout);
@@ -169,6 +171,19 @@ int main(int argc, char** argv)
     Press(menu, kCross);
     Press(menu, kOptions);
     Shot(menu, "dialog-info");
+
+    // OPTIONS on a game on the PS4's storage: Delete, which asks first
+    HomeMenu deleting = MakeMenu(false);
+    for (int i = 0; i < 3; i++)
+        Press(deleting, kRight);
+    Press(deleting, kOptions);
+    Shot(deleting, "dialog-info-delete");
+    Press(deleting, kLeft);
+    Press(deleting, kCross);
+    Shot(deleting, "dialog-delete");
+    Press(deleting, kRight);
+    const MenuAction deleted = deleting.Update(kCross, g_now);
+    std::printf("delete action: %s\n", deleted.kind == MenuAction::Kind::Delete ? deleted.path.c_str() : "none");
 
     HomeMenu dark = MakeMenu(true);
     dark.SetSettings(MenuSettings{false, false, false});
