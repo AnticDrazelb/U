@@ -377,6 +377,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.94: **stack and thread-local accesses walk from the start once one is declined; code cache
+use per core.** 03.93 on a console (Mario Kart, 50%, Profiler off): races at 22-24 fps (42-48 ms of
+work a frame); a service call 160 us (80 until the service's thread took it, 50 handling, 25 back);
+in a settled race the translator 60-100 blocks a second (12-16 ms). But fastmem declined 5,000
+accesses a second while loading, 400-1,900 at a race's start, and each decline recompiles its block
+(about 150 us with the fault), the old code left dead in the cache: two whole-cache flushes in the
+session (60 s, 180 s), each followed by everything translated again.
+
+- Patch 0082: each fastmem access's patch information says what its address is based on
+  (`Optimization::ClassifyAddressBase`: the stack pointer, the thread pointer (`A32CoprocGetOneWord`,
+  `A64GetTPIDRRO`), or other, through constant adds and subtracts). A decline of a stack or
+  thread-pointer access sets the emitter's `stack_walks` / `thread_local_walks`; from then on every
+  block compiled has all its accesses through that base go through `A32SharedWalkPass`, lone ones
+  too (`min_members` 1), so they never fault first. Host harness, split stack, 50 functions with a
+  PUSH/POP each: 1,000 fallbacks (faults) before, 20 now; results equal. Old build vs new, every
+  option on: 1,206 programs (split stack, fastmem) equal.
+- Patch 0082: `PS4Perf::jit_cache_free_kib[4]`, `jit_core_full_flushes[4]`: the 30-second line
+  shows each emulated core's code cache free space and its whole flushes.
+
 03.93: **declined accesses share a walk; the profile read.** 03.92 on a console, Mario Kart with
 the Profiler on (resolution 100%): races at 19-20 fps; core 0 75% in JIT code, 9% the app's code, 16%
 in system calls (12-13% idle); a service call 250 us (about 130 until the service's thread took it,

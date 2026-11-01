@@ -1,0 +1,300 @@
+From d876ade176f1d6b0780ad1a4cb53eaeae211187a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 1 Nov 2026 16:37:12 +0000
+Subject: [PATCH] PS4 dynarmic: stack and thread-local accesses walk from the
+ start once one is declined; cache use per core
+
+03.93 on a console: Mario Kart races at 22-24 fps, but fastmem declined 5,000 accesses a second
+while loading and 400-1,900 at a race's start, each one a fault and a recompile of its block
+(about 150 us), the old code left dead in the cache: two whole-cache flushes in the session, each
+followed by everything translated again. The stutters.
+
+Each fastmem access's patch information records what its address is based on
+(Optimization::ClassifyAddressBase: the stack pointer, the thread pointer through
+A32CoprocGetOneWord or A64GetTPIDRRO, or other, through constant adds and subtracts). A decline of
+a stack or thread-pointer access sets the emitter's stack_walks / thread_local_walks; from then on
+every block compiled sends all accesses through that base to A32SharedWalkPass, lone ones too
+(min_members 1), so none faults first. Host harness, stack pages out of the fastmem arena, 50
+functions with a PUSH/POP each: 1,000 fallbacks before, 20 now; results equal. Old build vs new,
+every option on: 1,206 random programs (split stack, fastmem) equal.
+
+PS4Perf: each emulated core's code cache free space (after its last translation) and its whole
+flushes, for the 30-second line.
+---
+ src/common/ps4_perf.h                         |  3 ++
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |  4 ++
+ .../backend/x64/a32_emit_x64_memory.cpp       |  1 +
+ .../dynarmic/backend/x64/a32_interface.cpp    | 19 +++++++--
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |  4 ++
+ .../backend/x64/a64_emit_x64_memory.cpp       |  1 +
+ .../dynarmic/backend/x64/a64_interface.cpp    |  3 ++
+ .../backend/x64/emit_x64_memory.cpp.inc       |  4 ++
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 39 +++++++++++++++++--
+ src/dynarmic/src/dynarmic/ir/opt_passes.h     |  9 ++++-
+ 10 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index a6e88d651..639cf28dc 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -46,6 +46,9 @@ inline std::atomic<uint64_t> jit_blocks{0}, jit_full_flushes{0}, jit_range_flush
+ // time spent translating and emitting those blocks (on the emulated cores' threads: a burst of new
+ // code is a burst of slow frames)
+ inline std::atomic<uint64_t> jit_compile_ns{0};
++// each emulated core's code cache: KiB of it free (after its last translation), and its whole flushes
++inline std::atomic<uint32_t> jit_cache_free_kib[4];
++inline std::atomic<uint64_t> jit_core_full_flushes[4];
+ // Guest memory accesses through the recompiler's callbacks instead of its inline page table walk,
+ // per emulated core (a cache line each: a busy count shared by the cores would cost time itself)
+ struct alignas(64) CoreCount {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index d9426d50e..3e605951a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -101,6 +101,7 @@ public:
+         u64 callback;
+         DoNotFastmemMarker marker;
+         bool recompile;
++        unsigned char base = 0;  // (Optimization::AddressBase of the access's address)
+     };
+     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;
+     FakeCall FastmemCallback(u64 rip);
+@@ -143,6 +144,9 @@ public:
+     ::Common::unordered_set<DoNotFastmemMarker> do_not_fastmem;
+     // the blocks with an access fastmem was declined for (FastmemCallback)
+     ::Common::unordered_set<IR::LocationDescriptor> blocks_without_fastmem;
++    // fastmem declined for an access through the stack pointer, the thread pointer: from then on
++    // every such access is compiled to walk the page table (shared), none left to fault first
++    bool stack_walks = false, thread_local_walks = false;
+     bool HasAccessWithoutFastmem(IR::LocationDescriptor location) const {
+         return blocks_without_fastmem.count(location) > 0;
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+index 5ede1758b..e4d49d739 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+@@ -20,6 +20,7 @@
+ #include "dynarmic/backend/x64/abi.h"
+ #include "dynarmic/backend/x64/devirtualize.h"
+ #include "dynarmic/backend/x64/emit_x64_memory.h"
++#include "dynarmic/ir/opt_passes.h"
+ #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+ #include "dynarmic/backend/x64/perf_map.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 9169a18ea..cf1abeec7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -214,12 +214,24 @@ private:
+         // Accesses fastmem was declined for (pages the PS4 can't map at the game's addresses: a
+         // thread's stack, its local storage) walk the page table: one walk for those through one
+         // base (a PUSH or POP, a function's stack frame), as without fastmem
+-        if (conf.fastmem_pointer && conf.fastmem_declined_shared_walk && emitter.HasAccessWithoutFastmem(descriptor)) {
++        // (and, once fastmem was declined for one through the stack or thread pointer, every access
++        // through it, a lone one too: no fault and recompile for each of them first)
++        if (conf.fastmem_pointer && conf.fastmem_declined_shared_walk &&
++            (emitter.stack_walks || emitter.thread_local_walks || emitter.HasAccessWithoutFastmem(descriptor))) {
++            const bool proactive = emitter.stack_walks || emitter.thread_local_walks;
+             Optimization::A32SharedWalkForSlowAccesses(ir_block, [&](const IR::Inst& inst) {
+-                return emitter.AccessWithoutFastmem(descriptor, inst.GetName());
+-            });
++                if (emitter.AccessWithoutFastmem(descriptor, inst.GetName()))
++                    return true;
++                if (!proactive)
++                    return false;
++                const auto base = Optimization::ClassifyAddressBase(inst);
++                return (emitter.stack_walks && base == Optimization::AddressBase::Stack) ||
++                       (emitter.thread_local_walks && base == Optimization::AddressBase::ThreadLocal);
++            }, proactive ? 1 : 2);
+         }
+         auto block = emitter.Emit(ir_block);
++        ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
++            u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+         ::Common::PS4Perf::jit_compile_ns.fetch_add(
+             u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()),
+             std::memory_order_relaxed);
+@@ -239,6 +251,7 @@ private:
+             jit_state.ResetRSB();
+             if (invalidate_entire_cache) {
+                 ::Common::PS4Perf::jit_full_flushes.fetch_add(1, std::memory_order_relaxed);
++                ::Common::PS4Perf::jit_core_full_flushes[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+                 block_of_code.ClearCache();
+                 emitter.ClearCache();
+             } else {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 463929cc4..0d98c4748 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -88,6 +88,7 @@ public:
+         u64 callback;
+         DoNotFastmemMarker marker;
+         bool recompile;
++        unsigned char base = 0;  // (Optimization::AddressBase of the access's address)
+     };
+     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
+     FakeCall FastmemCallback(u64 rip);
+@@ -139,6 +140,9 @@ public:
+     ::Common::unordered_set<DoNotFastmemMarker> do_not_fastmem;
+     // the blocks with an access fastmem was declined for (FastmemCallback)
+     ::Common::unordered_set<IR::LocationDescriptor> blocks_without_fastmem;
++    // fastmem declined for an access through the stack pointer, the thread pointer: from then on
++    // every such access is compiled to walk the page table (shared), none left to fault first
++    bool stack_walks = false, thread_local_walks = false;
+     bool HasAccessWithoutFastmem(IR::LocationDescriptor location) const {
+         return blocks_without_fastmem.count(location) > 0;
+     }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 2a980789a..75357c944 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -20,6 +20,7 @@
+ #include "dynarmic/backend/x64/abi.h"
+ #include "dynarmic/backend/x64/devirtualize.h"
+ #include "dynarmic/backend/x64/emit_x64_memory.h"
++#include "dynarmic/ir/opt_passes.h"
+ #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+ #include "dynarmic/backend/x64/perf_map.h"
+ #include "dynarmic/common/spin_lock_x64.h"
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 60cf576fc..68878681a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -265,6 +265,8 @@ private:
+         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         const auto entrypoint = emitter.Emit(ir_block).entrypoint;
++        ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
++            u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+         ::Common::PS4Perf::jit_compile_ns.fetch_add(
+             u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()),
+             std::memory_order_relaxed);
+@@ -284,6 +286,7 @@ private:
+             jit_state.ResetRSB();
+             if (invalidate_entire_cache) {
+                 ::Common::PS4Perf::jit_full_flushes.fetch_add(1, std::memory_order_relaxed);
++                ::Common::PS4Perf::jit_core_full_flushes[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+                 block_of_code.ClearCache();
+                 emitter.ClearCache();
+             } else {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index e57cb3858..368805c55 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -41,6 +41,8 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+             const auto marker = iter->second.marker;
+             do_not_fastmem.insert(marker);
+             blocks_without_fastmem.insert(std::get<0>(marker));
++            stack_walks |= iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::Stack);
++            thread_local_walks |= iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::ThreadLocal);
+             InvalidateBasicBlocks({std::get<0>(marker)});
+         }
+         return result;
+@@ -116,6 +118,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+                     std::bit_cast<u64>(wrapped_fn),
+                     *fastmem_marker,
+                     conf.recompile_on_fastmem_failure,
++                    static_cast<unsigned char>(Optimization::ClassifyAddressBase(*inst)),
+                 });
+ 
+             EmitCheckMemoryAbort(ctx, inst, end);
+@@ -212,6 +215,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+                     std::bit_cast<u64>(wrapped_fn),
+                     *fastmem_marker,
+                     conf.recompile_on_fastmem_failure,
++                    static_cast<unsigned char>(Optimization::ClassifyAddressBase(*inst)),
+                 });
+ 
+             EmitCheckMemoryAbort(ctx, inst, end);
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 85e2ac9a9..8886c0595 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -92,7 +92,7 @@ static void ConstantMemoryReads(IR::Block& block, A32::UserCallbacks* cb) {
+ // A32ReadMemoryVia* or A32WriteMemoryVia* (whose slow path is the access's own walk). Only groups
+ // spanning at most 256 bytes: one that crosses into the next page at run time costs that walk again.
+ template<typename Walks>
+-static void A32SharedWalkPass(IR::Block& block, Walks&& walks) {
++static void A32SharedWalkPass(IR::Block& block, Walks&& walks, size_t min_members = 2) {
+     struct Member {
+         IR::Block::iterator it;
+         s64 offset;
+@@ -161,7 +161,7 @@ static void A32SharedWalkPass(IR::Block& block, Walks&& walks) {
+         group->members.push_back({it, offset, bytes, via, write});
+     }
+     for (Group& group : groups) {
+-        if (group.members.size() < 2) {
++        if (group.members.size() < min_members) {
+             continue;
+         }
+         s64 lowest = group.members[0].offset, end = lowest;
+@@ -1706,8 +1706,39 @@ void Optimize(IR::Block& block, const A32::UserConfig& conf, const Optimization:
+     }
+ }
+ 
+-void A32SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks) {
+-    Optimization::A32SharedWalkPass(block, walks);
++AddressBase ClassifyAddressBase(const IR::Inst& access) {
++    IR::Value value = access.GetArg(1);
++    for (int depth = 0; depth < 16; depth++) {
++        while (value.IsIdentity())
++            value = value.GetInst()->GetArg(0);
++        if (value.IsImmediate())
++            return AddressBase::Other;
++        const IR::Inst* inst = value.GetInst();
++        switch (inst->GetOpcode()) {
++        case IR::Opcode::Add32:
++        case IR::Opcode::Sub32:
++        case IR::Opcode::Add64:
++        case IR::Opcode::Sub64:
++            if (!inst->GetArg(1).IsImmediate())
++                return AddressBase::Other;
++            value = inst->GetArg(0);
++            continue;
++        case IR::Opcode::A32GetRegister:
++            return inst->GetArg(0).GetA32RegRef() == A32::Reg::SP ? AddressBase::Stack : AddressBase::Other;
++        case IR::Opcode::A64GetSP:
++            return AddressBase::Stack;
++        case IR::Opcode::A32CoprocGetOneWord:
++        case IR::Opcode::A64GetTPIDRRO:
++            return AddressBase::ThreadLocal;
++        default:
++            return AddressBase::Other;
++        }
++    }
++    return AddressBase::Other;
++}
++
++void A32SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks, size_t min_members) {
++    Optimization::A32SharedWalkPass(block, walks, min_members);
+     Optimization::DeadCodeElimination(block);
+     Optimization::IdentityRemovalPass(block);
+ }
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.h b/src/dynarmic/src/dynarmic/ir/opt_passes.h
+index b006eddbe..a7a9d6d3b 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.h
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.h
+@@ -18,6 +18,7 @@ struct UserCallbacks;
+ struct UserConfig;
+ }
+ 
++#include <cstddef>
+ #include <functional>
+ 
+ namespace Dynarmic::IR {
+@@ -40,6 +41,12 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+ /// A32 with fastmem: the loads and stores that fastmem was declined for (`walks`: they walk the page
+ /// table each), when several go through one base register value plus constants, share one walk
+ /// (A32SharedWalkPass); the others keep fastmem
+-void A32SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks);
++void A32SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks,
++                                  std::size_t min_members = 2);
++
++/// What a memory access's address is, plus or minus constants: the stack pointer, the thread
++/// pointer (a read of CP15's TPIDRURO, TPIDRRO_EL0), or something else
++enum class AddressBase : unsigned char { Other = 0, Stack = 1, ThreadLocal = 2 };
++AddressBase ClassifyAddressBase(const IR::Inst& access);
+ 
+ }  // namespace Dynarmic::Optimization
+-- 
+2.43.0
+

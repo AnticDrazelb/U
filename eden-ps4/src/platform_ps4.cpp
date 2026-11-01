@@ -1265,6 +1265,15 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.94: fewer stutters. 03.93 ran Mario Kart races at 22-24 fps. Its stutters came at the start "
+         "of races and while loading: each time new game code ran, every stack access in it first failed "
+         "the fast way and had the code translated again (up to 5,000 times a second while loading, "
+         "hundreds at a race's start), and the old copies filled the translator's memory until it had "
+         "to throw everything away and start over (twice in that session). Now, once the first stack "
+         "access fails the fast way, all code that touches the stack (or a thread's own storage) is "
+         "translated the right way from the start. In a test of 50 functions: 1,000 failed accesses "
+         "before, 20 now. The 30-second lines also show each core's translator memory, to see whether "
+         "it still runs out.\n"
          "03.93: function calls up to 2.6 times cheaper in Mario Kart. 03.92's profile showed where the "
          "rest of the time goes: two thirds of the memory accesses in Mario Kart's busiest code went the "
          "slow way, mostly each function's saving and restoring of registers on its stack. The PS4 maps "
@@ -2015,6 +2024,20 @@ std::string PerfLine(double seconds)
         rate(now.blocks, last.blocks), double(now.compile_ns - last.compile_ns) / seconds / 1e6,
         now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow),
         rate(now.slow_writes, last.slow_writes));
+    // Each emulated core's code cache: what's left of it (a full one is flushed and its code
+    // translated again, a stutter), and its whole flushes so far
+    {
+        std::string caches;
+        for (int c = 0; c < 4; c++) {
+            const uint32_t kib = P::jit_cache_free_kib[c].load(std::memory_order_relaxed);
+            caches += fmt::format("{}{}", c ? ", " : "", kib ? fmt::format("{:.1f}", double(kib) / 1024.0) : std::string("-"));
+        }
+        line += fmt::format("; the emulated cores' code caches, MiB free: {} (whole flushes so far: {}, {}, {}, {})", caches,
+                            P::jit_core_full_flushes[0].load(std::memory_order_relaxed),
+                            P::jit_core_full_flushes[1].load(std::memory_order_relaxed),
+                            P::jit_core_full_flushes[2].load(std::memory_order_relaxed),
+                            P::jit_core_full_flushes[3].load(std::memory_order_relaxed));
+    }
     // Where the game's time goes besides running: each emulated core idle (no thread of the game
     // to run), all at once (every thread waiting: on the GPU, a vsync, a service), a finished
     // frame waiting for the next vsync to be shown, the game waiting for a buffer to draw in
