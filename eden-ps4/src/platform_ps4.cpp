@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.00: no more 20-second freezes. 03.99 ran Mario Kart's races at 25-29 fps with the profiler on "
+         "(23-26 before): the game's globals now use fastmem (declines down from 2,000 a second to none). But "
+         "five minutes in the picture froze for 20 seconds. The hang dump showed the GPU driver's and the "
+         "audio service's threads both waiting on a lock of the 30-second statistics, which spun instead of "
+         "sleeping: the thread holding it, of a lower priority, couldn't get a core while they spun, and the "
+         "game waited on the GPU driver until the hang watchdog's dump shook things loose. Those locks sleep "
+         "now (an earlier freeze in Captain Toad was likely the same). Also, the idle cores no longer bump a "
+         "shared counter each time they read the clock.\n"
          "03.99: the game's own globals on the fast path. 03.98's profile and thread list showed Mario Kart's "
          "main thread running three quarters of the time and waiting on two helper threads the rest, all of "
          "them in the game's translated code, its time spread thinly over thousands of places. Looking at that "

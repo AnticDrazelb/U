@@ -929,7 +929,7 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
 // kernel's clock on first use, so absolute times from both agree. Other clocks go to the kernel.
 int __real_clock_gettime(clockid_t id, struct timespec* ts);
 uint64_t sceKernelGetTscFrequency_ps4() __asm__("sceKernelGetTscFrequency");
-unsigned long long ps4_clock_reads;  // DolphinNoGUI monitor (approximate, unsynchronised)
+unsigned long long ps4_clock_reads;  // (DolphinNoGUI's monitor read this; no longer counted)
 
 int __wrap_clock_gettime(clockid_t id, struct timespec* ts) {
     if (id != CLOCK_MONOTONIC)
@@ -952,7 +952,8 @@ int __wrap_clock_gettime(clockid_t id, struct timespec* ts) {
     }();
     if (!anchor.ok)
         return __real_clock_gettime(id, ts);
-    ps4_clock_reads++;
+    // (no count of the reads: idle emulated cores read the clock every microsecond or so while they
+    // spin, and a counter all cores add to kept its cache line moving between them)
     const uint64_t ticks = __builtin_ia32_rdtsc() - anchor.tsc;
     const uint64_t ns =
         anchor.ns + static_cast<uint64_t>((static_cast<unsigned __int128>(ticks) * anchor.mult) >> 32);

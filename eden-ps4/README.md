@@ -377,6 +377,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.00: **statistics locks that sleep: a 20-second freeze.** 03.99 on a console (Mario Kart, 50%,
+Profiler on): races at 25-29 fps (23-26 on 03.98); fastmem's "pages not back to back" declines 78
+a second at boot then 0-3 (from 2,000, 1,200, 400-600, 150). The main thread still ran 75% of a
+race and waited on its helpers 24%. Five minutes in, no frame for 20 s: cores 0-2 idle, core 3
+busy 74%; hang.log had `nvservices` at `NVDRV::Ioctl1+0x184` and `audio` in
+`HandleSyncRequest`'s scope guard, both in the `xchg`/`test`/`jne` loop on
+`PS4Perf::service_lock`. The services' host threads (priority 640, module 1) spun while the
+lock's holder, of a lower priority, got no core; the game waited on the GPU driver until the hang
+watchdog's signals (thread stacks) let the holder run.
+
+- Patch 0087: `PS4Perf`'s service-call table, idle accounting and guest-thread table use
+  `std::mutex` (a waiter sleeps, the holder runs). `Orbis::ArenaPaddingCount` reads the count
+  without `arena_lock`. `core_switch_ns` a cache line a core.
+- `port/ps4_runtime.cpp`: `__wrap_clock_gettime` no longer increments `ps4_clock_reads` (no
+  reader; the idle cores' spins read the clock every microsecond or so, moving its cache line
+  between cores).
+- Seen, not changed yet: writes to memory the GPU caches through the callbacks climb through a
+  race (1,200 to 65,000 a second), mostly core 1's `memcpy` into GPU buffers.
+
 03.99: **the game's code region lined up with the PS4's pages.** 03.98 on a console (Mario Kart,
 50%, Profiler on): races at 23-26 fps. The busiest threads in a race: the main thread (core 0,
 priority 44) running 76% of the time, waiting on a condition variable 23% and on locks 4%; two

@@ -1,0 +1,206 @@
+From 50363864a7fa729c927195b29e2145c7538191c0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 10:03:12 +0000
+Subject: [PATCH] PS4 statistics: locks that sleep (a 20 s livelock), no shared
+ clock counter traffic
+
+PS4Perf's service-call table, idle accounting and guest-thread table were guarded by spin locks.
+On the PS4 the services' host threads (priority 640) spun on the service-call lock while the
+thread holding it, of a lower priority, got no core: the GPU driver stopped answering and Mario
+Kart froze for 20 s (hang.log: nvservices and audio both in the xchg loop). They are std::mutex
+now. ArenaPaddingCount reads the count without arena_lock (the launcher's thread). The per-core
+switch times are a cache line each.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/orbis_memory.cpp         |  7 ++---
+ src/common/ps4_perf.h               | 45 ++++++++++++-----------------
+ src/core/hle/kernel/k_scheduler.cpp |  2 +-
+ 3 files changed, 23 insertions(+), 31 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 9075fad7a..d225bd62a 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -609,10 +609,9 @@ unsigned PopArenaPadding(u64& group_va, size_t& dram_offset) {
+ }
+ 
+ size_t ArenaPaddingCount() {
+-    LockArena();
+-    const size_t count = padding_count;
+-    UnlockArena();
+-    return count;
++    // (a statistic: read without arena_lock, which the launcher's thread mustn't hold, a fault
++    // handler of a higher priority spinning on it while it waits for a core)
++    return __atomic_load_n(&padding_count, __ATOMIC_RELAXED);
+ }
+ 
+ size_t ArenaPaddedMaps() {
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 70f36fc0a..40c02ae92 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cstdint>
++#include <mutex>
+ 
+ namespace Common::PS4Perf {
+ 
+@@ -77,17 +78,21 @@ struct alignas(64) GuestThread {
+     std::atomic<uint64_t> wait_ns[size_t(ThreadWait::Count)]{};
+ };
+ inline GuestThread guest_threads[MaxGuestThreads];
+-inline std::atomic_flag guest_threads_lock = ATOMIC_FLAG_INIT;
+-// Each emulated core's last thread switch (only its own host thread writes it)
+-inline std::atomic<uint64_t> core_switch_ns[4];
++// (a mutex, as the others here: a lock that spins can be held by a thread the spinners, of a
++// higher priority, keep from running, and none ever gets on: 03.99 froze 20 s so)
++inline std::mutex guest_threads_mutex;
++// Each emulated core's last thread switch (only its own host thread writes it; a cache line each)
++struct alignas(64) SwitchTime {
++    std::atomic<uint64_t> ns{0};
++};
++inline SwitchTime core_switch_ns[4];
+ inline GuestThread* FindGuestThread(uint64_t id) {
+     if (id == 0)
+         return nullptr;
+     for (GuestThread& t : guest_threads)
+         if (t.id.load(std::memory_order_acquire) == id)
+             return &t;
+-    while (guest_threads_lock.test_and_set(std::memory_order_acquire)) {
+-    }
++    std::scoped_lock lock{guest_threads_mutex};
+     GuestThread* found = nullptr;
+     for (GuestThread& t : guest_threads) {
+         if (t.id.load(std::memory_order_relaxed) == id) {
+@@ -107,13 +112,12 @@ inline GuestThread* FindGuestThread(uint64_t id) {
+             }
+         }
+     }
+-    guest_threads_lock.clear(std::memory_order_release);
+     return found;
+ }
+ inline void AddThreadRun(size_t core, uint64_t id, int32_t priority, uint64_t now_ns) {
+     if (core >= 4)
+         return;
+-    const uint64_t since = core_switch_ns[core].exchange(now_ns, std::memory_order_relaxed);
++    const uint64_t since = core_switch_ns[core].ns.exchange(now_ns, std::memory_order_relaxed);
+     if (since == 0 || now_ns <= since)
+         return;
+     if (GuestThread* t = FindGuestThread(id)) {
+@@ -165,36 +169,31 @@ inline uint64_t SlowMemoryAccesses() {
+ // time all four were idle at once (every thread of the game waiting: on the GPU, a vsync, a
+ // service). Kept under a small lock (a few thousand idle periods a second); IdleSnapshot counts an
+ // idle period still going on up to now (a core can sleep for minutes in one).
+-inline std::atomic_flag idle_lock = ATOMIC_FLAG_INIT;
+-inline uint32_t idle_mask = 0;          // (the cores idle now; this and the rest under idle_lock)
++inline std::mutex idle_mutex;
++inline uint32_t idle_mask = 0;          // (the cores idle now; this and the rest under idle_mutex)
+ inline uint64_t idle_since[4] = {};     // (when each idle core's period began)
+ inline uint64_t core_idle_ns[4] = {};   // (finished periods)
+ inline uint64_t all_idle_since = 0;
+ inline uint64_t all_idle_ns = 0;
+ 
+-inline void IdleLock() {
+-    while (idle_lock.test_and_set(std::memory_order_acquire)) {
+-    }
+-}
+ 
+ inline void IdleBegin(size_t core, uint64_t now_ns) {
+     if (core >= 4) {
+         return;
+     }
+-    IdleLock();
++    std::scoped_lock lock{idle_mutex};
+     idle_mask |= 1u << core;
+     idle_since[core] = now_ns;
+     if (idle_mask == 0xF) {
+         all_idle_since = now_ns;
+     }
+-    idle_lock.clear(std::memory_order_release);
+ }
+ 
+ inline void IdleEnd(size_t core, uint64_t now_ns) {
+     if (core >= 4) {
+         return;
+     }
+-    IdleLock();
++    std::scoped_lock lock{idle_mutex};
+     if (idle_mask == 0xF && now_ns > all_idle_since) {
+         all_idle_ns += now_ns - all_idle_since;
+     }
+@@ -202,18 +201,16 @@ inline void IdleEnd(size_t core, uint64_t now_ns) {
+         core_idle_ns[core] += now_ns - idle_since[core];
+     }
+     idle_mask &= ~(1u << core);
+-    idle_lock.clear(std::memory_order_release);
+ }
+ 
+ // Each core's idle time and all four's at once since the start, up to now_ns (the wall clock's)
+ inline void IdleSnapshot(uint64_t now_ns, uint64_t (&cores)[4], uint64_t& all) {
+-    IdleLock();
++    std::scoped_lock lock{idle_mutex};
+     for (size_t core = 0; core < 4; core++) {
+         cores[core] = core_idle_ns[core] +
+                       ((idle_mask & (1u << core)) && now_ns > idle_since[core] ? now_ns - idle_since[core] : 0);
+     }
+     all = all_idle_ns + (idle_mask == 0xF && now_ns > all_idle_since ? now_ns - all_idle_since : 0);
+-    idle_lock.clear(std::memory_order_release);
+ }
+ 
+ // The game's frames: from its QueueBuffer to the composer taking the frame at a vsync (how long a
+@@ -238,11 +235,10 @@ inline thread_local uint64_t request_queue_ns = 0;
+ inline constexpr size_t MaxServiceCalls = 64;
+ inline ServiceCall service_calls[MaxServiceCalls];
+ inline size_t service_call_entries = 0;
+-inline std::atomic_flag service_lock = ATOMIC_FLAG_INIT;
++inline std::mutex service_mutex;
+ 
+ inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns, uint64_t queue_ns = 0) {
+-    while (service_lock.test_and_set(std::memory_order_acquire)) {
+-    }
++    std::scoped_lock lock{service_mutex};
+     ServiceCall* entry = nullptr;
+     for (size_t i = 0; i < service_call_entries; i++) {
+         if (service_calls[i].name == name && service_calls[i].command == command) {
+@@ -266,20 +262,17 @@ inline void AddServiceCall(const char* name, uint32_t command, uint64_t ns, uint
+     entry->total_ns += ns;
+     entry->max_ns = std::max(entry->max_ns, ns);
+     entry->queue_ns += queue_ns;
+-    service_lock.clear(std::memory_order_release);
+ }
+ 
+ // Copies the table out (up to max entries) and empties it, so that the next period's calls fill it
+ // afresh (a game's start uses many services it never calls again); returns the entries copied
+ inline size_t TakeServiceCalls(ServiceCall* out, size_t max) {
+-    while (service_lock.test_and_set(std::memory_order_acquire)) {
+-    }
++    std::scoped_lock lock{service_mutex};
+     const size_t n = std::min(max, service_call_entries);
+     for (size_t i = 0; i < n; i++) {
+         out[i] = service_calls[i];
+     }
+     service_call_entries = 0;
+-    service_lock.clear(std::memory_order_release);
+     return n;
+ }
+ 
+diff --git a/src/core/hle/kernel/k_scheduler.cpp b/src/core/hle/kernel/k_scheduler.cpp
+index ef862b402..bedd629cb 100644
+--- a/src/core/hle/kernel/k_scheduler.cpp
++++ b/src/core/hle/kernel/k_scheduler.cpp
+@@ -355,7 +355,7 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
+         Common::PS4Perf::AddThreadRun(m_core_id, cur_thread->GetThreadId(), cur_thread->GetPriority(),
+                                       static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()));
+     } else {
+-        Common::PS4Perf::core_switch_ns[m_core_id & 3].store(
++        Common::PS4Perf::core_switch_ns[m_core_id & 3].ns.store(
+             static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()), std::memory_order_relaxed);
+     }
+ #endif
+-- 
+2.43.0
+
