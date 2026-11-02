@@ -219,6 +219,9 @@ Dynarmic::A32::UserConfig MakeConfig(Env& env, const Options& o) {
 #ifdef HAVE_DECLINED_WALK
     config.fastmem_declined_shared_walk = std::getenv("DYN_NOSHARE") == nullptr;
 #endif
+#ifdef HAVE_DEAD_NZCV
+    config.elide_dead_nzcv = std::getenv("DYN_NZCV") != nullptr;
+#endif
 #endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
@@ -341,6 +344,7 @@ int main(int argc, char** argv) {
     env.jit = &jit;
     Setup(jit, thumb);
     jit.Run();
+    DumpJit();
     for (int i = 0; i < 16; i++)
         std::printf("r%d=%08x\n", i, jit.Regs()[i]);
     for (size_t i = 0; i < 64; i++)

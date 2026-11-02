@@ -1,9 +1,9 @@
 # Eden for PS4: performance progress
 
 Where the work stands, what was done, what was tried and ruled out, and what's next. Updated at
-**04.01** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
+**04.02** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
-are the patches in [patches/](patches) (0001-0087, applied in order to Eden; see "How to work").
+are the patches in [patches/](patches) (0001-0089, applied in order to Eden; see "How to work").
 
 ## Goal
 
@@ -30,13 +30,14 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 03.98 | 23-26 | Profiler on (costs a little) |
 | 03.99 | 25-29 | Profiler on: the game's globals on fastmem; one 20 s freeze |
 | 04.00 | 24-29 | Profiler on: no freeze in ~6 minutes |
-| 04.01 | not tested yet | 11-19% fewer instructions in the harness's loops and calls |
+| 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
+| 04.02 | not tested yet | flags not stored when dead: Mario Kart's hottest loops 29% fewer instructions |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
 the frame rate: it's CPU-bound. Other games: Celeste plays smoothly; Captain Toad (64-bit) was at
 about 15 fps in 03.80, limited by its main thread.
 
-### What a race frame is made of (03.98-03.99 logs, Profiler on)
+### What a race frame is made of (03.98-04.01 logs, Profiler on)
 
 - **Threads:** the game's main thread (core 0, priority 44) runs ~75% of the time and waits ~24% on a
   condition variable for two helper threads (priority 44, core 2: runs ~62%, core 1: ~44%): a job
@@ -46,6 +47,10 @@ about 15 fps in 03.80, limited by its main thread.
   handling, spread thin), the rest idle (spinning in `PhysicalCore::Idle`, or asleep).
 - **The translated code has no hot spot:** the busiest block on core 0 is 0.2% of its time.
   Speed has to come from translating everything better, or from less waiting between threads.
+- **Block entries:** of the samples that land in translated code (04.01, core 0, races), a third
+  land in a block's first 16 bytes (a quarter of the bytes past 64): getting into a block (its
+  first fetch, the jump there, the first loads of guest registers) costs more than its length says.
+- **Host instructions per guest instruction:** 5.85 in the 60 hottest blocks (04.01).
 - **Instruction mix of the hottest translated code:** ~23% loads/stores of the guest register file
   (in `JitState` memory), ~10% flag handling (`cmc`/`lahf`/`seto` to save NZCV, `sahf` to read it),
   ~8% guest memory accesses (fastmem, one `mov` each), the rest the work itself.
@@ -107,6 +112,11 @@ about 15 fps in 03.80, limited by its main thread.
   used to copy the operand out of the way first: every `[r3, #8]` with `r3` used again paid a
   `mov`); a conditional branch right after the flags are stored takes them from the register.
   11-19% fewer host instructions in the harness's loops, calls and structure accesses.
+- 04.02: dead flags at a block's exit. A block ending in links reads the ARM code its successors
+  start with (branches and calls followed; returns, indirect jumps, SVC count as reads); when they
+  set the flags before reading them, the block doesn't store its flags, and its conditional branch
+  is `cmp a, b; jcc` (or `test`) instead of `cmc/lahf/seto`, a store, a load and `sahf/cmc`.
+  Mario Kart's hottest loops 760 to 536 instructions an iteration, game-like C 7% fewer.
 
 ### Threads and scheduling
 
@@ -161,27 +171,38 @@ about 15 fps in 03.80, limited by its main thread.
 
 ## Next (most promising first)
 
-1. **Test 04.00** on a console: no freezes; race fps (same track as before, Profiler on or off).
+1. **Test 04.02** on a console: race fps (same track as before, Profiler on or off); a
+   `hotblocks.log` to see the flag code gone.
 2. **Translated code, generic** (where the main thread's time goes): fold a constant offset into
    the fastmem access itself (`mov [r13 + base + 8]`: needs the IR to carry it, the fallback to
-   rebuild the address); `ConditionalSelect` still reloads NZCV; the inline RSB pop reloads the
-   PC/upper descriptor it just stored; flag materialisation (`cmc`/`lahf`/`seto`) when nothing
-   reads V or C; the guest register file in memory (23% of hot instructions) needs cross-block
-   register caching: the biggest and hardest.
-3. **Writes to GPU-cached memory** climb through a race (tens of thousands a second) but cost
+   rebuild the address; ~5% of hot instructions are those `lea`s); `ConditionalSelect` still
+   reloads NZCV (a conditional MOV after a compare in the same block); flags still stored where a
+   successor returns or jumps through a register first (a conditional early return); the inline
+   RSB pop reloads the PC/upper descriptor it just stored; the guest register file in memory (27%
+   of hot instructions) needs cross-block register caching: the biggest and hardest.
+3. **Block entry costs** (a third of the translated code's samples): cold code (fallbacks, halt
+   paths) sits right after each block's hot code (`deferred_emits`), so hot code is spread out
+   (only 64% of a hot block's bytes are hot); a far-code region for it would pack hot code
+   tighter (fewer I-cache lines and pages per frame).
+4. **Writes to GPU-cached memory** climb through a race (tens of thousands a second) but cost
    little (04.00 profile); only if the GPU thread (65% busy) becomes the limit.
-4. **Contended mutex cost** in Eden's kernel (`ArbitrateLock`/`ArbitrateUnlock`, ~12 us an
+5. **Contended mutex cost** in Eden's kernel (`ArbitrateLock`/`ArbitrateUnlock`, ~12 us an
    unlock): profile `KScopedSchedulerLock`, `UpdateHighestPriorityThreads`, `RescheduleCores`,
    `PhysicalCore::Interrupt`.
-5. **TLS pages** (`KThreadLocalPage`, one 4 KiB page from the `KPageBuffer` slab at a random
+6. **TLS pages** (`KThreadLocalPage`, one 4 KiB page from the `KPageBuffer` slab at a random
    address): never lined up, so thread-local reads walk. Allocate them in owned, lined-up 16 KiB
    groups.
-6. **Core 3's services** (hid): ~100 us before a call is taken; core 3 shares module 1.
-7. **Core 0's code cache** fills in ~6 minutes; smaller code (e.g. the halt fallback of backward
+7. **Core 3's services** (hid): ~100 us before a call is taken; core 3 shares module 1.
+8. **Core 0's code cache** fills in ~6 minutes; smaller code (e.g. the halt fallback of backward
    links) or a different split.
 
 ## How to work
 
+- **A fresh container:** `tools/fresh-container.sh` sets everything below up (clang 21, Eden at
+  `eb88a40` with the patches, its dependencies, the PS4 SDK, libc++, the sysroot's libraries with
+  OpenSSL, Mesa, FFmpeg, libnx), about 45 minutes; the first `build.sh ps4` takes about 25 more.
+  The import check against Crema's needs `CREMA_ELF` (a Crema build's ELF), which a fresh container
+  doesn't have.
 - **Branch:** `eden-ps4-stage2` (this repo). Each version: Eden commit(s), exported as the next
   patch(es), `VERSION`, a README section and a News entry, then the package.
 - **Eden tree:** `~/eden` with `patches/` applied in order as commits (`build.sh` header names the
@@ -194,7 +215,10 @@ about 15 fps in 03.80, limited by its main thread.
   code with `EDEN_TEST_ARENA_LINE_UP`); then `./test.sh` (hello, games, `game/stacktest.c`...).
   `./ui-preview.sh` renders the launcher's screens to PNGs.
 - **dynarmic harness:** [tools/dynarmic-harness](tools/dynarmic-harness): benchmarks and
-  differential tests of translator changes (old build vs new on random programs).
+  differential tests of translator changes (old build vs new on random programs). Build the old
+  one first (`git stash` in `~/eden`, `./build.sh dynbench_base`, `git stash pop`). No hardware
+  counters in a VM: count instructions with `valgrind --tool=lackey --basic-counts=yes
+  --smc-check=all` at two iteration counts and take the difference.
 - **Reading a console log:** fps from `speed:` lines; the `running N s:` lines for everything else
   (look at race windows, not loading); with the Profiler, `samples.log` windows by thread and
   `hotblocks.log`. Compare like with like: same track, same Profiler setting.

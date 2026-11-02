@@ -16,7 +16,9 @@ DYNBENCH=dynbench64.cpp ./build.sh dynbench64x       # A64 harness
 
 `build.sh` configures `wrap/` (dynarmic alone) into `build/` once, rebuilds the library, links
 the harness. Needs clang-21, ld.lld-21, llvm-objcopy-21 and `~/eden-deps` (fetch-deps.sh) for
-fmt and xbyak. Keep the previous build's binary under another name: the tests compare two.
+fmt and xbyak (and Boost's headers: `libboost-dev`). Keep the previous build's binary under another
+name: the tests compare two. Options added since 04.02 are compiled in with `OPTS` (link.sh's list
+plus e.g. `-DHAVE_DEAD_NZCV`) and switched on at run time (`DYN_NZCV=1`).
 `DYNARMIC_HOST_FEATURES_MASK=16b00f` limits the host features to the Jaguar's.
 
 ## Run
@@ -36,6 +38,7 @@ single-stepped), outputs compared:
 ./dtx.sh gen9.py dynbench19 dynbench20 1 300                 # A32 (ARM and Thumb)
 DTX_OPTS=fastmem ./dtx.sh gen9.py dynbench19 dynbench20 301 500
 ./dtx64.sh gen8.py dynbench64n dynbench64w 1 200             # A64
+./dtxa.sh gen10.py dynbench_base dynbench_nzcv 1 400         # ARM-only generators
 ./xh.sh gen7.py arm dynbench19 dynbench20 1 100 [options]    # same programs, two harnesses
 ./strict_sweep.sh 1 100                                      # xbyak's strict checks on (build-strict/)
 ```
@@ -52,5 +55,14 @@ Failing programs are kept as `rt/failx_*.s`.
 | gen7.py | A32/Thumb control flow and flags: conditional instructions, IT blocks, loops, calls, VFP compares |
 | gen8.py | A64 control flow and flags |
 | gen9.py | NEON VLD1/VST1 (every size, count, alignment, writeback), lanes, VLD2-4, VLDM, VLDR |
+| gen10.py | ARM flags across blocks: setters (all flags, N and Z, the shifter's C) before branches, loops and calls; every kind of reader where they lead, functions that read their caller's flags (04.02's dead flags) |
 
-`programs/` holds the hand-written benchmarks (calls with PUSH/POP, NEON copies, atomics...).
+`programs/` holds the hand-written benchmarks (calls with PUSH/POP, NEON copies, atomics...);
+`programs/flagloops.s` Mario Kart's hottest loops from 04.01's `hotblocks.log`;
+`programs/c/game.c` game-like C for ARM (`programs/c/build.sh`, then `image programs/c/game.bin
+<frames> arm`).
+
+Instruction counts (no hardware counters in a VM): `valgrind --tool=lackey --basic-counts=yes
+--smc-check=all ./dynbench bench <bin> N` at two N, the difference over the iterations (bench mode
+runs N twice). `DUMP_JIT=<dir> PERF_BUILDID_DIR=<dir>` dumps each block's code in `bench`, `image`
+and `test` mode.

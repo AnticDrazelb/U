@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.02: no flags saved that nothing reads. 04.01 ran Mario Kart's races at 26-30 fps (Profiler on), "
+         "about where 04.00 was. Nearly every piece of the game's translated code ended the same wasteful way: "
+         "after a compare, the ARM flags were packed and saved to memory, then read back for the branch right "
+         "after it. The code a branch leads to almost always sets the flags again before reading them, so the "
+         "translator now reads a few instructions ahead into it; when the flags are dead there, they're neither "
+         "saved nor read back, and the branch tests the compare directly. In tests: 29% fewer instructions in "
+         "Mario Kart's busiest loops, 7% in game-like code, and 3,200 random programs giving the same results "
+         "as before.\n"
          "04.01: leaner translated code everywhere. 04.00 ran Mario Kart's races at 24-29 fps (Profiler on) "
          "with no freezes. Its main thread still spends three quarters of a frame in the game's translated "
          "code, spread over thousands of places, so this release makes all of that code shorter: reading a "

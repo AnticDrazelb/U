@@ -379,6 +379,40 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.02: **dead flags at a block's exit are not stored.** 04.01 on a console (Mario Kart, 50%,
+Profiler on): races at 26-30 fps (27-30 with the Profiler off, the run before), within a frame of
+04.00: the 11-19% fewer instructions didn't show. The main thread runs 76% of the time and waits
+23% on its two helpers (61% and 44% busy); core 0 is 58% translated code. The profile's offsets
+inside blocks: a third of the samples that land in translated code land in a block's first 16
+bytes. The 60 hottest blocks run 5.85 host instructions per guest instruction: 27% loads and
+stores of the guest registers in `JitState`, 9% flag handling. Almost every block ending in a
+conditional branch stored the flags after its compare (`xor; cmp; cmc; lahf; seto; mov [r15+76]`)
+and loaded them back for the branch (`mov; sahf; cmc; ja`); a TST cost nine instructions to
+merge N and Z in. The code a branch leads to almost always sets the flags before it reads them.
+
+- Patch 0089: a block ending in links (B<cond>'s If terminal, a branch, a call, the next
+  instruction) reads the ARM code its successors start with (`FlagsLookahead` in
+  `translate_arm.cpp`): along every path, following branches and BL into the called code, a flag
+  read before it is set again makes the flags live; a return, a jump or call through a register,
+  SVC, MRS/MSR or anything else it doesn't know counts as a read; a branch target reached again
+  with no more flags unset adds no path; 64 instructions and 6 branches at most. When the flags are
+  dead, `A32DeadNZCVPass` drops the stores after the block's last flag read, and a conditional
+  branch at the end tests the compare's values (`CondFlagsSub32/Add32/Test32/NZ32`: `cmp a, b`,
+  `jcc` on the host's flags). The code read joins the block's ranges for invalidation.
+  `UserConfig::elide_dead_nzcv`, on in Eden; off with cycle counting and halts on memory
+  accesses. A first version took a call to clobber the flags (the procedure call standard): a
+  random program whose function read its caller's flags caught it; calls are followed now.
+- Host harness (Eden's options, fastmem; valgrind's instruction count): Mario Kart's hottest loops
+  (`programs/flagloops.s`: the fill, copy, byte copy, test chain and indexed copy from 04.01's
+  `hotblocks.log`) 760 to 536 an iteration; game-like C compiled for ARM with clang -O2
+  (`programs/c/game.c`: entities, a sort, hashing, a tree) 135,555 to 126,310 a frame; calls,
+  PUSH/POP and struct accesses unchanged (their loops end next to an SVC). Old vs new: 3,200 random
+  A32 programs equal (gen2, 3, 4, 7, 9 and the new gen10, flags across blocks; ARM, Thumb, fastmem,
+  split stack).
+- `tools/dynarmic-harness`: `gen10.py` and `dtxa.sh` (ARM-only differential tests), `DYN_NZCV`,
+  `test` mode dumps code too (`DUMP_JIT`); `wrap/` takes xbyak and fmt from `~/eden-deps` when no
+  installed package has them.
+
 04.01: **LEA into a new register; flags from the register.** 04.00 on a console (Mario Kart, 50%,
 Profiler on): races at 24-29 fps, no freeze in ~6 minutes. The main thread 76% running, 24%
 waiting on its helpers; the game cores 48-58% translated code, Eden's own code under 2% besides
