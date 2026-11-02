@@ -33,7 +33,7 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
 | 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
 | 04.03 | 26-30 | at **100%** resolution (28-29 most of the time), Profiler on: as 04.01 at 50% |
-| 04.05 | not tested yet | target 30 min / 32 average on the slowest track; offsets folded, float compares fused: 13% fewer instructions than 04.04 in the busiest loops |
+| 04.05 | 28-32 | 50%, Profiler on, track to confirm (slowest?): 30-s windows 29.5-31.5 (mean 30.5), 10-s 28.2-32.0 bar a race start dip; helpers' work a frame 20.7 -> 18.4 ms, the main thread now waits 6.2 ms a frame (8.3) and runs 78-80%: it alone is the limit; Eden's GPU thread 69% busy (50-66%); hot blocks: LEAs 12% -> 6% of instructions |
 | 04.04 | 28-31 | the tester's **slowest track**, 50%, Profiler on: median 29.6 (04.01's usual track: 28.1); another track 30-33 (median 30.8); flag code gone from 93% of the hot blocks' samples |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
