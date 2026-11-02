@@ -1,0 +1,185 @@
+From 9cb86e9d43c898df337e3fe0506c0e80993d5e47 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 22:50:59 +0000
+Subject: [PATCH] PS4: what ended the game's waits on objects, by the events'
+ service names, per core
+
+KEvent keeps the name its service gave it (ServiceContext::CreateEvent); svcWaitSynchronization
+records what ended each wait (an event's name, one the game made, a thread, a timeout...) and how
+long it took, per emulated core, for the launcher's log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         | 32 +++++++++++++++
+ src/core/hle/kernel/k_event.h                 | 16 ++++++++
+ .../hle/kernel/svc/svc_synchronization.cpp    | 41 +++++++++++++++++++
+ src/core/hle/service/kernel_helpers.cpp       |  1 +
+ 4 files changed, 90 insertions(+)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 89693dd666..889b53b02a 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstring>
+ #include <cstdint>
+ #include <mutex>
+ 
+@@ -56,6 +57,37 @@ inline std::atomic<uint64_t> gpu_draws{0}, gpu_command_words{0}, gpu_sink_run_wo
+ // created; for what a race's start waits on
+ inline std::atomic<uint64_t> gpu_pipelines_new{0}, gpu_draws_skipped{0}, gpu_images_created{0},
+     gpu_buffers_created{0};
++// (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them (an event's
++// service name, "an event the game made", a thread, a timeout...), per emulated core. Written by
++// that core's thread only; entries are added, never removed (the launcher reads them)
++struct WaitEntry {
++    char label[40]{};
++    std::atomic<uint64_t> count{0}, total_ns{0};
++};
++struct WaitTable {
++    static constexpr size_t Max = 24;
++    WaitEntry entries[Max];
++    std::atomic<size_t> used{0};
++    void Add(const char* label, uint64_t ns) {
++        const size_t n = used.load(std::memory_order_relaxed);
++        for (size_t i = 0; i < n; i++) {
++            if (std::strncmp(entries[i].label, label, sizeof(entries[i].label) - 1) == 0) {
++                entries[i].count.fetch_add(1, std::memory_order_relaxed);
++                entries[i].total_ns.fetch_add(ns, std::memory_order_relaxed);
++                return;
++            }
++        }
++        const size_t slot = n < Max ? n : Max - 1;  // (the last one takes the rest)
++        if (n < Max) {
++            std::strncpy(entries[slot].label, n == Max - 1 ? "(others)" : label, sizeof(entries[slot].label) - 1);
++            used.store(n + 1, std::memory_order_release);
++        }
++        entries[slot].count.fetch_add(1, std::memory_order_relaxed);
++        entries[slot].total_ns.fetch_add(ns, std::memory_order_relaxed);
++    }
++};
++inline WaitTable object_waits[4];
++
+ // (04.10) Vulkan render pass ends the scheduler's worker skipped: none begun in their command
+ // buffer (counted on every platform; it would have crashed RADV)
+ inline std::atomic<uint64_t> vk_unmatched_render_pass_ends{0};
+diff --git a/src/core/hle/kernel/k_event.h b/src/core/hle/kernel/k_event.h
+index 75b03efa69..a99ae97558 100644
+--- a/src/core/hle/kernel/k_event.h
++++ b/src/core/hle/kernel/k_event.h
+@@ -6,6 +6,10 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
++#include <cstring>
++#include <string_view>
++
+ #include "core/hle/kernel/k_readable_event.h"
+ #include "core/hle/kernel/slab_helpers.h"
+ 
+@@ -51,7 +55,19 @@ public:
+         m_readable_event_destroyed = true;
+     }
+ 
++    /// (04.11) The service's name for it (ServiceContext::CreateEvent), for what the game waits on;
++    /// empty for an event the game made itself
++    void SetLabel(std::string_view label) {
++        const size_t n = std::min(label.size(), sizeof(m_label) - 1);
++        std::memcpy(m_label, label.data(), n);
++        m_label[n] = '\0';
++    }
++    const char* GetLabel() const {
++        return m_label;
++    }
++
+ private:
++    char m_label[40]{};
+     KReadableEvent m_readable_event;
+     KProcess* m_owner{};
+     bool m_initialized{};
+diff --git a/src/core/hle/kernel/svc/svc_synchronization.cpp b/src/core/hle/kernel/svc/svc_synchronization.cpp
+index 2b019c52d1..f402155a04 100644
+--- a/src/core/hle/kernel/svc/svc_synchronization.cpp
++++ b/src/core/hle/kernel/svc/svc_synchronization.cpp
+@@ -4,12 +4,18 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/cpu_features.h"
++#include "common/ps4_perf.h"
+ #include "common/scope_exit.h"
+ #include "common/scratch_buffer.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_hardware_timer.h"
++#include "core/hle/kernel/k_event.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/k_readable_event.h"
++#include "core/hle/kernel/k_server_port.h"
++#include "core/hle/kernel/k_server_session.h"
++#include "core/hle/kernel/k_thread.h"
+ #include "core/hle/kernel/svc.h"
+ #include "core/hle/kernel/svc_results.h"
+ 
+@@ -95,7 +101,42 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
+     }
+ 
+     // Wait on the objects.
++#ifdef __OPENORBIS__
++    const u64 wait_begin = u64(Common::g_wall_clock.GetTimeNS().count());
++#endif
+     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
++#ifdef __OPENORBIS__
++    {
++        // (04.11) what ended the wait, and how long it took: for the launcher's log
++        const u64 waited = u64(Common::g_wall_clock.GetTimeNS().count()) - wait_begin;
++        const char* label = "something else";
++        if (res == ResultTimedOut) {
++            label = num_handles == 0 ? "a sleep (no objects)" : "a timeout";
++        } else if (res == ResultCancelled) {
++            label = "a cancel";
++        } else if ((R_SUCCEEDED(res) || res == ResultSessionClosed) && *out_index >= 0 &&
++                   *out_index < num_handles) {
++            KSynchronizationObject* const obj = objs[*out_index];
++            if (auto* const readable = obj->DynamicCast<KReadableEvent*>(); readable != nullptr) {
++                const KEvent* const parent = readable->GetParent();
++                label = parent != nullptr && parent->GetLabel()[0] != '\0' ? parent->GetLabel()
++                                                                           : "an event the game made";
++            } else if (obj->DynamicCast<KThread*>() != nullptr) {
++                label = "a thread ending";
++            } else if (obj->DynamicCast<KServerSession*>() != nullptr) {
++                label = "a session's request";
++            } else if (obj->DynamicCast<KServerPort*>() != nullptr) {
++                label = "a port's connection";
++            } else if (obj->DynamicCast<KProcess*>() != nullptr) {
++                label = "a process";
++            }
++        }
++        const size_t core = system.Kernel().CurrentPhysicalCoreIndex();
++        if (core < 4) {
++            Common::PS4Perf::object_waits[core].Add(label, waited);
++        }
++    }
++#endif
+ 
+     R_SUCCEED_IF(res == ResultSessionClosed);
+     R_RETURN(res);
+diff --git a/src/core/hle/service/kernel_helpers.cpp b/src/core/hle/service/kernel_helpers.cpp
+index f7a5cb7049..771f8f60fd 100644
+--- a/src/core/hle/service/kernel_helpers.cpp
++++ b/src/core/hle/service/kernel_helpers.cpp
+@@ -57,6 +57,7 @@ Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
+ 
+     // Initialize the event.
+     event->Initialize(kernel, process);
++    event->SetLabel(name);
+ 
+     // Commit the thread reservation.
+     event_reservation.Commit();
+-- 
+2.43.0
+

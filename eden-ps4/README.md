@@ -379,6 +379,20 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.11: **what the game's waits end on.** 04.10 on a console (three races from fresh boots, all
+five sessions in the bundle; no crash, no render pass end skipped): two on one track started
+30.3/28.7 then 25.3/25.4 fps at 30-32k draws a second (~1,070-1,250 a frame), the third 37.7, 34.0,
+35.1 (~700); the GPU thread ~72% busy at the third's start, ~29 us a draw (28 in 04.09: the 3D
+engine's direct writes within the tracks' noise). At the starts the main thread ran 63-70% and
+waited on objects 10-19% (WaitSynchronization 17-21 a second, 5-9 ms each; later 11, 3 ms).
+
+- Patch 0098: `KEvent` keeps its service's name (`SetLabel`, from `ServiceContext::CreateEvent`:
+  `NVCTRL::NvEvent_<n>` for nvdrv's syncpoint events, `BufferQueue:WaitEvent`, `AudioOutEvent`...);
+  `svcWaitSynchronization` records what ended a wait (the signalled object's label, "an event the
+  game made", a thread, a session, a timeout) and how long it took, per emulated core
+  (`PS4Perf::object_waits`). The 30-second line lists each game core's four longest; the 10-second
+  speed line core 0's (the main thread's) two longest.
+
 04.10: **a race's start draws twice as much; the 3D engine's writes direct; a RADV crash
 guarded.** 04.09 on a console (the tester's three tracks from fresh boots; the bundle kept two of
 the four sessions): its 10-second counts show a race's start meets almost nothing new (the 10 s of

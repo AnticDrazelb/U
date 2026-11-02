@@ -5,6 +5,7 @@
 // What the program prints, and Eden's warnings and errors, go to the platform's sink and to
 // log.txt.
 
+#include <cstdint>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -631,6 +632,30 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                                             now[4] - last[4], now[0] - last[0], now[1] - last[1], now[2] - last[2],
                                             now[3] - last[3]);
                         std::copy(std::begin(now), std::end(now), std::begin(last));
+                        // (04.11) core 0's (the game's main thread's) two longest waits on objects
+                        const P::WaitTable& table = P::object_waits[0];
+                        static uint64_t last_count[P::WaitTable::Max] = {}, last_ns[P::WaitTable::Max] = {};
+                        const size_t used = std::min(table.used.load(std::memory_order_acquire), P::WaitTable::Max);
+                        size_t best[2] = {SIZE_MAX, SIZE_MAX};
+                        uint64_t best_ns[2] = {0, 0}, counts[P::WaitTable::Max] = {}, nss[P::WaitTable::Max] = {};
+                        for (size_t i = 0; i < used; i++) {
+                            const uint64_t c = table.entries[i].count.load(std::memory_order_relaxed);
+                            const uint64_t n = table.entries[i].total_ns.load(std::memory_order_relaxed);
+                            counts[i] = c - last_count[i];
+                            nss[i] = n - last_ns[i];
+                            last_count[i] = c;
+                            last_ns[i] = n;
+                            if (nss[i] > best_ns[0]) {
+                                best[1] = best[0], best_ns[1] = best_ns[0];
+                                best[0] = i, best_ns[0] = nss[i];
+                            } else if (nss[i] > best_ns[1]) {
+                                best[1] = i, best_ns[1] = nss[i];
+                            }
+                        }
+                        for (size_t k = 0; k < 2; k++)
+                            if (best[k] != SIZE_MAX && counts[best[k]] != 0)
+                                extra += fmt::format("{} {} x{} {:.0f} ms", k ? "," : "; core 0 waited on", table.entries[best[k]].label,
+                                                     counts[best[k]], double(nss[best[k]]) / 1e6);
                     }
 #endif
                     Output(LineKind::Status,

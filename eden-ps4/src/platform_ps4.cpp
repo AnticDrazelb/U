@@ -1322,6 +1322,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.11: what the game waits for at a race's start. In 04.10's races the game's main thread, at the "
+         "start, spent 10-19% of its time waiting on something (17-21 waits a second, 5-9 ms each, three "
+         "times what it waits later), while Eden's GPU thread was only ~72% busy: so it isn't only the GPU "
+         "thread's work it waits for. Eden's events now keep the names their services gave them (a GPU fence, "
+         "the display's buffer queue, audio...), and the log says, for each core, what ended the game's waits "
+         "and how long they took (every 30 s; the main thread's two longest every 10 s). No other change: "
+         "a race or two, each from a fresh boot, says where to go next.\n"
          "04.10: what slows a race's start, and a crash guarded. 04.09's counts show that a race's start "
          "isn't waiting for anything new (its shaders and textures came while the track loaded): it simply "
          "draws twice as much, ~800-880 draws a frame against ~400 later, with all the karts together, and "
@@ -2415,6 +2422,39 @@ std::string PerfLine(double seconds)
         last_skipped = skipped;
         last_images = images;
         last_buffers = buffers;
+    }
+    // (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them: an event by
+    // its service's name, one the game made, a thread, a timeout. Per core, the four longest.
+    {
+        static uint64_t last_count[4][P::WaitTable::Max] = {}, last_ns[4][P::WaitTable::Max] = {};
+        line += "; the game's waits on objects, by what ended them (a second, ms each):";
+        for (size_t core = 0; core < 3; core++)
+        {
+            const P::WaitTable& table = P::object_waits[core];
+            const size_t used = std::min(table.used.load(std::memory_order_acquire), P::WaitTable::Max);
+            struct Item
+            {
+                const char* label;
+                uint64_t count, ns;
+            };
+            std::vector<Item> items;
+            for (size_t i = 0; i < used; i++)
+            {
+                const uint64_t count = table.entries[i].count.load(std::memory_order_relaxed);
+                const uint64_t ns = table.entries[i].total_ns.load(std::memory_order_relaxed);
+                if (count > last_count[core][i])
+                    items.push_back({table.entries[i].label, count - last_count[core][i], ns - last_ns[core][i]});
+                last_count[core][i] = count;
+                last_ns[core][i] = ns;
+            }
+            std::sort(items.begin(), items.end(), [](const Item& x, const Item& y) { return x.ns > y.ns; });
+            line += fmt::format("{} core {}:", core ? ";" : "", core);
+            if (items.empty())
+                line += " none";
+            for (size_t i = 0; i < std::min<size_t>(items.size(), 4); i++)
+                line += fmt::format("{} {} {:.1f}, {:.2f}", i ? "," : "", items[i].label,
+                                    double(items[i].count) / seconds, average_us(items[i].ns, items[i].count) / 1000.0);
+        }
     }
     // (04.10) Vulkan render pass ends skipped: none begun in their command buffer (RADV crashed on
     // one, once)
