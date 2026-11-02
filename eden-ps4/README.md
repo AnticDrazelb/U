@@ -379,6 +379,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.01: **LEA into a new register; flags from the register.** 04.00 on a console (Mario Kart, 50%,
+Profiler on): races at 24-29 fps, no freeze in ~6 minutes. The main thread 76% running, 24%
+waiting on its helpers; the game cores 48-58% translated code, Eden's own code under 2% besides
+idling; writes to GPU-cached memory through the callbacks (up to 46,000 a second) don't show in the
+profile (cheap); Eden's GPU thread ~65% busy. The hottest loop (an unrolled memset) showed each
+`str r1, [r3, #N]` as three instructions: the base copied out of the way
+(`RegAlloc::UseScratchGpr` of a value still live), `lea` on the copy, the store.
+
+- Patch 0088: `EmitAdd` (no flags) with an operand used again: `lea result, [op1 + imm]` or
+  `[op1 + op2]` into a new register (`RegAlloc::IsLastUse`); `LogicalShiftLeft32` by 1-3 of an
+  operand used again: `lea result, [op * 2/4/8]`; `EmitCond` right after `A32SetCpsrNZCV` (nothing
+  emitted between) uses the register just stored instead of loading `cpsr_nzcv` back.
+- Host harness (Eden's options, Jaguar features, fastmem; callgrind instructions an iteration):
+  indexed loop 14,387 to 12,852, unrolled memset 10,579 to 9,053, calls with PUSH/POP 561 to 465,
+  PUSH/POP 505 to 407, struct accesses 91 to 77. Old vs new: 2,000 random A32 programs (gen2, 3,
+  4, 7, 9; ARM, Thumb; fastmem, split stack) and 350 A64 (gen6, 8) equal; `test.sh` 0 failed.
+- `tools/dynarmic-harness`: `link.sh` compiles in the options Eden uses (`HAVE_*`; without them the
+  `DYN_*` switches did nothing), `bench` mode dumps code with `DUMP_JIT`.
+
 04.00: **statistics locks that sleep: a 20-second freeze.** 03.99 on a console (Mario Kart, 50%,
 Profiler on): races at 25-29 fps (23-26 on 03.98); fastmem's "pages not back to back" declines 78
 a second at boot then 0-3 (from 2,000, 1,200, 400-600, 150). The main thread still ran 75% of a

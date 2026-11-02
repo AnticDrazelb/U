@@ -1,7 +1,7 @@
 # Eden for PS4: performance progress
 
 Where the work stands, what was done, what was tried and ruled out, and what's next. Updated at
-**04.00** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
+**04.01** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
 are the patches in [patches/](patches) (0001-0087, applied in order to Eden; see "How to work").
 
@@ -29,7 +29,8 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 03.97 | 24-28 | NEON loads/stores faster; no visible change (different track) |
 | 03.98 | 23-26 | Profiler on (costs a little) |
 | 03.99 | 25-29 | Profiler on: the game's globals on fastmem; one 20 s freeze |
-| 04.00 | not tested yet | the freeze's cause fixed |
+| 04.00 | 24-29 | Profiler on: no freeze in ~6 minutes |
+| 04.01 | not tested yet | 11-19% fewer instructions in the harness's loops and calls |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
 the frame rate: it's CPU-bound. Other games: Celeste plays smoothly; Captain Toad (64-bit) was at
@@ -102,6 +103,11 @@ about 15 fps in 03.80, limited by its main thread.
 - 03.91: one xbyak configuration for the whole program (the strict copy from `video_core` broke
   `jmp qword[...]`: Mario Kart crashed at start in 03.89/03.90).
 
+- 04.01: an add or a shift by 1-3 whose operand is used again is a `lea` into a new register (it
+  used to copy the operand out of the way first: every `[r3, #8]` with `r3` used again paid a
+  `mov`); a conditional branch right after the flags are stored takes them from the register.
+  11-19% fewer host instructions in the harness's loops, calls and structure accesses.
+
 ### Threads and scheduling
 
 - Pinned threads (setting, on by default): emulated cores 0-2 and the GPU thread each on a core of
@@ -146,20 +152,24 @@ about 15 fps in 03.80, limited by its main thread.
 - **Service calls:** ~2% of the main thread; not worth a redesign yet.
 - **Clock reads:** already from the TSC (`__wrap_clock_gettime`); 04.00 only removed a shared
   counter its every call incremented.
+- **Writes to GPU-cached memory through the callbacks** (tens of thousands a second in races):
+  invisible in 04.00's profile, so cheap; not worth chasing for speed.
+- **Following unconditional branches into one block (superblocks):** 90% of the hot blocks end in
+  a conditional branch (loops), under 3% in a plain `b`: little to gain.
 - **alechurri/nx-on-orbis** was looked at: nothing it had that this port didn't (owner's call:
   "ours is far superior").
 
 ## Next (most promising first)
 
 1. **Test 04.00** on a console: no freezes; race fps (same track as before, Profiler on or off).
-2. **Writes to GPU-cached memory** (1,000 to 65,000 a second, climbing through a race): find why
-   these pages stay tracked (Eden's buffer cache `OnCPUWrite` returning "GPU modified", so every
-   write is collected through the callback). Probably core 1's memcpy into a streamed buffer.
-3. **Translated code, generic:** the terminal `If` and `ConditionalSelect` reload NZCV from memory
-   right after storing it (use the register); the inline RSB pop reloads PC/upper descriptor it
-   just stored; flag materialisation (`cmc`/`lahf`/`seto`) when nothing reads V or C; the guest
-   register file in memory (23% of hot instructions) needs cross-block register caching or
-   superblocks: the biggest and hardest.
+2. **Translated code, generic** (where the main thread's time goes): fold a constant offset into
+   the fastmem access itself (`mov [r13 + base + 8]`: needs the IR to carry it, the fallback to
+   rebuild the address); `ConditionalSelect` still reloads NZCV; the inline RSB pop reloads the
+   PC/upper descriptor it just stored; flag materialisation (`cmc`/`lahf`/`seto`) when nothing
+   reads V or C; the guest register file in memory (23% of hot instructions) needs cross-block
+   register caching: the biggest and hardest.
+3. **Writes to GPU-cached memory** climb through a race (tens of thousands a second) but cost
+   little (04.00 profile); only if the GPU thread (65% busy) becomes the limit.
 4. **Contended mutex cost** in Eden's kernel (`ArbitrateLock`/`ArbitrateUnlock`, ~12 us an
    unlock): profile `KScopedSchedulerLock`, `UpdateHighestPriorityThreads`, `RescheduleCores`,
    `PhysicalCore::Interrupt`.

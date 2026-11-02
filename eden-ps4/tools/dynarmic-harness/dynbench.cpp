@@ -327,6 +327,7 @@ int main(int argc, char** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         jit.Run();
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        DumpJit();
         std::printf("%s%s: %.3f s, %.1f ns an iteration (slow reads %llu, writes %llu)\n", o.single ? "single walk" : "per access",
                     o.excl ? ", inline exclusives" : ", monitor exclusives",
                     s, s * 1e9 / double(iterations), (unsigned long long)env.slow_reads, (unsigned long long)env.slow_writes);

@@ -1,0 +1,177 @@
+From 9138f21ca403e8527bb229ea92b88b26f7816c64 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 11:10:56 +0000
+Subject: [PATCH] dynarmic x64: LEA into a new register when the operand lives
+ on; flags from the register
+
+- EmitAdd (32 and 64 bits, no flags): an immediate or register add whose operand is used again
+  is `lea result, [op1 + imm]` / `[op1 + op2]` into a scratch register, not a copy of the operand
+  moved out of the way first and the LEA on it (an address's base: `str r1, [r3, #4]`,
+  `[r3, #8]`... each paid a mov). RegAlloc::IsLastUse tells which.
+- LogicalShiftLeft32 by 1-3 of an operand used again: `lea result, [op * 2/4/8]`.
+- EmitCond (an If terminal) right after A32SetCpsrNZCV with nothing emitted between: the flags
+  from the register just stored, not loaded back from JitState.
+
+Host harness with Eden's options and the Jaguar's features, fastmem, callgrind instructions an
+iteration: an indexed loop 14387 -> 12852, an unrolled memset 10579 -> 9053, calls with
+PUSH/POP 561 -> 465, PUSH/POP 505 -> 407, struct accesses 91 -> 77. Old vs new: 2,000 random A32
+programs (gen2/3/4/7/9, ARM and Thumb, fastmem, split stack) and 350 A64 (gen6/8) equal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |  3 ++
+ .../src/dynarmic/backend/x64/emit_x64.cpp     | 10 +++++-
+ .../src/dynarmic/backend/x64/emit_x64.h       |  4 +++
+ .../backend/x64/emit_x64_data_processing.cpp  | 33 +++++++++++++++++--
+ .../src/dynarmic/backend/x64/reg_alloc.cpp    |  8 +++++
+ .../src/dynarmic/backend/x64/reg_alloc.h      |  3 ++
+ 6 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 7030cedf7..5a708512d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -126,6 +126,7 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
+         code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+     }
+ 
++    nzcv_stored_end = nullptr;
+     EmitCondPrelude(ctx);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+     constexpr EmitHandlerFn opcode_handlers[] = {
+@@ -528,6 +529,8 @@ void A32EmitX64::EmitA32SetCpsrNZCV(A32EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(code, args[0]).cvt32();
+     code.mov(dword[code.ABI_JIT_PTR + offsetof(A32JitState, cpsr_nzcv)], to_store);
++    nzcv_stored_end = code.getCurr();
++    nzcv_stored_reg = to_store.getIdx();
+ }
+ 
+ void A32EmitX64::EmitA32GetCpsrNZCV(A32EmitContext& ctx, IR::Inst* inst) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+index b9df3987c..f08bba2b7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -295,7 +295,15 @@ void EmitX64::EmitAddCycles(size_t cycles) {
+ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
+     Xbyak::Label pass;
+ 
+-    code.mov(eax, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
++    if (nzcv_stored_end != nullptr && nzcv_stored_end == code.getCurr() && nzcv_stored_reg >= 0) {
++        // (nothing emitted since the flags were stored: the register still holds them)
++        if (nzcv_stored_reg != eax.getIdx()) {
++            code.mov(eax, Xbyak::Reg32(nzcv_stored_reg));
++        }
++    } else {
++        code.mov(eax, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
++    }
++    nzcv_stored_end = nullptr;
+ 
+     code.LoadRequiredFlagsForCondFromRax(cond);
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 5e540e5f7..294c767cc 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -106,6 +106,10 @@ public:
+     virtual std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const = 0;
+     void EmitAddCycles(size_t cycles);
+     Xbyak::Label EmitCond(IR::Cond cond);
++    // The guest flags just stored from a host register (A32SetCpsrNZCV): where that store's code
++    // ended and the register (x64 format). EmitCond right there takes them from it.
++    const void* nzcv_stored_end = nullptr;
++    int nzcv_stored_reg = -1;
+     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
+     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index d05d4aa03..9e2204b7e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -273,7 +273,15 @@ void EmitX64::EmitLogicalShiftLeft32(EmitContext& ctx, IR::Inst* inst) {
+     auto& carry_arg = args[2];
+ 
+     if (!carry_inst) {
+-        if (shift_arg.IsImmediate()) {
++        if (shift_arg.IsImmediate() && shift_arg.GetImmediateU8() >= 1 && shift_arg.GetImmediateU8() <= 3 &&
++            !operand_arg.IsImmediate() && !ctx.reg_alloc.IsLastUse(operand_arg)) {
++            // (an index scaled by 2, 4 or 8 whose register is used again: LEA from where it is
++            // into a new register, not a copy shifted)
++            const Xbyak::Reg32 operand = ctx.reg_alloc.UseGpr(code, operand_arg).cvt32();
++            const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
++            code.lea(result, code.ptr[operand * (1 << shift_arg.GetImmediateU8())]);
++            ctx.reg_alloc.DefineValue(code, inst, result);
++        } else if (shift_arg.IsImmediate()) {
+             const Xbyak::Reg32 result = ctx.reg_alloc.UseScratchGpr(code, operand_arg).cvt32();
+             const u8 shift = shift_arg.GetImmediateU8();
+ 
+@@ -928,10 +936,31 @@ static void EmitAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, size_t
+ 
+     // Consider using LEA.
+     if (!carry_inst && !overflow_inst && !nzcv_inst && carry_in.IsImmediate() && !carry_in.GetImmediateU1()) {
+-        if (args[1].IsImmediate() && args[1].FitsInImmediateS32()) {
++        if (args[1].IsImmediate() && args[1].FitsInImmediateS32() && !args[0].IsImmediate() && !ctx.reg_alloc.IsLastUse(args[0])) {
++            // (the operand is used again, an address's base most often: LEA from where it is into
++            // a new register, not a copy of it moved out of the way first)
++            Xbyak::Reg const op1 = ctx.reg_alloc.UseGpr(code, args[0]).changeBit(bitsize);
++            Xbyak::Reg const result = ctx.reg_alloc.ScratchGpr(code).changeBit(bitsize);
++            code.lea(result, code.ptr[op1 + args[1].GetImmediateS32()]);
++            ctx.reg_alloc.DefineValue(code, inst, result);
++        } else if (args[1].IsImmediate() && args[1].FitsInImmediateS32()) {
+             Xbyak::Reg const result = ctx.reg_alloc.UseScratchGpr(code, args[0]).changeBit(bitsize);
+             code.lea(result, code.ptr[result + args[1].GetImmediateS32()]);
+             ctx.reg_alloc.DefineValue(code, inst, result);
++        } else if (!args[0].IsImmediate() && !args[1].IsImmediate() && !ctx.reg_alloc.IsLastUse(args[0]) &&
++                   !ctx.reg_alloc.IsLastUse(args[1])) {
++            // (both used again: LEA from where they are into a new register)
++            Xbyak::Reg const op1 = ctx.reg_alloc.UseGpr(code, args[0]).changeBit(bitsize);
++            Xbyak::Reg const op2 = ctx.reg_alloc.UseGpr(code, args[1]).changeBit(bitsize);
++            Xbyak::Reg const result = ctx.reg_alloc.ScratchGpr(code).changeBit(bitsize);
++            code.lea(result, code.ptr[op1 + op2]);
++            ctx.reg_alloc.DefineValue(code, inst, result);
++        } else if (!args[0].IsImmediate() && !args[1].IsImmediate() && !ctx.reg_alloc.IsLastUse(args[0])) {
++            // (the second operand's last use: its register takes the sum)
++            Xbyak::Reg const result = ctx.reg_alloc.UseScratchGpr(code, args[1]).changeBit(bitsize);
++            Xbyak::Reg const op1 = ctx.reg_alloc.UseGpr(code, args[0]).changeBit(bitsize);
++            code.lea(result, code.ptr[op1 + result]);
++            ctx.reg_alloc.DefineValue(code, inst, result);
+         } else {
+             Xbyak::Reg const result = ctx.reg_alloc.UseScratchGpr(code, args[0]).changeBit(bitsize);
+             Xbyak::Reg const op2 = ctx.reg_alloc.UseGpr(code, args[1]).changeBit(bitsize);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+index de81ca3e1..fb0f9240e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+@@ -288,6 +288,14 @@ HostLoc RegAlloc::UseImpl(BlockOfCode& code, IR::Value use_value, std::bitset<32
+     return destination_location;
+ }
+ 
++bool RegAlloc::IsLastUse(const Argument& arg) const noexcept {
++    if (arg.value.IsImmediate()) {
++        return true;
++    }
++    const auto location = ValueLocation(arg.value.GetInst());
++    return location && HostLocIsRegister(*location) && LocInfo(*location).IsLastUse();
++}
++
+ HostLoc RegAlloc::UseScratchImpl(BlockOfCode& code, IR::Value use_value, std::bitset<32> desired_locations) noexcept {
+     if (use_value.IsImmediate()) {
+         return LoadImmediate(code, use_value, ScratchImpl(code, desired_locations));
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+index 2c6409032..6a20618f1 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+@@ -142,6 +142,9 @@ public:
+     RegAlloc(std::bitset<32> gpr_order, std::bitset<32> xmm_order) noexcept;
+ 
+     ArgumentInfo GetArgumentInfo(const IR::Inst* inst) noexcept;
++    /// Whether this argument's value is in a register and this is its last use (a scratch of it
++    /// then costs no copy); immediates count as last uses
++    bool IsLastUse(const Argument& arg) const noexcept;
+     void RegisterPseudoOperation(const IR::Inst* inst) noexcept;
+     inline bool IsValueLive(const IR::Inst* inst) const noexcept {
+         return !!ValueLocation(inst);
+-- 
+2.43.0
+

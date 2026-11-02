@@ -1322,6 +1322,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.01: leaner translated code everywhere. 04.00 ran Mario Kart's races at 24-29 fps (Profiler on) "
+         "with no freezes. Its main thread still spends three quarters of a frame in the game's translated "
+         "code, spread over thousands of places, so this release makes all of that code shorter: reading a "
+         "field of a structure ([r3, #8]) or an array element ([r1, r2, lsl #2]) no longer copies the base "
+         "register first, and a conditional branch right after a compare takes the flags from the register "
+         "instead of reading them back from memory. In tests: 11-19% fewer instructions in loops, calls, "
+         "copies and structure accesses, with 2,350 random programs giving the same results as before.\n"
          "04.00: no more 20-second freezes. 03.99 ran Mario Kart's races at 25-29 fps with the profiler on "
          "(23-26 before): the game's globals now use fastmem (declines down from 2,000 a second to none). But "
          "five minutes in the picture froze for 20 seconds. The hang dump showed the GPU driver's and the "
