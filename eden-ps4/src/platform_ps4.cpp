@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.05: three more cuts to the game's translated code. 04.04 ran your slowest track at 28-31 fps "
+         "(29.6 on average), faster than 04.01 on your usual one; its busiest code no longer saves flags it "
+         "doesn't need. This release goes after what's left: a load or store at a register plus a constant "
+         "([r1, #8], a third of the game's busiest instructions) is now one access instead of an add and the "
+         "access; a float compare and the branch on it (vcmp, vmrs, bgt) is two host instructions instead of "
+         "about thirteen; and byte and halfword loads and stores lose a zero extension they didn't need. In "
+         "tests: 13% fewer instructions in Mario Kart's busiest loops and in game-like code, 9% in zlib, on top "
+         "of 04.04, with the same results as 04.01 in more than 5,000 random programs and zlib built every way.\n"
          "04.04: 04.02's speed-up, where Mario Kart spends its time. 04.03 ran the races at 26-30 fps at 100% "
          "resolution, as 04.01 did at 50%, but in two thirds of the busiest code the flags were still saved and "
          "read back: the code there leads to a function's return or a call within a few instructions, and the "

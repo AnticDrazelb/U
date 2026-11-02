@@ -1,9 +1,9 @@
 # Eden for PS4: performance progress
 
 Where the work stands, what was done, what was tried and ruled out, and what's next. Updated at
-**04.04** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
+**04.05** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
-are the patches in [patches/](patches) (0001-0091, applied in order to Eden; see "How to work").
+are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see "How to work").
 
 ## Goal
 
@@ -33,6 +33,7 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
 | 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
 | 04.03 | 26-30 | at **100%** resolution (28-29 most of the time), Profiler on: as 04.01 at 50% |
+| 04.05 | not tested yet | target 30 min / 32 average on the slowest track; offsets folded, float compares fused: 13% fewer instructions than 04.04 in the busiest loops |
 | 04.04 | 28-31 | the tester's **slowest track**, 50%, Profiler on: median 29.6 (04.01's usual track: 28.1); another track 30-33 (median 30.8); flag code gone from 93% of the hot blocks' samples |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
@@ -133,6 +134,10 @@ about 15 fps in 03.80, limited by its main thread.
   Mario Kart's hottest loops 760 to 536 instructions an iteration, game-like C 7% fewer.
   (04.02 registered the code read as one range per block, megabytes after a call: translation
   slowed to 1.3 ms a block and Mario Kart reached no frame; 04.03 registers each run read.)
+- 04.05: constant offsets in fastmem accesses (`[r13 + base + 8]`, a per-access fault stub rebuilds
+  the address), float compare branches fused (`ucomiss; ja`, the FPSCR's NZCV dead at a block's
+  exit by the same look-ahead), no zero extensions after LDRB/LDRH or before STRB/STRH. 13% fewer
+  instructions than 04.04 in Mario Kart's hottest loops and game-like C, 9% in zlib.
 - 04.04: calls and returns end the look-ahead's paths with the flags set (the procedure call
   standard; 04.03's console run showed most hot blocks lead to a return or a virtual call first),
   and a block whose flags stay live branches on its compare instead of reloading them. zlib 20%
@@ -200,10 +205,9 @@ about 15 fps in 03.80, limited by its main thread.
 1. **Same track, two versions** (04.01 vs 04.04, 50%, Profiler on) to measure 04.02-04.04's gain
    (04.04's console run was on another track); and the **slowest track's** log; race fps (same track as before, Profiler on or off); a
    `hotblocks.log` to see the flag code gone.
-2. **Translated code, generic** (where the main thread's time goes): fold a constant offset into
-   the fastmem access itself (`mov [r13 + base + 8]`: needs the IR to carry it, the fallback to
-   rebuild the address; ~5% of hot instructions are those `lea`s); `ConditionalSelect` still
-   reloads NZCV (a conditional MOV after a compare in the same block); flags still stored where a
+2. **Translated code, generic** (where the main thread's time goes): flags still stored and reloaded
+   across chains of conditional instructions (`ldrbeq; cmpeq; beq`: three blocks); `ConditionalSelect`
+   still reloads NZCV (a conditional MOV after a compare in the same block); flags still stored where a
    successor returns or jumps through a register first (a conditional early return); the inline
    RSB pop reloads the PC/upper descriptor it just stored; the guest register file in memory (27%
    of hot instructions) needs cross-block register caching: the biggest and hardest.

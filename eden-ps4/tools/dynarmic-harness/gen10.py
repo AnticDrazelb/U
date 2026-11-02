@@ -67,9 +67,19 @@ def setter():
         return [f"{op} {d}, {n}, {m}" if rng.random() < 0.5 else f"{op} {d}, {n}, #{imm()}"]
     if k < 0.9:
         return [f"{rng.choice(['lsls', 'lsrs', 'asrs'])} {d}, {n}, {m}"]  # by a register: by 0 keeps C
-    if k < 0.95:
+    if k < 0.93:
         return [f"muls {d}, {n}, {m}"]
-    return [f"vcmp.f32 s{rng.randrange(0, 16)}, s{rng.randrange(0, 16)}", "vmrs APSR_nzcv, fpscr"]
+    # float compares into the flags: f32, f64, against #0, signalling
+    x = rng.random()
+    if x < 0.4:
+        cmp = f"vcmp.f32 s{rng.randrange(0, 16)}, s{rng.randrange(0, 16)}"
+    elif x < 0.6:
+        cmp = f"vcmpe.f32 s{rng.randrange(0, 16)}, #0"
+    elif x < 0.8:
+        cmp = f"vcmp.f64 d{rng.randrange(0, 8)}, d{rng.randrange(0, 8)}"
+    else:
+        cmp = f"vcmp.f32 s{rng.randrange(0, 16)}, #0"
+    return [cmp, "vmrs APSR_nzcv, fpscr"]
 
 
 def full_setter():
@@ -102,8 +112,16 @@ def reader():
         return save_flags()
     if k < 0.75:
         return [f"str{c} {d}, [r12, #{4 * rng.randrange(0, 60)}]"]
-    if k < 0.85:
+    if k < 0.8:
         return [f"cmp{c} {n}, {m}"]  # a conditional setter: reads, and doesn't set for sure
+    if k < 0.85:
+        # the FPSCR (its NZCV a VCMP's) into memory
+        global slot_n
+        slot_n += 1
+        # (keeping to the call standard, the FPSCR's NZCV isn't preserved across a call or a return:
+        # what reads the whole FPSCR there, as fegetenv, carries those bits along unread)
+        mask = [f"bic {d}, {d}, #0xf0000000"] if ABI else []
+        return [f"vmrs {d}, fpscr"] + mask + [f"str {d}, [r12, #{4 * (slot_n % 60)}]"]
     return [f"vmov{c}.f32 s{rng.randrange(0, 16)}, s{rng.randrange(0, 16)}"]
 
 

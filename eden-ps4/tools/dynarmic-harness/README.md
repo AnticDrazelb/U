@@ -69,6 +69,12 @@ programs/c/game.bin <frames> arm`); `programs/c/zbench.c` zlib's deflate and inf
 compiler output, for changes that rely on the procedure call standard (`DYN_NZCV_ABI`, which
 random programs that don't keep to it fail; `GEN_ABI=1 gen10.py` makes ones that do).
 
+What the translated code executes, instruction by instruction: `valgrind --tool=callgrind
+--dump-instr=yes --smc-check=all` with `DUMP_JIT` and `PERF_BUILDID_DIR` (each block's code and
+address), the costs at the blocks' addresses, disassembled and grouped (04.05 chose its changes so).
+`programs/wrap.s`: loads and stores whose base plus offset passes 4 GiB, and on the marked and
+unmapped pages (`DYN_FOLD`). `DYN_EXT`: no redundant extensions.
+
 Instruction counts (no hardware counters in a VM): `valgrind --tool=lackey --basic-counts=yes
 --smc-check=all ./dynbench bench <bin> N` at two N, the difference over the iterations (bench mode
 runs N twice). `DUMP_JIT=<dir> PERF_BUILDID_DIR=<dir>` dumps each block's code in `bench`, `image`

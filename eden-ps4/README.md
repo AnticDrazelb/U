@@ -379,6 +379,44 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.05: **constant offsets in fastmem accesses, float compare branches, no redundant
+extensions.** 04.04 on a console (50%, Profiler on): the tester's slowest track at 28.2-30.9 fps
+(median 29.6), another track 29.7-32.9 (30.8), 04.01's usual track 26.7-28.9 (28.1): the main
+thread's work a race frame 27.1 ms on 04.01, 25.3 ms on 04.04's slowest track; flag code gone from
+93% of the hottest blocks' samples. The tester's target: 30 minimum, 32 average. What the
+translated code of compiled ARM C executes, instruction by instruction (callgrind with
+`--dump-instr`, the harness's `DUMP_JIT` and perf map; `cgjit.py`-style classification): guest
+register loads and stores 23-29%, LEAs 11-16% (2-7% an address used by the next access alone),
+a float compare and its branch ~10% of a float-heavy program (`ucomiss`, then `sete/rcl/shr/pext`
+into the FPSCR's and CPSR's NZCV, `cmp al; sahf; jcc`), a `movzx` after every LDRB/LDRH and before
+every STRB/STRH. In Mario Kart's 60 hottest blocks a third of the guest instructions are loads and
+stores at a register plus a positive constant (and none is a float compare).
+
+- Patch 0092, `UserConfig::fold_address_offsets` (on in Eden): before a block is emitted
+  (`A32EmitX64::FoldAddressOffsets`), a plain fastmem load or store through `Add32(base, 1..65535)`
+  used by it alone takes the base and puts the constant in its displacement: `[r13 + base + 8]`,
+  no LEA. A fault there fake-calls a per-access stub (`push base; lea base32, [base + 8]; call` the
+  fallback; `pop; ret`): the address whole with the 32-bit wrap (an address past 4 GiB faults in
+  the arena, which reaches 2^39; negative constants aren't folded, they could go below it).
+- `UserConfig::skip_redundant_extensions` (on): a zero extension of a byte or halfword just loaded
+  is the load's value; a byte or halfword store of a word's low bits stores from the word's
+  register.
+- Float compares: `CondFlagsFP32/64`, `ucomis` of the operands in the order the condition needs
+  (swapped for MI, PL, CS, CC, HI, LS), one jump (EQ and NE also test the parity: unordered). The
+  look-ahead also tells whether the FPSCR's NZCV is dead at a block's exit (a VMRS reads it; VCMP,
+  VMSR set it; calls and returns as for the flags): its stores go, and the compare with them.
+  `vcmp; vmrs APSR_nzcv, fpscr; bgt` is `ucomiss; ja`. With the call standard the FPSCR's NZCV
+  isn't preserved across a call or a return (as the standard has it): a function that reads the
+  whole FPSCR there (`fegetenv`, a rounding mode change) may see stale condition bits, which it
+  carries along unread. The random programs that read it there (`GEN_ABI=1 gen10.py`, 3 in 400)
+  differed until they masked those bits, as such code does; exact mode is exact.
+- Host harness (valgrind's instruction count, 04.04 -> 04.05): game-like C 122,570 -> 107,047 a
+  frame (133,744 on 04.01), zlib 21.94M -> 20.04M (27.58M), Mario Kart's hottest loops 537 -> 469
+  an iteration (760). Old vs new: more than 5,000 random A32 programs equal to 04.01 (gen, gen2-4,
+  gen7, gen9, gen10 with more float compares and FPSCR reads; fastmem, split stack; calls with and
+  without the call standard), `programs/wrap.s` (addresses past 4 GiB, the marked and unmapped
+  pages), zlib and the C benchmark at -O1, -O2, -O3 and -Os. Translation at scale as 04.04.
+
 04.04: **calls and returns end the flags; a live block's branch tests its compare.** 04.03 on a
 console (Mario Kart, **100%** resolution, Profiler on): races at 26-30 fps, 28-29 most of the
 time, as 04.01 at 50% (the PS4's GPU 14% busy, 10% at 50%; Eden's GPU thread waiting for it 10-12%

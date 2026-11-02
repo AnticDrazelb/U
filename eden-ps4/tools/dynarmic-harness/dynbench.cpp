@@ -173,7 +173,9 @@ Dynarmic::ExclusiveMonitor g_monitor{1};
 void* FastmemArena(Env& env) {
     static void* arena = nullptr;
     if (!arena) {
-        arena = mmap(nullptr, size_t(1) << 32, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        // (4 GiB and 64 KiB past it reserved, as the PS4's 2^39 arena has room past 4 GiB: an address
+        // folded into a displacement (fold_address_offsets) can pass 4 GiB there, and faults)
+        arena = mmap(nullptr, (size_t(1) << 32) + 0x10000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         for (size_t i = 0; i < kDataSize / 4096; i++) {
             const uint32_t vaddr = kData + uint32_t(i * 4096);
             if (vaddr == kUnmapped || vaddr == kMarked)
@@ -223,6 +225,10 @@ Dynarmic::A32::UserConfig MakeConfig(Env& env, const Options& o) {
     config.elide_dead_nzcv = std::getenv("DYN_NZCV") != nullptr;
 #ifdef HAVE_DEAD_NZCV_ABI
     config.elide_dead_nzcv_abi = std::getenv("DYN_NZCV_ABI") != nullptr;
+#endif
+#ifdef HAVE_FOLD
+    config.fold_address_offsets = std::getenv("DYN_FOLD") != nullptr;
+    config.skip_redundant_extensions = std::getenv("DYN_EXT") != nullptr;
 #endif
 #endif
 #endif
