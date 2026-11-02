@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "03.99: the game's own globals on the fast path. 03.98's profile and thread list showed Mario Kart's "
+         "main thread running three quarters of the time and waiting on two helper threads the rest, all of "
+         "them in the game's translated code, its time spread thinly over thousands of places. Looking at that "
+         "code: every read of the game's global variables, its constants and its function tables took the slow "
+         "way (a page table look-up), about 135,000 places in a session. The cause: Eden places the game's code "
+         "at a random address in 4 KiB steps, and three times in four that put all of it out of line with the "
+         "PS4's 16 KiB pages, so fastmem couldn't reach any of it. Now the step is 16 KiB (still random), and "
+         "the last odd pages of a large allocation come as one lined-up piece too.\n"
          "03.98: a look at which of the game's threads hold a frame up. 03.97's log showed Mario Kart's "
          "main thread (core 0) waiting for other threads about 28% of the time, and a lock it and a "
          "thread on core 2 take turns at about 1,100 times a second. The 30-second lines now list the "

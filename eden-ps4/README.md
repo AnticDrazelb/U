@@ -377,6 +377,28 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+03.99: **the game's code region lined up with the PS4's pages.** 03.98 on a console (Mario Kart,
+50%, Profiler on): races at 23-26 fps. The busiest threads in a race: the main thread (core 0,
+priority 44) running 76% of the time, waiting on a condition variable 23% and on locks 4%; two
+helpers at priority 44 (core 2: running 61%, waiting 38%; core 1: 43%, 48%), a job system; a
+priority-32 thread on core 1 running 12%, waiting on objects 87%. The profile's race windows on
+core 0: about 61% translated code with no hot spot (the busiest block 0.2%), 8% Eden's own code
+(the scheduler, SVC arguments), the rest idle (spinning in `PhysicalCore::Idle`, its
+`clock_gettime`, or asleep). In the hot blocks of today's build, a getter's literal-pool load,
+GOT load and global's load walked the page table while its heap loads used fastmem; fastmem had
+declined "pages not back to back" about 135,000 times in the session (2,000 a second at boot,
+400-600 in menus, 150 at a race's start). The loaders put the code region at 0x200000 plus a
+random 4 KiB step (`aslr_offset`, "this is bad form of ASLR"), while its memory comes in blocks
+at their own size's boundary: three times in four every 16 KiB of the game's code, constants and
+globals was out of line with the DRAM by 4, 8 or 12 KiB.
+
+- Patch 0086: on the PS4 the loaders' (`deconstructed_rom_directory.cpp`, `nro.cpp`) ASLR offset
+  is a 16 KiB step.
+- Patch 0086: `KMemoryManager::AllocatePageGroupImpl` gives the rest under 64 KiB as one run at a
+  16 KiB boundary (`AllocateAligned`) instead of single 4 KiB pages anywhere (a code region's
+  end, often its globals); the PS4 and `EDEN_TEST_ARENA_LINE_UP` desktop builds. Desktop:
+  `test.sh` 0 failed, the run taken (logged in test builds).
+
 03.98: **which threads a frame waits on.** 03.97 on a console (Mario Kart, 50%, Profiler off): races
 at 24-28 fps, as 03.96 (a different track); core 0 idle 29%, cores 1 and 2 36% and 30%. Core 0's
 threads' system calls a second: `WaitProcessWideKeyAtomic` 281 ms (794 calls: the main thread
