@@ -1,0 +1,475 @@
+From 2329fdee5b21f69ec82f5bbfb8eea2e0a99e1305 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 18:29:17 +0000
+Subject: [PATCH] PS4: small savings on the main thread's path: cold code
+ apart, returns take the PC from registers, plain TLS reads
+
+- dynarmic A32 (UserConfig::split_cold_code, on in Eden): a block's deferred emits go to cold
+  chunks taken from the code cache's top down while blocks fill it upwards (bounded up front,
+  the chunk's end the assembler's limit while written; inline as before if too large).
+- An inline return or fast dispatch whose block ends with BXWritePC takes the new PC and upper
+  location descriptor from ecx/ebx instead of loading back what it just stored.
+- KernelCore's thread-local data trivially destructible (constinit; the dummy KThread a thread
+  may own a thread-local of its own): GetCurrentEmuThread without __tls_init.
+- CoreTiming::UnscheduleEvent compares owners instead of lock()ing each queued weak pointer.
+- The services' host threads spin up to 250 us (twice their last wait) after a short wait,
+  50 us otherwise; their wakes are counted for the launcher's log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |  7 ++
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  2 +
+ src/core/core_timing.cpp                      |  4 +-
+ src/core/hle/kernel/k_thread.cpp              | 40 +++++++++--
+ src/core/hle/kernel/k_thread.h                |  3 +
+ src/core/hle/kernel/kernel.cpp                | 11 +--
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp | 71 ++++++++++++++++---
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |  5 ++
+ .../dynarmic/backend/x64/block_of_code.cpp    | 54 +++++++++++++-
+ .../src/dynarmic/backend/x64/block_of_code.h  | 21 ++++++
+ .../src/dynarmic/interface/A32/config.h       |  6 ++
+ 11 files changed, 201 insertions(+), 23 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 0450b7300c..487152b09b 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -48,6 +48,13 @@ inline LockStats lock_scheduler, lock_timer, lock_kernel_other, lock_core_contex
+ // for the earliest anyway, and sees it then)
+ inline std::atomic<uint64_t> timing_wakes{0}, timing_wakes_skipped{0};
+ 
++// The services' host threads (KThread's dummy threads) waiting for their next request: woken
++// while they still spun, or after sleeping (and the time from the signal until they ran); the
++// spin is longer (to 250 us) after a short wait (requests coming close together, 04.07)
++inline std::atomic<uint64_t> service_spin_wakes{0};
++inline Counter service_sleep_wakes;
++inline std::atomic<uint64_t> service_long_spins{0};
++
+ // An emulated core that had nothing to run: woken while it still spun (no host sleep), or after
+ // sleeping (the time from the interrupt to running again)
+ inline std::atomic<uint64_t> idle_spin_wakes{0};
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 53a3bfa9d9..e2346c89ea 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -234,6 +234,8 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.fold_address_offsets = true;
+     // and LDRB/LDRH/STRB/STRH without zero extensions of their own
+     config.skip_redundant_extensions = true;
++    // (04.07) each block's rarely run code apart from it: the code that runs packed together
++    config.split_cold_code = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index 21f636a51d..b29eb529a9 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -229,7 +229,9 @@ void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
+         std::vector<heap_t::handle_type> to_remove;
+         for (auto itr = event_queue.begin(); itr != event_queue.end(); itr++) {
+             const Event& e = *itr;
+-            if (e.type.lock().get() == event_type.get()) {
++            // (the same owner: no lock() of each queued event's weak pointer, an atomic
++            // update of a count the timing thread updates too)
++            if (!e.type.owner_before(event_type) && !event_type.owner_before(e.type)) {
+                 to_remove.push_back(itr->handle);
+             }
+         }
+diff --git a/src/core/hle/kernel/k_thread.cpp b/src/core/hle/kernel/k_thread.cpp
+index e7014a0a34..2b7086c978 100644
+--- a/src/core/hle/kernel/k_thread.cpp
++++ b/src/core/hle/kernel/k_thread.cpp
+@@ -22,6 +22,7 @@
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
+ #include "common/cpu_features.h"
++#include "common/ps4_perf.h"
+ #include "common/fiber.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+@@ -1335,18 +1336,42 @@ namespace Kernel {
+         // A host thread waiting for the game (a service for its next request) is usually woken
+         // within microseconds, and waking a sleeping host thread costs more than that on the PS4,
+         // on every service call: it spins for a while first (as an idle emulated core does).
+-        constexpr auto SpinTime = std::chrono::microseconds(50);
+-        const auto spin_end = Common::g_wall_clock.GetTimeNS() + SpinTime;
+-        while (!m_dummy_thread_runnable.load(std::memory_order_acquire) &&
+-               Common::g_wall_clock.GetTimeNS() < spin_end) {
++        // 50 us; after a wait shorter than 250 us (requests coming close together: the game's
++        // calls in a burst), twice that wait, up to 250 us (04.07). Bounded by what the requests
++        // themselves did: a thread whose requests are far apart spins 50 us.
++        constexpr u64 SpinNs = 50'000, LongSpinMaxNs = 250'000;
++        const u64 begin = u64(Common::g_wall_clock.GetTimeNS().count());
++        const u64 last = m_dummy_last_wait_ns;
++        u64 spin_ns = SpinNs;
++        if (last > SpinNs / 2 && last < LongSpinMaxNs) {
++            spin_ns = std::min(2 * last, LongSpinMaxNs);
++            Common::PS4Perf::service_long_spins.fetch_add(1, std::memory_order_relaxed);
++        }
++        const u64 spin_end = begin + spin_ns;
++        u64 now = begin;
++        while (!m_dummy_thread_runnable.load(std::memory_order_acquire) && now < spin_end) {
+             for (int i = 0; i < 16; i++) {
+                 _mm_pause();
+             }
++            now = u64(Common::g_wall_clock.GetTimeNS().count());
+         }
++        const bool spun = m_dummy_thread_runnable.load(std::memory_order_acquire);
+ #endif
+         // Block until runnable is no longer false.
+-        std::unique_lock lock{m_dummy_thread_mutex};
+-        m_dummy_thread_cv.wait(lock, [this] { return m_dummy_thread_runnable.load(); });
++        {
++            std::unique_lock lock{m_dummy_thread_mutex};
++            m_dummy_thread_cv.wait(lock, [this] { return m_dummy_thread_runnable.load(); });
++        }
++#ifdef __OPENORBIS__
++        const u64 end = u64(Common::g_wall_clock.GetTimeNS().count());
++        m_dummy_last_wait_ns = end - begin;
++        if (spun) {
++            Common::PS4Perf::service_spin_wakes.fetch_add(1, std::memory_order_relaxed);
++        } else {
++            const u64 signal = m_dummy_signal_ns.load(std::memory_order_relaxed);
++            Common::PS4Perf::service_sleep_wakes.Add(end > signal ? end - signal : 0);
++        }
++#endif
+     }
+ 
+     void KThread::DummyThreadEndWait(KernelCore& kernel) {
+@@ -1354,6 +1379,9 @@ namespace Kernel {
+         ASSERT(this->IsDummyThread());
+ 
+         // Wake up the waiting thread.
++#ifdef __OPENORBIS__
++        m_dummy_signal_ns.store(u64(Common::g_wall_clock.GetTimeNS().count()), std::memory_order_relaxed);
++#endif
+         {
+             std::scoped_lock lock{m_dummy_thread_mutex};
+             m_dummy_thread_runnable = true;
+diff --git a/src/core/hle/kernel/k_thread.h b/src/core/hle/kernel/k_thread.h
+index 200e340762..f8a53a9a3d 100644
+--- a/src/core/hle/kernel/k_thread.h
++++ b/src/core/hle/kernel/k_thread.h
+@@ -929,6 +929,9 @@ private:
+     std::atomic<bool> m_dummy_thread_runnable{true};
+     std::mutex m_dummy_thread_mutex{};
+     std::condition_variable m_dummy_thread_cv{};
++    // (the PS4: when it was last signalled, and how long its last wait was: common/ps4_perf.h)
++    std::atomic<u64> m_dummy_signal_ns{0};
++    u64 m_dummy_last_wait_ns = ~u64(0);
+ 
+     // For debugging
+     std::vector<KSynchronizationObject*> m_wait_objects_for_debugging{};
+diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
+index b404fa4bb0..63938486fc 100644
+--- a/src/core/hle/kernel/kernel.cpp
++++ b/src/core/hle/kernel/kernel.cpp
+@@ -53,8 +53,10 @@
+ namespace Kernel {
+ 
+ // Can only be used by a single implementation PER THREAD
++// (trivially destructible, so a plain thread-local read: the dummy KThread a host thread may own,
++// which has a destructor, is a thread-local of its own. With it in here every access went through
++// the thread-local's init guard, __tls_init: GetCurrentEmuThread, on each system call, 04.07)
+ struct ThreadLocalData {
+-    std::optional<KThread> raw_thread;
+     KThread* current_thread = nullptr;
+     KThread* thread = nullptr;
+     u8 host_thread_id = UINT8_MAX;
+@@ -79,7 +81,8 @@ struct KernelCore::Impl {
+     // And we have the guarantee that the data won't move out of the way so we can safely
+     // take a reference to it. This isn't always universally true but this is "global" data
+     // so it will be statically given a TLS slot anyways.
+-    static inline thread_local ThreadLocalData tls_data = {};
++    static inline constinit thread_local ThreadLocalData tls_data = {};
++    static inline thread_local std::optional<KThread> tls_raw_thread;
+ 
+     explicit Impl(Core::System& system_, KernelCore& kernel_) : system{system_} {
+         tls_data.lock = true;
+@@ -402,8 +405,8 @@ struct KernelCore::Impl {
+                 ASSERT(KThread::InitializeDummyThread(system, thread, nullptr).IsSuccess());
+                 return thread;
+             };
+-            t.raw_thread.emplace(system.Kernel());
+-            t.thread = existing_thread ? existing_thread : initialize(&*t.raw_thread);
++            tls_raw_thread.emplace(system.Kernel());
++            t.thread = existing_thread ? existing_thread : initialize(&*tls_raw_thread);
+             ASSERT(t.thread != nullptr);
+         }
+         return t.thread;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index d83304e2ec..9b4b3a3e88 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -88,6 +88,7 @@ A32EmitX64::A32EmitX64(BlockOfCode& code, A32::UserConfig conf, A32::Jit* jit_in
+     GenFastmemFallbacks();
+     GenTerminalHandlers();
+     code.PreludeComplete();
++    code.EnableColdCode(this->conf.split_cold_code);
+     ClearFastDispatchTable();
+ 
+     if (conf.fastmem_pointer.has_value()) {
+@@ -129,6 +130,7 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
+ 
+     nzcv_stored_end = nullptr;
+     host_cond_flags = HostCondFlags::None;
++    exit_descriptor_in_rbx_rcx = false;
+     FoldAddressOffsets(ctx, block);
+     EmitCondPrelude(ctx);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+@@ -189,9 +191,19 @@ finish_this_inst:
+     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+     code.int3();
+ 
+-    for (auto& deferred_emit : ctx.deferred_emits)
+-        deferred_emit();
+-    code.int3();
++    // the rarely run code: apart (split_cold_code), or after the block
++    if (!ctx.deferred_emits.empty() &&
++        code.SwitchToColdCode(ctx.deferred_emits.size() * BlockOfCode::COLD_BOUND_PER_EMIT)) {
++        for (auto& deferred_emit : ctx.deferred_emits) {
++            deferred_emit();
++        }
++        code.int3();
++        code.SwitchToHotCode();
++    } else {
++        for (auto& deferred_emit : ctx.deferred_emits)
++            deferred_emit();
++        code.int3();
++    }
+ 
+     const size_t size = size_t(code.getCurr() - entrypoint);
+ 
+@@ -850,9 +862,20 @@ void A32EmitX64::EmitA32BXWritePC(A32EmitContext& ctx, IR::Inst* inst) {
+         code.mov(MJitStateReg(A32::Reg::PC), new_pc & mask);
+         code.mov(dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)], new_upper);
+     } else {
+-        const Xbyak::Reg32 new_pc = ctx.reg_alloc.UseScratchGpr(code, arg).cvt32();
++        // (the block's exit takes them from ecx and ebx: see ExitReadsWrittenPC)
++        const bool to_exit = ExitReadsWrittenPC(ctx, inst);
++        Xbyak::Reg32 new_pc, new_upper;
++        if (to_exit) {
++            ctx.reg_alloc.UseScratch(code, arg, HostLoc::RCX);
++            new_pc = ecx;
++            new_upper = ctx.reg_alloc.ScratchGpr(code, HostLoc::RBX).cvt32();
++        } else {
++            new_pc = ctx.reg_alloc.UseScratchGpr(code, arg).cvt32();
++        }
+         const Xbyak::Reg32 mask = ctx.reg_alloc.ScratchGpr(code).cvt32();
+-        const Xbyak::Reg32 new_upper = ctx.reg_alloc.ScratchGpr(code).cvt32();
++        if (!to_exit) {
++            new_upper = ctx.reg_alloc.ScratchGpr(code).cvt32();
++        }
+ 
+         code.mov(mask, new_pc);
+         code.and_(mask, 1);
+@@ -861,7 +884,33 @@ void A32EmitX64::EmitA32BXWritePC(A32EmitContext& ctx, IR::Inst* inst) {
+         code.and_(new_pc, mask);
+         code.mov(MJitStateReg(A32::Reg::PC), new_pc);
+         code.mov(dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)], new_upper);
++        exit_descriptor_in_rbx_rcx = to_exit;
++    }
++}
++
++bool A32EmitX64::ExitReadsWrittenPC(A32EmitContext& ctx, const IR::Inst* inst) const {
++    // Its last instruction, and an exit (possibly after the halt check, which only compares memory)
++    // that reads the PC and upper descriptor first thing: nothing runs in between to change ebx
++    // or ecx (no cycle counting either)
++    if (ctx.IsSingleStep() || conf.enable_cycle_counting || ctx.block.instructions.empty() ||
++        &ctx.block.instructions.back() != inst) {
++        return false;
+     }
++    const IR::Term::Terminal terminal = ctx.block.GetTerminal();
++    const IR::Term::LeafTerminal* leaf = std::get_if<IR::Term::LeafTerminal>(&terminal);
++    if (const auto* halt = std::get_if<IR::Term::CheckHalt>(&terminal)) {
++        leaf = &halt->else_;
++    }
++    if (leaf == nullptr) {
++        return false;
++    }
++    if (std::holds_alternative<IR::Term::PopRSBHint>(*leaf)) {
++        return conf.inline_rsb_pop && conf.HasOptimization(OptimizationFlag::ReturnStackBuffer);
++    }
++    if (std::holds_alternative<IR::Term::FastDispatchHint>(*leaf)) {
++        return conf.inline_fast_dispatch && conf.HasOptimization(OptimizationFlag::FastDispatch);
++    }
++    return false;
+ }
+ 
+ void A32EmitX64::EmitA32UpdateUpperLocationDescriptor(A32EmitContext& ctx, IR::Inst*) {
+@@ -1341,9 +1390,11 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+         // terminal_handler_pop_rsb_hint, here: this return's own indirect jump, which the host's
+         // branch predictor learns on its own, instead of the one all returns share
+         auto& code = e.code;
+-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)]);
++        if (!e.exit_descriptor_in_rbx_rcx) {
++            code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)]);
++            code.mov(ecx, MJitStateReg(A32::Reg::PC));
++        }
+         code.shl(rbx, 32);
+-        code.mov(ecx, MJitStateReg(A32::Reg::PC));
+         code.or_(rbx, rcx);
+         code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A32JitState, rsb_ptr)]);
+         code.sub(eax, 1);
+@@ -1368,9 +1419,11 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
+     } else if (e.conf.inline_fast_dispatch) {
+         // terminal_handler_fast_dispatch_hint, here (its miss path shared): this site's own jump
+         auto& code = e.code;
+-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)]);
++        if (!e.exit_descriptor_in_rbx_rcx) {
++            code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A32JitState, upper_location_descriptor)]);
++            code.mov(ecx, MJitStateReg(A32::Reg::PC));
++        }
+         code.shl(rbx, 32);
+-        code.mov(ecx, MJitStateReg(A32::Reg::PC));
+         code.mov(edi, ecx);
+         code.or_(rbx, rcx);
+         code.mov(r8, reinterpret_cast<u64>(e.fast_dispatch_table.data()));
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index 41c11ada52..3409225b92 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -149,6 +149,11 @@ public:
+     // every such access is compiled to walk the page table (shared), none left to fault first
+     // (the stack's after a few: stacks are mostly where fastmem reaches, the kernel lines them up)
+     bool stack_walks = false, thread_local_walks = false;
++    // (04.07) the block's last instruction, a BXWritePC, left the new PC in ecx and the upper
++    // location descriptor in ebx for its exit (an inline return or fast dispatch), which reads
++    // them from there instead of loading back what it just stored
++    bool exit_descriptor_in_rbx_rcx = false;
++    bool ExitReadsWrittenPC(A32EmitContext& ctx, const IR::Inst* inst) const;
+     unsigned stack_declines = 0;
+     static constexpr unsigned StackDeclinesBeforeWalks = 32;
+     bool HasAccessWithoutFastmem(IR::LocationDescriptor location) const {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+index 8b06bb5e62..7026f1f4e4 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp
+@@ -198,15 +198,63 @@ void BlockOfCode::DisableWriting() {
+ 
+ void BlockOfCode::ClearCache() {
+     ASSERT(prelude_complete);
++    ASSERT(!in_cold);
+     SetCodePtr(code_begin);
++    ResetColdCode();
+ }
+ 
+ size_t BlockOfCode::SpaceRemaining() const {
+     ASSERT(prelude_complete);
+-    const u8* current_ptr = getCurr<const u8*>();
+-    if (current_ptr >= &top_[maxSize_])
++    const u8* current_ptr = in_cold ? hot_saved : getCurr<const u8*>();
++    const u8* limit = cold_enabled ? cold_low : &top_[maxSize_];
++    if (current_ptr >= limit)
+         return 0;
+-    return &top_[maxSize_] - current_ptr;
++    const size_t remaining = size_t(limit - current_ptr);
++    if (!cold_enabled)
++        return remaining;
++    // (room for one more chunk of cold code kept back: the next block may need one)
++    return remaining > COLD_CHUNK_SIZE ? remaining - COLD_CHUNK_SIZE : 0;
++}
++
++void BlockOfCode::ResetColdCode() {
++    cold_low = cold_ptr = cold_end = &top_[in_cold ? saved_max_size : maxSize_];
++}
++
++void BlockOfCode::EnableColdCode(bool on) {
++    ASSERT(!in_cold);
++    cold_enabled = on;
++    ResetColdCode();
++}
++
++bool BlockOfCode::SwitchToColdCode(size_t bound) {
++    ASSERT(!in_cold);
++    if (!cold_enabled || bound > COLD_CHUNK_SIZE)
++        return false;
++    const u8* hot = getCurr<const u8*>();
++    if (size_t(cold_end - cold_ptr) < bound) {
++        // a new chunk below the others (the rest of this one is left unused)
++        if (cold_low < hot || size_t(cold_low - hot) < COLD_CHUNK_SIZE)
++            return false;
++        cold_low -= COLD_CHUNK_SIZE;
++        cold_ptr = cold_low;
++        cold_end = cold_low + COLD_CHUNK_SIZE;
++    }
++    hot_saved = hot;
++    SetCodePtr(cold_ptr);
++    // (the chunk's end as the buffer's for now: code past it would throw, not overwrite the chunk
++    // above)
++    saved_max_size = maxSize_;
++    maxSize_ = size_t(cold_end - top_);
++    in_cold = true;
++    return true;
++}
++
++void BlockOfCode::SwitchToHotCode() {
++    ASSERT(in_cold);
++    cold_ptr = getCurr<const u8*>();
++    maxSize_ = saved_max_size;
++    in_cold = false;
++    SetCodePtr(hot_saved);
+ }
+ 
+ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h
+index 20012a070f..e9fa06a08e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/block_of_code.h
+@@ -143,6 +143,18 @@ public:
+     void SetCodePtr(CodePtr code_ptr);
+     void EnsurePatchLocationSize(CodePtr begin, size_t size);
+ 
++    /// Rarely run code apart (UserConfig::split_cold_code): in chunks taken from the top of the
++    /// cache down, while the blocks fill it upwards; the cache is full when the two meet.
++    void EnableColdCode(bool on);
++    /// Begins writing cold code with room for at most `bound` bytes (a new chunk if the current
++    /// one has less); false if off or it can't (then it goes after the block, as before)
++    bool SwitchToColdCode(size_t bound);
++    /// Back to where the block's code ended
++    void SwitchToHotCode();
++    /// The cold code's chunks: their size, and the most one block's deferred emits may take each
++    static constexpr size_t COLD_CHUNK_SIZE = 512 * 1024;
++    static constexpr size_t COLD_BOUND_PER_EMIT = 1024;
++
+     static const Xbyak::Reg64 ABI_JIT_PTR;
+     // ABI registers
+ #ifdef _WIN32
+@@ -184,6 +196,15 @@ private:
+     size_t committed_size = 0;
+ #endif
+     bool prelude_complete = false;
++    bool cold_enabled = false;
++    bool in_cold = false;
++    const u8* cold_low = nullptr;  // the lowest chunk's start (the blocks' limit)
++    const u8* cold_ptr = nullptr;  // the current chunk: where the next cold code goes
++    const u8* cold_end = nullptr;  // and its end
++    const u8* hot_saved = nullptr;
++    size_t saved_max_size = 0;
++
++    void ResetColdCode();
+ 
+     void GenRunCode(std::function<void(BlockOfCode&)> rcp);
+ };
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 20e211bfa2..edc6629e4b 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -283,6 +283,12 @@ struct UserConfig {
+     /// stored from a register (STRB, STRH) is stored from it without a movzx into another first.
+     bool skip_redundant_extensions = false;
+ 
++    /// A block's rarely run code (fault and slow-path stubs, float special cases: the deferred
++    /// emits) is written apart from the blocks, in chunks taken from the code cache's top down,
++    /// instead of right after each block: the code that runs lies together, in fewer cache lines
++    /// and pages. Jumps there were near jumps already.
++    bool split_cold_code = false;
++
+     /// With fastmem: the loads and stores it was declined for (recompiled to walk the page table),
+     /// when several in a block go through one base register value plus constants (a PUSH or POP, a
+     /// stack frame, a copy loop), share one walk, as without fastmem (page_table_single_walk_multiple)
+-- 
+2.43.0
+

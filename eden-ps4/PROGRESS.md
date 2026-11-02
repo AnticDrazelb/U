@@ -142,6 +142,9 @@ about 15 fps in 03.80, limited by its main thread.
   standard; 04.03's console run showed most hot blocks lead to a return or a virtual call first),
   and a block whose flags stay live branches on its compare instead of reloading them. zlib 20%
   fewer instructions, game-like C 8%.
+- 04.07: each block's rarely run code in cold chunks apart from the blocks (L2 instruction misses
+  -6% in a large game-like program, L1 unchanged); an inline return or fast dispatch takes the PC
+  `BXWritePC` just computed from registers (game-like C -1.0% instructions).
 
 ### Threads and scheduling
 
@@ -203,6 +206,26 @@ about 15 fps in 03.80, limited by its main thread.
 - **alechurri/nx-on-orbis** was looked at: nothing it had that this port didn't (owner's call:
   "ours is far superior").
 
+## Small savings on the main thread's path (a running list)
+
+The tester's point (04.06): savings of 1-2% each are worth having when there are several, and at
+30.5 fps each 1% of the main thread's time is ~0.33 ms a frame (~0.3 fps). The test is whether a
+saving is on the main thread's path (core 0), not its size. Kept here until done or ruled out.
+
+| Item | Share (estimate) | State |
+|---|---|---|
+| Inline return/fast dispatch reloads the PC it just stored | -1.0% instructions (game-like C) | done 04.07 |
+| `__tls_init` on every `GetCurrentEmuThread` | 0.18% + 0.16% of core 0 | done 04.07 |
+| `weak_ptr::lock` per queued event in `UnscheduleEvent` | part of 0.13% | done 04.07 |
+| Rarely run code between the hot code (I-cache, L2) | L2 instruction misses -6% (sim) | done 04.07 |
+| Service requests: hand-off latency (~80 us before taken, ~250 us a main-thread call) | up to ~2% | 04.07: spin to 250 us after short waits (likely few); its log line says how they wake; next: quick requests on the calling thread |
+| Host lock sleeps (`_umtx_op` 8.3% of core 0) | up to ~9% | 04.06: spin before sleeping; check its log line |
+| memcpy on core 0 walks the page table for loads and stores (declined at boot, "pages not back to back") | ~0.2-0.3% of core 0 | open: retry declined accesses, or an inline marked-page check with fastmem |
+| Flags across chains of conditional instructions, `ConditionalSelect` reloading NZCV | 1-2%? | open, needs measuring |
+| `UpdateHighestPriorityThreadsImpl` | 0.33% of core 0 | Horizon's algorithm; nothing obvious |
+| `SetSvcArguments` | 0.22% of core 0 | eight copies: probably sampling skid after the SVC |
+| Guest register file in memory (cross-block register caching) | ~25% of instructions | open: the biggest and hardest |
+
 ## Next (most promising first)
 
 1. **Same track, two versions** (04.01 vs 04.04, 50%, Profiler on) to measure 04.02-04.04's gain
@@ -212,12 +235,12 @@ about 15 fps in 03.80, limited by its main thread.
    across chains of conditional instructions (`ldrbeq; cmpeq; beq`: three blocks); `ConditionalSelect`
    still reloads NZCV (a conditional MOV after a compare in the same block); flags still stored where a
    successor returns or jumps through a register first (a conditional early return); the inline
-   RSB pop reloads the PC/upper descriptor it just stored; the guest register file in memory (27%
+   RSB pop reloaded the PC/upper descriptor it just stored (done 04.07); the guest register file in memory (27%
    of hot instructions) needs cross-block register caching: the biggest and hardest.
-3. **Block entry costs** (a third of the translated code's samples): cold code (fallbacks, halt
-   paths) sits right after each block's hot code (`deferred_emits`), so hot code is spread out
-   (only 64% of a hot block's bytes are hot); a far-code region for it would pack hot code
-   tighter (fewer I-cache lines and pages per frame).
+3. **Block entry costs** (a third of the translated code's samples): the deferred emits are apart
+   since 04.07 (cold chunks); the exits' own slow paths (a link's halt fallback with its RSB push,
+   ~70 bytes) still sit in the hot code. 04.05's busiest blocks (memset, memcpy) run on cores 1
+   and 2: core 0's code is spread thin, no block above 0.25%.
 4. **Writes to GPU-cached memory** climb through a race (tens of thousands a second) but cost
    little (04.00 profile); only if the GPU thread (65% busy) becomes the limit.
 5. **Contended mutex cost** in Eden's kernel (`ArbitrateLock`/`ArbitrateUnlock`, ~11 us an

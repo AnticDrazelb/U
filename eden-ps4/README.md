@@ -379,6 +379,43 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.07: **small savings on the main thread, together.** In 04.05's log the main thread (Mario
+Kart's #79, emulated core 0) was the frame rate's only limit, and its translated code is spread
+thin: no block above 0.25% of core 0 (the busiest blocks in `hotblocks.log`, memset and memcpy
+loops, run mostly on cores 1 and 2). So this release takes small, general savings, each measured
+on its own:
+
+- Patch 0094, `UserConfig::split_cold_code` (on in Eden): a block's deferred emits (fastmem fault
+  stubs, page table walk fallbacks, float special cases) go to cold chunks of 512 KiB taken from
+  the code cache's top down (`BlockOfCode::SwitchToColdCode`), while blocks fill it upwards; the
+  cache is full when the two meet (one chunk's room kept back). A block's cold code is bounded by
+  1 KiB per deferred emit up front (a new chunk if the current one has less; more than a chunk:
+  after the block, as before), and the chunk's end is the assembler's limit while it is written.
+  Jumps into and out of it were near jumps already. Measured with callgrind's cache simulation
+  (Jaguar-like: 32 KiB 2-way instruction cache, 2 MiB L2) on 1,500 generated game-like C functions
+  called every frame (`programs/c/big.py`): instruction cache misses -0.3%, L2 instruction misses
+  -5.7% a frame. Small: the cache only fetches the lines that run.
+- An inline return (`PopRSBHint`) or fast dispatch whose block ends with `BXWritePC` takes the new
+  PC and upper location descriptor from `ecx` and `ebx`, where `BXWritePC` computed them, instead
+  of loading back what it had just stored: game-like C 105,445 -> 104,366 host instructions a frame
+  (-1.0%).
+- `KernelCore`'s thread-local data is trivially destructible (`constinit`; the dummy `KThread` a
+  host thread may own is a thread-local of its own): `GetCurrentEmuThread`, on every system call,
+  is a plain thread-local read instead of a call through `__tls_init` (0.18% of core 0, and
+  `GetCurrentEmuThread` 0.16%, in 04.05's samples).
+- `CoreTiming::UnscheduleEvent` finds the event's entries by owner (`owner_before`) instead of
+  `lock()`ing each queued event's weak pointer (an atomic update of a count the timing thread
+  updates too): every guest sleep and timed wait reprograms the hardware timer through it.
+- The services' host threads (`KThread::DummyThreadBeginWait`) spin 50 us before sleeping, as
+  before, but after a wait shorter than 250 us (requests close together) twice that wait, up to
+  250 us. In 04.05 the main thread's ~95 service calls a second took ~250 us each, and a service's
+  thread took ~80 us on average to pick a request up: a sleeping thread's wake. Bounded by the
+  requests themselves: a thread whose requests are far apart spins 50 us, and that is likely most
+  of them (80 us on average means most found their thread asleep), so this is mostly a measurement:
+  the 30-second line now says how the services' threads were woken (spinning, or after sleeping
+  and how long after the signal) and how many waits spun longer. If isolated requests dominate,
+  the next step is handling quick requests on the calling thread.
+
 04.06: **less sleeping on Eden's host locks.** 04.05 on a console (the tester's slowest track,
 50%, Profiler on): 30-second windows 29.5-31.5 fps (mean 30.5), 10-second ones 28.2-32.0, a dip to
 24.8 at a race start. The helpers' work a frame fell from 20.7 to 18.4 ms, so the game's main thread

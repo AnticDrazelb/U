@@ -230,6 +230,9 @@ Dynarmic::A32::UserConfig MakeConfig(Env& env, const Options& o) {
     config.fold_address_offsets = std::getenv("DYN_FOLD") != nullptr;
     config.skip_redundant_extensions = std::getenv("DYN_EXT") != nullptr;
 #endif
+#ifdef HAVE_COLD
+    config.split_cold_code = std::getenv("DYN_COLD") != nullptr;
+#endif
 #endif
 #endif
     config.code_cache_size = 32u << 20;

@@ -29,6 +29,18 @@ plus e.g. `-DHAVE_DEAD_NZCV`) and switched on at run time (`DYN_NZCV=1`).
 ./dynbench20 test rt/calls.bin arm [options]         # registers, ext registers, memory hash
 ```
 
+## Cache simulation (04.07)
+
+`programs/c/big.py <functions> <seed>` writes game-like C with a large code footprint (every
+function called once a frame through a table, as a game's update and render code is); built like
+`game.c`, it runs in image mode. callgrind with Jaguar-like caches, at two frame counts (the
+difference is the steady frames, without the translation):
+
+```sh
+valgrind --tool=callgrind --cache-sim=yes --I1=32768,2,64 --D1=32768,8,64 --LL=2097152,16,64 \
+    ./dynbench_rsb image programs/c/big1500.bin 4 arm fastmem      # and 2; DYN_COLD=1: cold code apart
+```
+
 ## Differential tests
 
 Random programs from a generator, run on the old harness and the new one (and the new one

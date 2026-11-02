@@ -1322,6 +1322,15 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.07: a batch of small savings on the game's main thread, the one that sets Mario Kart's frame "
+         "rate. Each is small on its own (a fraction of a percent to about one percent), so they come "
+         "together: a function's return no longer reads back the address it just wrote (1% fewer host "
+         "instructions in game-like code); each piece of translated code keeps its rarely run parts (fault "
+         "and slow paths) apart from the code that runs, so more of the running code fits the CPU's caches; "
+         "finding the current thread on every system call is a plain read instead of a call; removing a "
+         "timer event no longer locks every other queued event; and the services' threads, which sleep "
+         "between requests, stay awake longer when the game's requests come close together. The log's "
+         "30-second line now also says how the services' threads were woken.\n"
          "04.06: less sleeping on locks. 04.05 ran your slowest track at 30.5 fps on average (29.5-31.5 over "
          "30 seconds, dips to 28 and to 25 at the start of a race). The game's main thread is now the only "
          "limit, and almost a tenth of its core's time went to the PS4's kernel: whenever an emulated core found "
@@ -2336,6 +2345,26 @@ std::string PerfLine(double seconds)
                             double(wakes - last_wakes) / seconds, double(skipped - last_skipped) / seconds);
         last_wakes = wakes;
         last_skipped = skipped;
+    }
+    // The services' host threads waiting for their next request (04.07: a longer spin, to 250 us,
+    // after a short wait): woken while spinning, or after sleeping
+    {
+        static uint64_t last_spin = 0, last_long = 0, last_sleep = 0, last_sleep_ns = 0;
+        const uint64_t spin = P::service_spin_wakes.load(std::memory_order_relaxed);
+        const uint64_t long_spins = P::service_long_spins.load(std::memory_order_relaxed);
+        const uint64_t sleep = P::service_sleep_wakes.count.load(std::memory_order_relaxed);
+        const uint64_t sleep_ns = P::service_sleep_wakes.total_ns.load(std::memory_order_relaxed);
+        const uint64_t sleep_max = P::service_sleep_wakes.max_ns.exchange(0, std::memory_order_relaxed);
+        line += fmt::format("; the services' threads woken {:.0f} times a second while spinning, {:.0f} after "
+                            "sleeping ({:.0f} us after the signal, at most {:.0f}); {:.0f} of their waits a second "
+                            "spun longer (a short wait before)",
+                            double(spin - last_spin) / seconds, double(sleep - last_sleep) / seconds,
+                            average_us(sleep_ns - last_sleep_ns, sleep - last_sleep), double(sleep_max) / 1000.0,
+                            double(long_spins - last_long) / seconds);
+        last_spin = spin;
+        last_long = long_spins;
+        last_sleep = sleep;
+        last_sleep_ns = sleep_ns;
     }
     // Fastmem: the arena's pages mapped, and its faults (resolved: a page mapped; declined: the
     // recompiler's fallback took the access, and the code there was recompiled without fastmem)
