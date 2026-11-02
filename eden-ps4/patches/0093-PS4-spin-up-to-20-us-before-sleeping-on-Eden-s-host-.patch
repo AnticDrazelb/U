@@ -1,0 +1,339 @@
+From 1274b924f3503afe77171fe5ffd620279cd6ac43 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 17:07:12 +0000
+Subject: [PATCH] PS4: spin up to 20 us before sleeping on Eden's host locks;
+ wake the timing thread only for a new earliest event
+
+The kernel's scheduler and hardware timer locks (KSpinLock), the emulated cores' context locks
+(PhysicalCore::m_guard) and CoreTiming's event queue lock are std::mutexes, which on the PS4 sleep
+in the kernel as soon as they are found taken; waking costs far more than they are held for.
+Common::SpinThenLock (common/ps4_spin_lock.h) tries again for up to 20 us first, bounded so a
+waiter never keeps a holder off its core for long. Each lock class counts its contention
+(PS4Perf::LockStats). ScheduleEvent wakes the timing thread only when the new event is the
+earliest in the queue. Other platforms lock as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                       | 20 ++++++
+ src/common/ps4_spin_lock.h                  | 68 +++++++++++++++++++++
+ src/core/core_timing.cpp                    | 26 ++++++--
+ src/core/hle/kernel/k_hardware_timer_base.h |  4 +-
+ src/core/hle/kernel/k_scheduler_lock.h      |  4 +-
+ src/core/hle/kernel/k_spin_lock.cpp         |  4 +-
+ src/core/hle/kernel/k_spin_lock.h           |  7 +++
+ src/core/hle/kernel/physical_core.cpp       | 12 ++--
+ 8 files changed, 131 insertions(+), 14 deletions(-)
+ create mode 100644 src/common/ps4_spin_lock.h
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 40c02ae92d..0450b7300c 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -28,6 +28,26 @@ struct Counter {
+     }
+ };
+ 
++// Host locks taken (common/ps4_spin_lock.h): a try that failed, then got it while spinning (and
++// the time that took), or slept on it (and the time until it had it)
++struct alignas(64) LockStats {
++    std::atomic<uint64_t> spun{0}, spun_ns{0}, slept{0}, slept_ns{0};
++    void Spun(uint64_t ns) {
++        spun.fetch_add(1, std::memory_order_relaxed);
++        spun_ns.fetch_add(ns, std::memory_order_relaxed);
++    }
++    void Slept(uint64_t ns) {
++        slept.fetch_add(1, std::memory_order_relaxed);
++        slept_ns.fetch_add(ns, std::memory_order_relaxed);
++    }
++};
++// the kernel's scheduler lock, its hardware timer's, its other spin locks (handle tables...), the
++// emulated cores' context locks (PhysicalCore::m_guard), CoreTiming's event queue
++inline LockStats lock_scheduler, lock_timer, lock_kernel_other, lock_core_context, lock_timing;
++// CoreTiming's timing thread woken for a new event (the earliest), or not (a later one: it wakes
++// for the earliest anyway, and sees it then)
++inline std::atomic<uint64_t> timing_wakes{0}, timing_wakes_skipped{0};
++
+ // An emulated core that had nothing to run: woken while it still spun (no host sleep), or after
+ // sleeping (the time from the interrupt to running again)
+ inline std::atomic<uint64_t> idle_spin_wakes{0};
+diff --git a/src/common/ps4_spin_lock.h b/src/common/ps4_spin_lock.h
+new file mode 100644
+index 0000000000..aaf797a654
+--- /dev/null
++++ b/src/common/ps4_spin_lock.h
+@@ -0,0 +1,68 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// Host locks the emulated cores take on every system call and thread switch (the kernel's
++// scheduler lock, the hardware timer's, each core's context lock, CoreTiming's event queue).
++// On the PS4 a std::mutex that is taken sleeps in the kernel at once, and waking from that sleep
++// costs tens of microseconds, far more than these locks are held for. So, on the PS4, a lock
++// that is taken is first tried again for a while (PAUSE between tries), and only then slept on.
++// The spin is bounded: a waiter that spins for ever can keep a lower-priority holder on its own
++// host core from running (04.00's 20-second freeze); this one sleeps after SpinNs, and the holder
++// runs. Each lock class counts its contention (common/ps4_perf.h: LockStats).
++
++#include <cstdint>
++#include <mutex>
++
++#include "common/ps4_perf.h"
++#ifdef __OPENORBIS__
++#include <immintrin.h>
++#include "common/cpu_features.h"
++#endif
++
++namespace Common {
++
++inline void SpinThenLock(std::mutex& m, PS4Perf::LockStats* stats) {
++#ifdef __OPENORBIS__
++    if (m.try_lock())
++        return;
++    constexpr int64_t SpinNs = 20'000;
++    const int64_t begin = g_wall_clock.GetTimeNS().count();
++    int64_t now = begin;
++    do {
++        for (int i = 0; i < 8; i++)
++            _mm_pause();
++        if (m.try_lock()) {
++            if (stats)
++                stats->Spun(static_cast<uint64_t>(g_wall_clock.GetTimeNS().count() - begin));
++            return;
++        }
++        now = g_wall_clock.GetTimeNS().count();
++    } while (now - begin < SpinNs);
++    m.lock();
++    if (stats)
++        stats->Slept(static_cast<uint64_t>(g_wall_clock.GetTimeNS().count() - begin));
++#else
++    (void)stats;
++    m.lock();
++#endif
++}
++
++// std::scoped_lock's place for one mutex, spinning first (on the PS4)
++class SpinLockGuard {
++public:
++    explicit SpinLockGuard(std::mutex& m, PS4Perf::LockStats* stats) : m_m{m} {
++        SpinThenLock(m, stats);
++    }
++    ~SpinLockGuard() {
++        m_m.unlock();
++    }
++    SpinLockGuard(const SpinLockGuard&) = delete;
++    SpinLockGuard& operator=(const SpinLockGuard&) = delete;
++
++private:
++    std::mutex& m_m;
++};
++
++} // namespace Common
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index 1f6217e071..21f636a51d 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -16,6 +16,7 @@
+ #endif
+ 
+ #include "common/ps4_perf.h"
++#include "common/ps4_spin_lock.h"
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+ #include "core/hardware_properties.h"
+@@ -174,21 +175,34 @@ bool CoreTiming::IsRunning() const {
+ }
+ 
+ bool CoreTiming::HasPendingEvents() const {
+-    std::scoped_lock lock{basic_lock};
++    Common::SpinLockGuard lock{basic_lock, &Common::PS4Perf::lock_timing};
+     return !(wait_set && event_queue.empty());
+ }
+ 
+ void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
+                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
++    bool earliest = true;
+     {
+-        std::scoped_lock scope{basic_lock};
++        Common::SpinLockGuard scope{basic_lock, &Common::PS4Perf::lock_timing};
+         const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
+ 
+-        auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
++        const u64 fifo_id = event_fifo_id++;
++        auto h{event_queue.emplace(Event{next_time.count(), fifo_id, event_type, 0})};
+         (*h).handle = h;
++#ifdef __OPENORBIS__
++        // The timing thread waits for the earliest event: a later one needs no wake (it sees it
++        // when it next wakes), and a wake on the PS4 is a system call the scheduling core pays
++        earliest = event_queue.top().fifo_order == fifo_id;
++#endif
+     }
+ 
+-    event.Set();
++#ifdef __OPENORBIS__
++    (earliest ? Common::PS4Perf::timing_wakes : Common::PS4Perf::timing_wakes_skipped)
++        .fetch_add(1, std::memory_order_relaxed);
++#endif
++    if (earliest) {
++        event.Set();
++    }
+ }
+ 
+ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
+@@ -196,7 +210,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
+                                       const std::shared_ptr<EventType>& event_type,
+                                       bool absolute_time) {
+     {
+-        std::scoped_lock scope{basic_lock};
++        Common::SpinLockGuard scope{basic_lock, &Common::PS4Perf::lock_timing};
+         const auto next_time{absolute_time ? start_time : GetGlobalTimeNs() + start_time};
+ 
+         auto h{event_queue.emplace(
+@@ -210,7 +224,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
+ void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
+                                  UnscheduleEventType type) {
+     {
+-        std::scoped_lock lk{basic_lock};
++        Common::SpinLockGuard lk{basic_lock, &Common::PS4Perf::lock_timing};
+ 
+         std::vector<heap_t::handle_type> to_remove;
+         for (auto itr = event_queue.begin(); itr != event_queue.end(); itr++) {
+diff --git a/src/core/hle/kernel/k_hardware_timer_base.h b/src/core/hle/kernel/k_hardware_timer_base.h
+index 75a4a54763..cdc5ca1451 100644
+--- a/src/core/hle/kernel/k_hardware_timer_base.h
++++ b/src/core/hle/kernel/k_hardware_timer_base.h
+@@ -14,7 +14,9 @@ namespace Kernel {
+ 
+ class KHardwareTimerBase {
+ public:
+-    explicit KHardwareTimerBase(KernelCore& kernel) : m_kernel{kernel} {}
++    explicit KHardwareTimerBase(KernelCore& kernel) : m_kernel{kernel} {
++        m_lock.SetStats(&Common::PS4Perf::lock_timer);
++    }
+ 
+     void CancelTask(KTimerTask* task) {
+         KScopedDisableDispatch dd{m_kernel};
+diff --git a/src/core/hle/kernel/k_scheduler_lock.h b/src/core/hle/kernel/k_scheduler_lock.h
+index caa1404f17..4277a9ba78 100644
+--- a/src/core/hle/kernel/k_scheduler_lock.h
++++ b/src/core/hle/kernel/k_scheduler_lock.h
+@@ -19,7 +19,9 @@ class GlobalSchedulerContext;
+ template <typename SchedulerType>
+ class KAbstractSchedulerLock {
+ public:
+-    explicit KAbstractSchedulerLock(KernelCore& kernel) : m_kernel{kernel} {}
++    explicit KAbstractSchedulerLock(KernelCore& kernel) : m_kernel{kernel} {
++        m_spin_lock.SetStats(&Common::PS4Perf::lock_scheduler);
++    }
+ 
+     bool IsLockedByCurrentThread() const {
+         return m_owner_thread == GetCurrentThreadPointer(m_kernel);
+diff --git a/src/core/hle/kernel/k_spin_lock.cpp b/src/core/hle/kernel/k_spin_lock.cpp
+index 8525320374..8fced6f323 100644
+--- a/src/core/hle/kernel/k_spin_lock.cpp
++++ b/src/core/hle/kernel/k_spin_lock.cpp
+@@ -2,11 +2,13 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "core/hle/kernel/k_spin_lock.h"
++#include "common/ps4_spin_lock.h"
+ 
+ namespace Kernel {
+ 
+ void KSpinLock::Lock() {
+-    m_lock.lock();
++    // (on the PS4: tried again for a while before it sleeps: common/ps4_spin_lock.h)
++    Common::SpinThenLock(m_lock, m_stats);
+ }
+ 
+ void KSpinLock::Unlock() {
+diff --git a/src/core/hle/kernel/k_spin_lock.h b/src/core/hle/kernel/k_spin_lock.h
+index 094a1e6be0..7628eef36f 100644
+--- a/src/core/hle/kernel/k_spin_lock.h
++++ b/src/core/hle/kernel/k_spin_lock.h
+@@ -6,6 +6,7 @@
+ #include <mutex>
+ 
+ #include "common/common_funcs.h"
++#include "common/ps4_perf.h"
+ #include "core/hle/kernel/k_scoped_lock.h"
+ 
+ namespace Kernel {
+@@ -21,8 +22,14 @@ public:
+     void Unlock();
+     bool TryLock();
+ 
++    // (the class of lock it counts its contention under: common/ps4_spin_lock.h)
++    void SetStats(Common::PS4Perf::LockStats* stats) {
++        m_stats = stats;
++    }
++
+ private:
+     std::mutex m_lock;
++    Common::PS4Perf::LockStats* m_stats = &Common::PS4Perf::lock_kernel_other;
+ };
+ 
+ // TODO(bunnei): Alias for now, in case we want to implement these accurately in the future.
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index dad9763087..2a1b7d8d8a 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "common/cpu_features.h"
+ #include "common/ps4_perf.h"
++#include "common/ps4_spin_lock.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -51,7 +52,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
+ 
+     const auto EnterContext = [&]() {
+         // Lock the core context.
+-        std::scoped_lock lk{m_guard};
++        Common::SpinLockGuard lk{m_guard, &Common::PS4Perf::lock_core_context};
+ 
+         // Check if we are already interrupted. If we are, we can just stop immediately.
+         if (m_is_interrupted) {
+@@ -82,7 +83,7 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
+         interface->UnlockThread(thread);
+ 
+         // Lock the core context.
+-        std::scoped_lock lk{m_guard};
++        Common::SpinLockGuard lk{m_guard, &Common::PS4Perf::lock_core_context};
+ 
+         // On exit, we no longer are running.
+         m_arm_interface = nullptr;
+@@ -264,7 +265,8 @@ void PhysicalCore::Idle() {
+         return;
+     }
+ #endif
+-    std::unique_lock lk{m_guard};
++    Common::SpinThenLock(m_guard, &Common::PS4Perf::lock_core_context);
++    std::unique_lock lk{m_guard, std::adopt_lock};
+ #ifdef __OPENORBIS__
+     const bool sleeps = !m_is_interrupted;
+ #endif
+@@ -283,7 +285,7 @@ bool PhysicalCore::IsInterrupted() const {
+ 
+ void PhysicalCore::Interrupt() {
+     // Lock core context.
+-    std::scoped_lock lk{m_guard};
++    Common::SpinLockGuard lk{m_guard, &Common::PS4Perf::lock_core_context};
+ 
+     // Load members.
+     auto* arm_interface = m_arm_interface;
+@@ -310,7 +312,7 @@ void PhysicalCore::Interrupt() {
+ }
+ 
+ void PhysicalCore::ClearInterrupt() {
+-    std::scoped_lock lk{m_guard};
++    Common::SpinLockGuard lk{m_guard, &Common::PS4Perf::lock_core_context};
+     m_is_interrupted = false;
+ }
+ 
+-- 
+2.43.0
+

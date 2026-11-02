@@ -33,7 +33,7 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
 | 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
 | 04.03 | 26-30 | at **100%** resolution (28-29 most of the time), Profiler on: as 04.01 at 50% |
-| 04.05 | 28-32 | 50%, Profiler on, track to confirm (slowest?): 30-s windows 29.5-31.5 (mean 30.5), 10-s 28.2-32.0 bar a race start dip; helpers' work a frame 20.7 -> 18.4 ms, the main thread now waits 6.2 ms a frame (8.3) and runs 78-80%: it alone is the limit; Eden's GPU thread 69% busy (50-66%); hot blocks: LEAs 12% -> 6% of instructions |
+| 04.05 | 28-32 | the tester's **slowest track**, 50%, Profiler on: 30-s windows 29.5-31.5 (mean 30.5), 10-s 28.2-32.0 bar a race start dip; helpers' work a frame 20.7 -> 18.4 ms, the main thread now waits 6.2 ms a frame (8.3) and runs 78-80%: it alone is the limit; Eden's GPU thread 69% busy (50-66%); hot blocks: LEAs 12% -> 6% of instructions |
 | 04.04 | 28-31 | the tester's **slowest track**, 50%, Profiler on: median 29.6 (04.01's usual track: 28.1); another track 30-33 (median 30.8); flag code gone from 93% of the hot blocks' samples |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
@@ -150,6 +150,9 @@ about 15 fps in 03.80, limited by its main thread.
 - Idle emulated cores spin before sleeping (50 us, 03.78; 1 ms on pinned cores 0-2, 03.97); the
   services' host threads spin before sleeping too (03.78) and run at VeryHigh priority (03.93).
 - Code caches 48/40/32/8 MiB for cores 0-3 (128 MiB of system flexible memory in all, 03.95).
+- Eden's host locks (the kernel's scheduler and timer locks, the cores' context locks, CoreTiming's
+  queue) spin up to 20 us before sleeping on the PS4; the timing thread is woken only for a new
+  earliest event (04.06). Per-lock counts in the 30-second line.
 
 ### Stability
 
@@ -217,9 +220,11 @@ about 15 fps in 03.80, limited by its main thread.
    tighter (fewer I-cache lines and pages per frame).
 4. **Writes to GPU-cached memory** climb through a race (tens of thousands a second) but cost
    little (04.00 profile); only if the GPU thread (65% busy) becomes the limit.
-5. **Contended mutex cost** in Eden's kernel (`ArbitrateLock`/`ArbitrateUnlock`, ~12 us an
-   unlock): profile `KScopedSchedulerLock`, `UpdateHighestPriorityThreads`, `RescheduleCores`,
-   `PhysicalCore::Interrupt`.
+5. **Contended mutex cost** in Eden's kernel (`ArbitrateLock`/`ArbitrateUnlock`, ~11 us an
+   unlock; core 0 8.3% in `_umtx_op` in 04.05): 04.06 spins before sleeping on the host locks;
+   its log line says which locks are found taken and how often. Next if it stays: the services'
+   condition variables (`SendSyncRequest` ~255 us), `UpdateHighestPriorityThreads`,
+   `RescheduleCores`.
 6. **TLS pages** (`KThreadLocalPage`, one 4 KiB page from the `KPageBuffer` slab at a random
    address): never lined up, so thread-local reads walk. Allocate them in owned, lined-up 16 KiB
    groups.

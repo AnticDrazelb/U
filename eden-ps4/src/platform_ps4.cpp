@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.06: less sleeping on locks. 04.05 ran your slowest track at 30.5 fps on average (29.5-31.5 over "
+         "30 seconds, dips to 28 and to 25 at the start of a race). The game's main thread is now the only "
+         "limit, and almost a tenth of its core's time went to the PS4's kernel: whenever an emulated core found "
+         "one of Eden's own locks taken (its scheduler's, its timer's, a core's context, the timer events' queue), "
+         "the PS4 put it to sleep, and waking it again costs far longer than the locks are held. Now a core that "
+         "finds a lock taken tries again for up to 20 microseconds before it sleeps, and the timer thread is only "
+         "woken for a new event that comes before all the others. The 30-second line in the log now counts, for "
+         "each of those locks, how often it was found taken and how it was got, to show what this saved.\n"
          "04.05: three more cuts to the game's translated code. 04.04 ran your slowest track at 28-31 fps "
          "(29.6 on average), faster than 04.01 on your usual one; its busiest code no longer saves flags it "
          "doesn't need. This release goes after what's left: a load or store at a register plus a constant "
@@ -2296,6 +2304,38 @@ std::string PerfLine(double seconds)
                             "ending) {:.0f} a second",
                             double(kernel_timer - last_kernel_timer) / seconds);
         last_kernel_timer = kernel_timer;
+    }
+    // The host locks the emulated cores take (04.06: tried again for up to 20 us before sleeping):
+    // how often each was found taken, and whether its waiter got it spinning or slept on it
+    {
+        struct LockTotals {
+            uint64_t spun, spun_ns, slept, slept_ns;
+        };
+        const auto take = [](const P::LockStats& l) {
+            return LockTotals{l.spun.load(std::memory_order_relaxed), l.spun_ns.load(std::memory_order_relaxed),
+                              l.slept.load(std::memory_order_relaxed), l.slept_ns.load(std::memory_order_relaxed)};
+        };
+        static LockTotals last_locks[5] = {};
+        static uint64_t last_wakes = 0, last_skipped = 0;
+        const P::LockStats* locks[5] = {&P::lock_scheduler, &P::lock_timer, &P::lock_kernel_other,
+                                        &P::lock_core_context, &P::lock_timing};
+        const char* names[5] = {"scheduler", "timer", "other kernel", "cores' contexts", "timing"};
+        line += "; host locks found taken, a second (got by spinning, us each / slept on, us each):";
+        for (size_t i = 0; i < 5; i++) {
+            const LockTotals t = take(*locks[i]);
+            const LockTotals& l = last_locks[i];
+            line += fmt::format("{} {} {:.0f}, {:.1f} / {:.0f}, {:.0f}", i ? "," : "", names[i],
+                                double(t.spun - l.spun) / seconds, average_us(t.spun_ns - l.spun_ns, t.spun - l.spun),
+                                double(t.slept - l.slept) / seconds,
+                                average_us(t.slept_ns - l.slept_ns, t.slept - l.slept));
+            last_locks[i] = t;
+        }
+        const uint64_t wakes = P::timing_wakes.load(std::memory_order_relaxed);
+        const uint64_t skipped = P::timing_wakes_skipped.load(std::memory_order_relaxed);
+        line += fmt::format("; the timing thread woken {:.0f} a second for new events, {:.0f} not (later ones)",
+                            double(wakes - last_wakes) / seconds, double(skipped - last_skipped) / seconds);
+        last_wakes = wakes;
+        last_skipped = skipped;
     }
     // Fastmem: the arena's pages mapped, and its faults (resolved: a page mapped; declined: the
     // recompiler's fallback took the access, and the code there was recompiled without fastmem)

@@ -379,6 +379,33 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.06: **less sleeping on Eden's host locks.** 04.05 on a console (the tester's slowest track,
+50%, Profiler on): 30-second windows 29.5-31.5 fps (mean 30.5), 10-second ones 28.2-32.0, a dip to
+24.8 at a race start. The helpers' work a frame fell from 20.7 to 18.4 ms, so the game's main thread
+alone is the limit now: busy 78-80%, waiting 6.2 ms a frame, its own work about 25.8 ms a frame. Of
+emulated core 0's host time in a race, 62% is translated code, 29% Eden (a fifth of it the idle
+spin) and 9% the PS4's kernel, nearly all of it (8.3%) in `_umtx_op`: host threads asleep on a lock
+or condition variable while the core had work. The main thread makes about 1,100-1,370
+`ArbitrateLock`, 2,100-2,340 `ArbitrateUnlock` and 780 `WaitProcessWideKeyAtomic` calls a second
+(about 11 us an unlock), and each takes Eden's scheduler lock, the hardware timer's, and wakes or
+interrupts other cores (their context locks, CoreTiming's event queue). All of those are a
+`std::mutex`, which on the PS4 sleeps in the kernel as soon as it is found taken; the wake costs
+tens of microseconds, the locks are held for a few.
+
+- Patch 0093, `common/ps4_spin_lock.h`: `Common::SpinThenLock` (and `SpinLockGuard`): on the PS4, a
+  lock found taken is tried again (8 `PAUSE`s between tries) for up to 20 us, then slept on.
+  Bounded, unlike 04.00's: a waiter never keeps a holder off its core for longer than that. Used by
+  `KSpinLock` (the scheduler lock, the hardware timer's, the other kernel spin locks),
+  `PhysicalCore`'s context lock (`m_guard`: entering and leaving a thread, `Interrupt`,
+  `ClearInterrupt`, the idle sleep), and CoreTiming's event queue lock. Other platforms lock as
+  before.
+- `CoreTiming::ScheduleEvent` wakes the timing thread only when the new event is now the earliest
+  in the queue: the thread waits for the earliest one and sees later ones when it wakes (the
+  hardware timer's reprogramming, every guest sleep and timed wait, schedules one).
+- The 30-second log line counts, for each lock class, how often it was found taken a second and
+  how it was got (spinning, us each / slept on, us each), and the timing thread's wakes a second
+  for new events and those skipped (later events).
+
 04.05: **constant offsets in fastmem accesses, float compare branches, no redundant
 extensions.** 04.04 on a console (50%, Profiler on): the tester's slowest track at 28.2-30.9 fps
 (median 29.6), another track 29.7-32.9 (30.8), 04.01's usual track 26.7-28.9 (28.1): the main
