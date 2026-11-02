@@ -1,9 +1,9 @@
 # Eden for PS4: performance progress
 
 Where the work stands, what was done, what was tried and ruled out, and what's next. Updated at
-**04.03** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
+**04.04** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
-are the patches in [patches/](patches) (0001-0090, applied in order to Eden; see "How to work").
+are the patches in [patches/](patches) (0001-0091, applied in order to Eden; see "How to work").
 
 ## Goal
 
@@ -32,7 +32,8 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 04.00 | 24-29 | Profiler on: no freeze in ~6 minutes |
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
 | 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
-| 04.03 | not tested yet | 04.02 fixed: its faster code, 04.01's translation speed |
+| 04.03 | 26-30 | at **100%** resolution (28-29 most of the time), Profiler on: as 04.01 at 50% |
+| 04.04 | not tested yet | calls and returns end the flags: the hottest blocks too |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
 the frame rate: it's CPU-bound. Other games: Celeste plays smoothly; Captain Toad (64-bit) was at
@@ -120,6 +121,10 @@ about 15 fps in 03.80, limited by its main thread.
   Mario Kart's hottest loops 760 to 536 instructions an iteration, game-like C 7% fewer.
   (04.02 registered the code read as one range per block, megabytes after a call: translation
   slowed to 1.3 ms a block and Mario Kart reached no frame; 04.03 registers each run read.)
+- 04.04: calls and returns end the look-ahead's paths with the flags set (the procedure call
+  standard; 04.03's console run showed most hot blocks lead to a return or a virtual call first),
+  and a block whose flags stay live branches on its compare instead of reloading them. zlib 20%
+  fewer instructions, game-like C 8%.
 
 ### Threads and scheduling
 
@@ -180,7 +185,8 @@ about 15 fps in 03.80, limited by its main thread.
 
 ## Next (most promising first)
 
-1. **Test 04.03** on a console: it should boot as fast as 04.01; race fps (same track as before, Profiler on or off); a
+1. **Test 04.04** on a console (at 50%, to compare with 04.01): `hotblocks.log` should show the
+   fill and copy loops without `lahf`/`sahf`; race fps (same track as before, Profiler on or off); a
    `hotblocks.log` to see the flag code gone.
 2. **Translated code, generic** (where the main thread's time goes): fold a constant offset into
    the fastmem access itself (`mov [r13 + base + 8]`: needs the IR to carry it, the fallback to

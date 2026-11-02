@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.04: 04.02's speed-up, where Mario Kart spends its time. 04.03 ran the races at 26-30 fps at 100% "
+         "resolution, as 04.01 did at 50%, but in two thirds of the busiest code the flags were still saved and "
+         "read back: the code there leads to a function's return or a call within a few instructions, and the "
+         "translator took those as places that might read the flags. The ARM calling convention leaves the flags "
+         "undefined when a function is called and when it returns, so now a call or a return counts as setting "
+         "them, and where the flags must still be saved, the branch tests the compare directly instead of "
+         "reading them back. In tests: 20% fewer instructions in zlib, 8% in game-like code, and the same "
+         "results as 04.01 in 2,200 random programs and zlib built every way.\n"
          "04.03: 04.02 fixed. 04.02 never got Mario Kart to its first frame: compiling the game's code got "
          "slower with every piece compiled (1.3 ms each and rising, against 0.1 ms in 04.01). To be safe if "
          "code changed, each piece remembered all the code it had looked ahead at as one span from the lowest "

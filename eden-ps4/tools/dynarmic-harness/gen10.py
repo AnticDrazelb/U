@@ -5,10 +5,15 @@
 # read their caller's flags and functions that hand flags back. For the differential tests of the
 # dead flags at a block's exit (04.02: a block reads the code its successors start with).
 #   python3 gen10.py <seed> arm <out.s>
+# GEN_ABI=1: programs that keep to the procedure call standard (04.04's look-ahead takes calls and
+# returns to end the flags): functions set all the flags before reading any, and callers set them
+# again after a call before reading them.
+import os
 import random
 import sys
 
 seed, mode, out = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+ABI = os.environ.get("GEN_ABI") == "1"
 rng = random.Random(seed)
 DATA = 0x10000000 + 0x1000 * 64
 CONDS = ["eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le"]
@@ -65,6 +70,15 @@ def setter():
     if k < 0.95:
         return [f"muls {d}, {n}, {m}"]
     return [f"vcmp.f32 s{rng.randrange(0, 16)}, s{rng.randrange(0, 16)}", "vmrs APSR_nzcv, fpscr"]
+
+
+def full_setter():
+    # all four flags
+    n, m, d = reg(), reg(), reg()
+    op = rng.choice(["cmp", "cmn", "adds", "subs", "rsbs"])
+    if op in ("cmp", "cmn"):
+        return [f"{op} {n}, {m}" if rng.random() < 0.5 else f"{op} {n}, #{imm()}"]
+    return [f"{op} {d}, {n}, {m}" if rng.random() < 0.5 else f"{op} {d}, {n}, #{imm()}"]
 
 
 def save_flags():
@@ -157,6 +171,7 @@ def segment(depth, funcs):
             lines += [f"bl{rng.choice(['', '', rng.choice(CONDS)])} {rng.choice(funcs)}"]
         else:
             lines += [f"adr lr, {rng.choice(funcs)}", "blx lr"]
+        lines += full_setter() if ABI else []
         lines += head()
     elif x < 0.9:
         # an unconditional branch over code into a head
@@ -182,12 +197,23 @@ lines += save_flags() + ["svc #0"]
 for f in funcs:
     lines += [".p2align 2", f"{f}:"]
     # functions that read the caller's flags first, set their own and hand them back, or neither
+    # (with ABI: set all the flags first); returning in each of the ways a return is recognised
+    ret = rng.choice(["bx", "pop", "ldr", "mov"])
+    if ret == "pop":
+        lines += ["push {r4, lr}"]
+    elif ret == "ldr":
+        lines += ["str lr, [sp, #-4]!"]
     x = rng.random()
-    if x < 0.35:
+    if ABI:
+        lines += plain() + full_setter() + run(rng.randint(0, 3))
+        # a conditional return in the middle
+        if rng.random() < 0.3 and ret == "bx":
+            lines += full_setter() + [f"bx{rng.choice(CONDS)} lr"] + run(rng.randint(0, 2))
+    elif x < 0.35:
         lines += reader() + run(rng.randint(0, 3))
     elif x < 0.7:
         lines += plain() + setter() + run(rng.randint(0, 2))
     else:
         lines += run(rng.randint(1, 4))
-    lines += ["bx lr"]
+    lines += {"bx": ["bx lr"], "pop": ["pop {r4, pc}"], "ldr": ["ldr pc, [sp], #4"], "mov": ["mov pc, lr"]}[ret]
 open(out, "w").write("\n".join(lines) + "\n")

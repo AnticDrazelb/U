@@ -221,6 +221,9 @@ Dynarmic::A32::UserConfig MakeConfig(Env& env, const Options& o) {
 #endif
 #ifdef HAVE_DEAD_NZCV
     config.elide_dead_nzcv = std::getenv("DYN_NZCV") != nullptr;
+#ifdef HAVE_DEAD_NZCV_ABI
+    config.elide_dead_nzcv_abi = std::getenv("DYN_NZCV_ABI") != nullptr;
+#endif
 #endif
 #endif
     config.code_cache_size = 32u << 20;

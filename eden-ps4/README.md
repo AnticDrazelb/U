@@ -379,6 +379,32 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.04: **calls and returns end the flags; a live block's branch tests its compare.** 04.03 on a
+console (Mario Kart, **100%** resolution, Profiler on): races at 26-30 fps, 28-29 most of the
+time, as 04.01 at 50% (the PS4's GPU 14% busy, 10% at 50%; Eden's GPU thread waiting for it 10-12%
+of the time, 6-9% at 50%). The main thread ran 73-74% (76%), waited 26% on its helpers. In
+`hotblocks.log`, the dead flags had gone from the byte copy and the test chain (the loops
+`programs/flagloops.s` copied), but two thirds of the hottest blocks' samples were still in blocks
+storing and reloading them: the fill and copy loops (memset, memcpy), an indexed copy,
+compare-and-branch blocks. Their successors lead to a return (memset's tail sets N, Z and C, then
+`bx lr`: V never set) or a call through a register within a few instructions, and the look-ahead
+counted those as reads.
+
+- Patch 0091: `UserConfig::elide_dead_nzcv_abi` (on in Eden): a call (BL, BLX) or a return (BX LR,
+  POP/LDM SP with the PC, LDR PC, [SP], #4, MOV PC, LR) ends a look-ahead path with the flags set:
+  the procedure call standard has them undefined on entry to a function and on return from it.
+  Compiled code keeps to that; the run-time ABI's helpers that return flags (`__aeabi_cdcmple`...)
+  set them in the block that returns (not one that links). Other jumps through registers (switch
+  tables) and SVC still count as reads. And a block ending in a conditional branch whose flags are
+  live keeps its store but branches on the compare (`cmp; jcc`) instead of loading the flags back.
+- Host harness, valgrind's instruction count a frame (04.01, exact, with the call standard):
+  game-like C 133,744, 124,601, 122,570; zlib (deflate and inflate, `programs/c/zbench.c`) 27.58M,
+  22.03M, 21.94M. Exact mode: 1,600 random A32 programs equal to 04.01. With the call standard:
+  600 random programs that keep to it (`GEN_ABI=1 gen10.py`: callees set the flags before reading
+  them, callers after a call, every kind of return) and zlib and the C benchmark built at -O1,
+  -O2, -O3, -Os and -O2 -fno-inline equal to 04.01; programs that break it (a function reading its
+  caller's flags) differ, 4 in 100, as they should. Translation at scale (`manyblocks.py`) as 04.03.
+
 04.03: **04.02's look-ahead registered as runs.** 04.02 on a console (Mario Kart, 50%, Profiler
 on): no frame in the minute before it was stopped (L3 + R3). The recompiler translated 1,196
 blocks a second in 536 ms in the first 30 s, then 651 in 871 ms (04.01: 3,061 in 346 ms, 113 us a

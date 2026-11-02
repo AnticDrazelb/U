@@ -63,8 +63,11 @@ ranges made it 18.3 s instead of 0.4 s for 3,000 functions; the small programs n
 
 `programs/` holds the hand-written benchmarks (calls with PUSH/POP, NEON copies, atomics...);
 `programs/flagloops.s` Mario Kart's hottest loops from 04.01's `hotblocks.log`;
-`programs/c/game.c` game-like C for ARM (`programs/c/build.sh`, then `image programs/c/game.bin
-<frames> arm`).
+`programs/c/game.c` game-like C for ARM (`programs/c/build.sh [-O...]`, then `image
+programs/c/game.bin <frames> arm`); `programs/c/zbench.c` zlib's deflate and inflate
+(`programs/c/build-zlib.sh [-O...]`, then `image programs/c/zbench.bin <rounds> arm`): real
+compiler output, for changes that rely on the procedure call standard (`DYN_NZCV_ABI`, which
+random programs that don't keep to it fail; `GEN_ABI=1 gen10.py` makes ones that do).
 
 Instruction counts (no hardware counters in a VM): `valgrind --tool=lackey --basic-counts=yes
 --smc-check=all ./dynbench bench <bin> N` at two N, the difference over the iterations (bench mode
