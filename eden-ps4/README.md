@@ -379,6 +379,26 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.09: **a stuck exit restarts the app; what a race's start meets new.** 04.08 on a console (the
+tester's slowest track, the Crossing Cup's first, 50%, Profiler on): 30-second windows 31.4-35.6
+fps (mean 34.0), 10-second ones 30.7-36.7 after the start, the start 32.2 then 27.6; the cup's other
+tracks 38.1, 39.6 and 35.9 on average, their starts without a dip. The GPU thread was 75% busy at
+the start (81-85% in 04.07). The session before, leaving the game for Eden's menu froze: the
+launcher had paused the program and listed its threads, then `System::ShutdownMainProcess` never
+returned (every host thread asleep; every other exit in the testers' logs completed, the next
+session's too).
+
+- Patch 0096: `ShutdownMainProcess` records each step (`PS4Diagnostics::shutdown_stage`, its own:
+  the GPU thread writes `stage` as it draws) and the launcher sets `shutting_down` from its pause
+  on. The hang watchdog's report names the step; a shutdown still going after 30 s writes the
+  threads' stacks to `hang.log` and restarts the app (`sceSystemServiceLoadExec`, as after every
+  game: the start page, which writes the log bundle of the unfinished run), `_exit` if refused.
+- What the GPU thread meets new: graphics pipelines not in the cache (the disk shader cache's are
+  there from the boot), draws skipped while theirs build (asynchronous shaders), images and buffers
+  created: in the 30-second line, and with its draws in the launcher's 10-second speed line (a
+  race's start lasts 10-20 s). In 04.08's first race the main thread waited on objects 16% of the
+  30 s with its start (3-9% later), the GPU thread 75% busy: something new is waited for there.
+
 04.08: **the race start: Eden's GPU thread.** 04.07 on a console (the tester's slowest track, 50%,
 Profiler on): 30-second windows 30.8-33.6 fps (mean 32.1), 10-second ones 29.4-34.4 after the
 start, but 25.7 and 28.2 in the race's first 20 seconds. The scheduler lock was found taken

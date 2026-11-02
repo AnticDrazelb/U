@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.09: no more frozen exits, and a closer look at a race's start. 04.08 ran your slowest track at 34.0 "
+         "fps on average, its lowest 30.7 after the start; but once, leaving the game for Eden's menu froze "
+         "everything. Now, if leaving a game ever stalls for 30 seconds, the app saves its logs and starts again "
+         "on its start page (where you were going) instead of staying frozen, and the log says which step of "
+         "the shutdown it stalled in, so it can be fixed. The first race's start still dips (27.6 once): the log "
+         "now says, every 10 seconds, how many draws the game made and what was new to Eden then (graphics "
+         "pipelines not in the shader cache, draws skipped while they built, new textures and buffers), to see "
+         "what that start waits on.\n"
          "04.08: the start of a race. 04.07 ran your slowest track at 32.1 fps on average, but the first 20 "
          "seconds of a race dipped to 25-28. There, with all twelve karts on screen, Eden's GPU thread (which "
          "turns the game's graphics commands into work for the PS4's GPU) was busy 85-90% of the time and the "
@@ -2369,6 +2377,20 @@ std::string PerfLine(double seconds)
         last_draws = draws;
         last_words = words;
         last_run_words = run_words;
+        // (04.09) what was new to it: what a race's first seconds wait on
+        static uint64_t last_new = 0, last_skipped = 0, last_images = 0, last_buffers = 0;
+        const uint64_t pipelines = P::gpu_pipelines_new.load(std::memory_order_relaxed);
+        const uint64_t skipped = P::gpu_draws_skipped.load(std::memory_order_relaxed);
+        const uint64_t images = P::gpu_images_created.load(std::memory_order_relaxed);
+        const uint64_t buffers = P::gpu_buffers_created.load(std::memory_order_relaxed);
+        line += fmt::format("; new to it, a second: {:.1f} graphics pipelines not in the shader cache, {:.0f} draws "
+                            "skipped while theirs built, {:.1f} images, {:.1f} buffers",
+                            double(pipelines - last_new) / seconds, double(skipped - last_skipped) / seconds,
+                            double(images - last_images) / seconds, double(buffers - last_buffers) / seconds);
+        last_new = pipelines;
+        last_skipped = skipped;
+        last_images = images;
+        last_buffers = buffers;
     }
     // The services' host threads waiting for their next request (04.07: a longer spin, to 250 us,
     // after a short wait): woken while spinning, or after sleeping
@@ -2473,7 +2495,7 @@ private:
         scePthreadSetprio(scePthreadSelf(), 600); // (it sleeps; when it looks, it must get to)
         const uint64_t base = Frames();
         uint64_t last = base;
-        int seconds = 0, stale = 0;
+        int seconds = 0, stale = 0, shutdown_seconds = 0;
         bool dumped = false;
         uint64_t reported = base;
         while (!stop)
@@ -2482,6 +2504,30 @@ private:
                 usleep(100 * 1000);
             seconds++;
             const uint64_t frames = Frames();
+            // (04.09) A program's shutdown that doesn't end: its threads in hang.log, then the app
+            // starts again (as after any game: a fresh process, the start page), instead of staying
+            // frozen. (A shutdown takes a few seconds; 04.08's once stopped for good, at a step no
+            // report named.)
+            if (Common::PS4Diagnostics::shutting_down.load(std::memory_order_relaxed))
+            {
+                if (++shutdown_seconds == kShutdownLimit)
+                {
+                    char reason[256];
+                    snprintf(reason, sizeof(reason), "%s: the shutdown stuck for %d s, at: %s (the GPU display: %s)",
+                             name.c_str(), shutdown_seconds, Common::PS4Diagnostics::shutdown_stage.load(),
+                             Common::PS4Diagnostics::stage.load());
+                    ps4_dump_thread_stacks(kHangFile, reason);
+                    Trace(std::string("hang watchdog: ") + reason + ": thread stacks in hang.log; restarting the app");
+                    const int restart = sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+                    Trace(fmt::format("restart refused ({:#x}): closing the app", uint32_t(restart)));
+                    sceSystemServiceLoadExec("exit", nullptr);
+                    _exit(0);
+                }
+            }
+            else
+            {
+                shutdown_seconds = 0;
+            }
             if (seconds % 30 == 0)
             {
                 // how it runs: the frame rate, and the memory (what a game needs, on the console)
@@ -2504,7 +2550,11 @@ private:
             dumped = true;
             char reason[256];
             const char* stage = Common::PS4Diagnostics::stage.load();
-            if (started)
+            if (started && Common::PS4Diagnostics::shutting_down.load())
+                snprintf(reason, sizeof(reason), "%s: no new frame for %d s, %d s after booting, %llu frames so far, "
+                         "shutting down, at: %s (the GPU display: %s)", name.c_str(), stale, seconds,
+                         (unsigned long long)(frames - base), Common::PS4Diagnostics::shutdown_stage.load(), stage);
+            else if (started)
                 snprintf(reason, sizeof(reason), "%s: no new frame for %d s, %d s after booting, %llu frames so far "
                          "(the GPU display: %s)", name.c_str(), stale, seconds, (unsigned long long)(frames - base),
                          stage);
@@ -2516,6 +2566,7 @@ private:
         }
     }
 
+    static constexpr int kShutdownLimit = 30;
     std::string name;
     int stall_limit = 20, boot_limit = 90;
     std::atomic<bool> stop{false};

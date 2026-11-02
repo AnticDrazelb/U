@@ -43,6 +43,10 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#ifdef __OPENORBIS__
+#include "common/ps4_diagnostics.h"
+#include "common/ps4_perf.h"
+#endif
 
 namespace Launcher {
 namespace {
@@ -614,11 +618,26 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                         break;
                     lock.unlock();
                     const Core::PerfStatsResults stats = system.GetAndResetPerfStats();
+                    std::string extra;
+#ifdef __OPENORBIS__
+                    {
+                        // (04.09) what the GPU thread met new in these 10 s (a race's start)
+                        namespace P = Common::PS4Perf;
+                        static uint64_t last[5] = {};
+                        const uint64_t now[5] = {P::gpu_pipelines_new.load(), P::gpu_draws_skipped.load(),
+                                                 P::gpu_images_created.load(), P::gpu_buffers_created.load(),
+                                                 P::gpu_draws.load()};
+                        extra = fmt::format("; {} draws, new: {} pipelines ({} draws skipped), {} images, {} buffers",
+                                            now[4] - last[4], now[0] - last[0], now[1] - last[1], now[2] - last[2],
+                                            now[3] - last[3]);
+                        std::copy(std::begin(now), std::end(now), std::begin(last));
+                    }
+#endif
                     Output(LineKind::Status,
                            fmt::format("speed: the game {:.1f} fps, emulation at {:.0f}% of full speed, {:.1f} ms "
-                                       "of work a frame",
+                                       "of work a frame{}",
                                        stats.average_game_fps, stats.emulation_speed * 100.0,
-                                       stats.frametime * 1000.0));
+                                       stats.frametime * 1000.0, extra));
                     lock.lock();
                 }
                 if (exited)
@@ -627,6 +646,11 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     result = {BootResult::Status::Stopped, {}};
                 g_running = false;
                 lock.unlock();
+#ifdef __OPENORBIS__
+                // (04.09: a shutdown stuck for 30 s restarts the app, its step in the hang report)
+                Common::PS4Diagnostics::shutdown_stage = "pausing the program";
+                Common::PS4Diagnostics::shutting_down = true;
+#endif
                 void(system.Pause());
                 if (!exited) {
                     // Where the program's threads were: addresses relative to its start (the
@@ -649,6 +673,9 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     g_gamepad = nullptr;
                 }
                 system.ShutdownMainProcess();
+#ifdef __OPENORBIS__
+                Common::PS4Diagnostics::shutting_down = false;
+#endif
             }
         }
         {

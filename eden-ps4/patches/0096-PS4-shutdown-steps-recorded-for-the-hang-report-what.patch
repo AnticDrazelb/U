@@ -1,0 +1,237 @@
+From d924f565a62c8e7b6e5e9f608d785fcfd1226b13 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 21:23:46 +0000
+Subject: [PATCH] PS4: shutdown steps recorded for the hang report; what the
+ GPU thread meets new counted
+
+- ShutdownMainProcess records each step (PS4Diagnostics::shutdown_stage); with the launcher's
+  shutting_down flag its watchdog names the step of a stuck shutdown, and restarts the app after
+  30 s.
+- Counters: graphics pipelines not in the cache, draws skipped while theirs build, images and
+  buffers created.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_diagnostics.h                  |  7 +++++
+ src/common/ps4_perf.h                         |  5 ++++
+ src/core/core.cpp                             | 28 +++++++++++++++++++
+ src/video_core/buffer_cache/buffer_cache.h    |  3 ++
+ .../buffer_cache/buffer_cache_base.h          |  1 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  4 +++
+ .../renderer_vulkan/vk_rasterizer.cpp         |  3 ++
+ src/video_core/texture_cache/texture_cache.h  |  4 +++
+ 8 files changed, 55 insertions(+)
+
+diff --git a/src/common/ps4_diagnostics.h b/src/common/ps4_diagnostics.h
+index 447bc7617f..22121109cb 100644
+--- a/src/common/ps4_diagnostics.h
++++ b/src/common/ps4_diagnostics.h
+@@ -39,12 +39,19 @@ inline std::atomic<u64> composites{};
+ inline std::atomic<u64> flips{};
+ inline std::atomic<u64> audio_buffers{};
+ inline std::atomic<const char*> stage{"waiting for guest display"};
++// (04.09) A program's shutdown is under way, and its step (core.cpp's ShutdownMainProcess, the
++// launcher's pause before it): the launcher's watchdog reports one stuck, and after 30 s restarts
++// the app (the GPU thread writes the stage above as it draws, so the step has its own)
++inline std::atomic<bool> shutting_down{false};
++inline std::atomic<const char*> shutdown_stage{""};
+ 
+ inline void Reset() {
+     composites = 0;
+     flips = 0;
+     audio_buffers = 0;
+     stage = "waiting for guest display";
++    shutting_down = false;
++    shutdown_stage = "";
+ }
+ 
+ inline size_t LargestFreeDirect() {
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 8a180dc5f8..62072ad570 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -51,6 +51,11 @@ inline std::atomic<uint64_t> timing_wakes{0}, timing_wakes_skipped{0};
+ // Eden's GPU thread (04.08): draws, the command words it read, and how many of those were in runs
+ // of plain register writes (DmaPusher::SinkRun). Added in bulk (a command list's words at once)
+ inline std::atomic<uint64_t> gpu_draws{0}, gpu_command_words{0}, gpu_sink_run_words{0};
++// (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
++// the boot), draws skipped while their pipeline builds (asynchronous shaders), images and buffers
++// created; for what a race's start waits on
++inline std::atomic<uint64_t> gpu_pipelines_new{0}, gpu_draws_skipped{0}, gpu_images_created{0},
++    gpu_buffers_created{0};
+ 
+ // The services' host threads (KThread's dummy threads) waiting for their next request: woken
+ // while they still spun, or after sleeping (and the time from the signal until they ran); the
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index dad4706e9b..509da0efcb 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -11,6 +11,9 @@
+ #include "audio_core/audio_core.h"
+ #include "common/fs/fs.h"
+ #include "common/logging.h"
++#ifdef __OPENORBIS__
++#include "common/ps4_diagnostics.h"
++#endif
+ #include "common/adpf.h"
+ #include "common/settings.h"
+ #include "common/settings_enums.h"
+@@ -67,6 +70,14 @@
+ #include "video_core/renderer_base.h"
+ #include "video_core/video_core.h"
+ 
++// (04.09) The step a shutdown is in, for the PS4 launcher's hang report (one stuck there for 30 s
++// restarts the app); nothing elsewhere
++#ifdef __OPENORBIS__
++#define PS4_SHUTDOWN_STAGE(text) Common::PS4Diagnostics::shutdown_stage.store(text)
++#else
++#define PS4_SHUTDOWN_STAGE(text) ((void)0)
++#endif
++
+ namespace Core {
+ 
+ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
+@@ -418,6 +429,7 @@ struct System::Impl {
+     }
+ 
+     void ShutdownMainProcess() {
++        PS4_SHUTDOWN_STAGE("shutting down: started");
+         SetShuttingDown(true);
+         Common::ADPF::Shutdown();
+ 
+@@ -430,24 +442,39 @@ struct System::Impl {
+         if (gpu_core)
+             gpu_core->NotifyShutdown();
+ 
++        PS4_SHUTDOWN_STAGE("shutting down: timing resumed");
+         stop_event.request_stop();
+         core_timing.SyncPause(false);
++        PS4_SHUTDOWN_STAGE("shutting down: network operations cancelled");
+         Network::CancelPendingSocketOperations();
++        PS4_SHUTDOWN_STAGE("shutting down: emulation suspended");
+         kernel.SuspendEmulation(true);
++        PS4_SHUTDOWN_STAGE("shutting down: the services' threads");
+         kernel.CloseServices();
++        PS4_SHUTDOWN_STAGE("shutting down: the emulated cores");
+         kernel.ShutdownCores();
++        PS4_SHUTDOWN_STAGE("shutting down: the services");
+         services.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: the service manager");
+         service_manager.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: the file system");
+         fs_controller.Reset();
+         cheat_engine.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: timer events");
+         core_timing.ClearPendingEvents();
++        PS4_SHUTDOWN_STAGE("shutting down: the program loader");
+         app_loader.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: audio");
+         audio_core.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: the GPU");
+         gpu_core.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: host1x");
+         host1x_core.reset();
+         perf_stats.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: the cores' threads");
+         cpu_manager.Shutdown();
+         debugger.reset();
++        PS4_SHUTDOWN_STAGE("shutting down: the kernel");
+         kernel.Shutdown();
+         stop_event = {};
+         Network::RestartSocketOperations();
+@@ -460,6 +487,7 @@ struct System::Impl {
+         // Reset all glue registrations
+         arp_manager.ResetAll();
+ 
++        PS4_SHUTDOWN_STAGE("shut down");
+         LOG_DEBUG(Core, "Shutdown OK");
+     }
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index c68d96ba4e..0d57f0d72e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1693,6 +1693,9 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
+ template <class P>
+ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
+                                       bool sparse_compatible) {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::gpu_buffers_created.fetch_add(1, std::memory_order_relaxed);
++#endif
+     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+     wanted_size = static_cast<u32>(device_addr_end - device_addr);
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 6e421f2e7c..8b694c0072 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -26,6 +26,7 @@
+ #include "common/lru_cache.h"
+ #include "common/range_sets.h"
+ #include "common/scope_exit.h"
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "video_core/buffer_cache/buffer_base.h"
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 76b980cd3c..885403fedd 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -15,6 +15,7 @@
+ #include <bit>
+ #include <numeric>
+ #include "common/cityhash.h"
++#include "common/ps4_perf.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/thread_worker.h"
+@@ -773,6 +774,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
+     auto& pipeline{pair->second};
+     if (is_new) {
++#ifdef __OPENORBIS__
++        Common::PS4Perf::gpu_pipelines_new.fetch_add(1, std::memory_order_relaxed);
++#endif
+         pipeline = CreateGraphicsPipeline();
+     }
+     if (!pipeline) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index d65ee2dcb6..0fdb264717 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -244,6 +244,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
+     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+     if (!pipeline) {
++#ifdef __OPENORBIS__
++        Common::PS4Perf::gpu_draws_skipped.fetch_add(1, std::memory_order_relaxed);
++#endif
+         return;
+     }
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 0b49020386..ad12cd32db 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -13,6 +13,7 @@
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "common/alignment.h"
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "video_core/control/channel_state.h"
+@@ -1548,6 +1549,9 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
+ 
+ template <class P>
+ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::gpu_images_created.fetch_add(1, std::memory_order_relaxed);
++#endif
+     ImageInfo new_info = info;
+     const size_t size_bytes = CalculateGuestSizeInBytes(new_info);
+     const bool broken_views = runtime.HasBrokenTextureViewFormats();
+-- 
+2.43.0
+

@@ -235,6 +235,9 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | Samplers (`GetSamplerId`, `Sampler::HandleFor`, `MakeKey`) | ~1.4% | open |
 | `GpuToCpuAddress` | ~2% | open: called often; a last-page cache? |
 | Buffer cache bindings, memory tracking (`WordManager`) | ~9% + ~7% | open |
+| **Stability** | | |
+| Exit to Eden's menu froze once (04.08, after 23 min: `ShutdownMainProcess` never returned) | | 04.09: the step in the hang report; restart after 30 s |
+| **First race's start** (27.6 once in 04.08; later races' starts don't dip) | | 04.09: pipelines, skipped draws, images, buffers new each 10 s |
 
 ## Next (most promising first)
 
