@@ -415,6 +415,10 @@ on its own:
   the 30-second line now says how the services' threads were woken (spinning, or after sleeping
   and how long after the signal) and how many waits spun longer. If isolated requests dominate,
   the next step is handling quick requests on the calling thread.
+- Old (04.05) vs new, cold code and the return hand-off on: 2,200 random A32 programs equal (gen,
+  gen3, gen4, gen7, gen9, gen10 with and without the call standard; fastmem, split stack), the
+  hand-written programs (`wrap.s`'s marked and unmapped pages, calls, push/pop, structures, flag
+  loops) also single-stepped, game-like C and zlib at -O1, -O2, -O3 and -Os.
 
 04.06: **less sleeping on Eden's host locks.** 04.05 on a console (the tester's slowest track,
 50%, Profiler on): 30-second windows 29.5-31.5 fps (mean 30.5), 10-second ones 28.2-32.0, a dip to
