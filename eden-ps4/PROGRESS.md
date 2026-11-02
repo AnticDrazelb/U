@@ -237,7 +237,9 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | Buffer cache bindings, memory tracking (`WordManager`) | ~9% + ~7% | open |
 | **Stability** | | |
 | Exit to Eden's menu froze once (04.08, after 23 min: `ShutdownMainProcess` never returned) | | 04.09: the step in the hang report; restart after 30 s |
-| **First race's start** (27.6 once in 04.08; later races' starts don't dip) | | 04.09: pipelines, skipped draws, images, buffers new each 10 s |
+| **First race's start** (27.6 once in 04.08; later races' starts don't dip) | | 04.09's counters (a third track, fresh boot): not new work. The loading's 10 s before the race make 117 pipelines, 3,059 images, 452 buffers; the race's first 30 s 1-3 pipelines, 46-192 images a 10 s, no draw skipped. The start has twice the draws: ~780-880 a frame (32-34 fps), later 360-410 (40-42). The GPU thread 77-81% busy there, ~28 us a draw; the main thread waits on objects 13%. So: Eden's cost per draw (headroom, the same work) |
+| RADV crash while a game loads (04.09, once): `end_subpass` (Mesa's common render pass code) on the Vulkan worker, a NULL + 0x60 read: a render pass ended with none begun? | | open: first seen |
+| The log bundle keeps the last two sessions only: the tester's four boots (three tracks) left the last two | | open: keep more |
 
 ## Next (most promising first)
 
