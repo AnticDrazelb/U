@@ -1,0 +1,165 @@
+From e96b8dcb84c4a550ef7df3143bb70d7871958570 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 13:27:45 +0000
+Subject: [PATCH] dynarmic A32: the flags look-ahead's code registered as runs,
+ not one range
+
+0089 registered the code a block's look-ahead read as one range from the lowest address to the
+highest. After a call that spans megabytes, and every block's range then overlapped thousands of
+others: the invalidation map (an interval map of sets) grew with each block, and translating one
+took 1.3 ms and rising on a console (Mario Kart reached no frame in a minute; 60% of core 0 in
+boost::icl). Now each run of consecutive instructions read is its own range (IR::Block::lookahead,
+at most 16; more, and the flags count as live). IR::Block keeps 29 instructions inline instead of
+30: the PS4's layout of it is larger than the desktop's, and the vector didn't fit in 4096 bytes.
+
+Host harness: a program of 3,000 functions calling leaves a megabyte away (manyblocks.py), run
+once (its time the recompiler's): 0.40 s with 04.01, 18.3 s with 0089, 0.42 s now; 12,000 functions
+1.38 s with 04.01, 1.52 s now. Old vs new: 1,500 random A32 programs equal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |  7 ++---
+ .../frontend/A32/translate/translate_arm.cpp  | 27 +++++++++++++------
+ src/dynarmic/src/dynarmic/ir/basic_block.cpp  |  3 +--
+ src/dynarmic/src/dynarmic/ir/basic_block.h    | 17 +++++++-----
+ 4 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 7b7ef78701..826ea18e0a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -198,9 +198,10 @@ finish_this_inst:
+ 
+     const auto range = boost::icl::discrete_interval<u32>::closed(descriptor.PC(), end_location.PC() - 1);
+     block_ranges.AddRange(range, descriptor);
+-    if (block.lookahead_hi > block.lookahead_lo) {
+-        // the code read to tell its flags are dead at its exit: the block depends on it as well
+-        block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(block.lookahead_lo, block.lookahead_hi - 1), descriptor);
++    for (const auto& [start, end] : block.lookahead) {
++        // the code read to tell its flags are dead at its exit (a few instructions each): the
++        // block depends on it as well
++        block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(start, end - 1), descriptor);
+     }
+ 
+     auto const bdesc = RegisterBlock(descriptor, entrypoint, size);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp b/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+index a2ae74c1cb..3c3b5a557f 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+@@ -21,7 +21,6 @@
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/terminal.h"
+ 
+-#include <algorithm>
+ #include <boost/container/static_vector.hpp>
+ 
+ namespace Dynarmic::A32 {
+@@ -53,9 +52,24 @@ constexpr u32 FlagsReadByCond(u32 cond) {
+ struct FlagsLookahead {
+     TranslateCallbacks* tcb;
+     int budget = 64;        // instructions read, on all paths together
+-    u32 lo = ~u32(0);       // the code read
+-    u32 hi = 0;
+     boost::container::static_vector<std::pair<u32, u32>, 16> targets;  // (address, flags unset there)
++    boost::container::static_vector<std::pair<u32, u32>, 16> runs;     // the code read: [start, end)
++
++    // Notes the instruction at pc as read: false when the runs are full (then: live)
++    bool Read(u32 pc) {
++        for (auto& [start, end] : runs) {
++            if (pc >= start && pc < end)
++                return true;
++            if (pc == end) {
++                end += 4;
++                return true;
++            }
++        }
++        if (runs.size() == runs.capacity())
++            return false;
++        runs.emplace_back(pc, pc + 4);
++        return true;
++    }
+ 
+     bool Seen(u32 pc, u32 unset) {
+         for (const auto& [address, then_unset] : targets) {
+@@ -74,10 +88,8 @@ struct FlagsLookahead {
+             if (--budget < 0)
+                 return true;
+             const auto word = tcb->MemoryReadCode(pc);
+-            if (!word)
++            if (!word || !Read(pc))
+                 return true;
+-            lo = std::min(lo, pc);
+-            hi = std::max(hi, pc + 4);
+             const u32 inst = *word;
+             const u32 cond = inst >> 28;
+ 
+@@ -223,8 +235,7 @@ void LookAheadForFlags(IR::Block& block, TranslateCallbacks* tcb) {
+             return;
+     }
+     block.nzcv_dead_at_exit = true;
+-    block.lookahead_lo = lookahead.lo;
+-    block.lookahead_hi = lookahead.hi;
++    block.lookahead.assign(lookahead.runs.begin(), lookahead.runs.end());
+ }
+ 
+ }  // namespace
+diff --git a/src/dynarmic/src/dynarmic/ir/basic_block.cpp b/src/dynarmic/src/dynarmic/ir/basic_block.cpp
+index 5fd05e0bfa..b800866435 100644
+--- a/src/dynarmic/src/dynarmic/ir/basic_block.cpp
++++ b/src/dynarmic/src/dynarmic/ir/basic_block.cpp
+@@ -70,8 +70,7 @@ void Block::Reset(LocationDescriptor location_) noexcept {
+     cond_failed_cycle_count = 0;
+     cycle_count = 0;
+     nzcv_dead_at_exit = false;
+-    lookahead_lo = 0;
+-    lookahead_hi = 0;
++    lookahead.clear();
+     ASSERT(instructions.size() == 0);
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/ir/basic_block.h b/src/dynarmic/src/dynarmic/ir/basic_block.h
+index 03bcbd5fc0..d5d39198fd 100644
+--- a/src/dynarmic/src/dynarmic/ir/basic_block.h
++++ b/src/dynarmic/src/dynarmic/ir/basic_block.h
+@@ -13,6 +13,9 @@
+ #include <optional>
+ #include <string>
+ 
++#include <utility>
++#include <vector>
++
+ #include <boost/container/container_fwd.hpp>
+ #include <boost/container/static_vector.hpp>
+ #include <boost/container/stable_vector.hpp>
+@@ -141,8 +144,9 @@ public:
+         return cycle_count;
+     }
+ 
+-    /// "Hot cache" for small blocks so we don't call global allocator
+-    boost::container::static_vector<Inst, 30> inlined_inst;
++    /// "Hot cache" for small blocks so we don't call global allocator (29: room for lookahead's
++    /// vector within the 4096 bytes on the PS4, whose layout of these is larger than the desktop's)
++    boost::container::static_vector<Inst, 29> inlined_inst;
+     /// List of instructions in this block.
+     instruction_list_type instructions;
+     /// "Long/far" memory pool
+@@ -163,11 +167,12 @@ public:
+     size_t cycle_count = 0;
+     /// The guest code its successors start with sets the condition flags before reading any of
+     /// them (A32, TranslationOptions::nzcv_lookahead): the flags it ends with are dead, it need not
+-    /// store them. lookahead_lo/hi (end exclusive): the guest code that was read to tell, for
+-    /// invalidation (the block depends on it as on its own code).
++    /// store them. lookahead: the guest code that was read to tell, as runs of consecutive
++    /// instructions (start, end exclusive), for invalidation (the block depends on them as on its
++    /// own code). Each run on its own: one range from the lowest address read to the highest
++    /// spans megabytes after a call, and every block's range then overlaps thousands of others.
+     bool nzcv_dead_at_exit = false;
+-    u32 lookahead_lo = 0;
+-    u32 lookahead_hi = 0;
++    std::vector<std::pair<u32, u32>> lookahead;
+ };
+ static_assert(sizeof(Block) == 4096);
+ 
+-- 
+2.43.0
+

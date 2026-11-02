@@ -1,9 +1,9 @@
 # Eden for PS4: performance progress
 
 Where the work stands, what was done, what was tried and ruled out, and what's next. Updated at
-**04.02** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
+**04.03** (2026-11-02). Per-version detail is in [README.md](README.md) (one section a version,
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
-are the patches in [patches/](patches) (0001-0089, applied in order to Eden; see "How to work").
+are the patches in [patches/](patches) (0001-0090, applied in order to Eden; see "How to work").
 
 ## Goal
 
@@ -31,7 +31,8 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 03.99 | 25-29 | Profiler on: the game's globals on fastmem; one 20 s freeze |
 | 04.00 | 24-29 | Profiler on: no freeze in ~6 minutes |
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
-| 04.02 | not tested yet | flags not stored when dead: Mario Kart's hottest loops 29% fewer instructions |
+| 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
+| 04.03 | not tested yet | 04.02 fixed: its faster code, 04.01's translation speed |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
 the frame rate: it's CPU-bound. Other games: Celeste plays smoothly; Captain Toad (64-bit) was at
@@ -117,6 +118,8 @@ about 15 fps in 03.80, limited by its main thread.
   set the flags before reading them, the block doesn't store its flags, and its conditional branch
   is `cmp a, b; jcc` (or `test`) instead of `cmc/lahf/seto`, a store, a load and `sahf/cmc`.
   Mario Kart's hottest loops 760 to 536 instructions an iteration, game-like C 7% fewer.
+  (04.02 registered the code read as one range per block, megabytes after a call: translation
+  slowed to 1.3 ms a block and Mario Kart reached no frame; 04.03 registers each run read.)
 
 ### Threads and scheduling
 
@@ -149,6 +152,12 @@ about 15 fps in 03.80, limited by its main thread.
 
 ## Tried and ruled out (or not worth it now)
 
+- **Translator changes tested on small programs only:** 04.02 passed 3,200 random programs and
+  sped up the benchmarks, but its invalidation ranges grew with the number of blocks; at a game's
+  scale translation slowed 10x and more. `tools/dynarmic-harness/manyblocks.py` (thousands of
+  functions, calls across a megabyte) times translation at scale: run it against the old build for
+  any change to what a block records.
+
 - **GPU-bound?** No: the PS4's GPU is busy 2-10% in races; resolution 50/75/100% and Frame Pacing
   Unlocked (03.84) changed nothing measurable.
 - **Walking every stack access from the start** (03.94): fewer declines, but ~10% slower than
@@ -171,7 +180,7 @@ about 15 fps in 03.80, limited by its main thread.
 
 ## Next (most promising first)
 
-1. **Test 04.02** on a console: race fps (same track as before, Profiler on or off); a
+1. **Test 04.03** on a console: it should boot as fast as 04.01; race fps (same track as before, Profiler on or off); a
    `hotblocks.log` to see the flag code gone.
 2. **Translated code, generic** (where the main thread's time goes): fold a constant offset into
    the fastmem access itself (`mov [r13 + base + 8]`: needs the IR to carry it, the fallback to

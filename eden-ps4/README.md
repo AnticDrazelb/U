@@ -379,6 +379,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.03: **04.02's look-ahead registered as runs.** 04.02 on a console (Mario Kart, 50%, Profiler
+on): no frame in the minute before it was stopped (L3 + R3). The recompiler translated 1,196
+blocks a second in 536 ms in the first 30 s, then 651 in 871 ms (04.01: 3,061 in 346 ms, 113 us a
+block): 1.3 ms a block and rising. Core 0 ran the game's code 9% of the time and Eden's 75%, most
+of it `boost::icl` (`block_ranges`, an interval map of sets of blocks). 0089 registered the code a
+block's look-ahead read as one range from the lowest address to the highest: after a call, a
+megabyte or more, so every block's range overlapped thousands of others and each insertion grew
+thousands of sets.
+
+- Patch 0090: each run of consecutive instructions the look-ahead read is a range of its own
+  (`IR::Block::lookahead`, at most 16 runs; past that the flags count as live). The code it
+  produces is 0089's.
+- Host harness: `manyblocks.py`, 3,000 functions calling leaves a megabyte away, run once (its
+  time is the recompiler's): 0.40 s with 04.01, 18.3 s with 0089, 0.42 s now; 12,000 functions
+  1.38 s with 04.01, 1.52 s now. Old vs new: 1,500 random A32 programs equal. `IR::Block` keeps
+  29 instructions inline instead of 30 (the PS4 lays it out larger than the desktop: the run list
+  didn't fit its 4096 bytes). The harness's tests were small programs: translation cost at a
+  game's scale needs this one.
+
 04.02: **dead flags at a block's exit are not stored.** 04.01 on a console (Mario Kart, 50%,
 Profiler on): races at 26-30 fps (27-30 with the Profiler off, the run before), within a frame of
 04.00: the 11-19% fewer instructions didn't show. The main thread runs 76% of the time and waits

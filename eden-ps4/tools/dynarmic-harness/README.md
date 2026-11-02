@@ -57,6 +57,10 @@ Failing programs are kept as `rt/failx_*.s`.
 | gen9.py | NEON VLD1/VST1 (every size, count, alignment, writeback), lanes, VLD2-4, VLDM, VLDR |
 | gen10.py | ARM flags across blocks: setters (all flags, N and Z, the shifter's C) before branches, loops and calls; every kind of reader where they lead, functions that read their caller's flags (04.02's dead flags) |
 
+`manyblocks.py <functions> <out.s>`: a large program (functions with compares and calls to leaves a
+megabyte away), run once with `test`: its time is translation at a game's scale (04.02's look-ahead
+ranges made it 18.3 s instead of 0.4 s for 3,000 functions; the small programs never showed it).
+
 `programs/` holds the hand-written benchmarks (calls with PUSH/POP, NEON copies, atomics...);
 `programs/flagloops.s` Mario Kart's hottest loops from 04.01's `hotblocks.log`;
 `programs/c/game.c` game-like C for ARM (`programs/c/build.sh`, then `image programs/c/game.bin
