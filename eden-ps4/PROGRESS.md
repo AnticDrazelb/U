@@ -33,7 +33,7 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
 | 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
 | 04.03 | 26-30 | at **100%** resolution (28-29 most of the time), Profiler on: as 04.01 at 50% |
-| 04.04 | 28-33 | **another track** (busier, per the tester), 50%, Profiler on: mostly 29-31; flag code gone from 93% of the hot blocks' samples |
+| 04.04 | 28-31 | the tester's **slowest track**, 50%, Profiler on: median 29.6 (04.01's usual track: 28.1); another track 30-33 (median 30.8); flag code gone from 93% of the hot blocks' samples |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
 the frame rate: it's CPU-bound. Other games: Celeste plays smoothly; Captain Toad (64-bit) was at
@@ -53,8 +53,13 @@ about 15 fps in 03.80, limited by its main thread.
   land in a block's first 16 bytes (a quarter of the bytes past 64): getting into a block (its
   first fetch, the jump there, the first loads of guest registers) costs more than its length says.
 - **Host instructions per guest instruction:** 5.85 in the 60 hottest blocks (04.01).
-- **Tracks differ** (the tester: fps depends heavily on the map). Two measured, 04.01's usual one
-  and 04.04's busier one: both limited by the game's own CPU work the same way (main thread 73-77%
+- **Tracks differ** (the tester: fps depends heavily on the map). A race frame's cost, from the
+  `running` lines (main thread running / waiting for its helpers; the core 2 and core 1 helpers'
+  running time): 04.01, usual track: 27.1 / 8.4 ms, 21.6, 15.7 ms (28.1 fps); 04.04, the slowest
+  track: 25.3 / 8.4 ms, 20.8, 15.1 ms (29.6 fps); 04.04, another: 24.6 / 7.9 ms, 19.6, 14.8 ms
+  (30.8 fps). The slowest track on 04.04 runs faster than the usual one on 04.01: 04.02-04.04
+  took at least ~7% off the main thread's work. The helpers' ~8 ms the main thread waits each
+  frame is on every track. Three tracks measured: all limited by the game's own CPU work the same way (main thread 73-77%
   running, 23-26% waiting on its helpers, which run ~61% and ~45%); the PS4's GPU 10-12% busy,
   Eden's GPU thread 50-66%; writes to GPU-cached memory up to 102,000 a second late in a race but
   under 0.5% of any game core in the profile, and no fps change with them. A slow track's log
