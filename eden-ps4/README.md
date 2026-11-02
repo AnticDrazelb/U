@@ -1,5 +1,7 @@
 # Eden for PS4: stage 3, Switch games playable; stage 4 begun, the GPU
 
+**Performance work: where it stands, what was tried and what's next is in [PROGRESS.md](PROGRESS.md).**
+
 Stage 1 ([switch-bench](../switch-bench/README.md), results in
 [RESULTS.md](../switch-bench/RESULTS.md)) measured Eden's recompiler and the memory a PS4 can give
 it. Stage 2 ran Eden's actual Switch core on the PS4: the kernel, the scheduler and the four
