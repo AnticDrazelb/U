@@ -379,6 +379,37 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.08: **the race start: Eden's GPU thread.** 04.07 on a console (the tester's slowest track, 50%,
+Profiler on): 30-second windows 30.8-33.6 fps (mean 32.1), 10-second ones 29.4-34.4 after the
+start, but 25.7 and 28.2 in the race's first 20 seconds. The scheduler lock was found taken
+5,500-9,000 times a second and got by spinning 97% of the time (3 us; ~180 slept, 75 us): the main
+thread's `ArbitrateLock` ~20 us a call (35 in 04.05), its lock waits 2-3% (4-6). At the start the
+GPU thread (Eden's: the game's command lists into Vulkan work) was 81-85% in Eden's code and idle
+only 10-15% (77% and 17% later in the race): ~31 ms of work a frame against ~24 ms later, and the
+main thread waited on it (on objects 13% of the time; before the race, nvdrv's syncpoint event waits,
+`0xc010001d`, 128 a second, 2.5 ms each). Nothing in particular grows there, all of it does (twelve
+karts on screen: more draws). Its time in the race, by part: the command stream (DmaPusher, the
+engines' methods, macros) 15%, the buffer cache 9%, the texture cache 7%, memory tracking 7%,
+pipeline state 5%, memcpy 5%, the rasterizer's descriptors and states 5%. So this release trims
+the GPU thread where it's simplest to do exactly:
+
+- Patch 0095, `DmaPusher::SinkRun`: an incrementing method's words that the engine only sinks
+  (register writes, not methods it executes) are taken in one loop, instead of a call to
+  `CallMethod` for each with the DMA state reloaded after it; the state after the run is what the
+  per-word path would have left. Old and new loops compared on 3,000 random command streams (all
+  submission modes, IncreaseOnce, random executable masks, streams split across calls), ~790,000
+  words: the same calls, sinks and states.
+- `BufferCache::UpdateVertexBuffers` visits only the vertex buffers whose dirty bit is set (a mask
+  taken from the flags first; nothing in the loop changes them), instead of a call for each of the
+  32 on every draw that changed one.
+- `RasterizerVulkan::CachedVertexFormat`: `MaxwellToVK::VertexFormat` (a switch, then the device's
+  format support through hash lookups) remembered by type and size, for each attribute of each
+  vertex input update.
+- The buffer cache reads `Settings::IsGPUFenceBehaviorAccurate()` (an out-of-line call and a
+  virtual one) once a frame instead of on every `FindBuffer`.
+- The 30-second line counts the GPU thread's draws and command words a second, and the share of
+  those taken in runs.
+
 04.07: **small savings on the main thread, together.** In 04.05's log the main thread (Mario
 Kart's #79, emulated core 0) was the frame rate's only limit, and its translated code is spread
 thin: no block above 0.25% of core 0 (the busiest blocks in `hotblocks.log`, memset and memcpy

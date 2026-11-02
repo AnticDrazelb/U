@@ -226,6 +226,14 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | `UpdateHighestPriorityThreadsImpl` | 0.33% of core 0 | Horizon's algorithm; nothing obvious |
 | `SetSvcArguments` | 0.22% of core 0 | eight copies: probably sampling skid after the SVC |
 | Guest register file in memory (cross-block register caching) | ~25% of instructions | open: the biggest and hardest |
+| **GPU thread** (04.07: the race start's limit, 81-85% busy; 77% later) | | |
+| Command stream: a call per register write (`DmaPusher::CallMethod`) | part of 15% of the GPU thread | 04.08: runs in one loop |
+| `UpdateVertexBuffer` called for all 32 slots per draw | ~2% of the GPU thread | 04.08: dirty ones only |
+| `VertexFormat` / `IsFormatSupported` per attribute per draw | ~0.7% | 04.08: cached |
+| `IsGPUFenceBehaviorAccurate` per `FindBuffer` | 0.23% | 04.08: once a frame |
+| Samplers (`GetSamplerId`, `Sampler::HandleFor`, `MakeKey`) | ~1.4% | open |
+| `GpuToCpuAddress` | ~2% | open: called often; a last-page cache? |
+| Buffer cache bindings, memory tracking (`WordManager`) | ~9% + ~7% | open |
 
 ## Next (most promising first)
 

@@ -1,0 +1,281 @@
+From 850eb67547078f297a84cb0d5701bd216b8b45d8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 19:56:25 +0000
+Subject: [PATCH] PS4: the GPU thread's command stream and draws: register
+ writes in one loop, dirty vertex buffers only
+
+- DmaPusher::SinkRun: an incrementing method's words the engine only sinks (register writes)
+  are taken in one loop instead of a CallMethod call each with the DMA state reloaded after it;
+  the state after the run is what the per-word path leaves.
+- BufferCache::UpdateVertexBuffers visits only the vertex buffers whose dirty bit is set.
+- RasterizerVulkan::CachedVertexFormat remembers MaxwellToVK::VertexFormat by type and size.
+- The buffer cache reads Settings::IsGPUFenceBehaviorAccurate() once a frame, not per FindBuffer.
+- PS4 counters: the GPU thread's draws, command words, and words taken in runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |  4 ++
+ src/video_core/buffer_cache/buffer_cache.h    | 17 +++++-
+ .../buffer_cache/buffer_cache_base.h          |  3 ++
+ src/video_core/dma_pusher.cpp                 | 52 +++++++++++++++++++
+ src/video_core/dma_pusher.h                   |  2 +
+ .../renderer_vulkan/vk_rasterizer.cpp         | 19 ++++++-
+ .../renderer_vulkan/vk_rasterizer.h           |  8 +++
+ 7 files changed, 102 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 487152b09b..8a180dc5f8 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -48,6 +48,10 @@ inline LockStats lock_scheduler, lock_timer, lock_kernel_other, lock_core_contex
+ // for the earliest anyway, and sees it then)
+ inline std::atomic<uint64_t> timing_wakes{0}, timing_wakes_skipped{0};
+ 
++// Eden's GPU thread (04.08): draws, the command words it read, and how many of those were in runs
++// of plain register writes (DmaPusher::SinkRun). Added in bulk (a command list's words at once)
++inline std::atomic<uint64_t> gpu_draws{0}, gpu_command_words{0}, gpu_sink_run_words{0};
++
+ // The services' host threads (KThread's dummy threads) waiting for their next request: woken
+ // while they still spun, or after sleeping (and the time from the signal until they ran); the
+ // spin is longer (to 250 us) after a short wait (requests coming close together, 04.07)
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index fbe92e3e4b..c68d96ba4e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -78,6 +78,7 @@ void BufferCache<P>::RunGarbageCollector() {
+ 
+ template <class P>
+ void BufferCache<P>::TickFrame() {
++    fence_behavior_accurate = Settings::IsGPUFenceBehaviorAccurate();
+     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
+     if (!channel_state) {
+         return;
+@@ -1364,7 +1365,19 @@ void BufferCache<P>::UpdateVertexBuffers() {
+     }
+     flags[Dirty::VertexBuffers] = false;
+ 
+-    for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
++    // (04.08) Only the vertex buffers marked dirty, in order: UpdateVertexBuffer returns at once
++    // for the others, but that was a call for each of the 32 on every draw that changed one.
++    // (Nothing here changes those dirty bits, so the mask taken first is the loop's.)
++    static_assert(NUM_VERTEX_BUFFERS <= 32);
++    using Flags = std::remove_cvref_t<decltype(flags)>;
++    static constexpr Flags low_word{0xFFFFFFFFULL};
++    u32 dirty_mask = static_cast<u32>(((flags >> Dirty::VertexBuffer0) & low_word).to_ullong());
++    if constexpr (NUM_VERTEX_BUFFERS < 32) {
++        dirty_mask &= (1U << NUM_VERTEX_BUFFERS) - 1;
++    }
++    while (dirty_mask != 0) {
++        const u32 index = static_cast<u32>(std::countr_zero(dirty_mask));
++        dirty_mask &= dirty_mask - 1;
+         UpdateVertexBuffer(index);
+     }
+ }
+@@ -1547,7 +1560,7 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
+     if (buffer_id) {
+         Buffer& buffer = slot_buffers[buffer_id];
+         if (buffer.IsInBounds(device_addr, size)) {
+-            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
++            const bool should_sync = fence_behavior_accurate;
+             if (should_sync) {
+                 SynchronizeBufferWrites(buffer);
+             }
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 26bf3dd9ed..6e421f2e7c 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -536,6 +536,9 @@ private:
+     std::vector<MultiRangeSegment> graphics_segments;
+     std::vector<MultiRangeSegment> compute_segments;
+     u64 frame_tick = 0;
++    // (04.08) Settings::IsGPUFenceBehaviorAccurate(), read once a frame instead of on every
++    // buffer lookup (an out-of-line call and a virtual one, several times a draw)
++    bool fence_behavior_accurate = Settings::IsGPUFenceBehaviorAccurate();
+     u64 total_used_memory = 0;
+     u64 minimum_memory = 0;
+     u64 critical_memory = 0;
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2c0ba007ef..1cf5515751 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "video_core/dma_pusher.h"
+@@ -112,6 +113,9 @@ bool DmaPusher::Step() {
+ }
+ 
+ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::gpu_command_words.fetch_add(commands.size(), std::memory_order_relaxed);
++#endif
+     for (size_t index = 0; index < commands.size();) {
+         // Data word of methods command
+         if (dma_state.method_count && dma_state.non_incrementing) {
+@@ -123,6 +127,13 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+             dma_state.is_last_call = true;
+             index += max_write;
+         } else if (dma_state.method_count) {
++            // (04.08) A run of plain register writes (methods the engine only sinks, not ones it
++            // executes): one loop, without a call and a reload of the DMA state for each word,
++            // leaving the state the per-word path below would
++            if (const size_t run = SinkRun(commands, index); run != 0) {
++                index += run;
++                continue;
++            }
+             auto const command_header = commands[index]; //can copy
+             dma_state.dma_word_offset = u32(index * sizeof(u32));
+             dma_state.is_last_call = dma_state.method_count <= 1;
+@@ -166,6 +177,47 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+     }
+ }
+ 
++size_t DmaPusher::SinkRun(std::span<const CommandHeader> commands, size_t index) {
++    // (only with an incrementing method count left: the caller's branch; non-incrementing words
++    // go to CallMultiMethod)
++    if (dma_state.method < non_puller_methods) {
++        return 0;
++    }
++    Engines::EngineInterface* const engine = subchannels[dma_state.subchannel];
++    if (engine == nullptr) {
++        return 0;
++    }
++    u32 method = dma_state.method;
++    u32 count = dma_state.method_count;
++    bool non_incrementing = dma_state.non_incrementing;
++    size_t i = index;
++    const size_t end = commands.size();
++    while (count != 0 && i < end && !non_incrementing && !engine->execution_mask[method]) {
++        engine->method_sink.emplace_back(method, commands[i].argument);
++        ++i;
++        --count;
++        // as the per-word path: the method advances, then IncreaseOnce makes the rest
++        // non-incrementing (CallMultiMethod's, after this run)
++        ++method;
++        non_incrementing = dma_increment_once;
++    }
++    const size_t run = i - index;
++#ifdef __OPENORBIS__
++    if (run > 1) {
++        Common::PS4Perf::gpu_sink_run_words.fetch_add(run, std::memory_order_relaxed);
++    }
++#endif
++    if (run != 0) {
++        // what the last word's per-word call left
++        dma_state.dma_word_offset = u32((i - 1) * sizeof(u32));
++        dma_state.is_last_call = count == 0;
++        dma_state.method = method;
++        dma_state.method_count = count;
++        dma_state.non_incrementing = non_incrementing;
++    }
++    return run;
++}
++
+ void DmaPusher::SetState(const CommandHeader& command_header) {
+     dma_state.method = command_header.method;
+     dma_state.subchannel = command_header.subchannel;
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 62af628511..c39f2aa831 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -146,6 +146,8 @@ private:
+     void ProcessCommands(std::span<const CommandHeader> commands);
+ 
+     void SetState(const CommandHeader& command_header);
++    /// The words from index on that are plain register writes, sunk in one loop: how many
++    size_t SinkRun(std::span<const CommandHeader> commands, size_t index);
+ 
+     void CallMethod(u32 argument);
+     void CallMultiMethod(const u32* base_start, u32 num_methods);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f43bea1220..d65ee2dcb6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -16,6 +16,7 @@
+ #include "common/assert.h"
+ #include "common/logging.h"
+ #include "common/scope_exit.h"
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+@@ -260,6 +261,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ }
+ 
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::gpu_draws.fetch_add(1, std::memory_order_relaxed);
++#endif
+     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+         const auto& draw_state = maxwell3d->draw_manager.draw_state;
+         const u32 num_instances{instance_count};
+@@ -293,6 +297,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+ }
+ 
+ void RasterizerVulkan::DrawIndirect() {
++#ifdef __OPENORBIS__
++    Common::PS4Perf::gpu_draws.fetch_add(1, std::memory_order_relaxed);
++#endif
+     const auto& params = maxwell3d->draw_manager.indirect_state;
+     buffer_cache.SetDrawIndirect(&params);
+     PrepareDraw(params.is_indexed, [this, &params] {
+@@ -1879,6 +1886,16 @@ void RasterizerVulkan::UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs&
+     });
+ }
+ 
++VkFormat RasterizerVulkan::CachedVertexFormat(Maxwell::VertexAttribute::Type type,
++                                              Maxwell::VertexAttribute::Size size) {
++    const size_t index = (static_cast<size_t>(type) & 7) * 64 + (static_cast<size_t>(size) & 63);
++    if (!vertex_formats_known[index]) {
++        vertex_formats[index] = MaxwellToVK::VertexFormat(device, type, size);
++        vertex_formats_known[index] = true;
++    }
++    return vertex_formats[index];
++}
++
+ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) {
+     auto& dirty{maxwell3d->dirty.flags};
+     const bool vertex_input_dirty = dirty[Dirty::VertexInput];
+@@ -1910,7 +1927,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs)
+             .pNext = nullptr,
+             .location = index,
+             .binding = binding,
+-            .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
++            .format = CachedVertexFormat(attribute.type, attribute.size),
+             .offset = attribute.offset,
+         });
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 7470aa4f14..06824856e6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <bitset>
+ 
+ #include <boost/container/static_vector.hpp>
+ 
+@@ -195,6 +196,13 @@ private:
+     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
+ 
+     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
++    /// MaxwellToVK::VertexFormat for this device, by type (3 bits) and size (6 bits), remembered
++    /// (04.08: on every vertex input update, each attribute's took hash lookups of the device's
++    /// format support)
++    VkFormat CachedVertexFormat(Tegra::Engines::Maxwell3D::Regs::VertexAttribute::Type type,
++                                Tegra::Engines::Maxwell3D::Regs::VertexAttribute::Size size);
++    std::array<VkFormat, 8 * 64> vertex_formats{};
++    std::bitset<8 * 64> vertex_formats_known{};
+ 
+     Tegra::GPU& gpu;
+     Tegra::MaxwellDeviceMemoryManager& device_memory;
+-- 
+2.43.0
+

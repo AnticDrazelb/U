@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.08: the start of a race. 04.07 ran your slowest track at 32.1 fps on average, but the first 20 "
+         "seconds of a race dipped to 25-28. There, with all twelve karts on screen, Eden's GPU thread (which "
+         "turns the game's graphics commands into work for the PS4's GPU) was busy 85-90% of the time and the "
+         "game waited for it. This release trims that thread: the game's register writes, most of its "
+         "graphics commands, are taken in one loop instead of one call each; only the vertex buffers that "
+         "changed are looked at on each draw (not all 32); vertex formats are remembered instead of looked up "
+         "on every draw; and a setting read on every buffer lookup is read once a frame. The 30-second log "
+         "line now also counts the GPU thread's draws and commands a second.\n"
          "04.07: a batch of small savings on the game's main thread, the one that sets Mario Kart's frame "
          "rate. Each is small on its own (a fraction of a percent to about one percent), so they come "
          "together: a function's return no longer reads back the address it just wrote (1% fewer host "
@@ -2345,6 +2353,22 @@ std::string PerfLine(double seconds)
                             double(wakes - last_wakes) / seconds, double(skipped - last_skipped) / seconds);
         last_wakes = wakes;
         last_skipped = skipped;
+    }
+    // Eden's GPU thread's load (04.08): draws, command words, and those in runs of plain register
+    // writes (one loop, DmaPusher::SinkRun)
+    {
+        static uint64_t last_draws = 0, last_words = 0, last_run_words = 0;
+        const uint64_t draws = P::gpu_draws.load(std::memory_order_relaxed);
+        const uint64_t words = P::gpu_command_words.load(std::memory_order_relaxed);
+        const uint64_t run_words = P::gpu_sink_run_words.load(std::memory_order_relaxed);
+        line += fmt::format("; the GPU thread: {:.0f} draws a second, {:.0f} command words a second ({:.0f}% of them "
+                            "register writes in runs, one loop each)",
+                            double(draws - last_draws) / seconds, double(words - last_words) / seconds,
+                            words > last_words ? 100.0 * double(run_words - last_run_words) / double(words - last_words)
+                                               : 0.0);
+        last_draws = draws;
+        last_words = words;
+        last_run_words = run_words;
     }
     // The services' host threads waiting for their next request (04.07: a longer spin, to 250 us,
     // after a short wait): woken while spinning, or after sleeping
