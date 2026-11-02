@@ -33,7 +33,7 @@ cores at 1.6 GHz (two modules of four, the seventh core shared with the system).
 | 04.01 | 26-30 | Profiler on (27-30 off): within a frame of 04.00 |
 | 04.02 | no frame | translation 1.3 ms a block and rising (the look-ahead's invalidation ranges) |
 | 04.03 | 26-30 | at **100%** resolution (28-29 most of the time), Profiler on: as 04.01 at 50% |
-| 04.04 | not tested yet | calls and returns end the flags: the hottest blocks too |
+| 04.04 | 28-33 | **another track** (busier, per the tester), 50%, Profiler on: mostly 29-31; flag code gone from 93% of the hot blocks' samples |
 
 The PS4's GPU is busy only 5-10% of the time in races, so resolution and GPU settings barely move
 the frame rate: it's CPU-bound. Other games: Celeste plays smoothly; Captain Toad (64-bit) was at
@@ -53,6 +53,13 @@ about 15 fps in 03.80, limited by its main thread.
   land in a block's first 16 bytes (a quarter of the bytes past 64): getting into a block (its
   first fetch, the jump there, the first loads of guest registers) costs more than its length says.
 - **Host instructions per guest instruction:** 5.85 in the 60 hottest blocks (04.01).
+- **Tracks differ** (the tester: fps depends heavily on the map). Two measured, 04.01's usual one
+  and 04.04's busier one: both limited by the game's own CPU work the same way (main thread 73-77%
+  running, 23-26% waiting on its helpers, which run ~61% and ~45%); the PS4's GPU 10-12% busy,
+  Eden's GPU thread 50-66%; writes to GPU-cached memory up to 102,000 a second late in a race but
+  under 0.5% of any game core in the profile, and no fps change with them. A slow track's log
+  would show whether it is the same limit (more game work a frame) or another (Eden's GPU thread
+  near 100%, the CPU waiting for the GPU).
 - **Instruction mix of the hottest translated code:** ~23% loads/stores of the guest register file
   (in `JitState` memory), ~10% flag handling (`cmc`/`lahf`/`seto` to save NZCV, `sahf` to read it),
   ~8% guest memory accesses (fastmem, one `mov` each), the rest the work itself.
@@ -185,8 +192,8 @@ about 15 fps in 03.80, limited by its main thread.
 
 ## Next (most promising first)
 
-1. **Test 04.04** on a console (at 50%, to compare with 04.01): `hotblocks.log` should show the
-   fill and copy loops without `lahf`/`sahf`; race fps (same track as before, Profiler on or off); a
+1. **Same track, two versions** (04.01 vs 04.04, 50%, Profiler on) to measure 04.02-04.04's gain
+   (04.04's console run was on another track); and the **slowest track's** log; race fps (same track as before, Profiler on or off); a
    `hotblocks.log` to see the flag code gone.
 2. **Translated code, generic** (where the main thread's time goes): fold a constant offset into
    the fastmem access itself (`mov [r13 + base + 8]`: needs the IR to carry it, the fallback to
