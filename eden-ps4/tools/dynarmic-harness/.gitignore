@@ -8,3 +8,4 @@ dynbench64[a-z0-9]*
 *.bin
 *.bin.o
 *.bin.elf
+!*.cpp
