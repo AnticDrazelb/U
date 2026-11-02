@@ -24,7 +24,7 @@ if (PS4)
     # The app heap leaves room in the system pool, the only memory that runs code, for the
     # recompiler's code caches (4 x 32 MiB).
     set_source_files_properties(${EDEN_PS4_RUNTIME_SOURCES} PROPERTIES
-        COMPILE_DEFINITIONS PS4_SYSTEM_HEAP_MAX_MB=384
+        COMPILE_DEFINITIONS "PS4_SYSTEM_HEAP_MAX_MB=384;PS4_TRACE_KEEP=4"
         INCLUDE_DIRECTORIES ${EDEN_PS4_REPO}/port)
 
     # The HOME menu (ui/), with its fonts (../ui-fonts) included whole

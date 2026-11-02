@@ -379,6 +379,31 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.10: **a race's start draws twice as much; the 3D engine's writes direct; a RADV crash
+guarded.** 04.09 on a console (the tester's three tracks from fresh boots; the bundle kept two of
+the four sessions): its 10-second counts show a race's start meets almost nothing new (the 10 s of
+loading before it made 117 pipelines, 3,059 images, 452 buffers; its first 30 s 1-3 pipelines,
+46-192 images a 10 s, no draw skipped), but draws ~780-880 a frame (32-34 fps) against 360-410
+later (40-42). The GPU thread was 77-81% busy there, ~28 us a draw. At that start the GPU thread's
+register-write path was still ~4.6% of its time (`SinkRun` 2.5%, `Maxwell3D::ConsumeSinkImpl`
+2.1%). The third boot crashed while the game loaded: RADV's `end_subpass` (Mesa's common render
+pass code) on the Vulkan worker read `NULL + 0x60`: a render pass ended in a command buffer with
+none begun.
+
+- Patch 0097, `Maxwell3D::SinkWriteRun`: a run of the 3D engine's plain register writes
+  (`DmaPusher::SinkRun`) goes straight into its registers (shadow RAM tracked or replayed, the
+  dirty flags set: what `ConsumeSinkImpl` does with each), after what was sunk before (consumed
+  first: the order). The shadow RAM control and anything that reads the registers or dirty flags
+  change or run only through a method that executes, which consumes the sink first. Checked with
+  `tools/gpu-tests/dmatest.cpp` (the engines' registers hashed at each executed method and at the
+  end): 3,000 random streams equal; without the consume before a run it fails (seed 11).
+- `Vulkan::Scheduler`'s worker tracks whether its command buffer has a render pass begun
+  (`worker_render_pass_open`): a render pass end without one is skipped (the image barriers after
+  it are valid outside a render pass), warned once and counted (the 30-second line, when any).
+- The log bundle keeps the last five sessions: `log`, `crash`, `hang` and `gpu/radv-ps4` as
+  `-previous`, `-previous-2` to `-previous-4` (all shift each run, so one number is one run), and
+  the shared runtime's boot traces (`PS4_TRACE_KEEP=4` for Eden; Crema keeps one).
+
 04.09: **a stuck exit restarts the app; what a race's start meets new.** 04.08 on a console (the
 tester's slowest track, the Crossing Cup's first, 50%, Profiler on): 30-second windows 31.4-35.6
 fps (mean 34.0), 10-second ones 30.7-36.7 after the start, the start 32.2 then 27.6; the cup's other

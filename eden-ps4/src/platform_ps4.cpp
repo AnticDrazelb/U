@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.10: what slows a race's start, and a crash guarded. 04.09's counts show that a race's start "
+         "isn't waiting for anything new (its shaders and textures came while the track loaded): it simply "
+         "draws twice as much, ~800-880 draws a frame against ~400 later, with all the karts together, and "
+         "Eden's GPU thread spends about 28 microseconds on each. This release makes the commonest part of "
+         "that cheaper: the game's register writes to the 3D engine now go straight into its registers "
+         "instead of a queue that was read back later. Also: a crash in the PS4's graphics driver while a "
+         "game loaded (ending a render pass that wasn't begun) is now skipped and counted instead, and the "
+         "log bundle keeps the last five sessions instead of two, so a test of several boots is all in it.\n"
          "04.09: no more frozen exits, and a closer look at a race's start. 04.08 ran your slowest track at 34.0 "
          "fps on average, its lowest 30.7 after the start; but once, leaving the game for Eden's menu froze "
          "everything. Now, if leaving a game ever stalls for 30 seconds, the app saves its logs and starts again "
@@ -1749,6 +1757,21 @@ void ExportLogs(const char* when)
     Trace(fmt::format("logs {}: {} {}", when, written ? "written to" : "could not be written to", file));
 }
 
+// A run's file kept as <stem>-previous<ext>, the ones before it as <stem>-previous-2<ext> to
+// <stem>-previous-<keep><ext> (04.10): every kind shifts each run, present or not, so that the
+// files with one number are one run's
+void KeepPrevious(const std::string& stem, const std::string& ext, int keep = 4)
+{
+    const auto previous = [&](int i) {
+        return stem + "-previous" + (i > 1 ? "-" + std::to_string(i) : std::string()) + ext;
+    };
+    std::remove(previous(keep).c_str());
+    for (int i = keep - 1; i >= 1; i--)
+        rename(previous(i).c_str(), previous(i + 1).c_str());
+    rename((stem + ext).c_str(), previous(1).c_str());
+}
+
+
 // What the HOME menu said to do: boot `program`, with these settings
 struct MenuChoice
 {
@@ -2027,10 +2050,11 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     choice.settings = menu.Settings();
     Trace("start page: booting " + choice.program);
 
-    // the last run's files are kept, under other names
-    rename(kLogFile, "/data/eden-ps4/log-previous.txt");
-    rename(kCrashFile, "/data/eden-ps4/crash-previous.log");
-    rename(kHangFile, "/data/eden-ps4/hang-previous.log");
+    // the last runs' files are kept, under other names (04.10: four runs back, so that a test of
+    // several boots, say a track each, is all in the log bundle)
+    KeepPrevious("/data/eden-ps4/log", ".txt");
+    KeepPrevious("/data/eden-ps4/crash", ".log");
+    KeepPrevious("/data/eden-ps4/hang", ".log");
     g_screen.Clear();
     g_screen.SetScale(2.0f);
     return choice;
@@ -2392,6 +2416,10 @@ std::string PerfLine(double seconds)
         last_images = images;
         last_buffers = buffers;
     }
+    // (04.10) Vulkan render pass ends skipped: none begun in their command buffer (RADV crashed on
+    // one, once)
+    if (const uint64_t unmatched = P::vk_unmatched_render_pass_ends.load(std::memory_order_relaxed); unmatched != 0)
+        line += fmt::format("; Vulkan render pass ends without a beginning, skipped so far: {}", unmatched);
     // The services' host threads waiting for their next request (04.07: a longer spin, to 250 us,
     // after a short wait): woken while spinning, or after sleeping
     {
@@ -2626,8 +2654,7 @@ void* Run(void*)
     // RADV's own log and its GPU hang and fault reports (port/mesa/ac_ps4_drm.c), here (the last
     // session's log kept: it starts a new one, and a crash restarts the app)
     setenv("RADV_PS4_DIR", (std::string(kDataDir) + "/gpu").c_str(), 0);
-    rename((std::string(kDataDir) + "/gpu/radv-ps4.log").c_str(),
-           (std::string(kDataDir) + "/gpu/radv-ps4-previous.log").c_str());
+    KeepPrevious(std::string(kDataDir) + "/gpu/radv-ps4", ".log");
     // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless System Settings
     // (or settings.txt, EDEN_PS4_RENDERER=null) chose the software renderer, or Vulkan didn't
     // start this session

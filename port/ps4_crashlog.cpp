@@ -147,8 +147,25 @@ int traceFd() {
             // the launcher's run (the app restarts into the game it picked): kept as
             // boot-trace-launcher.log, for its start-up times; the one before it as
             // boot-trace-launcher-previous.log (an app that runs each game in a run of its own
-            // keeps the game before the last one's)
-            rename("/data/Crema/boot-trace-launcher.log", "/data/Crema/boot-trace-launcher-previous.log");
+            // keeps the game before the last one's), and PS4_TRACE_KEEP - 1 before that as
+            // boot-trace-launcher-previous-2.log and on (Eden for PS4: 4, one per session)
+#ifndef PS4_TRACE_KEEP
+#define PS4_TRACE_KEEP 1
+#endif
+            char from[96], to[96];
+            for (int i = PS4_TRACE_KEEP; i >= 1; i--) {
+                if (i == 1)
+                    snprintf(from, sizeof(from), "/data/Crema/boot-trace-launcher.log");
+                else if (i == 2)
+                    snprintf(from, sizeof(from), "/data/Crema/boot-trace-launcher-previous.log");
+                else
+                    snprintf(from, sizeof(from), "/data/Crema/boot-trace-launcher-previous-%d.log", i - 1);
+                if (i == 1)
+                    snprintf(to, sizeof(to), "/data/Crema/boot-trace-launcher-previous.log");
+                else
+                    snprintf(to, sizeof(to), "/data/Crema/boot-trace-launcher-previous-%d.log", i);
+                rename(from, to);
+            }
             rename("/data/Crema/boot-trace.log", "/data/Crema/boot-trace-launcher.log");
         }
         g_traceFd = open("/data/Crema/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);

@@ -1,0 +1,184 @@
+From 680dad80c8db69363e2c122b28caed44fcacb701 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 2 Nov 2026 22:02:53 +0000
+Subject: [PATCH] PS4: the 3D engine's register runs straight into its
+ registers; a render pass end with none begun skipped
+
+- Maxwell3D::SinkWriteRun: a run of plain register writes (DmaPusher::SinkRun) is written as the
+  sink's replay would (shadow RAM, dirty flags), after consuming what was sunk before it.
+- The Vulkan scheduler's worker tracks a render pass begun in its command buffer and skips (and
+  counts) an end without one: RADV crashed on one (end_subpass, NULL render pass) as a game loaded.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |  3 +++
+ src/video_core/dma_pusher.cpp                 | 14 ++++++++++-
+ src/video_core/engines/maxwell_3d.h           | 23 +++++++++++++++++++
+ .../renderer_vulkan/vk_scheduler.cpp          | 18 ++++++++++++---
+ src/video_core/renderer_vulkan/vk_scheduler.h |  4 ++++
+ 5 files changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 62072ad570..89693dd666 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -56,6 +56,9 @@ inline std::atomic<uint64_t> gpu_draws{0}, gpu_command_words{0}, gpu_sink_run_wo
+ // created; for what a race's start waits on
+ inline std::atomic<uint64_t> gpu_pipelines_new{0}, gpu_draws_skipped{0}, gpu_images_created{0},
+     gpu_buffers_created{0};
++// (04.10) Vulkan render pass ends the scheduler's worker skipped: none begun in their command
++// buffer (counted on every platform; it would have crashed RADV)
++inline std::atomic<uint64_t> vk_unmatched_render_pass_ends{0};
+ 
+ // The services' host threads (KThread's dummy threads) waiting for their next request: woken
+ // while they still spun, or after sleeping (and the time from the signal until they ran); the
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 1cf5515751..35ce7172cd 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -192,8 +192,14 @@ size_t DmaPusher::SinkRun(std::span<const CommandHeader> commands, size_t index)
+     bool non_incrementing = dma_state.non_incrementing;
+     size_t i = index;
+     const size_t end = commands.size();
++    // (04.10) The 3D engine's writes go straight into its registers, the run's words all at once
++    // (Maxwell3D::SinkWriteRun: what its sink's replay does with them, without the sink)
++    const bool direct = subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D;
++    const u32 first_method = method;
+     while (count != 0 && i < end && !non_incrementing && !engine->execution_mask[method]) {
+-        engine->method_sink.emplace_back(method, commands[i].argument);
++        if (!direct) {
++            engine->method_sink.emplace_back(method, commands[i].argument);
++        }
+         ++i;
+         --count;
+         // as the per-word path: the method advances, then IncreaseOnce makes the rest
+@@ -202,6 +208,12 @@ size_t DmaPusher::SinkRun(std::span<const CommandHeader> commands, size_t index)
+         non_incrementing = dma_increment_once;
+     }
+     const size_t run = i - index;
++    if (direct && run != 0) {
++        // (what was sunk before, first: the order of the writes)
++        engine->ConsumeSink(system);
++        static_cast<Engines::Maxwell3D*>(engine)->SinkWriteRun(
++            first_method, &commands[index].argument, run);
++    }
+ #ifdef __OPENORBIS__
+     if (run > 1) {
+         Common::PS4Perf::gpu_sink_run_words.fetch_add(run, std::memory_order_relaxed);
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 0cab2ae986..549a7db9c5 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3196,6 +3196,29 @@ public:
+ 
+     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
+ 
++    /// (04.10) What ConsumeSinkImpl does with one sunk register write, done at once: for a run of
++    /// them (DmaPusher::SinkRun), the sink consumed first so they stay in order. The shadow RAM
++    /// control is the run's (it changes only through a method that executes, which consumes the
++    /// sink first), and nothing reads the registers or dirty flags before that either.
++    void SinkWriteRun(u32 method, const u32* words, size_t count) {
++        const auto control = shadow_state.shadow_ram_control;
++        const bool track = control == Regs::ShadowRamControl::Track ||
++                           control == Regs::ShadowRamControl::TrackWithFilter;
++        const bool replay = control == Regs::ShadowRamControl::Replay;
++        for (size_t i = 0; i < count; ++i, ++method) {
++            u32 argument = words[i];
++            if (track) {
++                shadow_state.reg_array[method] = argument;
++            } else if (replay) {
++                argument = shadow_state.reg_array[method];
++            }
++            regs.reg_array[method] = argument;
++            for (auto const& table : dirty.tables) {
++                dirty.flags[table[method]] = true;
++            }
++        }
++    }
++
+ private:
+     void InitializeRegisterDefaults();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 4a7a7d5e78..35a98cdb96 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+ 
++#include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+@@ -112,7 +113,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
+         values[i] = clear_values[i];
+     }
+-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
++    Record([this, renderpass, framebuffer_handle, render_area, values, clear_value_count](
+                vk::CommandBuffer cmdbuf) {
+         const VkRenderPassBeginInfo renderpass_bi{
+             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+@@ -128,6 +129,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
+         };
+         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
++        worker_render_pass_open = true;
+     });
+     num_renderpass_images = framebuffer->NumImages();
+     renderpass_images = framebuffer->Images();
+@@ -323,6 +325,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+ }
+ 
+ void Scheduler::AllocateWorkerCommandBuffer() {
++    worker_render_pass_open = false;
+     current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+     current_cmdbuf.Begin({
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+@@ -418,7 +421,7 @@ void Scheduler::EndRenderPass()
+         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
+         query_cache->NotifySegment(false);
+ 
+-        Record([num_images = num_renderpass_images,
++        Record([this, num_images = num_renderpass_images,
+                        images = renderpass_images,
+                        ranges = renderpass_image_ranges,
+                        has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+@@ -458,7 +461,16 @@ void Scheduler::EndRenderPass()
+                         .subresourceRange = range,
+                 };
+             }
+-            cmdbuf.EndRenderPass();
++            if (worker_render_pass_open) {
++                cmdbuf.EndRenderPass();
++                worker_render_pass_open = false;
++            } else {
++                // (a render pass end with none begun in this command buffer: skipped, the
++                // barriers after it are valid outside one)
++                if (Common::PS4Perf::vk_unmatched_render_pass_ends.fetch_add(1, std::memory_order_relaxed) == 0) {
++                    LOG_WARNING(Render_Vulkan, "A render pass end with none begun in its command buffer: skipped");
++                }
++            }
+             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                                    0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index d4bc8d0ec5..ad186696a9 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -304,6 +304,10 @@ private:
+     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
+ 
+     vk::CommandBuffer current_cmdbuf;
++    // (04.10, the worker's own) whether current_cmdbuf has a render pass begun and not ended: a
++    // render pass end without one is skipped (RADV crashed on it once, ending a NULL render pass,
++    // as a game loaded), and counted
++    bool worker_render_pass_open = false;
+     vk::CommandBuffer current_upload_cmdbuf;
+ 
+     DeferredClear deferred_clear;
+-- 
+2.43.0
+
