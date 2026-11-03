@@ -1322,6 +1322,12 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.15: before each draw Eden worked out the graphics pipeline's key again from ~410 of the GPU's "
+         "registers and compared it with the last one (~2-3% of its GPU thread). Now, when none of those "
+         "registers took a new value since (and the shaders and the kind of primitive are the same), it "
+         "uses the last pipeline. Which registers: found by a test that flips every bit of every register "
+         "against Eden's own code. Every 64th time it checks anyway; if the key ever differs, it stops "
+         "doing it for the session and the log says so.\n"
          "04.14: Eden's GPU thread does less per draw, from 04.12's samples of it in races. Eden for PS4's "
          "own counters cost it ~1%: two locked adds per uniform buffer, in a cache line the timing thread "
          "also writes; its counters now have their own, added without a lock. A macro's parameters, when "
@@ -2461,6 +2467,20 @@ std::string PerfLine(double seconds)
                             "frames copying every draw {:.0f}%",
                             double(d[0]) / 1024.0 / seconds, double(d[1]) / seconds, double(d[2]) / 1024.0 / seconds,
                             double(d[3]) / seconds, pct(d[4], d[3]), pct(d[6], d[5]));
+        std::copy(std::begin(now), std::end(now), std::begin(last));
+    }
+    // (04.15) Graphics pipeline lookups that reused the last one (none of the key's registers, the
+    // topology, the shaders changed), the reuses checked by a refresh, and those found different
+    {
+        const P::GpuThreadCounters& g = P::gpu_thread;
+        static uint64_t last[4] = {};
+        const uint64_t now[4] = {g.pipeline_lookups.load(), g.pipeline_reuses.load(), g.pipeline_reuse_checks.load(),
+                                 g.pipeline_reuse_mismatches.load()};
+        line += fmt::format("; graphics pipeline lookups: {:.0f} a second, {:.0f}% the last one again with its key "
+                            "unchanged (not refreshed); {} of those checked so far, {} found changed{}",
+                            double(now[0] - last[0]) / seconds,
+                            now[0] > last[0] ? 100.0 * double(now[1] - last[1]) / double(now[0] - last[0]) : 0.0,
+                            now[2], now[3], now[3] != 0 ? " (reuse turned off)" : "");
         std::copy(std::begin(now), std::end(now), std::begin(last));
     }
     // (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them: an event by

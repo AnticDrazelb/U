@@ -379,6 +379,37 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.15: **the pipeline key reused when none of its registers changed.** Before each draw,
+`PipelineCache::CurrentGraphicsPipeline` refreshed `FixedPipelineState` from the 3D engine's
+registers (`Refresh`: ~410 registers across the engine's state, most in different cache lines)
+and compared the whole key with the current pipeline's (`GraphicsPipeline::Next`, a `memcmp` of
+a few hundred bytes): in 04.12's race samples `Refresh` 1.3%, `Next` 0.7%, part of `bcmp`'s
+0.8%, ~0.5 us a draw.
+
+Which registers `Refresh` reads: `tools/gpu-tests/pkeyregs.sh` builds Eden's own
+`fixed_pipeline_state.cpp` on the host and (1) flips every bit of every register from 5,000
+random register files (zero, small, one-bit and random values; random topology, engine state,
+device features, the squashed-blend setting): 412 registers (103 ranges) ever change the key,
+the same from 200 register files on; (2) keeps those and re-randomizes all the others 20 times
+in each of 20,000 new register files: the key never changed; with one register dropped from the
+set (0x1d1, 0x204, 0x3fa, 0x4d8, 0x700 tried) it catches the change in 768-2,000 of 2,000.
+
+Patch 0102:
+
+- `video_core/renderer_vulkan/pipeline_key_registers.h`: the 412 as ranges (to be found again
+  if `Refresh` changes).
+- `Maxwell3D::DirtyState`: `pipeline_key_regs` (filled by the Vulkan pipeline cache) and
+  `pipeline_key_changed`, set when one of them takes a new value: every register write goes
+  through `ProcessDirtyRegisters` or 04.10's `SinkWriteRun`, which now compare. Of the registers
+  written elsewhere (HLE macros) only `transform_feedback_enabled` is in the key:
+  `HLE_TransformFeedbackSetup` sets the flag itself.
+- `CurrentGraphicsPipeline`: the last pipeline again, without `Refresh` or `Next`, when the flag
+  is clear, the engine (channel), topology, engine state, shader hashes and squashed-blend setting
+  are the last lookup's, the dirty flags `Refresh` consumes (vertex input, viewport swizzles,
+  blending) are clear, and the last lookup found a pipeline (the current one). Every 64th such
+  lookup refreshes and compares instead; a difference turns the reuse off for the session (logged
+  and counted in the 30-second line, with the share of lookups that reused).
+
 04.14: **the GPU thread's own overheads, from 04.12's samples.** The GPU thread's samples over
 the Grand Prix's races (100-211 s, 58,573 samples): idle 26%; the command stream ~13% (`SinkRun`
 3.6%, `ProcessCommands` 3.5%, `CallMethod` 2.1%, `ConsumeSinkImpl` 1.1%, macros 1.2%); memcpy

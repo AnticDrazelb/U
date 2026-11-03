@@ -1,0 +1,285 @@
+From 8969f4daa2e410a298d5c211b315157b47aeace7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 10:54:15 +0000
+Subject: [PATCH] Vulkan: reuse the graphics pipeline when none of its key's
+ registers changed
+
+FixedPipelineState::Refresh reads ~410 3D engine registers spread over the engine's state, and
+GraphicsPipeline::Next then compares the whole key: ~0.5 us a draw on the PS4's Jaguar cores. The
+registers Refresh reads (pipeline_key_registers.h, 412 in 103 ranges) were found by flipping every
+bit of every register from random register files against fixed_pipeline_state.cpp itself, and
+checked by re-randomizing all the others. Every register write (ProcessDirtyRegisters,
+SinkWriteRun) now sets Maxwell3D's dirty.pipeline_key_changed when one of them takes a new value;
+HLE_TransformFeedbackSetup, which writes transform_feedback_enabled directly, sets it itself.
+
+CurrentGraphicsPipeline returns the current pipeline without refreshing the key when that flag is
+clear and the engine, topology, engine state, shader hashes and squashed-blend setting are the last
+lookup's, the dirty flags Refresh consumes are clear, and the last lookup found that pipeline.
+Every 64th such lookup refreshes and compares instead; a difference turns the reuse off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |  5 ++
+ src/video_core/engines/maxwell_3d.cpp         |  4 ++
+ src/video_core/engines/maxwell_3d.h           | 11 +++
+ src/video_core/macro.cpp                      |  4 ++
+ .../renderer_vulkan/pipeline_key_registers.h  | 38 +++++++++++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 67 ++++++++++++++++++-
+ .../renderer_vulkan/vk_pipeline_cache.h       | 13 ++++
+ 7 files changed, 140 insertions(+), 2 deletions(-)
+ create mode 100644 src/video_core/renderer_vulkan/pipeline_key_registers.h
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 36d99b0c81..d5049ca99c 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -71,6 +71,11 @@ struct alignas(64) GpuThreadCounters {
+     std::atomic<uint64_t> cb_bytes{0};
+     std::atomic<uint64_t> ubo_copied{0}, ubo_copied_bytes{0}, ubo_cached{0}, ubo_cached_hits{0};
+     std::atomic<uint64_t> ubo_frames{0}, ubo_frames_copying{0};
++    // (04.15) graphics pipeline lookups: all of them, those that reused the last one (none of the
++    // key's registers changed), the reuses checked (the key refreshed and compared), and the
++    // checks that found it changed (reuse then off for the session)
++    std::atomic<uint64_t> pipeline_lookups{0}, pipeline_reuses{0}, pipeline_reuse_checks{0},
++        pipeline_reuse_mismatches{0};
+ };
+ inline GpuThreadCounters gpu_thread;
+ // (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index a3962cc45a..493fd0d518 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -311,6 +311,10 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+ }
+ 
+ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
++    // (PS4 04.15) a register of the pipeline key with a new value
++    if (dirty.pipeline_key_regs[method] != 0 && regs.reg_array[method] != argument) {
++        dirty.pipeline_key_changed = true;
++    }
+     regs.reg_array[method] = argument;
+     for (auto const& table : dirty.tables)
+         dirty.flags[table[method]] = true;
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 225505094e..c1a162a4a9 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3154,6 +3154,14 @@ public:
+ 
+         Flags flags;
+         Tables tables{};
++
++        /// (PS4 04.15) The registers a renderer's pipeline key reads (filled by the renderer: the
++        /// Vulkan pipeline cache), and whether one of them took a new value since it last read
++        /// them. Every register write (ProcessDirtyRegisters, SinkWriteRun) compares; the few
++        /// written elsewhere that are in a key set it themselves (HLE_TransformFeedbackSetup).
++        std::array<u8, Regs::NUM_REGS> pipeline_key_regs{};
++        bool pipeline_key_regs_filled = false;
++        bool pipeline_key_changed = true;
+     } dirty;
+ 
+     DrawManager draw_manager;
+@@ -3212,6 +3220,9 @@ public:
+             } else if (replay) {
+                 argument = shadow_state.reg_array[method];
+             }
++            if (dirty.pipeline_key_regs[method] != 0 && regs.reg_array[method] != argument) {
++                dirty.pipeline_key_changed = true;
++            }
+             regs.reg_array[method] = argument;
+             for (auto const& table : dirty.tables) {
+                 dirty.flags[table[method]] = true;
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index d121548c89..92b2ff2f95 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -382,6 +382,10 @@ void HLE_ClearMemory::Execute(Core::System& system, Engines::Maxwell3D& maxwell3
+ void HLE_TransformFeedbackSetup::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+     maxwell3d.RefreshParameters();
+     auto& regs = maxwell3d.regs;
++    // (PS4 04.15) a register of the pipeline key written directly (no ProcessDirtyRegisters)
++    if (regs.transform_feedback_enabled != 1) {
++        maxwell3d.dirty.pipeline_key_changed = true;
++    }
+     regs.transform_feedback_enabled = 1;
+     regs.transform_feedback.buffers[0].start_offset = 0;
+     regs.transform_feedback.buffers[1].start_offset = 0;
+diff --git a/src/video_core/renderer_vulkan/pipeline_key_registers.h b/src/video_core/renderer_vulkan/pipeline_key_registers.h
+new file mode 100644
+index 0000000000..3903d3b13b
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/pipeline_key_registers.h
+@@ -0,0 +1,38 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <utility>
++
++#include "common/common_types.h"
++
++namespace Vulkan {
++
++/// (PS4) The Maxwell 3D registers FixedPipelineState::Refresh reads: each one some bit of which
++/// changed the key, from some register file and set of device features. Found by flipping every
++/// bit of every register from 5,000 random register files, topologies and feature sets
++/// (eden-ps4/tools/gpu-tests/pkeyregs.cpp; 200 already find all 412). Inclusive ranges. To be
++/// found again whenever Refresh (or what it calls) changes.
++inline constexpr std::pair<u16, u16> PIPELINE_KEY_REGISTERS[] = {
++    {0x084, 0x084}, {0x0c8, 0x0c8}, {0x0df, 0x0df}, {0x1c0, 0x1c2}, {0x1c4, 0x1c6}, {0x1c8, 0x1ca},
++    {0x1cc, 0x1ce}, {0x1d1, 0x1d1}, {0x204, 0x204}, {0x214, 0x214}, {0x224, 0x224}, {0x234, 0x234},
++    {0x244, 0x244}, {0x254, 0x254}, {0x264, 0x264}, {0x274, 0x274}, {0x286, 0x286}, {0x28e, 0x28e},
++    {0x296, 0x296}, {0x29e, 0x29e}, {0x2a6, 0x2a6}, {0x2ae, 0x2ae}, {0x2b6, 0x2b6}, {0x2be, 0x2be},
++    {0x2c6, 0x2c6}, {0x2ce, 0x2ce}, {0x2d6, 0x2d6}, {0x2de, 0x2de}, {0x2e6, 0x2e6}, {0x2ee, 0x2ee},
++    {0x2f6, 0x2f6}, {0x2fe, 0x2fe}, {0x35f, 0x35f}, {0x36b, 0x36b}, {0x370, 0x374}, {0x3e4, 0x3e4},
++    {0x3e7, 0x3e8}, {0x3fa, 0x3fa}, {0x452, 0x452}, {0x458, 0x477}, {0x4b3, 0x4b3}, {0x4b9, 0x4bb},
++    {0x4c3, 0x4c5}, {0x4d0, 0x4d4}, {0x4d6, 0x4d6}, {0x4d8, 0x4e4}, {0x4eb, 0x4eb}, {0x546, 0x546},
++    {0x54e, 0x54f}, {0x55c, 0x55c}, {0x565, 0x569}, {0x574, 0x574}, {0x591, 0x591}, {0x59b, 0x59b},
++    {0x5a0, 0x5a1}, {0x620, 0x63f}, {0x646, 0x648}, {0x64f, 0x64f}, {0x66f, 0x66f}, {0x671, 0x672},
++    {0x680, 0x687}, {0x700, 0x700}, {0x703, 0x704}, {0x707, 0x708}, {0x70b, 0x70c}, {0x70f, 0x710},
++    {0x713, 0x714}, {0x717, 0x718}, {0x71b, 0x71c}, {0x71f, 0x720}, {0x723, 0x724}, {0x727, 0x728},
++    {0x72b, 0x72c}, {0x72f, 0x730}, {0x733, 0x734}, {0x737, 0x738}, {0x73b, 0x73c}, {0x73f, 0x740},
++    {0x743, 0x744}, {0x747, 0x748}, {0x74b, 0x74c}, {0x74f, 0x750}, {0x753, 0x754}, {0x757, 0x758},
++    {0x75b, 0x75c}, {0x75f, 0x760}, {0x763, 0x764}, {0x767, 0x768}, {0x76b, 0x76c}, {0x76f, 0x770},
++    {0x773, 0x774}, {0x777, 0x778}, {0x77b, 0x77c}, {0x77f, 0x77f}, {0x781, 0x786}, {0x789, 0x78e},
++    {0x791, 0x796}, {0x799, 0x79e}, {0x7a1, 0x7a6}, {0x7a9, 0x7ae}, {0x7b1, 0x7b6}, {0x7b9, 0x7be},
++    {0xa00, 0xa7f},
++};
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 885403fedd..624c967bac 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -32,6 +32,8 @@
+ #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+ #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+ #include "video_core/renderer_vulkan/pipeline_helper.h"
++#include "video_core/renderer_vulkan/pipeline_key_registers.h"
++#include "video_core/renderer_vulkan/vk_state_tracker.h"
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+ #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+@@ -569,17 +571,76 @@ PipelineCache::~PipelineCache() {
+ }
+ 
+ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+-
++#ifdef __OPENORBIS__
++    namespace P = Common::PS4Perf;
++    P::Bump(P::gpu_thread.pipeline_lookups);
++#endif
+     if (!RefreshStages(graphics_key.unique_hashes)) {
+         current_pipeline = nullptr;
++        key_pipeline = nullptr;
+         return nullptr;
+     }
+-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
++
++    // (PS4 04.15) FixedPipelineState::Refresh reads ~410 registers spread over the engine's state
++    // (most in different cache lines), and the key is then compared whole with the last
++    // pipeline's: ~0.5 us a draw on the PS4's CPU, at ~25,000 draws a second at a race's start.
++    // When none of what it reads changed since the last lookup (the registers by the engine's
++    // pipeline_key_changed, the rest here), the key, and so the pipeline, are the last ones.
++    auto& dirty = maxwell3d->dirty;
++    if (!dirty.pipeline_key_regs_filled) {
++        for (const auto& [first, last] : PIPELINE_KEY_REGISTERS) {
++            for (u32 reg = first; reg <= last; ++reg) {
++                dirty.pipeline_key_regs[reg] = 1;
++            }
++        }
++        dirty.pipeline_key_regs_filled = true;
++        dirty.pipeline_key_changed = true;
++    }
++    const auto topology = maxwell3d->draw_manager.draw_state.topology;
++    const bool squashed_blend = Settings::values.use_squashed_iterated_blend;
++    const bool unchanged = key_reuse_enabled && key_pipeline != nullptr && key_pipeline == current_pipeline &&
++                           !dirty.pipeline_key_changed && key_maxwell3d == maxwell3d &&
++                           !dirty.flags[Dirty::VertexInput] && !dirty.flags[Dirty::ViewportSwizzles] &&
++                           !dirty.flags[Dirty::Blending] && key_topology == topology &&
++                           key_engine_state == maxwell3d->engine_state &&
++                           key_hashes == graphics_key.unique_hashes && key_squashed_blend == squashed_blend;
++    if (unchanged) {
++        if (--key_reuses_to_check != 0) {
++#ifdef __OPENORBIS__
++            P::Bump(P::gpu_thread.pipeline_reuses);
++#endif
++            return BuiltPipeline(current_pipeline);
++        }
++        // the check: refresh it as usual, and compare
++        key_reuses_to_check = 64;
++        const FixedPipelineState last_state = graphics_key.state;
++        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
++        if (graphics_key.state != last_state) {
++            key_reuse_enabled = false;
++            LOG_ERROR(Render_Vulkan, "pipeline key changed with none of its registers changed: reuse off");
++#ifdef __OPENORBIS__
++            P::Bump(P::gpu_thread.pipeline_reuse_mismatches);
++#endif
++        } else {
++#ifdef __OPENORBIS__
++            P::Bump(P::gpu_thread.pipeline_reuse_checks);
++#endif
++        }
++    } else {
++        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
++    }
++    dirty.pipeline_key_changed = false;
++    key_maxwell3d = maxwell3d;
++    key_topology = topology;
++    key_engine_state = maxwell3d->engine_state;
++    key_hashes = graphics_key.unique_hashes;
++    key_squashed_blend = squashed_blend;
+ 
+     if (current_pipeline) {
+         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+         if (next) {
+             current_pipeline = next;
++            key_pipeline = next;
+             return BuiltPipeline(current_pipeline);
+         }
+     }
+@@ -780,12 +841,14 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
+         pipeline = CreateGraphicsPipeline();
+     }
+     if (!pipeline) {
++        key_pipeline = nullptr;  // (PS4 04.15) no pipeline for this key: nothing to reuse
+         return nullptr;
+     }
+     if (current_pipeline) {
+         current_pipeline->AddTransition(pipeline.get());
+     }
+     current_pipeline = pipeline.get();
++    key_pipeline = current_pipeline;  // (PS4 04.15)
+     return BuiltPipeline(current_pipeline);
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 71dfb46e3d..b176f74973 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -163,6 +163,19 @@ private:
+     GraphicsPipelineCacheKey graphics_key{};
+     GraphicsPipeline* current_pipeline{};
+ 
++    /// (PS4 04.15) What the key was last refreshed from, beyond the registers (the engine's
++    /// pipeline_key_changed covers those), and the pipeline found for it then (nullptr if none):
++    /// with none of it changed since, the key is the same, and so is the pipeline
++    const Tegra::Engines::Maxwell3D* key_maxwell3d{};
++    Maxwell::PrimitiveTopology key_topology{};
++    Tegra::Engines::Maxwell3D::EngineHint key_engine_state{};
++    std::array<u64, 6> key_hashes{};
++    bool key_squashed_blend{};
++    GraphicsPipeline* key_pipeline{};
++    /// every 64th reuse refreshes the key anyway and compares it; a difference turns reuse off
++    u32 key_reuses_to_check{64};
++    bool key_reuse_enabled{true};
++
+     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
+     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+ 
+-- 
+2.43.0
+
