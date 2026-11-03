@@ -79,7 +79,10 @@ DYN_COLD=1 DYN_RSB=1 ... ./ctx.sh gen7.py dynbench_p4 1 100        # DTX_OPTS: f
 ```
 
 `ctx.sh` runs a generator's programs through `test` and `cachetest` and compares them (and counts
-the blocks used from the cache). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
+the blocks used from the cache). For A64 (04.18): `DYNBENCH=dynbench64.cpp ./build.sh dynbench64_p5`
+(same build directory), `dynbench64 cachetest <prog> [fastmem|fastmem2|noexcl|nowalk] [twice]` (the
+thread registers read and written through pointers into the callbacks object, as Eden's;
+`programs/tpidr64.s`), `ctx64.sh gen8.py dynbench64_p5 1 100` (gen5, gen6, gen8). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
 `BUILD=<dir>` into another build directory.
 
 | Generator | Programs of |
