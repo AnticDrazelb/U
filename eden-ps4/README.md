@@ -379,6 +379,43 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.22: **the 32-bit translator's savings for 64-bit games; the FPS counter at the top centre.**
+The tester's 04.21 logs: the code caches got the largest tier everywhere (the system pool had 512
+MiB or more free: 160/96/96/8 MiB), and the flushes are gone (Echoes of Wisdom 0 in 7 minutes,
+was 2 and 5 in 6; Silksong 0 in 5.5, was 8 in 4.5; its 10-14 s freezes too: its worst frame 0.5
+s). What's left in Silksong (11-14 fps) and Bluey (3-6) is the game's own code: emulated cores 0
+and 1 busy 95-100%, translating 6-13 ms a second.
+
+- Patch 0115: the A64 JIT gets A32's `fold_address_offsets`, `skip_redundant_extensions` and
+  `split_cold_code` (A32's `inline_conditional_instructions` has no A64 counterpart; its dead-NZCV
+  elision needs a look-ahead decoder of its own for A64, whose code sets the flags far less often:
+  not now). Folding with A64's fastmem range check (the arena not mirrored, under 64 bits): the
+  base is compared with the arena's size less the constant (one `cmp` with a constant from the
+  pool, as before), so base + constant is always in the arena; past it, the range check calls the
+  same stub a fault does (the fallback's stack alignment), the address made whole in 64 bits
+  (`EmitWholeAddress`: A32's still wraps at 32). 128-bit accesses aren't folded. Cold code
+  reserves at least 16 KiB per block (a chunk overrun throws). Patch 0116 turns them on for Eden's
+  A64 cores and puts the FPS counter (Vulkan's present pass, and the CPU renderer's) at the top
+  centre.
+- Tests: the A64 harness's options `DYN_FOLD`, `DYN_EXT`, `DYN_COLD` (`HAVE_A64_PORT`); the
+  previous build vs the new over gen5 (exclusives), gen6 (accesses sharing a base: 39 `[xN, #imm]`
+  a program), gen8 (control flow) with no fastmem, an arena every access is past (the new
+  out-of-range path), a mapped arena, monitor exclusives and no shared walk: 1,500 programs the
+  same; the code cache suites (save, reload, twice) with the options on; A32 against 04.20's build
+  (600 programs, fastmem and split stacks, the shared memory emitter changed). `programs/c/
+  build64.sh` builds `game.c` for AArch64 (`game64.bin`, image mode): the same result, and per 20
+  steady frames (callgrind, 30 minus 10 frames) 0.9% fewer instructions and 6% fewer I1 misses
+  with all three (folding alone 0.8% and 5%). A small program; real games have far more code.
+- **Still in the way, measured in Bluey's hottest code** (`hotblocks.log`, 60 blocks): a third of
+  its memory accesses on the hot path walk the page table (about 12 instructions) instead of
+  fastmem (3): accesses fastmem was declined for once ("pages not back to back": a 16 KiB PS4 page
+  whose four guest pages aren't consecutive in the DRAM), compiled to walk from then on, for
+  every thread. A64 has no global stack switch (A32's `stack_walks` is set but only A32 uses it):
+  each access is declined on its own, but a shared function epilogue declined on one thread's
+  stack walks for all of them. The 30-second line now counts these per core ("guest accesses
+  walking the page table since fastmem was declined for them"); the next step is the guest pages
+  behind them.
+
 04.21: **the settings lists scroll; code caches sized by what the PS4 has.** The tester's logs
 (04.19: Echoes of Wisdom three times, Hollow Knight: Silksong twice) and a report that the settings
 menu doesn't scroll.

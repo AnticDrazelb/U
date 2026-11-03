@@ -1,0 +1,437 @@
+From 76b201fe515f450cda1b665648bbcdf58af7cfb6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 22:33:13 +0000
+Subject: [PATCH 115/116] dynarmic: A64 gets A32's offset folding, redundant
+ extension skipping and cold code
+
+fold_address_offsets, skip_redundant_extensions, split_cold_code for the A64 JIT. Folding with
+fastmem's range check (unmirrored, under 64 bits): the base is compared with the arena's size
+less the constant, so base + constant stays in the arena; past it the range check calls the
+same stub a fault does (the fallback's stack alignment), with the address made whole in 64 bits
+(A32 still wraps at 32). Cold code reserves at least 16 KiB a block. 128-bit accesses aren't
+folded. Also per-core counts of the accesses fastmem was declined for (walked from then on).
+
+Tests (harness, old build vs new with the options on): A64 gen5/gen6/gen8 x no fastmem, an
+arena every access is past, a mapped arena, monitor exclusives, no shared walk: 1,500
+programs the same; the code cache suites (save, reload, twice) with them; game.c built for
+AArch64: the same result, 0.9% fewer instructions and 6% fewer I1 misses a frame (callgrind).
+A32 against 04.20's build: 600 programs the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |   3 +
+ .../backend/x64/a32_emit_x64_memory.cpp       |   1 +
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 106 +++++++++++++++++-
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |   3 +
+ .../backend/x64/a64_emit_x64_memory.cpp       |   2 +
+ .../dynarmic/backend/x64/a64_interface.cpp    |   3 +
+ .../backend/x64/emit_x64_memory.cpp.inc       |  45 ++++++--
+ .../dynarmic/backend/x64/emit_x64_memory.h    |  17 ++-
+ .../src/dynarmic/interface/A64/config.h       |  16 +++
+ 9 files changed, 183 insertions(+), 13 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 7f0ffd22cf..67112a32fe 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -102,6 +102,9 @@ inline PipelineWork& PipelineWorkNow() {
+ // and the persistent translation cache: blocks loaded, used (their guest code the same), stale
+ inline std::atomic<uint64_t> jit_core_blocks[4], jit_core_compile_ns[4];
+ inline std::atomic<uint64_t> jit_cache_loaded[4], jit_cache_used[4], jit_cache_stale[4];
++// (04.22) Per core: the guest accesses fastmem was declined for (recompiled to walk the page table
++// from then on, for every thread), and of them those through the stack pointer
++inline std::atomic<uint64_t> jit_walked_sites[4], jit_walked_stack_sites[4];
+ inline GpuThreadCounters gpu_thread;
+ // (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
+ // the boot), draws skipped while their pipeline builds (asynchronous shaders), images and buffers
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+index e4d49d7392..1f4e592b09 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64_memory.cpp
+@@ -20,6 +20,7 @@
+ #include "dynarmic/backend/x64/abi.h"
+ #include "dynarmic/backend/x64/devirtualize.h"
+ #include "dynarmic/backend/x64/emit_x64_memory.h"
++#include "common/ps4_perf.h"
+ #include "dynarmic/ir/opt_passes.h"
+ #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+ #include "dynarmic/backend/x64/perf_map.h"
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 8c98f63d10..ae96434827 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -8,10 +8,13 @@
+ 
+ #include "dynarmic/backend/x64/a64_emit_x64.h"
+ 
++#include <algorithm>
++
+ #include <fmt/format.h>
+ #include <fmt/ostream.h>
+ #include "common/assert.h"
+ #include "common/common_types.h"
++#include "dynarmic/ir/acc_type.h"
+ #include "dynarmic/ir/terminal.h"
+ #include "dynarmic/mcl/integer_of_size.hpp"
+ #include <boost/container/static_vector.hpp>
+@@ -62,6 +65,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
+     GenFastmemFallbacks();
+     GenTerminalHandlers();
+     code.PreludeComplete();
++    code.EnableColdCode(this->conf.split_cold_code);
+     ClearFastDispatchTable();
+ 
+     if (conf.fastmem_pointer.has_value()) {
+@@ -102,6 +106,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     }
+ 
+     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
++    FoldAddressOffsets(ctx, block);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+     constexpr EmitHandlerFn opcode_handlers[] = {
+ #define OPCODE(name, type, ...) &EmitX64::Emit##name,
+@@ -157,9 +162,21 @@ finish_this_inst:
+         code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+     code.int3();
+-    for (auto& deferred_emit : ctx.deferred_emits)
+-        deferred_emit();
+-    code.int3();
++
++    // the rarely run code: apart (split_cold_code), or after the block. (At least 16 KiB of room:
++    // a chunk overrun throws, and A64's vector float fallbacks are the largest deferred emits;
++    // the reserve only decides when a new chunk starts.)
++    if (!ctx.deferred_emits.empty() &&
++        code.SwitchToColdCode(std::max<size_t>(ctx.deferred_emits.size() * BlockOfCode::COLD_BOUND_PER_EMIT, 16 * 1024))) {
++        for (auto& deferred_emit : ctx.deferred_emits)
++            deferred_emit();
++        code.int3();
++        code.SwitchToHotCode();
++    } else {
++        for (auto& deferred_emit : ctx.deferred_emits)
++            deferred_emit();
++        code.int3();
++    }
+ 
+     const size_t size = size_t(code.getCurr() - entrypoint);
+ 
+@@ -177,6 +194,89 @@ finish_this_inst:
+     return bdesc;
+ }
+ 
++void A64EmitX64::FoldAddressOffsets(A64EmitContext& ctx, IR::Block& block) {
++    folded_disp.clear();
++    if (conf.skip_redundant_extensions) {
++        for (auto& inst : block.instructions) {
++            switch (inst.GetOpcode()) {
++            case IR::Opcode::ZeroExtendByteToWord:
++            case IR::Opcode::ZeroExtendHalfToWord:
++            case IR::Opcode::ZeroExtendByteToLong:
++            case IR::Opcode::ZeroExtendHalfToLong: {
++                // a byte or halfword just loaded is zero-extended in its register already (movzx,
++                // the fallbacks' ZeroExtendFrom, the walks' movzx)
++                const IR::Value arg = inst.GetArg(0);
++                if (arg.IsImmediate())
++                    break;
++                const auto op = arg.GetInst()->GetOpcode();
++                if (op == IR::Opcode::A64ReadMemory8 || op == IR::Opcode::A64ReadMemory16)
++                    inst.ReplaceUsesWith(arg);
++                break;
++            }
++            case IR::Opcode::A64WriteMemory8:
++            case IR::Opcode::A64WriteMemory16: {
++                // stored from the wider value's register (the store writes its low 8 or 16 bits)
++                const IR::Value value = inst.GetArg(2);
++                if (value.IsImmediate())
++                    break;
++                IR::Inst* const narrow = value.GetInst();
++                const auto want = inst.GetOpcode() == IR::Opcode::A64WriteMemory8 ? IR::Opcode::LeastSignificantByte : IR::Opcode::LeastSignificantHalf;
++                if (narrow->GetOpcode() == want && narrow->UseCount() == 1 && !narrow->GetArg(0).IsImmediate()) {
++                    inst.SetArg(2, narrow->GetArg(0));
++                    narrow->Invalidate();
++                }
++                break;
++            }
++            default:
++                break;
++            }
++        }
++    }
++    // With fastmem, its range checked (not mirrored): a plain access (not ordered) through
++    // Add64(base, 1..65535) used by it alone takes the constant in its displacement; the
++    // Add64 goes. 128-bit accesses aren't folded (their fallbacks are xmm-based: untested here).
++    if (!conf.fastmem_pointer || !conf.fold_address_offsets || conf.silently_mirror_fastmem ||
++        conf.fastmem_address_space_bits >= 64)
++        return;
++    for (auto& inst : block.instructions) {
++        size_t acc_arg;
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::A64ReadMemory8:
++        case IR::Opcode::A64ReadMemory16:
++        case IR::Opcode::A64ReadMemory32:
++        case IR::Opcode::A64ReadMemory64:
++            acc_arg = 2;
++            break;
++        case IR::Opcode::A64WriteMemory8:
++        case IR::Opcode::A64WriteMemory16:
++        case IR::Opcode::A64WriteMemory32:
++        case IR::Opcode::A64WriteMemory64:
++            acc_arg = 3;
++            break;
++        default:
++            continue;
++        }
++        if (folded_disp.size() == folded_disp.capacity())
++            break;
++        const IR::Value address = inst.GetArg(1);
++        const IR::AccType acc = inst.GetArg(acc_arg).GetAccType();
++        if (address.IsImmediate() || acc == IR::AccType::ORDERED || acc == IR::AccType::ORDEREDRW || acc == IR::AccType::LIMITEDORDERED)
++            continue;
++        IR::Inst* const add = address.GetInst();
++        if (add->GetOpcode() != IR::Opcode::Add64 || add->UseCount() != 1)
++            continue;
++        const IR::Value carry = add->GetArg(2), offset = add->GetArg(1);
++        if (!carry.IsImmediate() || carry.GetU1() || !offset.IsImmediate() || add->GetArg(0).IsImmediate())
++            continue;
++        const u64 disp = offset.GetU64();
++        if (disp == 0 || disp > 0xFFFF || !ShouldFastmem(ctx, &inst))
++            continue;
++        inst.SetArg(1, add->GetArg(0));
++        add->Invalidate();
++        folded_disp.emplace_back(&inst, u32(disp));
++    }
++}
++
+ void A64EmitX64::ClearCache() {
+     EmitX64::ClearCache();
+     Ps4BlockMap::Clear(code.getCode(), false);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index fdf10d36cb..300c115ae2 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -91,6 +91,9 @@ public:
+         unsigned char base = 0;  // (Optimization::AddressBase of the access's address)
+     };
+     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
++    /// (PS4 04.22) Before a block is emitted: offsets folded into its accesses' displacements and
++    /// redundant zero-extensions taken out (fold_address_offsets, skip_redundant_extensions)
++    void FoldAddressOffsets(A64EmitContext& ctx, IR::Block& block);
+     FakeCall FastmemCallback(u64 rip);
+ 
+     // Memory access helpers
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 75357c944b..597faf700c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -20,6 +20,7 @@
+ #include "dynarmic/backend/x64/abi.h"
+ #include "dynarmic/backend/x64/devirtualize.h"
+ #include "dynarmic/backend/x64/emit_x64_memory.h"
++#include "common/ps4_perf.h"
+ #include "dynarmic/ir/opt_passes.h"
+ #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+ #include "dynarmic/backend/x64/perf_map.h"
+@@ -466,6 +467,7 @@ void EmitA64FastmemRangeWalk(BlockOfCode& code, const A64::UserConfig& conf, siz
+ }  // namespace
+ 
+ #define AXX_FASTMEM_RANGE_WALK 1
++#define AXX_ADDRESS_64 1
+ #define Axx A64
+ #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
+ #undef Axx
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 85c2fd7718..6aa0d10ec7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -342,6 +342,9 @@ private:
+         add(conf.link_forward_without_halt_check);
+         add(conf.inline_rsb_pop);
+         add(conf.inline_fast_dispatch);
++        add(conf.fold_address_offsets);
++        add(conf.skip_redundant_extensions);
++        add(conf.split_cold_code);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 65698902cb..1f9e8018a8 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -39,7 +39,11 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+         };
+         if (iter->second.recompile) {
+             const auto marker = iter->second.marker;
+-            do_not_fastmem.insert(marker);
++            if (do_not_fastmem.insert(marker).second) {  // (PS4 04.22: counted per core)
++                ::Common::PS4Perf::jit_walked_sites[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
++                if (iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::Stack))
++                    ::Common::PS4Perf::jit_walked_stack_sites[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
++            }
+             blocks_without_fastmem.insert(std::get<0>(marker));
+             if (iter->second.base == static_cast<unsigned char>(Optimization::AddressBase::Stack)) {
+                 stack_walks |= ++stack_declines >= StackDeclinesBeforeWalks;
+@@ -54,6 +58,15 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+     UNREACHABLE(); //("iter != fastmem_patch_info.end()");
+ }
+ 
++// (PS4 04.22) A folded address made whole: A32's wraps at 32 bits, A64's doesn't
++[[maybe_unused]] static void EmitWholeAddress(BlockOfCode& code, Xbyak::Reg64 dst, Xbyak::Reg64 base, u32 disp) {
++#ifdef AXX_ADDRESS_64
++    code.lea(dst, code.ptr[base + disp]);
++#else
++    code.lea(dst.cvt32(), code.ptr[base + disp]);
++#endif
++}
++
+ template<std::size_t bitsize, auto callback>
+ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+@@ -94,7 +107,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     u32 disp = FoldedDisp(inst);
+     if (disp != 0 && (!fastmem_marker || ordered)) {
+         const Xbyak::Reg64 whole = ctx.reg_alloc.ScratchGpr(code);
+-        code.lea(whole.cvt32(), code.ptr[vaddr + disp]);
++        EmitWholeAddress(code, whole, vaddr, disp);
+         vaddr = whole;
+         disp = 0;
+     }
+@@ -107,18 +120,27 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         // Use fastmem, the address's constant in the displacement: a fault's fallback takes the
+         // address whole (the 32-bit wrap) in the base's register, put back after
+         bool require_abort_handling = false;
+-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp);
+ 
+         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + disp, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
++            // (A64: past the arena, the range check comes here and calls the stub as a fault
++            // would: the same stack alignment for the fallback, then on as after it)
++            Xbyak::Label stub_label, resume_label;
+             code.L(*abort);
++            if (require_abort_handling) {
++                code.call(stub_label);
++                code.jmp(resume_label, code.T_NEAR);
++            }
++            code.L(stub_label);
+             const auto stub = code.getCurr();
+             code.push(vaddr);
+-            code.lea(vaddr.cvt32(), code.ptr[vaddr + disp]);
++            EmitWholeAddress(code, vaddr, vaddr, disp);
+             code.call(wrapped_fn);
+             code.pop(vaddr);
+             code.ret();
++            code.L(resume_label);
+ 
+             fastmem_patch_info.emplace(
+                 std::bit_cast<u64>(location),
+@@ -232,7 +254,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+     u32 disp = FoldedDisp(inst);
+     if (disp != 0 && (!fastmem_marker || ordered || bitsize == 128 || value_idx == vaddr.getIdx())) {
+         const Xbyak::Reg64 whole = ctx.reg_alloc.ScratchGpr(code);
+-        code.lea(whole.cvt32(), code.ptr[vaddr + disp]);
++        EmitWholeAddress(code, whole, vaddr, disp);
+         vaddr = whole;
+         disp = 0;
+     }
+@@ -245,18 +267,26 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+         // Use fastmem, the address's constant in the displacement: a fault's fallback takes the
+         // address whole (the 32-bit wrap) in the base's register, put back after
+         bool require_abort_handling = false;
+-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp);
+ 
+         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr + disp, value_idx, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
++            // (A64: past the arena, the range check comes here and calls the stub, as for reads)
++            Xbyak::Label stub_label, resume_label;
+             code.L(*abort);
++            if (require_abort_handling) {
++                code.call(stub_label);
++                code.jmp(resume_label, code.T_NEAR);
++            }
++            code.L(stub_label);
+             const auto stub = code.getCurr();
+             code.push(vaddr);
+-            code.lea(vaddr.cvt32(), code.ptr[vaddr + disp]);
++            EmitWholeAddress(code, vaddr, vaddr, disp);
+             code.call(wrapped_fn);
+             code.pop(vaddr);
+             code.ret();
++            code.L(resume_label);
+ 
+             fastmem_patch_info.emplace(
+                 std::bit_cast<u64>(location),
+@@ -755,3 +785,4 @@ void AxxEmitX64::EmitExclusiveWriteMemoryPageTable(AxxEmitContext& ctx, IR::Inst
+ #undef AxxJitState
+ #undef AxxUserConfig
+ #undef AXX_FASTMEM_RANGE_WALK
++#undef AXX_ADDRESS_64
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index 8aa056f8b7..e9a46f37cb 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -212,17 +212,28 @@ template<>
+     return page + tmp;
+ }
+ 
++// (PS4 04.22) disp: a constant folded into the access's displacement (A64EmitX64::
++// FoldAddressOffsets): the range check then makes sure vaddr + disp is in the arena
+ template<typename EmitContext>
+-Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt);
++Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 disp = 0);
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64) {
+     return r13 + vaddr;
+ }
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 disp) {
+     auto const unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
++    if (disp != 0) {
++        // folded (only with a range check, unmirrored, under 64 bits): the base below the
++        // arena's size less the constant, so base + constant (no wrap) is in it
++        ASSERT(unused_top_bits != 0 && !ctx.conf.silently_mirror_fastmem && disp < (u64(1) << ctx.conf.fastmem_address_space_bits));
++        code.cmp(vaddr, code.Const(code.qword, (u64(1) << ctx.conf.fastmem_address_space_bits) - disp));
++        code.jae(abort, code.T_NEAR);
++        require_abort_handling = true;
++        return r13 + vaddr;
++    }
+     if (unused_top_bits == 0) {
+         return r13 + vaddr;
+     } else if (ctx.conf.silently_mirror_fastmem) {
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 2e21ccf9d1..5bbfa6a33e 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -352,6 +352,22 @@ struct UserConfig {
+     /// host predicts each site's jump on its own. About 70 bytes a block that ends so.
+     bool inline_fast_dispatch = false;
+ 
++    /// (PS4 04.22, as A32's) With fastmem, not mirrored: a load or store at a base register plus
++    /// a constant (LDR x0, [x1, #8]) takes the constant in its displacement ([r13 + base + 8])
++    /// instead of an add before it. The range check compares the base with the arena's size less
++    /// the constant, so the access stays in the arena; past it, the fallback gets the address whole.
++    bool fold_address_offsets = false;
++
++    /// (PS4 04.22, as A32's) A byte or halfword loaded (LDRB, LDRH) isn't zero-extended again (the
++    /// load did), and one stored from a register (STRB, STRH) is stored from it without a movzx
++    /// into another first.
++    bool skip_redundant_extensions = false;
++
++    /// (PS4 04.22, as A32's) A block's rarely run code (fault and slow-path stubs, float special
++    /// cases: the deferred emits) is written apart from the blocks, in chunks taken from the code
++    /// cache's top down: the code that runs lies together, in fewer cache lines and pages.
++    bool split_cold_code = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+-- 
+2.43.0
+

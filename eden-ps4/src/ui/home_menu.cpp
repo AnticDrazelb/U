@@ -829,7 +829,7 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",
              [](MenuSettings& s) { s.async_shaders = !s.async_shaders; }},
             {"FPS Counter", on_off(settings.fps_overlay),
-             "The frames shown each second, top left of the picture while a game runs (a game's own target is "
+             "The frames shown each second, at the top centre of the picture while a game runs (a game's own target is "
              "usually 30 or 60).",
              [](MenuSettings& s) { s.fps_overlay = !s.fps_overlay; }},
             {"Frame Pacing", settings.unlocked_frames ? "Unlocked" : "60 Hz",

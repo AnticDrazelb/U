@@ -58,7 +58,7 @@ namespace {
 
 /// The FPS counter (System Settings, Graphics) on the null renderer's frames, as the Vulkan
 /// renderer's present pass draws it (patch 0063): the frames of the last second, seven-segment
-/// digits in a dark box at the top left, drawn into a copy of the frame. Each frame the null
+/// digits in a dark box at the top centre (04.22; top left before), drawn into a copy of the frame. Each frame the null
 /// renderer composes is one the game presented.
 class FpsCounter {
 public:
@@ -93,9 +93,10 @@ public:
         const s32 gap = thick * 2, pad = thick * 2, half = digit_height / 2;
         const std::string text = std::to_string(std::min<u32>(shown, 999));
         const s32 count = static_cast<s32>(text.size());
-        const s32 x0 = pad * 2, y0 = pad * 2;
-        fill(x0 - pad, y0 - pad, count * digit_width + (count - 1) * gap + pad * 2, digit_height + pad * 2,
-             kDark);
+        // (04.22) at the top centre, as the Vulkan renderer's
+        const s32 text_width = count * digit_width + (count - 1) * gap;
+        const s32 x0 = std::max<s32>(pad * 2, (static_cast<s32>(width) - text_width) / 2), y0 = pad * 2;
+        fill(x0 - pad, y0 - pad, text_width + pad * 2, digit_height + pad * 2, kDark);
         for (s32 i = 0; i < count; i++) {
             const u8 on = kSegments[text[static_cast<size_t>(i)] - '0'];
             const s32 x = x0 + i * (digit_width + gap);

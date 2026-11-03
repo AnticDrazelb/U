@@ -1306,6 +1306,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.22: 64-bit games (Zelda, Silksong, Bluey, Animal Crossing) get three of the CPU translator's "
+         "savings that only 32-bit games such as Mario Kart had: an address's constant taken into the memory "
+         "access itself (no add before it), no second zero-extension after loading a byte or halfword, and the "
+         "rarely run code kept apart from the code that runs. The FPS counter is at the top centre now.\n"
          "04.21: the settings lists scroll (Graphics had rows below the screen), and the package's own "
          "programs (Breakout, Blocks, the controller and GPU tests, the test program) are no longer listed "
          "with your games. And the CPU translator's code "
@@ -2325,6 +2329,15 @@ std::string PerfLine(double seconds)
                                    P::jit_cache_stale[c].load(std::memory_order_relaxed));
             line += fmt::format("; translation cache blocks used so far, by core: {}", use);
         }
+        // (04.22) the accesses fastmem was declined for, each compiled to walk the page table
+        // from then on (in Bluey a third of the hottest code's accesses)
+        std::string walked;
+        for (int c = 0; c < 4; c++)
+            walked += fmt::format("{}{} ({} through the stack)", c ? ", " : "",
+                                  P::jit_walked_sites[c].load(std::memory_order_relaxed),
+                                  P::jit_walked_stack_sites[c].load(std::memory_order_relaxed));
+        line += fmt::format("; guest accesses walking the page table since fastmem was declined for them, by core: {}",
+                            walked);
     }
     // Where the game's time goes besides running: each emulated core idle (no thread of the game
     // to run), all at once (every thread waiting: on the GPU, a vsync, a service), a finished

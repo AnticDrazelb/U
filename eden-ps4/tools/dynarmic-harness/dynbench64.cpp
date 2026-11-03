@@ -261,6 +261,11 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.inline_fast_dispatch = std::getenv("DYN_DISP") != nullptr;
 #endif
 #endif
+#ifdef HAVE_A64_PORT  // (04.22) A32's fold, extensions and cold code, ported
+    config.fold_address_offsets = std::getenv("DYN_FOLD") != nullptr;
+    config.skip_redundant_extensions = std::getenv("DYN_EXT") != nullptr;
+    config.split_cold_code = std::getenv("DYN_COLD") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
