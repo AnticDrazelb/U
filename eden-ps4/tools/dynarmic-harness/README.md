@@ -57,6 +57,31 @@ DTX_OPTS=fastmem ./dtx.sh gen9.py dynbench19 dynbench20 301 500
 
 Failing programs are kept as `rt/failx_*.s`.
 
+## Persistent code cache (04.17)
+
+`cachetest` runs a program, saves its code cache (`Jit::SaveCodeCache`), drops everything of that
+run (its objects are allocated from an arena that is then unmapped, so a pointer the cache failed
+to move faults instead of finding the same object again), loads the cache into a second run whose
+objects are all elsewhere (the JIT, the callbacks, the monitor, the coprocessor), runs the program
+again and prints what `test` prints. `twice`: that run's cache saved and loaded into a third;
+`cp15`: a coprocessor like Eden's (fields read and written through pointers, CNTPCT through a
+callback with its parent as the argument; `programs/cp15.s`); `CACHETEST_B=<other.bin>`: the last
+run runs another program (its blocks must all be found stale). The code caches need a fixed
+address, as on the PS4: build dynarmic with `-DDYNARMIC_RWX_CODE_ALLOCATOR` into its own build
+directory and set `DYNARMIC_CODE_ADDRESS`:
+
+```sh
+DEPS=$HOME/eden-deps; EDEN_SRC=$HOME/eden cmake -S wrap -B build-pptc2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 \
+    -DCMAKE_CXX_FLAGS="-isystem $DEPS/xbyak -isystem $DEPS/fmt/include -DFMT_HEADER_ONLY -DARCHITECTURE_x86_64 -DDYNARMIC_RWX_CODE_ALLOCATOR"
+BUILD=build-pptc2 OPTS="... -DHAVE_DEAD_NZCV -DHAVE_DEAD_NZCV_ABI -DHAVE_FOLD -DHAVE_COLD" ./build.sh dynbench_p4
+DYN_COLD=1 DYN_RSB=1 ... ./ctx.sh gen7.py dynbench_p4 1 100        # DTX_OPTS: fastmem, splitstack, twice
+```
+
+`ctx.sh` runs a generator's programs through `test` and `cachetest` and compares them (and counts
+the blocks used from the cache). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
+`BUILD=<dir>` into another build directory.
+
 | Generator | Programs of |
 |---|---|
 | gen.py | loads and stores of several registers near page boundaries (shared walks) |

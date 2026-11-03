@@ -1,4 +1,4 @@
-From 340fba2ddf31e700114142921d598385b7064b5c Mon Sep 17 00:00:00 2001
+From 2166025fb2ee255c2d4d5a30ecdb247426cb3386 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 3 Nov 2026 14:50:27 +0000
 Subject: [PATCH 106/106] PS4: shader and pipeline work measured; the shader
@@ -24,7 +24,7 @@ Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
  6 files changed, 191 insertions(+), 17 deletions(-)
 
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index f667912f3b..c9b4a8b0bf 100644
+index f667912f3b..1a04ad6267 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
 @@ -987,6 +987,31 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
@@ -34,20 +34,20 @@ index f667912f3b..c9b4a8b0bf 100644
 +        {
 +            // (04.17) How many copies repeat the slot's last one (what reusing a copy could save):
 +            // 1 in 16 of the copies hashed, the same slot's next copy compared with it
-+            namespace P = Common::PS4Perf;
++            namespace Perf = Common::PS4Perf;
 +            UboSample& sample = ubo_samples[stage % NUM_STAGES][binding_index % NUM_GRAPHICS_UNIFORM_BUFFERS];
 +            if (sample.armed || (++ubo_sample_tick & 15) == 0) {
 +                if (const u8* const source = device_memory.GetSpan(device_addr, size)) {
 +                    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(source), size);
 +                    if (sample.armed) {
 +                        sample.armed = false;
-+                        P::Bump(P::gpu_thread.ubo_checks);
++                        Perf::Bump(Perf::gpu_thread.ubo_checks);
 +                        if (sample.device_addr != device_addr || sample.size != size)
-+                            P::Bump(P::gpu_thread.ubo_moved);
++                            Perf::Bump(Perf::gpu_thread.ubo_moved);
 +                        else if (sample.hash == hash)
-+                            P::Bump(P::gpu_thread.ubo_same);
++                            Perf::Bump(Perf::gpu_thread.ubo_same);
 +                        else
-+                            P::Bump(P::gpu_thread.ubo_changed);
++                            Perf::Bump(Perf::gpu_thread.ubo_changed);
 +                    } else {
 +                        sample = {device_addr, size, hash, true};
 +                    }
