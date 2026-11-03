@@ -250,6 +250,7 @@ int main(int argc, char** argv) {
         return value && std::string_view{value} == "1";
     };
     Launcher::SetShaderCache(flag("EDEN_PS4_SHADER_CACHE"));
+    Launcher::SetJitCache(!flag("EDEN_PS4_NO_JIT_CACHE"));
     Launcher::SetAsyncShaders(flag("EDEN_PS4_ASYNC_SHADERS"));
     Launcher::SetGpuAccuracyHigh(flag("EDEN_PS4_GPU_HIGH"));
     Launcher::SetFpsOverlay(flag("EDEN_PS4_FPS"));

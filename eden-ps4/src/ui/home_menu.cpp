@@ -802,6 +802,11 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "A game's shaders are kept in /data/eden-ps4/user/cache/shader, and built while it loads the next time "
              "instead of when they first appear: a longer start, less stutter once it runs.",
              [](MenuSettings& s) { s.shader_cache = !s.shader_cache; }},
+            {"Translation Cache", on_off(settings.jit_cache),
+             "The game's CPU code Eden translated is kept in /data/eden-ps4/cache/jit when you leave the game, "
+             "and used again from its start the next time instead of translated again as it runs (the first "
+             "race's stutter). Kept for this version of Eden for PS4 only.",
+             [](MenuSettings& s) { s.jit_cache = !s.jit_cache; }},
             {"Asynchronous Shaders", on_off(settings.async_shaders),
              "New shaders are built in the background instead of stopping the game while they compile (slow on "
              "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",

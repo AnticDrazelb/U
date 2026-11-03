@@ -379,6 +379,38 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.17: **the persistent translation cache; shader and pipeline work measured; the shader cache
+kept whole.** From the tester's first-race investigation (`docs/first-race-and-caches.md`): Eden's
+per-game shader cache already rebuilds every pipeline the game used during the black screen (the
+first race made 0-2 new pipelines per 10 s, no draw skipped); what the first race of a session does
+that later ones don't is translate the game's CPU code (134-173 ms of the emulated cores' time a
+second at its start, 22 at a later race's), which only memory kept.
+
+- Patch 0104, dynarmic: `Jit::SaveCodeCache` / `LoadCodeCache` for the A32 JIT (Ryujinx's PPTC
+  idea, the comparison's item 5). The whole code image saved with each block's guest ranges and a
+  hash of their code, the link sites, the fastmem records, and the pointers the code holds into
+  objects that move between runs (found by scanning the code); loaded only from the same build and
+  configuration with the code cache at the same address (the PS4 port maps it at the same place
+  every boot); pointers moved, links undone; a block used when first looked up if its guest code
+  hashes the same, translated again otherwise. Tested in the harness (`ctx.sh`, `cachetest`): ~800
+  random programs of every generator, fastmem, split stacks, the PS4's translator options, a CP15
+  like Eden's, a cache reloaded twice, the first run's memory unmapped (a pointer missed would
+  fault); a changed program's 269 blocks all found stale.
+- Patch 0105: Eden's A32 cores declare their own object and their CP15 to it and save/load a file
+  per core (written beside it, renamed over it). The frontend loads them after the game is loaded
+  and before its cores run, and saves them when leaving the game (cores paused, the game still
+  loaded), `data_dir/cache/jit/<title id>-core<n>.bin`; setting *Translation Cache* (on). The log:
+  blocks loaded and the time at boot, MiB and time at exit, and in the 30-second line each core's
+  translation time and the cache's blocks used and stale. 64-bit games (A64) have none yet.
+- Patch 0106: the boot's shader cache load summarized (pipelines rebuilt, their shaders'
+  translation to SPIR-V, the driver's creation, RADV's cache hits by creation feedback on Vulkan
+  1.3, creations under 2 ms); the same for pipelines built in play, in the 30-second line; uniform
+  buffer copies sampled (1 in 16 compared with the slot's next: the same bytes, changed, another
+  range: what reusing copies could save, for the cross-game copying the tester's logs show). The
+  shader cache file is cut back to its last whole entry instead of deleted when an entry fails to
+  read or write (a crash or power cut during an append deleted every pipeline a game ever needed);
+  `vulkan_pipelines.bin` is written to a temporary file and renamed over the old one.
+
 04.16: **texture bindings (Ryujinx comparison, 4) and one pipeline lookup a draw.** 04.15 on a
 console (Baby Park, Moo Moo Meadows, fresh boots): at the same draws a frame, 32.8 -> 33.5 fps
 at 800 draws and 26.5 -> 27.8 at 1,150 (a fit of the 10-second lines against 04.12's); Baby

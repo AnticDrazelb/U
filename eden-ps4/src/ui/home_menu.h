@@ -56,6 +56,7 @@ struct MenuSettings
     bool docked = false;
     int resolution = 100;      // what games render at, in percent of the console mode's: 100, 75 or 50
     bool shader_cache = true;  // shaders kept on disk, built while a game loads the next time
+    bool jit_cache = true;     // (04.17) the CPU code translated kept on disk, loaded when the game starts again
     bool async_shaders = true; // shaders built in the background (a draw waits for none)
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
     bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal

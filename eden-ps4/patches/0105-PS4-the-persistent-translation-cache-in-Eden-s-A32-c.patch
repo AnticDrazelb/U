@@ -1,0 +1,188 @@
+From d79b92150cf9551733e0dc8b126f4bcf01122d3b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 14:50:26 +0000
+Subject: [PATCH 105/106] PS4: the persistent translation cache in Eden's A32
+ cores; recompiler counts per core
+
+ArmDynarmic32 declares itself (it holds the callbacks) and its CP15 as objects translated code
+points into, and saves/loads its JIT's code cache to/from a file (written beside it, then renamed
+over it). Per-core counts of blocks translated and the time, and of the cache's blocks loaded, used
+and found stale.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         | 23 ++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     | 45 +++++++++++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_32.h       |  6 +++
+ .../dynarmic/backend/x64/a32_interface.cpp    | 13 ++++--
+ 4 files changed, 84 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 6c13a49b07..7e69801433 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -78,7 +78,30 @@ struct alignas(64) GpuThreadCounters {
+         pipeline_reuse_mismatches{0};
+     // (04.16) texture and sampler descriptors read, and those read in place (the pool one host range)
+     std::atomic<uint64_t> descriptor_reads{0}, descriptor_reads_in_place{0};
++    // (04.17) uniform buffer copies sampled (1 in 16 of them hashed) and compared with the same
++    // slot's next copy: the same range with the same bytes (a copy that could have been reused),
++    // the same range changed, another range
++    std::atomic<uint64_t> ubo_checks{0}, ubo_same{0}, ubo_changed{0}, ubo_moved{0};
+ };
++
++// (04.17) Shaders and pipelines (the tester's question: what the first race builds): those built
++// at boot from the game's shader cache (vulkan.bin) and those built in play. Pipelines; Eden's
++// translation of their shaders to SPIR-V (us, summed over its threads); the driver's pipeline
++// creation (us); of the creations the driver reported on (creation feedback), those it found in
++// its pipeline cache (vulkan_pipelines.bin); creations under 2 ms (a cache hit's time). Written
++// by Eden's shader threads too: atomics.
++struct PipelineWork {
++    std::atomic<uint64_t> translated{0}, translate_us{0}, created{0}, create_us{0}, reported{0}, hits{0}, quick{0};
++};
++inline PipelineWork pipelines_at_boot, pipelines_in_play;
++inline std::atomic<bool> loading_shader_cache{false};
++inline PipelineWork& PipelineWorkNow() {
++    return loading_shader_cache.load(std::memory_order_relaxed) ? pipelines_at_boot : pipelines_in_play;
++}
++// (04.17) The recompiler per emulated core (each core's own thread): blocks translated, the time;
++// and the persistent translation cache: blocks loaded, used (their guest code the same), stale
++inline std::atomic<uint64_t> jit_core_blocks[4], jit_core_compile_ns[4];
++inline std::atomic<uint64_t> jit_cache_loaded[4], jit_cache_used[4], jit_cache_stale[4];
+ inline GpuThreadCounters gpu_thread;
+ // (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
+ // the boot), draws skipped while their pipeline builds (asynchronous shaders), images and buffers
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index e2346c89ea..e6212ca4af 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -4,7 +4,10 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdio>
+ #include <cstring>
++#include <string>
++#include <vector>
+ #include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+@@ -169,6 +172,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.callbacks = std::addressof(*m_cb);
+     config.coprocessors[15] = m_cp15;
+     config.define_unpredictable_behaviour = true;
++    // (PS4 04.17) What translated code points into, for a saved translation cache: this object
++    // (the callbacks are in it), the CP15 (its registers, and this as its CNTPCT callback's argument)
++    config.code_cache_objects = {{this, sizeof(ArmDynarmic32)}, {m_cp15.get(), sizeof(DynarmicCP15)}};
+ 
+     if (page_table) {
+         constexpr size_t PageBits = 12;
+@@ -426,6 +432,45 @@ ArmDynarmic32::ArmDynarmic32(System& system, bool uses_wall_clock, Kernel::KProc
+ 
+ ArmDynarmic32::~ArmDynarmic32() = default;
+ 
++bool ArmDynarmic32::SaveCodeCache(const std::string& path, std::string* why) {
++    const std::string temporary = path + ".tmp";
++    std::FILE* f = std::fopen(temporary.c_str(), "wb");
++    if (!f) {
++        if (why)
++            *why = "can't create the file";
++        return false;
++    }
++    std::vector<char> buffer(size_t(1) << 20);
++    std::setvbuf(f, buffer.data(), _IOFBF, buffer.size());
++    const bool saved = m_jit->SaveCodeCache([f](const void* data, std::size_t size) {
++        return std::fwrite(data, 1, size, f) == size;
++    });
++    const bool closed = std::fclose(f) == 0;
++    if (!saved || !closed || std::rename(temporary.c_str(), path.c_str()) != 0) {
++        std::remove(temporary.c_str());
++        if (why)
++            *why = "can't write it";
++        return false;
++    }
++    return true;
++}
++
++bool ArmDynarmic32::LoadCodeCache(const std::string& path, std::string* why) {
++    std::FILE* f = std::fopen(path.c_str(), "rb");
++    if (!f) {
++        if (why)
++            *why = "none saved";
++        return false;
++    }
++    std::vector<char> buffer(size_t(1) << 20);
++    std::setvbuf(f, buffer.data(), _IOFBF, buffer.size());
++    const bool loaded = m_jit->LoadCodeCache([f](void* data, std::size_t size) {
++        return std::fread(data, 1, size, f) == size;
++    }, why);
++    std::fclose(f);
++    return loaded;
++}
++
+ void ArmDynarmic32::SetTpidrroEl0(u64 value) {
+     m_cp15->uro = static_cast<u32>(value);
+ }
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.h b/src/core/arm/dynarmic/arm_dynarmic_32.h
+index 936f112272..ad6057a859 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.h
+@@ -83,6 +83,12 @@ public:
+     void ClearInstructionCache() override;
+     void InvalidateCacheRange(u64 addr, std::size_t size) override;
+ 
++    /// (PS4 04.17) The persistent translation cache: this core's translated code written to `path`
++    /// (beside it, then renamed over it) while the core is stopped and the game still loaded;
++    /// loaded from it before the core runs anything. False, and `why`, if not.
++    bool SaveCodeCache(const std::string& path, std::string* why);
++    bool LoadCodeCache(const std::string& path, std::string* why);
++
+ protected:
+     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
+     void RewindBreakpointInstruction() override;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 0be7f52093..20bd46a872 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -680,6 +680,7 @@ struct Jit::Impl {
+         cache_pending_ranges = std::move(ranges);
+         cache_use = {};
+         cache_use.loaded = cache_pending.size();
++        ::Common::PS4Perf::jit_cache_loaded[conf.processor_id & 3].store(cache_pending.size(), std::memory_order_relaxed);
+         ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+             u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+         return true;
+@@ -695,10 +696,12 @@ struct Jit::Impl {
+         if (CacheHashGuestCode(ranges) != it->code_hash) {
+             it->state = 2;
+             ++cache_use.stale;
++            ::Common::PS4Perf::jit_cache_stale[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+             return std::nullopt;
+         }
+         it->state = 1;
+         ++cache_use.used;
++        ::Common::PS4Perf::jit_cache_used[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+         const CodePtr entrypoint = block_of_code.CacheBase() + it->entry;
+         for (const auto& [start, end] : ranges)
+             emitter.block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(start, end - 1), descriptor);
+@@ -784,9 +787,13 @@ private:
+         auto block = emitter.Emit(ir_block);
+         ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+             u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+-        ::Common::PS4Perf::jit_compile_ns.fetch_add(
+-            u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()),
+-            std::memory_order_relaxed);
++        {
++            const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count());
++            ::Common::PS4Perf::jit_compile_ns.fetch_add(ns, std::memory_order_relaxed);
++            // (04.17) per core
++            ::Common::PS4Perf::jit_core_compile_ns[conf.processor_id & 3].fetch_add(ns, std::memory_order_relaxed);
++            ::Common::PS4Perf::jit_core_blocks[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
++        }
+         return block;
+     }
+ 
+-- 
+2.43.0
+

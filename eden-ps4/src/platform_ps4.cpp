@@ -1036,6 +1036,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.resolution = 50;
         else if (line == "shader_cache=off")
             settings.shader_cache = false;
+        else if (line == "jit_cache=off")
+            settings.jit_cache = false;
         else if (line == "async_shaders=off")
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
@@ -1071,7 +1073,8 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     if (FILE* f = std::fopen(kMenuFile, "w"))
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
-                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n",
+                        "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
+                        "jit_cache=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1079,7 +1082,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
-                     settings.fastmem ? "on" : "off");
+                     settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off");
         std::fclose(f);
     }
 }
@@ -1322,6 +1325,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.17: the first race after starting a game stutters because Eden translates the game's CPU code "
+         "for it the first time it runs (its shaders were already built during the black screen). Now each "
+         "core's translated code is kept when you leave the game (/data/eden-ps4/cache/jit) and used again "
+         "from the start next time, each piece checked against the game's code first (Settings: Translation "
+         "Cache; off to compare). Leaving takes a second or two longer; the first start after this version "
+         "builds the cache. Also: the shader cache is no longer deleted whole when a crash cut its last entry, "
+         "and the log measures shader and pipeline work at boot and in play.\n"
          "04.16: the next idea from Ryujinx, textures. For every texture of every draw Eden looked up its "
          "descriptor and its sampler's in the GPU's memory, translating each address through the GPU's page "
          "table, and did the same for each texture handle. Now the descriptors are read straight from where "
@@ -2279,6 +2289,30 @@ std::string PerfLine(double seconds)
                             P::jit_core_full_flushes[1].load(std::memory_order_relaxed),
                             P::jit_core_full_flushes[2].load(std::memory_order_relaxed),
                             P::jit_core_full_flushes[3].load(std::memory_order_relaxed));
+        // (04.17) the recompiler per core (the time translating, a second, and the blocks), and
+        // the translation cache loaded at boot: blocks used from it so far, and found stale
+        static uint64_t last_core_ns[4] = {}, last_core_blocks[4] = {};
+        std::string cores;
+        for (int c = 0; c < 4; c++) {
+            const uint64_t ns = P::jit_core_compile_ns[c].load(std::memory_order_relaxed);
+            const uint64_t blocks = P::jit_core_blocks[c].load(std::memory_order_relaxed);
+            cores += fmt::format("{}{:.1f} ms ({:.0f} blocks)", c ? ", " : "", double(ns - last_core_ns[c]) / seconds / 1e6,
+                                 double(blocks - last_core_blocks[c]) / seconds);
+            last_core_ns[c] = ns;
+            last_core_blocks[c] = blocks;
+        }
+        line += fmt::format("; translating by core, a second: {}", cores);
+        uint64_t loaded = 0;
+        for (int c = 0; c < 4; c++)
+            loaded += P::jit_cache_loaded[c].load(std::memory_order_relaxed);
+        if (loaded != 0) {
+            std::string use;
+            for (int c = 0; c < 4; c++)
+                use += fmt::format("{}{} of {}, {} stale", c ? "; " : "", P::jit_cache_used[c].load(std::memory_order_relaxed),
+                                   P::jit_cache_loaded[c].load(std::memory_order_relaxed),
+                                   P::jit_cache_stale[c].load(std::memory_order_relaxed));
+            line += fmt::format("; translation cache blocks used so far, by core: {}", use);
+        }
     }
     // Where the game's time goes besides running: each emulated core idle (no thread of the game
     // to run), all at once (every thread waiting: on the GPU, a vsync, a service), a finished
@@ -2496,6 +2530,32 @@ std::string PerfLine(double seconds)
                                                : 0.0);
         last_reads = reads;
         last_in_place = in_place;
+        // (04.17) uniform buffer copies sampled: the slot's next copy the same range with the same
+        // bytes (could have been reused), changed, another range
+        static uint64_t last_ubo[4] = {};
+        const uint64_t ubo[4] = {g.ubo_checks.load(), g.ubo_same.load(), g.ubo_changed.load(), g.ubo_moved.load()};
+        const uint64_t checks = ubo[0] - last_ubo[0];
+        if (checks != 0)
+            line += fmt::format("; uniform buffer copies compared with the slot's next: {}: {:.0f}% the same bytes, "
+                                "{:.0f}% changed, {:.0f}% another range",
+                                checks, 100.0 * double(ubo[1] - last_ubo[1]) / double(checks),
+                                100.0 * double(ubo[2] - last_ubo[2]) / double(checks),
+                                100.0 * double(ubo[3] - last_ubo[3]) / double(checks));
+        std::copy(std::begin(ubo), std::end(ubo), std::begin(last_ubo));
+    }
+    // (04.17) Pipelines built while the game ran (not at boot): Eden's translation of their shaders
+    // to SPIR-V, the driver's creation, and how many it found in its pipeline cache
+    {
+        const P::PipelineWork& w = P::pipelines_in_play;
+        static uint64_t last[7] = {};
+        const uint64_t now[7] = {w.translated.load(), w.translate_us.load(), w.created.load(), w.create_us.load(),
+                                 w.reported.load(), w.hits.load(), w.quick.load()};
+        if (now[2] != last[2] || now[0] != last[0])
+            line += fmt::format("; pipelines built while it ran: {} (their shaders translated {:.0f} ms, the driver's "
+                                "creation {:.0f} ms; in the driver's cache {} of {} reported; under 2 ms {})",
+                                now[2] - last[2], double(now[1] - last[1]) / 1000.0, double(now[3] - last[3]) / 1000.0,
+                                now[5] - last[5], now[4] - last[4], now[6] - last[6]);
+        std::copy(std::begin(now), std::end(now), std::begin(last));
     }
     // (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them: an event by
     // its service's name, one the game made, a thread, a timeout. Per core, the four longest.
@@ -2808,6 +2868,7 @@ void* Run(void*)
         Launcher::SetDocked(settings.docked);
         Launcher::SetResolution(settings.resolution);
         Launcher::SetShaderCache(settings.shader_cache);
+        Launcher::SetJitCache(settings.jit_cache);
         Launcher::SetAsyncShaders(settings.async_shaders);
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
@@ -2834,11 +2895,11 @@ void* Run(void*)
         setenv("EDEN_PS4_FASTMEM", settings.fastmem ? "1" : "0", 1);
         NoteRecent(program);
         const std::string setup = fmt::format(
-            "renderer: {}; console mode: {}; resolution {}%; shader cache {}, asynchronous shaders {}, "
+            "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
             "GPU accuracy {}, frame pacing {}, game speed {}%; CPU {}, {} cores, threads {}, fastmem {}; the Switch's "
             "RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
-            settings.shader_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
+            settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
             settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
             settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",

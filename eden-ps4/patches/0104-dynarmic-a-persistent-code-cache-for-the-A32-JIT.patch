@@ -1,7 +1,17 @@
-From a8ea456ba318bc9d43f8dcdfaf72bbc6d2188547 Mon Sep 17 00:00:00 2001
+From b6351790a15d0bba0981d0d9255bd5998e6626f9 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 3 Nov 2026 14:37:17 +0000
-Subject: [PATCH] dynarmic: persistent code cache (A32), work in progress
+Subject: [PATCH 104/106] dynarmic: a persistent code cache for the A32 JIT
+
+Jit::SaveCodeCache writes the translated code (the blocks, their cold code, the constants they
+placed) and what dynarmic keeps about it: each block's guest ranges (its code and its flags
+look-ahead) with a hash of that code, every link site, the fastmem fault records, and every
+pointer the code holds into objects that move between runs (the JIT, the callbacks, the monitor,
+the coprocessors, and UserConfig::code_cache_objects), found by scanning the code. LoadCodeCache,
+before anything is translated, takes it only from the same build and configuration with the code
+cache at the same address: the code is put back at the same addresses, its pointers moved to where
+the objects are now, every link undone. A saved block is registered when first looked up if its
+guest code still hashes the same (translated again otherwise), and linked as blocks register.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb

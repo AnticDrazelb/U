@@ -110,4 +110,5 @@ effects never seen before at all, new pipelines (made once, cached from then on)
    Thumb, exclusives, control flow, flags, NEON), fastmem and split stacks, the PS4's translator
    options, a CP15 like Eden's, a cache saved and reloaded twice; the second run's objects all
    elsewhere and the first run's memory unmapped, so a pointer left unrelocated faults; a changed
-   program's blocks all found stale (269 of 269) and translated again. Not yet wired into Eden.
+   program's blocks all found stale (269 of 269) and translated again. In 04.17 (patches
+   0104-0106, with 1 and 2).

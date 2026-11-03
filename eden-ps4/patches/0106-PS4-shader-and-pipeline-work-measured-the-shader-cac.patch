@@ -1,0 +1,455 @@
+From 340fba2ddf31e700114142921d598385b7064b5c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 14:50:27 +0000
+Subject: [PATCH 106/106] PS4: shader and pipeline work measured; the shader
+ cache files kept whole
+
+Pipelines built at boot from the game's shader cache and those built in play: Eden's translation
+of their shaders to SPIR-V and the driver's creation timed, and RADV's pipeline cache hits read
+(creation feedback, Vulkan 1.3). Uniform buffer copies sampled: how many repeat the slot's last.
+
+The shader cache (vulkan.bin) was deleted whole when an entry failed to read or write (an append
+cut short by a crash or a power cut): it is now cut back to the last whole entry. The driver's
+pipeline cache (vulkan_pipelines.bin) is written beside the old one and renamed over it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/video_core/buffer_cache/buffer_cache.h    | 25 +++++++++
+ .../buffer_cache/buffer_cache_base.h          | 13 +++++
+ .../renderer_vulkan/vk_compute_pipeline.cpp   | 34 ++++++++++++
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  | 36 ++++++++++++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 55 +++++++++++++++++--
+ src/video_core/shader_environment.cpp         | 45 +++++++++++----
+ 6 files changed, 191 insertions(+), 17 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index f667912f3b..c9b4a8b0bf 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -987,6 +987,31 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+ #ifdef __OPENORBIS__
+         Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_copied);
+         Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_copied_bytes, size);
++        {
++            // (04.17) How many copies repeat the slot's last one (what reusing a copy could save):
++            // 1 in 16 of the copies hashed, the same slot's next copy compared with it
++            namespace P = Common::PS4Perf;
++            UboSample& sample = ubo_samples[stage % NUM_STAGES][binding_index % NUM_GRAPHICS_UNIFORM_BUFFERS];
++            if (sample.armed || (++ubo_sample_tick & 15) == 0) {
++                if (const u8* const source = device_memory.GetSpan(device_addr, size)) {
++                    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(source), size);
++                    if (sample.armed) {
++                        sample.armed = false;
++                        P::Bump(P::gpu_thread.ubo_checks);
++                        if (sample.device_addr != device_addr || sample.size != size)
++                            P::Bump(P::gpu_thread.ubo_moved);
++                        else if (sample.hash == hash)
++                            P::Bump(P::gpu_thread.ubo_same);
++                        else
++                            P::Bump(P::gpu_thread.ubo_changed);
++                    } else {
++                        sample = {device_addr, size, hash, true};
++                    }
++                } else {
++                    sample.armed = false;
++                }
++            }
++        }
+ #endif
+         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 8b694c0072..15ff4fa981 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -26,6 +26,7 @@
+ #include "common/lru_cache.h"
+ #include "common/range_sets.h"
+ #include "common/scope_exit.h"
++#include "common/cityhash.h"
+ #include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+@@ -389,6 +390,18 @@ private:
+ 
+     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
+ 
++#ifdef __OPENORBIS__
++    /// (PS4 04.17) a sampled uniform buffer copy per slot, for the next copy to be compared with
++    struct UboSample {
++        DAddr device_addr = 0;
++        u32 size = 0;
++        u64 hash = 0;
++        bool armed = false;
++    };
++    std::array<std::array<UboSample, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> ubo_samples{};
++    u32 ubo_sample_tick = 0;
++#endif
++
+     void BindHostGraphicsStorageBuffers(size_t stage);
+ 
+     void BindHostGraphicsTextureBuffers(size_t stage);
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 29356cfcec..1c96d825a1 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <chrono>
+ #include <algorithm>
+ #include <vector>
+ 
+@@ -22,6 +23,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#include "common/ps4_perf.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+ 
+@@ -92,9 +94,24 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+         if (uses_descriptor_buffer) {
+             flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+         }
++#ifdef __OPENORBIS__
++        VkPipelineCreationFeedback creation_feedback{};  // (04.17) as for graphics pipelines
++        const VkPipelineCreationFeedbackCreateInfo creation_feedback_ci{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
++            .pNext = nullptr,
++            .pPipelineCreationFeedback = &creation_feedback,
++            .pipelineStageCreationFeedbackCount = 0,
++            .pPipelineStageCreationFeedbacks = nullptr,
++        };
++        const bool want_feedback = device.ApiVersion() >= VK_API_VERSION_1_3;
++#endif
+         const VkComputePipelineCreateInfo compute_ci{
+             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++#ifdef __OPENORBIS__
++            .pNext = want_feedback ? &creation_feedback_ci : nullptr,
++#else
+             .pNext = nullptr,
++#endif
+             .flags = flags,
+             .stage{
+                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+@@ -111,7 +128,24 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             .basePipelineIndex = 0,
+         };
+         try {
++#ifdef __OPENORBIS__
++            const auto create_start = std::chrono::steady_clock::now();
++#endif
+             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++#ifdef __OPENORBIS__
++            const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
++                                   std::chrono::steady_clock::now() - create_start).count());
++            auto& work = Common::PS4Perf::PipelineWorkNow();
++            work.created.fetch_add(1, std::memory_order_relaxed);
++            work.create_us.fetch_add(us, std::memory_order_relaxed);
++            if (us < 2000)
++                work.quick.fetch_add(1, std::memory_order_relaxed);
++            if (want_feedback && (creation_feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0) {
++                work.reported.fetch_add(1, std::memory_order_relaxed);
++                if (creation_feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
++                    work.hits.fetch_add(1, std::memory_order_relaxed);
++            }
++#endif
+         } catch (const vk::Exception& exception) {
+             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
+                          exception.what());
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index ed4871b72d..1e3ccc9a0f 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ #include <iostream>
+ #include <span>
+@@ -15,6 +16,7 @@
+ 
+ #include "video_core/renderer_vulkan/pipeline_helper.h"
+ 
++#include "common/ps4_perf.h"
+ #include "common/bit_field.h"
+ #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+@@ -1090,9 +1092,27 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+     }
+ 
++#ifdef __OPENORBIS__
++    // (04.17) the driver's creation, timed, and whether it found it in its pipeline cache (creation
++    // feedback, core in Vulkan 1.3)
++    VkPipelineCreationFeedback creation_feedback{};
++    const VkPipelineCreationFeedbackCreateInfo creation_feedback_ci{
++        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
++        .pNext = nullptr,
++        .pPipelineCreationFeedback = &creation_feedback,
++        .pipelineStageCreationFeedbackCount = 0,
++        .pPipelineStageCreationFeedbacks = nullptr,
++    };
++    const bool want_feedback = device.ApiVersion() >= VK_API_VERSION_1_3;
++    const auto create_start = std::chrono::steady_clock::now();
++#endif
+     pipeline = device.GetLogical().CreateGraphicsPipeline({
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++#ifdef __OPENORBIS__
++        .pNext = want_feedback ? &creation_feedback_ci : nullptr,
++#else
+         .pNext = nullptr,
++#endif
+         .flags = flags,
+         .stageCount = static_cast<u32>(shader_stages.size()),
+         .pStages = shader_stages.data(),
+@@ -1111,6 +1131,22 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         .basePipelineHandle = nullptr,
+         .basePipelineIndex = 0,
+     }, *pipeline_cache);
++#ifdef __OPENORBIS__
++    {
++        const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
++                               std::chrono::steady_clock::now() - create_start).count());
++        auto& work = Common::PS4Perf::PipelineWorkNow();
++        work.created.fetch_add(1, std::memory_order_relaxed);
++        work.create_us.fetch_add(us, std::memory_order_relaxed);
++        if (us < 2000)
++            work.quick.fetch_add(1, std::memory_order_relaxed);
++        if (want_feedback && (creation_feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0) {
++            work.reported.fetch_add(1, std::memory_order_relaxed);
++            if (creation_feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
++                work.hits.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++#endif
+ 
+     // Log graphics pipeline creation
+     if (GPU::Logging::IsActive()) {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 624c967bac..08882fd7a6 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstddef>
+ #include <fstream>
+ #include <iostream>
+@@ -16,6 +17,7 @@
+ #include <numeric>
+ #include "common/cityhash.h"
+ #include "common/ps4_perf.h"
++#include "common/scope_exit.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/thread_worker.h"
+@@ -673,6 +675,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     if (title_id == 0) {
+         return;
+     }
++#ifdef __OPENORBIS__
++    // (04.17) what's built from here until it returns counts as the boot's
++    Common::PS4Perf::loading_shader_cache.store(true, std::memory_order_relaxed);
++    SCOPE_EXIT {
++        Common::PS4Perf::loading_shader_cache.store(false, std::memory_order_relaxed);
++    };
++#endif
+     if (!pipeline_cache_filename.empty()) {
+         serialization_thread.WaitForRequests();
+         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+@@ -873,6 +882,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
+     bool build_in_parallel) try {
++#ifdef __OPENORBIS__
++    const auto translate_start = std::chrono::steady_clock::now();  // (04.17)
++#endif
+     auto hash = key.Hash();
+     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+     size_t env_index{0};
+@@ -972,6 +984,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         previous_stage = &program;
+     }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++#ifdef __OPENORBIS__
++    {
++        // (04.17) the shaders' translation to SPIR-V (the pipeline's creation is counted where it's made)
++        auto& work = Common::PS4Perf::PipelineWorkNow();
++        work.translated.fetch_add(1, std::memory_order_relaxed);
++        work.translate_us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(
++                                            std::chrono::steady_clock::now() - translate_start).count()),
++                                    std::memory_order_relaxed);
++    }
++#endif
+     return std::make_unique<GraphicsPipeline>(
+         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
+         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+@@ -1042,6 +1064,9 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
+     PipelineStatistics* statistics, bool build_in_parallel) try {
++#ifdef __OPENORBIS__
++    const auto translate_start = std::chrono::steady_clock::now();  // (04.17)
++#endif
+     auto hash = key.Hash();
+     if (device.HasBrokenCompute()) {
+         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
+@@ -1096,6 +1121,15 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         spv_module.SetObjectNameEXT(name.c_str());
+     }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++#ifdef __OPENORBIS__
++    {
++        auto& work = Common::PS4Perf::PipelineWorkNow();  // (04.17)
++        work.translated.fetch_add(1, std::memory_order_relaxed);
++        work.translate_us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(
++                                            std::chrono::steady_clock::now() - translate_start).count()),
++                                    std::memory_order_relaxed);
++    }
++#endif
+     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                                              guest_descriptor_queue, descriptor_buffer_ring,
+                                              thread_worker, statistics,
+@@ -1110,7 +1144,12 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                  const vk::PipelineCache& pipeline_cache,
+                                                  u32 cache_version) try {
+-    std::ofstream file(filename, std::ios::binary);
++    // (PS4 04.17) Written beside it and renamed over it once whole: a crash or power cut while
++    // writing leaves the previous file, not a cut-off one
++    auto temporary = filename;
++    temporary += ".tmp";
++    {
++    std::ofstream file(temporary, std::ios::binary);
+     file.exceptions(std::ifstream::failbit);
+     if (!file.is_open()) {
+         LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
+@@ -1128,16 +1167,20 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
+         pipeline_cache.Read(&cache_size, cache_data.data());
+     }
+     file.write(cache_data.data(), cache_size);
++    file.close();
++    }
++    std::filesystem::rename(temporary, filename);
+ 
+     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
+              Common::FS::PathToUTF8String(filename));
+ 
+-} catch (const std::ios_base::failure& e) {
++} catch (const std::exception& e) {
++    // (PS4 04.17) the unfinished temporary file goes; the previous cache stays
+     LOG_ERROR(Common_Filesystem, "{}", e.what());
+-    if (!Common::FS::RemoveFile(filename)) {
+-        LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
+-    }
++    auto temporary = filename;
++    temporary += ".tmp";
++    std::error_code ec;
++    std::filesystem::remove(temporary, ec);
+ }
+ 
+ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 4d5db7e511..b04b530272 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -595,12 +595,16 @@ std::optional<Shader::ReplaceConstant> FileEnvironment::GetReplaceConstBuffer(u3
+ void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
+                        const std::filesystem::path& filename, u32 cache_version) try {
+     std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
+-    file.exceptions(std::ifstream::failbit);
+     if (!file.is_open()) {
+         LOG_ERROR(Common_Filesystem, "Failed to open pipeline cache file {}",
+                   Common::FS::PathToUTF8String(filename));
+         return;
+     }
++    // (PS4 04.17) Where this entry starts: a failed write cuts the file back to it, instead of
++    // the whole cache (every pipeline the game ever needed) being deleted
++    const std::streamoff entry_start = static_cast<std::streamoff>(file.tellp());
++    try {
++    file.exceptions(std::ifstream::failbit);
+     if (file.tellp() == 0) {
+         // Write header
+         file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+@@ -615,19 +619,30 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
+         env->Serialize(file);
+     }
+     file.write(key.data(), key.size_bytes());
++    } catch (const std::ios_base::failure& e) {
++        LOG_ERROR(Common_Filesystem, "{}", e.what());
++        file.close();
++        std::error_code ec;
++        std::filesystem::resize_file(filename, static_cast<std::uintmax_t>(entry_start), ec);
++        if (ec && !Common::FS::RemoveFile(filename)) {
++            LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
++                      Common::FS::PathToUTF8String(filename));
++        }
++    }
+ 
+ } catch (const std::ios_base::failure& e) {
+     LOG_ERROR(Common_Filesystem, "{}", e.what());
+-    if (!Common::FS::RemoveFile(filename)) {
+-        LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
+-    }
+ }
+ 
+ void LoadPipelines(
+     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
+     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
+-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) try {
++    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) {
++    // (PS4 04.17) The end of the last entry read whole: a damaged entry after it (an append cut
++    // short by a crash or a power cut) is cut off, the entries before it kept, instead of the
++    // whole cache being deleted
++    std::streamoff good_end = 0;
++    try {
+     std::ifstream file(filename, std::ios::binary | std::ios::ate);
+     if (!file.is_open()) {
+         return;
+@@ -656,6 +671,7 @@ void LoadPipelines(
+         }
+         return;
+     }
++    good_end = static_cast<std::streamoff>(file.tellg());
+     while (file.tellg() != end) {
+         if (stop_loading.stop_requested()) {
+             return;
+@@ -671,13 +687,20 @@ void LoadPipelines(
+         } else {
+             load_graphics(file, std::move(envs));
+         }
++        good_end = static_cast<std::streamoff>(file.tellg());
+     }
+ 
+-} catch (const std::ios_base::failure& e) {
+-    LOG_ERROR(Common_Filesystem, "{}", e.what());
+-    if (!Common::FS::RemoveFile(filename)) {
+-        LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
++    } catch (const std::ios_base::failure& e) {
++        LOG_ERROR(Common_Filesystem, "{}", e.what());
++        std::error_code ec;
++        if (good_end > 0) {
++            std::filesystem::resize_file(filename, static_cast<std::uintmax_t>(good_end), ec);
++            LOG_ERROR(Common_Filesystem, "Pipeline cache file damaged after {} bytes: cut there", good_end);
++        }
++        if ((good_end == 0 || ec) && !Common::FS::RemoveFile(filename)) {
++            LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
++                      Common::FS::PathToUTF8String(filename));
++        }
+     }
+ }
+ 
+-- 
+2.43.0
+

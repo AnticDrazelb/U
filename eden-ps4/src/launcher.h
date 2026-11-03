@@ -80,6 +80,9 @@ void SetCpuUnsafe(bool on);
 void SetGpuAccuracyHigh(bool on);
 // The frames presented a second, top left of the picture (System Settings, Graphics, FPS Counter)
 void SetFpsOverlay(bool on);
+/// (04.17) The persistent translation cache: each emulated core's translated code saved when
+/// leaving a game, loaded when it starts again (on unless set off). Set it before Boot.
+void SetJitCache(bool on);
 // Frame pacing: frames shown at the Switch's 60 Hz vsync (Eden's speed limit at 100%), or each the
 // moment the game finishes it (unlocked: no speed limit)
 void SetUnlockedFrames(bool on);

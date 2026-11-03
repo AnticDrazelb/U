@@ -32,6 +32,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -168,6 +169,7 @@ bool g_docked = true;
 int g_resolution = 100;
 bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false, g_fps_overlay = false;
 bool g_unlocked_frames = false;
+bool g_jit_cache = true;  // (04.17) the persistent translation cache
 int g_speed_percent = 100;
 std::string g_keys_dir, g_firmware_dir; // (empty: the user folder's)
 
@@ -395,6 +397,10 @@ void SetGpuAccuracyHigh(bool on) {
     g_gpu_high = on;
 }
 
+void SetJitCache(bool on) {
+    g_jit_cache = on;
+}
+
 void SetFpsOverlay(bool on) {
     g_fps_overlay = on;
 }
@@ -491,6 +497,62 @@ void Stop() {
 
 // What a program that loaded is called, who made it, and its icon, for the HOME menu: a game's
 // can't be read without the keys that loading it just used.
+// (04.17) The persistent translation cache: each emulated core's translated code for a game, saved
+// when leaving it and loaded before it runs (data_dir/cache/jit/<title id>-core<n>.bin); a 64-bit
+// game's cores (A64) have none yet
+std::string JitCachePath(const std::filesystem::path& data_dir, u64 title_id, size_t core) {
+    return (data_dir / "cache" / "jit" / fmt::format("{:016x}-core{}.bin", title_id, core)).string();
+}
+
+void LoadJitCaches(Core::System& system, const std::filesystem::path& data_dir, u64 title_id) {
+    auto* process = system.ApplicationProcess();
+    if (!process || !title_id)
+        return;
+    std::error_code ec;
+    std::filesystem::create_directories(data_dir / "cache" / "jit", ec);
+    std::string summary;
+    for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; core++) {
+        auto* arm = process->GetArmInterface(core);
+        if (!arm || arm->GetArchitecture() != Core::Architecture::AArch32)
+            continue;
+        const auto start = std::chrono::steady_clock::now();
+        std::string why;
+        const bool loaded = static_cast<Core::ArmDynarmic32*>(arm)->LoadCodeCache(JitCachePath(data_dir, title_id, core), &why);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        summary += fmt::format("{}core {}: {}", summary.empty() ? "" : "; ", core,
+                               loaded ? fmt::format("{} blocks in {} ms",
+                                                    Common::PS4Perf::jit_cache_loaded[core & 3].load(), ms)
+                                      : why);
+    }
+    if (!summary.empty())
+        Output(LineKind::Status, "translation cache: " + summary);
+}
+
+void SaveJitCaches(Core::System& system, const std::filesystem::path& data_dir, u64 title_id) {
+    auto* process = system.ApplicationProcess();
+    if (!process || !title_id)
+        return;
+    std::error_code ec;
+    std::filesystem::create_directories(data_dir / "cache" / "jit", ec);
+    std::string summary;
+    for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; core++) {
+        auto* arm = process->GetArmInterface(core);
+        if (!arm || arm->GetArchitecture() != Core::Architecture::AArch32)
+            continue;
+        const auto start = std::chrono::steady_clock::now();
+        const std::string path = JitCachePath(data_dir, title_id, core);
+        std::string why;
+        const bool saved = static_cast<Core::ArmDynarmic32*>(arm)->SaveCodeCache(path, &why);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        summary += fmt::format("{}core {}: {}", summary.empty() ? "" : "; ", core,
+                               saved ? fmt::format("{:.1f} MiB in {} ms",
+                                                   double(std::filesystem::file_size(path, ec)) / 1048576.0, ms)
+                                     : why);
+    }
+    if (!summary.empty())
+        Output(LineKind::Status, "translation cache saved: " + summary);
+}
+
 void CacheTitle(Core::System& system, const std::filesystem::path& data_dir, const std::string& program) {
     Loader::AppLoader& loader = system.GetAppLoader();
     std::string title, publisher;
@@ -588,6 +650,12 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                 result = {BootResult::Status::LoadFailed, LoadError(status)};
             } else {
                 CacheTitle(system, data_dir, program.string());
+                u64 game_id = 0;  // (the title id, for the caches)
+                if (system.GetAppLoader().ReadProgramId(game_id) != Loader::ResultStatus::Success || !game_id)
+                    game_id = system.GetApplicationProcessProgramID();
+                // (04.17) the translated code of this game's last run, before its cores run anything
+                if (g_jit_cache)
+                    LoadJitCaches(system, data_dir, game_id);
                 system.GPU().Start();
                 system.GetCpuManager().OnGpuReady();
                 // the shaders this game used before, built now (as yuzu-cmd does): a longer start,
@@ -598,8 +666,27 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     if (system.GetAppLoader().ReadProgramId(title_id) != Loader::ResultStatus::Success || !title_id)
                         title_id = system.GetApplicationProcessProgramID();
                     Output(LineKind::Status, fmt::format("loading the shader cache of {:016x}", title_id));
+                    const auto shader_start = std::chrono::steady_clock::now();
                     system.Renderer().ReadRasterizer()->LoadDiskResources(
                         title_id, std::stop_token{}, [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+#ifdef __OPENORBIS__
+                    {
+                        // (04.17) what that took: the pipelines rebuilt, Eden's translation of their
+                        // shaders to SPIR-V and the driver's pipeline creation (summed over the
+                        // threads that did them), and how many the driver found in its cache
+                        namespace P = Common::PS4Perf;
+                        const P::PipelineWork& w = P::pipelines_at_boot;
+                        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - shader_start).count();
+                        Output(LineKind::Status,
+                               fmt::format("shader cache: {} pipelines rebuilt in {:.1f} s; their shaders' translation "
+                                           "to SPIR-V {:.1f} s, the driver's pipeline creation {:.1f} s (summed over "
+                                           "the threads); found in the driver's cache: {} of the {} it reported on; "
+                                           "created in under 2 ms: {}",
+                                           w.created.load(), seconds, double(w.translate_us.load()) / 1e6,
+                                           double(w.create_us.load()) / 1e6, w.hits.load(), w.reported.load(),
+                                           w.quick.load()));
+                    }
+#endif
                 }
                 std::unique_lock lock{g_run_mutex};
                 g_running = true;
@@ -700,6 +787,17 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                                                ctx.sp, base));
                         }
                     }
+                }
+                // (04.17) the translated code kept for the next run: the cores are stopped, the game
+                // still loaded (its code hashed for each block)
+                if (!exited && g_jit_cache) {
+#ifdef __OPENORBIS__
+                    Common::PS4Diagnostics::shutdown_stage = "saving the translation cache";
+#endif
+                    SaveJitCaches(system, data_dir, game_id);
+#ifdef __OPENORBIS__
+                    Common::PS4Diagnostics::shutdown_stage = "pausing the program";
+#endif
                 }
                 {
                     // no input into a system that is shutting down (it reached objects on its
