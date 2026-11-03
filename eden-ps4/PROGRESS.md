@@ -235,7 +235,8 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | `IsGPUFenceBehaviorAccurate` per `FindBuffer` | 0.23% | 04.08: once a frame |
 | Samplers (`GetSamplerId`, `Sampler::HandleFor`, `MakeKey`) | ~1.4% | open |
 | `TextureCache::SynchronizeAliases` at a race's start | 2.7% (0.3% mid-race) | open |
-| `FixedPipelineState::Refresh` every draw | 1.3-2.1% | open: needs a dirty flag covering every register it reads |
+| `FixedPipelineState::Refresh` every draw | 1.3-2.1% | open: needs a dirty flag covering every register it reads; Ryujinx's state groups (docs/ryujinx-comparison.md, 2) |
+| Uniform buffers copied every draw (Eden's skip-cache path), identical constant buffer rewrites invalidated | memcpy 3-5% + stream buffer work | open: docs/ryujinx-comparison.md, 1: counters first, then skip identical rewrites (not GPU-modified) |
 | `GpuToCpuAddress` | ~2% | open: called often; a last-page cache? |
 | Buffer cache bindings, memory tracking (`WordManager`) | ~9% + ~7% | open |
 | **Stability** | | |
