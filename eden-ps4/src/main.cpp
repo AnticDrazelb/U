@@ -32,7 +32,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
-#include "core/arm/dynarmic/arm_dynarmic_32.h"
+#include "core/arm/arm_interface.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -517,7 +517,7 @@ void LoadJitCaches(Core::System& system, const std::filesystem::path& data_dir, 
             continue;
         const auto start = std::chrono::steady_clock::now();
         std::string why;
-        const bool loaded = static_cast<Core::ArmDynarmic32*>(arm)->LoadCodeCache(JitCachePath(data_dir, title_id, core), &why);
+        const bool loaded = arm->LoadCodeCache(JitCachePath(data_dir, title_id, core), &why);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
         summary += fmt::format("{}core {}: {}", summary.empty() ? "" : "; ", core,
                                loaded ? fmt::format("{} blocks in {} ms",
@@ -542,7 +542,7 @@ void SaveJitCaches(Core::System& system, const std::filesystem::path& data_dir, 
         const auto start = std::chrono::steady_clock::now();
         const std::string path = JitCachePath(data_dir, title_id, core);
         std::string why;
-        const bool saved = static_cast<Core::ArmDynarmic32*>(arm)->SaveCodeCache(path, &why);
+        const bool saved = arm->SaveCodeCache(path, &why);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
         summary += fmt::format("{}core {}: {}", summary.empty() ? "" : "; ", core,
                                saved ? fmt::format("{:.1f} MiB in {} ms",

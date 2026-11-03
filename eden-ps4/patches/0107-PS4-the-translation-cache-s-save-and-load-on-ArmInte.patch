@@ -1,0 +1,59 @@
+From 9dce68fd65a60c772c5d96bf8c2ade9dff1d8876 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 15:03:33 +0000
+Subject: [PATCH] PS4: the translation cache's save and load on ArmInterface
+ (virtual)
+
+The frontend can't include dynarmic's headers (arm_dynarmic_32.h does): SaveCodeCache and
+LoadCodeCache are virtual on ArmInterface ("not supported" by default), ArmDynarmic32 overrides them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/arm_interface.h            | 14 ++++++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_32.h |  4 ++--
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/arm/arm_interface.h b/src/core/arm/arm_interface.h
+index 495963eefd..e0f4356f29 100644
+--- a/src/core/arm/arm_interface.h
++++ b/src/core/arm/arm_interface.h
+@@ -76,6 +76,20 @@ public:
+     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.
+     virtual Architecture GetArchitecture() const = 0;
+ 
++    /// (PS4 04.17) The persistent translation cache: this core's translated code saved to a file
++    /// (the core stopped, the game still loaded) / loaded before it runs anything. Only dynarmic's
++    /// A32 cores have one: false and "not supported" elsewhere.
++    virtual bool SaveCodeCache(const std::string& path, std::string* why) {
++        if (why)
++            *why = "not supported";
++        return false;
++    }
++    virtual bool LoadCodeCache(const std::string& path, std::string* why) {
++        if (why)
++            *why = "not supported";
++        return false;
++    }
++
+     // Context accessors.
+     // These should not be called if the CPU is running.
+     virtual void GetContext(Kernel::Svc::ThreadContext& ctx) const = 0;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.h b/src/core/arm/dynarmic/arm_dynarmic_32.h
+index ad6057a859..ad00628d80 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.h
+@@ -86,8 +86,8 @@ public:
+     /// (PS4 04.17) The persistent translation cache: this core's translated code written to `path`
+     /// (beside it, then renamed over it) while the core is stopped and the game still loaded;
+     /// loaded from it before the core runs anything. False, and `why`, if not.
+-    bool SaveCodeCache(const std::string& path, std::string* why);
+-    bool LoadCodeCache(const std::string& path, std::string* why);
++    bool SaveCodeCache(const std::string& path, std::string* why) override;
++    bool LoadCodeCache(const std::string& path, std::string* why) override;
+ 
+ protected:
+     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
+-- 
+2.43.0
+
