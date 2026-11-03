@@ -1322,6 +1322,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.14: Eden's GPU thread does less per draw, from 04.12's samples of it in races. Eden for PS4's "
+         "own counters cost it ~1%: two locked adds per uniform buffer, in a cache line the timing thread "
+         "also writes; its counters now have their own, added without a lock. A macro's parameters, when "
+         "they come in one piece, are no longer copied before it runs (0.4%). 04.12's comparison of "
+         "constant buffer data with memory is gone (answered). A few % together on the race start's limit.\n"
          "04.13: a crash fixed. Booting Mario Kart once crashed while it loaded (as one did in 04.09): when "
          "the game gave memory back, Eden's graphics service thread, deleting the textures in it, also wrote "
          "into Eden's list of GPU commands, which only the GPU thread may do, at the same time as the GPU "
@@ -2412,9 +2417,9 @@ std::string PerfLine(double seconds)
     // writes (one loop, DmaPusher::SinkRun)
     {
         static uint64_t last_draws = 0, last_words = 0, last_run_words = 0;
-        const uint64_t draws = P::gpu_draws.load(std::memory_order_relaxed);
-        const uint64_t words = P::gpu_command_words.load(std::memory_order_relaxed);
-        const uint64_t run_words = P::gpu_sink_run_words.load(std::memory_order_relaxed);
+        const uint64_t draws = P::gpu_thread.draws.load(std::memory_order_relaxed);
+        const uint64_t words = P::gpu_thread.command_words.load(std::memory_order_relaxed);
+        const uint64_t run_words = P::gpu_thread.sink_run_words.load(std::memory_order_relaxed);
         line += fmt::format("; the GPU thread: {:.0f} draws a second, {:.0f} command words a second ({:.0f}% of them "
                             "register writes in runs, one loop each)",
                             double(draws - last_draws) / seconds, double(words - last_words) / seconds,
@@ -2438,23 +2443,24 @@ std::string PerfLine(double seconds)
         last_images = images;
         last_buffers = buffers;
     }
-    // (04.12) Uniform buffers (docs/ryujinx-comparison.md, 1): constant buffer data written and how
-    // much memory already held; binds copied every draw against cached; frames copying
+    // (04.12) Uniform buffers (docs/ryujinx-comparison.md, 1): constant buffer data written; binds
+    // copied every draw against cached; frames copying. (04.14: what memory already held no longer
+    // compared)
     {
-        static uint64_t last[9] = {};
-        const uint64_t now[9] = {P::cb_bytes.load(), P::cb_identical_bytes.load(), P::cb_uncompared_bytes.load(),
-                                 P::ubo_copied.load(), P::ubo_copied_bytes.load(), P::ubo_cached.load(),
-                                 P::ubo_cached_hits.load(), P::ubo_frames.load(), P::ubo_frames_copying.load()};
-        uint64_t d[9];
-        for (int i = 0; i < 9; i++)
+        const P::GpuThreadCounters& g = P::gpu_thread;
+        static uint64_t last[7] = {};
+        const uint64_t now[7] = {g.cb_bytes.load(),   g.ubo_copied.load(),      g.ubo_copied_bytes.load(),
+                                 g.ubo_cached.load(), g.ubo_cached_hits.load(), g.ubo_frames.load(),
+                                 g.ubo_frames_copying.load()};
+        uint64_t d[7];
+        for (int i = 0; i < 7; i++)
             d[i] = now[i] - last[i];
         const auto pct = [](uint64_t part, uint64_t whole) { return whole ? 100.0 * double(part) / double(whole) : 0.0; };
-        line += fmt::format("; uniform buffers: constant buffer data written {:.0f} KiB a second, {:.0f}% of it what "
-                            "memory already held ({:.0f}% not compared); binds a second: {:.0f} copied ({:.0f} KiB), "
-                            "{:.0f} from the cache ({:.0f}% with nothing to upload); frames copying every draw "
-                            "{:.0f}%",
-                            double(d[0]) / 1024.0 / seconds, pct(d[1], d[0]), pct(d[2], d[0]), double(d[3]) / seconds,
-                            double(d[4]) / 1024.0 / seconds, double(d[5]) / seconds, pct(d[6], d[5]), pct(d[8], d[7]));
+        line += fmt::format("; uniform buffers: constant buffer data written {:.0f} KiB a second; binds a second: "
+                            "{:.0f} copied ({:.0f} KiB), {:.0f} from the cache ({:.0f}% with nothing to upload); "
+                            "frames copying every draw {:.0f}%",
+                            double(d[0]) / 1024.0 / seconds, double(d[1]) / seconds, double(d[2]) / 1024.0 / seconds,
+                            double(d[3]) / seconds, pct(d[4], d[3]), pct(d[6], d[5]));
         std::copy(std::begin(now), std::end(now), std::begin(last));
     }
     // (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them: an event by

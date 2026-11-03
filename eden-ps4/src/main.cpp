@@ -627,22 +627,19 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                         static uint64_t last[5] = {};
                         const uint64_t now[5] = {P::gpu_pipelines_new.load(), P::gpu_draws_skipped.load(),
                                                  P::gpu_images_created.load(), P::gpu_buffers_created.load(),
-                                                 P::gpu_draws.load()};
+                                                 P::gpu_thread.draws.load()};
                         extra = fmt::format("; {} draws, new: {} pipelines ({} draws skipped), {} images, {} buffers",
                                             now[4] - last[4], now[0] - last[0], now[1] - last[1], now[2] - last[2],
                                             now[3] - last[3]);
                         std::copy(std::begin(now), std::end(now), std::begin(last));
-                        // (04.12) uniform buffers: copied to stream buffers, and how much of the
-                        // constant buffer data written memory already held
+                        // (04.12) uniform buffers copied to stream buffers, and the constant buffer
+                        // data written
                         {
-                            static uint64_t last_ubo[3] = {};
-                            const uint64_t ubo[3] = {P::ubo_copied_bytes.load(), P::cb_bytes.load(),
-                                                     P::cb_identical_bytes.load()};
-                            const uint64_t cb = ubo[1] - last_ubo[1];
-                            extra += fmt::format("; uniform buffers copied {:.1f} MiB, constant data written {:.1f} MiB "
-                                                 "({:.0f}% already there)",
-                                                 double(ubo[0] - last_ubo[0]) / 1048576.0, double(cb) / 1048576.0,
-                                                 cb ? 100.0 * double(ubo[2] - last_ubo[2]) / double(cb) : 0.0);
+                            static uint64_t last_ubo[2] = {};
+                            const uint64_t ubo[2] = {P::gpu_thread.ubo_copied_bytes.load(), P::gpu_thread.cb_bytes.load()};
+                            extra += fmt::format("; uniform buffers copied {:.1f} MiB, constant data written {:.1f} MiB",
+                                                 double(ubo[0] - last_ubo[0]) / 1048576.0,
+                                                 double(ubo[1] - last_ubo[1]) / 1048576.0);
                             std::copy(std::begin(ubo), std::end(ubo), std::begin(last_ubo));
                         }
                         // (04.11) core 0's (the game's main thread's) two longest waits on objects

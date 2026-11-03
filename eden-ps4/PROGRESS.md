@@ -237,8 +237,10 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | Samplers (`GetSamplerId`, `Sampler::HandleFor`, `MakeKey`) | ~1.4% | open |
 | `TextureCache::SynchronizeAliases` at a race's start | 2.7% (0.3% mid-race) | open |
 | `FixedPipelineState::Refresh` every draw | 1.3-2.1% | open: needs a dirty flag covering every register it reads; Ryujinx's state groups (docs/ryujinx-comparison.md, 2) |
-| Uniform buffers copied every draw (Eden's skip-cache path), identical constant buffer rewrites invalidated | memcpy 3-5% + stream buffer work | open: docs/ryujinx-comparison.md, 1: counters first, then skip identical rewrites (not GPU-modified) |
+| Uniform buffers copied every draw (Eden's skip-cache path), identical constant buffer rewrites invalidated | memcpy 3-5% + stream buffer work | 04.12's counts: ~4 copied a draw, 30-40 MiB/s; the game's constant data 0.2-0.28 MiB/s, half identical (too little to matter). The cached path would end render passes for uploads; reusing a copy needs a content compare (about the copy's cost): no clear gain yet |
 | `GpuToCpuAddress` | ~2% | open: called often; a last-page cache? |
+| Eden for PS4's own counters on the GPU thread (locked adds, cache lines shared with other threads' counters) | ~1.1% (04.12's two per uniform buffer bind) | 04.14: own cache line, unlocked adds |
+| Macro parameters copied into `macro_params` (`vector::insert`) | 0.4% | 04.14: read in place when they come in one call |
 | Buffer cache bindings, memory tracking (`WordManager`) | ~9% + ~7% | open |
 | **Stability** | | |
 | Exit to Eden's menu froze once (04.08, after 23 min: `ShutdownMainProcess` never returned) | | 04.09: the step in the hang report; restart after 30 s |

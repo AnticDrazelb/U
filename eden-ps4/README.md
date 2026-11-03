@@ -379,6 +379,27 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.14: **the GPU thread's own overheads, from 04.12's samples.** The GPU thread's samples over
+the Grand Prix's races (100-211 s, 58,573 samples): idle 26%; the command stream ~13% (`SinkRun`
+3.6%, `ProcessCommands` 3.5%, `CallMethod` 2.1%, `ConsumeSinkImpl` 1.1%, macros 1.2%); memcpy
+3.5%; `BindHostGraphicsUniformBuffer` 1.7%, `GpuToCpuAddress` 1.7%, `FixedPipelineState::Refresh`
+1.3%, `UpdateVertexBuffer` 1.2%, memory tracking ~1.7%, image views and descriptors ~2%. Of
+`BindHostGraphicsUniformBuffer`'s 1.7%, 1.1% was one 16-byte spot: 04.12's two counters (`lock
+incq`, `lock addq`), and those counters shared 64-byte lines with the timing thread's
+(`timing_wakes`) and the services' (`service_spin_wakes`), so the line moved between cores.
+
+Patch 0101:
+
+- The GPU thread's counters (draws, command words, constant buffer bytes, the uniform buffer
+  counts) in one `alignas(64)` struct (`PS4Perf::gpu_thread`), added with `Bump` (a load and a
+  store: one writer, no lock prefix).
+- `Maxwell3D::ProcessMacro`: a macro whose parameters all come in one call (the usual case) runs
+  on them where they are (the command list) instead of a copy in `macro_params`
+  (`vector::insert`, 0.4%); `CallMacroMethod` takes a span. Not at high GPU accuracy, where
+  `RefreshParameters` rereads them into `macro_params`.
+- 04.12's comparison of constant buffer data with memory removed (46-63% identical, but 0.1 MiB a
+  second: skipping it would save little); the bytes are still counted.
+
 04.13: **a cross-thread crash fixed; what 04.12 counted.** 04.12 on a console (Grand Prix:
 the Crossing Cup's Baby Park, the Shell Cup's Moo Moo Meadows, each from a fresh boot):
 

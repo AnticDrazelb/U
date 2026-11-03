@@ -1,0 +1,241 @@
+From bc25762edefd8d551eb4b90f6a8d805f3063bfa1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 10:40:42 +0000
+Subject: [PATCH] PS4: GPU thread counters in their own cache line; macro
+ parameters read in place
+
+The GPU thread's statistics counters (draws, command words, constant buffer bytes, uniform buffer
+binds) were relaxed fetch_adds, lock-prefixed adds on x86-64, in cache lines other threads' counters
+also wrote: ~1.1% of the GPU thread in races for the two per uniform buffer bind. They are now one
+alignas(64) struct added with a load and a store (one writer). The constant buffer comparison with
+memory (a 04.12 measurement) is removed.
+
+Maxwell3D::ProcessMacro: when all of a macro's parameters come in one call, the macro runs on them
+in place instead of a copy in macro_params (not at high GPU accuracy, where RefreshParameters
+rereads them into macro_params). CallMacroMethod takes a span.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         | 36 ++++++++++++-------
+ src/video_core/buffer_cache/buffer_cache.h    | 12 +++----
+ src/video_core/dma_pusher.cpp                 |  4 +--
+ src/video_core/engines/maxwell_3d.cpp         | 29 ++++++++-------
+ src/video_core/engines/maxwell_3d.h           |  2 +-
+ .../renderer_vulkan/vk_rasterizer.cpp         |  4 +--
+ 6 files changed, 51 insertions(+), 36 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 1f58569a59..36d99b0c81 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -49,9 +49,30 @@ inline LockStats lock_scheduler, lock_timer, lock_kernel_other, lock_core_contex
+ // for the earliest anyway, and sees it then)
+ inline std::atomic<uint64_t> timing_wakes{0}, timing_wakes_skipped{0};
+ 
+-// Eden's GPU thread (04.08): draws, the command words it read, and how many of those were in runs
+-// of plain register writes (DmaPusher::SinkRun). Added in bulk (a command list's words at once)
+-inline std::atomic<uint64_t> gpu_draws{0}, gpu_command_words{0}, gpu_sink_run_words{0};
++// (04.14) A count only one thread adds to: a load and a store, no locked instruction. A relaxed
++// fetch_add is a lock-prefixed add on x86-64, ~20 cycles on the Jaguar with its cache line in the
++// core's cache and far more when another core wrote that 64-byte line since (it moves across; from
++// the other module, ~100 and up): 04.12's two per uniform buffer bind shared a line with the timing
++// thread's counters and were ~1.1% of the GPU thread's time in races. With one writer the reader
++// may see a count a little late, never a torn one.
++inline void Bump(std::atomic<uint64_t>& counter, uint64_t n = 1) {
++    counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
++}
++
++// Eden's GPU thread's own counts, in cache lines no other thread writes (04.14), added with Bump.
++// (04.08) draws, the command words it read, and how many of those were in runs of plain register
++// writes (DmaPusher::SinkRun), added in bulk (a command list's words at once). (04.12) Uniform
++// buffers, for docs/ryujinx-comparison.md's first idea: constant buffer data the game wrote
++// (bytes), the uniform buffer binds (copied to a stream buffer every draw, and the bytes; from the
++// cache, and of those with nothing to upload), and the frames in each mode (Eden copies every
++// uniform buffer up to 4 KiB each draw unless 98% of the cached binds hit)
++struct alignas(64) GpuThreadCounters {
++    std::atomic<uint64_t> draws{0}, command_words{0}, sink_run_words{0};
++    std::atomic<uint64_t> cb_bytes{0};
++    std::atomic<uint64_t> ubo_copied{0}, ubo_copied_bytes{0}, ubo_cached{0}, ubo_cached_hits{0};
++    std::atomic<uint64_t> ubo_frames{0}, ubo_frames_copying{0};
++};
++inline GpuThreadCounters gpu_thread;
+ // (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
+ // the boot), draws skipped while their pipeline builds (asynchronous shaders), images and buffers
+ // created; for what a race's start waits on
+@@ -88,15 +109,6 @@ struct WaitTable {
+ };
+ inline WaitTable object_waits[4];
+ 
+-// (04.12) Uniform buffers, for docs/ryujinx-comparison.md's first idea (counted, nothing changed):
+-// constant buffer data the game wrote (bytes; identical to what memory held; not compared: across
+-// a page), the GPU thread's uniform buffer binds (copied to a stream buffer every draw, and the
+-// bytes; from the cache, and of those with nothing to upload), and its frames in each mode (Eden
+-// copies every uniform buffer up to 4 KiB each draw unless 98% of the cached binds hit)
+-inline std::atomic<uint64_t> cb_bytes{0}, cb_identical_bytes{0}, cb_uncompared_bytes{0};
+-inline std::atomic<uint64_t> ubo_copied{0}, ubo_copied_bytes{0}, ubo_cached{0}, ubo_cached_hits{0};
+-inline std::atomic<uint64_t> ubo_frames{0}, ubo_frames_copying{0};
+-
+ // (04.10) Vulkan render pass ends the scheduler's worker skipped: none begun in their command
+ // buffer (counted on every platform; it would have crashed RADV)
+ inline std::atomic<uint64_t> vk_unmatched_render_pass_ends{0};
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 5b2f42af9e..f667912f3b 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -101,9 +101,9 @@ void BufferCache<P>::TickFrame() {
+ 
+     const bool skip_preferred = hits * 256 < shots * 251;
+ #ifdef __OPENORBIS__
+-    Common::PS4Perf::ubo_frames.fetch_add(1, std::memory_order_relaxed);
++    Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_frames);
+     if (skip_preferred) {
+-        Common::PS4Perf::ubo_frames_copying.fetch_add(1, std::memory_order_relaxed);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_frames_copying);
+     }
+ #endif
+     channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
+@@ -985,8 +985,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
+ #ifdef __OPENORBIS__
+-        Common::PS4Perf::ubo_copied.fetch_add(1, std::memory_order_relaxed);
+-        Common::PS4Perf::ubo_copied_bytes.fetch_add(size, std::memory_order_relaxed);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_copied);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_copied_bytes, size);
+ #endif
+         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+@@ -994,12 +994,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+     }
+     // Classic cached path
+ #ifdef __OPENORBIS__
+-    Common::PS4Perf::ubo_cached.fetch_add(1, std::memory_order_relaxed);
++    Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_cached);
+ #endif
+     if (SynchronizeBuffer(buffer, device_addr, size)) {
+         ++channel_state->uniform_cache_hits[0];
+ #ifdef __OPENORBIS__
+-        Common::PS4Perf::ubo_cached_hits.fetch_add(1, std::memory_order_relaxed);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_cached_hits);
+ #endif
+     }
+     // Skip binding if it's not needed and if the bound buffer is not the fast version
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 35ce7172cd..f6297fe815 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -114,7 +114,7 @@ bool DmaPusher::Step() {
+ 
+ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+ #ifdef __OPENORBIS__
+-    Common::PS4Perf::gpu_command_words.fetch_add(commands.size(), std::memory_order_relaxed);
++    Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.command_words, commands.size());
+ #endif
+     for (size_t index = 0; index < commands.size();) {
+         // Data word of methods command
+@@ -216,7 +216,7 @@ size_t DmaPusher::SinkRun(std::span<const CommandHeader> commands, size_t index)
+     }
+ #ifdef __OPENORBIS__
+     if (run > 1) {
+-        Common::PS4Perf::gpu_sink_run_words.fetch_add(run, std::memory_order_relaxed);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.sink_run_words, run);
+     }
+ #endif
+     if (run != 0) {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 71ca3ab85c..a3962cc45a 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -208,11 +208,22 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
+         executing_macro = method;
+     }
+ 
+-    macro_params.insert(macro_params.end(), base_start, base_start + amount);
+     macro_segments.emplace_back(current_dma_segment, amount);
+     current_macro_dirty |= current_dirty;
+     current_dirty = false;
+ 
++    // (PS4 04.14) All of its parameters in this one call: the macro reads them where they are (the
++    // command list, or the caller's word), not from a copy in macro_params. Not at high GPU
++    // accuracy, where RefreshParameters rereads them from memory into macro_params.
++    if (is_last_call && macro_params.empty() && !Settings::IsGPULevelHigh()) {
++        ConsumeSink(system);
++        CallMacroMethod(system, executing_macro, std::span<const u32>(base_start, amount));
++        macro_segments.clear();
++        current_macro_dirty = false;
++        return;
++    }
++    macro_params.insert(macro_params.end(), base_start, base_start + amount);
++
+     // Call the macro when there are no more parameters in the command buffer
+     if (is_last_call) {
+         ConsumeSink(system);
+@@ -373,7 +384,7 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
+     }
+ }
+ 
+-void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, const std::vector<u32>& parameters) {
++void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters) {
+     // Reset the current macro.
+     executing_macro = 0;
+ 
+@@ -622,17 +633,9 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+     const size_t copy_size = amount * sizeof(u32);
+ #ifdef __OPENORBIS__
+-    {
+-        // (04.12) how much of it memory already held (counted only)
+-        namespace P = Common::PS4Perf;
+-        P::cb_bytes.fetch_add(copy_size, std::memory_order_relaxed);
+-        const u8* const current = (address & 0xFFF) + copy_size <= 0x1000 ? memory_manager.GetPointer(address) : nullptr;
+-        if (current == nullptr) {
+-            P::cb_uncompared_bytes.fetch_add(copy_size, std::memory_order_relaxed);
+-        } else if (std::memcmp(current, start_base, copy_size) == 0) {
+-            P::cb_identical_bytes.fetch_add(copy_size, std::memory_order_relaxed);
+-        }
+-    }
++    // (04.12) counted; (04.14) no longer compared with what memory held (half of it was, 04.12: a
++    // small amount, 0.1 MiB a second)
++    Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.cb_bytes, copy_size);
+ #endif
+     memory_manager.WriteBlockCached(address, start_base, copy_size);
+ 
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 549a7db9c5..225505094e 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3244,7 +3244,7 @@ private:
+      * @param method Method to call
+      * @param parameters Arguments to the method call
+      */
+-    void CallMacroMethod(Core::System& system, u32 method, const std::vector<u32>& parameters);
++    void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
+ 
+     /// Handles writes to the macro uploading register.
+     void ProcessMacroUpload(u32 data);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 0fdb264717..170e402810 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -265,7 +265,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ 
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+ #ifdef __OPENORBIS__
+-    Common::PS4Perf::gpu_draws.fetch_add(1, std::memory_order_relaxed);
++    Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.draws);
+ #endif
+     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+         const auto& draw_state = maxwell3d->draw_manager.draw_state;
+@@ -301,7 +301,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+ 
+ void RasterizerVulkan::DrawIndirect() {
+ #ifdef __OPENORBIS__
+-    Common::PS4Perf::gpu_draws.fetch_add(1, std::memory_order_relaxed);
++    Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.draws);
+ #endif
+     const auto& params = maxwell3d->draw_manager.indirect_state;
+     buffer_cache.SetDrawIndirect(&params);
+-- 
+2.43.0
+
