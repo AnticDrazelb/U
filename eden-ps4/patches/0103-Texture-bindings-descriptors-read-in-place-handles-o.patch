@@ -1,0 +1,283 @@
+From 7789ca7ba806e97163ce05d28a8fc34ba5a2bcf4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 11:28:31 +0000
+Subject: [PATCH] Texture bindings: descriptors read in place, handles one page
+ walk per page; one pipeline lookup
+
+DescriptorTable::Read translated the pool's GPU address for every descriptor (twice per texture
+per draw: the texture's and the sampler's). It now keeps the pool's host range (MemoryManager::
+GetSpan over the whole limit, when contiguous) and reads in place, working it out again when the
+pool's address or limit changes or after any GPU or device mapping change: a new
+Core::gpu_mapping_generation, bumped by MemoryManager::PageTableOp/BigPageTableOp and
+DeviceMemoryManager::Map/Unmap. GraphicsPipeline::ConfigureImpl keeps the last 4 KiB GPU page's
+host pointer while reading a draw's texture handles. (Ryujinx reads a stage's handles from one
+span and skips unchanged bindings.)
+
+RasterizerVulkan::UpdateDynamicStates asked the pipeline cache for the current pipeline again
+(vertex input, alpha to coverage/one): PrepareDraw now passes the draw's (DrawPipeline()).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |  2 ++
+ src/core/device_memory_manager.h              |  4 +++
+ src/core/device_memory_manager.inc            |  2 ++
+ src/video_core/memory_manager.cpp             |  2 ++
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  | 25 ++++++++++++++---
+ .../renderer_vulkan/vk_rasterizer.cpp         | 12 ++++++---
+ .../renderer_vulkan/vk_rasterizer.h           |  5 ++++
+ .../texture_cache/descriptor_table.h          | 27 +++++++++++++++++--
+ 8 files changed, 70 insertions(+), 9 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index d5049ca99c..6c13a49b07 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -76,6 +76,8 @@ struct alignas(64) GpuThreadCounters {
+     // checks that found it changed (reuse then off for the session)
+     std::atomic<uint64_t> pipeline_lookups{0}, pipeline_reuses{0}, pipeline_reuse_checks{0},
+         pipeline_reuse_mismatches{0};
++    // (04.16) texture and sampler descriptors read, and those read in place (the pool one host range)
++    std::atomic<uint64_t> descriptor_reads{0}, descriptor_reads_in_place{0};
+ };
+ inline GpuThreadCounters gpu_thread;
+ // (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
+diff --git a/src/core/device_memory_manager.h b/src/core/device_memory_manager.h
+index b4b3b46088..f5bdf8a97f 100644
+--- a/src/core/device_memory_manager.h
++++ b/src/core/device_memory_manager.h
+@@ -22,6 +22,10 @@
+ 
+ namespace Core {
+ 
++/// (PS4 04.16) Bumped after any device or GPU address range is mapped or unmapped: a host pointer
++/// worked out from a GPU address (a texture descriptor pool's) is good while it is unchanged
++inline std::atomic<u64> gpu_mapping_generation{0};
++
+ constexpr size_t DEVICE_PAGEBITS = 12ULL;
+ constexpr size_t DEVICE_PAGESIZE = 1ULL << DEVICE_PAGEBITS;
+ constexpr size_t DEVICE_PAGEMASK = DEVICE_PAGESIZE - 1ULL;
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+index 97c2706abb..021fd5da23 100644
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -238,6 +238,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+     if (track) {
+         TrackContinuityImpl(address, virtual_address, size, asid);
+     }
++    gpu_mapping_generation.fetch_add(1, std::memory_order_release);  // (PS4 04.16)
+ }
+ 
+ template <typename Traits>
+@@ -269,6 +270,7 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+         }
+     }
+     t_slot = {};
++    gpu_mapping_generation.fetch_add(1, std::memory_order_release);  // (PS4 04.16)
+ }
+ template <typename Traits>
+ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtual_address,
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 8ffdcb6276..315f1bb890 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -127,6 +127,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
+         remaining_size -= page_size;
+     }
+     kind_map.Map(gpu_addr, gpu_addr + size, kind);
++    Core::gpu_mapping_generation.fetch_add(1, std::memory_order_release);  // (PS4 04.16)
+     return gpu_addr;
+ }
+ 
+@@ -168,6 +169,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
+         std::unique_lock<std::mutex> lock(guard);
+         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+     }
++    Core::gpu_mapping_generation.fetch_add(1, std::memory_order_release);  // (PS4 04.16)
+     return gpu_addr;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 8b5b0bc9c5..ed4871b72d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -361,6 +361,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+ 
+     const auto& regs{maxwell3d->regs};
+     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
++    // (PS4 04.16) The texture handles a draw reads from constant buffers sit next to each other:
++    // the last GPU page's host pointer kept for this draw, instead of translating the address
++    // (a page table walk) for every handle. A GPU page's 4 KiB are one device page, one host range.
++    GPUVAddr handle_page{~GPUVAddr{0}};
++    const u8* handle_page_host{};
++    const auto read_u32{[&](GPUVAddr addr) LAMBDA_FORCEINLINE {
++        const GPUVAddr page{addr & ~GPUVAddr{0xFFF}};
++        if (page != handle_page) {
++            handle_page = page;
++            handle_page_host = gpu_memory->GetPointer(page);
++        }
++        if (handle_page_host == nullptr || (addr & 0xFFF) > 0xFFC) [[unlikely]] {
++            return gpu_memory->Read<u32>(addr);
++        }
++        u32 value;
++        std::memcpy(&value, handle_page_host + (addr & 0xFFF), sizeof(value));
++        return value;
++    }};
+     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+         const Shader::Info& info{stage_infos[stage]};
+         buffer_cache.UnbindGraphicsStorageBuffers(stage);
+@@ -386,14 +404,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+                     const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
+                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
+                                                  second_offset};
+-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
+-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+-                                      << desc.secondary_shift_left};
++                    const u32 lhs_raw{read_u32(addr) << desc.shift_left};
++                    const u32 rhs_raw{read_u32(separate_addr) << desc.secondary_shift_left};
+                     const u32 raw{lhs_raw | rhs_raw};
+                     return TexturePair(raw, via_header_index);
+                 }
+             }
+-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
++            return TexturePair(read_u32(addr), via_header_index);
+         }};
+         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
+             for (u32 index = 0; index < desc.count; ++index) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 170e402810..05617d274b 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -255,7 +255,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     if (!pipeline->Configure(is_indexed))
+         return;
+ 
++    draw_pipeline = pipeline;
+     UpdateDynamicStates();
++    draw_pipeline = nullptr;
+ 
+     query_cache.NotifySegment(true);
+     HandleTransformFeedback();
+@@ -1070,6 +1072,10 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
+     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+ }
+ 
++GraphicsPipeline* RasterizerVulkan::DrawPipeline() {
++    return draw_pipeline != nullptr ? draw_pipeline : pipeline_cache.CurrentGraphicsPipeline();
++}
++
+ void RasterizerVulkan::UpdateDynamicStates() {
+     auto& regs = maxwell3d->regs;
+     auto& flags = maxwell3d->dirty.flags;
+@@ -1148,7 +1154,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+     }
+ 
+     if (device.IsExtVertexInputDynamicStateSupported()) {
+-        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
++        if (auto* gp = DrawPipeline(); gp && gp->HasDynamicVertexInput()) {
+             UpdateVertexInput(regs);
+         }
+     }
+@@ -1683,7 +1689,7 @@ void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Re
+     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
+         return;
+     }
+-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
++    GraphicsPipeline* const pipeline = DrawPipeline();
+     const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToCoverage() &&
+                         regs.anti_alias_alpha_control.alpha_to_coverage != 0;
+     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+@@ -1703,7 +1709,7 @@ void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& r
+         });
+         return;
+     }
+-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
++    GraphicsPipeline* const pipeline = DrawPipeline();
+     const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToOne() &&
+                         regs.anti_alias_alpha_control.alpha_to_one != 0;
+     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 06824856e6..4b082df038 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -162,6 +162,11 @@ private:
+ 
+     void UpdateDynamicStates();
+ 
++    /// (PS4 04.16) The draw's pipeline, while PrepareDraw updates the dynamic states: they asked
++    /// the pipeline cache again (a second lookup a draw). Null otherwise (DrawTexture): ask it.
++    GraphicsPipeline* draw_pipeline{};
++    GraphicsPipeline* DrawPipeline();
++
+     void HandleTransformFeedback();
+ 
+     void UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs);
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index e40c128ab5..a79b6ba018 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -7,12 +7,14 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+ #include "common/div_ceil.h"
+ #include "common/assert.h"
++#include "common/ps4_perf.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/rasterizer_interface.h"
+ 
+@@ -35,9 +37,27 @@ public:
+ 
+     [[nodiscard]] std::pair<T, bool> Read(Tegra::MemoryManager const& gpu_memory, u32 index) noexcept {
+         DEBUG_ASSERT(index <= current_limit);
+-        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+         std::pair<T, bool> result;
+-        gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
++        // (PS4 04.16) The pool in host memory, when it is one contiguous range there: read in
++        // place, without translating its GPU address for each descriptor (twice per texture per
++        // draw). Worked out again after any GPU or device mapping change.
++        const u64 generation = Core::gpu_mapping_generation.load(std::memory_order_acquire);
++        if (generation != host_pool_generation) {
++            host_pool_generation = generation;
++            host_pool = gpu_memory.GetSpan(current_gpu_addr, (size_t(current_limit) + 1) * sizeof(T));
++        }
++#ifdef __OPENORBIS__
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.descriptor_reads);
++        if (host_pool != nullptr) {
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.descriptor_reads_in_place);
++        }
++#endif
++        if (host_pool != nullptr) {
++            std::memcpy(std::addressof(result.first), host_pool + size_t(index) * sizeof(T), sizeof(T));
++        } else {
++            const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
++            gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
++        }
+         if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
+             result.second = result.first != descriptors[index];
+         } else {
+@@ -53,6 +73,7 @@ public:
+     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
+         current_gpu_addr = gpu_addr;
+         current_limit = limit;
++        host_pool_generation = ~u64{0};  // (PS4 04.16) its host range worked out again
+         // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
+         // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
+         const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
+@@ -68,6 +89,8 @@ public:
+     std::vector<T> descriptors;
+     GPUVAddr current_gpu_addr{};
+     u32 current_limit{};
++    const u8* host_pool{};                  // (PS4 04.16) the pool in host memory, or nullptr
++    u64 host_pool_generation{~u64{0}};      // the gpu_mapping_generation it was worked out at
+ };
+ 
+ } // namespace VideoCommon
+-- 
+2.43.0
+

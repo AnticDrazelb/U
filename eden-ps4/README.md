@@ -379,6 +379,35 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.16: **texture bindings (Ryujinx comparison, 4) and one pipeline lookup a draw.** 04.15 on a
+console (Baby Park, Moo Moo Meadows, fresh boots): at the same draws a frame, 32.8 -> 33.5 fps
+at 800 draws and 26.5 -> 27.8 at 1,150 (a fit of the 10-second lines against 04.12's); Baby
+Park's worst 10 s 25.3 -> 26.1 and 28.9; Moo Moo Meadows within noise. The key reuse checked
+~64,000 times, never different; but only ~30% of lookups reused, and lookups were twice the
+draws: `UpdateDynamicStates` asked the pipeline cache again (vertex input, alpha to coverage /
+one). Mario Kart changes key registers on most draws, so the reuse mostly met that second lookup.
+
+Ryujinx (`TextureBindingsManager.CommitBindings`) reads a stage's texture handles from one span
+of the constant buffer, and for a binding whose handle is the one it had and whose pools weren't
+written since, looks nothing up again. Eden, per texture per draw: the handle read with a GPU
+page table walk (`MemoryManager::Read`), the texture's and sampler's descriptors read with two
+more (`DescriptorTable::Read` -> `ReadBlockUnsafe`), compared with the last copies, then looked up
+by index. In 04.15's race samples: `GpuToCpuAddress` 1.6%, `GetPointer` 0.7%, `ReadBlockUnsafe`
+0.4%, `VisitImageView` 0.9%, `GetSamplerId` 0.3%.
+
+Patch 0103:
+
+- `DescriptorTable::Read`: the pool's host range (`MemoryManager::GetSpan` over its whole limit,
+  when contiguous) kept, and the descriptor read from it in place; worked out again when the
+  pool's address or limit changes or after any GPU or device mapping change (a new
+  `Core::gpu_mapping_generation`, bumped by `PageTableOp`, `BigPageTableOp` and
+  `DeviceMemoryManager::Map`/`Unmap`). Not contiguous: the old read. Counted in the 30-second
+  line (descriptors read, the share in place).
+- `GraphicsPipeline::ConfigureImpl`: the handles' reads keep the last 4 KiB GPU page's host
+  pointer for the draw (one page walk per page, not per handle).
+- `RasterizerVulkan`: the dynamic state updates use the draw's pipeline (`DrawPipeline()`); only
+  `DrawTexture`, which has none, still asks the cache.
+
 04.15: **the pipeline key reused when none of its registers changed.** Before each draw,
 `PipelineCache::CurrentGraphicsPipeline` refreshed `FixedPipelineState` from the 3D engine's
 registers (`Refresh`: ~410 registers across the engine's state, most in different cache lines)

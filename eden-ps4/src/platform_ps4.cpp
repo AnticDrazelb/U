@@ -1322,6 +1322,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.16: the next idea from Ryujinx, textures. For every texture of every draw Eden looked up its "
+         "descriptor and its sampler's in the GPU's memory, translating each address through the GPU's page "
+         "table, and did the same for each texture handle. Now the descriptors are read straight from where "
+         "they sit (worked out again when the GPU's memory map changes), and a draw's handles from one page "
+         "lookup. And Eden no longer looks up the draw's pipeline twice.\n"
          "04.15: before each draw Eden worked out the graphics pipeline's key again from ~410 of the GPU's "
          "registers and compared it with the last one (~2-3% of its GPU thread). Now, when none of those "
          "registers took a new value since (and the shaders and the kind of primitive are the same), it "
@@ -2482,6 +2487,15 @@ std::string PerfLine(double seconds)
                             now[0] > last[0] ? 100.0 * double(now[1] - last[1]) / double(now[0] - last[0]) : 0.0,
                             now[2], now[3], now[3] != 0 ? " (reuse turned off)" : "");
         std::copy(std::begin(now), std::end(now), std::begin(last));
+        // (04.16) texture/sampler descriptors read straight from the pool in host memory
+        static uint64_t last_reads = 0, last_in_place = 0;
+        const uint64_t reads = g.descriptor_reads.load(), in_place = g.descriptor_reads_in_place.load();
+        line += fmt::format("; texture descriptors read {:.0f} a second, {:.0f}% in place",
+                            double(reads - last_reads) / seconds,
+                            reads > last_reads ? 100.0 * double(in_place - last_in_place) / double(reads - last_reads)
+                                               : 0.0);
+        last_reads = reads;
+        last_in_place = in_place;
     }
     // (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them: an event by
     // its service's name, one the game made, a thread, a timeout. Per core, the four longest.
