@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
+#include <string>
 #include <random>
 #include <vector>
 #include <sys/mman.h>
@@ -21,8 +23,59 @@
 #include "common/page_table.h"
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
+#include "dynarmic/interface/A32/coprocessor.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/interface/optimization_flags.h"
+
+// (04.17) cachetest: allocations from an arena that can be unmapped, so that a saved code cache's
+// pointer left unrelocated (into the first run's objects) faults in the second run instead of
+// finding the same object at the same address
+namespace {
+struct Arena {
+    uint8_t* base = nullptr;
+    size_t size = 0, used = 0;
+};
+Arena* g_arena = nullptr;
+Arena g_arenas[2];
+void* ArenaAlloc(size_t size, size_t align) {
+    if (!g_arena) {
+        void* p = nullptr;
+        if (posix_memalign(&p, std::max<size_t>(align, sizeof(void*)), size ? size : 1) != 0)
+            throw std::bad_alloc{};
+        return p;
+    }
+    size_t offset = (g_arena->used + align - 1) & ~(align - 1);
+    if (offset + size > g_arena->size)
+        throw std::bad_alloc{};
+    g_arena->used = offset + size;
+    return g_arena->base + offset;
+}
+// every arena ever used, unmapped ones too (what's freed after its arena went is not malloc's)
+std::pair<uint8_t*, size_t> g_arena_ranges[8];
+size_t g_arena_count = 0;
+bool InArena(void* p) {
+    for (size_t i = 0; i < g_arena_count; i++)
+        if (static_cast<uint8_t*>(p) >= g_arena_ranges[i].first && static_cast<uint8_t*>(p) < g_arena_ranges[i].first + g_arena_ranges[i].second)
+            return true;
+    return false;
+}
+void NoteArena(const Arena& a) {
+    if (g_arena_count < 8)
+        g_arena_ranges[g_arena_count++] = {a.base, a.size};
+}
+}  // namespace
+void* operator new(size_t size) { return ArenaAlloc(size, 16); }
+void* operator new[](size_t size) { return ArenaAlloc(size, 16); }
+void* operator new(size_t size, std::align_val_t align) { return ArenaAlloc(size, size_t(align)); }
+void* operator new[](size_t size, std::align_val_t align) { return ArenaAlloc(size, size_t(align)); }
+void operator delete(void* p) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete(void* p, size_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p, size_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete(void* p, size_t, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p, size_t, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
 
 namespace {
 constexpr uint32_t kCode = 0x00010000, kData = 0x10000000, kDataSize = 16u << 20;
@@ -40,6 +93,8 @@ struct Env final : Dynarmic::A32::UserCallbacks {
     std::vector<uint64_t> entries = std::vector<uint64_t>(kPages, 0);
     uint64_t slow_reads = 0, slow_writes = 0;
     Dynarmic::A32::Jit* jit = nullptr;
+    void* fastmem_arena = nullptr;
+    uint64_t cntpct_reads = 0;  // (04.17, TestCP15's CNTPCT)
 
     Env() {
         memfd = memfd_create("guest", 0);
@@ -130,6 +185,43 @@ struct Env final : Dynarmic::A32::UserCallbacks {
     uint64_t GetTicksRemaining() override { return ~uint64_t{0} >> 2; }
 };
 
+// (04.17) A coprocessor as Eden's CP15: TPIDRURW/TPIDRURO read and written through pointers to its
+// fields, CNTPCT read through a callback whose argument is its parent (here the environment), a
+// barrier through a callback without one
+struct TestCP15 final : Dynarmic::A32::Coprocessor {
+    using CoprocReg = Dynarmic::A32::CoprocReg;
+    explicit TestCP15(Env& parent_) : parent{parent_} {}
+    Env& parent;
+    uint32_t uprw = 0x11223344, uro = 0x55667788;
+    uint64_t ticks = 1000;
+    std::optional<Callback> CompileInternalOperation(bool, unsigned, CoprocReg, CoprocReg, CoprocReg, unsigned) override { return std::nullopt; }
+    CallbackOrAccessOneWord CompileSendOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned opc2) override {
+        if (!two && CRn == CoprocReg::C13 && opc1 == 0 && CRm == CoprocReg::C0 && opc2 == 2)
+            return &uprw;
+        if (!two && CRn == CoprocReg::C7 && opc1 == 0 && CRm == CoprocReg::C10 && opc2 == 5)
+            return Callback{[](void*, std::uint32_t, std::uint32_t) -> std::uint64_t { return 0; }, std::nullopt};
+        return {};
+    }
+    CallbackOrAccessTwoWords CompileSendTwoWords(bool, unsigned, CoprocReg) override { return {}; }
+    CallbackOrAccessOneWord CompileGetOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned opc2) override {
+        if (!two && CRn == CoprocReg::C13 && opc1 == 0 && CRm == CoprocReg::C0)
+            return opc2 == 2 ? CallbackOrAccessOneWord{&uprw} : opc2 == 3 ? CallbackOrAccessOneWord{&uro} : CallbackOrAccessOneWord{};
+        return {};
+    }
+    CallbackOrAccessTwoWords CompileGetTwoWords(bool two, unsigned opc, CoprocReg CRm) override;
+    std::optional<Callback> CompileLoadWords(bool, bool, CoprocReg, std::optional<std::uint8_t>) override { return std::nullopt; }
+    std::optional<Callback> CompileStoreWords(bool, bool, CoprocReg, std::optional<std::uint8_t>) override { return std::nullopt; }
+};
+TestCP15::CallbackOrAccessTwoWords TestCP15::CompileGetTwoWords(bool two, unsigned opc, CoprocReg CRm) {
+    if (!two && opc == 0 && CRm == CoprocReg::C14) {
+        return Callback{[](void* arg, std::uint32_t, std::uint32_t) -> std::uint64_t {
+            Env& env = *static_cast<Env*>(arg);
+            return 0x100000000ull * (env.cntpct_reads & 3) + 1000 + 7 * env.cntpct_reads++;
+        }, &parent};
+    }
+    return {};
+}
+
 std::vector<uint8_t> ReadFile(const char* path) {
     FILE* f = std::fopen(path, "rb");
     if (!f) {
@@ -171,7 +263,7 @@ Dynarmic::ExclusiveMonitor g_monitor{1};
 // fastmem: a 4 GiB arena with the data pages mapped at their guest addresses (but the marked and
 // unmapped pages, which fault: the fallback, and the code recompiled without fastmem there)
 void* FastmemArena(Env& env) {
-    static void* arena = nullptr;
+    void*& arena = env.fastmem_arena;
     if (!arena) {
         // (4 GiB and 64 KiB past it reserved, as the PS4's 2^39 arena has room past 4 GiB: an address
         // folded into a displacement (fold_address_offsets) can pass 4 GiB there, and faults)
@@ -348,10 +440,137 @@ int main(int argc, char** argv) {
                     s, s * 1e9 / double(iterations), (unsigned long long)env.slow_reads, (unsigned long long)env.slow_writes);
         return 0;
     }
+    if (mode == "cachetest") {
+        // cachetest <code.bin> [arm|thumb] [options] [twice] [cp15]: (04.17) the program run and its
+        // code cache saved, everything of that run then unmapped; the cache loaded in a second run with
+        // all its objects elsewhere (the JIT, the callbacks, the monitor, the coprocessor), the
+        // program run again (twice: that run's cache saved and loaded in a third). Prints what test
+        // prints, for the last run. CACHETEST_B=<other.bin>: the last run runs that program instead
+        // (its blocks not the saved ones: they must be found stale).
+        const Options o = ParseOptions(argc, argv, 3);
+        bool twice = false, cp15 = false;
+        for (int i = 3; i < argc; i++) {
+            twice |= std::string(argv[i]) == "twice";
+            cp15 |= std::string(argv[i]) == "cp15";
+        }
+        const int runs = twice ? 3 : 2;
+        for (Arena& a : g_arenas) {
+            a.size = size_t(256) << 20;
+            a.base = static_cast<uint8_t*>(mmap(nullptr, a.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+            NoteArena(a);
+        }
+        std::vector<uint8_t> program = env.code;
+        std::vector<uint8_t> last_program = program;
+        if (const char* other = std::getenv("CACHETEST_B")) {
+            last_program = ReadFile(other);
+            while (last_program.size() % 4)
+                last_program.push_back(last_program.size() % 2 ? 0xDF : 0x00);
+            for (int i = 0; i < 2; i++)
+                for (uint8_t b : {0x00, 0xDF, 0x00, 0xDF})
+                    last_program.push_back(b);
+        }
+        {
+            // (one JIT made and gone first, the program run: statics it sets up (the code allocator's
+            // map, the translator's decode tables) live outside the arenas)
+            auto config = MakeConfig(env, o);
+            if (cp15)
+                config.coprocessors[15] = std::make_shared<TestCP15>(env);
+            Dynarmic::A32::Jit warm{config};
+            env.jit = &warm;
+            Setup(warm, o.thumb);
+            warm.Run();
+            env.jit = nullptr;
+        }
+        std::vector<uint8_t> saved;
+        saved.reserve(size_t(64) << 20);
+        for (int run = 0; run < runs; run++) {
+            const bool last = run == runs - 1;
+            Arena& arena = g_arenas[run % 2];
+            if (!arena.base) {
+                arena.base = static_cast<uint8_t*>(mmap(nullptr, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+                arena.used = 0;
+                NoteArena(arena);
+            }
+            g_arena = &arena;
+            void* spacer = ::operator new(size_t(1 + run) << 20);  // (each run's objects at other offsets)
+            (void)spacer;
+            Env* e = new Env;
+            e->code = last ? last_program : program;
+            auto* monitor = new Dynarmic::ExclusiveMonitor{1};
+            auto config = MakeConfig(*e, o);
+            config.global_monitor = monitor;
+            std::shared_ptr<TestCP15> coprocessor;
+            if (cp15) {
+                coprocessor = std::make_shared<TestCP15>(*e);
+                config.coprocessors[15] = coprocessor;
+            }
+            config.code_cache_objects = {{e, sizeof(Env)}};
+            if (coprocessor)
+                config.code_cache_objects.emplace_back(coprocessor.get(), sizeof(TestCP15));
+            auto* jit = new Dynarmic::A32::Jit{config};
+            e->jit = jit;
+            if (run > 0) {
+                size_t offset = 0;
+                std::string why;
+                const bool loaded = jit->LoadCodeCache([&](void* data, size_t size) {
+                    if (offset + size > saved.size())
+                        return false;
+                    std::memcpy(data, saved.data() + offset, size);
+                    offset += size;
+                    return true;
+                }, &why);
+                if (!loaded) {
+                    std::fprintf(stderr, "run %d: not loaded: %s\n", run, why.c_str());
+                    return 6;
+                }
+            }
+            Setup(*jit, o.thumb);
+            jit->Run();
+            const auto use = jit->GetCodeCacheUse();
+            if (run > 0)
+                std::fprintf(stderr, "run %d: cache %zu bytes, %zu blocks loaded, %zu used, %zu stale\n", run, saved.size(), use.loaded, use.used, use.stale);
+            if (last) {
+                for (int i = 0; i < 16; i++)
+                    std::printf("r%d=%08x\n", i, jit->Regs()[i]);
+                for (size_t i = 0; i < 64; i++)
+                    std::printf("s%zu=%08x\n", i, jit->ExtRegs()[i]);
+                uint64_t h = 1469598103934665603ull;
+                for (size_t p = 0; p < kDataSize / 4096; p++)
+                    for (size_t q = 0; q < 4096; q++)
+                        h = (h ^ e->host_page[p][q]) * 1099511628211ull;
+                std::printf("memory=%016llx cpsr=%08x\n", (unsigned long long)h, jit->Cpsr());
+                return 0;
+            }
+            g_arena = nullptr;
+            saved.clear();
+            const bool ok = jit->SaveCodeCache([&](const void* data, size_t size) {
+                saved.insert(saved.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+                return true;
+            });
+            if (!ok) {
+                std::fprintf(stderr, "run %d: save failed\n", run);
+                return 5;
+            }
+            g_arena = &arena;
+            delete jit;  // (its code cache unmapped: the next run's lands at the same place)
+            coprocessor.reset();  // (shared pointers into the arena let go before it goes)
+            config.coprocessors = {};
+            if (e->fastmem_arena)
+                munmap(e->fastmem_arena, (size_t(1) << 32) + 0x10000);
+            munmap(e->data, kDataSize);
+            g_arena = nullptr;
+            munmap(arena.base, arena.size);  // this run's objects: gone
+            arena.base = nullptr;
+        }
+        return 0;
+    }
     // test: run once, print registers, ext registers and a hash of the data
     const Options o = ParseOptions(argc, argv, 3);
     const bool thumb = o.thumb;
     auto config = MakeConfig(env, o);
+    for (int i = 3; i < argc; i++)
+        if (std::string(argv[i]) == "cp15")
+            config.coprocessors[15] = std::make_shared<TestCP15>(env);
     Dynarmic::A32::Jit jit{config};
     env.jit = &jit;
     Setup(jit, thumb);
