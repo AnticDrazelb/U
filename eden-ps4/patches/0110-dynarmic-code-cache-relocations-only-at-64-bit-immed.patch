@@ -1,0 +1,66 @@
+From a6fcfd3ca2c3e1b8fd18ae7006f1841e978ba48f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 17:45:04 +0000
+Subject: [PATCH 110/111] dynarmic: code cache relocations only at 64-bit
+ immediates (mov r64, imm64 and moffs)
+
+Any 8 bytes of the image holding a value in an object's range was taken as a pointer: the page
+table alone spans 1 GiB of host addresses, and instruction bytes such as 40 10 00 00 00 can fall
+in it, an instruction then rewritten at load. The emitters put addresses only in movabs (no data
+in the code, objects beyond 4 GiB); the harness's unmapped-arena runs confirm none is missed.
+Format 3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/jit_code_cache.h | 20 ++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h b/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+index 16bf47defd..496fbc3e5a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+@@ -364,8 +364,8 @@ private:
+     };
+     static_assert(sizeof(Pending) == 40);
+ 
+-    static constexpr u64 MAGIC = 0x3230434A4E454445ull;  // "EDENJC02"
+-    static constexpr u32 VERSION = 2;
++    static constexpr u64 MAGIC = 0x3330434A4E454445ull;  // "EDENJC03"
++    static constexpr u32 VERSION = 3;
+ 
+     struct Header {
+         u64 magic;
+@@ -405,7 +405,19 @@ private:
+         return std::nullopt;
+     }
+ 
+-    // Each 8 bytes in [begin, end) holding a pointer into one of the objects
++    // Each pointer into one of the objects in [begin, end): the 8-byte immediates of `mov r64,
++    // imm64` (REX.W B8+r) and of the moffs moves (REX.W A0-A3), the only x64 instructions that hold
++    // a 64-bit address (the emitters have no other: no data in the code, and the objects are
++    // beyond 4 GiB, so never a 32-bit immediate). Any 8 bytes in range, the instruction bytes
++    // included, is not enough: the page table alone is 1 GiB of host addresses, and a run like
++    // `40 10 00 00 00` (`mov dword [rax+0x10], 0`) can fall in it, an instruction then rewritten
++    // at load (04.19: before, with no block used yet on the console)
++    static bool IsImm64(const u8* begin, const u8* p) {
++        if (p - begin < 2 || (p[-2] & 0xf8) != 0x48)
++            return false;
++        return (p[-1] & 0xf8) == 0xb8 || (p[-1] >= 0xa0 && p[-1] <= 0xa3);
++    }
++
+     template<typename F>
+     static void Scan(const u8* begin, const u8* end, const std::vector<std::pair<u64, u64>>& objects, F&& found) {
+         u64 low = ~u64{0}, high = 0;
+@@ -414,6 +426,8 @@ private:
+             high = std::max(high, pointer + size);
+         }
+         for (const u8* p = begin; p + 8 <= end; ++p) {
++            if (!IsImm64(begin, p))
++                continue;
+             u64 value;
+             std::memcpy(&value, p, 8);
+             if (value < low || value >= high)
+-- 
+2.43.0
+

@@ -112,3 +112,21 @@ effects never seen before at all, new pipelines (made once, cached from then on)
    elsewhere and the first run's memory unmapped, so a pointer left unrelocated faults; a changed
    program's blocks all found stale (269 of 269) and translated again. In 04.17 (patches
    0104-0106, with 1 and 2).
+
+## 6. On the console (04.18 logs) and 04.19
+
+The warm runs loaded the caches (Mario Kart: 163,801 blocks on core 0 in 2.2 s; Echoes of Wisdom:
+60,902 in 0.7 s) and used **none of them**: "0 of 163801, 352 stale". Eden's loader puts the game's
+code region at a random 16 KiB-aligned offset of up to 16 MiB every boot
+(`deconstructed_rom_directory.cpp`, "this is bad form of ASLR"), so every guest address differed from
+the saved run's; the 352 "stale" blocks were addresses that happened to hold other code. The checks
+did their job (nothing wrong was run), the cache did nothing.
+
+04.19: the offset comes from the title id on the PS4 (the same every boot), the relocation scan
+accepts only `mov r64, imm64` / moffs immediates (the old scan could have rewritten instruction
+bytes that looked like a page table address), and a cache whose last run didn't end normally is
+deleted instead of loaded. Test A / test B (cold, then warm) are still to be done on the console
+with the cache really in use: the 30-second line's "translation cache blocks used so far" should
+now be most of the loaded blocks, and "translating by core" near zero at the first race.
+
+Echoes of Wisdom's slowness on its second and third runs was not the cache (README, 04.19).

@@ -379,6 +379,40 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.19: **the translation cache, used for the first time.** The tester's 04.18 logs (Mario Kart
+cold then warm, Echoes of Wisdom three times): the warm runs loaded 163,801 and 60,902 blocks on core
+0 and used **none** (`translation cache blocks used so far: 0 of 163801, 352 stale`). Eden's loader
+puts the game's code region at a random 16 KiB-aligned offset (0-16 MiB) every boot, 32-bit and
+64-bit alike, and the cache finds blocks by their guest address; the few "stale" ones were blocks
+whose address happened to hold other code this time. Mario Kart's warm run was fine because it was
+in effect a cold one.
+
+- Patch 0111: on the PS4 the offset comes from the title id (a fixed mix of it), the same every
+  boot; a set RNG seed (`rng_seed_enabled`) still decides it.
+- Patch 0110: the relocation scan, which took any 8 bytes of the image holding a value inside an
+  object (the page table alone is 1 GiB of host addresses) as a pointer, now takes only the 8-byte
+  immediates of `mov r64, imm64` and the moffs moves, the only x64 instructions holding a 64-bit
+  address. Before, instruction bytes such as `40 10 00 00 00` (`mov dword [rax+0x10], 0`) could fall
+  in the page table's range and be rewritten at load: never hit on the console (no block was used),
+  but it would have been with the cache in use. The harness's runs, whose first-run objects are
+  unmapped (a pointer missed faults), all pass with it: A32 gen2-gen10 with fastmem, split stacks,
+  CP15 and reloads (1,000 programs), A64 gen5/gen6/gen8 with fastmem, monitor exclusives, no walk
+  and reloads (540). File format 3.
+- Frontend: a marker (`cache/jit/<title id>.in-use`) is written when a run loaded translated code and
+  removed when it ends normally; found at the next boot (that run crashed, hung, or was closed from
+  the PS4's menu), the game's cache files are deleted unused and saved again at the end of the run.
+- **Echoes of Wisdom's slow second and third runs were the GPU, not the cache.** The first run
+  (40-56 fps at the end) froze at 386 s, right after 54 new pipelines: the GPU stopped finishing
+  work (the GPU thread and the fencing thread waiting on fences, 0 submissions). In the next run,
+  which loaded no translation cache (none had been saved), the GPU took over 2 s on the 8th
+  submission after boot ("GPU hang?" report) and 0.25-0.5 s a wait after it while busy 1-2% of the
+  time (4-8 fps); in the third, 1.5-2 s a wait, busy 0% (0.6 fps). Busy is measured from the command
+  processor starting a submission to its end, so the time went before Eden's work started: the GPU
+  still held by the first run's hang, or (if a restart doesn't clear it) a pipeline from the shader
+  cache, built at boot from then on, that stalls the GPU each frame. The 30-second line now notes
+  waits of 100 ms and more on a GPU busy under 10% ("restart the PS4"). To tell the two apart: a
+  full restart of the PS4, then the game; still slow, the same with Shader Cache off.
+
 04.18: **the translation cache for 64-bit games.** In the tester's logs the 64-bit games translate
 more than Mario Kart, and keep translating as they go: Animal Crossing 683, 516 and 678 ms of the
 emulated cores' time a second at its peaks, Echoes of Wisdom 506 and still 75-285 in play, Link's

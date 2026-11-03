@@ -1,0 +1,40 @@
+From 3f0c403ac71e9e04767b44bb446d2e647c4f3a33 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 17:45:04 +0000
+Subject: [PATCH 111/111] PS4: the game's code at the same address every boot
+ (from the title id)
+
+The persistent translation cache finds blocks by guest address; with the code region's offset
+random each boot, none matched (0 of 163,801 blocks used in Mario Kart 8 Deluxe, 0 of 60,902 in
+Zelda). A set RNG seed still decides it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/loader/deconstructed_rom_directory.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/core/loader/deconstructed_rom_directory.cpp b/src/core/loader/deconstructed_rom_directory.cpp
+index fb31eb46cc..2266c13bd8 100644
+--- a/src/core/loader/deconstructed_rom_directory.cpp
++++ b/src/core/loader/deconstructed_rom_directory.cpp
+@@ -234,6 +234,16 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
+     std::uintptr_t aslr_offset = ((::Settings::values.rng_seed_enabled.GetValue()
+         ? ::Settings::values.rng_seed.GetValue() : Common::Random::Random64(0)) << 12) & 0xfff000;
+ #ifdef __OPENORBIS__
++    // The same address every boot, from the title id (unless a seed is set): the persistent
++    // translation cache finds its blocks by the guest address, and code loaded elsewhere each boot
++    // matched none (04.18: 0 of 163,801 blocks used in Mario Kart, 0 of 60,902 in Zelda)
++    if (!::Settings::values.rng_seed_enabled.GetValue()) {
++        u64 x = metadata.GetTitleID() + 0x9e3779b97f4a7c15ULL;
++        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
++        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
++        x ^= x >> 31;
++        aslr_offset = std::uintptr_t(x << 12) & 0xfff000;
++    }
+     // At a 16 KiB boundary: the code region's memory comes in blocks at their own size's boundary,
+     // so its every 16 KiB page then lines up with 16 KiB of the DRAM, which the PS4's fastmem maps
+     // (at a 4 KiB step, three times in four none of the game's code, constants and globals did)
+-- 
+2.43.0
+

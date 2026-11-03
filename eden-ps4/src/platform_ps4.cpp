@@ -1325,6 +1325,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.19: the translation cache was never used: Eden put a game's code at a random address each boot, "
+         "and the cache finds code by its address, so 04.17's and 04.18's caches matched nothing (0 of 163,801 "
+         "pieces in Mario Kart, 0 of 60,902 in Zelda). Each game's code now has the same address every boot. "
+         "Made safer for its first real use: a cache whose last run crashed, hung or was closed from the PS4's "
+         "menu is deleted instead of loaded, and the saved code's pointers are found more strictly. Zelda's "
+         "slow second and third runs were the GPU, not the cache: after the first run hung the GPU, it started "
+         "Eden's work 0.25-2 s late in the next runs; the log now says so (restart the PS4 if it does).\n"
          "04.18: the translation cache for 64-bit games too (Animal Crossing, the Zelda games: they translate "
          "even more code as they run than Mario Kart, in every new area). The same on/off setting. 04.17's "
          "caches are made again once (a new file format).\n"
@@ -2204,6 +2211,13 @@ std::string GpuLine(double seconds)
                                    d_span ? 100.0 * double(d_busy) / double(d_span) : 0.0,
                                    double(submits - last_submits) / seconds, double(d_waits) / seconds,
                                    d_waits ? d_wait_ms / double(d_waits) : 0.0, d_wait_ms / (seconds * 10.0));
+    // (04.19) Waits of a tenth of a second and more on a GPU busy under 10% of the time: the GPU
+    // started this program's work late rather than took long doing it. Seen in the two sessions
+    // after one in which the GPU stopped finishing work (Zelda, 04.18): 0.25-0.5 s, then 2 s a
+    // wait, 0-2% busy, from the first frames on, translation cache or not
+    if (d_waits && d_wait_ms / double(d_waits) >= 100.0 && d_span && double(d_busy) < 0.1 * double(d_span))
+        line += " (the GPU started this program's work that late, it didn't take that long doing it: it is "
+                "probably still held by an earlier session in which it hung; restart the PS4, not from rest mode)";
     last_busy = busy;
     last_span = span;
     last_submits = submits;

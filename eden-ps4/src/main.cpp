@@ -504,13 +504,31 @@ std::string JitCachePath(const std::filesystem::path& data_dir, u64 title_id, si
     return (data_dir / "cache" / "jit" / fmt::format("{:016x}-core{}.bin", title_id, core)).string();
 }
 
+// (04.19) Written when a run loaded translated code, removed when that run ends normally: still
+// there at the next boot, that run crashed, hung or was closed from the PS4's menu, and the files
+// are deleted unused (saved anew when the run ends), in case they were the cause
+std::filesystem::path JitCacheMarker(const std::filesystem::path& data_dir, u64 title_id) {
+    return data_dir / "cache" / "jit" / fmt::format("{:016x}.in-use", title_id);
+}
+
 void LoadJitCaches(Core::System& system, const std::filesystem::path& data_dir, u64 title_id) {
     auto* process = system.ApplicationProcess();
     if (!process || !title_id)
         return;
     std::error_code ec;
     std::filesystem::create_directories(data_dir / "cache" / "jit", ec);
+    const auto marker = JitCacheMarker(data_dir, title_id);
+    if (std::filesystem::exists(marker, ec)) {
+        for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; core++)
+            std::filesystem::remove(JitCachePath(data_dir, title_id, core), ec);
+        std::filesystem::remove(marker, ec);
+        Output(LineKind::Status, "translation cache: not loaded: the last run that used it didn't end "
+                                 "normally (a crash, a hang, or closed from the PS4's menu); deleted, saved "
+                                 "again when this run ends");
+        return;
+    }
     std::string summary;
+    bool any = false;
     for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; core++) {
         auto* arm = process->GetArmInterface(core);
         if (!arm)
@@ -518,11 +536,17 @@ void LoadJitCaches(Core::System& system, const std::filesystem::path& data_dir, 
         const auto start = std::chrono::steady_clock::now();
         std::string why;
         const bool loaded = arm->LoadCodeCache(JitCachePath(data_dir, title_id, core), &why);
+        any = any || (loaded && Common::PS4Perf::jit_cache_loaded[core & 3].load() > 0);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
         summary += fmt::format("{}core {}: {}", summary.empty() ? "" : "; ", core,
                                loaded ? fmt::format("{} blocks in {} ms",
                                                     Common::PS4Perf::jit_cache_loaded[core & 3].load(), ms)
                                       : why);
+    }
+    if (any) {
+        std::FILE* f = std::fopen(marker.string().c_str(), "wb");
+        if (f)
+            std::fclose(f);
     }
     if (!summary.empty())
         Output(LineKind::Status, "translation cache: " + summary);
@@ -798,6 +822,10 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
 #ifdef __OPENORBIS__
                     Common::PS4Diagnostics::shutdown_stage = "pausing the program";
 #endif
+                }
+                if (g_jit_cache && game_id) {  // (04.19) this run ended normally
+                    std::error_code ec;
+                    std::filesystem::remove(JitCacheMarker(data_dir, game_id), ec);
                 }
                 {
                     // no input into a system that is shutting down (it reached objects on its
