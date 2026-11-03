@@ -251,6 +251,7 @@ int main(int argc, char** argv) {
     };
     Launcher::SetShaderCache(flag("EDEN_PS4_SHADER_CACHE"));
     Launcher::SetJitCache(!flag("EDEN_PS4_NO_JIT_CACHE"));
+    Launcher::SetDrawShortcuts(!flag("EDEN_PS4_NO_DRAW_SHORTCUTS"));
     Launcher::SetAsyncShaders(flag("EDEN_PS4_ASYNC_SHADERS"));
     Launcher::SetGpuAccuracyHigh(flag("EDEN_PS4_GPU_HIGH"));
     Launcher::SetFpsOverlay(flag("EDEN_PS4_FPS"));

@@ -379,6 +379,33 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.20: **Zelda's crashes; a switch for the draw shortcuts.** The tester's 04.19 logs, four Echoes
+of Wisdom runs: one ran 5.5 minutes at 23-30 fps (54 in places) then froze, two aborted at 45 and
+56 s (`std::bad_alloc`), one only reached the start page.
+
+- **The crashes.** Both times a 57,278,248-byte request failed right after the runtime had added
+  a 58 MiB overflow heap for it. The request: dynarmic's `patch_information` (per core, the places
+  to link to each block) growing to 16,384 groups of a boost flat map whose every slot, used or not,
+  costs the full 232 bytes (four `small_vector<CodePtr, 4>` and the key): (15 x 16,384 - 1) x 232 +
+  16,385 x 16 = 57,278,248. It has been there since 04.01 in every game (one 55,935 KiB allocation
+  per busy core), and only failed now: `addOverflow` published the new heap to all threads before
+  the request it was made for took its share, and other threads (Mesa's 2 MiB allocations) took
+  more than the 3.4 MiB to spare first. Port: the new heap serves that request first, then
+  becomes visible; 64 overflow heaps instead of 32 (Zelda used 25 by 3 minutes). Patch 0112: the
+  sites in one `small_vector<u64, 2>`, each with its kind in the pointer's top two bits: 48 bytes
+  a slot, 12 MB for the same table instead of 57 (and its next growth 24 instead of 114). Tests:
+  the old build vs the new over A32 gen2/gen7/gen9 (240 programs, against single-stepped runs too)
+  and A64 gen5/gen6/gen8 with fastmem (220), the cache suites again: all the same.
+- **The freeze.** In 04.18 and 04.19 alike, 5.5-6.5 minutes in, in the 10 s with 166 new images
+  and 210-219 new buffers (a scene load, the same one), the GPU stopped finishing work: the GPU
+  thread waits on a fence while presenting, the fencing thread on another, nothing submitted after;
+  the hang report's submission is 134 draws and 200 compute dispatches. 04.15's two runs (7 and 10
+  minutes, scene loads of 175 and 215 images) didn't freeze, but may not have reached that spot.
+  Since 04.15, the GPU-side changes are 04.15's pipeline reuse (0 mismatches in 1,613 checks in
+  this run) and 04.16's in-place texture reads; patch 0113 and Settings, Graphics, **Draw
+  Shortcuts** turn both off (`draw_shortcuts=off`; on the desktop `EDEN_PS4_NO_DRAW_SHORTCUTS=1`),
+  to play to the same spot without them.
+
 04.19: **the translation cache, used for the first time.** The tester's 04.18 logs (Mario Kart
 cold then warm, Echoes of Wisdom three times): the warm runs loaded 163,801 and 60,902 blocks on core
 0 and used **none** (`translation cache blocks used so far: 0 of 163801, 352 stale`). Eden's loader

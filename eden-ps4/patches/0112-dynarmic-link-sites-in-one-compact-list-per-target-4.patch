@@ -1,0 +1,212 @@
+From 207aaa4e041347b9ef15baaf71c77ab93d6c6bac Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 19:59:09 +0000
+Subject: [PATCH 112/113] dynarmic: link sites in one compact list per target
+ (48-byte flat map slots, not 232)
+
+PatchInformation held four small_vector<CodePtr, 4> (224 bytes), in a boost flat map that costs
+every slot, used or not, its full size: one core's map was 57 MB in Zelda: Echoes of Wisdom
+(about 215,000 link targets), a single allocation, and the next growth would need 114 MB more.
+That 54.6 MiB allocation, needing a new overflow heap on the PS4, is where two runs aborted.
+Now one small_vector<u64, 2> of sites, each with its kind (jg, jz, jmp, mov rcx) in its top two
+bits. Patching order within a target doesn't matter (each site independent).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |  6 ++--
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |  6 ++--
+ .../src/dynarmic/backend/x64/emit_x64.cpp     | 36 +++++++++----------
+ .../src/dynarmic/backend/x64/emit_x64.h       | 19 +++++++---
+ .../src/dynarmic/backend/x64/jit_code_cache.h | 20 +++--------
+ 5 files changed, 43 insertions(+), 44 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 9b4b3a3e88..af6c5a06db 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -1345,7 +1345,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+     } else {
+         if (e.conf.enable_cycle_counting) {
+             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+-            e.patch_information[terminal.next].jg.push_back(e.code.getCurr());
++            e.patch_information[terminal.next].Add(EmitX64::PatchInformation::Jg, e.code.getCurr());
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJg(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -1353,7 +1353,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+             }
+         } else {
+             e.code.cmp(dword[e.code.ABI_JIT_PTR + offsetof(A32JitState, halt_reason)], 0);
+-            e.patch_information[terminal.next].jz.push_back(e.code.getCurr());
++            e.patch_information[terminal.next].Add(EmitX64::PatchInformation::Jz, e.code.getCurr());
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJz(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -1373,7 +1373,7 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
+         e.code.mov(MJitStateReg(A32::Reg::PC), A32::LocationDescriptor{terminal.next}.PC());
+         e.code.ReturnFromRunCode();
+     } else {
+-        e.patch_information[terminal.next].jmp.push_back(e.code.getCurr());
++        e.patch_information[terminal.next].Add(EmitX64::PatchInformation::Jmp, e.code.getCurr());
+         if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+             e.EmitPatchJmp(terminal.next, next_bb->entrypoint);
+         } else {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 14220f3364..8c98f63d10 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -651,7 +651,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+         }
+         if (e.conf.enable_cycle_counting) {
+             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+-            e.patch_information[terminal.next].jg.push_back(e.code.getCurr());
++            e.patch_information[terminal.next].Add(EmitX64::PatchInformation::Jg, e.code.getCurr());
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJg(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -659,7 +659,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+             }
+         } else {
+             e.code.cmp(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+-            e.patch_information[terminal.next].jz.push_back(e.code.getCurr());
++            e.patch_information[terminal.next].Add(EmitX64::PatchInformation::Jz, e.code.getCurr());
+             if (const auto next_bb = e.GetBasicBlock(terminal.next)) {
+                 e.EmitPatchJz(terminal.next, next_bb->entrypoint);
+             } else {
+@@ -679,7 +679,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
+ 
+ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
+     if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+-        e.patch_information[terminal.next].jmp.push_back(e.code.getCurr());
++        e.patch_information[terminal.next].Add(EmitX64::PatchInformation::Jmp, e.code.getCurr());
+         if (auto next_bb = e.GetBasicBlock(terminal.next)) {
+             e.EmitPatchJmp(terminal.next, next_bb->entrypoint);
+         } else {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+index 0765cafcfe..4eab3e83fd 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -102,7 +102,7 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
+ 
+     code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
+     code.mov(loc_desc_reg, target.Value());
+-    patch_information[target].mov_rcx.push_back(code.getCurr());
++    patch_information[target].Add(PatchInformation::MovRcx, code.getCurr());
+     EmitPatchMovRcx(target_code_ptr);
+     code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
+     code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_codeptrs], rcx);
+@@ -480,25 +480,23 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
+     const CodePtr save_code_ptr = code.getCurr();
+     const PatchInformation& patch_info = patch_information[target_desc];
+ 
+-    for (CodePtr location : patch_info.jg) {
++    patch_info.ForEach([&](PatchInformation::Kind kind, CodePtr location) {
+         code.SetCodePtr(location);
+-        EmitPatchJg(target_desc, target_code_ptr);
+-    }
+-
+-    for (CodePtr location : patch_info.jz) {
+-        code.SetCodePtr(location);
+-        EmitPatchJz(target_desc, target_code_ptr);
+-    }
+-
+-    for (CodePtr location : patch_info.jmp) {
+-        code.SetCodePtr(location);
+-        EmitPatchJmp(target_desc, target_code_ptr);
+-    }
+-
+-    for (CodePtr location : patch_info.mov_rcx) {
+-        code.SetCodePtr(location);
+-        EmitPatchMovRcx(target_code_ptr);
+-    }
++        switch (kind) {
++        case PatchInformation::Jg:
++            EmitPatchJg(target_desc, target_code_ptr);
++            break;
++        case PatchInformation::Jz:
++            EmitPatchJz(target_desc, target_code_ptr);
++            break;
++        case PatchInformation::Jmp:
++            EmitPatchJmp(target_desc, target_code_ptr);
++            break;
++        case PatchInformation::MovRcx:
++            EmitPatchMovRcx(target_code_ptr);
++            break;
++        }
++    });
+ 
+     code.SetCodePtr(save_code_ptr);
+ }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 32f0c80e1c..7a17e016b5 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -136,11 +136,22 @@ public:
+     virtual bool EmitTerminal(IR::Term::Terminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept = 0;
+ 
+     // Patching
++    // The places linked to a block (jumps and RSB pushes made before it existed, patched when it
++    // is compiled or invalidated). (PS4 04.20) One list, each site's kind in its pointer's top two
++    // bits (user addresses are below 2^47): 48 bytes a slot in the flat map, which costs every
++    // slot, used or not, its full size. Four small_vector<CodePtr, 4> made it 232: one core's map
++    // 57 MB in Zelda (about 215,000 targets), the next growth one allocation of 114 MB more.
+     struct PatchInformation {
+-        boost::container::small_vector<CodePtr, 4> jg; //4*8=32
+-        boost::container::small_vector<CodePtr, 4> jz; //4*8=32
+-        boost::container::small_vector<CodePtr, 4> jmp; //4*8=32
+-        boost::container::small_vector<CodePtr, 4> mov_rcx; //4*8=32
++        enum Kind : u64 { Jg = 0, Jz = 1, Jmp = 2, MovRcx = 3 };
++        boost::container::small_vector<u64, 2> sites;
++        void Add(Kind kind, CodePtr location) {
++            sites.push_back(reinterpret_cast<u64>(location) | (u64(kind) << 62));
++        }
++        template<typename F>
++        void ForEach(F&& f) const {
++            for (const u64 site : sites)
++                f(Kind(site >> 62), reinterpret_cast<CodePtr>(site & ((u64{1} << 62) - 1)));
++        }
+     };
+     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
+     virtual void Unpatch(const IR::LocationDescriptor& target_desc);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h b/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+index 496fbc3e5a..443d878c77 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+@@ -78,14 +78,9 @@ public:
+ 
+         std::vector<Site> sites;
+         for (const auto& [target, info] : emitter.patch_information) {
+-            const auto add = [&](const auto& list, u32 type) {
+-                for (const CodePtr site : list)
+-                    sites.push_back({target.Value(), u32(static_cast<const u8*>(site) - base), type});
+-            };
+-            add(info.jg, 0);
+-            add(info.jz, 1);
+-            add(info.jmp, 2);
+-            add(info.mov_rcx, 3);
++            info.ForEach([&](auto kind, CodePtr site) {
++                sites.push_back({target.Value(), u32(static_cast<const u8*>(site) - base), u32(kind)});
++            });
+         }
+ 
+         // each block's guest ranges (its code and its look-ahead), from the invalidation map
+@@ -279,13 +274,8 @@ public:
+         // every link undone (the saved blocks register when looked up, and are linked then)
+         for (const Site& site : sites) {
+             auto& info = emitter.patch_information[IR::LocationDescriptor{site.target}];
+-            const CodePtr location = base + site.offset;
+-            switch (site.type) {
+-            case 0: info.jg.push_back(location); break;
+-            case 1: info.jz.push_back(location); break;
+-            case 2: info.jmp.push_back(location); break;
+-            default: info.mov_rcx.push_back(location); break;
+-            }
++            using Kind = typename std::remove_reference_t<decltype(info)>::Kind;
++            info.Add(Kind(site.type & 3), base + site.offset);
+         }
+         for (const auto& [target, info] : emitter.patch_information)
+             emitter.Patch(target, nullptr);
+-- 
+2.43.0
+

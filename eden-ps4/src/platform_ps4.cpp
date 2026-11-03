@@ -1038,6 +1038,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.shader_cache = false;
         else if (line == "jit_cache=off")
             settings.jit_cache = false;
+        else if (line == "draw_shortcuts=off")
+            settings.draw_shortcuts = false;
         else if (line == "async_shaders=off")
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
@@ -1074,7 +1076,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
-                        "jit_cache=%s\n",
+                        "jit_cache=%s\ndraw_shortcuts=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1082,7 +1084,8 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.profiler ? "on" : "off", settings.ram_on_demand ? "on-demand" : "reserved",
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
-                     settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off");
+                     settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
+                     settings.draw_shortcuts ? "on" : "off");
         std::fclose(f);
     }
 }
@@ -1325,6 +1328,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.20: Zelda's crashes 30-50 s in (two runs in a row): the CPU translator keeps, per core, a table of the "
+         "places to link to each block, and in Zelda it grew to 57 MB, made as one piece of memory; Eden for PS4 "
+         "added a heap for it, but another thread could take some of that heap first, and the allocation failed. "
+         "The table now takes a fifth of that, and a new heap serves the request it was made for first. Also: "
+         "Settings, Graphics, Draw Shortcuts (04.15 and 04.16's savings on every draw): Zelda froze twice at the "
+         "same spot (5.5-6.5 minutes in, the GPU stopped), which it hadn't in 04.15; turn them off and play to "
+         "that spot to tell whether they are the cause.\n"
          "04.19: the translation cache was never used: Eden put a game's code at a random address each boot, "
          "and the cache finds code by its address, so 04.17's and 04.18's caches matched nothing (0 of 163,801 "
          "pieces in Mario Kart, 0 of 60,902 in Zelda). Each game's code now has the same address every boot. "
@@ -2886,6 +2896,7 @@ void* Run(void*)
         Launcher::SetResolution(settings.resolution);
         Launcher::SetShaderCache(settings.shader_cache);
         Launcher::SetJitCache(settings.jit_cache);
+        Launcher::SetDrawShortcuts(settings.draw_shortcuts);
         Launcher::SetAsyncShaders(settings.async_shaders);
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
@@ -2913,12 +2924,12 @@ void* Run(void*)
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}, frame pacing {}, game speed {}%; CPU {}, {} cores, threads {}, fastmem {}; the Switch's "
-            "RAM {}{}",
+            "GPU accuracy {}, frame pacing {}, game speed {}%, draw shortcuts {}; CPU {}, {} cores, threads {}, fastmem {}; "
+            "the Switch's RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
-            settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
+            settings.draw_shortcuts ? "on" : "off", settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
             settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");

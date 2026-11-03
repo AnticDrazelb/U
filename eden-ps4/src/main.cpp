@@ -401,6 +401,10 @@ void SetJitCache(bool on) {
     g_jit_cache = on;
 }
 
+void SetDrawShortcuts(bool on) {
+    Common::PS4Perf::gpu_shortcuts.store(on, std::memory_order_relaxed);
+}
+
 void SetFpsOverlay(bool on) {
     g_fps_overlay = on;
 }

@@ -1,0 +1,87 @@
+From 372738fdbd22f4446188e2a924f1339f46984ff6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 19:59:09 +0000
+Subject: [PATCH 113/113] PS4: a switch for 04.15/04.16's draw shortcuts
+ (pipeline reuse, in-place texture reads)
+
+Common::PS4Perf::gpu_shortcuts, on by default: off, the pipeline key is refreshed every draw and
+texture descriptors and handles are read through the GPU's page table as before them, to tell
+whether a game's glitch or GPU hang is theirs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                                   | 4 ++++
+ src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp | 4 ++++
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp    | 3 ++-
+ src/video_core/texture_cache/descriptor_table.h         | 9 +++++++--
+ 4 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 7e69801433..7f0ffd22cf 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -144,6 +144,10 @@ inline WaitTable object_waits[4];
+ inline std::atomic<uint64_t> vk_unmatched_render_pass_ends{0};
+ // (04.13) framebuffer removals asked for on another thread (an nvdrv unmap), left to the GPU thread
+ inline std::atomic<uint64_t> framebuffer_removals_handed_over{0};
++// (04.20) The draw shortcuts of 04.15 (the pipeline reused when none of its key's registers
++// changed) and 04.16 (texture descriptors and handles read in place): on unless the frontend's
++// "Draw Shortcuts" setting turns them off, to tell whether a game's glitch or GPU hang is theirs
++inline std::atomic<bool> gpu_shortcuts{true};
+ 
+ // The services' host threads (KThread's dummy threads) waiting for their next request: woken
+ // while they still spun, or after sleeping (and the time from the signal until they ran); the
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 1e3ccc9a0f..f4082e4da1 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -368,7 +368,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     // (a page table walk) for every handle. A GPU page's 4 KiB are one device page, one host range.
+     GPUVAddr handle_page{~GPUVAddr{0}};
+     const u8* handle_page_host{};
++    const bool handle_shortcut{Common::PS4Perf::gpu_shortcuts.load(std::memory_order_relaxed)};
+     const auto read_u32{[&](GPUVAddr addr) LAMBDA_FORCEINLINE {
++        if (!handle_shortcut) [[unlikely]] {
++            return gpu_memory->Read<u32>(addr);  // (04.20: shortcuts off) as before 04.16
++        }
+         const GPUVAddr page{addr & ~GPUVAddr{0xFFF}};
+         if (page != handle_page) {
+             handle_page = page;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 08882fd7a6..bd32fe0232 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -600,7 +600,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+     }
+     const auto topology = maxwell3d->draw_manager.draw_state.topology;
+     const bool squashed_blend = Settings::values.use_squashed_iterated_blend;
+-    const bool unchanged = key_reuse_enabled && key_pipeline != nullptr && key_pipeline == current_pipeline &&
++    const bool unchanged = key_reuse_enabled && Common::PS4Perf::gpu_shortcuts.load(std::memory_order_relaxed) &&
++                           key_pipeline != nullptr && key_pipeline == current_pipeline &&
+                            !dirty.pipeline_key_changed && key_maxwell3d == maxwell3d &&
+                            !dirty.flags[Dirty::VertexInput] && !dirty.flags[Dirty::ViewportSwizzles] &&
+                            !dirty.flags[Dirty::Blending] && key_topology == topology &&
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index a79b6ba018..c60685f956 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -41,8 +41,13 @@ public:
+         // (PS4 04.16) The pool in host memory, when it is one contiguous range there: read in
+         // place, without translating its GPU address for each descriptor (twice per texture per
+         // draw). Worked out again after any GPU or device mapping change.
+-        const u64 generation = Core::gpu_mapping_generation.load(std::memory_order_acquire);
+-        if (generation != host_pool_generation) {
++        const u64 generation = Common::PS4Perf::gpu_shortcuts.load(std::memory_order_relaxed)
++                                   ? Core::gpu_mapping_generation.load(std::memory_order_acquire)
++                                   : ~u64{0} - 1;  // (04.20: shortcuts off) never in place
++        if (generation == ~u64{0} - 1) {
++            host_pool_generation = ~u64{0};
++            host_pool = nullptr;
++        } else if (generation != host_pool_generation) {
+             host_pool_generation = generation;
+             host_pool = gpu_memory.GetSpan(current_gpu_addr, (size_t(current_limit) + 1) * sizeof(T));
+         }
+-- 
+2.43.0
+

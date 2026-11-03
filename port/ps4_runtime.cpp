@@ -271,7 +271,7 @@ struct OverflowHeap {
     uintptr_t base;
     size_t size;
 };
-constexpr int MAX_OVERFLOW_HEAPS = 32;
+constexpr int MAX_OVERFLOW_HEAPS = 64;  // (04.20: 32 before; Zelda had 25 by 3 minutes)
 constexpr size_t FLEXIBLE_KEEP = 64 * MB;  // regular flexible memory left for the system's libraries
 OverflowHeap g_overflows[MAX_OVERFLOW_HEAPS];
 int g_overflowCount = 0;  // published with release once its entry is written
@@ -279,14 +279,22 @@ bool g_overflowTried = false;  // the default's one heap
 size_t g_overflowGpuReserve = 0;
 __attribute__((tls_model("initial-exec"))) thread_local bool t_inOverflow = false;
 
+// The new heap is written at g_overflows[g_overflowCount] but not yet visible to other threads:
+// publishOverflow() makes it so, once the request it was made for has been served from it.
+// (04.20) Published at once, other threads' allocations (Mesa's 2 MiB ones, say) took its room in
+// the few milliseconds before that request got there: a 58 MiB heap made for a 54.6 MiB request
+// then failed it, and the app aborted (std::bad_alloc; two Zelda runs in a row).
 bool addOverflow(void* base, size_t size, const char* pool) {
     mspace msp = create_mspace_with_base(base, size, 1);
     if (!msp)
         return false;
     g_overflows[g_overflowCount] = {msp, reinterpret_cast<uintptr_t>(base), size};
-    __atomic_store_n(&g_overflowCount, g_overflowCount + 1, __ATOMIC_RELEASE);
-    heapLog("[cemu] heap: overflow heap %d: %zu MiB of %s at %p\n", g_overflowCount, size / MB, pool, base);
+    heapLog("[cemu] heap: overflow heap %d: %zu MiB of %s at %p\n", g_overflowCount + 1, size / MB, pool, base);
     return true;
+}
+
+void publishOverflow() {
+    __atomic_store_n(&g_overflowCount, g_overflowCount + 1, __ATOMIC_RELEASE);
 }
 
 // Direct memory for an overflow heap, mapped well above 0x200000000 (where the kernel library
@@ -365,8 +373,10 @@ void* overflowAlloc(size_t need, F alloc) {
         const size_t step = need > 29 * MB ? (need + 3 * MB + 2 * MB - 1) & ~(2 * MB - 1) : 32 * MB;
         if (g_overflowCount >= MAX_OVERFLOW_HEAPS)
             heapLog("[cemu] heap: all %d overflow heaps full\n", MAX_OVERFLOW_HEAPS);
-        else if (addOverflowStep(step))
-            result = alloc(g_overflows[g_overflowCount - 1].msp);
+        else if (addOverflowStep(step)) {
+            result = alloc(g_overflows[g_overflowCount].msp);
+            publishOverflow();
+        }
     } else if (!result && !g_overflowTried) {
         g_overflowTried = true;
         const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
@@ -375,9 +385,10 @@ void* overflowAlloc(size_t need, F alloc) {
             if ((added = addDirectOverflow(size)))
                 break;
         }
-        if (added)
-            result = alloc(g_overflows[g_overflowCount - 1].msp);
-        else
+        if (added) {
+            result = alloc(g_overflows[g_overflowCount].msp);
+            publishOverflow();
+        } else
             heapLog("[cemu] heap: main heap full and no direct memory for an overflow heap\n");
     }
     pthread_mutex_unlock(&g_overflowLock);

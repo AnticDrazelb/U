@@ -83,6 +83,9 @@ void SetFpsOverlay(bool on);
 /// (04.17) The persistent translation cache: each emulated core's translated code saved when
 /// leaving a game, loaded when it starts again (on unless set off). Set it before Boot.
 void SetJitCache(bool on);
+/// (04.20) The draw shortcuts of 04.15 and 04.16 (the graphics pipeline reused when none of its
+/// key's registers changed; texture descriptors and handles read in place): on unless set off
+void SetDrawShortcuts(bool on);
 // Frame pacing: frames shown at the Switch's 60 Hz vsync (Eden's speed limit at 100%), or each the
 // moment the game finishes it (unlocked: no speed limit)
 void SetUnlockedFrames(bool on);

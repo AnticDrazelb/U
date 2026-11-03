@@ -808,6 +808,11 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "race's stutter), 32-bit and 64-bit games alike. Kept for this version of Eden for PS4 only; "
              "deleted unused if the last run that used it crashed or was closed from the PS4's menu.",
              [](MenuSettings& s) { s.jit_cache = !s.jit_cache; }},
+            {"Draw Shortcuts", on_off(settings.draw_shortcuts),
+             "Two savings on every draw from 04.15 and 04.16: the last graphics pipeline used again when none of "
+             "what picks it changed, and textures' descriptors read where they are. Off: as before them (a little "
+             "slower), to check whether a game's glitch or freeze comes from them.",
+             [](MenuSettings& s) { s.draw_shortcuts = !s.draw_shortcuts; }},
             {"Asynchronous Shaders", on_off(settings.async_shaders),
              "New shaders are built in the background instead of stopping the game while they compile (slow on "
              "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",
