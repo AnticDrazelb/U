@@ -157,7 +157,7 @@ about 15 fps in 03.80, limited by its main thread.
   module 0; everything else on module 1 (03.79).
 - Idle emulated cores spin before sleeping (50 us, 03.78; 1 ms on pinned cores 0-2, 03.97); the
   services' host threads spin before sleeping too (03.78) and run at VeryHigh priority (03.93).
-- Code caches 48/40/32/8 MiB for cores 0-3 (128 MiB of system flexible memory in all, 03.95).
+- Code caches 48/40/32/8 MiB for cores 0-3 (128 MiB of system flexible memory in all, 03.95); from 04.21 as large as the pool allows (tiers up to 160/96/96/8).
 - Eden's host locks (the kernel's scheduler and timer locks, the cores' context locks, CoreTiming's
   queue) spin up to 20 us before sleeping on the PS4; the timing thread is woken only for a new
   earliest event (04.06). Per-lock counts in the 30-second line.
@@ -251,6 +251,8 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | First race of a session slower than the rest (any track; back after a relaunch) | | Not pipelines (0-2 new per 10 s, the shader cache rebuilds them at boot); the CPU code translated the first time (134-173 ms/s vs 22): 04.17's persistent translation cache |
 | 64-bit games translating as they go (Animal Crossing up to 683 ms/s, Echoes of Wisdom 75-285 in play) | | 04.18: the translation cache for A64 too |
 | The translation cache never used (04.17/04.18: 0 of 163,801 blocks in Mario Kart, 0 of 60,902 in Zelda) | | 04.19: the code region was at a random offset every boot; now fixed per title. Relocations only at 64-bit immediates; a cache whose run didn't end normally is deleted |
+| Code caches too small outside Mario Kart (Silksong core 0: 8 whole flushes in 270 s, 250-550 ms/s translating; Zelda core 2: 5 in 6 min) | | 04.21: sized from the system pool's free memory in fixed tiers (up to 160/96/96/8 MiB), the app heap's share of the pool 384 -> 192 MiB |
+| Settings lists ran off the screen (Graphics) | | 04.21: scrolled with the selection, description kept on screen |
 | Zelda: aborted at 45-56 s (std::bad_alloc), two runs in a row | | 04.20: dynarmic's link table, 57 MB in one piece per core (232-byte flat map slots), now 48-byte slots; a new overflow heap serves its request before other threads see it |
 | Zelda: the GPU stops at the same scene load 5.5-6.5 min in (04.18, 04.19) | | 04.20: Draw Shortcuts setting (04.15/04.16's savings off) to test whether they are the cause |
 | Zelda: 0.6 fps after a run in which the GPU hung | | 04.19: not the cache (it loaded none in the first slow run); the GPU started Eden's work 0.25-2 s late, busy 0-2%. Flagged in the 30-second line; to test: a full PS4 restart, then Shader Cache off |

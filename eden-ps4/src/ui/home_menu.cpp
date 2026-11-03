@@ -343,6 +343,8 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
                     screen = Screen::Settings;
                     settings_items = false;
                     settings_item = 0;
+                    settings_first = 0;
+                    settings_scroll = settings_scroll_target = 0;
                     break;
                 default: {
                     Dialog dialog;
@@ -396,14 +398,22 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
         const int items = int(list.size());
         if (!settings_items)
         {
+            const int category = settings_category;
             if (moves & kUp)
                 settings_category = std::max(0, settings_category - 1);
             if (moves & kDown)
                 settings_category = std::min(kCategoryCount - 1, settings_category + 1);
+            if (settings_category != category)
+            {
+                settings_first = 0;
+                settings_scroll = settings_scroll_target = 0;
+            }
             if (((moves & kRight) || (pressed & kCross)) && items > 0)
             {
                 settings_items = true;
                 settings_item = 0;
+                settings_first = 0;
+                settings_scroll_target = 0;
             }
             return {};
         }
@@ -586,6 +596,7 @@ void HomeMenu::Draw(Canvas& c, double now)
     last_draw = now;
     scroll = Smooth(scroll, scroll_target, dt);
     grid_scroll = Smooth(grid_scroll, grid_scroll_target, dt);
+    settings_scroll = Smooth(settings_scroll, settings_scroll_target, dt);
     const Theme& t = CurrentTheme();
     c.Clear(t.bg);
     switch (screen)
@@ -911,18 +922,55 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
     // the category's items, and what the selected one means
     const std::vector<SettingItem> items = SettingItems(settings_category);
     c.Text(kItemLeft, 150, kCategories[settings_category], 24, Weight::SemiBold, t.text);
-    float y = 176;
+    // (04.21) The rows that fit above the longest description of the category (so the layout
+    // doesn't move as the selection does), scrolled to keep the selected one in view; before,
+    // the rows just went on down, past the bottom bar (Graphics: GPU Accuracy, Game Speed), and
+    // the description with them
+    constexpr float kListTop = 176;
+    const float wrap_width = kItemRight - kItemLeft - 16;
+    size_t description_lines = 0;
+    for (const SettingItem& item : items)
+        description_lines = std::max(description_lines, c.Wrap(item.description, 17, Weight::Regular, wrap_width).size());
+    const float list_bottom = kBottomLine - 12 - (description_lines * 26.0f + 30);
+    const int count = int(items.size());
+    const int visible = std::max(1, std::min(count, int((list_bottom - kListTop) / kItemHeight)));
+    if (settings_items)
+    {
+        if (settings_item < settings_first)
+            settings_first = settings_item;
+        if (settings_item >= settings_first + visible)
+            settings_first = settings_item - visible + 1;
+    }
+    settings_first = std::clamp(settings_first, 0, std::max(0, count - visible));
+    settings_scroll_target = settings_first * kItemHeight;
+    const float rows_bottom = kListTop + visible * kItemHeight;
+    c.Clip(kItemLeft - 14, kListTop - 1, kItemRight - kItemLeft + 28, rows_bottom - kListTop + 2);
+    float y = kListTop - settings_scroll;
     for (size_t i = 0; i < items.size(); i++)
     {
-        const bool selected = settings_items && int(i) == settings_item;
-        c.Line(kItemLeft, y, kItemRight, y, 1.0f, t.line);
-        if (selected)
-            c.RoundRectOutline(kItemLeft - 8, y + 4, kItemRight - kItemLeft + 16, kItemHeight - 8, 6, 4.5f, cursor);
-        c.Text(kItemLeft + 16, y + 40, items[i].label, 20, Weight::Regular, t.text);
-        c.Text(kItemRight - 16, y + 40, items[i].value, 20, Weight::Regular, t.accent, Align::Right);
+        if (y + kItemHeight >= kListTop - 1 && y <= rows_bottom + 1)
+        {
+            const bool selected = settings_items && int(i) == settings_item;
+            c.Line(kItemLeft, y, kItemRight, y, 1.0f, t.line);
+            if (selected)
+                c.RoundRectOutline(kItemLeft - 8, y + 4, kItemRight - kItemLeft + 16, kItemHeight - 8, 6, 4.5f, cursor);
+            c.Text(kItemLeft + 16, y + 40, items[i].label, 20, Weight::Regular, t.text);
+            c.Text(kItemRight - 16, y + 40, items[i].value, 20, Weight::Regular, t.accent, Align::Right);
+            c.Line(kItemLeft, y + kItemHeight, kItemRight, y + kItemHeight, 1.0f, t.line);
+        }
         y += kItemHeight;
-        c.Line(kItemLeft, y, kItemRight, y, 1.0f, t.line);
     }
+    c.ResetClip();
+    if (count > visible)
+    {
+        // where the shown rows are in the list
+        const float track = rows_bottom - kListTop - 8;
+        const float thumb = std::max(24.0f, track * float(visible) / float(count));
+        const float at = kListTop + 4 + (track - thumb) * (settings_scroll / ((count - visible) * kItemHeight));
+        c.RoundRect(kItemRight + 22, kListTop + 4, 4, track, 2, t.line);
+        c.RoundRect(kItemRight + 21, at, 6, thumb, 3, t.dim);
+    }
+    y = items.empty() ? kListTop : rows_bottom;
     std::string description;
     if (items.empty())
         description = "Eden for PS4 " + version + "\nThe Nintendo Switch emulator Eden (eden-emu.dev), on the PS4.\n\n"
@@ -931,7 +979,7 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
     else
         description = items[std::min(size_t(settings_items ? settings_item : 0), items.size() - 1)].description;
     y += items.empty() ? 0 : 36;
-    for (const std::string& line : c.Wrap(description, 17, Weight::Regular, kItemRight - kItemLeft - 16))
+    for (const std::string& line : c.Wrap(description, 17, Weight::Regular, wrap_width))
     {
         c.Text(kItemLeft + 8, y, line, 17, Weight::Regular, t.dim);
         y += 26;

@@ -22,9 +22,11 @@ if (PS4)
         list(APPEND EDEN_PS4_RUNTIME_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/runtime/${name})
     endforeach()
     # The app heap leaves room in the system pool, the only memory that runs code, for the
-    # recompiler's code caches (4 x 32 MiB).
+    # recompiler's code caches: 192 MiB of it (04.21; 384 before, for 128 MiB of caches). It fills
+    # within seconds anyway and grows into overflow heaps (regular flexible, then direct memory);
+    # the caches take what the pool has, in tiers (common/orbis_memory.cpp in Eden).
     set_source_files_properties(${EDEN_PS4_RUNTIME_SOURCES} PROPERTIES
-        COMPILE_DEFINITIONS "PS4_SYSTEM_HEAP_MAX_MB=384;PS4_TRACE_KEEP=4"
+        COMPILE_DEFINITIONS "PS4_SYSTEM_HEAP_MAX_MB=192;PS4_TRACE_KEEP=4"
         INCLUDE_DIRECTORIES ${EDEN_PS4_REPO}/port)
 
     # The HOME menu (ui/), with its fonts (../ui-fonts) included whole

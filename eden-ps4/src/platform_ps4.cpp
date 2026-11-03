@@ -1328,6 +1328,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.21: the settings lists scroll (Graphics had rows below the screen). And the CPU translator's code "
+         "space, sized for Mario Kart (48 MiB for the main core), is now as large as the PS4's memory for "
+         "generated code allows, up to 160 MiB: Silksong filled the main core's 48 MiB every 30-40 s and "
+         "translated everything again each time (half of every second, the long freezes), Zelda's third core "
+         "5 times in 6 minutes. The boot trace says which sizes it got.\n"
          "04.20: Zelda's crashes 30-50 s in (two runs in a row): the CPU translator keeps, per core, a table of the "
          "places to link to each block, and in Zelda it grew to 57 MB, made as one piece of memory; Eden for PS4 "
          "added a heap for it, but another thread could take some of that heap first, and the allocation failed. "

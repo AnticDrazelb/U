@@ -885,6 +885,31 @@ ExecSource chooseExecSource() {
 
 }  // namespace
 
+// (04.21) How much more of the system flexible pool, the only memory that runs generated code
+// here, can be mapped right now: the largest multiple of 16 MiB up to `max` that maps (read/write,
+// unmapped at once). For Eden's code caches, which were sized for Mario Kart (128 MiB in all)
+// and are far too small for games such as Silksong (core 0's 48 MiB flushed 8 times in 270 s).
+extern "C" size_t ps4_system_pool_free(size_t max) {
+    constexpr size_t kStep = 16 * MB;
+    size_t lo = 0, hi = max / kStep;
+    while (lo < hi) {
+        const size_t mid = (lo + hi + 1) / 2;
+        const size_t size = mid * kStep;
+        bool ok = false;
+        if (void* base = reserveAwayFromKernel(size)) {
+            ok = sceKernelMapNamedSystemFlexibleMemory(&base, size, PROT_CPU_RW, MAP_FIXED_FLAG, "cemu probe") == 0;
+            sceKernelMunmap(base, size);
+        }
+        if (ok)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    heapLog("[cemu] heap: system flexible memory still free: %zu MiB (or more, up to %zu checked)\n",
+            lo * kStep / MB, max / MB);
+    return lo * kStep;
+}
+
 void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     const bool anonymous = fd == -1 && (flags & MAP_ANON) && !(flags & MAP_FIXED);
     if (anonymous && (prot & PROT_EXEC)) {

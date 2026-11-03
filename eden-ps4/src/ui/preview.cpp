@@ -128,6 +128,9 @@ int main(int argc, char** argv)
     Press(menu, kDown);
     Press(menu, kCross);
     Shot(menu, "settings-graphics");
+    for (int i = 0; i < 12; i++)  // (04.21) to the last row: the list scrolls
+        Press(menu, kDown);
+    Shot(menu, "settings-graphics-end");
     Press(menu, kLeft);
     Press(menu, kDown);
     Press(menu, kRight);

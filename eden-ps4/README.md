@@ -379,6 +379,34 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.21: **the settings lists scroll; code caches sized by what the PS4 has.** The tester's logs
+(04.19: Echoes of Wisdom three times, Hollow Knight: Silksong twice) and a report that the settings
+menu doesn't scroll.
+
+- **The settings menu.** `DrawSettings` laid a category's rows down the screen with the selected
+  row's description under them; Graphics' ten rows ran past the bottom bar (Frame Pacing, Game Speed,
+  GPU Accuracy, and the description, off screen). Now the rows that fit above the category's longest
+  description are shown, scrolled to keep the selection in view (eased, with a scroll bar), and the
+  description always under them (`ui-preview.sh`: `settings-graphics-end.png`).
+- **Shaders aren't what holds these games back.** Echoes of Wisdom rebuilds its 688-1,018 cached
+  pipelines at boot and then makes 0-40 new ones per 10 s with almost no draw skipped; a run with
+  none new at all ran 22-30 fps, as the others. Silksong's 10-14 s frames came with 0 new pipelines.
+  Pre-building the shader cache already happens; caching its SPIR-V as well would shorten the boot
+  (10-14 s of translating shaders again for Zelda), not the play.
+- **The CPU translator's code caches were too small for anything but Mario Kart.** Silksong:
+  core 0's 48 MiB filled and was flushed 8 times in 270 s, 250-550 ms of every second spent
+  translating, emulated core 0 idle 1-2% (the freezes; and the translation cache's 73,261 blocks
+  lost at the first flush: 967 used). Echoes of Wisdom: core 0 flushed twice, core 2 (32 MiB) 5
+  times in 6 minutes, 200-300 ms a second after each. Mario Kart: never. The caches come from the
+  system flexible pool, the only memory that runs generated code here, which the app heap shared:
+  capped at 384 MiB for 128 MiB of caches. The heap fills within 6 s of a boot anyway (one 10 MiB
+  arena is carved from it) and grows into overflow heaps, so it is capped at 192 MiB now; the port's
+  `ps4_system_pool_free` measures what the pool still has (16 MiB steps, mapped and unmapped) when
+  the first core's JIT is made, and Eden takes the largest tier that leaves 48 MiB free:
+  160/96/96/8, 128/80/80/8, 96/64/64/8, 72/48/48/8, or 04.20's 48/40/32/8 (`Common::Orbis::
+  CodeCacheSize`; fixed tiers keep the caches at the same addresses each boot, as the translation
+  cache needs). The boot trace: `code caches: ... MiB (system flexible memory free before them: ...)`.
+
 04.20: **Zelda's crashes; a switch for the draw shortcuts.** The tester's 04.19 logs, four Echoes
 of Wisdom runs: one ran 5.5 minutes at 23-30 fps (54 in places) then froze, two aborted at 45 and
 56 s (`std::bad_alloc`), one only reached the start page.

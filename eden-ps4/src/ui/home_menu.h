@@ -212,6 +212,10 @@ private:
     // System Settings: the category, and whether its items have the cursor (and which)
     int settings_category = 0, settings_item = 0;
     bool settings_items = false;
+    // (04.21) the category's list scrolled to keep the selection in view: its first row shown, and
+    // the drawn offset easing towards it
+    int settings_first = 0;
+    float settings_scroll = 0, settings_scroll_target = 0;
     // News and Games: scrolled this far
     float page_scroll = 0;
     // Game Folder: the folder shown ("" the places), its rows, the selected one

@@ -48,6 +48,9 @@
 #ifdef __OPENORBIS__
 #include "common/ps4_diagnostics.h"
 #include "common/ps4_perf.h"
+#ifdef __OPENORBIS__
+#include "common/orbis_memory.h"
+#endif
 #endif
 
 namespace Launcher {
@@ -556,6 +559,17 @@ void LoadJitCaches(Core::System& system, const std::filesystem::path& data_dir, 
         Output(LineKind::Status, "translation cache: " + summary);
 }
 
+#ifdef __OPENORBIS__
+// (04.21) The code caches' sizes the pool allowed (the first core's JIT chose them)
+void ReportCodeCaches() {
+    std::uint32_t mib[4], pool_free = 0;
+    Common::Orbis::CodeCachePlan(mib, pool_free);
+    Output(LineKind::Status, fmt::format("code caches: {}, {}, {}, {} MiB (system flexible memory free before "
+                                         "them: {} MiB; 48, 40, 32, 8 before 04.21)",
+                                         mib[0], mib[1], mib[2], mib[3], pool_free));
+}
+#endif
+
 void SaveJitCaches(Core::System& system, const std::filesystem::path& data_dir, u64 title_id) {
     auto* process = system.ApplicationProcess();
     if (!process || !title_id)
@@ -682,6 +696,9 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                 if (system.GetAppLoader().ReadProgramId(game_id) != Loader::ResultStatus::Success || !game_id)
                     game_id = system.GetApplicationProcessProgramID();
                 // (04.17) the translated code of this game's last run, before its cores run anything
+#ifdef __OPENORBIS__
+                ReportCodeCaches();
+#endif
                 if (g_jit_cache)
                     LoadJitCaches(system, data_dir, game_id);
                 system.GPU().Start();

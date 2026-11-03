@@ -1,0 +1,154 @@
+From 5512e7e5276940400268dc0edc9f6218ca05f841 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 20:59:37 +0000
+Subject: [PATCH] PS4: code caches as large as the system flexible pool allows,
+ in fixed tiers
+
+Sized for Mario Kart (48/40/32/8 MiB), core 0's cache filled and was flushed 8 times in 270 s in
+Hollow Knight: Silksong (half of every second translating), core 2's 5 times in 6 minutes in
+Echoes of Wisdom. Common::Orbis::CodeCacheSize: the first core's JIT asks the port how much of
+the pool (the only memory that runs generated code) is free and takes the largest of
+160/96/96/8, 128/80/80/8, 96/64/64/8, 72/48/48/8 MiB that leaves 48 MiB, else 48/40/32/8. Fixed
+tiers keep the caches' addresses the same each boot (the translation cache needs them).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/orbis_memory.cpp               | 50 +++++++++++++++++++++++
+ src/common/orbis_memory.h                 |  8 ++++
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp |  8 +++-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp |  5 ++-
+ 4 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index d225bd62a1..88cbb87de0 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -37,6 +37,8 @@ int32_t sceKernelMprotect(const void* addr, size_t len, int32_t prot);
+ int32_t sceKernelEnableDmemAliasing(void);
+ // Crema's runtime (port/ps4_crashlog.cpp): a line in boot-trace.log, safe in a signal handler
+ __attribute__((weak)) void ps4_boot_trace(const char* stage);
++// port/ps4_runtime.cpp (04.21): the system flexible pool's free memory, up to `max`
++__attribute__((weak)) size_t ps4_system_pool_free(size_t max);
+ }
+ 
+ namespace Common::Orbis {
+@@ -702,6 +704,54 @@ extern "C" void dynarmic_ps4_fault_leave() {
+ 
+ namespace Common::Orbis {
+ 
++namespace {
++
++struct CodeCacheChoice {
++    std::uint32_t mib[4];
++    std::uint32_t pool_free_mib;
++};
++
++// Silksong flushed core 0's 48 MiB 8 times in 270 s (translating half of every second), Echoes of
++// Wisdom core 2's 32 MiB 5 times in 6 minutes; Mario Kart fits in 48. Core 3 is the system's
++// (HLE services: it runs nothing). Kept free in the pool beyond the caches: the kernel's own
++// objects and the system libraries' heaps come from it too, and so do the macro JIT's chunks.
++constexpr std::uint32_t kTiers[][4] = {{160, 96, 96, 8}, {128, 80, 80, 8}, {96, 64, 64, 8}, {72, 48, 48, 8}};
++constexpr std::uint32_t kSmallest[4] = {48, 40, 32, 8};
++constexpr std::size_t kPoolMargin = 48_MiB;
++
++const CodeCacheChoice& Choice() {
++    static const CodeCacheChoice choice = [] {
++        CodeCacheChoice c{};
++        const std::size_t free_bytes = ps4_system_pool_free ? ps4_system_pool_free(512_MiB) : 0;
++        c.pool_free_mib = std::uint32_t(free_bytes >> 20);
++        const std::uint32_t* plan = kSmallest;
++        for (const auto& tier : kTiers) {
++            const std::size_t total = (std::size_t(tier[0]) + tier[1] + tier[2] + tier[3]) << 20;
++            if (total + kPoolMargin <= free_bytes) {
++                plan = tier;
++                break;
++            }
++        }
++        for (int i = 0; i < 4; i++)
++            c.mib[i] = plan[i];
++        return c;
++    }();
++    return choice;
++}
++
++} // namespace
++
++std::size_t CodeCacheSize(unsigned core) {
++    return std::size_t(Choice().mib[core & 3]) << 20;
++}
++
++void CodeCachePlan(std::uint32_t (&mib)[4], std::uint32_t& pool_free_mib) {
++    const CodeCacheChoice& c = Choice();
++    for (int i = 0; i < 4; i++)
++        mib[i] = c.mib[i];
++    pool_free_mib = c.pool_free_mib;
++}
++
+ } // namespace Common::Orbis
+ 
+ #endif
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index c9c9d78ef2..5a96f0eeea 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -109,6 +109,14 @@ unsigned PopArenaPadding(std::uint64_t& group_va, std::size_t& dram_offset);
+ std::size_t ArenaPaddingCount();
+ std::size_t ArenaPaddedMaps();
+ 
++/// (04.21) The emulated core's code cache size: one plan for all four, chosen the first time from
++/// what the system flexible pool (the only memory that runs code) has free, from fixed tiers so
++/// that it is the same at every boot (the translation cache needs the same addresses). The
++/// smallest tier is 04.20's 48/40/32/8 MiB.
++std::size_t CodeCacheSize(unsigned core);
++/// The plan's sizes in MiB and the pool's free MiB when it was chosen, for the boot trace
++void CodeCachePlan(std::uint32_t (&mib)[4], std::uint32_t& pool_free_mib);
++
+ /// RAII: the arena locked while the page table changes (fastmem only)
+ class ArenaUpdate {
+ public:
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index e6212ca4af..08b37697b6 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -10,6 +10,9 @@
+ #include <vector>
+ #include "common/ps4_perf.h"
+ #include "common/settings.h"
++#ifdef __OPENORBIS__
++#include "common/orbis_memory.h"
++#endif
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_32.h"
+ #include "core/arm/dynarmic/dynarmic_cp15.h"
+@@ -250,8 +253,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     // code compiled again, a stutter), the most for core 0, where games run their main thread
+     // (Mario Kart filled 35 of 40 MiB there in a few races); the fourth is the system's, whose
+     // services are HLE.
+-    static constexpr std::size_t CodeCacheSizes[4] = {48_MiB, 40_MiB, 32_MiB, 8_MiB};
+-    config.code_cache_size = std::uint32_t(CodeCacheSizes[m_core_index & 3]);
++    // (04.21) as large as the pool allows, in fixed tiers (common/orbis_memory.cpp): 48/40/32/8
++    // MiB at the least, as before
++    config.code_cache_size = std::uint32_t(Common::Orbis::CodeCacheSize(unsigned(m_core_index)));
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 2a216458cc..92f7478b2b 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -292,8 +292,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // code compiled again, a stutter), the most for core 0, where games run their main thread
+     // (Mario Kart filled 35 of 40 MiB there in a few races); the fourth is the system's, whose
+     // services are HLE.
+-    static constexpr std::size_t CodeCacheSizes[4] = {48_MiB, 40_MiB, 32_MiB, 8_MiB};
+-    config.code_cache_size = std::uint32_t(CodeCacheSizes[m_core_index & 3]);
++    // (04.21) as large as the pool allows, in fixed tiers (common/orbis_memory.cpp): 48/40/32/8
++    // MiB at the least, as before
++    config.code_cache_size = std::uint32_t(Common::Orbis::CodeCacheSize(unsigned(m_core_index)));
+ #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+-- 
+2.43.0
+
