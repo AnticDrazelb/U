@@ -130,3 +130,27 @@ with the cache really in use: the 30-second line's "translation cache blocks use
 now be most of the loaded blocks, and "translating by core" near zero at the first race.
 
 Echoes of Wisdom's slowness on its second and third runs was not the cache (README, 04.19).
+
+## 7. Test A / test B on the console (04.19, Mario Kart 8 Deluxe, tester's logs d83d5ab6)
+
+One cold run (04.18's cache refused: another format), then two warm runs, each relaunched.
+
+| | Cold | Warm 1 | Warm 2 |
+|---|---|---|---|
+| Translation cache loaded (core 0, 1, 2) | none | 171,188 / 68,242 / 38,620 blocks, 2.2 s | 182,337 / 74,300 / 41,580 blocks, 2.6 s |
+| Blocks used by 30 s / by the end (core 0) | - | 106,772 / 167,850 (98%), 0 stale | 81,285 / 173,923, 0 stale |
+| Core 0 translating, first 30 s | 273 ms a second (2,307 blocks) | 14 ms (10 blocks) | 0 ms |
+| Core 0 translating, first race | 37, then 26 ms a second | 2-25 | 0.3-2 |
+| First 10-s window at 57+ fps (menus), after booting | 63 s | 44 s | 46 s |
+| Race windows (10 s, 215,000+ draws): mean, lowest | 35.2, 26.8 fps (31) | 35.7, 31.1 (27) | 37.9, 26.0 (14) |
+| First race's first 30 s | 29.8 fps | 37.1 | 31.5 |
+| C heap at 60 s / flexible memory free | 881 MiB / 26 | 912 / 14 | 915 / 14 |
+| Core 0 code cache free | 30.0 -> 11.4 MiB | 9.9 -> 8.0 | 7.6 -> 7.4 |
+
+The translation the first race did is gone (0-2 ms a second instead of 26-37), the game reaches its
+menus ~18 s sooner, and no block was stale or wrong. The remaining dips at a race's start (26.0 in
+warm 2, at 311,788 draws in 10 s) come with no translation at all: they are the draws (more than
+1,000 a frame), not the cache's to remove. Costs: 2.2 s more at boot (the load), ~30 MiB more C heap,
+and the image is restored whole, so core 0's 48 MiB fills a little more each session (11.4 MiB
+free after the cold run, 7.4 after the second warm one); when it fills, a whole flush mid-session
+translates everything again once, and the image saved after that starts small again.
