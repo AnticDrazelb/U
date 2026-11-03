@@ -632,6 +632,19 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                                             now[4] - last[4], now[0] - last[0], now[1] - last[1], now[2] - last[2],
                                             now[3] - last[3]);
                         std::copy(std::begin(now), std::end(now), std::begin(last));
+                        // (04.12) uniform buffers: copied to stream buffers, and how much of the
+                        // constant buffer data written memory already held
+                        {
+                            static uint64_t last_ubo[3] = {};
+                            const uint64_t ubo[3] = {P::ubo_copied_bytes.load(), P::cb_bytes.load(),
+                                                     P::cb_identical_bytes.load()};
+                            const uint64_t cb = ubo[1] - last_ubo[1];
+                            extra += fmt::format("; uniform buffers copied {:.1f} MiB, constant data written {:.1f} MiB "
+                                                 "({:.0f}% already there)",
+                                                 double(ubo[0] - last_ubo[0]) / 1048576.0, double(cb) / 1048576.0,
+                                                 cb ? 100.0 * double(ubo[2] - last_ubo[2]) / double(cb) : 0.0);
+                            std::copy(std::begin(ubo), std::end(ubo), std::begin(last_ubo));
+                        }
                         // (04.11) core 0's (the game's main thread's) two longest waits on objects
                         const P::WaitTable& table = P::object_waits[0];
                         static uint64_t last_count[P::WaitTable::Max] = {}, last_ns[P::WaitTable::Max] = {};

@@ -1322,6 +1322,14 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.12: counting the uniform buffers. Comparing with Ryujinx (another Switch emulator, built "
+         "differently) showed one big difference in the work done on every draw: Eden copies each of a draw's "
+         "small uniform buffers (the game's constants) into a fresh buffer every draw unless almost all of "
+         "them came unchanged from its cache, and a game rewriting the same constants every frame looks to it "
+         "like a change; Ryujinx skips identical rewrites and copies only what changed. Before changing "
+         "anything, the log now counts it: the constant data the game writes and how much was already there, "
+         "the uniform buffers copied (every 10 s too) and those taken from the cache. Also 04.11's report of "
+         "what the game waits for.\n"
          "04.11: what the game waits for at a race's start. In 04.10's races the game's main thread, at the "
          "start, spent 10-19% of its time waiting on something (17-21 waits a second, 5-9 ms each, three "
          "times what it waits later), while Eden's GPU thread was only ~72% busy: so it isn't only the GPU "
@@ -2422,6 +2430,25 @@ std::string PerfLine(double seconds)
         last_skipped = skipped;
         last_images = images;
         last_buffers = buffers;
+    }
+    // (04.12) Uniform buffers (docs/ryujinx-comparison.md, 1): constant buffer data written and how
+    // much memory already held; binds copied every draw against cached; frames copying
+    {
+        static uint64_t last[9] = {};
+        const uint64_t now[9] = {P::cb_bytes.load(), P::cb_identical_bytes.load(), P::cb_uncompared_bytes.load(),
+                                 P::ubo_copied.load(), P::ubo_copied_bytes.load(), P::ubo_cached.load(),
+                                 P::ubo_cached_hits.load(), P::ubo_frames.load(), P::ubo_frames_copying.load()};
+        uint64_t d[9];
+        for (int i = 0; i < 9; i++)
+            d[i] = now[i] - last[i];
+        const auto pct = [](uint64_t part, uint64_t whole) { return whole ? 100.0 * double(part) / double(whole) : 0.0; };
+        line += fmt::format("; uniform buffers: constant buffer data written {:.0f} KiB a second, {:.0f}% of it what "
+                            "memory already held ({:.0f}% not compared); binds a second: {:.0f} copied ({:.0f} KiB), "
+                            "{:.0f} from the cache ({:.0f}% with nothing to upload); frames copying every draw "
+                            "{:.0f}%",
+                            double(d[0]) / 1024.0 / seconds, pct(d[1], d[0]), pct(d[2], d[0]), double(d[3]) / seconds,
+                            double(d[4]) / 1024.0 / seconds, double(d[5]) / seconds, pct(d[6], d[5]), pct(d[8], d[7]));
+        std::copy(std::begin(now), std::end(now), std::begin(last));
     }
     // (04.11) The game's waits on objects (svcWaitSynchronization), by what ended them: an event by
     // its service's name, one the game made, a thread, a timeout. Per core, the four longest.

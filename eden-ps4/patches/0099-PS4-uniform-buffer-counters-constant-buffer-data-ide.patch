@@ -1,0 +1,114 @@
+From 7aa6f74682704f21c659c42b604c699031a8c4d9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 09:41:44 +0000
+Subject: [PATCH] PS4: uniform buffer counters: constant buffer data identical
+ to memory, binds copied against cached
+
+For docs/ryujinx-comparison.md's first idea, counted only: constant buffer bytes written and how
+many matched guest memory already, uniform buffer binds copied to stream buffers (and bytes)
+against those from the cache, and frames in each mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                      |  9 +++++++++
+ src/video_core/buffer_cache/buffer_cache.h | 16 ++++++++++++++++
+ src/video_core/engines/maxwell_3d.cpp      | 14 ++++++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 889b53b02a..a2610ba5d5 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -88,6 +88,15 @@ struct WaitTable {
+ };
+ inline WaitTable object_waits[4];
+ 
++// (04.12) Uniform buffers, for docs/ryujinx-comparison.md's first idea (counted, nothing changed):
++// constant buffer data the game wrote (bytes; identical to what memory held; not compared: across
++// a page), the GPU thread's uniform buffer binds (copied to a stream buffer every draw, and the
++// bytes; from the cache, and of those with nothing to upload), and its frames in each mode (Eden
++// copies every uniform buffer up to 4 KiB each draw unless 98% of the cached binds hit)
++inline std::atomic<uint64_t> cb_bytes{0}, cb_identical_bytes{0}, cb_uncompared_bytes{0};
++inline std::atomic<uint64_t> ubo_copied{0}, ubo_copied_bytes{0}, ubo_cached{0}, ubo_cached_hits{0};
++inline std::atomic<uint64_t> ubo_frames{0}, ubo_frames_copying{0};
++
+ // (04.10) Vulkan render pass ends the scheduler's worker skipped: none begun in their command
+ // buffer (counted on every platform; it would have crashed RADV)
+ inline std::atomic<uint64_t> vk_unmatched_render_pass_ends{0};
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 0d57f0d72e..5b2f42af9e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -100,6 +100,12 @@ void BufferCache<P>::TickFrame() {
+     channel_state->uniform_cache_shots[0] = 0;
+ 
+     const bool skip_preferred = hits * 256 < shots * 251;
++#ifdef __OPENORBIS__
++    Common::PS4Perf::ubo_frames.fetch_add(1, std::memory_order_relaxed);
++    if (skip_preferred) {
++        Common::PS4Perf::ubo_frames_copying.fetch_add(1, std::memory_order_relaxed);
++    }
++#endif
+     channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
+ 
+     // If we can obtain the memory info, use it instead of the estimate.
+@@ -978,13 +984,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
++#ifdef __OPENORBIS__
++        Common::PS4Perf::ubo_copied.fetch_add(1, std::memory_order_relaxed);
++        Common::PS4Perf::ubo_copied_bytes.fetch_add(size, std::memory_order_relaxed);
++#endif
+         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+         return;
+     }
+     // Classic cached path
++#ifdef __OPENORBIS__
++    Common::PS4Perf::ubo_cached.fetch_add(1, std::memory_order_relaxed);
++#endif
+     if (SynchronizeBuffer(buffer, device_addr, size)) {
+         ++channel_state->uniform_cache_hits[0];
++#ifdef __OPENORBIS__
++        Common::PS4Perf::ubo_cached_hits.fetch_add(1, std::memory_order_relaxed);
++#endif
+     }
+     // Skip binding if it's not needed and if the bound buffer is not the fast version
+     // This exists to avoid instances where the fast buffer is bound and a GPU write happens
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index e7da9d9138..71ca3ab85c 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -8,6 +8,7 @@
+ #include <optional>
+ #include "common/assert.h"
+ #include "common/bit_util.h"
++#include "common/ps4_perf.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -620,6 +621,19 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+ 
+     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+     const size_t copy_size = amount * sizeof(u32);
++#ifdef __OPENORBIS__
++    {
++        // (04.12) how much of it memory already held (counted only)
++        namespace P = Common::PS4Perf;
++        P::cb_bytes.fetch_add(copy_size, std::memory_order_relaxed);
++        const u8* const current = (address & 0xFFF) + copy_size <= 0x1000 ? memory_manager.GetPointer(address) : nullptr;
++        if (current == nullptr) {
++            P::cb_uncompared_bytes.fetch_add(copy_size, std::memory_order_relaxed);
++        } else if (std::memcmp(current, start_base, copy_size) == 0) {
++            P::cb_identical_bytes.fetch_add(copy_size, std::memory_order_relaxed);
++        }
++    }
++#endif
+     memory_manager.WriteBlockCached(address, start_base, copy_size);
+ 
+     // Increment the current buffer position.
+-- 
+2.43.0
+

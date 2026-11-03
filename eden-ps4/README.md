@@ -379,6 +379,19 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.12: **uniform buffer counters (from the comparison with Ryujinx).** `docs/ryujinx-comparison.md`
+(Ryubing's continuation of Ryujinx read next to Eden's GPU frontend): the most promising difference
+is uniform buffers. Eden copies every uniform buffer up to 4 KiB into a stream buffer on every draw
+(`BindHostGraphicsUniformBuffer`'s skip-cache path) unless 98% of the cached path's binds found
+nothing to upload in the last frames, and invalidates every constant buffer update
+(`ProcessCBMultiData`, `WriteBlockCached`) even when the data was already there; Ryujinx gathers
+the updates, skips identical ones and binds cached ranges, with no copy per draw.
+
+- Patch 0099, counters only: constant buffer data written (bytes, identical to what guest memory
+  held, not compared: across a page), uniform buffer binds copied (and bytes) against cached (and
+  with nothing to upload), frames in each mode; in the 30-second line, and the copies and the
+  identical share in the 10-second speed line.
+
 04.11: **what the game's waits end on.** 04.10 on a console (three races from fresh boots, all
 five sessions in the bundle; no crash, no render pass end skipped): two on one track started
 30.3/28.7 then 25.3/25.4 fps at 30-32k draws a second (~1,070-1,250 a frame), the third 37.7, 34.0,
