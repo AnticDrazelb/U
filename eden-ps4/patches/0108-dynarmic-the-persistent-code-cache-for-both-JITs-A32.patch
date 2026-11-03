@@ -1,0 +1,1366 @@
+From e6471463dfc03fb7abe56dada858ba449bc4129e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 15:34:08 +0000
+Subject: [PATCH 108/109] dynarmic: the persistent code cache for both JITs
+ (A32 and A64)
+
+The A32 JIT's code cache moves to backend/x64/jit_code_cache.h, a template over the emitter and the
+guest address width that both JITs use; each keeps what is its own (the build and configuration
+fingerprints, the objects its code may point into). The A64 JIT gets SaveCodeCache, LoadCodeCache
+and GetCodeCacheUse as the A32 one, with UserConfig::code_cache_objects; its objects include the
+system registers it is given (TPIDR_EL0, TPIDRRO_EL0) and its page table at its address space's
+size. The file format is version 2 (guest ranges 64 bits wide). Per-core translation counts for
+the A64 JIT too. (The desktop harness's fixed code cache address applies to code caches only.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../dynarmic/backend/x64/a32_interface.cpp    | 478 +---------------
+ .../dynarmic/backend/x64/a64_interface.cpp    | 142 ++++-
+ .../src/dynarmic/backend/x64/jit_code_cache.h | 515 ++++++++++++++++++
+ src/dynarmic/src/dynarmic/backend/x64/xbyak.h |   3 +-
+ src/dynarmic/src/dynarmic/interface/A64/a64.h |  14 +
+ .../src/dynarmic/interface/A64/config.h       |   8 +
+ 6 files changed, 701 insertions(+), 459 deletions(-)
+ create mode 100644 src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 20bd46a872..b0f40c3876 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -29,6 +29,7 @@
+ #include "dynarmic/backend/x64/block_of_code.h"
+ #include "dynarmic/backend/x64/callback.h"
+ #include "dynarmic/backend/x64/devirtualize.h"
++#include "dynarmic/backend/x64/jit_code_cache.h"
+ #include "dynarmic/backend/x64/jitstate_info.h"
+ #include "dynarmic/backend/x64/ps4_block_map.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+@@ -179,82 +180,23 @@ struct Jit::Impl {
+         return Common::DisassembleX64(p, p + size);
+     }
+ 
+-    // ---- (PS4 04.17) Persistent code cache --------------------------------------------------
+-    // The whole code image (the blocks, their cold code, the constants they placed) is saved with
+-    // what dynarmic keeps about it, and put back at the same addresses in a later run: same
+-    // build, same configuration, the code cache at the same address. Pointers in the code into
+-    // objects that move between runs (this JIT, the callbacks, the monitor, the coprocessors and
+-    // what Eden lists in code_cache_objects) are found by scanning the code at save time and set
+-    // to where those objects are when it loads. Every link between blocks is undone at load; a
+-    // saved block is registered when first looked up, if its guest code (its range and the code
+-    // its flags look-ahead read) hashes as it did, and links are made again as blocks register.
+-
+-    struct CachePendingBlock {
+-        u64 descriptor;
+-        u32 entry, size;  // from the cache's start
+-        u32 first_range, range_count;
+-        u64 code_hash;
+-        u32 state;  // 0 not looked up yet, 1 used, 2 stale
+-        u32 pad;
+-    };
+-    static_assert(sizeof(CachePendingBlock) == 40);
+-    std::vector<CachePendingBlock> cache_pending;              // sorted by descriptor
+-    std::vector<std::pair<u32, u32>> cache_pending_ranges;     // [start, end) each
+-    Jit::CodeCacheUse cache_use;
+-
+-    static constexpr u64 CACHE_MAGIC = 0x3130434A4E454445ull;  // "EDENJC01"
+-    static constexpr u32 CACHE_VERSION = 1;
+-
+-    struct CacheHeader {
+-        u64 magic;
+-        u32 version, header_size;
+-        u64 build_hash, config_hash;
+-        u64 base;  // the code cache's address
+-        u64 prelude_end, hot_end, cold_low, cold_ptr, cold_end, total;
+-        u64 prelude_hash;
+-        u64 num_kinds, num_constants, num_relocs, num_sites, num_blocks, num_ranges, num_fastmem, num_dnf, num_bwf;
+-        u32 stack_walks, thread_local_walks, stack_declines, pad;
+-    };
+-    struct CacheReloc {
+-        u32 offset, kind;
+-        u64 addend;
+-    };
+-    struct CacheSite {
+-        u64 target;
+-        u32 offset, type;  // 0 jg, 1 jz, 2 jmp, 3 mov rcx
+-    };
+-    struct CacheFastmem {
+-        u32 rip, resume;
+-        u64 callback;
+-        u64 marker_descriptor;
+-        u32 marker_name;
+-        u8 recompile, base, pad[2];
+-    };
+-    struct CacheMarker {
+-        u64 descriptor;
+-        u64 name;
+-    };
+-
+-    static u64 CacheMix(u64 h, u64 v) {
+-        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+-        h *= 0xBF58476D1CE4E5B9ull;
+-        return h ^ (h >> 31);
+-    }
++    // ---- (PS4 04.17) Persistent code cache: backend/x64/jit_code_cache.h; here what's A32's
++    using CodeCache = JitCodeCache<A32EmitX64, u32>;
+ 
+-    // The build: this file's compile time and the sizes of what the image relies on
++    // The build: this file's compile time and the sizes the image relies on
+     static u64 CacheBuildHash() {
+         u64 h = 0;
+         for (const char* p = __DATE__ " " __TIME__ " a32"; *p; ++p)
+-            h = CacheMix(h, u8(*p));
+-        h = CacheMix(h, sizeof(Impl));
+-        h = CacheMix(h, sizeof(A32JitState));
+-        h = CacheMix(h, sizeof(A32EmitX64));
++            h = CodeCache::Mix(h, u8(*p));
++        h = CodeCache::Mix(h, sizeof(Impl));
++        h = CodeCache::Mix(h, sizeof(A32JitState));
++        h = CodeCache::Mix(h, sizeof(A32EmitX64));
+         return h;
+     }
+ 
+     u64 CacheConfigHash() const {
+         u64 h = 0;
+-        auto add = [&](u64 v) { h = CacheMix(h, v); };
++        auto add = [&](u64 v) { h = CodeCache::Mix(h, v); };
+         add(u64(conf.optimizations));
+         add(conf.page_table != nullptr);
+         add(conf.global_monitor != nullptr);
+@@ -327,396 +269,15 @@ struct Jit::Impl {
+         return objects;
+     }
+ 
+-    static std::optional<std::pair<u32, u64>> CacheFindObject(const std::vector<std::pair<u64, u64>>& objects, u64 value) {
+-        for (u32 k = 0; k < objects.size(); ++k) {
+-            if (value - objects[k].first < objects[k].second)
+-                return std::make_pair(k, value - objects[k].first);
+-        }
+-        return std::nullopt;
+-    }
+-
+-    // Each 8 bytes in [begin, end) holding a pointer into one of the objects
+-    template<typename F>
+-    static void CacheScan(const u8* begin, const u8* end, const std::vector<std::pair<u64, u64>>& objects, F&& found) {
+-        u64 low = ~u64{0}, high = 0;
+-        for (const auto& [pointer, size] : objects) {
+-            low = std::min(low, pointer);
+-            high = std::max(high, pointer + size);
+-        }
+-        for (const u8* p = begin; p + 8 <= end; ++p) {
+-            u64 value;
+-            std::memcpy(&value, p, 8);
+-            if (value < low || value >= high)
+-                continue;
+-            if (const auto hit = CacheFindObject(objects, value)) {
+-                found(p, hit->first, hit->second);
+-                p += 7;
+-            }
+-        }
+-    }
+-
+-    // The prelude without what changes between runs (pointers into the objects, the constants)
+-    u64 CachePreludeHash(const std::vector<std::pair<u64, u64>>& objects) {
+-        const u8* const base = block_of_code.CacheBase();
+-        const auto layout = block_of_code.GetCacheLayout();
+-        const auto constants = block_of_code.GetConstantPool().Area();
+-        std::vector<u8> prelude(base, base + layout.prelude_end);
+-        std::memset(prelude.data() + (constants.data() - base), 0, constants.size());
+-        CacheScan(prelude.data(), prelude.data() + prelude.size(), objects, [&](const u8* p, u32, u64) {
+-            std::memset(prelude.data() + (p - prelude.data()), 0, 8);
+-        });
+-        u64 h = 0;
+-        for (size_t i = 0; i + 8 <= prelude.size(); i += 8) {
+-            u64 v;
+-            std::memcpy(&v, prelude.data() + i, 8);
+-            h = CacheMix(h, v);
+-        }
+-        return CacheMix(h, prelude.size());
+-    }
+-
+-    u64 CacheHashGuestCode(std::span<const std::pair<u32, u32>> ranges) {
+-        u64 h = 0;
+-        for (const auto& [start, end] : ranges) {
+-            h = CacheMix(h, (u64(start) << 32) | end);
+-            for (u64 address = start & ~u32{3}; address < u64(end); address += 4) {
+-                const auto word = conf.callbacks->MemoryReadCode(u32(address));
+-                h = CacheMix(h, word ? (u64(*word) | (u64{1} << 32)) : 0);
+-            }
+-        }
+-        return h;
+-    }
+-
+-    struct CacheWriter {
+-        const std::function<bool(const void*, std::size_t)>& write;
+-        u64 hash = 0;
+-        bool ok = true;
+-        void Put(const void* data, size_t size) {
+-            if (!ok || size == 0)
+-                return;
+-            const u8* p = static_cast<const u8*>(data);
+-            for (size_t i = 0; i < size; i += 8) {
+-                u64 v = 0;
+-                std::memcpy(&v, p + i, std::min<size_t>(8, size - i));
+-                hash = CacheMix(hash, v);
+-            }
+-            ok = write(data, size);
+-        }
+-        template<typename T>
+-        void PutAll(const std::vector<T>& v) { Put(v.data(), v.size() * sizeof(T)); }
+-    };
+-    struct CacheReader {
+-        const std::function<bool(void*, std::size_t)>& read;
+-        u64 hash = 0;
+-        bool ok = true;
+-        void Get(void* data, size_t size) {
+-            if (!ok || size == 0)
+-                return;
+-            ok = read(data, size);
+-            if (!ok)
+-                return;
+-            const u8* p = static_cast<const u8*>(data);
+-            for (size_t i = 0; i < size; i += 8) {
+-                u64 v = 0;
+-                std::memcpy(&v, p + i, std::min<size_t>(8, size - i));
+-                hash = CacheMix(hash, v);
+-            }
+-        }
+-        template<typename T>
+-        void GetAll(std::vector<T>& v, u64 count, u64 limit) {
+-            if (count > limit) {
+-                ok = false;
+-                return;
+-            }
+-            v.resize(size_t(count));
+-            Get(v.data(), v.size() * sizeof(T));
+-        }
+-    };
+-
+     bool SaveCodeCache(const std::function<bool(const void*, std::size_t)>& write) {
+         ASSERT(!jit_interface->is_executing);
+         PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
+-        const u8* const base = block_of_code.CacheBase();
+-        const auto layout = block_of_code.GetCacheLayout();
+-        const auto objects = CacheObjects();
+-
+-        std::vector<CacheReloc> relocs;
+-        const auto add_relocs = [&](size_t from, size_t to) {
+-            CacheScan(base + from, base + to, objects, [&](const u8* p, u32 kind, u64 addend) {
+-                relocs.push_back({u32(p - base), kind, addend});
+-            });
+-        };
+-        add_relocs(layout.prelude_end, layout.hot_end);
+-        add_relocs(layout.cold_low, layout.total);
+-
+-        std::vector<CacheSite> sites;
+-        for (const auto& [target, info] : emitter.patch_information) {
+-            const auto add = [&](const auto& list, u32 type) {
+-                for (const CodePtr site : list)
+-                    sites.push_back({target.Value(), u32(static_cast<const u8*>(site) - base), type});
+-            };
+-            add(info.jg, 0);
+-            add(info.jz, 1);
+-            add(info.jmp, 2);
+-            add(info.mov_rcx, 3);
+-        }
+-
+-        // each block's guest ranges (its code and its look-ahead), from the invalidation map
+-        std::vector<std::tuple<u64, u32, u32>> block_ranges;  // descriptor, start, end
+-        for (const auto& [interval, descriptors] : emitter.block_ranges.block_ranges) {
+-            const u32 first = boost::icl::first(interval), last = boost::icl::last(interval);
+-            if (last == 0xFFFFFFFF)
+-                continue;  // (none ends there; an end of 2^32 doesn't fit)
+-            for (const auto& descriptor : descriptors)
+-                block_ranges.emplace_back(descriptor.Value(), first, last + 1);
+-        }
+-        std::sort(block_ranges.begin(), block_ranges.end());
+-        std::vector<CachePendingBlock> blocks;
+-        std::vector<std::pair<u32, u32>> ranges;
+-        for (size_t i = 0; i < block_ranges.size();) {
+-            const u64 descriptor = std::get<0>(block_ranges[i]);
+-            const size_t first_range = ranges.size();
+-            for (; i < block_ranges.size() && std::get<0>(block_ranges[i]) == descriptor; ++i)
+-                ranges.emplace_back(std::get<1>(block_ranges[i]), std::get<2>(block_ranges[i]));
+-            const auto it = emitter.block_descriptors.find(IR::LocationDescriptor{descriptor});
+-            if (it == emitter.block_descriptors.end()) {
+-                ranges.resize(first_range);
+-                continue;
+-            }
+-            const auto block_ranges_span = std::span(ranges).subspan(first_range);
+-            blocks.push_back({descriptor, u32(static_cast<const u8*>(it->second.entrypoint) - base), u32(it->second.size),
+-                              u32(first_range), u32(block_ranges_span.size()), CacheHashGuestCode(block_ranges_span), 0, 0});
+-        }
+-
+-        std::vector<CacheFastmem> fastmem;
+-        for (const auto& [rip, info] : emitter.fastmem_patch_info) {
+-            fastmem.push_back({u32(rip - reinterpret_cast<u64>(base)), u32(info.resume_rip - reinterpret_cast<u64>(base)), info.callback,
+-                               std::get<0>(info.marker).Value(), u32(std::get<1>(info.marker)), u8(info.recompile), info.base, {}});
+-        }
+-        std::vector<CacheMarker> dnf, bwf;
+-        for (const auto& marker : emitter.do_not_fastmem)
+-            dnf.push_back({std::get<0>(marker).Value(), u64(std::get<1>(marker))});
+-        for (const auto& descriptor : emitter.blocks_without_fastmem)
+-            bwf.push_back({descriptor.Value(), 0});
+-
+-        const auto constants = block_of_code.GetConstantPool().Used();
+-        std::vector<u64> kind_sizes;
+-        for (const auto& object : objects)
+-            kind_sizes.push_back(object.second);
+-
+-        CacheHeader header{};
+-        header.magic = CACHE_MAGIC;
+-        header.version = CACHE_VERSION;
+-        header.header_size = sizeof(CacheHeader);
+-        header.build_hash = CacheBuildHash();
+-        header.config_hash = CacheConfigHash();
+-        header.base = reinterpret_cast<u64>(base);
+-        header.prelude_end = layout.prelude_end;
+-        header.hot_end = layout.hot_end;
+-        header.cold_low = layout.cold_low;
+-        header.cold_ptr = layout.cold_ptr;
+-        header.cold_end = layout.cold_end;
+-        header.total = layout.total;
+-        header.prelude_hash = CachePreludeHash(objects);
+-        header.num_kinds = kind_sizes.size();
+-        header.num_constants = constants.size();
+-        header.num_relocs = relocs.size();
+-        header.num_sites = sites.size();
+-        header.num_blocks = blocks.size();
+-        header.num_ranges = ranges.size();
+-        header.num_fastmem = fastmem.size();
+-        header.num_dnf = dnf.size();
+-        header.num_bwf = bwf.size();
+-        header.stack_walks = emitter.stack_walks;
+-        header.thread_local_walks = emitter.thread_local_walks;
+-        header.stack_declines = emitter.stack_declines;
+-
+-        CacheWriter w{write};
+-        w.Put(&header, sizeof(header));
+-        w.PutAll(kind_sizes);
+-        w.Put(constants.data(), constants.size_bytes());
+-        w.Put(base + layout.prelude_end, layout.hot_end - layout.prelude_end);
+-        w.Put(base + layout.cold_low, layout.total - layout.cold_low);
+-        w.PutAll(relocs);
+-        w.PutAll(sites);
+-        w.PutAll(blocks);
+-        w.PutAll(ranges);
+-        w.PutAll(fastmem);
+-        w.PutAll(dnf);
+-        w.PutAll(bwf);
+-        const u64 trailer = w.hash;
+-        w.Put(&trailer, sizeof(trailer));
+-        return w.ok;
++        return code_cache.Save(write, CacheBuildHash(), CacheConfigHash(), CacheObjects());
+     }
+ 
+     bool LoadCodeCache(const std::function<bool(void*, std::size_t)>& read, std::string* why) {
+-        const auto fail = [&](const char* reason) {
+-            if (why)
+-                *why = reason;
+-            return false;
+-        };
+         ASSERT(!jit_interface->is_executing);
+-        if (!emitter.block_descriptors.empty() || !cache_pending.empty())
+-            return fail("blocks already translated");
+-        u8* const base = block_of_code.CacheBase();
+-        const auto layout = block_of_code.GetCacheLayout();
+-        const auto objects = CacheObjects();
+-
+-        CacheReader r{read};
+-        CacheHeader header{};
+-        r.Get(&header, sizeof(header));
+-        if (!r.ok)
+-            return fail("can't read its header");
+-        if (header.magic != CACHE_MAGIC || header.version != CACHE_VERSION || header.header_size != sizeof(CacheHeader))
+-            return fail("another format");
+-        if (header.build_hash != CacheBuildHash())
+-            return fail("another build");
+-        if (header.config_hash != CacheConfigHash())
+-            return fail("another configuration");
+-        if (header.base != reinterpret_cast<u64>(base))
+-            return fail("the code cache at another address");
+-        if (header.total != layout.total || header.prelude_end != layout.prelude_end || layout.hot_end != layout.prelude_end)
+-            return fail("another code cache layout");
+-        if (header.num_kinds != objects.size())
+-            return fail("other objects");
+-        if (header.prelude_hash != CachePreludeHash(objects))
+-            return fail("another prelude");
+-        BlockOfCode::CacheLayout saved;
+-        saved.prelude_end = header.prelude_end;
+-        saved.hot_end = header.hot_end;
+-        saved.cold_low = header.cold_low;
+-        saved.cold_ptr = header.cold_ptr;
+-        saved.cold_end = header.cold_end;
+-        saved.total = header.total;
+-        if (saved.hot_end < saved.prelude_end || saved.hot_end > saved.cold_low || saved.cold_low > saved.cold_ptr ||
+-            saved.cold_ptr > saved.cold_end || saved.cold_end > saved.total)
+-            return fail("a bad layout");
+-
+-        std::vector<u64> kind_sizes;
+-        r.GetAll(kind_sizes, header.num_kinds, 1024);
+-        for (size_t k = 0; r.ok && k < kind_sizes.size(); ++k) {
+-            if (kind_sizes[k] != objects[k].second)
+-                return fail("objects of other sizes");
+-        }
+-        std::vector<std::pair<u64, u64>> constants;
+-        r.GetAll(constants, header.num_constants, u64{1} << 24);
+-
+-        // the code, straight into the cache (put back as it was if the rest doesn't check out)
+-        block_of_code.EnableWriting();
+-        r.Get(base + saved.prelude_end, saved.hot_end - saved.prelude_end);
+-        r.Get(base + saved.cold_low, saved.total - saved.cold_low);
+-
+-        std::vector<CacheReloc> relocs;
+-        std::vector<CacheSite> sites;
+-        std::vector<CachePendingBlock> blocks;
+-        std::vector<std::pair<u32, u32>> ranges;
+-        std::vector<CacheFastmem> fastmem;
+-        std::vector<CacheMarker> dnf, bwf;
+-        const u64 limit = u64{1} << 28;
+-        r.GetAll(relocs, header.num_relocs, limit);
+-        r.GetAll(sites, header.num_sites, limit);
+-        r.GetAll(blocks, header.num_blocks, limit);
+-        r.GetAll(ranges, header.num_ranges, limit);
+-        r.GetAll(fastmem, header.num_fastmem, limit);
+-        r.GetAll(dnf, header.num_dnf, limit);
+-        r.GetAll(bwf, header.num_bwf, limit);
+-        const u64 expected = r.hash;
+-        u64 trailer = 0;
+-        r.Get(&trailer, sizeof(trailer));
+-
+-        bool good = r.ok && trailer == expected;
+-        const auto in_image = [&](u64 offset, u64 size) {
+-            return (offset >= saved.prelude_end && offset + size <= saved.hot_end) ||
+-                   (offset >= saved.cold_low && offset + size <= saved.total);
+-        };
+-        for (size_t i = 0; good && i < relocs.size(); ++i)
+-            good = relocs[i].kind < objects.size() && relocs[i].addend < objects[relocs[i].kind].second && in_image(relocs[i].offset, 8);
+-        for (size_t i = 0; good && i < sites.size(); ++i)
+-            good = sites[i].type < 4 && in_image(sites[i].offset, 1);
+-        for (size_t i = 0; good && i < blocks.size(); ++i)
+-            good = in_image(blocks[i].entry, blocks[i].size) && u64(blocks[i].first_range) + blocks[i].range_count <= ranges.size() &&
+-                   (i == 0 || blocks[i - 1].descriptor < blocks[i].descriptor);
+-        for (size_t i = 0; good && i < fastmem.size(); ++i)
+-            good = in_image(fastmem[i].rip, 1) && in_image(fastmem[i].resume, 0);
+-        if (!good || !block_of_code.GetConstantPool().Restore(constants) || !block_of_code.SetCacheLayout(saved)) {
+-            block_of_code.ClearCache();
+-            block_of_code.DisableWriting();
+-            return fail(good ? "its constants don't fit" : "a damaged file");
+-        }
+-
+-        for (const CacheReloc& reloc : relocs) {
+-            const u64 value = objects[reloc.kind].first + reloc.addend;
+-            std::memcpy(base + reloc.offset, &value, 8);
+-        }
+-        // every link undone (the saved blocks register when looked up, and are linked then)
+-        for (const CacheSite& site : sites) {
+-            auto& info = emitter.patch_information[IR::LocationDescriptor{site.target}];
+-            const CodePtr location = base + site.offset;
+-            switch (site.type) {
+-            case 0: info.jg.push_back(location); break;
+-            case 1: info.jz.push_back(location); break;
+-            case 2: info.jmp.push_back(location); break;
+-            default: info.mov_rcx.push_back(location); break;
+-            }
+-        }
+-        for (const auto& [target, info] : emitter.patch_information)
+-            emitter.Patch(target, nullptr);
+-        for (const CacheFastmem& entry : fastmem) {
+-            emitter.fastmem_patch_info.emplace(reinterpret_cast<u64>(base) + entry.rip,
+-                                               A32EmitX64::FastmemPatchInfo{
+-                                                   reinterpret_cast<u64>(base) + entry.resume, entry.callback,
+-                                                   std::make_tuple(IR::LocationDescriptor{entry.marker_descriptor}, unsigned(entry.marker_name)),
+-                                                   entry.recompile != 0, entry.base});
+-        }
+-        for (const CacheMarker& marker : dnf)
+-            emitter.do_not_fastmem.insert(std::make_tuple(IR::LocationDescriptor{marker.descriptor}, unsigned(marker.name)));
+-        for (const CacheMarker& marker : bwf)
+-            emitter.blocks_without_fastmem.insert(IR::LocationDescriptor{marker.descriptor});
+-        emitter.stack_walks = header.stack_walks != 0;
+-        emitter.thread_local_walks = header.thread_local_walks != 0;
+-        emitter.stack_declines = header.stack_declines;
+-        block_of_code.DisableWriting();
+-
+-        cache_pending = std::move(blocks);
+-        cache_pending_ranges = std::move(ranges);
+-        cache_use = {};
+-        cache_use.loaded = cache_pending.size();
+-        ::Common::PS4Perf::jit_cache_loaded[conf.processor_id & 3].store(cache_pending.size(), std::memory_order_relaxed);
+-        ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+-            u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+-        return true;
+-    }
+-
+-    // A saved block for this location, if its guest code is still what it was
+-    std::optional<A32EmitX64::BlockDescriptor> UseSavedBlock(IR::LocationDescriptor descriptor) {
+-        const auto it = std::lower_bound(cache_pending.begin(), cache_pending.end(), descriptor.Value(),
+-                                         [](const CachePendingBlock& block, u64 value) { return block.descriptor < value; });
+-        if (it == cache_pending.end() || it->descriptor != descriptor.Value() || it->state != 0)
+-            return std::nullopt;
+-        const auto ranges = std::span(cache_pending_ranges).subspan(it->first_range, it->range_count);
+-        if (CacheHashGuestCode(ranges) != it->code_hash) {
+-            it->state = 2;
+-            ++cache_use.stale;
+-            ::Common::PS4Perf::jit_cache_stale[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+-            return std::nullopt;
+-        }
+-        it->state = 1;
+-        ++cache_use.used;
+-        ::Common::PS4Perf::jit_cache_used[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+-        const CodePtr entrypoint = block_of_code.CacheBase() + it->entry;
+-        for (const auto& [start, end] : ranges)
+-            emitter.block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(start, end - 1), descriptor);
+-        block_of_code.EnableWriting();
+-        emitter.Patch(descriptor, entrypoint);
+-        block_of_code.DisableWriting();
+-        const A32EmitX64::BlockDescriptor block{entrypoint, it->size};
+-        emitter.block_descriptors.insert({descriptor, block});
+-        const u32 pc = A32::LocationDescriptor{descriptor}.PC();
+-        size_t pc_span = 0;
+-        for (const auto& [start, end] : ranges)
+-            if (start <= pc && pc < end)
+-                pc_span = end - pc;
+-        Ps4BlockMap::Register(block_of_code.getCode(), entrypoint, it->size, descriptor.Value(), pc_span);
+-        return block;
++        return code_cache.Load(read, why, CacheBuildHash(), CacheConfigHash(), CacheObjects());
+     }
+ 
+ private:
+@@ -741,8 +302,8 @@ private:
+         if (auto block = emitter.GetBasicBlock(descriptor))
+             return *block;
+         // (PS4 04.17) from a loaded code cache, if it has it and its guest code is the same
+-        if (!cache_pending.empty()) {
+-            if (auto block = UseSavedBlock(descriptor))
++        if (code_cache.HasPending()) {
++            if (auto block = code_cache.Use(descriptor))
+                 return *block;
+         }
+ 
+@@ -813,8 +374,7 @@ private:
+                 ::Common::PS4Perf::jit_core_full_flushes[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+                 block_of_code.ClearCache();
+                 emitter.ClearCache();
+-                cache_pending.clear();  // (PS4 04.17) the loaded code went with the rest
+-                cache_pending_ranges.clear();
++                code_cache.Clear();  // (PS4 04.17) the loaded code went with the rest
+             } else {
+                 ::Common::PS4Perf::jit_range_flushes.fetch_add(1, std::memory_order_relaxed);
+                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
+@@ -837,6 +397,13 @@ private:
+     bool invalidate_entire_cache = false;
+     boost::icl::interval_set<u32> invalid_cache_ranges;
+     std::mutex invalidation_mutex;
++
++public:
++    // (PS4 04.17) after conf and the emitter, which it uses
++    CodeCache code_cache{block_of_code, emitter,
++                         [this](u32 address) { return conf.callbacks->MemoryReadCode(address); },
++                         [](IR::LocationDescriptor descriptor) { return A32::LocationDescriptor{descriptor}.PC(); },
++                         conf.processor_id};
+ };
+ 
+ Jit::Jit(UserConfig conf)
+@@ -921,7 +488,8 @@ bool Jit::LoadCodeCache(const std::function<bool(void* data, std::size_t size)>&
+ }
+ 
+ Jit::CodeCacheUse Jit::GetCodeCacheUse() const {
+-    return impl->cache_use;
++    const auto& counts = impl->code_cache.counts;
++    return {counts.loaded, counts.used, counts.stale};
+ }
+ 
+ }  // namespace Dynarmic::A32
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 68878681ab..85c2fd7718 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include <chrono>
+ #include <cstring>
++#include <functional>
++#include <string>
+ #include <memory>
+ #include <mutex>
+ 
+@@ -22,7 +24,9 @@
+ #include "dynarmic/backend/x64/a64_jitstate.h"
+ #include "dynarmic/backend/x64/block_of_code.h"
+ #include "dynarmic/backend/x64/devirtualize.h"
++#include "dynarmic/backend/x64/jit_code_cache.h"
+ #include "dynarmic/backend/x64/jitstate_info.h"
++#include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/common/atomic.h"
+ #include "dynarmic/frontend/A64/translate/a64_translate.h"
+ #include "dynarmic/interface/A64/a64.h"
+@@ -246,6 +250,11 @@ private:
+     CodePtr GetBlock(IR::LocationDescriptor descriptor) {
+         if (auto block = emitter.GetBasicBlock(descriptor))
+             return block->entrypoint;
++        // (PS4 04.18) from a loaded code cache, if it has it and its guest code is the same
++        if (code_cache.HasPending()) {
++            if (auto block = code_cache.Use(descriptor))
++                return block->entrypoint;
++        }
+ 
+         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
+         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
+@@ -267,12 +276,118 @@ private:
+         const auto entrypoint = emitter.Emit(ir_block).entrypoint;
+         ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+             u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+-        ::Common::PS4Perf::jit_compile_ns.fetch_add(
+-            u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count()),
+-            std::memory_order_relaxed);
++        {
++            const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compile_start).count());
++            ::Common::PS4Perf::jit_compile_ns.fetch_add(ns, std::memory_order_relaxed);
++            // (04.18) per core, as the A32 JIT's
++            ::Common::PS4Perf::jit_core_compile_ns[conf.processor_id & 3].fetch_add(ns, std::memory_order_relaxed);
++            ::Common::PS4Perf::jit_core_blocks[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
++        }
+         return entrypoint;
+     }
+ 
++    // ---- (PS4 04.18) Persistent code cache: backend/x64/jit_code_cache.h; here what's A64's
++    using CodeCache = JitCodeCache<A64EmitX64, u64>;
++
++    // The build: this file's compile time and the sizes the image relies on
++    static u64 CacheBuildHash() {
++        u64 h = 0;
++        for (const char* p = __DATE__ " " __TIME__ " a64"; *p; ++p)
++            h = CodeCache::Mix(h, u8(*p));
++        h = CodeCache::Mix(h, sizeof(Impl));
++        h = CodeCache::Mix(h, sizeof(A64JitState));
++        h = CodeCache::Mix(h, sizeof(A64EmitX64));
++        return h;
++    }
++
++    u64 CacheConfigHash() const {
++        u64 h = 0;
++        auto add = [&](u64 v) { h = CodeCache::Mix(h, v); };
++        add(u64(conf.optimizations));
++        add(conf.page_table != nullptr);
++        add(conf.global_monitor != nullptr);
++        add(conf.tpidr_el0 != nullptr);
++        add(conf.tpidrro_el0 != nullptr);
++        add(conf.fastmem_pointer.has_value());
++        add(conf.code_cache_size);
++        add(conf.page_table_address_space_bits);
++        add(conf.page_table_pointer_mask);
++        add(conf.page_table_log2_stride);
++        add(conf.page_table_marked_bit ? 0x100u | *conf.page_table_marked_bit : 0);
++        add(conf.page_table_marked_bit_reads);
++        add(conf.page_table_sign_extension ? 0x100u | *conf.page_table_sign_extension : 0);
++        add(conf.cntfrq_el0);
++        add(conf.ctr_el0);
++        add(conf.dczid_el0);
++        add(conf.fastmem_address_space_bits);
++        add(conf.detect_misaligned_access_via_page_table);
++        add(conf.processor_id);
++        add(conf.unsafe_optimizations);
++        add(conf.hook_data_cache_operations);
++        add(conf.hook_isb);
++        add(conf.hook_hint_instructions);
++        add(conf.silently_mirror_page_table);
++        add(conf.absolute_offset_page_table);
++        add(conf.only_detect_misalignment_via_page_table_on_page_boundary);
++        add(conf.recompile_on_fastmem_failure);
++        add(conf.silently_mirror_fastmem);
++        add(conf.fastmem_exclusive_access);
++        add(conf.recompile_on_exclusive_fastmem_failure);
++        add(conf.define_unpredictable_behaviour);
++        add(conf.wall_clock_cntpct);
++        add(conf.check_halt_on_memory_access);
++        add(conf.page_table_inline_exclusives);
++        add(conf.page_table_shared_walk);
++        add(conf.jit_frame_pointer);
++        add(conf.link_forward_without_halt_check);
++        add(conf.inline_rsb_pop);
++        add(conf.inline_fast_dispatch);
++        add(conf.enable_cycle_counting);
++        add(conf.code_cache_objects.size());
++        for (const auto& object : conf.code_cache_objects)
++            add(object.second);
++        u64 features = 0;
++        for (u32 bit = 0; bit < 64; ++bit)
++            features |= block_of_code.HasHostFeature(static_cast<HostFeature>(u64{1} << bit)) ? u64{1} << bit : 0;
++        add(features);
++        return h;
++    }
++
++    // The objects the code may point into, in a fixed order (their sizes must match at load)
++    std::vector<std::pair<u64, u64>> CacheObjects() const {
++        std::vector<std::pair<u64, u64>> objects;
++        for (const auto& [pointer, size] : conf.code_cache_objects)
++            objects.emplace_back(reinterpret_cast<u64>(pointer), u64(size));
++        objects.emplace_back(reinterpret_cast<u64>(this), u64(sizeof(*this)));
++        if (conf.page_table) {
++            const u64 entries = u64{1} << (std::min<u32>(conf.page_table_address_space_bits, 48) - 12);
++            objects.emplace_back(reinterpret_cast<u64>(conf.page_table), entries * sizeof(void*));
++        }
++        if (conf.global_monitor)
++            objects.emplace_back(reinterpret_cast<u64>(conf.global_monitor), u64(sizeof(ExclusiveMonitor)));
++        objects.emplace_back(reinterpret_cast<u64>(conf.callbacks), u64(1));
++        if (conf.tpidr_el0)
++            objects.emplace_back(reinterpret_cast<u64>(conf.tpidr_el0), u64(sizeof(*conf.tpidr_el0)));
++        if (conf.tpidrro_el0)
++            objects.emplace_back(reinterpret_cast<u64>(conf.tpidrro_el0), u64(sizeof(*conf.tpidrro_el0)));
++        if (conf.fastmem_pointer)
++            objects.emplace_back(u64(*conf.fastmem_pointer), u64(1));
++        return objects;
++    }
++
++public:
++    bool SaveCodeCache(const std::function<bool(const void*, std::size_t)>& write) {
++        ASSERT(!is_executing);
++        PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
++        return code_cache.Save(write, CacheBuildHash(), CacheConfigHash(), CacheObjects());
++    }
++
++    bool LoadCodeCache(const std::function<bool(void*, std::size_t)>& read, std::string* why) {
++        ASSERT(!is_executing);
++        return code_cache.Load(read, why, CacheBuildHash(), CacheConfigHash(), CacheObjects());
++    }
++
++private:
+     void PerformRequestedCacheInvalidation(HaltReason hr) {
+         if (Has(hr, HaltReason::CacheInvalidation)) {
+             std::unique_lock lock{invalidation_mutex};
+@@ -289,6 +404,7 @@ private:
+                 ::Common::PS4Perf::jit_core_full_flushes[conf.processor_id & 3].fetch_add(1, std::memory_order_relaxed);
+                 block_of_code.ClearCache();
+                 emitter.ClearCache();
++                code_cache.Clear();  // (PS4 04.18) the loaded code went with the rest
+             } else {
+                 ::Common::PS4Perf::jit_range_flushes.fetch_add(1, std::memory_order_relaxed);
+                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
+@@ -308,6 +424,13 @@ private:
+     bool invalidate_entire_cache = false;
+     boost::icl::interval_set<u64> invalid_cache_ranges;
+     std::mutex invalidation_mutex;
++
++public:
++    // (PS4 04.18) after conf and the emitter, which it uses
++    CodeCache code_cache{block_of_code, emitter,
++                         [this](u64 address) { return conf.callbacks->MemoryReadCode(address); },
++                         [](IR::LocationDescriptor descriptor) { return A64::LocationDescriptor{descriptor}.PC(); },
++                         conf.processor_id};
+ };
+ 
+ Jit::Jit(UserConfig conf)
+@@ -427,4 +550,17 @@ std::string Jit::Disassemble() const {
+     return impl->Disassemble();
+ }
+ 
++bool Jit::SaveCodeCache(const std::function<bool(const void* data, std::size_t size)>& write) {
++    return impl->SaveCodeCache(write);
++}
++
++bool Jit::LoadCodeCache(const std::function<bool(void* data, std::size_t size)>& read, std::string* why) {
++    return impl->LoadCodeCache(read, why);
++}
++
++Jit::CodeCacheUse Jit::GetCodeCacheUse() const {
++    const auto& counts = impl->code_cache.counts;
++    return {counts.loaded, counts.used, counts.stale};
++}
++
+ }  // namespace Dynarmic::A64
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h b/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+new file mode 100644
+index 0000000000..16bf47defd
+--- /dev/null
++++ b/src/dynarmic/src/dynarmic/backend/x64/jit_code_cache.h
+@@ -0,0 +1,515 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// (PS4 04.17, both JITs from 04.18) A persistent code cache. The whole code image (the blocks,
++// their cold code, the constants they placed) is saved with what dynarmic keeps about it, and put
++// back at the same addresses in a later run: same build, same configuration, the code cache at the
++// same address. Pointers in the code into objects that move between runs (the JIT, the callbacks,
++// the monitor, the coprocessors, the system registers and what the embedder lists in
++// code_cache_objects) are found by scanning the code at save time and set to where those objects
++// are when it loads. Every link between blocks is undone at load; a saved block is registered when
++// first looked up, if its guest code (its range, and the code its flags look-ahead read) hashes as
++// it did, and links are made again as blocks register.
++
++#include <algorithm>
++#include <cstring>
++#include <functional>
++#include <optional>
++#include <span>
++#include <string>
++#include <tuple>
++#include <vector>
++
++#include <boost/icl/interval_map.hpp>
++
++#include "common/common_types.h"
++#include "common/ps4_perf.h"
++#include "dynarmic/backend/x64/block_of_code.h"
++#include "dynarmic/backend/x64/emit_x64.h"
++#include "dynarmic/backend/x64/ps4_block_map.h"
++#include "dynarmic/ir/location_descriptor.h"
++
++namespace Dynarmic::Backend::X64 {
++
++struct CodeCacheCounts {
++    std::size_t loaded = 0, used = 0, stale = 0;
++};
++
++/// Emitter: A32EmitX64 or A64EmitX64. Address: the guest's (u32, u64). ReadCode: the guest code's
++/// word at an address (the callbacks' MemoryReadCode). PcOf: a location's guest PC.
++template<typename Emitter, typename Address>
++class JitCodeCache {
++public:
++    using ReadCode = std::function<std::optional<u32>(Address)>;
++    using PcOf = Address (*)(IR::LocationDescriptor);
++
++    JitCodeCache(BlockOfCode& code_, Emitter& emitter_, ReadCode read_code_, PcOf pc_of_, unsigned processor_id_)
++        : code{code_}, emitter{emitter_}, read_code{std::move(read_code_)}, pc_of{pc_of_}, processor_id{processor_id_ & 3} {}
++
++    CodeCacheCounts counts;
++
++    bool HasPending() const noexcept {
++        return !pending.empty();
++    }
++
++    /// The whole cache went (a full flush): the loaded code with it
++    void Clear() {
++        pending.clear();
++        pending_ranges.clear();
++    }
++
++    // build_hash: the build (its compile time and the sizes the image relies on); config_hash:
++    // the JIT's configuration; objects: what the code may point into, in a fixed order
++    bool Save(const std::function<bool(const void*, std::size_t)>& write, u64 build_hash, u64 config_hash,
++              const std::vector<std::pair<u64, u64>>& objects) {
++        const u8* const base = code.CacheBase();
++        const auto layout = code.GetCacheLayout();
++
++        std::vector<Reloc> relocs;
++        const auto add_relocs = [&](size_t from, size_t to) {
++            Scan(base + from, base + to, objects, [&](const u8* p, u32 kind, u64 addend) {
++                relocs.push_back({u32(p - base), kind, addend});
++            });
++        };
++        add_relocs(layout.prelude_end, layout.hot_end);
++        add_relocs(layout.cold_low, layout.total);
++
++        std::vector<Site> sites;
++        for (const auto& [target, info] : emitter.patch_information) {
++            const auto add = [&](const auto& list, u32 type) {
++                for (const CodePtr site : list)
++                    sites.push_back({target.Value(), u32(static_cast<const u8*>(site) - base), type});
++            };
++            add(info.jg, 0);
++            add(info.jz, 1);
++            add(info.jmp, 2);
++            add(info.mov_rcx, 3);
++        }
++
++        // each block's guest ranges (its code and its look-ahead), from the invalidation map
++        std::vector<std::tuple<u64, u64, u64>> block_ranges;  // descriptor, start, end
++        for (const auto& [interval, descriptors] : emitter.block_ranges.block_ranges) {
++            const Address first = boost::icl::first(interval), last = boost::icl::last(interval);
++            if (last == Address(~Address{0}))
++                continue;  // (none ends there: an end past the address space doesn't fit)
++            for (const auto& descriptor : descriptors)
++                block_ranges.emplace_back(descriptor.Value(), u64(first), u64(last) + 1);
++        }
++        std::sort(block_ranges.begin(), block_ranges.end());
++        std::vector<Pending> blocks;
++        std::vector<std::pair<u64, u64>> ranges;
++        for (size_t i = 0; i < block_ranges.size();) {
++            const u64 descriptor = std::get<0>(block_ranges[i]);
++            const size_t first_range = ranges.size();
++            for (; i < block_ranges.size() && std::get<0>(block_ranges[i]) == descriptor; ++i)
++                ranges.emplace_back(std::get<1>(block_ranges[i]), std::get<2>(block_ranges[i]));
++            const auto it = emitter.block_descriptors.find(IR::LocationDescriptor{descriptor});
++            if (it == emitter.block_descriptors.end()) {
++                ranges.resize(first_range);
++                continue;
++            }
++            const auto span = std::span(ranges).subspan(first_range);
++            blocks.push_back({descriptor, u32(static_cast<const u8*>(it->second.entrypoint) - base), u32(it->second.size),
++                              u32(first_range), u32(span.size()), HashGuestCode(span), 0, 0});
++        }
++
++        std::vector<Fastmem> fastmem;
++        for (const auto& [rip, info] : emitter.fastmem_patch_info) {
++            fastmem.push_back({u32(rip - reinterpret_cast<u64>(base)), u32(info.resume_rip - reinterpret_cast<u64>(base)), info.callback,
++                               std::get<0>(info.marker).Value(), u32(std::get<1>(info.marker)), u8(info.recompile), info.base, {}});
++        }
++        std::vector<Marker> dnf, bwf;
++        for (const auto& marker : emitter.do_not_fastmem)
++            dnf.push_back({std::get<0>(marker).Value(), u64(std::get<1>(marker))});
++        for (const auto& descriptor : emitter.blocks_without_fastmem)
++            bwf.push_back({descriptor.Value(), 0});
++
++        const auto constants = code.GetConstantPool().Used();
++        std::vector<u64> kind_sizes;
++        for (const auto& object : objects)
++            kind_sizes.push_back(object.second);
++
++        Header header{};
++        header.magic = MAGIC;
++        header.version = VERSION;
++        header.header_size = sizeof(Header);
++        header.build_hash = build_hash;
++        header.config_hash = config_hash;
++        header.base = reinterpret_cast<u64>(base);
++        header.prelude_end = layout.prelude_end;
++        header.hot_end = layout.hot_end;
++        header.cold_low = layout.cold_low;
++        header.cold_ptr = layout.cold_ptr;
++        header.cold_end = layout.cold_end;
++        header.total = layout.total;
++        header.prelude_hash = PreludeHash(objects);
++        header.num_kinds = kind_sizes.size();
++        header.num_constants = constants.size();
++        header.num_relocs = relocs.size();
++        header.num_sites = sites.size();
++        header.num_blocks = blocks.size();
++        header.num_ranges = ranges.size();
++        header.num_fastmem = fastmem.size();
++        header.num_dnf = dnf.size();
++        header.num_bwf = bwf.size();
++        header.stack_walks = emitter.stack_walks;
++        header.thread_local_walks = emitter.thread_local_walks;
++        header.stack_declines = emitter.stack_declines;
++
++        Writer w{write};
++        w.Put(&header, sizeof(header));
++        w.PutAll(kind_sizes);
++        w.Put(constants.data(), constants.size_bytes());
++        w.Put(base + layout.prelude_end, layout.hot_end - layout.prelude_end);
++        w.Put(base + layout.cold_low, layout.total - layout.cold_low);
++        w.PutAll(relocs);
++        w.PutAll(sites);
++        w.PutAll(blocks);
++        w.PutAll(ranges);
++        w.PutAll(fastmem);
++        w.PutAll(dnf);
++        w.PutAll(bwf);
++        const u64 trailer = w.hash;
++        w.Put(&trailer, sizeof(trailer));
++        return w.ok;
++    }
++
++    bool Load(const std::function<bool(void*, std::size_t)>& read, std::string* why, u64 build_hash, u64 config_hash,
++              const std::vector<std::pair<u64, u64>>& objects) {
++        const auto fail = [&](const char* reason) {
++            if (why)
++                *why = reason;
++            return false;
++        };
++        if (!emitter.block_descriptors.empty() || !pending.empty())
++            return fail("blocks already translated");
++        u8* const base = code.CacheBase();
++        const auto layout = code.GetCacheLayout();
++
++        Reader r{read};
++        Header header{};
++        r.Get(&header, sizeof(header));
++        if (!r.ok)
++            return fail("can't read its header");
++        if (header.magic != MAGIC || header.version != VERSION || header.header_size != sizeof(Header))
++            return fail("another format");
++        if (header.build_hash != build_hash)
++            return fail("another build");
++        if (header.config_hash != config_hash)
++            return fail("another configuration");
++        if (header.base != reinterpret_cast<u64>(base))
++            return fail("the code cache at another address");
++        if (header.total != layout.total || header.prelude_end != layout.prelude_end || layout.hot_end != layout.prelude_end)
++            return fail("another code cache layout");
++        if (header.num_kinds != objects.size())
++            return fail("other objects");
++        if (header.prelude_hash != PreludeHash(objects))
++            return fail("another prelude");
++        BlockOfCode::CacheLayout saved;
++        saved.prelude_end = header.prelude_end;
++        saved.hot_end = header.hot_end;
++        saved.cold_low = header.cold_low;
++        saved.cold_ptr = header.cold_ptr;
++        saved.cold_end = header.cold_end;
++        saved.total = header.total;
++        if (saved.hot_end < saved.prelude_end || saved.hot_end > saved.cold_low || saved.cold_low > saved.cold_ptr ||
++            saved.cold_ptr > saved.cold_end || saved.cold_end > saved.total)
++            return fail("a bad layout");
++
++        std::vector<u64> kind_sizes;
++        r.GetAll(kind_sizes, header.num_kinds, 1024);
++        for (size_t k = 0; r.ok && k < kind_sizes.size(); ++k) {
++            if (kind_sizes[k] != objects[k].second)
++                return fail("objects of other sizes");
++        }
++        std::vector<std::pair<u64, u64>> constants;
++        r.GetAll(constants, header.num_constants, u64{1} << 24);
++
++        // the code, straight into the cache (put back as it was if the rest doesn't check out)
++        code.EnableWriting();
++        r.Get(base + saved.prelude_end, saved.hot_end - saved.prelude_end);
++        r.Get(base + saved.cold_low, saved.total - saved.cold_low);
++
++        std::vector<Reloc> relocs;
++        std::vector<Site> sites;
++        std::vector<Pending> blocks;
++        std::vector<std::pair<u64, u64>> ranges;
++        std::vector<Fastmem> fastmem;
++        std::vector<Marker> dnf, bwf;
++        const u64 limit = u64{1} << 28;
++        r.GetAll(relocs, header.num_relocs, limit);
++        r.GetAll(sites, header.num_sites, limit);
++        r.GetAll(blocks, header.num_blocks, limit);
++        r.GetAll(ranges, header.num_ranges, limit);
++        r.GetAll(fastmem, header.num_fastmem, limit);
++        r.GetAll(dnf, header.num_dnf, limit);
++        r.GetAll(bwf, header.num_bwf, limit);
++        const u64 expected = r.hash;
++        u64 trailer = 0;
++        r.Get(&trailer, sizeof(trailer));
++
++        bool good = r.ok && trailer == expected;
++        const auto in_image = [&](u64 offset, u64 size) {
++            return (offset >= saved.prelude_end && offset + size <= saved.hot_end) ||
++                   (offset >= saved.cold_low && offset + size <= saved.total);
++        };
++        for (size_t i = 0; good && i < relocs.size(); ++i)
++            good = relocs[i].kind < objects.size() && relocs[i].addend < objects[relocs[i].kind].second && in_image(relocs[i].offset, 8);
++        for (size_t i = 0; good && i < sites.size(); ++i)
++            good = sites[i].type < 4 && in_image(sites[i].offset, 1);
++        for (size_t i = 0; good && i < blocks.size(); ++i)
++            good = in_image(blocks[i].entry, blocks[i].size) && u64(blocks[i].first_range) + blocks[i].range_count <= ranges.size() &&
++                   (i == 0 || blocks[i - 1].descriptor < blocks[i].descriptor);
++        for (size_t i = 0; good && i < ranges.size(); ++i)
++            good = ranges[i].first < ranges[i].second && ranges[i].second - 1 <= u64(Address(~Address{0}));
++        for (size_t i = 0; good && i < fastmem.size(); ++i)
++            good = in_image(fastmem[i].rip, 1) && in_image(fastmem[i].resume, 0);
++        if (!good || !code.GetConstantPool().Restore(constants) || !code.SetCacheLayout(saved)) {
++            code.ClearCache();
++            code.DisableWriting();
++            return fail(good ? "its constants don't fit" : "a damaged file");
++        }
++
++        for (const Reloc& reloc : relocs) {
++            const u64 value = objects[reloc.kind].first + reloc.addend;
++            std::memcpy(base + reloc.offset, &value, 8);
++        }
++        // every link undone (the saved blocks register when looked up, and are linked then)
++        for (const Site& site : sites) {
++            auto& info = emitter.patch_information[IR::LocationDescriptor{site.target}];
++            const CodePtr location = base + site.offset;
++            switch (site.type) {
++            case 0: info.jg.push_back(location); break;
++            case 1: info.jz.push_back(location); break;
++            case 2: info.jmp.push_back(location); break;
++            default: info.mov_rcx.push_back(location); break;
++            }
++        }
++        for (const auto& [target, info] : emitter.patch_information)
++            emitter.Patch(target, nullptr);
++        for (const Fastmem& entry : fastmem) {
++            emitter.fastmem_patch_info.emplace(reinterpret_cast<u64>(base) + entry.rip,
++                                               typename Emitter::FastmemPatchInfo{
++                                                   reinterpret_cast<u64>(base) + entry.resume, entry.callback,
++                                                   std::make_tuple(IR::LocationDescriptor{entry.marker_descriptor}, unsigned(entry.marker_name)),
++                                                   entry.recompile != 0, entry.base});
++        }
++        for (const Marker& marker : dnf)
++            emitter.do_not_fastmem.insert(std::make_tuple(IR::LocationDescriptor{marker.descriptor}, unsigned(marker.name)));
++        for (const Marker& marker : bwf)
++            emitter.blocks_without_fastmem.insert(IR::LocationDescriptor{marker.descriptor});
++        emitter.stack_walks = header.stack_walks != 0;
++        emitter.thread_local_walks = header.thread_local_walks != 0;
++        emitter.stack_declines = header.stack_declines;
++        code.DisableWriting();
++
++        pending = std::move(blocks);
++        pending_ranges = std::move(ranges);
++        counts = {};
++        counts.loaded = pending.size();
++        ::Common::PS4Perf::jit_cache_loaded[processor_id].store(pending.size(), std::memory_order_relaxed);
++        ::Common::PS4Perf::jit_cache_free_kib[processor_id].store(u32(code.SpaceRemaining() >> 10), std::memory_order_relaxed);
++        return true;
++    }
++
++    /// A saved block for this location, if its guest code is still what it was
++    std::optional<EmitX64::BlockDescriptor> Use(IR::LocationDescriptor descriptor) {
++        const auto it = std::lower_bound(pending.begin(), pending.end(), descriptor.Value(),
++                                         [](const Pending& block, u64 value) { return block.descriptor < value; });
++        if (it == pending.end() || it->descriptor != descriptor.Value() || it->state != 0)
++            return std::nullopt;
++        const auto ranges = std::span(pending_ranges).subspan(it->first_range, it->range_count);
++        if (HashGuestCode(ranges) != it->code_hash) {
++            it->state = 2;
++            ++counts.stale;
++            ::Common::PS4Perf::jit_cache_stale[processor_id].fetch_add(1, std::memory_order_relaxed);
++            return std::nullopt;
++        }
++        it->state = 1;
++        ++counts.used;
++        ::Common::PS4Perf::jit_cache_used[processor_id].fetch_add(1, std::memory_order_relaxed);
++        const CodePtr entrypoint = code.CacheBase() + it->entry;
++        for (const auto& [start, end] : ranges)
++            emitter.block_ranges.AddRange(boost::icl::discrete_interval<Address>::closed(Address(start), Address(end - 1)), descriptor);
++        code.EnableWriting();
++        emitter.Patch(descriptor, entrypoint);
++        code.DisableWriting();
++        const EmitX64::BlockDescriptor block{entrypoint, it->size};
++        emitter.block_descriptors.insert({descriptor, block});
++        const u64 pc = u64(pc_of(descriptor));
++        size_t pc_span = 0;
++        for (const auto& [start, end] : ranges)
++            if (start <= pc && pc < end)
++                pc_span = size_t(end - pc);
++        Ps4BlockMap::Register(code.getCode(), entrypoint, it->size, descriptor.Value(), pc_span);
++        return block;
++    }
++
++    static u64 Mix(u64 h, u64 v) {
++        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
++        h *= 0xBF58476D1CE4E5B9ull;
++        return h ^ (h >> 31);
++    }
++
++private:
++    struct Pending {
++        u64 descriptor;
++        u32 entry, size;  // from the cache's start
++        u32 first_range, range_count;
++        u64 code_hash;
++        u32 state;  // 0 not looked up yet, 1 used, 2 stale
++        u32 pad;
++    };
++    static_assert(sizeof(Pending) == 40);
++
++    static constexpr u64 MAGIC = 0x3230434A4E454445ull;  // "EDENJC02"
++    static constexpr u32 VERSION = 2;
++
++    struct Header {
++        u64 magic;
++        u32 version, header_size;
++        u64 build_hash, config_hash;
++        u64 base;  // the code cache's address
++        u64 prelude_end, hot_end, cold_low, cold_ptr, cold_end, total;
++        u64 prelude_hash;
++        u64 num_kinds, num_constants, num_relocs, num_sites, num_blocks, num_ranges, num_fastmem, num_dnf, num_bwf;
++        u32 stack_walks, thread_local_walks, stack_declines, pad;
++    };
++    struct Reloc {
++        u32 offset, kind;
++        u64 addend;
++    };
++    struct Site {
++        u64 target;
++        u32 offset, type;  // 0 jg, 1 jz, 2 jmp, 3 mov rcx
++    };
++    struct Fastmem {
++        u32 rip, resume;
++        u64 callback;
++        u64 marker_descriptor;
++        u32 marker_name;
++        u8 recompile, base, pad[2];
++    };
++    struct Marker {
++        u64 descriptor;
++        u64 name;
++    };
++
++    static std::optional<std::pair<u32, u64>> FindObject(const std::vector<std::pair<u64, u64>>& objects, u64 value) {
++        for (u32 k = 0; k < objects.size(); ++k) {
++            if (value - objects[k].first < objects[k].second)
++                return std::make_pair(k, value - objects[k].first);
++        }
++        return std::nullopt;
++    }
++
++    // Each 8 bytes in [begin, end) holding a pointer into one of the objects
++    template<typename F>
++    static void Scan(const u8* begin, const u8* end, const std::vector<std::pair<u64, u64>>& objects, F&& found) {
++        u64 low = ~u64{0}, high = 0;
++        for (const auto& [pointer, size] : objects) {
++            low = std::min(low, pointer);
++            high = std::max(high, pointer + size);
++        }
++        for (const u8* p = begin; p + 8 <= end; ++p) {
++            u64 value;
++            std::memcpy(&value, p, 8);
++            if (value < low || value >= high)
++                continue;
++            if (const auto hit = FindObject(objects, value)) {
++                found(p, hit->first, hit->second);
++                p += 7;
++            }
++        }
++    }
++
++    // The prelude without what changes between runs (pointers into the objects, the constants)
++    u64 PreludeHash(const std::vector<std::pair<u64, u64>>& objects) {
++        const u8* const base = code.CacheBase();
++        const auto layout = code.GetCacheLayout();
++        const auto constants = code.GetConstantPool().Area();
++        std::vector<u8> prelude(base, base + layout.prelude_end);
++        std::memset(prelude.data() + (constants.data() - base), 0, constants.size());
++        Scan(prelude.data(), prelude.data() + prelude.size(), objects, [&](const u8* p, u32, u64) {
++            std::memset(prelude.data() + (p - prelude.data()), 0, 8);
++        });
++        u64 h = 0;
++        for (size_t i = 0; i + 8 <= prelude.size(); i += 8) {
++            u64 v;
++            std::memcpy(&v, prelude.data() + i, 8);
++            h = Mix(h, v);
++        }
++        return Mix(h, prelude.size());
++    }
++
++    u64 HashGuestCode(std::span<const std::pair<u64, u64>> ranges) {
++        u64 h = 0;
++        for (const auto& [start, end] : ranges) {
++            h = Mix(h, start);
++            h = Mix(h, end);
++            for (u64 address = start & ~u64{3}; address < end; address += 4) {
++                const auto word = read_code(Address(address));
++                h = Mix(h, word ? (u64(*word) | (u64{1} << 32)) : 0);
++            }
++        }
++        return h;
++    }
++
++    struct Writer {
++        const std::function<bool(const void*, std::size_t)>& write;
++        u64 hash = 0;
++        bool ok = true;
++        void Put(const void* data, size_t size) {
++            if (!ok || size == 0)
++                return;
++            const u8* p = static_cast<const u8*>(data);
++            for (size_t i = 0; i < size; i += 8) {
++                u64 v = 0;
++                std::memcpy(&v, p + i, std::min<size_t>(8, size - i));
++                hash = Mix(hash, v);
++            }
++            ok = write(data, size);
++        }
++        template<typename T>
++        void PutAll(const std::vector<T>& v) { Put(v.data(), v.size() * sizeof(T)); }
++    };
++    struct Reader {
++        const std::function<bool(void*, std::size_t)>& read;
++        u64 hash = 0;
++        bool ok = true;
++        void Get(void* data, size_t size) {
++            if (!ok || size == 0)
++                return;
++            ok = read(data, size);
++            if (!ok)
++                return;
++            const u8* p = static_cast<const u8*>(data);
++            for (size_t i = 0; i < size; i += 8) {
++                u64 v = 0;
++                std::memcpy(&v, p + i, std::min<size_t>(8, size - i));
++                hash = Mix(hash, v);
++            }
++        }
++        template<typename T>
++        void GetAll(std::vector<T>& v, u64 count, u64 limit) {
++            if (count > limit) {
++                ok = false;
++                return;
++            }
++            v.resize(size_t(count));
++            Get(v.data(), v.size() * sizeof(T));
++        }
++    };
++
++    BlockOfCode& code;
++    Emitter& emitter;
++    ReadCode read_code;
++    PcOf pc_of;
++    unsigned processor_id;
++    std::vector<Pending> pending;                   // sorted by descriptor
++    std::vector<std::pair<u64, u64>> pending_ranges;  // [start, end) each
++};
++
++}  // namespace Dynarmic::Backend::X64
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/xbyak.h b/src/dynarmic/src/dynarmic/backend/x64/xbyak.h
+index 9c5c046d6d..0375ebeaa0 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/xbyak.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/xbyak.h
+@@ -30,7 +30,8 @@ struct RWXCodeAllocator final : Xbyak::Allocator {
+ #if !defined(__ORBIS__) && defined(MAP_FIXED_NOREPLACE)
+         // (04.17, the desktop harness) DYNARMIC_CODE_ADDRESS: code caches at a fixed address, as the
+         // PS4 port's mmap places them, so a saved code cache can be loaded in a later run
+-        if (const char* at = std::getenv("DYNARMIC_CODE_ADDRESS")) {
++        // (code caches only: a megabyte and more; the spin lock's code is smaller)
++        if (const char* at = size >= (size_t(1) << 20) ? std::getenv("DYNARMIC_CODE_ADDRESS") : nullptr) {
+             hint = reinterpret_cast<void*>(std::strtoull(at, nullptr, 0));
+             fixed = MAP_FIXED_NOREPLACE;
+         }
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/a64.h b/src/dynarmic/src/dynarmic/interface/A64/a64.h
+index e8d2352702..7a703441a4 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/a64.h
+@@ -11,6 +11,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -126,6 +127,19 @@ public:
+     /// the resulting instructions as a vector of their string representations.
+     std::string Disassemble() const;
+ 
++    /// (PS4 04.18) A persistent code cache, as the A32 JIT's (see there): saved through `write`
++    /// while not executing (the guest's memory still holding the code), loaded through `read`
++    /// before anything was translated; its blocks used when first needed if their guest code is
++    /// still what was saved
++    bool SaveCodeCache(const std::function<bool(const void* data, std::size_t size)>& write);
++    bool LoadCodeCache(const std::function<bool(void* data, std::size_t size)>& read, std::string* why = nullptr);
++    struct CodeCacheUse {
++        std::size_t loaded = 0;  // blocks loaded
++        std::size_t used = 0;    // used (their guest code still the same)
++        std::size_t stale = 0;   // found changed (translated again)
++    };
++    CodeCacheUse GetCodeCacheUse() const;
++
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl;
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 74b7e9f12d..2e21ccf9d1 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -13,6 +13,8 @@
+ #include <cstdint>
+ #include <memory>
+ #include <optional>
++#include <utility>
++#include <vector>
+ 
+ #include "dynarmic/interface/optimization_flags.h"
+ 
+@@ -222,6 +224,12 @@ struct UserConfig {
+     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
+     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
+ 
++    /// (PS4 04.18) Objects the translated code may point into besides the JIT's own, the exclusive
++    /// monitor and the system registers given above (the callbacks object and what it holds), with
++    /// their sizes: a saved code cache's pointers into them are moved to where they are in the run
++    /// that loads it (Jit::LoadCodeCache). Listed in the same order in every run.
++    std::vector<std::pair<const void*, std::size_t>> code_cache_objects;
++
+     /// Determines if we should detect memory accesses via page_table that straddle are
+     /// misaligned. Accesses that straddle page boundaries will fallback to the relevant
+     /// memory callback.
+-- 
+2.43.0
+

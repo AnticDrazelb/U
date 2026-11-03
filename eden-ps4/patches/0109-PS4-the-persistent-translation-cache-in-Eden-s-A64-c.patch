@@ -1,0 +1,104 @@
+From 13959bed8c08074dac9e8989cec85ff670bb2571 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 15:34:08 +0000
+Subject: [PATCH 109/109] PS4: the persistent translation cache in Eden's A64
+ cores
+
+ArmDynarmic64 declares itself (its callbacks, with the system registers, are in it) as an object
+translated code points into, and saves/loads its JIT's code cache as ArmDynarmic32 does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 45 +++++++++++++++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_64.h   |  4 ++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 82b3449009..2a216458cc 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -5,6 +5,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #ifdef __OPENORBIS__
++#include <vector>
++#include <string>
++#include <cstdio>
+ #include <cstring>
+ #include "common/orbis_memory.h"
+ #endif
+@@ -259,6 +262,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // System registers
+     config.tpidrro_el0 = &m_cb->m_tpidrro_el0;
+     config.tpidr_el0 = &m_cb->m_tpidr_el0;
++    // (PS4 04.18) What translated code points into, for a saved translation cache: this object
++    // (the callbacks and their system registers are in it)
++    config.code_cache_objects = {{this, sizeof(ArmDynarmic64)}};
+     config.dczid_el0 = 4;
+     config.ctr_el0 = 0x8444c004;
+     config.cntfrq_el0 = Hardware::CNTFREQ;
+@@ -444,6 +450,45 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
+ 
+ ArmDynarmic64::~ArmDynarmic64() = default;
+ 
++bool ArmDynarmic64::SaveCodeCache(const std::string& path, std::string* why) {
++    const std::string temporary = path + ".tmp";
++    std::FILE* f = std::fopen(temporary.c_str(), "wb");
++    if (!f) {
++        if (why)
++            *why = "can't create the file";
++        return false;
++    }
++    std::vector<char> buffer(size_t(1) << 20);
++    std::setvbuf(f, buffer.data(), _IOFBF, buffer.size());
++    const bool saved = m_jit->SaveCodeCache([f](const void* data, std::size_t size) {
++        return std::fwrite(data, 1, size, f) == size;
++    });
++    const bool closed = std::fclose(f) == 0;
++    if (!saved || !closed || std::rename(temporary.c_str(), path.c_str()) != 0) {
++        std::remove(temporary.c_str());
++        if (why)
++            *why = "can't write it";
++        return false;
++    }
++    return true;
++}
++
++bool ArmDynarmic64::LoadCodeCache(const std::string& path, std::string* why) {
++    std::FILE* f = std::fopen(path.c_str(), "rb");
++    if (!f) {
++        if (why)
++            *why = "none saved";
++        return false;
++    }
++    std::vector<char> buffer(size_t(1) << 20);
++    std::setvbuf(f, buffer.data(), _IOFBF, buffer.size());
++    const bool loaded = m_jit->LoadCodeCache([f](void* data, std::size_t size) {
++        return std::fread(data, 1, size, f) == size;
++    }, why);
++    std::fclose(f);
++    return loaded;
++}
++
+ void ArmDynarmic64::SetTpidrroEl0(u64 value) {
+     m_cb->m_tpidrro_el0 = value;
+ }
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.h b/src/core/arm/dynarmic/arm_dynarmic_64.h
+index 26ac7ec1b3..10e8a4b26f 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.h
+@@ -97,6 +97,10 @@ public:
+     void ClearInstructionCache() override;
+     void InvalidateCacheRange(u64 addr, std::size_t size) override;
+ 
++    /// (PS4 04.18) The persistent translation cache, as ArmDynarmic32's
++    bool SaveCodeCache(const std::string& path, std::string* why) override;
++    bool LoadCodeCache(const std::string& path, std::string* why) override;
++
+ protected:
+     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
+     void RewindBreakpointInstruction() override;
+-- 
+2.43.0
+

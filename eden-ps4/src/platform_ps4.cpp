@@ -1325,6 +1325,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.18: the translation cache for 64-bit games too (Animal Crossing, the Zelda games: they translate "
+         "even more code as they run than Mario Kart, in every new area). The same on/off setting. 04.17's "
+         "caches are made again once (a new file format).\n"
          "04.17: the first race after starting a game stutters because Eden translates the game's CPU code "
          "for it the first time it runs (its shaders were already built during the black screen). Now each "
          "core's translated code is kept when you leave the game (/data/eden-ps4/cache/jit) and used again "

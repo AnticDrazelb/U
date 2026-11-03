@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <random>
 #include <string>
 #include <vector>
@@ -21,6 +22,57 @@
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/interface/optimization_flags.h"
+
+// (04.18) cachetest: allocations from an arena that can be unmapped (as dynbench.cpp's), so a saved
+// code cache's pointer left unrelocated faults in the next run instead of finding the same object
+namespace {
+struct Arena {
+    uint8_t* base = nullptr;
+    size_t size = 0, used = 0;
+};
+Arena* g_arena = nullptr;
+Arena g_arenas[2];
+std::pair<uint8_t*, size_t> g_arena_ranges[8];
+size_t g_arena_count = 0;
+void* ArenaAlloc(size_t size, size_t align) {
+    if (!g_arena) {
+        void* p = nullptr;
+        if (posix_memalign(&p, std::max<size_t>(align, sizeof(void*)), size ? size : 1) != 0)
+            throw std::bad_alloc{};
+        return p;
+    }
+    size_t offset = (g_arena->used + align - 1) & ~(align - 1);
+    if (offset + size > g_arena->size)
+        throw std::bad_alloc{};
+    g_arena->used = offset + size;
+    return g_arena->base + offset;
+}
+bool InArena(void* p) {
+    for (size_t i = 0; i < g_arena_count; i++)
+        if (static_cast<uint8_t*>(p) >= g_arena_ranges[i].first && static_cast<uint8_t*>(p) < g_arena_ranges[i].first + g_arena_ranges[i].second)
+            return true;
+    return false;
+}
+void NewArena(Arena& a) {
+    a.size = size_t(256) << 20;
+    a.used = 0;
+    a.base = static_cast<uint8_t*>(mmap(nullptr, a.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+    if (g_arena_count < 8)
+        g_arena_ranges[g_arena_count++] = {a.base, a.size};
+}
+}  // namespace
+void* operator new(size_t size) { return ArenaAlloc(size, 16); }
+void* operator new[](size_t size) { return ArenaAlloc(size, 16); }
+void* operator new(size_t size, std::align_val_t align) { return ArenaAlloc(size, size_t(align)); }
+void* operator new[](size_t size, std::align_val_t align) { return ArenaAlloc(size, size_t(align)); }
+void operator delete(void* p) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete(void* p, size_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p, size_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete(void* p, size_t, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
+void operator delete[](void* p, size_t, std::align_val_t) noexcept { if (p && !InArena(p)) free(p); }
 
 namespace {
 constexpr uint64_t kCode = 0x00010000, kData = 0x10000000, kDataSize = 16u << 20;
@@ -35,6 +87,9 @@ struct Env final : Dynarmic::A64::UserCallbacks {
     std::vector<uint64_t> entries = std::vector<uint64_t>(kPages, 0);
     uint64_t slow_reads = 0, slow_writes = 0;
     Dynarmic::A64::Jit* jit = nullptr;
+    void* fastmem_arena = nullptr;
+    // (04.18) the thread registers, as Eden's (in its callbacks object): read and written through pointers
+    uint64_t tpidr_el0 = 0x1122334455667788ull, tpidrro_el0 = 0x0123456789abcdefull;
 
     Env() {
         memfd = memfd_create("guest", 0);
@@ -158,7 +213,7 @@ Dynarmic::ExclusiveMonitor g_monitor{1};
 // fastmem proper, the faults sent to the fallback and the code recompiled without it.
 bool g_fastmem = false, g_fastmem_mapped = false;
 void* FastmemArena(Env& env) {
-    static void* arena = nullptr;
+    void*& arena = env.fastmem_arena;
     if (!arena) {
         const size_t size = size_t(1) << (g_fastmem_mapped ? 32 : 28);
         arena = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -181,6 +236,8 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     Dynarmic::A64::UserConfig config;
     config.callbacks = &env;
     config.global_monitor = &g_monitor;
+    config.tpidr_el0 = &env.tpidr_el0;
+    config.tpidrro_el0 = &env.tpidrro_el0;
     config.processor_id = 0;
     config.define_unpredictable_behaviour = true;
     config.page_table = reinterpret_cast<void**>(env.entries.data());
@@ -278,6 +335,100 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "fastmem2")
             g_fastmem = g_fastmem_mapped = true;
     }
+    if (mode == "cachetest") {
+        // cachetest <code.bin> [options] [twice]: (04.18) as dynbench.cpp's: the program run and its
+        // code cache saved, that run's objects unmapped, the cache loaded in a run with all its
+        // objects elsewhere and the program run again (twice: once more); prints what test prints
+        // for the last run. CACHETEST_B=<other.bin>: the last run runs that program instead.
+        bool twice = false;
+        for (int i = 3; i < argc; i++)
+            twice |= std::string(argv[i]) == "twice";
+        const int runs = twice ? 3 : 2;
+        std::vector<uint8_t> program = env.code, last_program = env.code;
+        if (const char* other = std::getenv("CACHETEST_B"))
+            last_program = ReadFile(other);
+        {
+            // (a JIT made and run first: statics it sets up live outside the arenas)
+            auto config = MakeConfig(env, excl, walk);
+            Dynarmic::A64::Jit warm{config};
+            env.jit = &warm;
+            Setup(warm);
+            warm.Run();
+            env.jit = nullptr;
+        }
+        std::vector<uint8_t> saved;
+        saved.reserve(size_t(64) << 20);
+        for (int run = 0; run < runs; run++) {
+            const bool last = run == runs - 1;
+            Arena& arena = g_arenas[run % 2];
+            NewArena(arena);
+            g_arena = &arena;
+            void* spacer = ::operator new(size_t(1 + run) << 20);
+            (void)spacer;
+            Env* e = new Env;
+            e->code = last ? last_program : program;
+            auto* monitor = new Dynarmic::ExclusiveMonitor{1};
+            auto config = MakeConfig(*e, excl, walk);
+            config.global_monitor = monitor;
+            config.code_cache_objects = {{e, sizeof(Env)}};
+            auto* jit = new Dynarmic::A64::Jit{config};
+            e->jit = jit;
+            if (run > 0) {
+                size_t offset = 0;
+                std::string why;
+                const bool loaded = jit->LoadCodeCache([&](void* data, size_t size) {
+                    if (offset + size > saved.size())
+                        return false;
+                    std::memcpy(data, saved.data() + offset, size);
+                    offset += size;
+                    return true;
+                }, &why);
+                if (!loaded) {
+                    std::fprintf(stderr, "run %d: not loaded: %s\n", run, why.c_str());
+                    return 6;
+                }
+            }
+            Setup(*jit);
+            jit->Run();
+            const auto use = jit->GetCodeCacheUse();
+            if (run > 0)
+                std::fprintf(stderr, "run %d: cache %zu bytes, %zu blocks loaded, %zu used, %zu stale\n", run, saved.size(), use.loaded, use.used, use.stale);
+            if (last) {
+                const auto regs = jit->GetRegisters();
+                for (size_t i = 0; i < 31; i++)
+                    std::printf("x%zu=%016llx\n", i, (unsigned long long)regs[i]);
+                const auto vecs = jit->GetVectors();
+                for (size_t i = 0; i < 32; i++)
+                    std::printf("q%zu=%016llx%016llx\n", i, (unsigned long long)vecs[i][1], (unsigned long long)vecs[i][0]);
+                std::printf("sp=%016llx\n", (unsigned long long)jit->GetSP());
+                uint64_t h = 1469598103934665603ull;
+                for (size_t p = 0; p < kDataSize / 4096; p++)
+                    for (size_t b = 0; b < 4096; b++)
+                        h = (h ^ e->host_page[p][b]) * 1099511628211ull;
+                std::printf("memory=%016llx pstate=%08x pc=%llx tpidr=%016llx\n", (unsigned long long)h, jit->GetPstate(),
+                            (unsigned long long)jit->GetPC(), (unsigned long long)e->tpidr_el0);
+                return 0;
+            }
+            g_arena = nullptr;
+            saved.clear();
+            if (!jit->SaveCodeCache([&](const void* data, size_t size) {
+                    saved.insert(saved.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+                    return true;
+                })) {
+                std::fprintf(stderr, "run %d: save failed\n", run);
+                return 5;
+            }
+            g_arena = &arena;
+            delete jit;
+            if (e->fastmem_arena)
+                munmap(e->fastmem_arena, size_t(1) << (g_fastmem_mapped ? 32 : 28));
+            munmap(e->data, kDataSize);
+            g_arena = nullptr;
+            munmap(arena.base, arena.size);
+            arena.base = nullptr;
+        }
+        return 0;
+    }
     auto config = MakeConfig(env, excl, walk);
     Dynarmic::A64::Jit jit{config};
     env.jit = &jit;
@@ -327,7 +478,8 @@ int main(int argc, char** argv) {
     for (size_t p = 0; p < kDataSize / 4096; p++)
         for (size_t b = 0; b < 4096; b++)
             h = (h ^ env.host_page[p][b]) * 1099511628211ull;
-    std::printf("memory=%016llx pstate=%08x pc=%llx\n", (unsigned long long)h, jit.GetPstate(), (unsigned long long)jit.GetPC());
+    std::printf("memory=%016llx pstate=%08x pc=%llx tpidr=%016llx\n", (unsigned long long)h, jit.GetPstate(), (unsigned long long)jit.GetPC(),
+                (unsigned long long)env.tpidr_el0);
     std::fprintf(stderr, "slow reads %llu writes %llu\n", (unsigned long long)env.slow_reads, (unsigned long long)env.slow_writes);
     return 0;
 }

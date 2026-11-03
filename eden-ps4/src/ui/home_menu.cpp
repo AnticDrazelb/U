@@ -805,7 +805,7 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
             {"Translation Cache", on_off(settings.jit_cache),
              "The game's CPU code Eden translated is kept in /data/eden-ps4/cache/jit when you leave the game, "
              "and used again from its start the next time instead of translated again as it runs (the first "
-             "race's stutter). Kept for this version of Eden for PS4 only.",
+             "race's stutter), 32-bit and 64-bit games alike. Kept for this version of Eden for PS4 only.",
              [](MenuSettings& s) { s.jit_cache = !s.jit_cache; }},
             {"Asynchronous Shaders", on_off(settings.async_shaders),
              "New shaders are built in the background instead of stopping the game while they compile (slow on "

@@ -379,6 +379,26 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.18: **the translation cache for 64-bit games.** In the tester's logs the 64-bit games translate
+more than Mario Kart, and keep translating as they go: Animal Crossing 683, 516 and 678 ms of the
+emulated cores' time a second at its peaks, Echoes of Wisdom 506 and still 75-285 in play, Link's
+Awakening 220-332 (Mario Kart 330 at boot, 173 at its first race, 5-35 later).
+
+- Patch 0108: the code cache moves to `backend/x64/jit_code_cache.h`, one template over the emitter
+  and the guest address width, used by both JITs; each keeps its build and configuration
+  fingerprints and the objects its code may point into (A64: TPIDR_EL0, TPIDRRO_EL0, its page table
+  at its address space's size). A64 gets `SaveCodeCache`, `LoadCodeCache`, `GetCodeCacheUse` and
+  `code_cache_objects`. File format 2 (64-bit guest ranges): 04.17's files are refused once and
+  made again.
+- Patch 0109: Eden's A64 cores (`ArmDynarmic64`) declare themselves (the callbacks and their system
+  registers are in them) and save/load as the A32 cores do; the frontend takes both.
+- Tests (harness): the A32 suite again on the shared code (gen2-gen10, fastmem, split stacks, CP15,
+  twice); A64: `dynbench64 cachetest` (arenas as A32's, the thread registers through pointers into
+  the callbacks object as Eden's, `programs/tpidr64.s`), `ctx64.sh` over gen5 (exclusives), gen6
+  (shared bases), gen8 (control flow and flags) with fastmem, mapped fastmem, monitor exclusives and
+  reloads: 520 programs, all the same as fresh runs; 40 programs swapped for others at the same
+  addresses: 161 saved blocks found stale, none used.
+
 04.17: **the persistent translation cache; shader and pipeline work measured; the shader cache
 kept whole.** From the tester's first-race investigation (`docs/first-race-and-caches.md`): Eden's
 per-game shader cache already rebuilds every pipeline the game used during the black screen (the

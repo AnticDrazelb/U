@@ -498,8 +498,8 @@ void Stop() {
 // What a program that loaded is called, who made it, and its icon, for the HOME menu: a game's
 // can't be read without the keys that loading it just used.
 // (04.17) The persistent translation cache: each emulated core's translated code for a game, saved
-// when leaving it and loaded before it runs (data_dir/cache/jit/<title id>-core<n>.bin); a 64-bit
-// game's cores (A64) have none yet
+// when leaving it and loaded before it runs (data_dir/cache/jit/<title id>-core<n>.bin); 32-bit
+// games' cores (A32) from 04.17, 64-bit games' (A64) from 04.18
 std::string JitCachePath(const std::filesystem::path& data_dir, u64 title_id, size_t core) {
     return (data_dir / "cache" / "jit" / fmt::format("{:016x}-core{}.bin", title_id, core)).string();
 }
@@ -513,7 +513,7 @@ void LoadJitCaches(Core::System& system, const std::filesystem::path& data_dir, 
     std::string summary;
     for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; core++) {
         auto* arm = process->GetArmInterface(core);
-        if (!arm || arm->GetArchitecture() != Core::Architecture::AArch32)
+        if (!arm)
             continue;
         const auto start = std::chrono::steady_clock::now();
         std::string why;
@@ -537,7 +537,7 @@ void SaveJitCaches(Core::System& system, const std::filesystem::path& data_dir, 
     std::string summary;
     for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; core++) {
         auto* arm = process->GetArmInterface(core);
-        if (!arm || arm->GetArchitecture() != Core::Architecture::AArch32)
+        if (!arm)
             continue;
         const auto start = std::chrono::steady_clock::now();
         const std::string path = JitCachePath(data_dir, title_id, core);
