@@ -57,13 +57,8 @@ std::vector<Title> SampleTitles()
         t.on_ps4 = t.location == "data folder";
         titles.push_back(std::move(t));
     };
-    add("Breakout", "NRO", "in the package", "1 MB", false, Art::Breakout);
     add("Sky Garden Adventure", "NSP", "USB 0", "5.2 GB", true);
-    add("Blocks", "NRO", "in the package", "1 MB", false, Art::Blocks);
     add("Racing League Deluxe", "XCI", "data folder", "12.8 GB", true);
-    add("Controller test", "NRO", "in the package", "1 MB", false, Art::Controller);
-    add("GPU test", "NRO", "in the package", "1 MB", false, Art::Gpu);
-    add("The test program", "NRO", "in the package", "1 MB", false, Art::Terminal);
     add("Puzzle Quest of the Very Long Title: Remastered Edition", "NSP", "USB 1", "780 MB", true);
     add("Homebrew Menu", "NRO", "data folder", "4 MB", false);
     return titles;

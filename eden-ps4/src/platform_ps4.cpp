@@ -1,7 +1,7 @@
 // The launcher on the PS4. A start page first: it shows what an unfinished last run left behind
 // (the end of its log.txt, its crash report and boot trace) so that a photo of it is enough to see
 // where it stopped, and lets the player pick a program from a list (D-pad, X): the package's
-// (two games, a controller test, a GPU test, the test program hello.nro) and every program or
+// (from 04.21 only the player's: the package's own test programs aren't listed) every program or
 // game in /data/eden-ps4 (.nro, .nso, .nsp, .xci: commercial games need the console's keys in
 // /data/eden-ps4/user/keys and its firmware in /data/eden-ps4/user/nand).
 // Then the program runs. With Mesa's RADV linked, Eden's Vulkan renderer draws it on the PS4's GPU,
@@ -920,34 +920,12 @@ std::string UsbSignature()
 
 std::vector<Ui::Title> LoadTitles()
 {
-    struct BuiltIn
-    {
-        const char* path;
-        const char* name;
-        Ui::Art art;
-    };
-    const BuiltIn built_in[] = {
-        {"/app0/breakout.nro", "Breakout", Ui::Art::Breakout},
-        {"/app0/blocks.nro", "Blocks", Ui::Art::Blocks},
-        {"/app0/padtest.nro", "Controller test", Ui::Art::Controller},
-        {"/app0/gputest.nro", "GPU test", Ui::Art::Gpu},
-        {kTestProgram, "The test program", Ui::Art::Terminal},
-    };
+    // (04.21) The package's own programs (Breakout, Blocks, the controller and GPU tests, the test
+    // program) are no longer listed: only the player's games and programs. Their files stay in the
+    // package: the Controllers screen still starts the controller test (X), the start page the test
+    // program when no controller is found, and test.sh runs them all.
     std::vector<Ui::Title> titles;
     std::error_code ec;
-    for (const BuiltIn& program : built_in)
-    {
-        Ui::Title title;
-        title.path = program.path;
-        title.name = program.name;
-        title.publisher = "Eden for PS4";
-        title.location = "in the package";
-        title.kind = "NRO";
-        title.art = program.art;
-        const uintmax_t size = std::filesystem::file_size(program.path, ec);
-        title.size = ec ? "" : SizeText(size);
-        titles.push_back(std::move(title));
-    }
     // the data folder's top (its folders are the app's own), and each USB drive's top and folders
     std::vector<std::tuple<std::string, std::string, int>> folders = {{kDataDir, "data folder", 0}};
     for (int i = 0; i < 8; i++)
@@ -1328,7 +1306,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
-         "04.21: the settings lists scroll (Graphics had rows below the screen). And the CPU translator's code "
+         "04.21: the settings lists scroll (Graphics had rows below the screen), and the package's own "
+         "programs (Breakout, Blocks, the controller and GPU tests, the test program) are no longer listed "
+         "with your games. And the CPU translator's code "
          "space, sized for Mario Kart (48 MiB for the main core), is now as large as the PS4's memory for "
          "generated code allows, up to 160 MiB: Silksong filled the main core's 48 MiB every 30-40 s and "
          "translated everything again each time (half of every second, the long freezes), Zelda's third core "

@@ -388,6 +388,10 @@ menu doesn't scroll.
   GPU Accuracy, and the description, off screen). Now the rows that fit above the category's longest
   description are shown, scrolled to keep the selection in view (eased, with a scroll bar), and the
   description always under them (`ui-preview.sh`: `settings-graphics-end.png`).
+- **The package's own programs** (Breakout, Blocks, the controller and GPU tests, `hello.nro`)
+  are no longer listed on HOME or in All Software, only the player's games and programs. Their files
+  stay in the package: the Controllers screen's X still starts the controller test, the start page
+  still boots `hello.nro` when no controller is found, and `test.sh` runs them.
 - **Shaders aren't what holds these games back.** Echoes of Wisdom rebuilds its 688-1,018 cached
   pipelines at boot and then makes 0-40 new ones per 10 s with almost no draw skipped; a run with
   none new at all ran 22-30 fps, as the others. Silksong's 10-14 s frames came with 0 new pipelines.
