@@ -379,6 +379,33 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.13: **a cross-thread crash fixed; what 04.12 counted.** 04.12 on a console (Grand Prix:
+the Crossing Cup's Baby Park, the Shell Cup's Moo Moo Meadows, each from a fresh boot):
+
+- What the main thread waits on at a start: `NVCTRL::NvEvent_0`, nvdrv's syncpoint event. At Low
+  GPU accuracy Eden signals a syncpoint when the GPU thread reaches it (`FenceManager::
+  SignalFence`, not delayed), so these are waits for Eden's GPU thread: Baby Park's start 2.96 s
+  then 1.92 s of the main thread's 10 s, Moo Moo Meadows' 2.18 s then 0.48 s, later 0.01-1.1 s.
+  The PS4's GPU was 7-11% busy, the Vulkan worker 20-24%, the GPU thread 56-77%: the two threads
+  take turns there.
+- Uniform buffers: every frame in the copy-every-draw mode (the cached path's hits 66-89%, under
+  98%); 88,000-119,000 binds a second copied in races (~4 a draw), 30-40 MiB a second (~1.1 MiB
+  a frame), 95-160 from the cache; the game wrote 0.2-0.28 MiB a second of constant buffer data,
+  46-63% of it what memory already held.
+- The second boot crashed while it loaded: `Scheduler::BeginRenderPassImpl` (NULL + 0x10), from
+  `RealizeDeferredClear` < `FlushDeferredClear` < `TextureCache::RemoveFramebuffers` <
+  `DeleteImage` < `UnmapMemory` < `MemoryManager::Unmap` < `nvhost_as_gpu::UnmapBuffer`, on the
+  nvdrv service thread: the deferred clear (Eden's `3e07b466eb`) realized before a framebuffer's
+  removal records into the Vulkan scheduler, which the GPU thread records into at the same time
+  (04.09's crash, a render pass end with none begun, the same way).
+
+Patch 0100: `TextureCache::RemoveFramebuffers` on another thread than the GPU thread (known from its
+first draw or clear) only notes the views (`pending_removed_views`, under the cache's mutex, which
+the unmap holds); the GPU thread removes those framebuffers (`RemovePendingFramebuffers`: the
+deferred clear realized on its own thread) before it next updates render targets or looks a
+framebuffer up (`UpdateRenderTargets`, `GetFramebuffer`, `GetFramebufferId`, all under the mutex).
+Counted in the 30-second line (handed over so far).
+
 04.12: **uniform buffer counters (from the comparison with Ryujinx).** `docs/ryujinx-comparison.md`
 (Ryubing's continuation of Ryujinx read next to Eden's GPU frontend): the most promising difference
 is uniform buffers. Eden copies every uniform buffer up to 4 KiB into a stream buffer on every draw

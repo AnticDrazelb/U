@@ -1,0 +1,125 @@
+From a914f682a4793c619877aabb89cda2e7f10f77f5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 10:21:19 +0000
+Subject: [PATCH] Texture cache: framebuffer removal on another thread left to
+ the GPU thread
+
+RemoveFramebuffers realizes a pending deferred clear (FlushDeferredClear) through the Vulkan
+scheduler, which only the GPU thread records into; nvdrv's unmap (nvhost_as_gpu::UnmapBuffer ->
+MemoryManager::Unmap -> UnmapMemory -> DeleteImage) called it on its service thread, recording at
+the same time as the GPU thread: a crash in BeginRenderPassImpl, and a render pass end with none
+begun (RADV's end_subpass). Off the GPU thread the removed views are noted (under the cache's
+mutex) and the GPU thread removes those framebuffers before it next updates render targets or
+looks a framebuffer up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/ps4_perf.h                         |  2 ++
+ src/video_core/texture_cache/texture_cache.h  | 25 +++++++++++++++++++
+ .../texture_cache/texture_cache_base.h        | 10 ++++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index a2610ba5d5..1f58569a59 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -100,6 +100,8 @@ inline std::atomic<uint64_t> ubo_frames{0}, ubo_frames_copying{0};
+ // (04.10) Vulkan render pass ends the scheduler's worker skipped: none begun in their command
+ // buffer (counted on every platform; it would have crashed RADV)
+ inline std::atomic<uint64_t> vk_unmatched_render_pass_ends{0};
++// (04.13) framebuffer removals asked for on another thread (an nvdrv unmap), left to the GPU thread
++inline std::atomic<uint64_t> framebuffer_removals_handed_over{0};
+ 
+ // The services' host threads (KThread's dummy threads) waiting for their next request: woken
+ // while they still spun, or after sleeping (and the time from the signal until they ran); the
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index ad12cd32db..dfb417a32e 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -468,8 +468,23 @@ bool TextureCache<P>::RescaleRenderTargets() {
+     return rescaled;
+ }
+ 
++template <class P>
++void TextureCache<P>::RemovePendingFramebuffers() {
++    if (gpu_thread_id == std::thread::id{}) {
++        // (the first draw or clear: from now on the GPU thread is known)
++        gpu_thread_id = std::this_thread::get_id();
++    }
++    if (pending_removed_views.empty()) {
++        return;
++    }
++    std::vector<ImageViewId> views;
++    views.swap(pending_removed_views);
++    RemoveFramebuffers(views);
++}
++
+ template <class P>
+ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
++    RemovePendingFramebuffers();
+     using namespace VideoCommon::Dirty;
+     auto& flags = maxwell3d->dirty.flags;
+     if (!flags[Dirty::RenderTargets]) {
+@@ -537,6 +552,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+ 
+ template <class P>
+ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
++    RemovePendingFramebuffers();
+     if (last_framebuffer_id && last_framebuffer_serial == render_targets_serial) {
+         return &slot_framebuffers[last_framebuffer_id];
+     }
+@@ -577,6 +593,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+ 
+ template <class P>
+ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
++    RemovePendingFramebuffers();
+     const auto [pair, is_new] = framebuffers.try_emplace(key);
+     FramebufferId& framebuffer_id = pair->second;
+     if (!is_new) {
+@@ -2436,6 +2453,14 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
+ 
+ template <class P>
+ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_views) {
++    // (PS4 04.13) not on the GPU thread (an nvdrv unmap): left to it (RemovePendingFramebuffers)
++    if (gpu_thread_id != std::thread::id{} && std::this_thread::get_id() != gpu_thread_id) {
++        pending_removed_views.insert(pending_removed_views.end(), removed_views.begin(), removed_views.end());
++#ifdef __OPENORBIS__
++        Common::PS4Perf::framebuffer_removals_handed_over.fetch_add(1, std::memory_order_relaxed);
++#endif
++        return;
++    }
+     runtime.FlushDeferredClear();
+     auto it = framebuffers.begin();
+     while (it != framebuffers.end()) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 8a2318cc72..58a506d9f8 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -16,6 +16,7 @@
+ #include <unordered_map>
+ #include "common/container/unordered_map.h"
+ #include "common/container/unordered_set.h"
++#include <thread>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+ #include <boost/container/static_vector.hpp>
+@@ -388,6 +389,15 @@ private:
+     /// Remove framebuffers using the given image views from the cache
+     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
+ 
++    /// (PS4 04.13) Framebuffers' removal asked for on another thread than the GPU thread (an
++    /// nvdrv unmap deleting images, from its service thread): done by the GPU thread before it
++    /// next looks a framebuffer up. RemoveFramebuffers realizes a pending deferred clear through
++    /// the Vulkan scheduler, which only the GPU thread may record into (two threads recording at
++    /// once crashed RADV, then Eden: 04.09, 04.12). Both under this cache's mutex.
++    void RemovePendingFramebuffers();
++    std::vector<ImageViewId> pending_removed_views;
++    std::thread::id gpu_thread_id{};
++
+     /// Mark an image as modified from the GPU
+     void MarkModification(ImageBase& image) noexcept;
+ 
+-- 
+2.43.0
+

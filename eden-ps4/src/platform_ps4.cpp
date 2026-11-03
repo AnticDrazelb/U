@@ -1322,6 +1322,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.13: a crash fixed. Booting Mario Kart once crashed while it loaded (as one did in 04.09): when "
+         "the game gave memory back, Eden's graphics service thread, deleting the textures in it, also wrote "
+         "into Eden's list of GPU commands, which only the GPU thread may do, at the same time as the GPU "
+         "thread. Now it leaves that part to the GPU thread, which does it before it next draws. And what "
+         "04.12's counts showed: at a race's start the game waits for Eden's GPU thread (up to 30% of the "
+         "main thread's time on Baby Park), and that thread copies about four of the game's constant buffers "
+         "for every draw, ~1 MiB a frame, half of it unchanged: the next thing to make cheaper.\n"
          "04.12: counting the uniform buffers. Comparing with Ryujinx (another Switch emulator, built "
          "differently) showed one big difference in the work done on every draw: Eden copies each of a draw's "
          "small uniform buffers (the game's constants) into a fresh buffer every draw unless almost all of "
@@ -2487,6 +2494,9 @@ std::string PerfLine(double seconds)
     // one, once)
     if (const uint64_t unmatched = P::vk_unmatched_render_pass_ends.load(std::memory_order_relaxed); unmatched != 0)
         line += fmt::format("; Vulkan render pass ends without a beginning, skipped so far: {}", unmatched);
+    // (04.13) framebuffer removals from another thread (an nvdrv unmap), left to the GPU thread
+    if (const uint64_t handed = P::framebuffer_removals_handed_over.load(std::memory_order_relaxed); handed != 0)
+        line += fmt::format("; framebuffer removals from other threads, left to the GPU thread so far: {}", handed);
     // The services' host threads waiting for their next request (04.07: a longer spin, to 250 us,
     // after a short wait): woken while spinning, or after sleeping
     {
