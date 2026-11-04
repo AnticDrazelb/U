@@ -1402,6 +1402,101 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
       __atomic_store_n(&dev->hang_reported, false, __ATOMIC_RELEASE);
 }
 
+/* (Eden 04.40) A stall note, sooner than the hang report and whether or not anything waits:
+ * Captain Toad's level 3 took the PS4 down within seconds with no GPU wait 2 s long, so 04.39's
+ * report never started, and radv-ps4.log (not synced) lost its last minute. A thread looks at the
+ * GPU's progress every 50 ms; when it has finished nothing for RADV_PS4_STALL_MS (300) with work
+ * submitted, "where the GPU stopped" goes to gpu/gpu-stall.txt (its shaders: stall-shaders.txt) and
+ * a line to the boot trace, both on the disk at once. Nothing else is done (a long submission is
+ * no hang); at most 8 notes a session, one a stall. ac_ps4_gpu_progress: the numbers, for the app's
+ * black box. */
+static int64_t ps4_progress_ns; /* when the GPU last finished something, or was last idle */
+static ac_drm_device *ps4_last_device; /* (defined with the flight recorder, below) */
+
+void ac_ps4_gpu_progress(uint64_t *submitted, uint64_t *completed, uint32_t *trace_id, int64_t *stalled_ms);
+void
+ac_ps4_gpu_progress(uint64_t *submitted, uint64_t *completed, uint32_t *trace_id, int64_t *stalled_ms)
+{
+   ac_drm_device *dev = ps4_last_device;
+   *submitted = dev ? dev->last_seq : 0;
+   *completed = dev ? ps4_completed(dev) : 0;
+   const volatile uint32_t *t = ps4_trace_va ? ps4_hw_read(ps4_trace_va, 4) : NULL;
+   *trace_id = t ? *t : 0;
+   const int64_t since = __atomic_load_n(&ps4_progress_ns, __ATOMIC_RELAXED);
+   *stalled_ms = dev && *completed < *submitted && since ? (os_time_get_nano() - since) / 1000000 : 0;
+}
+
+static void *
+ps4_stall_thread(void *arg)
+{
+   ac_drm_device *dev = arg;
+   const char *e = getenv("RADV_PS4_STALL_MS");
+   const int64_t limit = (e && atoi(e) > 0 ? atoi(e) : 300) * 1000000ll;
+   uint64_t last = ps4_completed(dev), noted = ~0ull;
+   int64_t moved = os_time_get_nano();
+   unsigned notes = 0;
+   __atomic_store_n(&ps4_progress_ns, moved, __ATOMIC_RELAXED);
+   for (;;) {
+      sceKernelUsleep(50000);
+      const uint64_t done = ps4_completed(dev);
+      const int64_t now = os_time_get_nano();
+      if (done != last || done >= dev->last_seq) {
+         if (done != last && noted == last) {
+            char line[160];
+            snprintf(line, sizeof(line), "radv/ps4: the GPU went on after a %.1f s stall (completed %llu)",
+                     (now - moved) / 1e9, (unsigned long long)done);
+            ps4_log("%s\n", line);
+            ps4_boot_trace(line);
+         }
+         last = done;
+         moved = now;
+         __atomic_store_n(&ps4_progress_ns, now, __ATOMIC_RELAXED);
+         continue;
+      }
+      if (now - moved < limit || noted == done || notes >= 8)
+         continue;
+      noted = done;
+      notes++;
+      FILE *f = fopen(ps4_gpu_file("gpu-stall.txt"), "w");
+      if (f) {
+         fprintf(f, "the GPU finished nothing for %.0f ms: completed %llu, submitted %llu (stall note %u)\n\n",
+                 (now - moved) / 1e6, (unsigned long long)done, (unsigned long long)dev->last_seq, notes);
+         const int shader_fd = open(ps4_gpu_file("stall-shaders.txt"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+         ps4_report_stop_point(dev, f, done, shader_fd);
+         if (shader_fd >= 0) {
+            fsync(shader_fd);
+            close(shader_fd);
+         }
+         fflush(f);
+         fsync(fileno(f));
+         fclose(f);
+      }
+      char line[200];
+      snprintf(line, sizeof(line), "radv/ps4: GPU stalled %.1f s at submission %llu (of %llu submitted): where it "
+               "stopped in gpu/gpu-stall.txt", (os_time_get_nano() - moved) / 1e9, (unsigned long long)(done + 1),
+               (unsigned long long)dev->last_seq);
+      ps4_log("%s\n", line);
+      ps4_boot_trace(line);
+      if (ps4_boot_trace_sync)
+         ps4_boot_trace_sync();
+   }
+   return NULL;
+}
+
+static void
+ps4_start_stall_thread(ac_drm_device *dev)
+{
+   static bool started;
+   const char *e = getenv("RADV_PS4_STALL_MS");
+   if (started || !ps4_trace_option(NULL) || (e && !strcmp(e, "0")))
+      return;
+   pthread_t t;
+   if (pthread_create(&t, NULL, ps4_stall_thread, dev) == 0) {
+      pthread_detach(t);
+      started = true;
+   }
+}
+
 /* Crema: how the CPU waits for the GPU, every 5 s in the boot trace (waits per second, their
  * average length, and how many sleeps ended by the 1 ms timeout instead of the interrupt). */
 void ps4_boot_trace(const char *stage);
@@ -2113,6 +2208,7 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
       ps4_install_fault_capture(dev, dev->gnm_module);
    ps4_fault_dev = dev; /* the last device created is the one in use */
    ps4_start_flight_recorder(dev);
+   ps4_start_stall_thread(dev);
    ps4_device = dev;
    ps4_device_users = 1;
    pthread_mutex_unlock(&ps4_device_lock);

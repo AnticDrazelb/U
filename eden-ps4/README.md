@@ -379,6 +379,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.40: **a black box, and a stall note at 0.3 s.** 04.39's first run (Captain Toad, level 3) took the
+PS4 down as before, but nothing of 04.39's hang path is in its logs: no "GPU hang?" line in the boot
+trace (written and synced 2 s into a GPU wait), `gpu-hang.txt` still 04.38's Zelda report. The boot
+trace ends at 64.8 s, 4 s after its last line of note (the C heap's overflow heap 15: a 23 MiB
+allocation of the 32-bit translator, which Mario Kart makes too, and lives); `radv-ps4.log` and
+`log.txt` aren't synced and lost their last minute. So either nothing waited on the GPU for 2 s
+before the PS4 went down, or the PS4 went down for another reason; Zelda's (the GPU stopped, the PS4
+lived ~40 s more) may be a different fault. Two things for the next crash:
+- `blackbox.txt` (`BlackBox`, `src/platform_ps4.cpp`): four times a second while a program runs, a
+  line with the GPU's submissions made and finished, how long it has finished nothing, RADV's trace
+  id, its busy share, the frames shown, the GPU thread's stage, the Switch's RAM, the GPU's buffers,
+  flexible and direct memory free; written in place in a ring of 480 lines (2 minutes) and fsynced
+  each time. `EDEN_PS4_BLACKBOX=0` turns it off.
+- A stall thread in `port/mesa/ac_ps4_drm.c`: every 50 ms it looks at the GPU's progress, and once
+  the GPU has finished nothing for 300 ms with work submitted (`RADV_PS4_STALL_MS`), "where the GPU
+  stopped" goes to `gpu/gpu-stall.txt` (shaders: `gpu/stall-shaders.txt`) and a line to the boot
+  trace, synced. Nothing waiting is needed, and nothing else is done (a long submission is no hang);
+  at most 8 notes a session. `ac_ps4_gpu_progress` gives the black box its numbers.
+
 04.39: **the GPU hang: where it stopped, and the app ends instead of the PS4.** 04.38's Zelda log
 (Echoes of Wisdom, after the cliff scene) and Captain Toad's level 3 with CPU Auto went down the same
 way: a submission the GPU never finished (`radv/ps4: GPU hang? waiting for 30753, completed

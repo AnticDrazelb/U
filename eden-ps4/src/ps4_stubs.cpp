@@ -40,6 +40,12 @@ void ac_ps4_get_gpu_stats(uint64_t* busy_ticks, uint64_t* span_ticks, uint64_t* 
 {
     *busy_ticks = *span_ticks = *submits = *waits = *wait_ns = 0;
 }
+void ac_ps4_gpu_progress(uint64_t* submitted, uint64_t* completed, uint32_t* trace_id, int64_t* stalled_ms)
+{
+    *submitted = *completed = 0;
+    *trace_id = 0;
+    *stalled_ms = 0;
+}
 #endif
 
 void ps4_crash_guest_info() {}

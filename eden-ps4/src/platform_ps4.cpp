@@ -36,6 +36,7 @@
 #include <vector>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -96,6 +97,9 @@ void ps4_dump_thread_stacks(const char* path, const char* reason);
 uint64_t ac_ps4_gpu_bytes();
 void ac_ps4_get_gpu_stats(uint64_t* busy_ticks, uint64_t* span_ticks, uint64_t* submits, uint64_t* waits,
                           uint64_t* wait_ns);
+// (04.40) the GPU's progress: submissions made and finished, RADV's last trace id, and how long the
+// GPU has gone without finishing anything while work was waiting (0: it hasn't, or it's idle)
+void ac_ps4_gpu_progress(uint64_t* submitted, uint64_t* completed, uint32_t* trace_id, int64_t* stalled_ms);
 // port/ps4_sampler.cpp: the profiler (samples.log), the threads it samples (by name), and a line
 // in samples.log
 void ps4_sampler_sample_threads(const char* names);
@@ -1311,6 +1315,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.40: a black box for crashes of the whole PS4: four times a second, what the GPU and the memory "
+         "were doing goes to blackbox.txt, on the disk at once; and a note as soon as the GPU has finished "
+         "nothing for 0.3 s (04.39's hang report waited 2 s, and Captain Toad's level 3 took the PS4 down "
+         "before that).\n"
          "04.39: the GPU hang that takes the whole PS4 down (Captain Toad's level 3, Zelda: Echoes of Wisdom "
          "after the cliff scene): the hang report now shows where the GPU stopped and which shaders were "
          "running, and the app ends a few seconds into a hang instead of waiting ~40 s for the PS4's system "
@@ -2875,6 +2883,98 @@ private:
     std::thread thread;
 };
 
+// (04.40) The black box: four times a second while a program runs, a line with the GPU's progress,
+// the frames shown, the GPU thread's stage and the memory, in /data/eden-ps4/blackbox.txt, on the
+// disk before the next (fsync). Captain Toad's level 3 takes the whole PS4 down within seconds, and
+// what the boot trace (synced once a second, written every 5-10 s) and the logs (not synced) hold
+// stops up to 10 s before: this says what the last quarter second looked like. A ring of 480 lines
+// (2 minutes) after a header; each line starts with its number, the highest is the last.
+// EDEN_PS4_BLACKBOX=0 in settings.txt turns it off.
+class BlackBox
+{
+public:
+    void Start(const std::string& program)
+    {
+        const char* off = std::getenv("EDEN_PS4_BLACKBOX");
+        if (off && std::string_view{off} == "0")
+            return;
+        fd = open(kBlackBoxFile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0)
+            return;
+        std::string header = fmt::format("Eden for PS4 {}: {}; a ring of {} lines of {} bytes, 4 a second, "
+                                         "the highest number the last (times: the monotonic clock)",
+                                         EDEN_PS4_VERSION, program, kLines, kLineBytes);
+        header.resize(kHeaderBytes - 1, ' ');
+        header += '\n';
+        (void)!pwrite(fd, header.data(), header.size(), 0);
+        fsync(fd);
+        Trace(fmt::format("black box: {} from monotonic {:.3f} s", kBlackBoxFile, Now()));
+        stop = false;
+        thread = std::thread([this] { Run(); });
+    }
+    void Stop()
+    {
+        stop = true;
+        if (thread.joinable())
+            thread.join();
+        if (fd >= 0)
+            close(fd);
+        fd = -1;
+    }
+
+private:
+    static double Now()
+    {
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return double(now.tv_sec) + double(now.tv_nsec) / 1e9;
+    }
+    void Run()
+    {
+        scePthreadSetprio(scePthreadSelf(), 600); // (it sleeps; when it looks, it must get to)
+        uint64_t number = 0, busy0 = 0, span0 = 0;
+        {
+            uint64_t submits, waits, wait_ns;
+            ac_ps4_get_gpu_stats(&busy0, &span0, &submits, &waits, &wait_ns);
+        }
+        while (!stop)
+        {
+            usleep(250 * 1000);
+            uint64_t submitted = 0, completed = 0, busy = 0, span = 0, submits = 0, waits = 0, wait_ns = 0;
+            uint32_t trace = 0;
+            int64_t stalled = 0;
+            ac_ps4_gpu_progress(&submitted, &completed, &trace, &stalled);
+            ac_ps4_get_gpu_stats(&busy, &span, &submits, &waits, &wait_ns);
+            const double busy_share = span > span0 ? double(busy - busy0) * 100.0 / double(span - span0) : 0.0;
+            busy0 = busy;
+            span0 = span;
+            size_t flexible = 0;
+            sceKernelAvailableFlexibleMemorySize(&flexible);
+            const uint64_t frames = Common::PS4Diagnostics::composites.load(std::memory_order_relaxed) +
+                                    g_frames_shown.load(std::memory_order_relaxed);
+            const char* stage = Common::PS4Diagnostics::stage.load();
+            std::string line = fmt::format(
+                "#{:06} {:.3f}: frames {}; GPU {} of {} done{}, trace {}, busy {:.0f}%; RAM {} MiB, GPU buffers {} "
+                "MiB, flexible {} MiB, direct {} MiB free; GPU thread: {}",
+                number, Now(), frames, completed, submitted,
+                stalled ? fmt::format(", NOTHING FINISHED FOR {} ms", stalled) : std::string(), trace, busy_share,
+                Common::Orbis::OnDemandBytes() / MB, ac_ps4_gpu_bytes() / MB, flexible / MB,
+                Common::PS4Diagnostics::LargestFreeDirect() / MB, stage ? stage : "-");
+            line.resize(kLineBytes - 1, ' ');
+            line += '\n';
+            (void)!pwrite(fd, line.data(), line.size(), kHeaderBytes + off_t(number % kLines) * kLineBytes);
+            fsync(fd);
+            number++;
+        }
+    }
+
+    static constexpr const char* kBlackBoxFile = "/data/eden-ps4/blackbox.txt";
+    static constexpr int kLines = 480, kLineBytes = 256, kHeaderBytes = 256;
+    int fd = -1;
+    std::atomic<bool> stop{false};
+    std::thread thread;
+};
+
 // The C heap, flexible and direct memory, in the boot trace: what a program left behind shows
 // up as the next one starts (the first console run ran out after two programs)
 void MemoryTrace(const char* when)
@@ -3041,7 +3141,10 @@ void* Run(void*)
         MemoryTrace("before booting");
         HangWatchdog watchdog;
         watchdog.Start(program);
+        BlackBox black_box;
+        black_box.Start(program);
         auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
+        black_box.Stop();
         watchdog.Stop();
         if (gpu)
         {

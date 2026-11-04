@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.39)
+# Eden for PS4: status (after 04.40)
 
-Install **04.39** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.40** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0143). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -48,6 +48,8 @@ programs, 0 failures.
   a crash of the whole PS4.
 - **04.39:** the GPU hang: the report now shows where the GPU stopped, and the app ends instead of
   the PS4 (below).
+- **04.40:** a black box (`blackbox.txt`, synced 4 times a second) and a GPU stall note at 0.3 s
+  (below).
 
 ## Where we are: the open problem
 
@@ -77,10 +79,26 @@ checkerboard screen, sometimes a hard reset).
 2. **Stop the system crashes:** `RADV_PS4_HANG_EXIT=1`: if the GPU hasn't finished anything 2 s
    after the report started (about 4 s into the hang), `abort()`. The PS4 may then close just the app.
 
+### 04.39's run (Captain Toad level 3): no hang report
+- The PS4 went down as before, but 04.39's hang path left nothing: no "GPU hang?" boot trace line
+  (synced, 2 s into a GPU wait), `gpu-hang.txt` still 04.38's Zelda one.
+- The boot trace ends at 64.8 s, ~4 s after overflow heap 15 (the 32-bit translator's 23 MiB
+  allocation; Mario Kart makes it too and lives). All four Toad runs end within 4-10 s of it: it marks
+  level 3's loading, not the cause.
+- So in Toad nothing waited on the GPU for 2 s before the PS4 died, or it died for another reason.
+  Zelda's (the GPU stopped, the PS4 lived ~40 s more) may be a different fault.
+- Never tried for Toad: CPU Cores 6 (with 7, Eden's shader compilers and services also run on the core
+  the system shares), Fastmem off, Thread Placement Free, Switch Memory all up front.
+
+### 04.40: what the next crash leaves
+- `blackbox.txt`: 4 lines a second (GPU submitted/finished, how long it has finished nothing, trace
+  id, busy share, frames, the GPU thread's stage, memory), fsynced each time, a 2-minute ring.
+- A stall thread in the driver: after 0.3 s with nothing finished, `gpu/gpu-stall.txt` ("where the
+  GPU stopped") and a synced boot trace line, without anything having to wait.
+
 ### Next
-- One run into a hang (Captain Toad level 3 is the quickest), then send the logs. Whether the PS4
-  survived it (app-closed error CE-34878-0, or the system crash again) says if step 2 works.
-- From the report: the shader or packet that hangs, then a fix in Eden's GPU emulation or in RADV.
+- One Toad level 3 run with 04.40, default settings: the black box's last lines say whether the GPU
+  had stopped before the PS4 went down. Then, if it hadn't, CPU Cores 6, then Fastmem off.
 
 ### Also open
 - **Little Kitty, Big City:** a black screen. The game's allocator traps
