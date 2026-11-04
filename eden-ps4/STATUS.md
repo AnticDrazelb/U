@@ -81,3 +81,29 @@ checkerboard screen, sometimes a hard reset).
 - **Shelved:** `exit_pc_in_register` (04.31 WIP). It's in `git stash` in `~/eden-pptc`.
   - Indirect jumps alone: unity -0.35%, not worth it.
   - Returns need the return stack's placeholder entries to store the PC first.
+
+## Frame rates of every game tested (from all console logs, 04.01-04.38)
+
+Each game has two rows: "best" is the run with the highest average, "latest" is the most recent run.
+
+- **How the numbers were taken:** from the boot trace's `speed:` lines, each a 10-second average. The first three samples (boot) and samples under 1 fps (loading screens, hangs) are left out.
+- **Version:** the build that exported the logs. A run in an upload can be from that build or the one just before.
+- **Caveats:** menus count too (they often run at 55-60 fps), and scenes differ between runs.
+- **Captain Toad:** its runs end at level 3's GPU hang.
+
+| Game | Run | Version (logs exported by) | High | Low | Average | 10-s samples |
+|---|---|---|---|---|---|---|
+| Animal Crossing New Horizons | best | 04.31 | 56.2 | 23.9 | 33.8 | 26 |
+| Animal Crossing New Horizons | latest | 04.34 | 58.8 | 13.8 | 31.0 | 17 |
+| Bluey's Quest for the Gold Pen | best | 04.31 | 50.6 | 3.2 | 18.9 | 17 |
+| Bluey's Quest for the Gold Pen | latest | 04.33 | 47.6 | 3.7 | 16.8 | 16 |
+| Captain Toad Treasure Tracker | best | 04.38 | 59.9 | 55.4 | 58.8 | 4 |
+| Captain Toad Treasure Tracker | latest | 04.38 | 59.9 | 55.4 | 58.8 | 4 |
+| Hollow Knight Silksong | best | 04.30 | 58.6 | 11.7 | 30.7 | 22 |
+| Hollow Knight Silksong | latest | 04.30 | 58.6 | 11.7 | 30.7 | 22 |
+| Mario Kart 8 Deluxe | best | 04.10 | 58.4 | 34.0 | 46.2 | 8 |
+| Mario Kart 8 Deluxe | latest | 04.38 | 57.6 | 26.9 | 41.7 | 15 |
+| The Legend of Zelda Echoes of Wisdom | best | 04.30 | 51.2 | 22.1 | 33.7 | 18 |
+| The Legend of Zelda Echoes of Wisdom | latest | 04.38 | 58.5 | 7.3 | 31.4 | 24 |
+| The Legend of Zelda Links Awakening | best | 04.30 | 33.8 | 17.6 | 26.3 | 9 |
+| The Legend of Zelda Links Awakening | latest | 04.30 | 33.8 | 17.6 | 26.3 | 9 |
