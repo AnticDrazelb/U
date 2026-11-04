@@ -1306,6 +1306,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.35: a test switch: with CPU Unsafe off, the 64-bit CPU translator runs without any of the PS4 "
+         "speed-ups since 04.22 (slower). If a game works with it off and not on, they're the cause.\n"
          "04.34: a crash at 6-8 s into booting (Captain Toad, Little Kitty, Big City): a stick's movement "
          "reached the game's controller code before the game had set it up. Now it waits for it.\n"
          "04.33: Eden's heap grows into the PS4's large pool of memory (direct, 4.6 GiB free) before its "

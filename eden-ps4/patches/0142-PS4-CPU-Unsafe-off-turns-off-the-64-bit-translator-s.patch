@@ -1,0 +1,46 @@
+From 19286f847afe60bea64ea6b281342acaff5fe70c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 14:04:34 +0000
+Subject: [PATCH] PS4: CPU Unsafe off turns off the 64-bit translator's PS4
+ extras
+
+With CPU accuracy Auto (the menu's CPU Unsafe off), the A64 cores run without 04.22-04.30's
+options (folded offsets, dead flags, superblocks, bitfield shifts, plain acquire loads, ...): a
+switch to tell whether a game's trouble is theirs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 16d6cb3289..120f052e0b 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -313,6 +313,22 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.superblocks_cond = true;
+     // (04.30) LSL, LSR, UBFX, SBFIZ, ... by immediate as shifts, not a rotate and two masks
+     config.bitfield_shifts = true;
++    // (04.35) With CPU Unsafe off (Auto): none of the 64-bit translator's PS4 extras (04.22-04.30):
++    // a switch in the menu to tell whether a game's trouble is theirs (Little Kitty, Big City's
++    // allocator trap; Captain Toad's level 3)
++    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Unsafe) {
++        config.fold_address_offsets = false;
++        config.skip_redundant_extensions = false;
++        config.split_cold_code = false;
++        config.elide_dead_nzcv = false;
++        config.elide_dead_nzcv_abi = false;
++        config.return_stack_pc_only = false;
++        config.plain_acquire_loads = false;
++        config.elide_load_store_only_barriers = false;
++        config.superblocks = false;
++        config.superblocks_cond = false;
++        config.bitfield_shifts = false;
++    }
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

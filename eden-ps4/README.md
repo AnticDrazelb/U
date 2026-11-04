@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.35: **a switch for the 64-bit translator's extras.** Patch 0142: with CPU accuracy Auto (the
+menu's CPU Unsafe off), the A64 cores run without 04.22-04.30's options (`fold_address_offsets`,
+`skip_redundant_extensions`, `split_cold_code`, `elide_dead_nzcv(_abi)`, `return_stack_pc_only`,
+`plain_acquire_loads`, `elide_load_store_only_barriers`, `superblocks(_cond)`, `bitfield_shifts`).
+For Little Kitty, Big City (its allocator's `nnmem_nlib_debug_break`, after reads at 0 and at
+unmapped addresses, 16 times; no frame in 90 s) and Captain Toad's level 3 (the PS4 itself went
+down, the app's last lines new GPU macros being compiled, as in 04.33's run).
+
 04.34: **a boot crash on a stick's movement.** Patch 0141: the launcher's pad thread
 (`Launcher::SetPad` -> `VirtualGamepad::SetStickPosition` -> `EmulatedController::SetStick`)
 reached `NPad::ControllerUpdate` before the game's applet resource was set, and read it through
