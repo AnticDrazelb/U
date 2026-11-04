@@ -262,6 +262,8 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | Unity (IL2CPP) code cut into 2-3 instruction blocks by null checks; float stores through general registers | | 04.28: forward CBZ/TBZ as side exits, stores from XMMs (unity.c: -22% blocks entered, -3.0% instructions) |
 | 04.23-04.27: the flags look-ahead read B.cond/CBZ/TBZ targets 1-3 bytes off (rarely took live flags for dead) | | 04.28: fixed (found by the full sweep, gen8) |
 | Every B.cond ending a block (63% of game.c's block ends) | | 04.29: forward ones as side exits, flags stored only where the target reads them: -7.4%, -43.2% vs 04.22 |
+| Boot crash at 6-8 s (Captain Toad, Little Kitty): a stick's movement reached NPad::ControllerUpdate before the HID resource existed | | 04.34: returns until it does (patch 0141) |
+| Captain Toad level 3: the app ends while loading, no crash report (GPU log stops mid-run, no teardown) | | open: a system-side kill (a GPU fault?); the PS4's error code, if it shows one, tells |
 | The heap's overflow took 270 MiB of the ~364 MiB of flexible memory in a game's first seconds | | 04.33: direct memory first, flexible only when that fails |
 | Animal Crossing: "thread constructor failed" at 330 s (16 MiB default stacks; the next one couldn't be had) | | 04.32: 4 MiB for threads asking for no size, a retry at 2 MiB (untested on the console yet) |
 | Bluey: boot crash in 04.30 at 64 s (a page table's page unmappable: flexible memory out; 1 MiB free at the end of 04.21's run) | | 04.31: such pages from direct memory once flexible memory is out (untested on the console yet) |

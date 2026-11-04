@@ -1,0 +1,36 @@
+From 65ab01cb0ed30468a26b86e11ab58c94b650cb48 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 13:50:36 +0000
+Subject: [PATCH] hid: no controller update before the game's HID resource
+ exists
+
+The PS4's pad thread moving a stick while a game boots reached NPad::ControllerUpdate before the
+applet resource was set: Captain Toad and Little Kitty, Big City crashed at 6-8 s reading it
+through a null pointer (fault address 0x188). Nothing to update yet: return.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/hid_core/resources/npad/npad.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/hid_core/resources/npad/npad.cpp b/src/hid_core/resources/npad/npad.cpp
+index 2b04e2c670..231a09e709 100644
+--- a/src/hid_core/resources/npad/npad.cpp
++++ b/src/hid_core/resources/npad/npad.cpp
+@@ -150,6 +150,12 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
+         return;
+     }
+ 
++    // (PS4 04.34) A controller's change can come before the game's HID resource exists (the
++    // PS4's pad thread moving a stick while a game boots: Captain Toad, Little Kitty, Big City
++    // crashed here at 6-8 s, reading it through a null pointer): nothing to update yet.
++    if (applet_resource_holder.applet_resource == nullptr) {
++        return;
++    }
+     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
+         if (controller_idx >= controller_data[aruid_index].size()) {
+             return;
+-- 
+2.43.0
+

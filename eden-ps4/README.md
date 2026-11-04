@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.34: **a boot crash on a stick's movement.** Patch 0141: the launcher's pad thread
+(`Launcher::SetPad` -> `VirtualGamepad::SetStickPosition` -> `EmulatedController::SetStick`)
+reached `NPad::ControllerUpdate` before the game's applet resource was set, and read it through
+a null pointer (fault address 0x188; Captain Toad, Little Kitty, Big City, 6-8 s into the boot).
+It returns until that resource exists. Still open: Captain Toad's level 3 (Touchstone Trouble)
+ends the app while loading, with no crash report: the GPU log stops mid-run (6,000 submissions,
+all but one done), no teardown; 04.31's run ended the same way.
+
 04.33: **the heap grows into direct memory first.** `port/ps4_runtime.cpp`'s `addOverflowStep`
 took its overflow heaps from regular flexible memory while 64 MiB more than the request was free,
 and from direct memory only after: Bluey's first seconds took 150 + 120 MiB of the about 364 MiB
