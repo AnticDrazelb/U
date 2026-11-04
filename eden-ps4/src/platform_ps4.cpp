@@ -91,6 +91,8 @@ void ps4_heap_usage(size_t* in_use, size_t* size);
 int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
 // port/ps4_sampler.cpp: every thread's stack, appended to a file
 void ps4_dump_thread_stacks(const char* path, const char* reason);
+// port/ps4_crashlog.cpp (04.41): the boot trace synced within `ms` of each line, by a thread
+void ps4_boot_trace_sync_every(int ms);
 // Mesa's PS4 winsys (port/mesa/ac_ps4_drm.c; ps4_stubs.cpp without it): the GPU buffers' memory,
 // and the GPU's statistics since it started (busy and span in GPU clock ticks, submissions, and
 // the CPU's waits for the GPU's work: how many, and how long in all)
@@ -1315,6 +1317,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.41: more for the crash of the whole PS4: the black box showed the GPU idle and caught up just "
+         "before it, during level 3's loading. The boot trace now reaches the disk within 0.05 s of each line "
+         "(was 1 s), and it gets the GPU's first submissions after a loading screen, the big GPU buffers and "
+         "each 2 MiB of the Switch's RAM as it's mapped.\n"
          "04.40: a black box for crashes of the whole PS4: four times a second, what the GPU and the memory "
          "were doing goes to blackbox.txt, on the disk at once; and a note as soon as the GPU has finished "
          "nothing for 0.3 s (04.39's hang report waited 2 s, and Captain Toad's level 3 took the PS4 down "
@@ -3037,6 +3043,13 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
+    // (04.41) the boot trace on the disk within 50 ms of each line (EDEN_PS4_TRACE_SYNC_MS; 0:
+    // once a second, as before): Captain Toad's level 3 takes the whole PS4 down within a quarter
+    // second of the last line that made it to the disk
+    {
+        const char* sync = std::getenv("EDEN_PS4_TRACE_SYNC_MS");
+        ps4_boot_trace_sync_every(sync ? std::atoi(sync) : 50);
+    }
     // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless System Settings
     // (or settings.txt, EDEN_PS4_RENDERER=null) chose the software renderer, or Vulkan didn't
     // start this session

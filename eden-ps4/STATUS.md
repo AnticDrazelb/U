@@ -1,7 +1,7 @@
-# Eden for PS4: status (after 04.40)
+# Eden for PS4: status (after 04.41)
 
-Install **04.40** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
-The patches are in `eden-ps4/patches` (up to 0143). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.41** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -50,6 +50,8 @@ programs, 0 failures.
   the PS4 (below).
 - **04.40:** a black box (`blackbox.txt`, synced 4 times a second) and a GPU stall note at 0.3 s
   (below).
+- **04.41:** the boot trace synced within 50 ms; the GPU's first submissions after a loading screen,
+  big GPU buffers and each RAM chunk in it (below).
 
 ## Where we are: the open problem
 
@@ -96,9 +98,20 @@ checkerboard screen, sometimes a hard reset).
 - A stall thread in the driver: after 0.3 s with nothing finished, `gpu/gpu-stall.txt` ("where the
   GPU stopped") and a synced boot trace line, without anything having to wait.
 
+### 04.40's runs (Captain Toad level 3, three of them): not the GPU
+- Settings: 7 cores, then 6, then 7; Fastmem off; compiled macros; resolution 50%. All three went down.
+- The black box: for the last 1.8 s the GPU was idle and caught up (0% busy, every submission done),
+  no new frames (level 3 loading), the RAM growing. No stall note (nothing was waiting on the GPU).
+- The last line of both the black box and the boot trace (80.288 s): the macro JIT's 10th 64 KiB
+  block at `0x100c098000`, the same in all three runs; the PS4 went down within 0.25 s.
+- 04.37-04.39's runs with interpreted macros (no such blocks) went down at level 3 too: the block is
+  most likely just the last thing logged before level 3's first frames.
+- So CPU Cores and Fastmem are ruled out too, and the swapchain (never recreated: fixed 1280x720).
+
 ### Next
-- One Toad level 3 run with 04.40, default settings: the black box's last lines say whether the GPU
-  had stopped before the PS4 went down. Then, if it hadn't, CPU Cores 6, then Fastmem off.
+- One Toad level 3 run with 04.41. The boot trace's last lines (now synced within 50 ms) say whether
+  level 3's first GPU work was submitted and finished, and what memory was mapped just before.
+- Still untested for Toad: Switch Memory "All 4 GB up front", Thread Placement "Free".
 
 ### Also open
 - **Little Kitty, Big City:** a black screen. The game's allocator traps

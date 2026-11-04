@@ -372,6 +372,9 @@ extern "C" __attribute__((noinline)) void ps4_trace_callers(const char* what) {
     ps4_boot_trace(line);
 }
 
+// Lines written to the boot trace (ps4_boot_trace_sync_every syncs when it has grown).
+static std::atomic<uint64_t> g_traceLines{0};
+
 // Appends a line to /data/Crema/boot-trace.log (startup milestones), prefixed with the
 // seconds since the first trace line.
 extern "C" void ps4_boot_trace(const char* stage) {
@@ -399,6 +402,7 @@ extern "C" void ps4_boot_trace(const char* stage) {
     if (written >= static_cast<int>(sizeof(line)))
         line[sizeof(line) - 2] = '\n';
     writeAll(fd, line);
+    g_traceLines.fetch_add(1, std::memory_order_release);
     // (04.37) on the disk at most a second after it was written: a crash of the whole PS4 (Captain
     // Toad's level 3) loses what is only in its cache, and the last run's last minute was gone
     static std::atomic<int64_t> s_synced{0};
@@ -414,6 +418,38 @@ extern "C" void ps4_boot_trace_sync() {
     const int fd = traceFd();
     if (fd >= 0)
         fsync(fd);
+}
+
+// (Eden 04.41) The boot trace on the disk within `ms` of each line, from a thread of its own (no
+// line waits for the disk): Captain Toad's level 3 takes the whole PS4 down within a quarter second
+// of its last line that made it, and the once-a-second sync above can lose the second before it.
+// Started once; a later call changes the interval (0: stops syncing).
+static std::atomic<int> g_traceSyncMs{0};
+static void* traceSyncThread(void*) {
+    uint64_t synced = 0;
+    for (;;) {
+        const int ms = g_traceSyncMs.load(std::memory_order_relaxed);
+        usleep(static_cast<useconds_t>((ms > 0 ? ms : 1000) * 1000));
+        const uint64_t lines = g_traceLines.load(std::memory_order_acquire);
+        if (ms > 0 && lines != synced) {
+            synced = lines;
+            const int fd = traceFd();
+            if (fd >= 0)
+                fsync(fd);
+        }
+    }
+    return nullptr;
+}
+extern "C" void ps4_boot_trace_sync_every(int ms) {
+    static std::atomic<bool> started{false};
+    g_traceSyncMs.store(ms, std::memory_order_relaxed);
+    if (ms > 0 && !started.exchange(true)) {
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, traceSyncThread, nullptr) == 0)
+            pthread_detach(thread);
+        else
+            started = false;
+    }
 }
 
 // Every open() and close() of the app's own code (Cemu, Mesa, libc++, and the C library's fopen,

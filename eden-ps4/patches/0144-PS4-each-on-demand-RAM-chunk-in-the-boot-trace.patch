@@ -1,0 +1,38 @@
+From 9afe4d09144604b68087bc3aaa514b0274f636e4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 18:37:12 +0000
+Subject: [PATCH] PS4: each on-demand RAM chunk in the boot trace
+
+Captain Toad's level 3 takes the whole PS4 down while it loads, with
+the RAM growing: each chunk the fault handler maps goes to the boot
+trace (a fixed buffer and snprintf, nothing that allocates), which the
+app syncs within 50 ms (04.41).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/common/orbis_memory.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index f9c396c455..375ffe0539 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -156,6 +156,14 @@ bool CommitChunk(size_t index) noexcept {
+     while (bytes > peak && !on_demand.peak.compare_exchange_weak(peak, bytes)) {
+     }
+     state.store(ChunkMapped, std::memory_order_release);
++    // (04.41) each chunk in the boot trace, which the app syncs within 50 ms: Captain Toad's level 3
++    // takes the whole PS4 down while it loads, with the RAM growing (a fault handler's context: a
++    // fixed buffer and snprintf, nothing that allocates)
++    char line[128];
++    snprintf(line, sizeof(line), "eden: RAM chunk %zu mapped at %p (direct memory %#llx, %s): %zu MiB in all",
++             index, static_cast<void*>(at), static_cast<unsigned long long>(phys),
++             alignment == OnDemandChunk ? "2 MiB aligned" : "64 KiB aligned", bytes >> 20);
++    Trace(line);
+     return true;
+ }
+ 
+-- 
+2.43.0
+

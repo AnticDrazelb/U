@@ -379,6 +379,23 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.41: **the last 50 ms.** 04.40's three Captain Toad runs (6 and 7 cores, Fastmem off, compiled
+macros) all took the PS4 down at level 3, and the black box shows it wasn't the GPU: for the last
+1.8 s the GPU was idle and caught up (12097 of 12097 submissions done, 0% busy), the frames stopped
+(level 3 loading), the RAM growing. Its last line (80.288 s) is also the boot trace's last: the GPU
+macro JIT's 10th 64 KiB code block, at `0x100c098000` in all three runs (the same sequence of blocks
+before it each time); the PS4 went down within the next quarter second. The earlier runs with
+interpreted macros (no such blocks) went down at level 3 too, so the block is most likely only the
+last thing logged before level 3's first frames. Not the swapchain (the frontend's layout is fixed
+at 1280x720: never recreated). For the next run:
+- the boot trace synced within 50 ms of each line, by a thread (`ps4_boot_trace_sync_every`,
+  `port/ps4_crashlog.cpp`; `EDEN_PS4_TRACE_SYNC_MS`, 0: once a second as before);
+- after the GPU was idle 0.5 s, its next 40 submissions (IBs, dwords, draws, dispatches, indirect
+  ones, WAIT_REG_MEMs, trace id range) and each completion in the boot trace
+  (`ps4_note_submission`, `port/mesa/ac_ps4_drm.c`);
+- GPU buffers of 4 MiB or more as they're allocated and freed, and each 2 MiB chunk of the Switch's
+  RAM as the fault handler maps it (patch 0144).
+
 04.40: **a black box, and a stall note at 0.3 s.** 04.39's first run (Captain Toad, level 3) took the
 PS4 down as before, but nothing of 04.39's hang path is in its logs: no "GPU hang?" line in the boot
 trace (written and synced 2 s into a GPU wait), `gpu-hang.txt` still 04.38's Zelda report. The boot

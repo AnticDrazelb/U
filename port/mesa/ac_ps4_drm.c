@@ -1413,6 +1413,62 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
 static int64_t ps4_progress_ns; /* when the GPU last finished something, or was last idle */
 static ac_drm_device *ps4_last_device; /* (defined with the flight recorder, below) */
 
+/* (04.41) The first submissions after the GPU was idle a while (a game's loading screen), and their
+ * completions, in the boot trace (synced within 50 ms by the app): Captain Toad's level 3 takes the
+ * PS4 down within a quarter second of its loading, with the GPU idle and caught up just before;
+ * this says whether the GPU got level 3's first work and how far it got. */
+static int64_t ps4_idle_since;       /* (the stall thread) when the GPU was first seen idle; 0: busy */
+static int ps4_after_idle_left;      /* submissions still to note (under dev->lock) */
+static uint64_t ps4_after_idle_last; /* the last one noted: completions are noted up to it */
+
+static void
+ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs)
+{
+   const int64_t idle = __atomic_load_n(&ps4_idle_since, __ATOMIC_RELAXED);
+   const int64_t now = os_time_get_nano();
+   if (!ps4_after_idle_left && idle && now - idle >= 500000000ll && ps4_completed(dev) + 1 >= seq) {
+      ps4_after_idle_left = 40;
+      char line[160];
+      snprintf(line, sizeof(line), "radv/ps4: the GPU was idle %.1f s: its next 40 submissions follow",
+               (now - idle) / 1e9);
+      ps4_boot_trace(line);
+   }
+   if (ps4_after_idle_left <= 0)
+      return;
+   ps4_after_idle_left--;
+   __atomic_store_n(&ps4_after_idle_last, seq, __ATOMIC_RELEASE);
+   static struct ps4_pkt pkts[4096];
+   struct ps4_walk w;
+   memset(&w, 0, sizeof(w));
+   w.pkts = pkts;
+   w.max = ARRAY_SIZE(pkts);
+   unsigned dwords = 0;
+   for (unsigned i = 0; i < num_ibs; i++) {
+      ps4_walk_collect(&w, (uintptr_t)dcb[i], sizes[i] / 4, 0);
+      dwords += sizes[i] / 4;
+   }
+   unsigned draws = 0, indirect = 0, dispatches = 0, waits = 0, traces = 0;
+   uint32_t first_trace = 0, last_trace = 0;
+   for (unsigned i = 0; i < w.count; i++) {
+      const struct ps4_pkt *p = &w.pkts[i];
+      draws += p->op == 0x27 || p->op == 0x2d || p->op == 0x35 || p->op == 0x24 || p->op == 0x25 ||
+               p->op == 0x2c || p->op == 0x38;
+      indirect += p->op == 0x24 || p->op == 0x25 || p->op == 0x2c || p->op == 0x38 || p->op == 0x16;
+      dispatches += p->op == 0x15 || p->op == 0x16;
+      waits += p->op == 0x3c;
+      if (p->op == 0x37 && ps4_trace_va && p->addr == ps4_trace_va) {
+         if (!traces++)
+            first_trace = p->v[0];
+         last_trace = p->v[0];
+      }
+   }
+   char line[220];
+   snprintf(line, sizeof(line), "radv/ps4: submit %llu: %u IBs, %u dwords, %u draws, %u dispatches (%u of them "
+            "indirect), %u WAIT_REG_MEM, trace ids %u-%u%s", (unsigned long long)seq, num_ibs, dwords, draws,
+            dispatches, indirect, waits, first_trace, last_trace, w.dropped ? " (walk cut short)" : "");
+   ps4_boot_trace(line);
+}
+
 void ac_ps4_gpu_progress(uint64_t *submitted, uint64_t *completed, uint32_t *trace_id, int64_t *stalled_ms);
 void
 ac_ps4_gpu_progress(uint64_t *submitted, uint64_t *completed, uint32_t *trace_id, int64_t *stalled_ms)
@@ -1440,6 +1496,18 @@ ps4_stall_thread(void *arg)
       sceKernelUsleep(50000);
       const uint64_t done = ps4_completed(dev);
       const int64_t now = os_time_get_nano();
+      if (done >= dev->last_seq) {
+         if (!__atomic_load_n(&ps4_idle_since, __ATOMIC_RELAXED))
+            __atomic_store_n(&ps4_idle_since, now, __ATOMIC_RELAXED);
+      } else {
+         __atomic_store_n(&ps4_idle_since, 0, __ATOMIC_RELAXED);
+      }
+      if (done != last && last < __atomic_load_n(&ps4_after_idle_last, __ATOMIC_ACQUIRE)) {
+         char line[120];
+         snprintf(line, sizeof(line), "radv/ps4: GPU completed %llu (submitted %llu)", (unsigned long long)done,
+                  (unsigned long long)dev->last_seq);
+         ps4_boot_trace(line);
+      }
       if (done != last || done >= dev->last_seq) {
          if (done != last && noted == last) {
             char line[160];
@@ -2358,6 +2426,13 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
    }
 
    ps4_register_bo(dev, bo);
+   if (bo->size >= (4ull << 20)) { /* (04.41) the big ones in the boot trace */
+      char line[160];
+      snprintf(line, sizeof(line), "radv/ps4: GPU buffer %u: %llu KiB (%s), phys %#llx; %llu MiB in all", bo->handle,
+               (unsigned long long)(bo->size >> 10), bo->write_combined ? "garlic" : "onion",
+               (unsigned long long)bo->phys, (unsigned long long)((dev->bo_bytes + bo->size) >> 20));
+      ps4_boot_trace(line);
+   }
 
    out->abo = bo;
    __atomic_add_fetch(&dev->bo_bytes, bo->size, __ATOMIC_RELAXED);
@@ -2388,6 +2463,12 @@ ps4_do_free(ac_drm_device *dev, struct amdgpu_bo *b)
       dev->bos[b->handle] = NULL;
       free(b);
       return;
+   }
+   if (b->size >= (4ull << 20)) { /* (04.41) the big ones in the boot trace */
+      char line[120];
+      snprintf(line, sizeof(line), "radv/ps4: GPU buffer %u freed (%llu KiB)", b->handle,
+               (unsigned long long)(b->size >> 10));
+      ps4_boot_trace(line);
    }
    if (b->cpu_owned)
       sceKernelMunmap(b->cpu, b->size);
@@ -3868,6 +3949,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
    }
    ps4_account_gpu_time(dev);
    const uint64_t seq = ++dev->last_seq;
+   ps4_note_submission(dev, seq, dcb, dcb_sizes, num_ibs);
    uint32_t *fence_ib = dev->fence_ibs + (seq % FENCE_IB_COUNT) * FENCE_IB_DW;
    uint32_t *cs = fence_ib;
    if (user_fence_addr)
