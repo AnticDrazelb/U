@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.41)
+# Eden for PS4: status (after 04.42)
 
-Install **04.41** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.42** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -52,6 +52,7 @@ programs, 0 failures.
   (below).
 - **04.41:** the boot trace synced within 50 ms; the GPU's first submissions after a loading screen,
   big GPU buffers and each RAM chunk in it (below).
+- **04.42:** a test: geometry shader and tessellation draws (and their ring registers) skipped (below).
 
 ## Where we are: the open problem
 
@@ -108,10 +109,21 @@ checkerboard screen, sometimes a hard reset).
   most likely just the last thing logged before level 3's first frames.
 - So CPU Cores and Fastmem are ruled out too, and the swapchain (never recreated: fixed 1280x720).
 
-### Next
-- One Toad level 3 run with 04.41. The boot trace's last lines (now synced within 50 ms) say whether
-  level 3's first GPU work was submitted and finished, and what memory was mapped just before.
-- Still untested for Toad: Switch Memory "All 4 GB up front", Thread Placement "Free".
+### 04.41's run: level 3's first frame
+- The usual settings. The screen flickered between garbage and black; a hard reset.
+- Level 3 loaded (six 16-32 MiB GPU buffers: two of them the size of RADV's GS rings on the PS4),
+  its first frame reached the GPU at 69.520 s (183 draws, 2 dispatches), the GPU finished nothing
+  after 69.491 s, and the PS4 was gone within ~0.1 s: the GPU, and fast.
+- "Switch Memory: All 4 GB up front": `std::bad_alloc` at 30 s (no room for the C heap's overflow).
+  Not usable for Toad.
+
+### 04.42: the test
+- Draws with a geometry shader or tessellation, and RADV's writes of those rings' registers (the
+  system's on the PS4), become NOPs (`RADV_PS4_SKIP_GS_TESS=1`, the default in this build), and are
+  counted in the boot trace.
+- Toad level 3 runs (with something missing): they're the cause; then the fix is setting the rings
+  up as the PS4 wants. It still goes down with none counted: not them. Down with some counted and
+  skipped: not them either.
 
 ### Also open
 - **Little Kitty, Big City:** a black screen. The game's allocator traps

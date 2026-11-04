@@ -379,6 +379,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.42: **a test: no geometry shaders or tessellation.** 04.41's run (Captain Toad, level 3, the usual
+settings; the screen flickered between garbage and black, then a hard reset) left its last 50 ms:
+level 3 loaded (six 16-32 MiB GPU buffers, RAM chunks), its first GPU work was submitted at 69.458 s
+and its first full frame at 69.520 s (submission 10781: 183 draws, 2 dispatches, 54 WAIT_REG_MEM),
+the GPU finished nothing after 69.491 s, and the PS4 went down within ~0.1 s. So it is the GPU,
+level 3's first frame, and fast. Its two 16 MiB buffers are the size RADV gives each GS ring on the
+PS4 (`ac_ps4_gs_ring_min` 8 MiB, allocated twice over). On the PS4 the GS and tessellation rings are
+the system's (Gnm sets their sizes with a system call and hands apps one tessellation factor ring);
+RADV programs their registers itself (`VGT_ESGS/GSVS_RING_SIZE`, `VGT_TF_RING_SIZE`,
+`VGT_HS_OFFCHIP_PARAM`, `VGT_TF_MEMORY_BASE`), and Crema found the GS writing past RADV's ring. Zelda's
+hung submission (04.38) had neither (`VGT_SHADER_STAGES_EN` 0 throughout): a different fault.
+`ps4_filter_gs_tess` (`port/mesa/ac_ps4_drm.c`) walks every submission (no memory reads), counts the
+draws with an LS, HS, ES or GS stage and the packets that write only those ring registers, describes
+the first 12 in the boot trace, and with `RADV_PS4_SKIP_GS_TESS=1` (Eden's default in 04.42) turns
+them into NOPs of the same length before the submission. The post-loading submission notes carry the
+counts. Tested on the PC (`hangwalk.sh` case G: ring registers recognised, `VGT_PRIMITIVE_TYPE` and
+`VGT_NUM_INSTANCES` beside them left alone). "Switch Memory: All 4 GB up front" can't run Toad: the
+C heap's overflow (direct memory) has no room, `std::bad_alloc` at 30 s.
+
 04.41: **the last 50 ms.** 04.40's three Captain Toad runs (6 and 7 cores, Fastmem off, compiled
 macros) all took the PS4 down at level 3, and the black box shows it wasn't the GPU: for the last
 1.8 s the GPU was idle and caught up (12097 of 12097 submissions done, 0% busy), the frames stopped

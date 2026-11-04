@@ -333,6 +333,52 @@ static void test_cases(void) {
     }
 }
 
+// case G (04.42): SET_UCONFIG_REG of the GS/tessellation ring registers recognised, and the ones
+// every draw sets beside them (VGT_PRIMITIVE_TYPE, VGT_NUM_INSTANCES) left alone; a draw's stages
+static void test_rings(void) {
+    uint32_t* s = add_region(0x4405000000ull, 256);
+    struct cs a = {s, 0};
+    emit(&a, pkt3(0x79, 2));  // VGT_PRIMITIVE_TYPE alone: not a ring register
+    emit(&a, 0x242);
+    emit(&a, 4);
+    emit(&a, pkt3(0x79, 3));  // VGT_ESGS_RING_SIZE, VGT_GSVS_RING_SIZE
+    emit(&a, 0x240);
+    emit(&a, 0x8000);
+    emit(&a, 0x8000);
+    emit(&a, pkt3(0x79, 4));  // VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM, VGT_TF_MEMORY_BASE
+    emit(&a, 0x24e);
+    emit(&a, 0x2000);
+    emit(&a, 0x1ff);
+    emit(&a, 0x44001234);
+    emit(&a, pkt3(0x79, 3));  // VGT_NUM_INSTANCES (0x24d) and VGT_TF_RING_SIZE: mixed
+    emit(&a, 0x24d);
+    emit(&a, 1);
+    emit(&a, 0x2000);
+    emit(&a, pkt3(0x69, 2));  // VGT_SHADER_STAGES_EN: ES, GS, VS
+    emit(&a, 0x2d5);
+    emit(&a, 0x2 << 3 | 1 << 5 | 1 << 6);
+    emit(&a, pkt3(0x2d, 2));  // DRAW_INDEX_AUTO
+    emit(&a, 3);
+    emit(&a, 2);
+    struct ps4_pkt pkts[16];
+    struct ps4_walk w = {0};
+    w.pkts = pkts;
+    w.max = 16;
+    w.light = true;
+    ps4_walk_collect(&w, 0x4405000000ull, a.n, 0);
+    unsigned rings = 0, all = 0, gs_draws = 0;
+    for (unsigned i = 0; i < w.count; i++) {
+        rings += w.pkts[i].op == 0x79;
+        all += w.pkts[i].op == 0x79 && w.pkts[i].v[7];
+        gs_draws += ps4_pkt_is_work(&w.pkts[i]) && (w.pkts[i].stages & 0x20);
+    }
+    if (rings != 3 || all != 2 || gs_draws != 1) {
+        printf("FAIL G: %u ring packets (3), %u only ring registers (2), %u GS draws (1)\n", rings, all, gs_draws);
+        g_failures++;
+    }
+    reset_regions();
+}
+
 // ---- 2: the uploaded log's hang report, submission 30753
 static void test_report(const char* path) {
     FILE* f = fopen(path, "r");
@@ -526,6 +572,7 @@ static void test_garbage(unsigned rounds) {
 
 int main(int argc, char** argv) {
     test_cases();
+    test_rings();
     test_report(argc > 1 ? argv[1] : "");
     const unsigned rounds = argc > 2 ? (unsigned)atoi(argv[2]) : 2000;
     test_garbage(rounds);

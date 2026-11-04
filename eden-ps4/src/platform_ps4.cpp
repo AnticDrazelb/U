@@ -1317,6 +1317,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.42: a test for the crash of the whole PS4: 04.41's log shows Captain Toad's level 3 going down "
+         "within 0.1 s of its first frame reaching the GPU. Draws that use a geometry shader or tessellation "
+         "(whose GPU rings the PS4's system owns) are now left out, and counted in the boot trace. If level 3 "
+         "runs (with things missing), they're the cause.\n"
          "04.41: more for the crash of the whole PS4: the black box showed the GPU idle and caught up just "
          "before it, during level 3's loading. The boot trace now reaches the disk within 0.05 s of each line "
          "(was 1 s), and it gets the GPU's first submissions after a loading screen, the big GPU buffers and "
@@ -3043,6 +3047,11 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
+    // (04.42) a test: draws with a geometry shader or tessellation, and RADV's writes of those
+    // rings' registers (the system's on the PS4), become no-ops before the GPU gets them. Captain
+    // Toad's level 3 took the whole PS4 down within 0.1 s of its first frame, the screen corrupted.
+    // settings.txt RADV_PS4_SKIP_GS_TESS=0 draws them (they're counted and logged either way).
+    setenv("RADV_PS4_SKIP_GS_TESS", "1", 0);
     // (04.41) the boot trace on the disk within 50 ms of each line (EDEN_PS4_TRACE_SYNC_MS; 0:
     // once a second, as before): Captain Toad's level 3 takes the whole PS4 down within a quarter
     // second of the last line that made it to the disk

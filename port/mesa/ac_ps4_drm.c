@@ -522,6 +522,7 @@ struct ps4_pkt {
    uint64_t addr;          /* memory it writes, waits on, or reads its arguments from */
    uint64_t sh[PS4_STAGES]; /* draws and dispatches: the shaders they run (0: none) */
    uint32_t v[8];          /* the packet's values (see ps4_pkt_text) */
+   uint32_t stages;        /* draws: VGT_SHADER_STAGES_EN when issued */
    uint8_t op, depth, sub;
    int8_t done;            /* the memory check: 1 done (or satisfied), 0 not, -1 none */
 };
@@ -535,6 +536,7 @@ struct ps4_walk {
    uint32_t instances;                      /* NUM_INSTANCES */
    uint64_t base[4];                        /* SET_BASE */
    uint8_t sub;                             /* the submission being walked (index) */
+   bool light;                              /* no memory checks, no indirect arguments (per submission) */
 };
 
 static uint32_t
@@ -581,6 +583,7 @@ static void
 ps4_walk_draw_shaders(const struct ps4_walk *w, struct ps4_pkt *p)
 {
    const uint32_t en = w->stages_en;
+   p->stages = en;
    if (en & 3) /* LS_EN */
       p->sh[PS4_LS] = ps4_walk_shader(w, PS4_LS);
    if (en & 4) /* HS_EN */
@@ -595,9 +598,11 @@ ps4_walk_draw_shaders(const struct ps4_walk *w, struct ps4_pkt *p)
 
 /* Indirect draws and dispatches: their arguments, read from memory (v[6] = 1 when read). */
 static void
-ps4_walk_args(struct ps4_pkt *p, uint64_t va, unsigned dwords)
+ps4_walk_args(const struct ps4_walk *w, struct ps4_pkt *p, uint64_t va, unsigned dwords)
 {
    p->addr = va;
+   if (w->light)
+      return;
    const uint32_t *a = ps4_hw_read(va, dwords * 4ull);
    if (!a)
       return;
@@ -676,6 +681,27 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
                }
             }
             break;
+         case 0x79: /* SET_UCONFIG_REG: the GS and tessellation rings' (system-owned on the PS4):
+                     * VGT_ESGS/GSVS_RING_SIZE (0x30900/4), VGT_TF_RING_SIZE, VGT_HS_OFFCHIP_PARAM,
+                     * VGT_TF_MEMORY_BASE (0x30938-0x30940); not VGT_PRIMITIVE_TYPE and the others
+                     * between, which every draw sets */
+            if (body >= 2) {
+               bool any = false, all = true;
+               for (unsigned k = 1; k < body; k++) {
+                  const unsigned reg = b[0] + k - 1;
+                  const bool ring = reg == 0x240 || reg == 0x241 || (reg >= 0x24e && reg <= 0x250);
+                  any |= ring;
+                  all &= ring;
+               }
+               if (any && (p = ps4_walk_add(w, va, op, depth))) {
+                  p->v[0] = b[0];             /* first register (dwords from 0x30000) */
+                  p->v[1] = body - 1;         /* how many */
+                  for (unsigned k = 1; k < body && k <= 5; k++)
+                     p->v[1 + k] = b[k];      /* v[2..6]: their values */
+                  p->v[7] = all;              /* only ring registers in it */
+               }
+            }
+            break;
          case 0x69: /* SET_CONTEXT_REG */
             for (unsigned k = 1; k < body; k++)
                if (b[0] + k - 1 == 0x2d5) /* VGT_SHADER_STAGES_EN */
@@ -698,7 +724,7 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
                   p->v[2] = b[2];
                   p->v[6] = 1;
                } else {
-                  ps4_walk_args(p, w->base[1] + b[0], 3);
+                  ps4_walk_args(w, p, w->base[1] + b[0], 3);
                }
                p->v[3] = w->threads[0];
                p->v[4] = w->threads[1];
@@ -723,12 +749,12 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
             if ((p = ps4_walk_add(w, va, op, depth))) {
                ps4_walk_draw_shaders(w, p);
                const bool indexed = op == 0x25 || op == 0x38;
-               ps4_walk_args(p, w->base[1] + b[0], indexed ? 5 : 4);
+               ps4_walk_args(w, p, w->base[1] + b[0], indexed ? 5 : 4);
                p->v[5] = 1; /* draws */
                if ((op == 0x2c || op == 0x38) && body >= 8) {
                   p->v[5] = b[4];
                   p->v[7] = b[7]; /* stride */
-                  if (b[3] & (1u << 30)) { /* COUNT_INDIRECT_ENABLE: the count from memory */
+                  if ((b[3] & (1u << 30)) && !w->light) { /* COUNT_INDIRECT_ENABLE: the count from memory */
                      const uint32_t count = ps4_hw_read32(b[5] | ((uint64_t)b[6] << 32), &ok);
                      p->v[5] = ok ? MIN2(count, b[4]) : 0xffffffffu;
                   }
@@ -742,7 +768,7 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
                   p->addr = b[1] | ((uint64_t)b[2] << 32);
                   p->v[0] = b[3];
                   p->v[1] = body - 3;
-                  const uint32_t now = ps4_hw_read32(p->addr, &ok);
+                  const uint32_t now = w->light ? 0 : ps4_hw_read32(p->addr, &ok);
                   p->v[2] = now;
                   p->done = ok ? now == b[3] : -1;
                }
@@ -753,7 +779,7 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
                p->v[0] = b[0];
                if (body >= 3) {
                   p->addr = b[1] | ((uint64_t)(b[2] & 0xffff) << 32);
-                  if ((b[0] & 0x3f) == 0x15) { /* ZPASS_DONE: the DBs' counts, bit 63 = written */
+                  if ((b[0] & 0x3f) == 0x15 && !w->light) { /* ZPASS_DONE: the DBs' counts, bit 63 = written */
                      const uint64_t now = ps4_hw_read64(p->addr, &ok);
                      p->done = ok ? (int8_t)(now >> 63) : -1;
                   }
@@ -767,7 +793,7 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
                p->addr = b[1] | ((uint64_t)(b[2] & 0xffff) << 32);
                p->v[1] = b[3];
                p->v[3] = op == 0x47 ? b[2] >> 29 : 1; /* DATA_SEL (EOS: its data, 32 bits) */
-               if (p->v[3] == 1 || p->v[3] == 2) {
+               if ((p->v[3] == 1 || p->v[3] == 2) && !w->light) {
                   const uint32_t now = ps4_hw_read32(p->addr, &ok);
                   p->v[2] = now;
                   p->done = ok ? now == b[3] : -1;
@@ -782,7 +808,7 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
                p->v[2] = b[4];              /* mask */
                if (p->v[3]) {
                   p->addr = (b[1] & ~3u) | ((uint64_t)b[2] << 32);
-                  const uint32_t now = ps4_hw_read32(p->addr, &ok) & b[4];
+                  const uint32_t now = w->light ? 0 : ps4_hw_read32(p->addr, &ok) & b[4];
                   p->v[4] = now;
                   const uint32_t ref = b[3];
                   const bool met = p->v[0] == 0 ? true : p->v[0] == 1 ? now < ref
@@ -1016,6 +1042,12 @@ ps4_pkt_text(struct ps4_line *l, const struct ps4_pkt *p, uint64_t trace_va)
    case 0x43:
    case 0x58:
       ps4_line_add(l, "%s %#x%s", p->op == 0x43 ? "SURFACE_SYNC" : "ACQUIRE_MEM", v[0], ps4_pkt_is_wait(p) ? " (waits)" : "");
+      break;
+   case 0x79:
+      ps4_line_add(l, "SET_UCONFIG_REG %#x (%u):", 0x30000 + v[0] * 4, v[1]);
+      for (unsigned k = 0; k < v[1] && k < 5; k++)
+         ps4_line_add(l, " %#x", v[2 + k]);
+      ps4_line_add(l, " (GS/tessellation rings)");
       break;
    case 0x42: ps4_line_add(l, "PFP_SYNC_ME"); break;
    case 0x1e: ps4_line_add(l, "ATOMIC_MEM %#x", v[0]); break;
@@ -1413,6 +1445,84 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
 static int64_t ps4_progress_ns; /* when the GPU last finished something, or was last idle */
 static ac_drm_device *ps4_last_device; /* (defined with the flight recorder, below) */
 
+/* (04.42) Geometry shaders and tessellation. On the PS4 the GS and tessellation rings are the
+ * system's (Sony's Gnm sets their sizes with a system call, and hands apps one system tessellation
+ * factor ring); RADV writes their registers itself (VGT_ESGS/GSVS_RING_SIZE, VGT_TF_RING_SIZE,
+ * VGT_HS_OFFCHIP_PARAM, VGT_TF_MEMORY_BASE), and Crema saw the GS write past RADV's ring (the VGT
+ * wraps it at a larger size). Captain Toad's level 3 takes the whole PS4 down within 0.1 s of its
+ * first frame, the screen corrupted: whether that frame has such draws, and whether the PS4 survives
+ * without them. Every submission's draws with a GS or tessellation stage enabled
+ * (VGT_SHADER_STAGES_EN) and its ring register writes are counted, the first ones described in the
+ * boot trace; with RADV_PS4_SKIP_GS_TESS=1 (Eden 04.42's default) they become NOPs before the GPU
+ * gets them (the draws don't appear: a test, not a fix). */
+static unsigned ps4_gs_tess_last_draws, ps4_gs_tess_last_rings; /* the last submission's (for its note) */
+
+static void
+ps4_filter_gs_tess(void *const *dcb, const uint32_t *sizes, unsigned num_ibs, uint64_t seq)
+{
+   static int skip = -1;
+   if (skip < 0) {
+      const char *e = getenv("RADV_PS4_SKIP_GS_TESS");
+      skip = e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "off") != 0;
+   }
+   static struct ps4_pkt pkts[8192];
+   static uint64_t total_draws, total_rings, submissions;
+   static unsigned described;
+   struct ps4_walk w;
+   memset(&w, 0, sizeof(w));
+   w.pkts = pkts;
+   w.max = ARRAY_SIZE(pkts);
+   w.light = true;
+   for (unsigned i = 0; i < num_ibs; i++)
+      ps4_walk_collect(&w, (uintptr_t)dcb[i], sizes[i] / 4, 0);
+   unsigned draws = 0, rings = 0;
+   for (unsigned k = 0; k < w.count; k++) {
+      struct ps4_pkt *p = &w.pkts[k];
+      const bool draw = ps4_pkt_is_work(p) && p->op != 0x15 && p->op != 0x16 && (p->stages & 0x3f);
+      const bool ring = p->op == 0x79;
+      if (!draw && !ring)
+         continue;
+      draws += draw;
+      rings += ring;
+      const bool nop = skip && (draw || p->v[7]);
+      if (described < 12) {
+         described++;
+         struct ps4_line l = {{0}, 0};
+         ps4_pkt_text(&l, p, ps4_trace_va);
+         char line[460];
+         snprintf(line, sizeof(line), "radv/ps4: submission %llu: %s%s%s", (unsigned long long)seq, l.s,
+                  draw ? "" : "", nop ? " - SKIPPED (a NOP)" : "");
+         if (draw) {
+            const size_t n = strlen(line);
+            snprintf(line + n, sizeof(line) - n, " [VGT_SHADER_STAGES_EN %#x:%s%s%s%s]", p->stages,
+                     (p->stages & 3) ? " LS" : "", (p->stages & 4) ? " HS" : "", (p->stages & 0x18) ? " ES" : "",
+                     (p->stages & 0x20) ? " GS" : "");
+         }
+         ps4_boot_trace(line);
+      }
+      if (nop) {
+         uint32_t *h = (uint32_t *)(uintptr_t)p->va;
+         const unsigned body = ((*h >> 16) & 0x3fff) + 1;
+         *h = 0xC0001000u | ((body - 1) << 16); /* PKT3(NOP) of the same length */
+         ps4_flush_cpu_cache(h, 4);
+      }
+   }
+   ps4_gs_tess_last_draws = draws;
+   ps4_gs_tess_last_rings = rings;
+   if (!draws && !rings)
+      return;
+   total_draws += draws;
+   total_rings += rings;
+   if (submissions++ % 600 == 0) {
+      char line[200];
+      snprintf(line, sizeof(line), "radv/ps4: geometry shader / tessellation so far: %llu draws, %llu ring register "
+               "writes in %llu submissions%s%s", (unsigned long long)total_draws, (unsigned long long)total_rings,
+               (unsigned long long)submissions, skip ? " (skipped: RADV_PS4_SKIP_GS_TESS)" : "",
+               w.dropped ? "; a walk cut short" : "");
+      ps4_boot_trace(line);
+   }
+}
+
 /* (04.41) The first submissions after the GPU was idle a while (a game's loading screen), and their
  * completions, in the boot trace (synced within 50 ms by the app): Captain Toad's level 3 takes the
  * PS4 down within a quarter second of its loading, with the GPU idle and caught up just before;
@@ -1462,10 +1572,11 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
          last_trace = p->v[0];
       }
    }
-   char line[220];
+   char line[260];
    snprintf(line, sizeof(line), "radv/ps4: submit %llu: %u IBs, %u dwords, %u draws, %u dispatches (%u of them "
-            "indirect), %u WAIT_REG_MEM, trace ids %u-%u%s", (unsigned long long)seq, num_ibs, dwords, draws,
-            dispatches, indirect, waits, first_trace, last_trace, w.dropped ? " (walk cut short)" : "");
+            "indirect), %u WAIT_REG_MEM, trace ids %u-%u; geometry shader / tessellation: %u draws, %u ring "
+            "writes%s", (unsigned long long)seq, num_ibs, dwords, draws, dispatches, indirect, waits, first_trace,
+            last_trace, ps4_gs_tess_last_draws, ps4_gs_tess_last_rings, w.dropped ? " (walk cut short)" : "");
    ps4_boot_trace(line);
 }
 
@@ -3914,6 +4025,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
          break;
       }
    }
+   ps4_filter_gs_tess(dcb, dcb_sizes, num_ibs, dev->last_seq + 1);
    ps4_record_submission(dcb, dcb_sizes, num_ibs, dev->last_seq + 1);
 
    /* Commands that would write where they mustn't: report and disable them (RADV_PS4_SCAN=1;
