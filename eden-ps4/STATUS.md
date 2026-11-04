@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.43)
+# Eden for PS4: status (after 04.44)
 
-Install **04.43** (newest; 04.42 is the GS/tessellation skip test to fall back on). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.44** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -128,11 +128,17 @@ checkerboard screen, sometimes a hard reset).
   up as the PS4 wants. It still goes down with none counted: not them. Down with some counted and
   skipped: not them either.
 
-### Next (after 04.43)
-- One Toad level 3 run with 04.43. Level 3 runs: the rings were it. The boot trace says how many GS
-  and tessellation draws there were, and what `sceGnmSetGsRingSizes` returned.
-- It still goes down: 04.42 (those draws left out) tells whether they're involved at all. If not, the
-  next suspect is the 2020 Mesa one below: storage buffers through VK_EXT_descriptor_buffer.
+### 04.43's run: not GS or tessellation
+- `sceGnmSetGsRingSizes(8 MiB, 8 MiB)` returned 0; 2288 noted submissions had no GS or tessellation
+  draw and no ring register write. Level 3 went down as in 04.41.
+
+### 04.44: bad descriptors
+- After a loading screen, each draw's and dispatch's descriptors are checked against the live GPU
+  buffers; a wild one (or a range far past its buffer) is logged and its draw skipped. The notes carry
+  a census of global-state packets (config and register writes, GDS, streamout, unusual packets).
+- Next: one Toad level 3 run. Wild descriptors logged and level 3 runs: that's it, then find which
+  shader and why (Eden's storage buffer tracking, or the descriptor buffer path). None logged and it
+  goes down: the census lines of level 3's first frame against the frames before it.
 
 ### What other emulators and ports found (research, after 04.42)
 - **Mesa issue 3168 (2020): yuzu, Captain Toad, AMD GCN (R9 Fury, Linux), "the GPU hangs and I need

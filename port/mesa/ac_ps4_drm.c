@@ -1523,6 +1523,355 @@ ps4_filter_gs_tess(void *const *dcb, const uint32_t *sizes, unsigned num_ibs, ui
    }
 }
 
+/* ---- descriptor check: begin (also built on a PC: eden-ps4/tools/gpu-tests/desccheck.sh) ---- */
+/* (04.44) The check of the first submissions after a loading screen, where Captain Toad's level 3
+ * takes the whole PS4 down within 0.05 s (04.41-04.43: its first frame, 183 draws; no geometry shader
+ * or tessellation). Mesa issue 3168 (2020): the same game hung a GCN GPU for good on a new stage in
+ * yuzu, because its shaders bound more storage buffers than radeonsi had slots and the rest read
+ * garbage descriptors. Here, for every draw and dispatch: its user data (32-bit pointers into the
+ * 32-bit window, 64-bit ones into the GPU windows), the descriptors they point to (buffer V#s: base
+ * and num_records x stride; image T#s: base), each checked against the live GPU mappings. A
+ * descriptor or pointer outside every one ("wild"), or a buffer range running more than 64 KiB past
+ * its mapping's end, is described in the boot trace and its draw or dispatch turned into a NOP
+ * (RADV_PS4_SKIP_WILD=0: described only). A census of what touches the GPU's global state goes with
+ * it: register writes and waits, config registers, the user-config registers written, GDS,
+ * streamout, packets the walker doesn't know. dev->lock held. */
+struct ps4_live_range {
+   uint64_t start, end; /* [start, end): the mapping, its tail included when mapped */
+   uint64_t size;       /* the buffer's own size */
+   uint32_t handle;
+};
+
+static int
+ps4_live_range_cmp(const void *a, const void *b)
+{
+   const struct ps4_live_range *x = a, *y = b;
+   return x->start < y->start ? -1 : x->start > y->start;
+}
+
+struct ps4_check {
+   ac_drm_device *dev;
+   struct ps4_live_range *ranges;
+   unsigned num_ranges;
+   unsigned wild, overruns, skipped, described;
+   unsigned config_regs, reg_writes, reg_waits, reg_copies, gds, streamout, loads, unknown;
+   uint16_t uconfig[24];
+   unsigned num_uconfig;
+   uint8_t unknown_ops[12];
+   unsigned num_unknown_ops;
+};
+
+static const struct ps4_live_range *
+ps4_live_at(const struct ps4_check *c, uint64_t va)
+{
+   unsigned lo = 0, hi = c->num_ranges;
+   while (lo < hi) {
+      const unsigned mid = (lo + hi) / 2;
+      if (c->ranges[mid].start <= va)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   if (!lo)
+      return NULL;
+   const struct ps4_live_range *r = &c->ranges[lo - 1];
+   return va < r->end ? r : NULL;
+}
+
+static bool
+ps4_in_gpu_windows(const ac_drm_device *dev, uint64_t va)
+{
+   return (va >= dev->va_start && va < dev->va_start + PS4_VA_SIZE) ||
+          (dev->va32_start && va >= dev->va32_start && va < dev->va32_start + PS4_VA32_SIZE);
+}
+
+/* One problem found: described (the first 12 of a session), counted. Returns true: skip the work. */
+static bool
+ps4_check_report(struct ps4_check *c, uint64_t seq, const void *packet, const char *work, const char *what,
+                 uint64_t va, uint64_t bytes, const struct ps4_live_range *r)
+{
+   static unsigned session;
+   if (session < 12) {
+      session++;
+      char line[300];
+      if (r)
+         snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s: %s %#llx + %#llx runs %#llx past bo %u (%#llx "
+                  "bytes)", (unsigned long long)seq, packet, work, what, (unsigned long long)va,
+                  (unsigned long long)bytes, (unsigned long long)(va + bytes - r->start - r->size), r->handle,
+                  (unsigned long long)r->size);
+      else
+         snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s: %s %#llx%s is in no GPU buffer (WILD)",
+                  (unsigned long long)seq, packet, work, what, (unsigned long long)va,
+                  ps4_in_gpu_windows(c->dev, va) ? "" : ", outside the GPU windows too");
+      ps4_boot_trace(line);
+   }
+   return true;
+}
+
+/* A descriptor set (or table) at `ptr`: its V#s and T#s, each one's base checked. A quad is taken
+ * for a descriptor only when it looks like one (channel selects set; a V# with records and a data
+ * format, a T# of an image type) and its base is inside the GPU windows; and a bad one only counts in
+ * a set where others point into live buffers (one: described; two: the work is skipped), so that data
+ * a stray user-data value points to isn't taken for a set. Returns true: skip the work. */
+static bool
+ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char *work, uint64_t ptr)
+{
+   const struct ps4_live_range *set = ps4_live_at(c, ptr);
+   if (!set)
+      return false; /* not a pointer to our memory (a value, not an address) */
+   struct amdgpu_bo *b = c->dev->bos[set->handle];
+   if (!b || !b->cpu || ptr % 4)
+      return false;
+   const uint64_t avail = (uint64_t)(uintptr_t)b->cpu + b->size - ptr;
+   const unsigned n = (unsigned)MIN2(avail / 4, 256);
+   const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+   unsigned valid = 0, bad_wild = 0, bad_over = 0;
+   uint64_t first_va = 0, first_bytes = 0;
+   const struct ps4_live_range *first_r = NULL;
+   const char *first_what = NULL;
+   for (unsigned j = 0; j + 4 <= n; j += 4) {
+      const uint32_t d1 = d[j + 1], d2 = d[j + 2], d3 = d[j + 3];
+      if ((d3 & 0xfff) == 0)
+         continue; /* no channel selects: not a buffer or image descriptor (a sampler, data) */
+      if ((d3 >> 30) == 0 && d2 && ((d3 >> 15) & 0xf)) { /* V#: a buffer (with a data format) */
+         const uint64_t base = d[j] | ((uint64_t)(d1 & 0xffff) << 32);
+         const unsigned stride = (d1 >> 16) & 0x3fff;
+         const uint64_t bytes = stride ? (uint64_t)d2 * stride : d2;
+         if (!base || !ps4_in_gpu_windows(c->dev, base))
+            continue;
+         const struct ps4_live_range *r = ps4_live_at(c, base);
+         if (!r) {
+            if (!bad_wild++ && !bad_over)
+               first_va = base, first_bytes = bytes, first_r = NULL, first_what = "buffer descriptor at";
+         } else if (base + bytes > r->end + (64u << 10) && bytes < (1ull << 32)) {
+            if (!bad_over++ && !bad_wild)
+               first_va = base, first_bytes = bytes, first_r = r, first_what = "buffer descriptor";
+         } else {
+            valid++;
+         }
+      } else if ((d3 >> 28) >= 9 && (d3 >> 28) <= 15 && j + 8 <= n) { /* T#: an image (2D and up) */
+         const uint64_t base = (d[j] | ((uint64_t)(d1 & 0xff) << 32)) << 8;
+         if (base && ps4_in_gpu_windows(c->dev, base)) {
+            if (ps4_live_at(c, base))
+               valid++;
+            else if (!bad_wild++ && !bad_over)
+               first_va = base, first_bytes = 0, first_r = NULL, first_what = "image descriptor at";
+         }
+         j += 4; /* (T#s are 8 dwords) */
+      }
+   }
+   if (!valid || !(bad_wild + bad_over))
+      return false;
+   c->wild += bad_wild;
+   c->overruns += bad_over;
+   ps4_check_report(c, seq, packet, work, first_what, first_va, first_bytes, first_r);
+   return valid >= 2;
+}
+
+/* A draw's or dispatch's user data: 32-bit pointers into the 32-bit window (descriptor sets, vertex
+ * buffer tables, push constants; RADV's on gfx7) and 64-bit ones into the 16 GiB window. Values that
+ * point into no live buffer are just values (push constants). */
+static bool
+ps4_check_user_data(struct ps4_check *c, uint64_t seq, const void *packet, const char *work, const uint32_t *ud)
+{
+   bool skip = false;
+   for (unsigned u = 0; u < 16 && !skip; u++) {
+      if (!ud[u])
+         continue;
+      if (u + 1 < 16 && (ud[u + 1] >> 8) == (c->dev->va_start >> 40) && !(ud[u] & 3)) {
+         const uint64_t ptr = ud[u] | ((uint64_t)ud[u + 1] << 32);
+         if (ptr >= c->dev->va_start && ptr < c->dev->va_start + PS4_VA_SIZE)
+            skip = ps4_check_set(c, seq, packet, work, ptr);
+      }
+      if (!skip && c->dev->va32_start && !(ud[u] & 3))
+         skip = ps4_check_set(c, seq, packet, work, c->dev->va32_start + ud[u]);
+   }
+   return skip;
+}
+
+static void
+ps4_check_note_uconfig(struct ps4_check *c, unsigned reg)
+{
+   for (unsigned i = 0; i < c->num_uconfig; i++)
+      if (c->uconfig[i] == reg)
+         return;
+   if (c->num_uconfig < ARRAY_SIZE(c->uconfig))
+      c->uconfig[c->num_uconfig++] = (uint16_t)reg;
+}
+
+static void
+ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, int depth, bool skip)
+{
+   static const unsigned stage_reg[6] = {0x0c, 0x4c, 0x8c, 0xcc, 0x10c, 0x14c};
+   static const char *const stage_name[6] = {"draw (PS)", "draw (VS)", "draw (GS)", "draw (ES)", "draw (HS)", "draw (LS)"};
+   uint32_t compute_ud[16] = {0};
+   uint32_t gfx_ud[6][16] = {{0}};
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      if (!ps4_mapped(ib, num_dw * 4ull))
+         return;
+      uint32_t *next = NULL;
+      unsigned next_dw = 0;
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2) {
+            i++;
+            continue;
+         }
+         if (h >> 30 != 3)
+            return;
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         if (i + 1 + body > num_dw)
+            return;
+         uint32_t *b = &ib[i + 1];
+         bool bad = false;
+         switch (op) {
+         case 0x76: /* SET_SH_REG */
+            for (unsigned k = 1; k < body; k++) {
+               const unsigned reg = b[0] + k - 1;
+               if (reg >= 0x240 && reg < 0x250)
+                  compute_ud[reg - 0x240] = b[k];
+               for (unsigned st = 0; st < 6; st++)
+                  if (reg >= stage_reg[st] && reg < stage_reg[st] + 16)
+                     gfx_ud[st][reg - stage_reg[st]] = b[k];
+            }
+            break;
+         case 0x27: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: /* draws */
+            for (unsigned st = 0; st < 6 && !bad; st++)
+               bad = ps4_check_user_data(c, seq, &ib[i], stage_name[st], gfx_ud[st]);
+            break;
+         case 0x15: case 0x16: /* dispatches */
+            bad = ps4_check_user_data(c, seq, &ib[i], "dispatch", compute_ud);
+            break;
+         case 0x68: /* SET_CONFIG_REG */
+            c->config_regs++;
+            break;
+         case 0x79: /* SET_UCONFIG_REG */
+            for (unsigned k = 1; k < body; k++)
+               ps4_check_note_uconfig(c, b[0] + k - 1);
+            break;
+         case 0x37: /* WRITE_DATA */
+            if (body >= 1 && ((b[0] >> 8) & 0xf) == 0)
+               c->reg_writes++;
+            if (body >= 1 && ((b[0] >> 8) & 0xf) == 6)
+               c->gds++;
+            break;
+         case 0x3c: /* WAIT_REG_MEM */
+            if (body >= 1 && !((b[0] >> 4) & 1))
+               c->reg_waits++;
+            break;
+         case 0x40: /* COPY_DATA: register source or destination, GDS */
+            if (body >= 1 && ((b[0] & 0xf) == 0 || ((b[0] >> 8) & 0xf) == 0))
+               c->reg_copies++;
+            if (body >= 1 && ((b[0] & 0xf) == 3 || ((b[0] >> 8) & 0xf) == 3))
+               c->gds++;
+            break;
+         case 0x50: /* DMA_DATA: GDS or register ends */
+            if (body >= 1 && (((b[0] >> 20) & 3) == 1 || ((b[0] >> 29) & 3) == 1))
+               c->gds++;
+            break;
+         case 0x1d: /* ATOMIC_GDS */
+            c->gds++;
+            break;
+         case 0x34: /* STRMOUT_BUFFER_UPDATE */
+            c->streamout++;
+            break;
+         case 0x5f: case 0x60: case 0x61: case 0x63: /* LOAD_SH/CONFIG/CONTEXT/UCONFIG_REG */
+            c->loads++;
+            break;
+         case 0x3f: { /* INDIRECT_BUFFER */
+            uint32_t *t = (uint32_t *)(uintptr_t)(b[0] | ((uint64_t)(b[1] & 0xffff) << 32));
+            if (body >= 3 && (b[2] & (1u << 20))) {
+               next = t;
+               next_dw = b[2] & 0xfffff;
+            } else if (body >= 3 && depth < 3) {
+               ps4_check_ib(c, t, b[2] & 0xfffff, seq, depth + 1, skip);
+            }
+            break;
+         }
+         /* the packets RADV emits all the time */
+         case 0x10: case 0x11: case 0x12: case 0x13: case 0x26: case 0x28: case 0x2a: case 0x2f: case 0x33:
+         case 0x39: case 0x42: case 0x43: case 0x46: case 0x47: case 0x48: case 0x58: case 0x69: case 0x1e:
+         case 0x22: case 0x23: case 0x20:
+            break;
+         default:
+            c->unknown++;
+            if (c->num_unknown_ops < ARRAY_SIZE(c->unknown_ops)) {
+               bool seen = false;
+               for (unsigned u = 0; u < c->num_unknown_ops; u++)
+                  seen |= c->unknown_ops[u] == op;
+               if (!seen)
+                  c->unknown_ops[c->num_unknown_ops++] = (uint8_t)op;
+            }
+            break;
+         }
+         if (bad && skip) {
+            ib[i] = (h & ~0xff00u) | (0x10u << 8); /* NOP, same length */
+            ps4_flush_cpu_cache(&ib[i], 4);
+            c->skipped++;
+         }
+         if (next)
+            break;
+         i += 1 + body;
+      }
+      if (!next)
+         return;
+      ib = next;
+      num_dw = next_dw;
+   }
+}
+
+/* ---- descriptor check: end ---- */
+
+/* Writes the census into `out` (for the submission's note). */
+static void
+ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
+                     char *out, size_t out_size)
+{
+   static int skip = -1;
+   if (skip < 0) {
+      const char *e = getenv("RADV_PS4_SKIP_WILD");
+      skip = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+   }
+   static struct ps4_live_range *ranges;
+   static unsigned capacity;
+   if (capacity < dev->num_bos) {
+      free(ranges);
+      capacity = dev->num_bos + 256;
+      ranges = malloc(capacity * sizeof(*ranges));
+      if (!ranges) {
+         capacity = 0;
+         snprintf(out, out_size, "; no memory for the check");
+         return;
+      }
+   }
+   struct ps4_check c;
+   memset(&c, 0, sizeof(c));
+   c.dev = dev;
+   c.ranges = ranges;
+   for (unsigned h = 1; h < dev->num_bos; h++) {
+      const struct amdgpu_bo *b = dev->bos[h];
+      if (!b || !b->cpu)
+         continue;
+      const uint64_t start = (uintptr_t)b->cpu;
+      c.ranges[c.num_ranges++] = (struct ps4_live_range){start, start + b->size + (b->tail_mapped ? PS4_TAIL : 0),
+                                                         b->size, b->handle};
+   }
+   qsort(c.ranges, c.num_ranges, sizeof(*c.ranges), ps4_live_range_cmp);
+   for (unsigned i = 0; i < num_ibs; i++)
+      ps4_check_ib(&c, dcb[i], sizes[i] / 4, seq, 0, skip);
+   size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; config regs %u, register "
+                               "writes %u, waits %u, copies %u, GDS %u, streamout %u, register loads %u, other %u",
+                               c.wild, c.overruns, c.skipped, c.config_regs, c.reg_writes, c.reg_waits, c.reg_copies,
+                               c.gds, c.streamout, c.loads, c.unknown);
+   for (unsigned u = 0; u < c.num_unknown_ops && n < out_size; u++)
+      n += (size_t)snprintf(out + n, out_size - n, "%s%#x", u ? "," : " (", c.unknown_ops[u]);
+   if (c.num_unknown_ops && n < out_size)
+      n += (size_t)snprintf(out + n, out_size - n, ")");
+   for (unsigned u = 0; u < c.num_uconfig && n < out_size; u++)
+      n += (size_t)snprintf(out + n, out_size - n, "%s%#x", u ? "," : "; uconfig ", 0x30000 + c.uconfig[u] * 4);
+}
+
 /* (04.41) The first submissions after the GPU was idle a while (a game's loading screen), and their
  * completions, in the boot trace (synced within 50 ms by the app): Captain Toad's level 3 takes the
  * PS4 down within a quarter second of its loading, with the GPU idle and caught up just before;
@@ -1572,11 +1921,14 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
          last_trace = p->v[0];
       }
    }
-   char line[260];
+   char check[600];
+   check[0] = 0;
+   ps4_check_submission(dev, seq, dcb, sizes, num_ibs, check, sizeof(check));
+   char line[1000];
    snprintf(line, sizeof(line), "radv/ps4: submit %llu: %u IBs, %u dwords, %u draws, %u dispatches (%u of them "
             "indirect), %u WAIT_REG_MEM, trace ids %u-%u; geometry shader / tessellation: %u draws, %u ring "
-            "writes%s", (unsigned long long)seq, num_ibs, dwords, draws, dispatches, indirect, waits, first_trace,
-            last_trace, ps4_gs_tess_last_draws, ps4_gs_tess_last_rings, w.dropped ? " (walk cut short)" : "");
+            "writes%s%s", (unsigned long long)seq, num_ibs, dwords, draws, dispatches, indirect, waits, first_trace,
+            last_trace, ps4_gs_tess_last_draws, ps4_gs_tess_last_rings, w.dropped ? " (walk cut short)" : "", check);
    ps4_boot_trace(line);
 }
 

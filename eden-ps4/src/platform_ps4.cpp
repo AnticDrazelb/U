@@ -1317,6 +1317,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.44: 04.43's log ruled out geometry shaders and tessellation (Captain Toad uses neither). The next "
+         "suspect, from a 2020 report of the same game hanging an AMD GPU for good in yuzu: shaders given bad "
+         "buffer addresses. After each loading screen the first frames' draws are checked, and one whose "
+         "descriptors point outside every GPU buffer is left out and logged.\n"
          "04.43: a fix to try for the crash of the whole PS4 (Captain Toad's level 3): the GPU's buffers for "
          "tessellation are now as large as the PS4's system may use them (16 MiB, were about 2.3 MiB), and the "
          "geometry shader buffers are sized through Sony's own call, as PS4 games do. Those draws are drawn "

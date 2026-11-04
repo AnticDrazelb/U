@@ -379,6 +379,25 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.44: **bad descriptors checked after a loading screen.** 04.43's run: `sceGnmSetGsRingSizes` returned
+0, and 2288 noted submissions had no GS or tessellation draw and no ring register write: Captain Toad
+uses neither, and 04.42's test would have changed nothing. Level 3 went down exactly as in 04.41 (the
+same six GPU buffers, its first frame of 183 draws, nothing finished after it). The next suspect is
+Mesa issue 3168's (2020): the same game hung a GCN GPU for good in yuzu because its shaders bound more
+storage buffers than radeonsi had slots, and the rest read garbage descriptors. `ps4_check_submission`
+(`port/mesa/ac_ps4_drm.c`) now runs on the 40 submissions noted after a loading screen: each draw's
+and dispatch's user data (32-bit pointers into the 32-bit window, 64-bit ones into the 16 GiB one)
+leads to its descriptor sets, and each buffer V# (base, num_records x stride) and image T# (base) in
+them is checked against the live GPU mappings (a sorted table, binary search). A quad counts as a
+descriptor only if it looks like one and its base is in the GPU windows, and a bad one only in a set
+where others point into live buffers: one valid, it's described; two, the draw becomes a NOP
+(`RADV_PS4_SKIP_WILD=0`: described only). A buffer range more than 64 KiB past its mapping counts as an
+overrun. The note also gets a census of what touches the GPU's global state (config registers,
+register writes, waits and copies, GDS, streamout, register loads, packets outside RADV's usual set,
+the user-config registers written). Tested on the PC (`tools/gpu-tests/desccheck.sh`: a wild V# in a
+real set skipped, a lone one described, a 1 MiB overrun, a valid set, a stray value, 20,000 random
+sets never skipped).
+
 04.43: **the GS and tessellation rings set up as the PS4's system uses them** (a fix to try; 04.42,
 which leaves those draws out, is the test to fall back on). From what other emulators found (STATUS.md):
 shadPS4's reading of Sony's libSceGnmDriver has `sceGnmSetGsRingSizes` taking 4-8 MiB and setting the
