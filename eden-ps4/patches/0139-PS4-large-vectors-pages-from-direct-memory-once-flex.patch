@@ -1,0 +1,119 @@
+From 2ecc8794658ffd5c100a5bec1fec5534c9454394 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 12:12:24 +0000
+Subject: [PATCH 139/140] PS4: large vectors' pages from direct memory once
+ flexible memory is out
+
+Bluey filled flexible memory to its last MiB in 04.21 and past it in 04.30: a page table's page
+then failed to commit (sparse_large_vector CommitPage), and MapPages wrote to it unmapped.
+MapFlexibleMemory now falls back to 16 KiB pieces of direct memory (8 MiB allocated at a time,
+zeroed through a scratch mapping before they appear: the page table's readers don't lock), and
+says so once in the log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/common/orbis_memory.cpp        | 48 ++++++++++++++++++++++++++++--
+ src/common/orbis_memory.h          |  2 ++
+ src/common/sparse_large_vector.cpp | 11 +++++--
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 88cbb87de0..f9c396c455 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -443,10 +443,54 @@ void UnmapDirectMemory(void* base, size_t size) {
+     ReleasePieces(base);
+ }
+ 
++namespace {
++// (PS4 04.31) Pages once flexible memory has run out (Bluey filled it to its last MiB in 04.21,
++// and past it in 04.30, at a page table's page): 16 KiB pieces of direct memory instead, 8 MiB of
++// it allocated at a time. Only the vectors' commits call this, under their lock (signal handlers
++// too): no other lock, no allocation.
++off_t fallback_phys = 0;
++size_t fallback_left = 0;
++std::atomic<size_t> fallback_pages{0};
++constexpr size_t FallbackChunk = 8_MiB;
++constexpr size_t FallbackPage = 16_KiB;
++
++bool MapDirectFallback(void* address, size_t size) {
++    if (size > FallbackChunk || size % FallbackPage != 0)
++        return false;
++    if (fallback_left < size) {
++        off_t phys = 0;
++        if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), FallbackChunk, FallbackPage,
++                                          MemoryTypeWriteBack, &phys) != 0)
++            return false;
++        fallback_phys = phys;
++        fallback_left = FallbackChunk;
++    }
++    const off_t phys = fallback_phys + off_t(FallbackChunk - fallback_left);
++    // zeroed before it appears at the address (reused direct memory isn't, and the page table's
++    // readers there don't take the lock); one mapping at a time, as CommitChunk's
++    void* scratch = nullptr;
++    if (sceKernelMapDirectMemory(&scratch, size, ProtCpuReadWrite, 0, phys, FallbackPage) != 0)
++        return false;
++    std::memset(scratch, 0, size);
++    sceKernelMunmap(scratch, size);
++    void* at = address;
++    if (sceKernelMapDirectMemory(&at, size, ProtCpuReadWrite, MapFixed, phys, FallbackPage) != 0 || at != address)
++        return false;
++    fallback_left -= size;
++    fallback_pages.fetch_add(size / FallbackPage, std::memory_order_relaxed);
++    return true;
++}
++} // namespace
++
+ bool MapFlexibleMemory(void* address, size_t size) {
+     void* at = address;
+-    return sceKernelMapNamedFlexibleMemory(&at, size, ProtCpuReadWrite, MapFixed, "eden") == 0 &&
+-           at == address;
++    if (sceKernelMapNamedFlexibleMemory(&at, size, ProtCpuReadWrite, MapFixed, "eden") == 0 && at == address)
++        return true;
++    return MapDirectFallback(address, size);
++}
++
++size_t FlexibleFallbackPages() {
++    return fallback_pages.load(std::memory_order_relaxed);
+ }
+ 
+ bool ReserveOnDemand(void* base, size_t size) {
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index 5a96f0eeea..81c0e83035 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -32,6 +32,8 @@ void UnmapDirectMemory(void* base, std::size_t size);
+ /// Maps zero-filled read/write flexible memory at `address`, inside a reserved range. Safe to
+ /// call from a signal handler.
+ bool MapFlexibleMemory(void* address, std::size_t size);
++/// (04.31) Pages MapFlexibleMemory took from direct memory, flexible memory being out
++std::size_t FlexibleFallbackPages();
+ 
+ /// The emulated DRAM on demand: a range from ReserveRange whose direct memory is taken a chunk
+ /// (OnDemandChunk) at a time, the first time the chunk is touched (a fault handler maps it, filled
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index f22663fa45..fd2d6deb53 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -213,8 +213,15 @@ void UnregisterVectorRegion(void* base) noexcept {
+ }
+ 
+ bool CommitVectorPage(void* base, std::atomic<u64>* committed, uintptr_t page) noexcept {
+-    CommitLock lock;
+-    return CommitLocked(reinterpret_cast<uintptr_t>(base), committed, page);
++    bool ok;
++    {
++        CommitLock lock;
++        ok = CommitLocked(reinterpret_cast<uintptr_t>(base), committed, page);
++    }
++    static std::atomic<bool> told{false};
++    if (Orbis::FlexibleFallbackPages() != 0 && !told.exchange(true))
++        LOG_WARNING(HW_Memory, "Flexible memory is out: large vectors' pages from direct memory now");
++    return ok;
+ }
+ 
+ bool ResolveVectorFault(uintptr_t address) noexcept {
+-- 
+2.43.0
+

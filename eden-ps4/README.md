@@ -379,6 +379,18 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.31: **Bluey's boot crash; stalls on the FPS counter.**
+
+- Patch 0139: Bluey crashed at 64 s in 04.30, in `MapPhysicalMemory` -> `MapPages`, right after
+  `sparse_large_vector CommitPage: Failed to commit large buffer region`: a page table's page
+  couldn't be mapped, flexible memory being out (04.21's run had ended with 1 MiB of it free;
+  direct memory had 4.6 GiB). `Orbis::MapFlexibleMemory` now falls back to 16 KiB pieces of
+  direct memory, 8 MiB allocated at a time, each zeroed through a scratch mapping before it is
+  mapped in place (the page table's readers don't lock), and logs `Flexible memory is out` once.
+- Patch 0140: nothing is presented during a stall, so the FPS counter couldn't change while one
+  lasted, and kept the rate from before it. A frame 100 ms or more after the last now turns the
+  digits red for 2 s, and one 250 ms or more after it takes the rate at once, the stall in it.
+
 04.30: **bit-field instructions as shifts; no second zero-extension of 32-bit results.** Per 20
 steady frames of `game.c` for AArch64 with Eden's options: 1,895,226 instructions in 04.29,
 1,806,170 now (-4.7%; -45.8% from 04.22's 3,335,063). unity.c (8 frames minus 3): 381,358 ->

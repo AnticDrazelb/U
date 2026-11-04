@@ -1306,6 +1306,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.31: Bluey crashed booting in 04.30: it ran the PS4 out of flexible memory (it was down to its "
+         "last MiB in 04.21 already), and a page table's page couldn't be mapped. Such pages now come from "
+         "direct memory when flexible memory is out. The FPS counter shows stalls: red for 2 s after the "
+         "game took 100 ms or more for a frame, and the rate counts the stall at once.\n"
          "04.30: 64-bit games: shifts and bit-field instructions (LSL, LSR, UBFX, SBFIZ, ...) in one or two "
          "PS4 instructions instead of up to nine, and 32-bit results no longer zero-extended again when "
          "they are zero above 32 bits already. The 64-bit test game: 4.7% fewer instructions than 04.29 "

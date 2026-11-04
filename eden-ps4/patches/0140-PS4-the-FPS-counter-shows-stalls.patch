@@ -1,0 +1,73 @@
+From eba94f4c8f822c6d7197a04de46d818ae5625eb7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 12:12:24 +0000
+Subject: [PATCH 140/140] PS4: the FPS counter shows stalls
+
+Nothing is presented during a stall, so the counter couldn't change while one lasted and showed the
+rate from before it. Now a frame 100 ms or more after the last turns the digits red for 2 s, and one
+250 ms or more after it takes the rate at once, the stall in it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../present/window_adapt_pass.cpp             | 20 ++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+index ef5164d70e..f4a78c8c76 100644
+--- a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
++++ b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+@@ -35,18 +35,31 @@ struct FpsCounter {
+     u32 frames = 0;
+     u32 shown = 0;
+     u64 last_buffer = 0;
++    // (04.31) a stall: nothing is presented during one, so the counter can't change while it
++    // lasts; after one (a frame 100 ms or more after the last) the digits are red for 2 s, and
++    // after one of 250 ms or more the rate is taken at once, the stall in it
++    std::chrono::steady_clock::time_point last_frame{};
++    std::chrono::steady_clock::time_point red_until{};
+ };
+ FpsCounter fps_counter;
+ 
+ // Counts this presentation (of the game's buffer at `buffer`); the rate over the last second or so
+ u32 CountFrame(u64 buffer) {
++    const auto now = std::chrono::steady_clock::now();
++    bool refresh = false;
+     if (buffer != fps_counter.last_buffer) {
+         fps_counter.frames++;
+         fps_counter.last_buffer = buffer;
++        if (fps_counter.last_frame != std::chrono::steady_clock::time_point{}) {
++            const auto gap = now - fps_counter.last_frame;
++            if (gap >= std::chrono::milliseconds(100))
++                fps_counter.red_until = now + std::chrono::seconds(2);
++            refresh = gap >= std::chrono::milliseconds(250);
++        }
++        fps_counter.last_frame = now;
+     }
+-    const auto now = std::chrono::steady_clock::now();
+     const double seconds = std::chrono::duration<double>(now - fps_counter.start).count();
+-    if (seconds >= 1.0) {
++    if (seconds >= 1.0 || (refresh && seconds > 0.0)) {
+         fps_counter.shown = static_cast<u32>(fps_counter.frames / seconds + 0.5);
+         fps_counter.frames = 0;
+         fps_counter.start = now;
+@@ -160,6 +173,7 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+         const u64 buffer = configs.empty() ? 0 : configs[0].address + configs[0].offset;
+         FpsRects(CountFrame(buffer), render_area, fps_box, fps_digits);
+     }
++    const bool fps_red = std::chrono::steady_clock::now() < fps_counter.red_until;
+ 
+     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+         const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
+@@ -201,7 +215,7 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+                                          .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}}};
+             const VkClearAttachment light{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                           .colorAttachment = 0,
+-                                          .clearValue = {.color = {.float32 = {1.0f, 1.0f, 0.3f, 1.0f}}}};
++                                          .clearValue = {.color = {.float32 = {1.0f, fps_red ? 0.25f : 1.0f, fps_red ? 0.2f : 0.3f, 1.0f}}}};
+             cmdbuf.ClearAttachments({dark}, fps_box);
+             if (!fps_digits.empty()) {
+                 cmdbuf.ClearAttachments({light}, fps_digits);
+-- 
+2.43.0
+

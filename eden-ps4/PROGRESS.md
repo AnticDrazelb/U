@@ -262,6 +262,8 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | Unity (IL2CPP) code cut into 2-3 instruction blocks by null checks; float stores through general registers | | 04.28: forward CBZ/TBZ as side exits, stores from XMMs (unity.c: -22% blocks entered, -3.0% instructions) |
 | 04.23-04.27: the flags look-ahead read B.cond/CBZ/TBZ targets 1-3 bytes off (rarely took live flags for dead) | | 04.28: fixed (found by the full sweep, gen8) |
 | Every B.cond ending a block (63% of game.c's block ends) | | 04.29: forward ones as side exits, flags stored only where the target reads them: -7.4%, -43.2% vs 04.22 |
+| Bluey: boot crash in 04.30 at 64 s (a page table's page unmappable: flexible memory out; 1 MiB free at the end of 04.21's run) | | 04.31: such pages from direct memory once flexible memory is out (untested on the console yet) |
+| FPS counter frozen through stalls, showing the rate from before them | | 04.31: red for 2 s after a frame 100 ms or more late; the rate taken at once after 250 ms |
 | SBFM/UBFM (LSL, LSR, UBFX, SBFIZ) as a rotate and two masks (2-9 instructions); every W result zero-extended again before its store (3.3% of game.c's instructions) | | 04.30: shifts (1-2); W values zero above 32 bits stored and widened as they are, LeastSignificantWord a no-op for 32-bit uses: -4.7%, -45.8% vs 04.22; unity.c -3.6% |
 | Code caches too small outside Mario Kart (Silksong core 0: 8 whole flushes in 270 s, 250-550 ms/s translating; Zelda core 2: 5 in 6 min) | | 04.21: sized from the system pool's free memory in fixed tiers (up to 160/96/96/8 MiB), the app heap's share of the pool 384 -> 192 MiB |
 | Settings lists ran off the screen (Graphics) | | 04.21: scrolled with the selection, description kept on screen |
