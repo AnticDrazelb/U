@@ -1,0 +1,54 @@
+From ac086be28a8c7230bbb4072a8f58a16dae4889b4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 02:48:34 +0000
+Subject: [PATCH 128/128] dynarmic A64: W registers read sign-extended for
+ SXTW; no second SXTW of a sign-extended value
+
+A GetW whose one use is SignExtendWordToLong is a movsxd from the JIT state; a
+SignExtendWordToLong of a value sign-extended from 32 bits already (LDRSW or SXTW, then SXTW of
+its low half) is that value. game.c for AArch64: -1.6%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp   | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 98c459b67f..4d2dba9891 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -381,6 +381,16 @@ void A64EmitX64::PeepholeQuad(A64EmitContext& ctx, IR::Block& block) {
+                 if (low->UseCount() == 0)
+                     low->Invalidate();
+             }
++            // (PS4 04.26) the value sign-extended from 32 bits already (LDRSW, SXTW, then SXTW of
++            // its low half again): the same value
++            if (!inst.GetArg(0).IsImmediate() && inst.GetArg(0).GetInst()->GetOpcode() == IR::Opcode::SignExtendWordToLong) {
++                inst.ReplaceUsesWith(inst.GetArg(0));  // (an Identity of it now)
++                continue;
++            }
++            // (a W register read for this alone: movsxd from the JIT state)
++            IR::Inst* const get = inst.GetArg(0).IsImmediate() ? nullptr : inst.GetArg(0).GetInst();
++            if (get && get->GetOpcode() == IR::Opcode::A64GetW && get->UseCount() == 1)
++                signed_loads.emplace_back(get, 64);
+             continue;
+         }
+         if (inst.GetOpcode() != IR::Opcode::ZeroExtendLongToQuad || inst.GetArg(0).IsImmediate())
+@@ -629,6 +639,13 @@ void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
+ 
+ void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
+     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
++    if (SignedLoadBits(inst) == 64) {
++        // (PS4 04.26, PeepholeQuad: read for a SignExtendWordToLong alone) sign-extended as read
++        const Xbyak::Reg64 wide = ctx.reg_alloc.ScratchGpr(code);
++        code.movsxd(wide, dword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
++        ctx.reg_alloc.DefineValue(code, inst, wide);
++        return;
++    }
+     const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
+ 
+     code.mov(result, dword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+-- 
+2.43.0
+

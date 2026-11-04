@@ -108,6 +108,7 @@ into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `E
 | gen13.py | A64 flag setters followed by CSEL/CSINC/CSINV/CSNEG/CSET/CINC/FCSEL in the same block (04.24) |
 | gen14.py | A64 calls and returns around FPCR changes (the return stack across mode changes) (04.24) |
 | gen15.py | A64 load-acquires, store-releases, exclusive pairs and DMBs of every type, ordinary and marked pages (04.25) |
+| gen16.py | A64 sign extensions: LDRSB/LDRSH/LDRSW, SXTB/SXTH/SXTW (again), SMULL/SMADDL, extended-register ADD/SUB (04.26) |
 | gen6.py | A64 loads/stores sharing a base |
 | gen7.py | A32/Thumb control flow and flags: conditional instructions, IT blocks, loops, calls, VFP compares |
 | gen8.py | A64 control flow and flags |

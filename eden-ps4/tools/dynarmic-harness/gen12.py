@@ -11,6 +11,11 @@ import sys
 seed, out = int(sys.argv[1]), sys.argv[2]
 rng = random.Random(seed)
 DATA = 0x10000000 + 0x1000 * 64
+# (04.26) GEN12_MARKED=1: the data on a marked page (dynbench64: every access there faults to the
+# fallback with fastmem, or takes the callbacks): float loads into XMMs through their stubs
+import os
+if os.environ.get("GEN12_MARKED"):
+    DATA = 0x10800000
 CONDS = ["eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le"]
 FREE = list(range(0, 18))
 n_label = 0

@@ -1,0 +1,276 @@
+From abd5c15686ab4595ba8407aae15dfe4b423dc2bc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 02:34:00 +0000
+Subject: [PATCH 127/128] dynarmic A64: sign-extending loads in one instruction
+ (LDRSB, LDRSH, LDRSW with fastmem)
+
+A plain load whose one use sign-extends it is a movsx/movsxd from memory (to 32 bits with the
+register's upper half zeroed, or 64), the extension nothing, instead of a load and a movsx/movsxd
+after it. Fastmem sites only (PeepholeQuad marks them); their fallbacks are stubs that sign-extend
+the callback's value; a range-check miss takes the fallback. game.c for AArch64: -1.0%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 22 +++++++++++++
+ .../backend/x64/a64_emit_x64_memory.cpp       | 31 +++++++++++++++++++
+ .../src/dynarmic/backend/x64/emit_x64.h       | 11 +++++++
+ .../backend/x64/emit_x64_data_processing.cpp  | 25 +++++++++++++++
+ .../backend/x64/emit_x64_memory.cpp.inc       | 14 +++++++--
+ .../dynarmic/backend/x64/emit_x64_memory.h    | 17 ++++++++++
+ 6 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 7b4d7496a5..98c459b67f 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -371,6 +371,7 @@ void A64EmitX64::FuseCondFlags(IR::Block& block) {
+ 
+ void A64EmitX64::PeepholeQuad(A64EmitContext& ctx, IR::Block& block) {
+     xmm_loads.clear();
++    signed_loads.clear();
+     for (auto& inst : block.instructions) {
+         // (movsxd reads the low 32 bits alone: no zero-extension of them first, SXTW, SMULL)
+         if (inst.GetOpcode() == IR::Opcode::SignExtendWordToLong && !inst.GetArg(0).IsImmediate()) {
+@@ -408,6 +409,27 @@ void A64EmitX64::PeepholeQuad(A64EmitContext& ctx, IR::Block& block) {
+         if (ShouldFastmem(ctx, load))
+             xmm_loads.push_back(load);
+     }
++    // (PS4 04.26) LDRSB, LDRSH, LDRSW (a load sign-extended, nothing else using it), with fastmem:
++    // loaded with movsx/movsxd
++    for (auto& inst : block.instructions) {
++        IR::Opcode want;
++        unsigned to_bits;
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::SignExtendByteToWord: want = IR::Opcode::A64ReadMemory8, to_bits = 32; break;
++        case IR::Opcode::SignExtendByteToLong: want = IR::Opcode::A64ReadMemory8, to_bits = 64; break;
++        case IR::Opcode::SignExtendHalfToWord: want = IR::Opcode::A64ReadMemory16, to_bits = 32; break;
++        case IR::Opcode::SignExtendHalfToLong: want = IR::Opcode::A64ReadMemory16, to_bits = 64; break;
++        case IR::Opcode::SignExtendWordToLong: want = IR::Opcode::A64ReadMemory32, to_bits = 64; break;
++        default: continue;
++        }
++        if (inst.GetArg(0).IsImmediate())
++            continue;
++        IR::Inst* const load = inst.GetArg(0).GetInst();
++        if (load->GetOpcode() != want || load->UseCount() != 1 || load->GetArg(2).GetAccType() != IR::AccType::NORMAL)
++            continue;
++        if (ShouldFastmem(ctx, load))
++            signed_loads.emplace_back(load, to_bits);
++    }
+ }
+ 
+ void A64EmitX64::ClearCache() {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 51a6203e7e..5bdc3be4db 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -246,6 +246,37 @@ void A64EmitX64::GenFastmemFallbacks() {
+                     PerfMapRegister(read_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)], code.getCurr(), fmt::format("a64_read_fallback_{}", bitsize));
+                 }
+ 
++                // (PS4 04.26) sign-extending plain loads (EmitReadMemoryMovSigned): the callback's
++                // value sign-extended to 32 bits (the upper half zeroed) or 64
++                if (!ordered) {
++                    for (const size_t bitsize : {size_t(8), size_t(16), size_t(32)}) {
++                        for (const size_t to_bits : {size_t(32), size_t(64)}) {
++                            if (bitsize == 32 && to_bits == 32)
++                                continue;
++                            const auto key = std::make_tuple(false, bitsize | (to_bits == 32 ? SignedLoadTag32 : SignedLoadTag64), vaddr_idx, value_idx);
++                            const Xbyak::Reg64 value{value_idx};
++                            code.align();
++                            read_fallbacks[key] = code.getCurr<void (*)()>();
++                            ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
++                            if (vaddr_idx != code.ABI_PARAM2.getIdx()) {
++                                code.mov(code.ABI_PARAM2, Xbyak::Reg64{vaddr_idx});
++                            }
++                            code.mov(code.ABI_PARAM3, bitsize / CHAR_BIT);
++                            Devirtualize<&A64::UserCallbacks::MemoryRead>(conf.callbacks).EmitCall(code);
++                            if (bitsize == 8) {
++                                to_bits == 64 ? code.movsx(value, code.ABI_RETURN.cvt8()) : code.movsx(value.cvt32(), code.ABI_RETURN.cvt8());
++                            } else if (bitsize == 16) {
++                                to_bits == 64 ? code.movsx(value, code.ABI_RETURN.cvt16()) : code.movsx(value.cvt32(), code.ABI_RETURN.cvt16());
++                            } else {
++                                code.movsxd(value, code.ABI_RETURN.cvt32());
++                            }
++                            ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLocRegIdx(value_idx));
++                            code.ret();
++                            PerfMapRegister(read_fallbacks[key], code.getCurr(), fmt::format("a64_read_fallback_signed_{}_{}", bitsize, to_bits));
++                        }
++                    }
++                }
++
+                 for (const auto& [bitsize, callback] : write_callbacks) {
+                     code.align();
+                     write_fallbacks[std::make_tuple(ordered, bitsize, vaddr_idx, value_idx)] = code.getCurr<void (*)()>();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 6dc4691c80..8c6c04ea9f 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -135,6 +135,17 @@ public:
+     bool IsXmmLoad(const IR::Inst* inst) const {
+         return std::find(xmm_loads.begin(), xmm_loads.end(), inst) != xmm_loads.end();
+     }
++    // (PS4 04.26) A load whose one use sign-extends it (LDRSB, LDRSH, LDRSW), with fastmem: loaded
++    // with movsx/movsxd to 32 or 64 bits, the extension then nothing
++    static constexpr size_t SignedLoadTag32 = 0x200, SignedLoadTag64 = 0x400;
++    boost::container::small_vector<std::pair<const IR::Inst*, unsigned>, 16> signed_loads;
++    unsigned SignedLoadBits(const IR::Inst* inst) const {
++        for (const auto& [load, bits] : signed_loads) {
++            if (load == inst)
++                return bits;
++        }
++        return 0;
++    }
+     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
+     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
+     // What a return stack entry for target holds (its descriptor; A64 with return_stack_pc_only:
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index 374f619767..c7f1fad65d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -1548,6 +1548,11 @@ void EmitX64::EmitNot64(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitSignExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (!args[0].IsImmediate() && SignedLoadBits(inst->GetArg(0).GetInst()) != 0) {
++        // (PS4 04.26) loaded sign-extended already (movsx/movsxd)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.movsx(result.cvt32(), result.cvt8());
+     ctx.reg_alloc.DefineValue(code, inst, result);
+@@ -1555,6 +1560,11 @@ void EmitX64::EmitSignExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitSignExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (!args[0].IsImmediate() && SignedLoadBits(inst->GetArg(0).GetInst()) != 0) {
++        // (PS4 04.26) loaded sign-extended already (movsx/movsxd)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.movsx(result.cvt32(), result.cvt16());
+     ctx.reg_alloc.DefineValue(code, inst, result);
+@@ -1562,6 +1572,11 @@ void EmitX64::EmitSignExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitSignExtendByteToLong(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (!args[0].IsImmediate() && SignedLoadBits(inst->GetArg(0).GetInst()) != 0) {
++        // (PS4 04.26) loaded sign-extended already (movsx/movsxd)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.movsx(result.cvt64(), result.cvt8());
+     ctx.reg_alloc.DefineValue(code, inst, result);
+@@ -1569,6 +1584,11 @@ void EmitX64::EmitSignExtendByteToLong(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitSignExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (!args[0].IsImmediate() && SignedLoadBits(inst->GetArg(0).GetInst()) != 0) {
++        // (PS4 04.26) loaded sign-extended already (movsx/movsxd)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.movsx(result.cvt64(), result.cvt16());
+     ctx.reg_alloc.DefineValue(code, inst, result);
+@@ -1576,6 +1596,11 @@ void EmitX64::EmitSignExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitSignExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (!args[0].IsImmediate() && SignedLoadBits(inst->GetArg(0).GetInst()) != 0) {
++        // (PS4 04.26) loaded sign-extended already (movsx/movsxd)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.movsxd(result.cvt64(), result.cvt32());
+     ctx.reg_alloc.DefineValue(code, inst, result);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index fc6630a233..b23b515c7e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -120,6 +120,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+     // (marked only with fastmem, plain: A64EmitX64::PeepholeQuad)
+     const bool to_xmm = (bitsize == 32 || bitsize == 64) && fastmem_marker && !ordered && IsXmmLoad(inst);
++    const unsigned sx = (bitsize <= 32) && fastmem_marker && !ordered ? SignedLoadBits(inst) : 0;
+     const int value_idx = (bitsize == 128 || to_xmm) ? ctx.reg_alloc.ScratchXmm(code).getIdx() : ctx.reg_alloc.ScratchGpr(code).getIdx();
+ 
+     // (an address folded into the displacement: whole again where the access needs it whole)
+@@ -131,7 +132,8 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         disp = 0;
+     }
+ 
+-    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, to_xmm ? (bitsize | XmmLoadTag) : bitsize, vaddr.getIdx(), value_idx)];
++    const size_t fallback_kind = to_xmm ? (bitsize | XmmLoadTag) : sx == 32 ? (bitsize | SignedLoadTag32) : sx == 64 ? (bitsize | SignedLoadTag64) : bitsize;
++    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, fallback_kind, vaddr.getIdx(), value_idx)];
+ 
+     SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+ 
+@@ -144,7 +146,11 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         const void* location;
+         if constexpr (bitsize == 32 || bitsize == 64) {
+             location = to_xmm ? EmitReadMemoryMovXmm<bitsize>(code, value_idx, src_ptr + disp)
++                     : sx     ? EmitReadMemoryMovSigned<bitsize>(code, value_idx, src_ptr + disp, sx)
+                               : EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + disp, ordered && !conf.plain_acquire_loads);
++        } else if constexpr (bitsize != 128) {
++            location = sx ? EmitReadMemoryMovSigned<bitsize>(code, value_idx, src_ptr + disp, sx)
++                          : EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + disp, ordered && !conf.plain_acquire_loads);
+         } else {
+             location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + disp, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+         }
+@@ -189,7 +195,11 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         const void* location;
+         if constexpr (bitsize == 32 || bitsize == 64) {
+             location = to_xmm ? EmitReadMemoryMovXmm<bitsize>(code, value_idx, src_ptr)
++                     : sx     ? EmitReadMemoryMovSigned<bitsize>(code, value_idx, src_ptr, sx)
+                               : EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !conf.plain_acquire_loads);
++        } else if constexpr (bitsize != 128) {
++            location = sx ? EmitReadMemoryMovSigned<bitsize>(code, value_idx, src_ptr, sx)
++                          : EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && !conf.plain_acquire_loads);
+         } else {
+             location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+         }
+@@ -199,7 +209,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+ #ifdef AXX_FASTMEM_RANGE_WALK
+             // (only the range check jumps here: past the arena, the page table walk; into an XMM,
+             // the fallback)
+-            if (require_abort_handling && conf.page_table && !(ordered && bitsize == 128) && !to_xmm) {
++            if (require_abort_handling && conf.page_table && !(ordered && bitsize == 128) && !to_xmm && !sx) {
+                 EmitA64FastmemRangeWalk(code, conf, bitsize, vaddr, value_idx, false, ordered, wrapped_fn, *end);
+             } else {
+                 code.call(wrapped_fn);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index 61fb6b29dc..c87316ed3b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -271,6 +271,23 @@ template<>
+     }
+ }
+ 
++// (PS4 04.26) A plain load sign-extended to to_bits (32: the register's upper half zeroed)
++template<std::size_t bitsize>
++const void* EmitReadMemoryMovSigned(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, unsigned to_bits) {
++    const void* fastmem_location = code.getCurr();
++    const Xbyak::Reg64 value{value_idx};
++    if constexpr (bitsize == 8) {
++        to_bits == 64 ? code.movsx(value, code.byte[addr]) : code.movsx(value.cvt32(), code.byte[addr]);
++    } else if constexpr (bitsize == 16) {
++        to_bits == 64 ? code.movsx(value, code.word[addr]) : code.movsx(value.cvt32(), code.word[addr]);
++    } else if constexpr (bitsize == 32) {
++        code.movsxd(value, code.dword[addr]);
++    } else {
++        UNREACHABLE();
++    }
++    return fastmem_location;
++}
++
+ // (PS4 04.26) A 32- or 64-bit plain load into an XMM (its other lanes zeroed)
+ template<std::size_t bitsize>
+ const void* EmitReadMemoryMovXmm(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr) {
+-- 
+2.43.0
+

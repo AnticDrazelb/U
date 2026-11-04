@@ -379,6 +379,33 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.26: **loads in one instruction: floats into vector registers, sign-extended values.** Per
+20 steady frames of `game.c` for AArch64 with Eden's options: 2,222,553 instructions in 04.25,
+2,123,983 now (-4.4%; -36.3% from 04.22's 3,335,063).
+
+- Patch 0126: **LDR S/D straight into an XMM** (a 32- or 64-bit load whose one use widens it to a
+  quad: `movd`/`movq xmm, [mem]`, the other lanes zeroed, the widening nothing; was a load into a
+  general register and a `movd`/`movq` across) (-1.9%).
+- Patch 0127: **LDRSB, LDRSH, LDRSW in one instruction** (`movsx`/`movsxd` from memory; was a load
+  and a `movsx`/`movsxd` after it) (-1.0%). Both for fastmem sites only: their fault fallbacks are
+  new stubs (the callback's value into the XMM, or sign-extended), a range-check miss takes the
+  fallback, and a site fastmem was declined for keeps the general-register path.
+- Patch 0128: **a W register read only to be sign-extended** (SXTW, SMULL, SMADDL's operands) is a
+  `movsxd` from the JIT state, and **a second SXTW of a value sign-extended already** (LDRSW then
+  SXTW of its low half) is that value (-1.6%).
+- **Tried and dropped: superblocks** (a B.cond in the middle of a block as a side exit, `A64ExitIf`:
+  a `jcc` to a link in the cold code, the code after it translated on). 22% fewer block entries,
+  but 13% more instructions in late frames (5.5% with forward branches only): each exit keeps the
+  flags stored for the code it leaves to (the dead flags look-ahead only covers a block's end),
+  float compares materialize their flags, and only about 35 thousand guest register loads in 30
+  frames were saved. Not kept.
+- Tests: `gen16.py` (LDRSB/LDRSH/LDRSW into W and X, plain, unscaled, register offset; SXTB/SXTH/SXTW
+  of registers just written, loaded or not, extended again; SMULL/SMADDL/SMSUBL/UMULL; ADD/SUB with
+  extended registers; the sign bits of each size) 250 with no fastmem, a mapped arena and one every
+  access is past; gen12 with its data on a marked page (`GEN12_MARKED=1`: float loads through the
+  new fallback stubs) and in both fastmem modes; gen5, gen6, gen8, gen11-gen15 and the cache suites;
+  04.25's whole set (960 programs, all generators, both modes, the cache suites) the same as before.
+
 04.25: **no shared page walks where fastmem works; atomics without locked loads.** Per 20
 steady frames of `game.c` for AArch64 with Eden's options: 2,425,968 instructions in 04.24,
 2,222,553 now (-8.4%; -33.4% from 04.22's 3,335,063).

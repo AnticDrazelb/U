@@ -1306,6 +1306,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.26: 64-bit games load floats straight into the PS4's vector registers and sign-extending "
+         "values (LDRSW and friends) in one instruction each: the test game is now 36% leaner than in 04.22.\n"
          "04.25: 64-bit games: loads and stores through the same base no longer go through a shared "
          "page-table lookup when the direct path works (8% fewer instructions on the test game, 33% fewer "
          "than 04.22), and atomic loads (spin locks, job counters: Unity games use many) are plain loads "
