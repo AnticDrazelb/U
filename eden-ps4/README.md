@@ -379,6 +379,35 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.24: **selects on the host's flags, returns without the descriptor.** Per 20 steady frames of
+`game.c` for AArch64 with all of Eden's options (the harness's `DYN_FWD`, `DYN_RSB`, `DYN_DISP`
+too, as Eden has them; 04.23's figures were without): 3,335,063 instructions in 04.22, 2,616,091
+in 04.23, 2,425,968 now (-27.3% from 04.22).
+
+- Patch 0121: **a CSEL/CSINC/CSINV/CSNEG/FCSEL (CSET, CINC...) after the compare that set its
+  flags in the same block** selects on the host's flags as that compare of its values sets them
+  right before it (`CondFlags*` then `ConditionalSelectHost32/64`: `cmp; cmov`) instead of loading
+  the stored flags back (`mov eax, [nzcv]; sahf...; cmov`); the select no longer reads the stored
+  flags, so their store goes when nothing else does (the dead flags pass). The `cmp` and the
+  `cmov` stay next to each other: the select's operands are loaded with `mov`s only (an immediate
+  0 too, not `xor`), and it counts as having side effects so that DCE can't leave its compare
+  behind for the block's branch (-1.9%). `SignExtendWordToLong(LeastSignificantWord(x))` takes x
+  (`movsxd` reads the low half: no `mov eax, eax` first; -0.8%). **The return stack holds return
+  addresses alone** (`return_stack_pc_only`): a return compares the PC as it is instead of putting
+  the location descriptor together (PC and the FPCR's mode bits: 7 instructions), and the stack is
+  emptied whenever those FPCR bits change (`MSR FPCR`, a context with another FPCR), so no entry
+  outlives the mode its code was translated for (-4.6%). `follow_direct_branches` (BL and forward
+  B translated through into one block) is there but off: 17% fewer block entries and 2.2% fewer
+  instructions in late frames, but each inlined function is translated again for every caller.
+- Patch 0122 is that option; patch 0123 turns the return stack's on for Eden's 64-bit cores (the
+  selects come with `elide_dead_nzcv`, on since 04.23).
+- Tests: `gen13.py` (every flag setter followed in the same block by one to three selects of
+  every kind on every condition, FCMP/FCMPE then FCSEL, edge values and immediates) 400 programs,
+  gen11 150, gen12 150, gen8 300, the gen13 cache suite; `gen14.py` (calls and returns around FPCR
+  changes, the mode varying from one run of a call to the next, float work after each return
+  whose result depends on the mode) 200, its cache suite, and a build without the emptying fails
+  11 of 30 (the test sees it); gen8 and gen14 with `DYN_FOLLOW` 250; A32 against 04.23's.
+
 04.23: **64-bit games' CPU code: branches on the host's flags, dead flags, floats in vector
 registers.** Per 20 steady frames of `game.c` built for AArch64 (callgrind, 30 minus 10 frames,
 Eden's options, no frame pointer): 3,415,799 instructions in 04.22, 2,696,927 now (-21.0%).

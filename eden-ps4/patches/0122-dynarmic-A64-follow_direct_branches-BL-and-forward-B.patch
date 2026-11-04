@@ -1,0 +1,217 @@
+From 6194693e4c0acf3c20404a64ac07ba68aa8b8bf6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 01:38:57 +0000
+Subject: [PATCH 122/123] dynarmic A64: follow_direct_branches (BL and forward
+ B translated through; off by default)
+
+A direct call or a forward branch doesn't end the block: the code at its target is translated
+into it (three times a block at most, never into code the block has); the other pieces of guest
+code are the block's ranges (IR::Block::lookahead). game.c for AArch64: 17% fewer block
+entries, 2.2% fewer instructions in late frames, but each inlined callee is translated again for
+every caller (more compiling): not enabled in Eden.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../dynarmic/backend/x64/a64_interface.cpp    |  2 ++
+ .../frontend/A64/translate/a64_translate.cpp  | 24 ++++++++++++++-----
+ .../frontend/A64/translate/a64_translate.h    |  5 ++++
+ .../A64/translate/impl/a64_branch.cpp         | 24 +++++++++++++++++++
+ .../frontend/A64/translate/impl/impl.h        | 12 ++++++++++
+ .../src/dynarmic/interface/A64/config.h       |  7 ++++++
+ 6 files changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index c060a0c08f..7bab71ed86 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -275,6 +275,7 @@ private:
+         A64::TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
+         options.nzcv_lookahead = conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         options.nzcv_lookahead_abi = conf.elide_dead_nzcv_abi;
++        options.follow_direct_branches = conf.follow_direct_branches;
+         A64::Translate(ir_block, arch_descriptor, get_code, options);
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         const auto entrypoint = emitter.Emit(ir_block).entrypoint;
+@@ -352,6 +353,7 @@ private:
+         add(conf.elide_dead_nzcv);
+         add(conf.elide_dead_nzcv_abi);
+         add(conf.return_stack_pc_only);
++        add(conf.follow_direct_branches);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+index d0afb8e2f3..f128a35d16 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+@@ -211,10 +211,9 @@ struct FlagsLookahead {
+ 
+ // IR::Block::nzcv_dead_at_exit for a block ending in links to other code, or (abi) in a call or a
+ // return
+-void LookAheadForFlags(IR::Block& block, const MemoryReadCodeFuncType& read_code, bool abi) {
+-    const LocationDescriptor end{block.EndLocation()};
++void LookAheadForFlags(IR::Block& block, const MemoryReadCodeFuncType& read_code, bool abi, u64 last_pc) {
+     if (abi) {
+-        if (const auto last = read_code(end.PC() - 4); last && (IsCall(*last) || IsReturn(*last))) {
++        if (const auto last = read_code(last_pc); last && (IsCall(*last) || IsReturn(*last))) {
+             block.nzcv_dead_at_exit = true;
+             return;
+         }
+@@ -252,7 +251,7 @@ void LookAheadForFlags(IR::Block& block, const MemoryReadCodeFuncType& read_code
+             return;
+     }
+     block.nzcv_dead_at_exit = true;
+-    block.lookahead.assign(lookahead.runs.begin(), lookahead.runs.end());
++    block.lookahead.insert(block.lookahead.end(), lookahead.runs.begin(), lookahead.runs.end());
+ }
+ 
+ }  // namespace
+@@ -262,8 +261,12 @@ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFu
+     TranslatorVisitor visitor{block, descriptor, options};
+ 
+     bool should_continue = true;
++    visitor.piece_start = descriptor.PC();
++    u64 last_pc = descriptor.PC();
+     do {
+         const u64 pc = visitor.ir.current_location->PC();
++        last_pc = pc;
++        visitor.instructions++;
+         if (const auto instruction = memory_read_code(pc)) {
+             if (auto decoder = Decode<TranslatorVisitor, bool>(visitor, *instruction)) {
+                 should_continue = *decoder;
+@@ -281,10 +284,19 @@ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFu
+         visitor.ir.SetTerm(IR::Term::LinkBlock{*visitor.ir.current_location});
+     }
+     ASSERT(block.HasTerminal() && "Terminal has not been set");
+-    block.SetEndLocation(*visitor.ir.current_location);
++    if (visitor.pieces.empty()) {
++        block.SetEndLocation(*visitor.ir.current_location);
++    } else {
++        // (branches followed: the block's location to its end location is its first piece, the
++        // others are ranges of guest code it depends on, as the flags look-ahead's)
++        block.SetEndLocation(descriptor.SetPC(visitor.pieces[0].second));
++        for (size_t i = 1; i < visitor.pieces.size(); i++)
++            block.lookahead.push_back(visitor.pieces[i]);
++        block.lookahead.emplace_back(visitor.piece_start, visitor.ir.current_location->PC());
++    }
+ 
+     if (options.nzcv_lookahead && !single_step) {
+-        LookAheadForFlags(block, memory_read_code, options.nzcv_lookahead_abi);
++        LookAheadForFlags(block, memory_read_code, options.nzcv_lookahead_abi, last_pc);
+     }
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 3299029356..cd0467c508 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -48,6 +48,11 @@ struct TranslationOptions {
+     /// the procedure call standard has them; a block ending in one has them dead at its exit
+     /// (UserConfig::elide_dead_nzcv_abi).
+     bool nzcv_lookahead_abi = false;
++
++    /// A direct call (BL) or a forward branch (B) doesn't end the block: the code at its target
++    /// is translated into it (up to three times a block, never into code the block already has).
++    /// The block's other pieces of guest code are in IR::Block::lookahead (its ranges).
++    bool follow_direct_branches = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index 36b91f13e9..bf97fe9657 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -28,10 +28,32 @@ bool TranslatorVisitor::B_uncond(Imm<26> imm26) {
+         ir.SetTerm(IR::Term::LinkBlock{ir.current_location->SetPC(target)});
+         return false;
+     }
++    if (target > ir.PC() && Follow(target))
++        return true;
+     ir.SetTerm(IR::Term::LinkBlockFast{ir.current_location->SetPC(target)});
+     return false;
+ }
+ 
++bool TranslatorVisitor::Follow(u64 target) {
++    if (!options.follow_direct_branches || follows_left <= 0 || instructions >= 64 || ir.current_location->SingleStepping())
++        return false;
++    const u64 pc = ir.PC();
++    if (target >= piece_start && target <= pc)
++        return false;
++    for (const auto& [start, end] : pieces) {
++        if (target >= start && target < end)
++            return false;
++    }
++    if (pieces.size() == pieces.capacity())
++        return false;
++    pieces.emplace_back(piece_start, pc + 4);
++    piece_start = target;
++    follows_left--;
++    // (Translate's loop moves on by 4 after this instruction)
++    ir.current_location = ir.current_location->SetPC(target - 4);
++    return true;
++}
++
+ bool TranslatorVisitor::BL(Imm<26> imm26) {
+     const s64 offset = concatenate(imm26, Imm<2>{0}).SignExtend<s64>();
+ 
+@@ -39,6 +61,8 @@ bool TranslatorVisitor::BL(Imm<26> imm26) {
+     ir.PushRSB(ir.current_location->AdvancePC(4));
+ 
+     const u64 target = ir.PC() + offset;
++    if (Follow(target))
++        return true;
+     ir.SetTerm(IR::Term::LinkBlockFast{ir.current_location->SetPC(target)});
+     return false;
+ }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+index c8afef3283..aeda7b92cb 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+@@ -8,6 +8,8 @@
+ 
+ #pragma once
+ 
++#include <boost/container/static_vector.hpp>
++
+ #include <optional>
+ 
+ #include "dynarmic/frontend/A64/a64_ir_emitter.h"
+@@ -27,6 +29,16 @@ struct TranslatorVisitor final {
+     A64::IREmitter ir;
+     TranslationOptions options;
+ 
++    // (options.follow_direct_branches) The block's guest code so far: the pieces before the
++    // current one ([start, end)), the current one's start, and how many more branches it may follow
++    boost::container::static_vector<std::pair<u64, u64>, 4> pieces;
++    u64 piece_start = 0;
++    int follows_left = 3;
++    size_t instructions = 0;
++    // Continues the block at target (a BL's, a forward B's) if it may: the current piece ends
++    // after this instruction
++    bool Follow(u64 target);
++
+     bool UnpredictableInstruction();
+     bool DecodeError();
+     bool ReservedValue();
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 17c993fee3..e5a90e6600 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -387,6 +387,13 @@ struct UserConfig {
+     /// the descriptor together first (seven instructions fewer each).
+     bool return_stack_pc_only = false;
+ 
++    /// (PS4 04.24) A direct call (BL) or a forward branch (B) doesn't end a block: the code at
++    /// its target is translated into the block (three at most, never into code it already has),
++    /// which then keeps the guest registers it has in host registers across it, without the jump
++    /// between two blocks. The block depends on each piece of guest code it has (invalidation,
++    /// the translation cache's hash).
++    bool follow_direct_branches = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+-- 
+2.43.0
+

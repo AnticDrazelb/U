@@ -88,7 +88,10 @@ for AArch64 (`dynbench64 image programs/c/game64.bin <frames> fastmem2`). (04.23
 `DYN_NZCV=1` (the flags look-ahead), `DYN_NZCVABI=1` (calls and returns end it; not for gen8, whose
 random functions read the flags a call left); `steady64.sh <harness> [VAR=1...]` counts 20 steady
 frames of `game64.bin` (callgrind, 30 minus 10); `cgjit64.py <dir>` and `cgblock.py <dir> <n>` show
-what the translated code executed by kind and the n-th hottest block (callgrind `--dump-instr=yes`
+what the translated code executed by kind and the n-th hottest block (04.24: `-DHAVE_RSB_PC`,
+`DYN_RSBPC=1`, the return stack of return addresses; `-DHAVE_FOLLOW`, `DYN_FOLLOW=1`, BL and
+forward B translated through; measure with Eden's `DYN_FWD=1 DYN_RSB=1 DYN_DISP=1 DYN_NOFRAME=1` too;
+`blockstats64.py <dir>`: block entries and host instructions per entry) (callgrind `--dump-instr=yes`
 into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
 `BUILD=<dir>` into another build directory.
 
@@ -100,6 +103,8 @@ into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `E
 | gen5.py | A64 exclusives |
 | gen11.py | A64 flag setters right before B.cond, CBZ/CBNZ/TBZ/TBNZ on every bit, edge values (04.23) |
 | gen12.py | A64 scalar floats: arithmetic, conversions, compares, loads and stores of S and D (04.23) |
+| gen13.py | A64 flag setters followed by CSEL/CSINC/CSINV/CSNEG/CSET/CINC/FCSEL in the same block (04.24) |
+| gen14.py | A64 calls and returns around FPCR changes (the return stack across mode changes) (04.24) |
 | gen6.py | A64 loads/stores sharing a base |
 | gen7.py | A32/Thumb control flow and flags: conditional instructions, IT blocks, loops, calls, VFP compares |
 | gen8.py | A64 control flow and flags |

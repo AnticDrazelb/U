@@ -1306,6 +1306,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.24: more of the same for 64-bit games: a CSEL or CSET after a compare picks its value on the "
+         "PS4's own flags (cmp; cmov) instead of saving the Switch's flags and reading them back, and a "
+         "function's return checks the return address as it is (8 instructions instead of 14). The 64-bit "
+         "test game: 27% fewer instructions than in 04.22 with the options Eden uses.\n"
          "04.23: 64-bit games' CPU code (Zelda, Silksong, Bluey, Animal Crossing) runs leaner again: a "
          "conditional branch tests the compare just before it on the PS4's own flags instead of saving the "
          "Switch's flags and reading them back; flags that no later code reads aren't saved at all (the "

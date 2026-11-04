@@ -1,0 +1,29 @@
+From 03d82b0caf3351f65ab91929e68538ed7133b1ef Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 01:44:16 +0000
+Subject: [PATCH 123/123] PS4: the A64 cores' return stack holds return
+ addresses alone
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 85c52dfe67..8025aa70b7 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -297,6 +297,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // procedure call standard has them so), and a block ending in one doesn't store them either
+     config.elide_dead_nzcv = true;
+     config.elide_dead_nzcv_abi = true;
++    // (04.24) the return stack holds return addresses alone, emptied when the FPCR's rounding or
++    // flush-to-zero bits change: each return checks the PC as it is (8 instructions, not 14)
++    config.return_stack_pc_only = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

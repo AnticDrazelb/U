@@ -1,0 +1,551 @@
+From 7c8892edec86db88e98a14ef68cd7d3dffb8e4da Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 01:30:30 +0000
+Subject: [PATCH 121/123] dynarmic A64: selects on the host's flags, SXTW
+ without a zero-extension first, return stack entries of the PC
+
+A CSEL/CSINC/CSINV/CSNEG/FCSEL whose flags a compare earlier in the block made selects on the
+host's flags as that compare of its values sets them right before it (CondFlags* then
+ConditionalSelectHost32/64: cmp; cmov) instead of loading the stored flags back; the stored
+flags no longer read there can go (GetSetElimination, the dead flags pass). SignExtendWordToLong
+of a LeastSignificantWord takes the wide value (movsxd reads the low half). With
+return_stack_pc_only the return stack holds return addresses alone and is emptied when the
+FPCR's mode bits change: a return compares the PC as it is (8 instructions instead of 14).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |  52 ++++-
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |   1 +
+ .../dynarmic/backend/x64/a64_interface.cpp    |   4 +-
+ .../src/dynarmic/backend/x64/a64_jitstate.cpp |   4 +
+ .../src/dynarmic/backend/x64/emit_x64.cpp     |   2 +-
+ .../src/dynarmic/backend/x64/emit_x64.h       |   3 +
+ .../backend/x64/emit_x64_data_processing.cpp  |  69 +++++++
+ .../src/dynarmic/interface/A64/config.h       |   6 +
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |   4 +
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |   3 +
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 182 ++++++++++--------
+ 11 files changed, 243 insertions(+), 87 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 814a735a00..9f8d340337 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -153,6 +153,10 @@ opcode_branch:
+ a64_branch:
+         (this->*a64_handlers[size_t(opcode) - std::size(opcode_handlers)])(ctx, &inst);
+ finish_this_inst:
++        // (the host's flags a CondFlags* left are for the instruction right after it, or the
++        // terminal: anything else in between and they're gone)
++        if (!IR::IsCondFlagsForTerminal(opcode))
++            host_cond_flags = HostCondFlags::None;
+         ctx.reg_alloc.EndOfAllocScope();
+ #ifndef NDEBUG
+         if (conf.very_verbose_debugging_output)
+@@ -367,6 +371,16 @@ void A64EmitX64::FuseCondFlags(IR::Block& block) {
+ 
+ void A64EmitX64::PeepholeQuad(IR::Block& block) {
+     for (auto& inst : block.instructions) {
++        // (movsxd reads the low 32 bits alone: no zero-extension of them first, SXTW, SMULL)
++        if (inst.GetOpcode() == IR::Opcode::SignExtendWordToLong && !inst.GetArg(0).IsImmediate()) {
++            IR::Inst* const low = inst.GetArg(0).GetInst();
++            if (low->GetOpcode() == IR::Opcode::LeastSignificantWord && !low->GetArg(0).IsImmediate()) {
++                inst.SetArg(0, low->GetArg(0));
++                if (low->UseCount() == 0)
++                    low->Invalidate();
++            }
++            continue;
++        }
+         if (inst.GetOpcode() != IR::Opcode::ZeroExtendLongToQuad || inst.GetArg(0).IsImmediate())
+             continue;
+         IR::Inst* const widen = inst.GetArg(0).GetInst();
+@@ -416,14 +430,20 @@ void A64EmitX64::GenTerminalHandlers() {
+ 
+     code.align();
+     terminal_handler_pop_rsb_hint = code.getCurr<const void*>();
+-    calculate_location_descriptor();
++    Xbyak::Label rsb_pc_miss;
++    if (conf.return_stack_pc_only) {
++        code.mov(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++    } else {
++        calculate_location_descriptor();
++    }
+     code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+     code.sub(eax, 1);
+     code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+     code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
+     code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+-        code.jne(rsb_cache_miss, code.T_NEAR);
++        // (with entries of the PC alone, the descriptor is put together on a miss)
++        code.jne(conf.return_stack_pc_only ? rsb_pc_miss : rsb_cache_miss, code.T_NEAR);
+     } else {
+         code.jne(code.GetReturnFromRunCodeAddress());
+     }
+@@ -434,6 +454,7 @@ void A64EmitX64::GenTerminalHandlers() {
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+         code.align();
+         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
++        code.L(rsb_pc_miss);
+         calculate_location_descriptor();
+         code.L(rsb_cache_miss);
+         code.mov(r8, u64(fast_dispatch_table.data()));
+@@ -468,6 +489,13 @@ void A64EmitX64::GenTerminalHandlers() {
+     }
+ }
+ 
++u64 A64EmitX64::RSBEntryFor(IR::LocationDescriptor target) const {
++    if (!conf.return_stack_pc_only)
++        return target.Value();
++    const A64::LocationDescriptor location{target};
++    return location.SingleStepping() ? ~u64(0) : location.PC();
++}
++
+ void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
+     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+         return;
+@@ -930,13 +958,19 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+         // terminal_handler_pop_rsb_hint, here: this return's own indirect jump, which the host's
+         // branch predictor learns on its own, instead of the one all returns share
+         auto& code = e.code;
+-        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+-        code.mov(rcx, A64::LocationDescriptor::pc_mask);
+-        code.and_(rcx, rdi);
+-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
+-        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+-        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+-        code.or_(rbx, rcx);
++        if (e.conf.return_stack_pc_only) {
++            // (entries of the return address alone, the stack emptied when the FPCR's mode
++            // bits change: the PC as it is; a miss puts the descriptor together)
++            code.mov(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++        } else {
++            code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++            code.mov(rcx, A64::LocationDescriptor::pc_mask);
++            code.and_(rcx, rdi);
++            code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
++            code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
++            code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
++            code.or_(rbx, rcx);
++        }
+         code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+         code.sub(eax, 1);
+         code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 132da7542a..96e49bca9b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -109,6 +109,7 @@ public:
+     /// (PS4 04.23) ZeroExtendLongToQuad(ZeroExtendWordToLong(w)), as a scalar float result or a
+     /// word loaded into a vector register comes: ZeroExtendLongToQuad(w) (one movd or insertps)
+     void PeepholeQuad(IR::Block& block);
++    u64 RSBEntryFor(IR::LocationDescriptor target) const override;
+     FakeCall FastmemCallback(u64 rip);
+ 
+     // Memory access helpers
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index dff52f868d..c060a0c08f 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -85,7 +85,8 @@ public:
+         const CodePtr current_code_ptr = [this] {
+             // RSB optimization
+             const u32 new_rsb_ptr = (jit_state.rsb_ptr - 1) & A64JitState::RSB_PTR_MASK;
+-            if (jit_state.GetUniqueHash() == jit_state.rsb_location_descriptors[new_rsb_ptr]) {
++            const u64 entry = conf.return_stack_pc_only ? (jit_state.pc & A64::LocationDescriptor::pc_mask) : jit_state.GetUniqueHash();
++            if (entry == jit_state.rsb_location_descriptors[new_rsb_ptr]) {
+                 jit_state.rsb_ptr = new_rsb_ptr;
+                 return CodePtr(jit_state.rsb_codeptrs[new_rsb_ptr]);
+             }
+@@ -350,6 +351,7 @@ private:
+         add(conf.split_cold_code);
+         add(conf.elide_dead_nzcv);
+         add(conf.elide_dead_nzcv_abi);
++        add(conf.return_stack_pc_only);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp
+index 3f04ed63f0..d541e4579c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp
+@@ -58,6 +58,10 @@ u32 A64JitState::GetFpcr() const {
+ }
+ 
+ void A64JitState::SetFpcr(u32 value) {
++    // (a return stack entry's code is for the mode it was pushed in: with entries of the PC
++    // alone, return_stack_pc_only, none may outlive a change of it)
++    if (((fpcr ^ value) & A64::LocationDescriptor::fpcr_mask) != 0)
++        ResetRSB();
+     fpcr = value & FPCR_MASK;
+ 
+     asimd_MXCSR &= 0x0000003D;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+index 5abd376406..7ff83ae102 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -102,7 +102,7 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
+                                 : code.GetReturnFromRunCodeAddress();
+ 
+     code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
+-    code.mov(loc_desc_reg, target.Value());
++    code.mov(loc_desc_reg, RSBEntryFor(target));
+     patch_information[target].Add(PatchInformation::MovRcx, code.getCurr());
+     EmitPatchMovRcx(target_code_ptr);
+     code.mov(qword[code.ABI_JIT_PTR + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 7a17e016b5..23ebe34d3c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -128,6 +128,9 @@ public:
+     }
+     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
+     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
++    // What a return stack entry for target holds (its descriptor; A64 with return_stack_pc_only:
++    // its PC, never matched for a single-stepping one)
++    virtual u64 RSBEntryFor(IR::LocationDescriptor target) const { return target.Value(); }
+ 
+ #ifndef NDEBUG
+     void EmitVerboseDebuggingOutput(RegAlloc& reg_alloc);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index 511e264a42..e0b6092516 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -208,6 +208,75 @@ void EmitX64::EmitConditionalSelect64(EmitContext& ctx, IR::Inst* inst) {
+     EmitConditionalSelect(code, ctx, inst, 64);
+ }
+ 
++// (A64SelectOnHostFlagsPass) The host's flags as the CondFlags* right before this left them:
++// only moves between them (no immediate loaded with an xor), then a cmov
++static void EmitConditionalSelectHost(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bitsize, EmitX64::HostCondFlags kind) {
++    ASSERT(kind != EmitX64::HostCondFlags::None);
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const IR::Cond cond = args[0].GetImmediateCond();
++    const auto load = [&](Argument& arg, bool scratch) -> Xbyak::Reg {
++        if (arg.IsImmediate()) {
++            const Xbyak::Reg64 r = ctx.reg_alloc.ScratchGpr(code);
++            const u64 value = arg.GetImmediateU64();
++            if (bitsize == 32 || value <= 0xFFFFFFFF)
++                code.mov(r.cvt32(), u32(value));  // (mov: the flags stay)
++            else
++                code.mov(r, value);
++            return r.changeBit(bitsize);
++        }
++        return (scratch ? ctx.reg_alloc.UseScratchGpr(code, arg) : ctx.reg_alloc.UseGpr(code, arg)).changeBit(bitsize);
++    };
++    const Xbyak::Reg else_ = load(args[2], true);
++    const Xbyak::Reg then_ = load(args[1], false);
++    using K = EmitX64::HostCondFlags;
++    if (kind == K::FP) {
++        // ucomis (swapped for some, ChooseCondFlags): EmitCond's FP mapping, EQ and NE not here
++        switch (cond) {
++        case IR::Cond::GT: case IR::Cond::MI: case IR::Cond::CC: code.cmova(else_, then_); break;
++        case IR::Cond::GE: case IR::Cond::LS: code.cmovae(else_, then_); break;
++        case IR::Cond::LT: case IR::Cond::HI: code.cmovb(else_, then_); break;
++        case IR::Cond::LE: case IR::Cond::PL: case IR::Cond::CS: code.cmovbe(else_, then_); break;
++        case IR::Cond::VS: code.cmovp(else_, then_); break;
++        case IR::Cond::VC: code.cmovnp(else_, then_); break;
++        default: UNREACHABLE();
++        }
++    } else {
++        ASSERT(kind == K::Sub || (cond != IR::Cond::HI && cond != IR::Cond::LS));
++        switch (cond) {
++        case IR::Cond::EQ: code.cmovz(else_, then_); break;
++        case IR::Cond::NE: code.cmovnz(else_, then_); break;
++        // ARM's C after a subtraction is x64's CF inverted (no borrow); after an addition, the carry;
++        // after a test clear (as x64's)
++        case IR::Cond::CS: kind == K::Sub ? code.cmovae(else_, then_) : code.cmovc(else_, then_); break;
++        case IR::Cond::CC: kind == K::Sub ? code.cmovb(else_, then_) : code.cmovnc(else_, then_); break;
++        case IR::Cond::MI: code.cmovs(else_, then_); break;
++        case IR::Cond::PL: code.cmovns(else_, then_); break;
++        case IR::Cond::VS: code.cmovo(else_, then_); break;
++        case IR::Cond::VC: code.cmovno(else_, then_); break;
++        case IR::Cond::HI: code.cmova(else_, then_); break;
++        case IR::Cond::LS: code.cmovbe(else_, then_); break;
++        case IR::Cond::GE: code.cmovge(else_, then_); break;
++        case IR::Cond::LT: code.cmovl(else_, then_); break;
++        case IR::Cond::GT: code.cmovg(else_, then_); break;
++        case IR::Cond::LE: code.cmovle(else_, then_); break;
++        default: UNREACHABLE();
++        }
++    }
++    ctx.reg_alloc.DefineValue(code, inst, else_);
++}
++
++void EmitX64::EmitConditionalSelectHost32(EmitContext& ctx, IR::Inst* inst) {
++    const HostCondFlags kind = host_cond_flags;
++    host_cond_flags = HostCondFlags::None;
++    EmitConditionalSelectHost(code, ctx, inst, 32, kind);
++}
++
++void EmitX64::EmitConditionalSelectHost64(EmitContext& ctx, IR::Inst* inst) {
++    const HostCondFlags kind = host_cond_flags;
++    host_cond_flags = HostCondFlags::None;
++    EmitConditionalSelectHost(code, ctx, inst, 64, kind);
++}
++
+ void EmitX64::EmitConditionalSelectNZCV(EmitContext& ctx, IR::Inst* inst) {
+     EmitConditionalSelect(code, ctx, inst, 32);
+ }
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 934e83cfde..17c993fee3 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -381,6 +381,12 @@ struct UserConfig {
+     /// are followed, returns count as reads (exact for any code).
+     bool elide_dead_nzcv_abi = false;
+ 
++    /// (PS4 04.24) The return stack buffer holds the return address alone (not its whole location
++    /// descriptor: the FPCR's mode bits with it), and is emptied whenever those bits change (MSR
++    /// FPCR, a context with another FPCR): a return compares the PC as it is instead of putting
++    /// the descriptor together first (seven instructions fewer each).
++    bool return_stack_pc_only = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index af9e7bb187..37684b0631 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -626,6 +626,10 @@ constexpr bool IsCondFlagsForTerminal(const Opcode op) noexcept {
+ constexpr bool MayHaveSideEffects(const Opcode op) noexcept {
+     return op == Opcode::PushRSB
+         || IsCondFlagsForTerminal(op)
++        // (kept with the CondFlags* before it, whose host flags it takes: one left alone would
++        // stand for the block's terminal)
++        || op == Opcode::ConditionalSelectHost32
++        || op == Opcode::ConditionalSelectHost64
+         || op == Opcode::CallHostFunction
+         || op == Opcode::A64DataCacheOperationRaised
+         || op == Opcode::A64InstructionCacheOperationRaised
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index 386c9b12b1..94834dec21 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -40,6 +40,9 @@ OPCODE(CondFlagsSub64,                                      Void,           U64,
+ OPCODE(CondFlagsAdd64,                                      Void,           U64,            U64                                             )
+ OPCODE(CondFlagsTest64,                                     Void,           U64,            U64                                             )
+ OPCODE(CondFlagsNZ64,                                       Void,           U64                                                             )
++// (a select on the host's flags as the CondFlags* right before it left them: A64SelectOnHostFlagsPass)
++OPCODE(ConditionalSelectHost32,                             U32,            Cond,           U32,            U32                             )
++OPCODE(ConditionalSelectHost64,                             U64,            Cond,           U64,            U64                             )
+ // (a float compare: ucomiss/ucomisd of the two, in the order the condition needs: A32DeadNZCVPass)
+ OPCODE(CondFlagsFP32,                                       Void,           U32,            U32                                             )
+ OPCODE(CondFlagsFP64,                                       Void,           U64,            U64                                             )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 8f2d5cf01e..0649292b0f 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -788,6 +788,104 @@ static void A32DeadNZCVPass(IR::Block& block) {
+     drop_unused_compare();
+ }
+ 
++// The CondFlags* instruction (and its arguments) that sets the host's flags for `cond` as the
++// guest flags `flags` (an A64SetNZCV's value) have them: a compare (cmp) for a subtraction's, an
++// addition (add) for an addition's but for HI and LS, a test for an And's (C and V clear: not HI,
++// LS), N and Z of the result (test r, r) for EQ, NE, MI, PL when the result is wanted anyway
++// (more than by the flags: its operands then needn't live on), a float compare's (ucomis, swapped
++// for the conditions on N or C alone and HI/LS; EQ and NE only with fp_eq: two jumps, the parity).
++// None for anything else (ADCS, SBCS, CCMP, MSR NZCV, a constant).
++struct CondFlagsChoice {
++    IR::Opcode op;
++    boost::container::static_vector<IR::Value, 2> args;
++};
++static std::optional<CondFlagsChoice> ChooseCondFlags(IR::Inst* flags, IR::Cond cond, bool fp_eq) {
++    const bool nz_only = cond == IR::Cond::EQ || cond == IR::Cond::NE || cond == IR::Cond::MI || cond == IR::Cond::PL;
++    const bool hi_ls = cond == IR::Cond::HI || cond == IR::Cond::LS;
++    if (cond == IR::Cond::AL || cond == IR::Cond::NV)
++        return std::nullopt;
++    if (flags->GetOpcode() == IR::Opcode::FPCompare32 || flags->GetOpcode() == IR::Opcode::FPCompare64) {
++        if (!fp_eq && (cond == IR::Cond::EQ || cond == IR::Cond::NE))
++            return std::nullopt;
++        const bool swap = cond == IR::Cond::MI || cond == IR::Cond::PL || cond == IR::Cond::HI || cond == IR::Cond::LS ||
++                          cond == IR::Cond::CS || cond == IR::Cond::CC;
++        return CondFlagsChoice{flags->GetOpcode() == IR::Opcode::FPCompare32 ? IR::Opcode::CondFlagsFP32 : IR::Opcode::CondFlagsFP64,
++                               {flags->GetArg(swap ? 1 : 0), flags->GetArg(swap ? 0 : 1)}};
++    }
++    if (flags->GetOpcode() != IR::Opcode::GetNZCVFromOp || flags->GetArg(0).IsImmediate())
++        return std::nullopt;
++    const IR::Value source = flags->GetArg(0);
++    IR::Inst* const op = source.GetInst();
++    const bool is64 = source.GetType() == IR::Type::U64;
++    if (!is64 && source.GetType() != IR::Type::U32)
++        return std::nullopt;
++    const auto carry_in = [&](bool value) {
++        return op->GetArg(2).IsImmediate() && op->GetArg(2).GetU1() == value;
++    };
++    const bool result_used = op->UseCount() > 1;
++    const IR::Opcode nz = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
++    switch (op->GetOpcode()) {
++    case IR::Opcode::Sub32:
++    case IR::Opcode::Sub64:
++        if (!carry_in(true))
++            return std::nullopt;  // (SBCS)
++        if (nz_only && result_used)
++            return CondFlagsChoice{nz, {source}};
++        return CondFlagsChoice{is64 ? IR::Opcode::CondFlagsSub64 : IR::Opcode::CondFlagsSub32, {op->GetArg(0), op->GetArg(1)}};
++    case IR::Opcode::Add32:
++    case IR::Opcode::Add64:
++        if (!carry_in(false))
++            return std::nullopt;  // (ADCS)
++        if (nz_only && result_used)
++            return CondFlagsChoice{nz, {source}};
++        if (hi_ls)
++            return std::nullopt;
++        return CondFlagsChoice{is64 ? IR::Opcode::CondFlagsAdd64 : IR::Opcode::CondFlagsAdd32, {op->GetArg(0), op->GetArg(1)}};
++    case IR::Opcode::And32:
++    case IR::Opcode::And64:
++        if (hi_ls)
++            return std::nullopt;
++        if (result_used)
++            return CondFlagsChoice{nz, {source}};
++        return CondFlagsChoice{is64 ? IR::Opcode::CondFlagsTest64 : IR::Opcode::CondFlagsTest32, {op->GetArg(0), op->GetArg(1)}};
++    default:
++        return std::nullopt;
++    }
++}
++
++// A64: a CSEL, CSINC, CSINV, CSNEG (CSET, CINC...) or FCSEL whose flags a compare earlier in the
++// block made (the last A64SetNZCV before it, of a CMP, CMN, SUBS, ADDS, TST, ANDS or FCMP) selects
++// on the host's flags as that compare of its values sets them right before it (CondFlags*;
++// ConditionalSelectHost: cmp; cmov) instead of loading the stored flags back. It no longer reads
++// them: the store can then go as any other (A64GetSetElimination, A64DeadNZCVPass).
++static void A64SelectOnHostFlagsPass(IR::Block& block) {
++    IR::Inst* flags = nullptr;  // the stored flags' value, while known
++    for (auto it = block.instructions.begin(); it != block.instructions.end(); ++it) {
++        const auto op = it->GetOpcode();
++        if (op == IR::Opcode::A64SetNZCV) {
++            flags = it->GetArg(0).IsImmediate() ? nullptr : it->GetArg(0).GetInst();
++            continue;
++        }
++        if (op != IR::Opcode::ConditionalSelect32 && op != IR::Opcode::ConditionalSelect64) {
++            if (WritesToCPSR(op) || CausesCPUException(op))
++                flags = nullptr;
++            continue;
++        }
++        if (!flags)
++            continue;
++        const IR::Cond cond = it->GetArg(0).GetCond();
++        const auto choice = ChooseCondFlags(flags, cond, false);
++        if (!choice)
++            continue;
++        if (choice->args.size() == 2)
++            block.PrependNewInst(it, choice->op, {choice->args[0], choice->args[1]});
++        else
++            block.PrependNewInst(it, choice->op, {choice->args[0]});
++        // (the same arguments: the condition, then, else)
++        it->op = op == IR::Opcode::ConditionalSelect32 ? IR::Opcode::ConditionalSelectHost32 : IR::Opcode::ConditionalSelectHost64;
++    }
++}
++
+ // A64's: a block whose flags are dead at its exit (IR::Block::nzcv_dead_at_exit) doesn't store
+ // those its last flag-setting instructions make (after the last instruction that reads them); one
+ // that ends in a conditional branch then branches on the host's flags as a compare of the values
+@@ -829,87 +927,16 @@ static void A64DeadNZCVPass(IR::Block& block) {
+         finish();
+         return;
+     }
+-    const IR::Cond cond = if_->if_;
+-    const bool nz_only = cond == IR::Cond::EQ || cond == IR::Cond::NE || cond == IR::Cond::MI || cond == IR::Cond::PL;
+-    const bool hi_ls = cond == IR::Cond::HI || cond == IR::Cond::LS;
+     IR::Inst* const last = writes.front();
+     if (last->GetOpcode() != IR::Opcode::A64SetNZCV || last->GetArg(0).IsImmediate())
+         return;
+-    IR::Inst* const flags = last->GetArg(0).GetInst();
+-
+-    if (flags->GetOpcode() == IR::Opcode::FPCompare32 || flags->GetOpcode() == IR::Opcode::FPCompare64) {
+-        // FCMP: ucomis of its operands, swapped for the conditions on N or C alone and HI/LS
+-        // (EmitCond's FP mapping, the same flags as A32's VCMP)
+-        const bool swap = cond == IR::Cond::MI || cond == IR::Cond::PL || cond == IR::Cond::HI || cond == IR::Cond::LS ||
+-                          cond == IR::Cond::CS || cond == IR::Cond::CC;
+-        const IR::Value x = flags->GetArg(swap ? 1 : 0), y = flags->GetArg(swap ? 0 : 1);
+-        block.AppendNewInst(flags->GetOpcode() == IR::Opcode::FPCompare32 ? IR::Opcode::CondFlagsFP32 : IR::Opcode::CondFlagsFP64, {x, y});
+-        finish();
+-        return;
+-    }
+-    if (flags->GetOpcode() != IR::Opcode::GetNZCVFromOp || flags->GetArg(0).IsImmediate())
+-        return;
+-    const IR::Value source = flags->GetArg(0);
+-    IR::Inst* const op = source.GetInst();
+-    const bool is64 = source.GetType() == IR::Type::U64;
+-    if (!is64 && source.GetType() != IR::Type::U32)
++    const auto choice = ChooseCondFlags(last->GetArg(0).GetInst(), if_->if_, true);
++    if (!choice)
+         return;
+-    const auto carry_in = [&](bool value) {
+-        return op->GetArg(2).IsImmediate() && op->GetArg(2).GetU1() == value;
+-    };
+-    // the result is wanted anyway (by more than these flags): N and Z from it (test r, r) keep
+-    // its operands from having to live to the end
+-    const bool result_used = op->UseCount() > 1;
+-
+-    IR::Opcode cond_flags;
+-    boost::container::static_vector<IR::Value, 2> args;
+-    switch (op->GetOpcode()) {
+-    case IR::Opcode::Sub32:
+-    case IR::Opcode::Sub64:
+-        if (!carry_in(true))
+-            return;  // (SBCS)
+-        if (nz_only && result_used) {
+-            cond_flags = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
+-            args = {source};
+-        } else {
+-            cond_flags = is64 ? IR::Opcode::CondFlagsSub64 : IR::Opcode::CondFlagsSub32;  // CMP, SUBS
+-            args = {op->GetArg(0), op->GetArg(1)};
+-        }
+-        break;
+-    case IR::Opcode::Add32:
+-    case IR::Opcode::Add64:
+-        if (!carry_in(false))
+-            return;  // (ADCS)
+-        if (nz_only && result_used) {
+-            cond_flags = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
+-            args = {source};
+-        } else if (!hi_ls) {
+-            cond_flags = is64 ? IR::Opcode::CondFlagsAdd64 : IR::Opcode::CondFlagsAdd32;  // CMN, ADDS
+-            args = {op->GetArg(0), op->GetArg(1)};
+-        } else {
+-            return;
+-        }
+-        break;
+-    case IR::Opcode::And32:
+-    case IR::Opcode::And64:
+-        // ANDS, TST, BICS (an And of a Not): N and Z, C and V clear (no HI, LS: C clear there)
+-        if (hi_ls)
+-            return;
+-        if (result_used) {
+-            cond_flags = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
+-            args = {source};
+-        } else {
+-            cond_flags = is64 ? IR::Opcode::CondFlagsTest64 : IR::Opcode::CondFlagsTest32;
+-            args = {op->GetArg(0), op->GetArg(1)};
+-        }
+-        break;
+-    default:
+-        return;
+-    }
+-    if (args.size() == 2)
+-        block.AppendNewInst(cond_flags, {args[0], args[1]});
++    if (choice->args.size() == 2)
++        block.AppendNewInst(choice->op, {choice->args[0], choice->args[1]});
+     else
+-        block.AppendNewInst(cond_flags, {args[0]});
++        block.AppendNewInst(choice->op, {choice->args[0]});
+     finish();
+ }
+ 
+@@ -2013,6 +2040,9 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+     Optimization::PolyfillPass(block, polyfill_options);
+     Optimization::A64CallbackConfigPass(block, conf);
+     Optimization::NamingPass(block);
++    if (conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access) {
++        Optimization::A64SelectOnHostFlagsPass(block);
++    }
+     if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
+         Optimization::A64GetSetElimination(block);
+         Optimization::DeadCodeElimination(block);
+-- 
+2.43.0
+

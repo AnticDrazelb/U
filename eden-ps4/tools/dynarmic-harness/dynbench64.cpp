@@ -273,6 +273,9 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
 #ifdef HAVE_RSB_PC  // (04.24) return stack entries of the PC alone (DYN_RSBPC)
     config.return_stack_pc_only = std::getenv("DYN_RSBPC") != nullptr;
 #endif
+#ifdef HAVE_FOLLOW  // (04.24) direct calls and forward branches translated through (DYN_FOLLOW)
+    config.follow_direct_branches = std::getenv("DYN_FOLLOW") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
