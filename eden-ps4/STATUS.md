@@ -125,6 +125,34 @@ checkerboard screen, sometimes a hard reset).
   up as the PS4 wants. It still goes down with none counted: not them. Down with some counted and
   skipped: not them either.
 
+### What other emulators and ports found (research, after 04.42)
+- **Mesa issue 3168 (2020): yuzu, Captain Toad, AMD GCN (R9 Fury, Linux), "the GPU hangs and I need
+  to reboot" on entering stage 2; fine on Windows.** Closed as fixed by Mesa !5632 ("radeonsi: bump
+  SI_NUM_SHADER_BUFFERS to 32": yuzu's shaders use more than 8 storage buffers) and !5167
+  (gl_Layer/gl_ViewportIndex in the VS). On the related Super Mario Odyssey hang (issue 3057) the
+  Mesa developer found "an infinite loop in a compute shader" because "this shader uses more than 8
+  storage buffers"; it hung on gfx9, not Navi. So: Captain Toad's shaders bind many storage buffers
+  (the Switch's global memory), and a bad buffer descriptor took a GCN machine down. RADV has no 8-slot
+  limit, but Eden on the PS4 uses VK_EXT_descriptor_buffer (raw GPU addresses in descriptors): the
+  next suspect if 04.42 doesn't settle it (a run with descriptor buffers off).
+- **yuzu progress reports:** the Switch's geometry shader passthrough (an NVIDIA feature, for viewport
+  and layer selection) is emulated with real geometry shaders on AMD, so a Switch game can run GS on
+  the PS4 without having one (our logs: "Device doesn't support extension
+  VK_NV_geometry_shader_passthrough"). Tessellation crashed AMD's Windows driver until yuzu forced the
+  PATCH_LIST topology.
+- **shadPS4 (Sony's libSceGnmDriver as reverse-engineered):** `sceGnmSetGsRingSizes` takes 4-8 MB,
+  1 MB aligned, and sets VGT_ESGS/GSVS_RING_SIZE itself (Crema's 16 MiB GS rings cover 8 MB). The
+  tessellation factor ring is one system buffer at a fixed system address
+  (`sceGnmGetTheTessellationFactorRingBufferBaseAddress`), and the off-chip buffer is 8 MiB
+  (`sceGnmGetOffChipTessellationBufferSize`). RADV's tessellation buffer on Liverpool is ~2.3 MiB (2
+  SEs x 36 workgroups x 32 KiB + 54 KiB of factors), with no PS4 margin: if the system's
+  VGT_HS_OFFCHIP_PARAM / VGT_TF_MEMORY_BASE stay (as the GS ring sizes do), the HS writes up to
+  ~5.7 MiB past it and the VGT reads factors from the system's ring. A fix to make either way: an
+  8 MiB-or-more off-chip ring, and the system's factor ring.
+- **Eden4 (github.com/xatyy/eden4):** no GS or tessellation handling; two games tried. PS4 Pro mode
+  "hung the GPU and crashed the whole console" (RADV describes the base GPU): a GPU configuration
+  that doesn't match the system's is a known way to take the console down.
+
 ### Also open
 - **Little Kitty, Big City:** a black screen. The game's allocator traps
   (`nnmem_nlib_debug_break`) after reads at 0 and at unmapped addresses, 16 times. Not the
