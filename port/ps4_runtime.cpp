@@ -321,8 +321,16 @@ bool addDirectOverflow(size_t size) {
     return false;
 }
 
-// With a GPU reserve: one more heap of `size` bytes.
+// With a GPU reserve: one more heap of `size` bytes. (04.33) Direct memory first (4.6 GiB of it
+// free at boot), regular flexible memory only when that fails: flexible memory is the PS4's small
+// pool (about 364 MiB) that thread stacks, the page tables' pages and the system's libraries take
+// from, and taking 270 MiB of it here in Bluey's first seconds left it empty a minute later.
 bool addOverflowStep(size_t size) {
+    off_t start = 0;
+    size_t largest = 0;
+    const int32_t query = ps4QueryDirectMemory(0, sceKernelGetDirectMemorySize(), 2 * MB, &start, &largest);
+    if (query == 0 && largest >= g_overflowGpuReserve + size && addDirectOverflow(size))
+        return true;
     size_t flexible = 0;
     if (sceKernelAvailableFlexibleMemorySize(&flexible) == 0 && flexible >= FLEXIBLE_KEEP + size) {
         void* base = nullptr;
@@ -332,16 +340,10 @@ bool addOverflowStep(size_t size) {
             sceKernelMunmap(base, size);
         }
     }
-    off_t start = 0;
-    size_t largest = 0;
-    const int32_t query = ps4QueryDirectMemory(0, sceKernelGetDirectMemorySize(), 2 * MB, &start, &largest);
-    if (query != 0 || largest < g_overflowGpuReserve + size) {
-        heapLog("[cemu] heap: no memory for a %zu MiB overflow heap (regular flexible %zu MiB free, largest "
-                "free direct block %zu MiB, %zu MiB of it kept for the GPU)\n",
-                size / MB, flexible / MB, largest / MB, g_overflowGpuReserve / MB);
-        return false;
-    }
-    return addDirectOverflow(size);
+    heapLog("[cemu] heap: no memory for a %zu MiB overflow heap (regular flexible %zu MiB free, largest "
+            "free direct block %zu MiB, %zu MiB of it kept for the GPU)\n",
+            size / MB, flexible / MB, largest / MB, g_overflowGpuReserve / MB);
+    return false;
 }
 
 // `alloc` on each overflow heap in turn; when they are all full, one more is added (by default

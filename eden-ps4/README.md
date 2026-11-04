@@ -379,6 +379,13 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.33: **the heap grows into direct memory first.** `port/ps4_runtime.cpp`'s `addOverflowStep`
+took its overflow heaps from regular flexible memory while 64 MiB more than the request was free,
+and from direct memory only after: Bluey's first seconds took 150 + 120 MiB of the about 364 MiB
+there, which thread stacks, the page tables' pages (04.31) and the system's libraries take from.
+Now direct memory first (with the GPU's reserve kept, as before), flexible memory only when that
+fails.
+
 04.32: **"thread constructor failed" (Animal Crossing at 330 s, opening a video device).** Every
 thread asking for no stack size (`std::thread`: nearly all of Eden's, the services', the shader
 compilers') got the PS4's default of 16 MiB, and the next one's stack couldn't be had

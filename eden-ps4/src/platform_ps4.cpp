@@ -1306,6 +1306,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.33: Eden's heap grows into the PS4's large pool of memory (direct, 4.6 GiB free) before its "
+         "small one (flexible, about 364 MiB): it took 270 MiB of the small one in a game's first seconds, "
+         "which thread stacks and the page tables need. The small pool now stays mostly free.\n"
          "04.32: Animal Crossing (and others) could abort with \"thread constructor failed\": every thread "
          "got a 16 MiB stack by default, and the memory they come from ran out. Threads that ask for no "
          "size now get 4 MiB (Eden runs with 1 MiB on Windows), and one that can't start retries with "
