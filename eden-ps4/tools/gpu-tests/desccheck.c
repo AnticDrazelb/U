@@ -114,6 +114,7 @@ static void ctx_reg(uint32_t* ib, unsigned* n, unsigned reg, uint32_t v) {
     ib[(*n)++] = reg;
     ib[(*n)++] = v;
 }
+static struct ps4_hole g_hole; // (04.50) a hole the mapping audit found, for run_rt
 static void run_rt(const char* name, uint64_t cb, unsigned slice_tile_max, unsigned mode, uint64_t z,
                    unsigned want_wild, unsigned want_over, bool want_skip) {
     uint32_t ib[64];
@@ -143,6 +144,10 @@ static void run_rt(const char* name, uint64_t cb, unsigned slice_tile_max, unsig
         ranges[c.num_ranges++] = (struct ps4_live_range){start, start + g_bos[h]->size, g_bos[h]->size, h};
     }
     qsort(ranges, c.num_ranges, sizeof(ranges[0]), ps4_live_range_cmp);
+    if (g_hole.end) {
+        c.holes[c.num_holes++] = g_hole;
+        c.holes_trusted = true;
+    }
     printf("-- %s\n", name);
     ps4_check_ib(&c, ib, n, 9, 0, true);
     const bool skipped = ((ib[draw] >> 8) & 0xff) == 0x10;
@@ -189,6 +194,12 @@ int main(void) {
     run_rt("a wild color target with the CB disabled", 0x10300000ull, 15, 0, 0, 0, 0, false);
     run_rt("a color target outside the GPU windows (a VideoOut buffer)", 0x123400000ull, 15, 1, 0, 0, 0, false);
     run_rt("a depth target in no buffer", 0x10200100ull, 15, 1, 0x10900000ull, 2, 0, true);
+    // (04.50) a page of the image buffer that the kernel doesn't map as the buffer's
+    g_hole = (struct ps4_hole){0x1021c000ull, 0x10220000ull, 3};
+    run_rt("a color target on a hole in its buffer", 0x1021c100ull, 15, 1, 0, 1, 0, true);
+    run_rt("a color target in the same buffer, off the hole", 0x10200100ull, 15, 1, 0, 0, 0, false);
+    run_rt("a color target running into the hole", 0x1021b000ull, 15, 1, 0, 1, 0, true);
+    g_hole = (struct ps4_hole){0, 0, 0};
     // random data: never skipped, rarely described
     uint64_t rng = 88172645463325252ull;
     unsigned skips = 0, described = 0;

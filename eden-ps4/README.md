@@ -379,6 +379,13 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.50: **the mapping audit.** 04.49 serialized level 3's first batch, and the CP stopped exactly after
+the first copy draw into 0x43fdcfc100 (bo 26 at +0x1bc100), the destination in all three recorded runs
+while the source moved: that memory, not the copy. After a loading screen, every live buffer's pages
+are now checked against the kernel (`sceKernelVirtualQuery`: mapped, direct memory, the bo's physical
+pages, GPU-writable); a draw whose target or descriptor touches a wrong page is logged and skipped, and
+an unmap that runs over another live buffer is logged.
+
 04.49: **GPU work around a loading screen serialized.** 04.48's Toad run stopped at the same copy chain
 as 04.46's (461 vs 464 trace points into level 3's first batch), with its destination and source well
 inside live buffers and register state identical to a copy that finished. Now from 0.25 s with nothing

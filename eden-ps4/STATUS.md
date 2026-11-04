@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.49)
+# Eden for PS4: status (after 04.50)
 
-Install **04.49** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.50** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -61,6 +61,27 @@ programs, 0 failures.
 - **04.47:** 04.46's slowdown and crash fixed (both the diagnostics'); "idle" is a 1 s gap (below).
 - **04.48:** render targets checked; descriptors and the buffer list in the record (below).
 - **04.49:** GPU work around a loading screen serialized (below).
+- **04.50:** the mapping audit (below).
+
+## 04.50: the mapping audit
+
+- **04.49's run (Toad level 3, serialized):** the batch (8040) recorded with a wait after every
+  draw and dispatch; the CP passed trace id 201916 and never reached 201917: the one draw between
+  them never finished. It is the first draw of the same chain: the 32x32 copy into **0x43fdcfc100**
+  (bo 26, a 2 MiB garlic buffer, at +0x1bc100). Its source this time: bo 19 at +0xc2e700 (+0xece800
+  in 04.48): the source moves from run to run, the destination is the same in all three. So: that
+  memory, not the copy. By the driver layer's books (the live buffer list, no overlaps) it is fine.
+- **04.50:** after a loading screen (the first 8 noted submissions of a period) every live
+  buffer's pages are audited with `sceKernelVirtualQuery`: mapped, direct memory, the bo's own
+  physical pages (`vq.offset`), GPU-writable (GPU-readable for a read-only bo) when the self-test
+  shows the query reports GPU protection. Wrong pages become holes: a draw whose render target or a
+  descriptor touches one is skipped and logged ("on memory the kernel doesn't map as the bo's"); the
+  audit's summary goes in the boot trace. More than 8 bad buffers: not trusted, nothing skipped.
+  Every unmap that runs over another live buffer is logged too (the likeliest way to punch such a
+  hole). The record's buffer list has each bo's physical address.
+- **Next:** one Toad level 3 run. A hole in bo 26: the cause (then the unmap lines say who made it);
+  level 3 may load without that texture. No hole: the page is mapped as it should be, and the GPU
+  still can't write it (next: its physical memory and GPU protection in detail).
 
 ## 04.49: GPU work around a loading screen serialized
 

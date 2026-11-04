@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.50: with 04.49's one-at-a-time GPU work, Captain Toad's level 3 still went down, and now the log "
+         "is exact: the GPU never finished its very first write to one spot of memory (the same address in all "
+         "three runs, whatever it copied there). By the driver's books that memory is fine. Now the PS4's own "
+         "view of every GPU buffer is checked after a loading screen: a page that isn't really there (or is "
+         "other memory) is logged, and the work touching it left out. That may get level 3 to load.\n"
          "04.49: 04.48's run stopped at the same texture copy in level 3 as 04.46's, and everything it uses checked "
          "fine. Now, from a quarter of a second without GPU work (a loading screen) until 60 batches later, "
          "each draw and compute job waits for the one before to finish. If level 3 still goes down, the log "

@@ -1572,7 +1572,41 @@ struct ps4_check {
     * render targets' check */
    uint32_t ctx[0x400];
    uint32_t ctx_seen[0x400 / 32];
+   /* (04.50) pages inside live buffers that the kernel doesn't map as the driver layer did
+    * (ps4_audit_mappings), when the audit is trusted */
+   struct ps4_hole { uint64_t start, end; uint32_t handle; } holes[64];
+   unsigned num_holes;
+   bool holes_trusted;
 };
+
+/* The hole that [va, va + bytes) touches, or NULL. */
+static const struct ps4_hole *
+ps4_hole_at(const struct ps4_check *c, uint64_t va, uint64_t bytes)
+{
+   if (!c->holes_trusted)
+      return NULL;
+   for (unsigned i = 0; i < c->num_holes; i++)
+      if (va < c->holes[i].end && va + MAX2(bytes, 1) > c->holes[i].start)
+         return &c->holes[i];
+   return NULL;
+}
+
+static bool
+ps4_check_hole_report(struct ps4_check *c, uint64_t seq, const void *packet, const char *work, const char *what,
+                      uint64_t va, const struct ps4_hole *h)
+{
+   static unsigned session;
+   if (session < 24) {
+      session++;
+      char line[300];
+      snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s: %s %#llx is in bo %u but on memory the kernel "
+               "doesn't map as the bo's ([%#llx, %#llx): see the mapping audit)", (unsigned long long)seq, packet,
+               work, what, (unsigned long long)va, h->handle, (unsigned long long)h->start,
+               (unsigned long long)h->end);
+      ps4_boot_trace(line);
+   }
+   return true;
+}
 
 static const struct ps4_live_range *
 ps4_live_at(const struct ps4_check *c, uint64_t va)
@@ -1643,7 +1677,7 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
    const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
    if (n < 4 || !ps4_mapped(d, n * 4ull))
       return false;
-   unsigned valid = 0, bad_wild = 0, bad_over = 0;
+   unsigned valid = 0, bad_wild = 0, bad_over = 0, holes_hit = 0;
    uint64_t first_va = 0, first_bytes = 0;
    const struct ps4_live_range *first_r = NULL;
    const char *first_what = NULL;
@@ -1658,7 +1692,11 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
          if (!base || !ps4_in_gpu_windows(c->dev, base))
             continue;
          const struct ps4_live_range *r = ps4_live_at(c, base);
-         if (!r) {
+         const struct ps4_hole *h = r ? ps4_hole_at(c, base, MIN2(bytes, r->end - base)) : NULL;
+         if (h) {
+            holes_hit++;
+            ps4_check_hole_report(c, seq, packet, work, "buffer descriptor at", base, h);
+         } else if (!r) {
             if (!bad_wild++ && !bad_over)
                first_va = base, first_bytes = bytes, first_r = NULL, first_what = "buffer descriptor at";
          } else if (base + bytes > r->end + (64u << 10) && bytes < (1ull << 32)) {
@@ -1670,13 +1708,21 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
       } else if ((d3 >> 28) >= 9 && (d3 >> 28) <= 15 && j + 8 <= n) { /* T#: an image (2D and up) */
          const uint64_t base = (d[j] | ((uint64_t)(d1 & 0xff) << 32)) << 8;
          if (base && ps4_in_gpu_windows(c->dev, base)) {
-            if (ps4_live_at(c, base))
+            const struct ps4_hole *h = ps4_hole_at(c, base, 1);
+            if (h) {
+               holes_hit++;
+               ps4_check_hole_report(c, seq, packet, work, "image descriptor at", base, h);
+            } else if (ps4_live_at(c, base))
                valid++;
             else if (!bad_wild++ && !bad_over)
                first_va = base, first_bytes = 0, first_r = NULL, first_what = "image descriptor at";
          }
          j += 4; /* (T#s are 8 dwords) */
       }
+   }
+   if (holes_hit) { /* (04.50) a descriptor on a live buffer's unmapped page: skip, whatever the rest */
+      c->wild += holes_hit;
+      return true;
    }
    if (!valid || !(bad_wild + bad_over))
       return false;
@@ -1698,6 +1744,11 @@ ps4_check_range(struct ps4_check *c, uint64_t seq, const void *packet, const cha
    if (!r) {
       c->wild++;
       return ps4_check_report(c, seq, packet, "draw (render target)", what, va, 0, NULL);
+   }
+   const struct ps4_hole *h = ps4_hole_at(c, va, bytes);
+   if (h) {
+      c->wild++;
+      return ps4_check_hole_report(c, seq, packet, "draw (render target)", what, va, h);
    }
    if (bytes && va + bytes > r->end + (64u << 10)) {
       c->overruns++;
@@ -1943,6 +1994,88 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
 
 /* ---- descriptor check: end ---- */
 
+/* (04.50) The mapping audit: each live buffer's pages as the kernel maps them (sceKernelVirtualQuery):
+ * direct memory, the bo's own physical pages, GPU-writable (readable for a read-only one). Toad's
+ * level 3 stops the GPU on its first write to 0x43fdcfc100 in all three recorded runs (another
+ * source each time), well inside bo 26 by the driver layer's books. A page that isn't (unmapped, a
+ * bare reservation, other memory) becomes a hole: work touching it is skipped and logged. More than
+ * 8 bad buffers: the audit itself is wrong, nothing skipped. */
+static bool ps4_vq_ok, ps4_vq_gpu_prot;
+static unsigned ps4_audits_left = 8; /* the first 8 noted submissions of an idle period (dev->lock) */
+static void
+ps4_audit_mappings(struct ps4_check *c)
+{
+   if (!ps4_vq_ok || !ps4_audits_left)
+      return;
+   ps4_audits_left--;
+   static unsigned logged;
+   unsigned bad_bos = 0;
+   for (unsigned i = 0; i < c->num_ranges; i++) {
+      const struct ps4_live_range *r = &c->ranges[i];
+      const struct amdgpu_bo *b = c->dev->bos[r->handle];
+      if (!b || !b->cpu || b->user_mem || b->phys < 0)
+         continue;
+      const uint64_t cpu = (uintptr_t)b->cpu;
+      const char *first_why = NULL;
+      uint64_t first_at = 0, first_got = 0, bad_bytes = 0;
+      int first_prot = 0;
+      unsigned steps = 0;
+      for (uint64_t at = r->start; at < r->end && steps < 8192; steps++) {
+         struct ps4_vq_info vq;
+         memset(&vq, 0, sizeof(vq));
+         const int q = sceKernelVirtualQuery((void *)(uintptr_t)at, 0, &vq, sizeof(vq));
+         const char *why = NULL;
+         uint64_t next = at + PS4_PAGE, got = 0;
+         if (q) {
+            why = "not mapped";
+         } else if (!vq.is_direct) {
+            why = vq.is_flexible ? "flexible memory, not the bo's" : "not mapped (a bare reservation)";
+         } else {
+            got = (uint64_t)vq.offset + (at - (uintptr_t)vq.start);
+            if (got != (uint64_t)b->phys + (at - cpu))
+               why = "backed by other direct memory";
+            else if (ps4_vq_gpu_prot && !(vq.protection & (b->gpu_ro ? 0x10 : 0x20)))
+               why = b->gpu_ro ? "not GPU-readable" : "not GPU-writable";
+            else if ((uintptr_t)vq.end > at)
+               next = MAX2(next, (uintptr_t)vq.end);
+         }
+         if (why) {
+            bad_bytes += PS4_PAGE;
+            if (!first_why)
+               first_why = why, first_at = at, first_got = got, first_prot = vq.protection;
+            struct ps4_hole *last = c->num_holes ? &c->holes[c->num_holes - 1] : NULL;
+            if (last && last->handle == r->handle && last->end == at)
+               last->end = at + PS4_PAGE;
+            else if (c->num_holes < ARRAY_SIZE(c->holes))
+               c->holes[c->num_holes++] = (struct ps4_hole){at, at + PS4_PAGE, r->handle};
+         }
+         at = next;
+      }
+      if (!first_why)
+         continue;
+      bad_bos++;
+      if (logged < 16) {
+         logged++;
+         char line[360];
+         snprintf(line, sizeof(line), "radv/ps4: mapping audit: bo %u (%#llx, %#llx bytes, %s%s): %#llx bytes wrong from "
+                  "%#llx: %s (prot %#x, direct memory %#llx, the bo's %#llx)", b->handle, (unsigned long long)cpu,
+                  (unsigned long long)b->size, b->write_combined ? "garlic" : "onion", b->gpu_ro ? ", GPU read-only" : "",
+                  (unsigned long long)bad_bytes, (unsigned long long)first_at, first_why, first_prot,
+                  (unsigned long long)first_got, (unsigned long long)(b->phys + (first_at - cpu)));
+         ps4_boot_trace(line);
+      }
+   }
+   c->holes_trusted = bad_bos && bad_bos <= 8;
+   static unsigned summaries;
+   if (summaries < 8) {
+      summaries++;
+      char line[200];
+      snprintf(line, sizeof(line), "radv/ps4: mapping audit of %u buffers: %u wrong%s", c->num_ranges, bad_bos,
+               bad_bos > 8 ? " (too many to be real: the audit isn't trusted, nothing skipped for it)" : "");
+      ps4_boot_trace(line);
+   }
+}
+
 /* Writes the census into `out` (for the submission's note). */
 static void
 ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
@@ -1978,6 +2111,7 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
                                                          b->size, b->handle};
    }
    qsort(c.ranges, c.num_ranges, sizeof(*c.ranges), ps4_live_range_cmp);
+   ps4_audit_mappings(&c);
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_check_ib(&c, dcb[i], sizes[i] / 4, seq, 0, skip);
    size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; config regs %u, register "
@@ -2314,10 +2448,11 @@ ps4_pf_buffers(ac_drm_device *dev, int fd)
          bytes += n;
          n = 0;
       }
-      n += (size_t)snprintf(buf + n, sizeof(buf) - n, "b %u %010llx %llx %s%s%s\n", b->handle,
+      n += (size_t)snprintf(buf + n, sizeof(buf) - n, "b %u %010llx %llx %s%s%s%s phys %llx\n", b->handle,
                             (unsigned long long)(uintptr_t)b->cpu, (unsigned long long)b->size,
                             b->write_combined ? "garlic" : "onion", b->tail_mapped ? " tail" : "",
-                            b->user_mem ? " user" : b->cpu_owned ? " cpu" : "");
+                            b->user_mem ? " user" : b->cpu_owned ? " cpu" : "", b->gpu_ro ? " ro" : "",
+                            (unsigned long long)b->phys);
    }
    (void)!write(fd, buf, n);
    return bytes + n;
@@ -2489,6 +2624,7 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
                "submissions follow", gap / 1e9);
       ps4_boot_trace(line);
       ps4_pf_begin(dev, gap / 1e9);
+      ps4_audits_left = 8;
    }
    if (ps4_after_idle_left <= 0) {
       ps4_last_submit_ns = now;
@@ -3210,7 +3346,6 @@ ps4_reserve(uint64_t addr, uint64_t size)
  * MAP_FIXED would silently replace someone else's memory, and their writes would land in ours.)
  * Logs the first few, returns true if found. */
 static unsigned ps4_foreign_logged;
-static bool ps4_vq_ok;
 static bool
 ps4_check_va_free(uint64_t addr, uint64_t size, const char *what)
 {
@@ -3315,9 +3450,11 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
       const int r = sceKernelVirtualQuery(page + 64, 0, &vq, sizeof(vq));
       ps4_vq_ok = r == 0 && vq.start == page && vq.end == page + PS4_PAGE * 4 && vq.is_direct &&
                   vq.offset == page_phys;
-      ps4_log("radv/ps4: virtual query check %s (%#x: [%p, %p) offset %#llx direct %u, expected "
+      /* (04.50) does it report the GPU's protection too? (the mapping audit checks it if so) */
+      ps4_vq_gpu_prot = ps4_vq_ok && (vq.protection & 0x30) == 0x30;
+      ps4_log("radv/ps4: virtual query check %s (%#x: [%p, %p) offset %#llx direct %u prot %#x, expected "
               "[%p, +%#llx) offset %#llx)\n", ps4_vq_ok ? "ok" : "FAILED - mapping checks off", r,
-              vq.start, vq.end, (unsigned long long)vq.offset, vq.is_direct, page,
+              vq.start, vq.end, (unsigned long long)vq.offset, vq.is_direct, vq.protection, page,
               (unsigned long long)(PS4_PAGE * 4), (unsigned long long)page_phys);
    }
    memset(page, 0, PS4_PAGE * 4);
@@ -3865,6 +4002,23 @@ ps4_do_unmap(ac_drm_device *dev, struct amdgpu_bo *b, uint32_t bo_handle, uint64
       if (b && addr == b->last_va)
          ps4_note_released(b->handle, addr, b->size, dev->last_seq);
       ps4_record(dev, 'U', b, addr, size);
+      /* (04.50) an unmap over another live buffer would leave it a hole the GPU then hangs on */
+      for (unsigned h = 1; h < dev->num_bos; h++) {
+         const struct amdgpu_bo *o = dev->bos[h];
+         if (!o || o == b || !o->cpu || o->user_mem)
+            continue;
+         const uint64_t os = (uintptr_t)o->cpu, oe = os + o->size + (o->tail_mapped ? PS4_TAIL : 0);
+         if (addr < oe && addr + size > os) {
+            static unsigned logged;
+            if (logged++ < 16) {
+               char line[260];
+               snprintf(line, sizeof(line), "radv/ps4: unmap of bo %u at [%#llx, +%#llx) runs over live bo %u "
+                        "[%#llx, %#llx): its pages there are gone", bo_handle, (unsigned long long)addr,
+                        (unsigned long long)size, o->handle, (unsigned long long)os, (unsigned long long)oe);
+               ps4_boot_trace(line);
+            }
+         }
+      }
       /* Unmap explicitly, then put the reservation back so the window stays ours. (Reserving
        * over a live mapping isn't guaranteed to replace it; a mapping left behind would vanish
        * when its direct memory is released, leaving a hole the kernel hands to other mappings
