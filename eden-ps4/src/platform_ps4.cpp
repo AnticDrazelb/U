@@ -1066,6 +1066,9 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
                      settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted");
+        // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
+        std::fflush(f);
+        fsync(fileno(f));
         std::fclose(f);
     }
 }
@@ -1308,6 +1311,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.37: the boot trace is written through to the disk every second, and the settings when they "
+         "change: a crash of the whole PS4 (Captain Toad's level 3) lost the last run's last minute and the "
+         "settings changed before it.\n"
          "04.36: a second test switch, Settings, Graphics, Compiled GPU Macros: off, the GPU's small programs "
          "are interpreted instead of compiled. Captain Toad's level 3 took the PS4 down right after new ones were "
          "compiled, three runs out of three, with the CPU switch off too.\n"

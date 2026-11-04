@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <atomic>
 
 #include <cxxabi.h>
 #include <exception>
@@ -398,6 +399,13 @@ extern "C" void ps4_boot_trace(const char* stage) {
     if (written >= static_cast<int>(sizeof(line)))
         line[sizeof(line) - 2] = '\n';
     writeAll(fd, line);
+    // (04.37) on the disk at most a second after it was written: a crash of the whole PS4 (Captain
+    // Toad's level 3) loses what is only in its cache, and the last run's last minute was gone
+    static std::atomic<int64_t> s_synced{0};
+    const int64_t tenths = static_cast<int64_t>(seconds * 10.0);
+    int64_t last = s_synced.load(std::memory_order_relaxed);
+    if (tenths - last >= 10 && s_synced.compare_exchange_strong(last, tenths, std::memory_order_relaxed))
+        fsync(fd);
 }
 
 // Every open() and close() of the app's own code (Cemu, Mesa, libc++, and the C library's fopen,

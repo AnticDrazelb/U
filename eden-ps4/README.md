@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.37: **logs that survive a crash of the whole PS4.** `ps4_boot_trace` (`port/ps4_crashlog.cpp`)
+fsyncs its file at most once a second, and the menu's settings are fsynced when saved: Captain
+Toad's level 3 with Compiled GPU Macros off (04.36) took the PS4 down again, and the export after
+it had the run before's files (04.35's, Draw Shortcuts off): the last run's trace and the
+settings change were only in the PS4's cache. With macros off too, the macro compiler is out
+(as are the translator's extras and the draw shortcuts): the GPU's work for that level, or the
+PS4's GPU driver, is what's left.
+
 04.36: **a menu switch for the GPU macro compiler.** Settings, Graphics, Compiled GPU Macros
 (`macros=interpreted` in menu.txt when off): off sets `disable_macro_jit` (the MME interpreter).
 Captain Toad's level 3 took the whole PS4 down (blue screen, then black and checkerboard frames
