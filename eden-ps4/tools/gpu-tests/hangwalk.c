@@ -357,6 +357,7 @@ static void test_rings(void) {
     emit(&a, pkt3(0x69, 2));  // VGT_SHADER_STAGES_EN: ES, GS, VS
     emit(&a, 0x2d5);
     emit(&a, 0x2 << 3 | 1 << 5 | 1 << 6);
+    emit(&a, 0xffff1000);     // (04.45) PKT3_NOP_PAD: a header-only NOP, the walk goes on
     emit(&a, pkt3(0x2d, 2));  // DRAW_INDEX_AUTO
     emit(&a, 3);
     emit(&a, 2);

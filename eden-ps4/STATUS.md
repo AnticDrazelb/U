@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.44)
+# Eden for PS4: status (after 04.45)
 
-Install **04.44** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.45** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -57,7 +57,23 @@ programs, 0 failures.
   tessellation buffer and the largest factor ring (`patches/mesa-ps4-rings.patch`), GS ring sizes
   through `sceGnmSetGsRingSizes(8 MiB, 8 MiB)`; those draws drawn again, still counted.
 
-## Where we are: the open problem
+## 04.45: the GPU hang found (to be confirmed on the console)
+
+- **Cause:** RADV writes multi indirect draws as opcode 0x38 (indexed) / 0x2C in the desktop layout
+  (with draw index register and count address). On the PS4's CP firmware 0x38/0x2C are a *short* form
+  (Sony's `sceGnmDrawIndexIndirectMulti`: offset, base vertex reg, start instance reg, count, stride,
+  initiator); the desktop layout is 0x9D/0x9C there (`sceGnmDraw(Index)IndirectCountMulti`, base mode
+  too; from shadPS4). The CP read `0x80000052` draws with a 1-byte stride: ~2 billion draws through
+  whatever memory follows the arguments.
+- **Evidence:** Zelda on 04.43 hung; the trace id in memory (2627226) and the next (2627227, not
+  reached) have only prefetches, `SET_BASE` and one `DRAW_INDEX_INDIRECT_MULTI` between them; 04.38's
+  Zelda hang had one too. The PS4 survived that run (04.39's exit on a hang works).
+- **Fix:** `patches/mesa-ps4-indirect-draws.patch` (0x9D/0x9C on the PS4). Also: the driver layer's
+  walkers stopped at `PKT3_NOP_PAD` (0xffff1000), so 04.42-04.44's counts and checks saw only parts of
+  submissions; fixed.
+- **Next:** Zelda past the point where it hung, and Captain Toad's level 3.
+
+## Where we are: the open problem (before 04.45)
 
 **The GPU hangs at heavy loading points and takes the whole PS4 down** (CE-36329-3, black or
 checkerboard screen, sometimes a hard reset).

@@ -1,0 +1,27 @@
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index cea0298..b0a5680 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -10537,7 +10537,22 @@ radv_cs_emit_indirect_draw_packet(struct radv_cmd_buffer *cmd_buffer, bool index
+       radeon_emit(start_instance_reg);
+       radeon_emit(di_src_sel);
+    } else {
++#ifdef __PS4__
++      /* The PS4's command processor firmware knows DRAW_INDEX_INDIRECT_MULTI (0x38) and
++       * DRAW_INDIRECT_MULTI (0x2C) only in their short form, without the draw index and the count
++       * address: data offset, base vertex and start instance registers, count, stride, draw
++       * initiator (Sony's sceGnmDrawIndexIndirectMulti and sceGnmDrawIndirectMulti, as shadPS4
++       * reads them). This layout is its DRAW_INDEX_INDIRECT_COUNT_MULTI (0x9D) and
++       * DRAW_INDIRECT_COUNT_MULTI (0x9C) (sceGnmDraw(Index)IndirectCountMulti, base mode too). Sent
++       * as 0x38, the CP read 0x80000052 (the draw index register and its enable) as the draw count
++       * and the count as the stride: about two billion draws, a byte apart, through whatever memory
++       * follows the arguments. Zelda: Echoes of Wisdom hung the GPU on it (Eden 04.43's trace ids:
++       * the CP stopped between the two trace points around one); Captain Toad's level 3 took the
++       * whole PS4 down. */
++      radeon_emit(PKT3(indexed ? 0x9D : 0x9C, 8, predicating));
++#else
+       radeon_emit(PKT3(indexed ? PKT3_DRAW_INDEX_INDIRECT_MULTI : PKT3_DRAW_INDIRECT_MULTI, 8, predicating));
++#endif
+       radeon_emit(0);
+       radeon_emit(vertex_offset_reg);
+       radeon_emit(start_instance_reg);

@@ -1317,6 +1317,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.45: the GPU hang found. Zelda: Echoes of Wisdom's last hang (04.43) stopped the GPU on an indirect "
+         "draw. The PS4's GPU reads that command in a shorter form than PC AMD GPUs: it took a register number for "
+         "the number of draws, about two billion of them, and walked through memory one byte at a time for their "
+         "parameters. Mesa now sends the form Sony's own driver uses for it. Likely Captain Toad's level 3 too.\n"
          "04.44: 04.43's log ruled out geometry shaders and tessellation (Captain Toad uses neither). The next "
          "suspect, from a 2020 report of the same game hanging an AMD GPU for good in yuzu: shaders given bad "
          "buffer addresses. After each loading screen the first frames' draws are checked, and one whose "

@@ -48,15 +48,17 @@ made executable (`git config core.fileMode false` keeps that out of git):
    (`git apply --exclude=src/amd/common/ac_ps4_drm.c`; `build-mesa.sh` copies
    `port/mesa/ac_ps4_drm.c` in): `mesa-ps4`, `mesa-ps4-aligned-vertex-fetch`,
    `mesa-ps4-vertex-fetch-switch`, `mesa-ps4-flush-all-draws`, `mesa-ps4-gs-ring-probe`,
-   `mesa-ps4-cs-grow-oom`, `mesa-ps4-trace-ids`, `mesa-ps4-rings`. The first five are needed:
-   Crema's settings reference `ac_ps4_flush_all_draws`, `ac_ps4_gs_ring_min` and
-   `ac_ps4_unaligned_vertex_fetch`. The sixth makes a command buffer that runs out of GPU memory
+   `mesa-ps4-cs-grow-oom`, `mesa-ps4-trace-ids`, `mesa-ps4-rings`, `mesa-ps4-indirect-draws`. The
+   first five are needed: Crema's settings reference `ac_ps4_flush_all_draws`, `ac_ps4_gs_ring_min`
+   and `ac_ps4_unaligned_vertex_fetch`. The sixth makes a command buffer that runs out of GPU memory
    fail with `VK_ERROR_OUT_OF_DEVICE_MEMORY` instead of writing past its IB (an upstream error
    path). The seventh gives every RADV trace id its own number and adds `RADV_PS4_TRACE=ids` (the
    trace ids without the flight recorder), which the GPU hang report uses to tell where the GPU
    stopped. The eighth sizes the tessellation buffers for the PS4 system's settings (16 MiB
-   off-chip, the largest factor ring). libdrm `libdrm-2.4.125` (headers only) in
-   `~/cemups4-build/src/libdrm`. Then `scripts/build-mesa.sh setup`.
+   off-chip, the largest factor ring). The ninth sends multi indirect draws as the PS4's opcodes
+   (0x9D/0x9C: its 0x38/0x2C are a shorter form); without it an indirect draw can hang the GPU.
+   libdrm `libdrm-2.4.125` (headers only) in `~/cemups4-build/src/libdrm`. Then
+   `scripts/build-mesa.sh setup`.
 4. Cemu at `patches/BASE.txt`'s commit + `patches/cemu-ps4.patch`, with the ZArchive, imgui and
    Vulkan-Headers submodules, in `~/cemups4-build/src/Cemu`. Then
    `scripts/configure-cemu.sh -DCMAKE_HAVE_LIBC_PTHREAD=1` (a fresh configure's `find_package(Threads)`

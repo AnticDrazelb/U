@@ -379,6 +379,26 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.45: **the GPU hang: RADV's multi indirect draws in the PS4's opcodes.** A Zelda: Echoes of Wisdom run
+on 04.43 hung the GPU again, and this time the PS4 survived: the stall note at 0.3 s, the hang report
+at 2 s, `abort()` at 4 s, and the app closed with its crash page (no system crash). Its report has the
+answer. RADV's trace id in memory was 2627226; in the full decode, the packets between it and 2627227
+(not reached) are two `DMA_DATA` prefetches, `SET_BASE` (the indirect arguments, 0x43dfde4410),
+**`DRAW_INDEX_INDIRECT_MULTI`** (count 1, draw index enabled) and another prefetch: no wait, so the CP
+itself stopped on one of them. 04.38's Zelda hang had exactly one such draw too. shadPS4's reading of
+Sony's libSceGnmDriver: on the PS4 opcode 0x38 is the *short* form (`sceGnmDrawIndexIndirectMulti`:
+data offset, base vertex and start instance registers, count, stride, initiator; 0x2C the same for
+`sceGnmDrawIndirectMulti`), and the layout RADV writes for 0x38 (with the draw index register and the
+count address) is opcode **0x9D** there (`sceGnmDrawIndexIndirectCountMulti`, also in base mode; 0x9C
+non-indexed). Read as 0x38's short form, RADV's packet says `0x80000052` draws (its draw index register
+and enable bit) with a stride of 1 (its count): about two billion draws, a byte apart, through whatever
+memory follows the arguments. `../patches/mesa-ps4-indirect-draws.patch` emits 0x9D/0x9C on the PS4
+(the same body). Captain Toad's level 3 most likely too: its notes counted no indirect draws, but
+04.42-04.44's walkers stopped at `0xffff1000`, Mesa's `PKT3_NOP_PAD` (a header-only NOP), taking its
+count field (0x3fff) for a body: every walker in `port/mesa/ac_ps4_drm.c` now steps over it, so the
+notes, the GS/tessellation count and the descriptor check see whole submissions (`hangwalk.sh` case G
+has one now).
+
 04.44: **bad descriptors checked after a loading screen.** 04.43's run: `sceGnmSetGsRingSizes` returned
 0, and 2288 noted submissions had no GS or tessellation draw and no ring register write: Captain Toad
 uses neither, and 04.42's test would have changed nothing. Level 3 went down exactly as in 04.41 (the

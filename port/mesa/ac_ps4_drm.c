@@ -445,7 +445,7 @@ ps4_walk_ib(ac_drm_device *dev, FILE *f, const uint32_t *ib, unsigned num_dw, in
    for (unsigned i = 0; i < num_dw && ps4_walk_lines < 4000;) {
       const uint32_t h = ib[i];
       const unsigned type = h >> 30;
-      if (type == 2) {
+      if (type == 2 || h == 0xffff1000u) { /* (PKT3_NOP_PAD: a header-only NOP) */
          i++;
          continue;
       }
@@ -626,7 +626,7 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -744,14 +744,19 @@ ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
             break;
          case 0x24: /* DRAW_INDIRECT */
          case 0x25: /* DRAW_INDEX_INDIRECT */
-         case 0x2c: /* DRAW_INDIRECT_MULTI */
-         case 0x38: /* DRAW_INDEX_INDIRECT_MULTI */
+         case 0x2c: /* DRAW_INDIRECT_MULTI (on the PS4 the short form: no draw index, no count address) */
+         case 0x38: /* DRAW_INDEX_INDIRECT_MULTI (the same) */
+         case 0x9c: /* DRAW_INDIRECT_COUNT_MULTI: the PS4's for desktop 0x2C's layout */
+         case 0x9d: /* DRAW_INDEX_INDIRECT_COUNT_MULTI: for desktop 0x38's */
             if ((p = ps4_walk_add(w, va, op, depth))) {
                ps4_walk_draw_shaders(w, p);
-               const bool indexed = op == 0x25 || op == 0x38;
+               const bool indexed = op == 0x25 || op == 0x38 || op == 0x9d;
                ps4_walk_args(w, p, w->base[1] + b[0], indexed ? 5 : 4);
                p->v[5] = 1; /* draws */
-               if ((op == 0x2c || op == 0x38) && body >= 8) {
+               if ((op == 0x2c || op == 0x38) && body == 6) { /* the PS4's short form */
+                  p->v[5] = b[3];
+                  p->v[7] = b[4];
+               } else if ((op == 0x2c || op == 0x38 || op == 0x9c || op == 0x9d) && body >= 8) {
                   p->v[5] = b[4];
                   p->v[7] = b[7]; /* stride */
                   if ((b[3] & (1u << 30)) && !w->light) { /* COUNT_INDIRECT_ENABLE: the count from memory */
@@ -913,6 +918,7 @@ ps4_pkt_is_work(const struct ps4_pkt *p)
 {
    switch (p->op) {
    case 0x15: case 0x16: case 0x24: case 0x25: case 0x27: case 0x2c: case 0x2d: case 0x35: case 0x38:
+   case 0x9c: case 0x9d:
       return true;
    default:
       return false;
@@ -980,12 +986,14 @@ ps4_pkt_text(struct ps4_line *l, const struct ps4_pkt *p, uint64_t trace_va)
    case 0x24:
    case 0x25:
    case 0x2c:
-   case 0x38: {
+   case 0x38:
+   case 0x9c:
+   case 0x9d: {
       static const char *const names[] = {"DRAW_INDIRECT", "DRAW_INDEX_INDIRECT"};
-      const bool indexed = p->op == 0x25 || p->op == 0x38;
-      const bool multi = p->op == 0x2c || p->op == 0x38;
-      ps4_line_add(l, "%s%s (arguments at %#llx", names[indexed], multi ? "_MULTI" : "",
-                   (unsigned long long)p->addr);
+      const bool indexed = p->op == 0x25 || p->op == 0x38 || p->op == 0x9d;
+      const bool multi = p->op != 0x24 && p->op != 0x25;
+      ps4_line_add(l, "%s%s (arguments at %#llx", names[indexed],
+                   p->op >= 0x9c ? "_COUNT_MULTI" : multi ? "_MULTI" : "", (unsigned long long)p->addr);
       if (multi)
          ps4_line_add(l, ", %u draws, stride %u", v[5], v[7]);
       ps4_line_add(l, ")");
@@ -1713,7 +1721,7 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -1736,7 +1744,7 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
                      gfx_ud[st][reg - stage_reg[st]] = b[k];
             }
             break;
-         case 0x27: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: /* draws */
+         case 0x27: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x9c: case 0x9d:
             for (unsigned st = 0; st < 6 && !bad; st++)
                bad = ps4_check_user_data(c, seq, &ib[i], stage_name[st], gfx_ud[st]);
             break;
@@ -1911,8 +1919,9 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
    for (unsigned i = 0; i < w.count; i++) {
       const struct ps4_pkt *p = &w.pkts[i];
       draws += p->op == 0x27 || p->op == 0x2d || p->op == 0x35 || p->op == 0x24 || p->op == 0x25 ||
-               p->op == 0x2c || p->op == 0x38;
-      indirect += p->op == 0x24 || p->op == 0x25 || p->op == 0x2c || p->op == 0x38 || p->op == 0x16;
+               p->op == 0x2c || p->op == 0x38 || p->op == 0x9c || p->op == 0x9d;
+      indirect += p->op == 0x24 || p->op == 0x25 || p->op == 0x2c || p->op == 0x38 || p->op == 0x9c ||
+                  p->op == 0x9d || p->op == 0x16;
       dispatches += p->op == 0x15 || p->op == 0x16;
       waits += p->op == 0x3c;
       if (p->op == 0x37 && ps4_trace_va && p->addr == ps4_trace_va) {
@@ -2352,7 +2361,7 @@ ps4_record_ib(int fd, const uint32_t *ib, unsigned num_dw, uint64_t seq, unsigne
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -2406,7 +2415,7 @@ ps4_collect_user_data(uint32_t *ib, unsigned num_dw, uint32_t *values, unsigned 
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -3589,7 +3598,7 @@ ps4_scan_ib(ac_drm_device *dev, FILE *f, const uint32_t *ib, unsigned num_dw, ui
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw && ps4_scan_hits < 300;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -3825,7 +3834,7 @@ ps4_scan_dispatches(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t 
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -3854,6 +3863,8 @@ ps4_scan_dispatches(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t 
          case 0x25: /* DRAW_INDEX_INDIRECT */
          case 0x2c: /* DRAW_INDIRECT_MULTI */
          case 0x38: /* DRAW_INDEX_INDIRECT_MULTI */
+         case 0x9c: /* DRAW_INDIRECT_COUNT_MULTI */
+         case 0x9d: /* DRAW_INDEX_INDIRECT_COUNT_MULTI */
             for (unsigned s = 0; s < 6; s++) {
                unsigned where = 0;
                uint64_t addr = 0;
@@ -3933,7 +3944,7 @@ ps4_scan_writes(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t seq,
       unsigned next_dw = 0;
       for (unsigned i = 0; i < num_dw;) {
          const uint32_t h = ib[i];
-         if (h >> 30 == 2) {
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* (and PKT3_NOP_PAD: a header-only NOP) */
             i++;
             continue;
          }
@@ -4449,7 +4460,7 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
    }
    cs = ps4_emit_eop(cs, (uintptr_t)dev->fence, seq, dev->eop_queue != NULL);
    while ((cs - fence_ib) % 8)
-      *cs++ = 0xFFFF1000; /* type-2 NOP padding */
+      *cs++ = 0xFFFF1000; /* PKT3_NOP_PAD: a header-only NOP */
    dcb[num_ibs] = fence_ib;
    dcb_sizes[num_ibs] = (cs - fence_ib) * 4;
 
