@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.47: fixes 04.46's slowdown and its crash, both from the GPU diagnostics: they were meant to run "
+         "only after a loading screen, but took a game that ran a little slowly for one again and again (every "
+         "second or so), and each time checked and wrote out the next 40 batches of GPU work. That made Captain "
+         "Toad crawl, and Zelda's 04.45 slowdown was likely the same. Now only a full second with no GPU work "
+         "counts. The check also read memory that wasn't there: the crash.\n"
          "04.46: Zelda made it through with 04.45; Captain Toad's level 3 didn't. Its log shows the PS4 going "
          "down within a quarter of a second of level 3's first big batch of GPU work (uploads: 458 draws, 138 "
          "compute jobs), too fast for the stall and hang reports. Now each big batch after a loading screen is "

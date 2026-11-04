@@ -1631,9 +1631,14 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
    struct amdgpu_bo *b = c->dev->bos[set->handle];
    if (!b || !b->cpu || ptr % 4)
       return false;
-   const uint64_t avail = (uint64_t)(uintptr_t)b->cpu + b->size - ptr;
+   /* (04.47) The range's end (past b->size when the tail is mapped: b->size alone wrapped), and the
+    * memory checked before it is read: 04.46 read 0x44fdfac00c this way in Captain Toad, unmapped
+    * though a live range held it, and crashed (SIGSEGV in here). */
+   const uint64_t avail = set->end - ptr;
    const unsigned n = (unsigned)MIN2(avail / 4, 256);
    const uint32_t *d = (const uint32_t *)(uintptr_t)ptr;
+   if (n < 4 || !ps4_mapped(d, n * 4ull))
+      return false;
    unsigned valid = 0, bad_wild = 0, bad_over = 0;
    uint64_t first_va = 0, first_bytes = 0;
    const struct ps4_live_range *first_r = NULL;
@@ -2075,6 +2080,7 @@ ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes,
 /* ---- pre-flight record: end ---- */
 
 static int ps4_pf_fd = -1;            /* gpu/preflight.txt of the current idle period (under dev->lock) */
+static unsigned ps4_pf_count;         /* submissions in it (at most 16 a period) */
 static uint64_t ps4_pf_bytes;         /* written to it */
 static uint64_t ps4_pf_shaders[1024]; /* the shaders in it */
 static uint8_t ps4_pf_stages[1024];
@@ -2100,6 +2106,7 @@ ps4_pf_begin(double idle_s)
    rename(old, ps4_gpu_file("preflight-previous.txt"));
    ps4_pf_fd = open(old, O_WRONLY | O_CREAT | O_TRUNC, 0666);
    ps4_pf_bytes = 0;
+   ps4_pf_count = 0;
    ps4_pf_num_shaders = 0;
    if (ps4_pf_fd >= 0) {
       char line[400];
@@ -2120,8 +2127,9 @@ static void
 ps4_preflight(uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs, uint32_t first_trace,
               uint32_t last_trace)
 {
-   if (ps4_pf_fd < 0 || ps4_pf_bytes >= PS4_PF_LIMIT)
+   if (ps4_pf_fd < 0 || ps4_pf_bytes >= PS4_PF_LIMIT || ps4_pf_count >= 16)
       return;
+   ps4_pf_count++;
    const int64_t t0 = os_time_get_nano();
    unsigned ibs = 0, new_shaders = 0;
    const uint64_t bytes = ps4_pf_submission(ps4_pf_fd, seq, dcb, sizes, num_ibs, first_trace, last_trace,
@@ -2228,26 +2236,38 @@ ps4_watch_thread(void *arg)
 /* (04.41) The first submissions after the GPU was idle a while (a game's loading screen), and their
  * completions, in the boot trace (synced within 50 ms by the app): Captain Toad's level 3 takes the
  * PS4 down within a quarter second of its loading, with the GPU idle and caught up just before;
- * this says whether the GPU got level 3's first work and how far it got. */
-static int64_t ps4_idle_since;       /* (the stall thread) when the GPU was first seen idle; 0: busy */
+ * this says whether the GPU got level 3's first work and how far it got.
+ * (04.47) "Idle" is now a gap of 1 s (RADV_PS4_NOTE_GAP_MS) with nothing submitted. Before, it was
+ * the stall thread finding the GPU done at its 50 ms looks for 0.5 s, which a game running at all
+ * slowly (the GPU idle between frames) met every second or so: Zelda's 04.45 run noted 8762
+ * submissions in 220 periods, and 04.46's record (MiBs written and synced for each) slowed Captain
+ * Toad to 11 fps, which met it more often still. */
+static int64_t ps4_last_submit_ns;   /* when the last submission was noted or passed by (under dev->lock) */
 static int ps4_after_idle_left;      /* submissions still to note (under dev->lock) */
 static uint64_t ps4_after_idle_last; /* the last one noted: completions are noted up to it */
 
 static void
 ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs)
 {
-   const int64_t idle = __atomic_load_n(&ps4_idle_since, __ATOMIC_RELAXED);
+   static int64_t min_gap = -1;
+   if (min_gap < 0) {
+      const char *e = getenv("RADV_PS4_NOTE_GAP_MS");
+      min_gap = (e && atoi(e) > 0 ? atoi(e) : 1000) * 1000000ll;
+   }
    const int64_t now = os_time_get_nano();
-   if (!ps4_after_idle_left && idle && now - idle >= 500000000ll && ps4_completed(dev) + 1 >= seq) {
+   const int64_t gap = ps4_last_submit_ns ? now - ps4_last_submit_ns : 0;
+   if (!ps4_after_idle_left && gap >= min_gap && ps4_completed(dev) + 1 >= seq) {
       ps4_after_idle_left = 40;
       char line[160];
-      snprintf(line, sizeof(line), "radv/ps4: the GPU was idle %.1f s: its next 40 submissions follow",
-               (now - idle) / 1e9);
+      snprintf(line, sizeof(line), "radv/ps4: the GPU was idle %.1f s (nothing submitted): its next 40 "
+               "submissions follow", gap / 1e9);
       ps4_boot_trace(line);
-      ps4_pf_begin((now - idle) / 1e9);
+      ps4_pf_begin(gap / 1e9);
    }
-   if (ps4_after_idle_left <= 0)
+   if (ps4_after_idle_left <= 0) {
+      ps4_last_submit_ns = now;
       return;
+   }
    ps4_after_idle_left--;
    __atomic_store_n(&ps4_after_idle_last, seq, __ATOMIC_RELEASE);
    static struct ps4_pkt pkts[16384]; /* (04.46: 4096 cut Toad's level 3 upload short) */
@@ -2288,6 +2308,7 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
    if (draws + dispatches >= 8)
       ps4_preflight(seq, dcb, sizes, num_ibs, first_trace, last_trace);
    __atomic_store_n(&ps4_watch_until, os_time_get_nano() + 3000000000ll, __ATOMIC_RELAXED);
+   ps4_last_submit_ns = os_time_get_nano(); /* (the note's own time is no gap) */
 }
 
 void ac_ps4_gpu_progress(uint64_t *submitted, uint64_t *completed, uint32_t *trace_id, int64_t *stalled_ms);
@@ -2317,12 +2338,6 @@ ps4_stall_thread(void *arg)
       sceKernelUsleep(50000);
       const uint64_t done = ps4_completed(dev);
       const int64_t now = os_time_get_nano();
-      if (done >= dev->last_seq) {
-         if (!__atomic_load_n(&ps4_idle_since, __ATOMIC_RELAXED))
-            __atomic_store_n(&ps4_idle_since, now, __ATOMIC_RELAXED);
-      } else {
-         __atomic_store_n(&ps4_idle_since, 0, __ATOMIC_RELAXED);
-      }
       if (done != last && last < __atomic_load_n(&ps4_after_idle_last, __ATOMIC_ACQUIRE)) {
          char line[120];
          snprintf(line, sizeof(line), "radv/ps4: GPU completed %llu (submitted %llu)", (unsigned long long)done,

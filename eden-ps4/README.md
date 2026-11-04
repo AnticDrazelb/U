@@ -379,6 +379,16 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.47: **04.46's slowdown and crash, both the diagnostics'.** The 40 noted submissions after "the GPU
+was idle 0.5 s" were meant for loading screens, but "idle" was the stall thread finding the GPU done at
+each of its 50 ms looks: a game that idles the GPU between frames met it every second or so (Zelda's
+04.45 run: 220 times, 8762 submissions walked and checked), and 04.46's record (MiBs written and synced
+each time) slowed Captain Toad to 11 fps, so it met it still more often. Now it's a 1 s gap with nothing
+submitted (`RADV_PS4_NOTE_GAP_MS`), and the record takes the first 16 big submissions of a period. The
+crash (SIGSEGV in `ps4_check_set`, reading 0x44fdfac00c): the descriptor check read a set without
+checking it was mapped, bounded by the buffer's size (a pointer into its tail wrapped that); now by the
+live range's end, after `ps4_mapped`.
+
 04.46: **the pre-flight record.** On 04.45 Zelda: Echoes of Wisdom ran past its hang; Captain Toad's
 level 3 still took the PS4 down, 0.1-0.25 s after its first big submission after the loading screen
 (7941: 458 draws, 138 dispatches, 17 `COPY_DATA` register loads) reached the GPU: before the stall

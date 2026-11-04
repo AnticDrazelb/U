@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.46)
+# Eden for PS4: status (after 04.47)
 
-Install **04.46** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.47** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -58,6 +58,24 @@ programs, 0 failures.
   through `sceGnmSetGsRingSizes(8 MiB, 8 MiB)`; those draws drawn again, still counted.
 - **04.45:** multi indirect draws in the PS4's opcodes: Zelda's GPU hang fixed (below).
 - **04.46:** the pre-flight record and the 2 ms GPU progress record (below).
+- **04.47:** 04.46's slowdown and crash fixed (both the diagnostics'); "idle" is a 1 s gap (below).
+
+## 04.47: the diagnostics' slowdown and crash
+
+- **04.46's run (Captain Toad level 1):** 11-38 fps (04.45: ~52), then Eden's crash page: SIGSEGV
+  at elf 0x3bf477 = `ps4_check_set` (the 04.44 descriptor check) reading 0x44fdfac00c.
+- **The slowdown:** the "GPU idle 0.5 s" that starts 40 noted submissions was the stall thread
+  seeing the GPU done at each of its 50 ms looks for 0.5 s. A game whose GPU idles between frames
+  met that every second or so: Zelda's 04.45 run had 220 such periods (8762 noted submissions, each
+  walked and checked; most likely its 10-12 fps too), Toad's 04.45 run 32 in 60 s. 04.46 added the
+  pre-flight record (MiBs written and synced per period), which slowed Toad further and so met it
+  more often. Now: a 1 s gap with nothing submitted and the GPU caught up (`RADV_PS4_NOTE_GAP_MS`),
+  the note's own time not counted; the record takes the first 16 big ones of a period.
+- **The crash:** `ps4_check_set` read up to 1 KiB from a descriptor set pointer without checking it
+  was mapped, and bounded it by `b->size` (a pointer into a mapped tail wrapped that). Now bounded by
+  the live range's end and checked with `ps4_mapped` first.
+- **Next:** the same Toad run (levels 1, 2, then 3) at 04.45's speed; level 3's record then names
+  the command the GPU was on.
 
 ## 04.46: the pre-flight record (Captain Toad level 3)
 
