@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.52: **not the memory: level 3's first scene draw.** 04.51's probe wrote the address fine, and with
+the copies into its page skipped, level 3 stopped a step or so later anyway. In all six recorded runs
+the stop comes 1-10 steps after offset 455 of the batch: the first draw of level 3's scene shaders, the
+first into four color targets at once (with Z32F + HTILE, an occlusion query, five interpolants). That
+one draw is now left out (`RADV_PS4_SKIP_DRAWS=455-456`, first big submission after an idle GPU only).
+
 04.51: **a probe write and a skip test.** 04.50's audit found all 2789 buffers mapped as they should be
 (own physical pages, GPU-writable, no physical overlaps), and level 3 stopped at the same copy into
 0x43fdcfc100 again. Now the CP writes that address itself (`WRITE_DATA` with write confirm, then trace

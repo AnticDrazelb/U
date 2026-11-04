@@ -200,6 +200,37 @@ int main(void) {
     run_rt("a color target in the same buffer, off the hole", 0x10200100ull, 15, 1, 0, 0, 0, false);
     run_rt("a color target running into the hole", 0x1021b000ull, 15, 1, 0, 1, 0, true);
     g_hole = (struct ps4_hole){0, 0, 0};
+    // (04.52) the test skip by place: three draws, each after a trace id 100, 101, 102; skip 1-2
+    {
+        uint32_t ib[64];
+        unsigned n = 0, draws[3];
+        for (unsigned k = 0; k < 3; k++) {
+            ib[n++] = 0xc0000000u | (3u << 16) | (0x37u << 8);  // WRITE_DATA: the trace id
+            ib[n++] = 5u << 8;
+            ib[n++] = 0x10000000u;
+            ib[n++] = 0;
+            ib[n++] = 100 + k;
+            draws[k] = n;
+            ib[n++] = 0xc0000000u | (1u << 16) | (0x2du << 8);  // DRAW_INDEX_AUTO
+            ib[n++] = 3;
+            ib[n++] = 2;
+        }
+        struct ps4_check c;
+        memset(&c, 0, sizeof(c));
+        c.dev = &g_dev;
+        c.trace_va = 0x10000000u;
+        c.first_trace = 100;
+        c.skip_from = 1;
+        c.skip_to = 2;
+        printf("-- skip by place: the draw after trace id 101 only\n");
+        ps4_check_ib(&c, ib, n, 10, 0, true);
+        const bool ok = ((ib[draws[0]] >> 8) & 0xff) == 0x2d && ((ib[draws[1]] >> 8) & 0xff) == 0x10 &&
+                        ((ib[draws[2]] >> 8) & 0xff) == 0x2d && c.skipped == 1;
+        if (!ok) {
+            printf("FAIL skip by place: %x %x %x, skipped %u\n", ib[draws[0]], ib[draws[1]], ib[draws[2]], c.skipped);
+            g_failures++;
+        }
+    }
     // random data: never skipped, rarely described
     uint64_t rng = 88172645463325252ull;
     unsigned skips = 0, described = 0;

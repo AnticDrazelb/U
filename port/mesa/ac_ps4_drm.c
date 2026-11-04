@@ -1578,6 +1578,11 @@ struct ps4_check {
    struct ps4_hole { uint64_t start, end; uint32_t handle; } holes[64];
    unsigned num_holes;
    bool holes_trusted;
+   /* (04.52) the test skip by place: draws and dispatches after trace id first_trace + skip_from,
+    * before first_trace + skip_to (the trace id the CP writes before each), become NOPs */
+   uint64_t trace_va;
+   uint32_t first_trace, cur_trace;
+   unsigned skip_from, skip_to, skipped_by_place;
 };
 
 /* The hole that [va, va + bytes) touches, or NULL. */
@@ -1866,6 +1871,28 @@ ps4_check_note_uconfig(struct ps4_check *c, unsigned reg)
       c->uconfig[c->num_uconfig++] = (uint16_t)reg;
 }
 
+/* (04.52) A draw or dispatch in the test skip's place range? (logged; true: skip it) */
+static bool
+ps4_check_skip_place(struct ps4_check *c, uint64_t seq, const void *packet, const char *work)
+{
+   if (c->skip_to <= c->skip_from || !c->first_trace || c->cur_trace < c->first_trace)
+      return false;
+   const uint32_t at = c->cur_trace - c->first_trace;
+   if (at < c->skip_from || at >= c->skip_to)
+      return false;
+   static unsigned logged;
+   if (logged < 16) {
+      logged++;
+      char line[220];
+      snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s after trace id %u (%u into it) left out: the test "
+               "RADV_PS4_SKIP_DRAWS=%u-%u", (unsigned long long)seq, packet, work, c->cur_trace, at, c->skip_from,
+               c->skip_to);
+      ps4_boot_trace(line);
+   }
+   c->skipped_by_place++;
+   return true;
+}
+
 static void
 ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, int depth, bool skip)
 {
@@ -1904,6 +1931,10 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
             }
             break;
          case 0x27: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x9c: case 0x9d:
+            if (ps4_check_skip_place(c, seq, &ib[i], "draw")) {
+               bad = true;
+               break;
+            }
             bad = ps4_check_targets(c, seq, &ib[i]);
             for (unsigned st = 0; st < 6 && !bad; st++)
                bad = ps4_check_user_data(c, seq, &ib[i], stage_name[st], gfx_ud[st]);
@@ -1918,6 +1949,10 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
             }
             break;
          case 0x15: case 0x16: /* dispatches */
+            if (ps4_check_skip_place(c, seq, &ib[i], "dispatch")) {
+               bad = true;
+               break;
+            }
             bad = ps4_check_user_data(c, seq, &ib[i], "dispatch", compute_ud);
             break;
          case 0x68: /* SET_CONFIG_REG */
@@ -1928,6 +1963,8 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
                ps4_check_note_uconfig(c, (b[0] & 0xffff) + k - 1);
             break;
          case 0x37: /* WRITE_DATA */
+            if (c->trace_va && body >= 4 && (b[1] | ((uint64_t)b[2] << 32)) == c->trace_va)
+               c->cur_trace = b[3];
             if (body >= 1 && ((b[0] >> 8) & 0xf) == 0)
                c->reg_writes++;
             if (body >= 1 && ((b[0] >> 8) & 0xf) == 6)
@@ -2087,7 +2124,7 @@ ps4_audit_mappings(struct ps4_check *c)
 /* Writes the census into `out` (for the submission's note). */
 static void
 ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
-                     char *out, size_t out_size)
+                     char *out, size_t out_size, uint32_t first_trace, bool first_big)
 {
    static int skip = -1;
    if (skip < 0) {
@@ -2120,6 +2157,26 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    }
    qsort(c.ranges, c.num_ranges, sizeof(*c.ranges), ps4_live_range_cmp);
    ps4_audit_mappings(&c);
+   /* (04.52) the test skip by place, in the first big submission after an idle GPU only
+    * (RADV_PS4_SKIP_DRAWS=from-to, trace ids into it; default 455-456: Toad level 3's first
+    * 4-target scene draw; 0 = off) */
+   static int skip_from = -1, skip_to;
+   if (skip_from < 0) {
+      const char *e = getenv("RADV_PS4_SKIP_DRAWS");
+      if (!e)
+         e = "455-456";
+      char *end = NULL;
+      skip_from = (int)strtoul(e, &end, 0);
+      skip_to = end && *end == '-' ? (int)strtoul(end + 1, NULL, 0) : 0;
+      if (skip_to <= skip_from)
+         skip_from = skip_to = 0;
+   }
+   if (first_big && skip_to) {
+      c.trace_va = ps4_trace_va;
+      c.first_trace = first_trace;
+      c.skip_from = (unsigned)skip_from;
+      c.skip_to = (unsigned)skip_to;
+   }
    /* (04.51) a test: work writing or reading [va, va + bytes) is skipped (RADV_PS4_SKIP_TARGET=va:bytes;
     * default the 16 KiB page of Toad level 3's stuck copy, 0x43fdcfc100; 0 = off) */
    static uint64_t skip_lo = 1, skip_hi;
@@ -2127,7 +2184,7 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
       const char *e = getenv("RADV_PS4_SKIP_TARGET");
       skip_lo = 0;
       if (!e)
-         e = "0x43fdcfc000:0x4000";
+         e = "0"; /* (04.52: off by default; 04.51's runs settled it) */
       char *end = NULL;
       const uint64_t va = strtoull(e, &end, 0);
       const uint64_t bytes = end && *end == ':' ? strtoull(end + 1, NULL, 0) : 0x4000;
@@ -2694,7 +2751,11 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
    }
    char check[600];
    check[0] = 0;
-   ps4_check_submission(dev, seq, dcb, sizes, num_ibs, check, sizeof(check));
+   static unsigned skip_period;
+   const bool first_big = draws + dispatches >= 8 && skip_period != ps4_pf_period;
+   if (first_big)
+      skip_period = ps4_pf_period;
+   ps4_check_submission(dev, seq, dcb, sizes, num_ibs, check, sizeof(check), first_trace, first_big);
    char line[1000];
    snprintf(line, sizeof(line), "radv/ps4: submit %llu: %u IBs, %u dwords, %u draws, %u dispatches (%u of them "
             "indirect), %u WAIT_REG_MEM, trace ids %u-%u; geometry shader / tessellation: %u draws, %u ring "
@@ -2706,7 +2767,7 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
    static uint64_t probe_va = 1;
    if (probe_va == 1) {
       const char *e = getenv("RADV_PS4_PROBE");
-      probe_va = strtoull(e ? e : "0x43fdcfc100", NULL, 0) & ~3ull;
+      probe_va = strtoull(e ? e : "0", NULL, 0) & ~3ull; /* (04.52: off by default) */
    }
    static unsigned probed_period;
    if (probe_va && draws + dispatches >= 8 && probed_period != ps4_pf_period) { /* the period's first big one */

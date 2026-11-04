@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.52: 04.51's two tests: the GPU can write that address itself, and with the copies into it left out, "
+         "level 3 still stopped a step or so later. So it isn't that memory. Every run stops within ten steps "
+         "after the same draw: level 3's first scene draw into four images at once (with depth), the first of "
+         "its kind in that batch. This build leaves out just that one draw: if the stop moves on to the next draw "
+         "of its kind, that kind of draw is the cause.\n"
          "04.51: 04.50's check found every page of every GPU buffer mapped exactly as it should be, and level 3 "
          "still stopped at that one address. Two tests at once now: just before level 3's first batch the GPU "
          "writes a single value there by itself (if the PS4 dies right there, the GPU can't write that memory at "

@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.51)
+# Eden for PS4: status (after 04.52)
 
-Install **04.51** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.52** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -63,6 +63,31 @@ programs, 0 failures.
 - **04.49:** GPU work around a loading screen serialized (below).
 - **04.50:** the mapping audit (below).
 - **04.51:** the probe write and the skip test at Toad's address (below).
+- **04.52:** the test skip of level 3's first 4-target scene draw (below).
+
+## 04.52: not the memory; the stop follows level 3's first scene draw
+
+- **04.51's two runs** (the first took the whole PS4 down, checkerboard and black in turns, a hard
+  reset; the second's logs): the probe wrote 0x43fdcfc100 with a write confirm and the CP went on
+  (so the GPU can write it). With the page's work skipped, run 1 stopped at the flush after the
+  first skipped copy (no draw at all between the two trace ids: two `DMA_DATA` prefetches, the
+  CB/DB meta flushes, `PS_PARTIAL_FLUSH`, `SURFACE_SYNC`), run 2 went on through the skipped chain
+  and stopped at the next copy (0x43fdba3b00, bo 26 again). So not that memory.
+- **The stop's place, all six recorded runs:** 456-466 trace ids into the batch, serialized or
+  not (serialized runs are much slower, so it isn't time). In the batch, nothing writes into its
+  IBs, outside live buffers or past a buffer's end; CP DMA all inside buffers, none into read-only
+  ones; no scratch; occlusion queries (280 `ZPASS_DONE`, 8 RBs x 16 bytes a slot) normal; the
+  Z32F depth's HTILE initialized (fill 0xfffc000f) and used fine at 355-363.
+- **What's new at 455, the last thing before every stop:** the first draw of level 3's scene
+  shaders in the batch, the first into **4 color targets** (RGBA8, RGB10A2, RG16, R11G11B10, 640x384,
+  2D-tiled) at once, with Z32F + HTILE (compression off), 5 interpolants (`SPI_PS_IN_CONTROL` 5),
+  an occlusion query around it. It finishes (its wait passes); the GPU stops within 1-10 steps.
+  (04.51's skip also left out RADV copy-buffer dispatches whose raw pointers met data that looked
+  like a descriptor in the page: a flaw of that test, off now.)
+- **04.52:** that one draw left out (`RADV_PS4_SKIP_DRAWS=455-456`: draws and dispatches after
+  those trace ids, in the first big submission after an idle GPU only; 0 = off). The page skip and
+  the probe are off. If the stop moves on (the next such draw is at 575), that draw kind is it; if
+  not, it's something before it.
 
 ## 04.51: a probe write and a skip test at 0x43fdcfc100
 
