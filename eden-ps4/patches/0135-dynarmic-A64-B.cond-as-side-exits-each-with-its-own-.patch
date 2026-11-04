@@ -1,0 +1,272 @@
+From c444bb8bcdc16380b75c4abb1bfc37d8f5dfa9dc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 08:15:48 +0000
+Subject: [PATCH 135/136] dynarmic A64: B.cond as side exits, each with its own
+ flags liveness
+
+superblocks_cond: a forward B.cond whose target may be a side exit doesn't end the block:
+A64ExitIfCond (a jcc to a link of its own in the cold code), the code after it translated on into
+the block. Each exit gets its own flags look-ahead at its target (its live flags in the third
+argument), so the dead flags pass and the selects on host flags know what the taken path reads:
+with none, A64SelectOnHostFlagsPass turns the exit into A64ExitIfCondHost on the compare's own host
+flags, nothing saved. The look-ahead's ranges at the exit targets go into the block's ranges for
+invalidation and the persistent cache hash. game.c -7.4% instructions (24% fewer block entries).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 18 +++++++++++++++
+ .../dynarmic/backend/x64/a64_interface.cpp    |  3 +++
+ .../dynarmic/frontend/A64/a64_ir_emitter.h    |  4 ++++
+ .../frontend/A64/translate/a64_translate.cpp  | 12 ++++++++++
+ .../frontend/A64/translate/a64_translate.h    |  3 +++
+ .../A64/translate/impl/a64_branch.cpp         |  4 ++++
+ .../src/dynarmic/interface/A64/config.h       |  5 ++++
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |  5 +++-
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |  6 +++++
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 23 +++++++++++++++----
+ 10 files changed, 77 insertions(+), 6 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 36d6ca0bc0..6065070b27 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -592,6 +592,24 @@ void A64EmitX64::EmitSideExitLink(A64EmitContext& ctx, Xbyak::Label& taken, IR::
+     });
+ }
+ 
++// (PS4 04.29) A B.cond side exit: the stored flags (eax) or the host's as a CondFlags* right before
++// left them (ExitIfCondHost: always the latter)
++void A64EmitX64::EmitA64ExitIfCond(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const IR::Cond cond = args[0].GetImmediateCond();
++    const IR::LocationDescriptor target{args[1].GetImmediateU64()};
++    ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);  // (EmitCond's: moves only, the host's flags stay)
++    code.setDefaultJmpNEAR(true);
++    Xbyak::Label taken = EmitCond(cond);
++    code.setDefaultJmpNEAR(false);
++    EmitSideExitLink(ctx, taken, target);
++}
++
++void A64EmitX64::EmitA64ExitIfCondHost(A64EmitContext& ctx, IR::Inst* inst) {
++    ASSERT(host_cond_flags != HostCondFlags::None);
++    EmitA64ExitIfCond(ctx, inst);
++}
++
+ void A64EmitX64::EmitA64ExitIfZero32(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const bool when_zero = args[1].GetImmediateU1();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index b9c979f210..d101f3a318 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -278,6 +278,8 @@ private:
+         options.follow_direct_branches = conf.follow_direct_branches;
+         options.elide_load_store_only_barriers = conf.elide_load_store_only_barriers;
+         options.superblocks = conf.superblocks && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
++        // (the exits' flags need the look-ahead)
++        options.superblocks_cond = options.superblocks && conf.superblocks_cond && options.nzcv_lookahead;
+         A64::Translate(ir_block, arch_descriptor, get_code, options);
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         // (PS4 04.25) With fastmem, the accesses it was declined for (pages the PS4 can't map at
+@@ -367,6 +369,7 @@ private:
+         add(conf.plain_acquire_loads);
+         add(conf.elide_load_store_only_barriers);
+         add(conf.superblocks);
++        add(conf.superblocks_cond);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h b/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
+index c2848404a4..9606274bb1 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
+@@ -53,6 +53,10 @@ public:
+         Inst(value.GetType() == IR::Type::U32 ? Opcode::A64ExitIfZero32 : Opcode::A64ExitIfZero64, value, IR::Value{when_zero}, IR::Value{target.UniqueHash()});
+     }
+ 
++    void ExitIfCond(IR::Cond cond, const LocationDescriptor& target) noexcept {
++        Inst(Opcode::A64ExitIfCond, IR::Value{cond}, IR::Value{target.UniqueHash()}, IR::Value{true});
++    }
++
+     void ExitIfTestBit(const IR::U64& value, u8 bit, bool when_set, const LocationDescriptor& target) noexcept {
+         Inst(Opcode::A64ExitIfTestBit, value, IR::Value{bit}, IR::Value{when_set}, IR::Value{target.UniqueHash()});
+     }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+index 1a9eea5afb..3b76f0e991 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+@@ -12,6 +12,7 @@
+ #include "dynarmic/frontend/A64/decoder/a64.h"
+ #include "dynarmic/frontend/A64/translate/impl/impl.h"
+ #include "dynarmic/ir/basic_block.h"
++#include "dynarmic/ir/opcodes.h"
+ #include "dynarmic/ir/terminal.h"
+ 
+ #include <boost/container/static_vector.hpp>
+@@ -299,6 +300,17 @@ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFu
+ 
+     if (options.nzcv_lookahead && !single_step) {
+         LookAheadForFlags(block, memory_read_code, options.nzcv_lookahead_abi, last_pc);
++        // (PS4 04.29) each B.cond side exit: whether its target may read the flags (the code
++        // read is the block's too)
++        for (auto& inst : block.instructions) {
++            if (inst.GetOpcode() != IR::Opcode::A64ExitIfCond)
++                continue;
++            FlagsLookahead lookahead{memory_read_code, options.nzcv_lookahead_abi};
++            const LocationDescriptor target{IR::LocationDescriptor{inst.GetArg(1).GetU64()}};
++            const bool live = lookahead.Live(target.PC(), FlagsAll, 6);
++            inst.SetArg(2, IR::Value{live});
++            block.lookahead.insert(block.lookahead.end(), lookahead.runs.begin(), lookahead.runs.end());
++        }
+     }
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 721e7829d1..8297708628 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -61,6 +61,9 @@ struct TranslationOptions {
+     /// after it is translated on into the block (eight times a block at most, in its first 64
+     /// instructions)
+     bool superblocks = false;
++
++    /// With superblocks: a forward B.cond too, its target's need for the flags looked ahead
++    bool superblocks_cond = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index 019f2bc664..ffc8e45a86 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -14,6 +14,10 @@ bool TranslatorVisitor::B_cond(Imm<19> imm19, Cond cond) {
+     const s64 offset = concatenate(imm19, Imm<2>{0}).SignExtend<s64>();
+     const u64 target = ir.PC() + offset;
+ 
++    if (options.superblocks_cond && cond != Cond::AL && cond != Cond::NV && MaySideExit(target)) {
++        ir.ExitIfCond(cond, ir.current_location->SetPC(target));
++        return true;
++    }
+     const auto cond_pass = IR::Term::LinkBlock{ir.current_location->SetPC(target)};
+     const auto cond_fail = IR::Term::LinkBlock{ir.current_location->AdvancePC(4)};
+     ir.SetTerm(IR::Term::If{cond, cond_pass, cond_fail});
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 47779b2acc..e4904b9951 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -414,6 +414,11 @@ struct UserConfig {
+     /// and flags were set to before such an exit is stored before it.
+     bool superblocks = false;
+ 
++    /// (PS4 04.29) With superblocks and elide_dead_nzcv: a forward B.cond as a side exit too (a
++    /// bounds check); the flags stored before it only when its target may read them (the
++    /// look-ahead's), its condition on the compare's values right before it where it can be
++    bool superblocks_cond = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index 3e6a0de314..c8355336bb 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -212,6 +212,7 @@ constexpr bool ReadsFromCPSR(const Opcode op) noexcept {
+     case Opcode::A64ExitIfZero32:
+     case Opcode::A64ExitIfZero64:
+     case Opcode::A64ExitIfTestBit:
++    case Opcode::A64ExitIfCond:
+     case Opcode::ConditionalSelect32:
+     case Opcode::ConditionalSelect64:
+     case Opcode::ConditionalSelectNZCV:
+@@ -615,7 +616,9 @@ constexpr bool IsSetCheckBitOperation(const Opcode op) noexcept {
+ constexpr bool IsSideExit(const Opcode op) noexcept {
+     return op == Opcode::A64ExitIfZero32
+         || op == Opcode::A64ExitIfZero64
+-        || op == Opcode::A64ExitIfTestBit;
++        || op == Opcode::A64ExitIfTestBit
++        || op == Opcode::A64ExitIfCond
++        || op == Opcode::A64ExitIfCondHost;
+ }
+ 
+ /// @brief Determines whether or not this instruction sets the host's flags for the terminal.
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index e081ff89fc..c4706671cc 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -680,6 +680,12 @@ A64OPC(SetCheckBit,                                         Void,           U1
+ A64OPC(ExitIfZero32,                                        Void,           U32,            U1,             U64                             )
+ A64OPC(ExitIfZero64,                                        Void,           U64,            U1,             U64                             )
+ A64OPC(ExitIfTestBit,                                       Void,           U64,            U8,             U1,             U64             )
++// (PS4 04.29) A forward B.cond in the middle of a block: the condition true, the block is left for
++// the target. The U1: the flags may be read there (the look-ahead's); without that and with the
++// condition on the host's flags (a CondFlags* right before), A64ExitIfCondHost, which doesn't read
++// the stored flags (they may go)
++A64OPC(ExitIfCond,                                          Void,           Cond,           U64,            U1                              )
++A64OPC(ExitIfCondHost,                                      Void,           Cond,           U64                                             )
+ A64OPC(GetCFlag,                                            U1,                                                                             )
+ A64OPC(GetNZCVRaw,                                          U32,                                                                            )
+ A64OPC(SetNZCVRaw,                                          Void,           U32                                                             )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 0f240ee127..9bbd48e100 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -870,7 +870,10 @@ static void A64SelectOnHostFlagsPass(IR::Block& block) {
+             flags = it->GetArg(0).IsImmediate() ? nullptr : it->GetArg(0).GetInst();
+             continue;
+         }
+-        if (op != IR::Opcode::ConditionalSelect32 && op != IR::Opcode::ConditionalSelect64) {
++        // (PS4 04.29) a B.cond side exit's condition on the host's flags too (EmitCond takes a float
++        // compare's EQ and NE); one whose target doesn't read the flags no longer reads them at all
++        const bool exit = op == IR::Opcode::A64ExitIfCond;
++        if (op != IR::Opcode::ConditionalSelect32 && op != IR::Opcode::ConditionalSelect64 && !exit) {
+             if (WritesToCPSR(op) || CausesCPUException(op))
+                 flags = nullptr;
+             continue;
+@@ -878,13 +881,19 @@ static void A64SelectOnHostFlagsPass(IR::Block& block) {
+         if (!flags)
+             continue;
+         const IR::Cond cond = it->GetArg(0).GetCond();
+-        const auto choice = ChooseCondFlags(flags, cond, false);
++        const auto choice = ChooseCondFlags(flags, cond, exit);
+         if (!choice)
+             continue;
+         if (choice->args.size() == 2)
+             block.PrependNewInst(it, choice->op, {choice->args[0], choice->args[1]});
+         else
+             block.PrependNewInst(it, choice->op, {choice->args[0]});
++        if (exit) {
++            // (the target's need for the flags: the look-ahead's, set when it was translated)
++            if (it->GetArg(2).IsImmediate() && !it->GetArg(2).GetU1())
++                it->op = IR::Opcode::A64ExitIfCondHost;  // (the condition and the target as they were)
++            continue;
++        }
+         // (the same arguments: the condition, then, else)
+         it->op = op == IR::Opcode::ConditionalSelect32 ? IR::Opcode::ConditionalSelectHost32 : IR::Opcode::ConditionalSelectHost64;
+     }
+@@ -1131,15 +1140,19 @@ static void A64GetSetElimination(IR::Block& block) {
+         }
+         case IR::Opcode::A64ExitIfZero32:
+         case IR::Opcode::A64ExitIfZero64:
+-        case IR::Opcode::A64ExitIfTestBit: {
++        case IR::Opcode::A64ExitIfTestBit:
++        case IR::Opcode::A64ExitIfCond:
++        case IR::Opcode::A64ExitIfCondHost: {
+             // (PS4 04.28) the block may leave here: what was set before stays set (a later set of
+-            // the same register doesn't make it redundant), the values known stay known after
++            // the same register doesn't make it redundant), the values known stay known after;
++            // (04.29) the flags too but at an exit whose target doesn't read them (ExitIfCondHost)
+             for (auto& info : reg_info)
+                 info.set_instruction_present = false;
+             for (auto& info : vec_info)
+                 info.set_instruction_present = false;
+             sp_info.set_instruction_present = false;
+-            nzcv_info.set_instruction_present = false;
++            if (opcode != IR::Opcode::A64ExitIfCondHost)
++                nzcv_info.set_instruction_present = false;
+             break;
+         }
+         default: {
+-- 
+2.43.0
+

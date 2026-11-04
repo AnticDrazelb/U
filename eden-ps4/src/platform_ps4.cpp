@@ -1306,6 +1306,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.29: forward conditional branches (an if, a bounds check) no longer end a block of CPU code "
+         "either: taken, they leave from its middle, and the Switch's flags are saved there only when the "
+         "code they go to reads them. The 64-bit test game: 43% fewer instructions than in 04.22.\n"
          "04.28: a fix for 04.23-04.27: the CPU translator could, rarely, wrongly drop the saving of a "
          "result's flags before a branch (its look-ahead read the branch's target a few bytes off): a 64-bit "
          "game could then take a wrong turn. Install this one over them. Also aimed at Unity games "

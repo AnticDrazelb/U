@@ -1,0 +1,115 @@
+From ef825e16eced73887f119362060407a7ac81ea72 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 07:33:27 +0000
+Subject: [PATCH 134/136] dynarmic A64: no second widening of a value zero
+ above its width already
+
+A value in an XMM whose bits above 32 or 64 are zero by how it was made (a quad widened from a
+word or a long, a movd/movq load, GetS/GetD, lane 0 of one of those) is widened again by nothing
+(no insertps, no movq). unity.c -0.65%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 29 +++++++++++++++++++
+ .../src/dynarmic/backend/x64/emit_x64.h       | 11 +++++++
+ .../backend/x64/emit_x64_data_processing.cpp  | 14 ++++++---
+ 3 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 7065d22fd4..36d6ca0bc0 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -372,6 +372,7 @@ void A64EmitX64::FuseCondFlags(IR::Block& block) {
+ void A64EmitX64::PeepholeQuad(A64EmitContext& ctx, IR::Block& block) {
+     xmm_loads.clear();
+     signed_loads.clear();
++    zero_upper.clear();
+     for (auto& inst : block.instructions) {
+         // (movsxd reads the low 32 bits alone: no zero-extension of them first, SXTW, SMULL)
+         if (inst.GetOpcode() == IR::Opcode::SignExtendWordToLong && !inst.GetArg(0).IsImmediate()) {
+@@ -440,6 +441,34 @@ void A64EmitX64::PeepholeQuad(A64EmitContext& ctx, IR::Block& block) {
+         if (ShouldFastmem(ctx, load))
+             signed_loads.emplace_back(load, to_bits);
+     }
++    // (PS4 04.29) zero above 32 or 64 bits by construction, in IR order (an argument before its use)
++    for (auto& inst : block.instructions) {
++        unsigned bits = 0;
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::A64GetS: bits = 32; break;  // (movd)
++        case IR::Opcode::A64GetD: bits = 64; break;  // (movq)
++        case IR::Opcode::A64ReadMemory32: bits = IsXmmLoad(&inst) ? 32 : 0; break;
++        case IR::Opcode::A64ReadMemory64: bits = IsXmmLoad(&inst) ? 64 : 0; break;
++        case IR::Opcode::ZeroExtendLongToQuad:
++            bits = inst.GetArg(0).GetType() == IR::Type::U32 ? 32 : 64;
++            break;
++        case IR::Opcode::VectorGetElement32:
++        case IR::Opcode::VectorGetElement64: {
++            // lane 0 is the vector's register itself (EmitVectorGetElement32/64)
++            const unsigned width = inst.GetOpcode() == IR::Opcode::VectorGetElement32 ? 32 : 64;
++            if (!inst.GetArg(0).IsImmediate() && inst.GetArg(1).IsImmediate() && inst.GetArg(1).GetU8() == 0) {
++                const unsigned below = ZeroUpperBits(inst.GetArg(0).GetInst());
++                if (below != 0 && below <= width)
++                    bits = width;
++            }
++            break;
++        }
++        default:
++            break;
++        }
++        if (bits != 0)
++            zero_upper.emplace_back(&inst, bits);
++    }
+ }
+ 
+ void A64EmitX64::ClearCache() {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 8c6c04ea9f..dce1039673 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -135,6 +135,17 @@ public:
+     bool IsXmmLoad(const IR::Inst* inst) const {
+         return std::find(xmm_loads.begin(), xmm_loads.end(), inst) != xmm_loads.end();
+     }
++    // (PS4 04.29) Values in an XMM whose bits above 32 or 64 are zero by how they were made (a
++    // quad widened from a word or a long, movd/movq loads, GetS/GetD, lane 0 of one of those):
++    // widening one of them again is nothing (A64EmitX64::PeepholeQuad finds them)
++    boost::container::small_vector<std::pair<const IR::Inst*, unsigned>, 32> zero_upper;
++    unsigned ZeroUpperBits(const IR::Inst* inst) const {
++        for (const auto& [value, bits] : zero_upper) {
++            if (value == inst)
++                return bits;
++        }
++        return 0;
++    }
+     // (PS4 04.26) A load whose one use sign-extends it (LDRSB, LDRSH, LDRSW), with fastmem: loaded
+     // with movsx/movsxd to 32 or 64 bits, the extension then nothing
+     static constexpr size_t SignedLoadTag32 = 0x200, SignedLoadTag64 = 0x400;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index de4493a0b7..d719ad3c10 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -1639,10 +1639,16 @@ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitZeroExtendLongToQuad(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+-    if (!args[0].IsImmediate() && IsXmmLoad(inst->GetArg(0).GetInst())) {
+-        // (PS4 04.26) loaded into an XMM by movd/movq: the other lanes zero already
+-        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+-        return;
++    if (!args[0].IsImmediate()) {
++        // (PS4 04.26) loaded into an XMM by movd/movq: the other lanes zero already; (04.29) or
++        // zero above its width by how it was made (A64EmitX64::PeepholeQuad's zero_upper)
++        const IR::Inst* const arg = inst->GetArg(0).GetInst();
++        const unsigned width = args[0].GetType() == IR::Type::U32 ? 32 : 64;
++        const unsigned zero_above = ZeroUpperBits(arg);
++        if (IsXmmLoad(arg) || (zero_above != 0 && zero_above <= width)) {
++            ctx.reg_alloc.DefineValue(code, inst, args[0]);
++            return;
++        }
+     }
+     if (args[0].IsImmediate()) {
+         // (PS4 04.26) a constant (FMOV #imm, MOVI): one load of it, the other lanes zeroed by it
+-- 
+2.43.0
+

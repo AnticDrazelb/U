@@ -261,6 +261,7 @@ saving is on the main thread's path (core 0), not its size. Kept here until done
 | 64-bit float constants in two instructions; return stack of 8 with an and-mask on every call and return | | 04.27: one load; 256 entries, a byte pointer: -38.0% vs 04.22 |
 | Unity (IL2CPP) code cut into 2-3 instruction blocks by null checks; float stores through general registers | | 04.28: forward CBZ/TBZ as side exits, stores from XMMs (unity.c: -22% blocks entered, -3.0% instructions) |
 | 04.23-04.27: the flags look-ahead read B.cond/CBZ/TBZ targets 1-3 bytes off (rarely took live flags for dead) | | 04.28: fixed (found by the full sweep, gen8) |
+| Every B.cond ending a block (63% of game.c's block ends) | | 04.29: forward ones as side exits, flags stored only where the target reads them: -7.4%, -43.2% vs 04.22 |
 | Code caches too small outside Mario Kart (Silksong core 0: 8 whole flushes in 270 s, 250-550 ms/s translating; Zelda core 2: 5 in 6 min) | | 04.21: sized from the system pool's free memory in fixed tiers (up to 160/96/96/8 MiB), the app heap's share of the pool 384 -> 192 MiB |
 | Settings lists ran off the screen (Graphics) | | 04.21: scrolled with the selection, description kept on screen |
 | Zelda: aborted at 45-56 s (std::bad_alloc), two runs in a row | | 04.20: dynarmic's link table, 57 MB in one piece per core (232-byte flat map slots), now 48-byte slots; a new overflow heap serves its request before other threads see it |

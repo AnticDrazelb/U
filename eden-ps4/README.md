@@ -379,6 +379,29 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.29: **B.cond side exits, with the flags stored only where the exit's target reads them.**
+Per 20 steady frames of `game.c` for AArch64 with Eden's options: 2,047,039 instructions in
+04.28, 1,895,226 now (-7.4%; -43.2% from 04.22's 3,335,063); 40 frames after 40: -3.4%; blocks
+entered in 30 frames 170,163 -> 129,932. unity.c: flat.
+
+- Patch 0135: **a forward B.cond as a side exit too** (`superblocks_cond`, with `superblocks` and
+  the dead flags look-ahead): `A64ExitIfCond` (the condition, the target, and whether the target
+  may read the flags: after translating, the look-ahead reads each exit's target as it reads a
+  block's successors, and its code is the block's ranges too). Where the condition's flags came
+  from a compare in the block, the select pass puts a `CondFlags*` before it (`cmp; jcc`, floats
+  `ucomis` with EmitCond's mapping); where the target doesn't read the flags either, the exit
+  becomes `A64ExitIfCondHost`, which doesn't read the stored flags: get/set elimination doesn't
+  keep their store for it and the dead flags pass goes past it. 04.26's try kept every exit's flags
+  stored (and its look-ahead read targets off: patch 0133), and lost. A negative control (every
+  exit taken as not reading the flags) fails gen17 17 of 30. Patch 0136 turns it on for Eden's
+  64-bit cores.
+- Patch 0134: a value in an XMM zero above its width by how it was made (a quad widened from a
+  word or a long, a `movd`/`movq` load, GetS/GetD, lane 0 of one of those) isn't widened again
+  (no `insertps`, no `movq`): unity.c -0.65%.
+- Tests: gen11, gen13, gen17, gen12, gen14, gen16, gen15 250 each (no fastmem and a mapped arena),
+  gen8 500, gen6, gen5, the cache suites for gen8, gen11, gen13, gen17; 04.28's long sweep (2,000
+  more programs) the same.
+
 04.28: **a fix for 04.23-04.27's flags look-ahead; side exits for null checks; float stores from
 vector registers.**
 

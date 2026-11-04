@@ -1,0 +1,27 @@
+From 8038c019062809b0f68ea9bbf113e33aa5ca5fde Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 08:15:48 +0000
+Subject: [PATCH 136/136] PS4: the A64 cores' forward B.cond as side exits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index ebab676595..ad7cf8a749 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -309,6 +309,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // (04.28) a forward CBZ/CBNZ/TBZ/TBNZ (Unity's null checks) leaves the block from its middle
+     // when taken instead of ending it: the code after it in the same block
+     config.superblocks = true;
++    // (04.29) and a forward B.cond, the flags stored before it only when its target reads them
++    config.superblocks_cond = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

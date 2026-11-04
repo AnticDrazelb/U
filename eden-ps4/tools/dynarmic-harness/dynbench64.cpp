@@ -283,6 +283,10 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.very_verbose_debugging_output = std::getenv("DYN_IRDUMP") != nullptr;  // (each block's IR)
 #ifdef HAVE_SUPER  // (04.28) forward CBZ/CBNZ/TBZ/TBNZ as side exits (DYN_SUPER)
     config.superblocks = std::getenv("DYN_SUPER") != nullptr;
+    config.superblocks_cond = std::getenv("DYN_SUPERCOND") != nullptr;  // (04.29) B.cond too
+#endif
+#ifdef HAVE_BFS  // (04.30) SBFM/UBFM as shifts (DYN_BFS)
+    config.bitfield_shifts = std::getenv("DYN_BFS") != nullptr;
 #endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
