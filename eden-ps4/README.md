@@ -379,6 +379,23 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.43: **the GS and tessellation rings set up as the PS4's system uses them** (a fix to try; 04.42,
+which leaves those draws out, is the test to fall back on). From what other emulators found (STATUS.md):
+shadPS4's reading of Sony's libSceGnmDriver has `sceGnmSetGsRingSizes` taking 4-8 MiB and setting the
+GS ring size registers itself, and an 8 MiB off-chip tessellation buffer
+(`sceGnmGetOffChipTessellationBufferSize`); PS4 games write `VGT_TF_MEMORY_BASE` themselves, never
+`VGT_TF_RING_SIZE` or `VGT_HS_OFFCHIP_PARAM`. So:
+- `../patches/mesa-ps4-rings.patch`: on the PS4 RADV's tessellation buffer is sized for the system's
+  settings, not its own: 16 MiB off-chip (twice the system's 8; RADV's own on Liverpool: 2 SEs x 36
+  workgroups x 32 KiB = 2.25 MiB) and a factor ring of the most `VGT_TF_RING_SIZE` can say on gfx7
+  (0xffff dwords, 261888 bytes rounded; RADV's own 54 KiB). Before, with the system's buffering and
+  ring size in force, the HS could write up to ~5.7 MiB past the buffer. Only the buffer, its two
+  descriptors and the ring registers use these sizes (no shader does: the pipeline cache stays).
+- `ps4_load_gnm` (`port/mesa/ac_ps4_drm.c`) calls `sceGnmSetGsRingSizes(8 MiB, 8 MiB)`, so the VGT's
+  GS rings are the 8 MiB RADV programs (`ac_ps4_gs_ring_min`) and half what it allocates; the result
+  goes to the boot trace. `RADV_PS4_GS_RINGS=0` leaves the system's sizes.
+- `RADV_PS4_SKIP_GS_TESS` is no longer set: those draws are drawn, and still counted and described.
+
 04.42: **a test: no geometry shaders or tessellation.** 04.41's run (Captain Toad, level 3, the usual
 settings; the screen flickered between garbage and black, then a hard reset) left its last 50 ms:
 level 3 loaded (six 16-32 MiB GPU buffers, RAM chunks), its first GPU work was submitted at 69.458 s

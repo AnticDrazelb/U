@@ -1776,6 +1776,22 @@ ps4_load_gnm(ac_drm_device *dev)
       return false;
    }
    dev->gnm_module = module;
+   /* (Eden 04.43) The GS ring sizes as PS4 games set them: VGT_ESGS/GSVS_RING_SIZE are the
+    * system's (RADV's own writes don't take: Crema found the GS writing past RADV's ring), and
+    * Sony's sceGnmSetGsRingSizes takes 4-8 MiB (1 MiB aligned; shadPS4's reading of
+    * libSceGnmDriver). 8 MiB each, which is what RADV programs on the PS4 (ac_ps4_gs_ring_min) and
+    * half of what it allocates (PS4_RING_ALLOC): the VGT and RADV then agree on the rings.
+    * RADV_PS4_GS_RINGS=0: the system's sizes as they are. */
+   const char *gs = getenv("RADV_PS4_GS_RINGS");
+   int (*set_gs_ring_sizes)(uint32_t, uint32_t) = NULL;
+   if (!(gs && !strcmp(gs, "0")) &&
+       !sceKernelDlsym(module, "sceGnmSetGsRingSizes", (void **)&set_gs_ring_sizes) && set_gs_ring_sizes) {
+      const int r = set_gs_ring_sizes(8u << 20, 8u << 20);
+      char line[120];
+      snprintf(line, sizeof(line), "radv/ps4: sceGnmSetGsRingSizes(8 MiB, 8 MiB) = %#x", r);
+      ps4_log("%s\n", line);
+      ps4_boot_trace(line);
+   }
    return true;
 }
 

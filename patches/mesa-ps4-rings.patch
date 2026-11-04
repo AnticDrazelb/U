@@ -1,0 +1,22 @@
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index b5d7487..0177633 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -1634,6 +1634,17 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
+    info->tess_offchip_ring_size = num_workgroups * max_hs_out_vram_dwords_per_wg * 4;
+    info->tess_factor_ring_size = typical_tess_factor_size_per_wg * num_tess_factor_wg_per_cu *
+                                  info->max_good_cu_per_sa * info->max_sa_per_se * info->max_se;
++#ifdef __PS4__
++   /* The PS4's tessellation buffers, as large as the system may use them. Its VGT_HS_OFFCHIP_PARAM
++    * and VGT_TF_RING_SIZE are the system's (PS4 games never write them: Sony's Gnm hands them an
++    * 8 MiB off-chip buffer size, sceGnmGetOffChipTessellationBufferSize), and Crema found the
++    * system's GS ring sizes overriding RADV's the same way: RADV's own sizes (on Liverpool ~2.3 MiB
++    * off-chip, 54 KiB of factors) would let the HS write past the buffer, into whatever comes next
++    * (Captain Toad's level 3 took the whole PS4 down, the screen corrupted). Off-chip: twice the
++    * system's 8 MiB; factors: the most VGT_TF_RING_SIZE can say on gfx7 (16 bits of dwords). */
++   info->tess_offchip_ring_size = MAX2(info->tess_offchip_ring_size, 16u << 20);
++   info->tess_factor_ring_size = MAX2(info->tess_factor_ring_size, (0xffffu * 4) & ~255u);
++#endif
+    info->total_tess_ring_size = info->tess_offchip_ring_size + info->tess_factor_ring_size;
+ 
+    if (info->gfx_level >= GFX12)

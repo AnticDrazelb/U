@@ -49,7 +49,8 @@ mesa() {
     [ -d "$PSB/src/mesa" ] || git clone -q --depth 1 --branch mesa-26.0.8 https://gitlab.freedesktop.org/mesa/mesa.git "$PSB/src/mesa"
     if [ ! -f "$PSB/src/mesa/.ps4-patched" ]; then
         for p in mesa-ps4 mesa-ps4-aligned-vertex-fetch mesa-ps4-vertex-fetch-switch mesa-ps4-flush-all-draws \
-                 mesa-ps4-gs-ring-probe mesa-ps4-cs-grow-oom mesa-ps4-trace-ids; do
+                 mesa-ps4-gs-ring-probe mesa-ps4-cs-grow-oom mesa-ps4-trace-ids \
+                 mesa-ps4-rings; do
             git -C "$PSB/src/mesa" apply --exclude=src/amd/common/ac_ps4_drm.c "$REPO/patches/$p.patch"
         done
         touch "$PSB/src/mesa/.ps4-patched"

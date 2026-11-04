@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.42)
+# Eden for PS4: status (after 04.43)
 
-Install **04.42** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.43** (newest; 04.42 is the GS/tessellation skip test to fall back on). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -53,6 +53,9 @@ programs, 0 failures.
 - **04.41:** the boot trace synced within 50 ms; the GPU's first submissions after a loading screen,
   big GPU buffers and each RAM chunk in it (below).
 - **04.42:** a test: geometry shader and tessellation draws (and their ring registers) skipped (below).
+- **04.43:** the GS and tessellation rings set up as the PS4's system uses them: a 16 MiB off-chip
+  tessellation buffer and the largest factor ring (`patches/mesa-ps4-rings.patch`), GS ring sizes
+  through `sceGnmSetGsRingSizes(8 MiB, 8 MiB)`; those draws drawn again, still counted.
 
 ## Where we are: the open problem
 
@@ -124,6 +127,12 @@ checkerboard screen, sometimes a hard reset).
 - Toad level 3 runs (with something missing): they're the cause; then the fix is setting the rings
   up as the PS4 wants. It still goes down with none counted: not them. Down with some counted and
   skipped: not them either.
+
+### Next (after 04.43)
+- One Toad level 3 run with 04.43. Level 3 runs: the rings were it. The boot trace says how many GS
+  and tessellation draws there were, and what `sceGnmSetGsRingSizes` returned.
+- It still goes down: 04.42 (those draws left out) tells whether they're involved at all. If not, the
+  next suspect is the 2020 Mesa one below: storage buffers through VK_EXT_descriptor_buffer.
 
 ### What other emulators and ports found (research, after 04.42)
 - **Mesa issue 3168 (2020): yuzu, Captain Toad, AMD GCN (R9 Fury, Linux), "the GPU hangs and I need

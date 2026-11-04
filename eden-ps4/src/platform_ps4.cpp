@@ -1317,6 +1317,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.43: a fix to try for the crash of the whole PS4 (Captain Toad's level 3): the GPU's buffers for "
+         "tessellation are now as large as the PS4's system may use them (16 MiB, were about 2.3 MiB), and the "
+         "geometry shader buffers are sized through Sony's own call, as PS4 games do. Those draws are drawn "
+         "again (04.42 left them out) and still counted in the boot trace.\n"
          "04.42: a test for the crash of the whole PS4: 04.41's log shows Captain Toad's level 3 going down "
          "within 0.1 s of its first frame reaching the GPU. Draws that use a geometry shader or tessellation "
          "(whose GPU rings the PS4's system owns) are now left out, and counted in the boot trace. If level 3 "
@@ -3047,11 +3051,11 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
-    // (04.42) a test: draws with a geometry shader or tessellation, and RADV's writes of those
-    // rings' registers (the system's on the PS4), become no-ops before the GPU gets them. Captain
-    // Toad's level 3 took the whole PS4 down within 0.1 s of its first frame, the screen corrupted.
-    // settings.txt RADV_PS4_SKIP_GS_TESS=0 draws them (they're counted and logged either way).
-    setenv("RADV_PS4_SKIP_GS_TESS", "1", 0);
+    // (04.42) draws with a geometry shader or tessellation, and RADV's writes of those rings'
+    // registers (the system's on the PS4), are counted and the first ones logged; with
+    // RADV_PS4_SKIP_GS_TESS=1 in settings.txt they become no-ops (04.42's test, its default). 04.43
+    // sets those rings up as the PS4's system uses them instead (patches/mesa-ps4-rings.patch,
+    // sceGnmSetGsRingSizes in port/mesa/ac_ps4_drm.c), and draws them.
     // (04.41) the boot trace on the disk within 50 ms of each line (EDEN_PS4_TRACE_SYNC_MS; 0:
     // once a second, as before): Captain Toad's level 3 takes the whole PS4 down within a quarter
     // second of the last line that made it to the disk
