@@ -1306,6 +1306,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.32: Animal Crossing (and others) could abort with \"thread constructor failed\": every thread "
+         "got a 16 MiB stack by default, and the memory they come from ran out. Threads that ask for no "
+         "size now get 4 MiB (Eden runs with 1 MiB on Windows), and one that can't start retries with "
+         "2 MiB instead of aborting.\n"
          "04.31: Bluey crashed booting in 04.30: it ran the PS4 out of flexible memory (it was down to its "
          "last MiB in 04.21 already), and a page table's page couldn't be mapped. Such pages now come from "
          "direct memory when flexible memory is out. The FPS counter shows stalls: red for 2 s after the "

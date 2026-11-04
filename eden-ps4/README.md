@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.32: **"thread constructor failed" (Animal Crossing at 330 s, opening a video device).** Every
+thread asking for no stack size (`std::thread`: nearly all of Eden's, the services', the shader
+compilers') got the PS4's default of 16 MiB, and the next one's stack couldn't be had
+(`Host1x::StartDevice` from `nvhost_vic::OnOpen`, EAGAIN, then `std::terminate`). In
+`port/ps4_runtime.cpp`'s `__wrap_pthread_create`: such threads now get 4 MiB (Eden runs with 1
+MiB on Windows), and a creation failing with EAGAIN is tried once more with 2 MiB (boot trace:
+`threads: no memory for a ... stack`).
+
 04.31: **Bluey's boot crash; stalls on the FPS counter.**
 
 - Patch 0139: Bluey crashed at 64 s in 04.30, in `MapPhysicalMemory` -> `MapPages`, right after

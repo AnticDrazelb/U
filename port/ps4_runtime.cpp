@@ -12,6 +12,7 @@
 // - libc++abi runs thread_local destructors through __cxa_thread_atexit_impl, which the PS4
 //   libc lacks (and create-fself refuses unresolved imports).
 
+#include <cerrno>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -1064,6 +1065,7 @@ constexpr uint64_t kModule1Cores = 0x70; // cores 4-6 of the second (the 7th is 
 // compiler recurse deeply on large shaders; a thread out of stack is ended by the system with
 // error CE-34878-0 (suspected when Minecraft's menus appear).
 constexpr size_t kMinThreadStack = 2 * 1024 * 1024;
+constexpr size_t kDefaultThreadStack = 4 * 1024 * 1024; // (04.32) for threads that ask for no size
 using SetAffinityFn = int (*)(void*, uint64_t);
 using GetAffinityFn = int (*)(void*, uint64_t*);
 
@@ -1252,7 +1254,13 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
     } else if (pthread_attr_init(&local) == 0) {
         ownAttr = true;
         pthread_attr_getstacksize(&local, &stack);
-        if (stack < kMinThreadStack)
+        // (04.32) no size asked for (std::thread: nearly all of Eden's, the services', the
+        // shader compilers'): 4 MiB, not the PS4's default of 16 (Eden runs with Windows' 1 MiB).
+        // Dozens of 16 MiB stacks filled the memory they come from: Animal Crossing's next video
+        // device thread then failed to start ("thread constructor failed") and the app aborted.
+        if (stack > kDefaultThreadStack)
+            pthread_attr_setstacksize(&local, kDefaultThreadStack);
+        else if (stack < kMinThreadStack)
             pthread_attr_setstacksize(&local, kMinThreadStack);
         attr = &local;
     }
@@ -1262,9 +1270,9 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
         reinterpret_cast<GetAffinityFn>(&scePthreadGetaffinity)(scePthreadSelf(), &mask);
         char line[160];
         snprintf(line, sizeof(line),
-                 "threads: first creator's cores %#llx, new threads get %#llx; stack %zu KiB by default, at least %zu KiB",
+                 "threads: first creator's cores %#llx, new threads get %#llx; stack %zu KiB by default (%zu KiB given), at least %zu KiB",
                  static_cast<unsigned long long>(mask), static_cast<unsigned long long>(kAppCores), stack / 1024,
-                 kMinThreadStack / 1024);
+                 kDefaultThreadStack / 1024, kMinThreadStack / 1024);
         ps4_boot_trace(line);
     }
     int result;
@@ -1274,6 +1282,24 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
     } else {
         *wrapped = {start, arg};
         result = __real_pthread_create(thread, attr, startOnAppCores, wrapped);
+        if (result == EAGAIN && attr) {
+            // (04.32) no memory for its stack: once more with the smallest one, and said
+            pthread_attr_t retry;
+            size_t asked = 0;
+            pthread_attr_getstacksize(attr, &asked);
+            if (asked > kMinThreadStack && pthread_attr_init(&retry) == 0) {
+                int detach = PTHREAD_CREATE_JOINABLE;
+                pthread_attr_getdetachstate(attr, &detach);
+                pthread_attr_setdetachstate(&retry, detach);
+                pthread_attr_setstacksize(&retry, kMinThreadStack);
+                result = __real_pthread_create(thread, &retry, startOnAppCores, wrapped);
+                pthread_attr_destroy(&retry);
+                char line[128];
+                snprintf(line, sizeof(line), "threads: no memory for a %zu KiB stack: retried with %zu KiB: %s",
+                         asked / 1024, kMinThreadStack / 1024, result == 0 ? "started" : "failed too");
+                ps4_boot_trace(line);
+            }
+        }
         if (result != 0)
             free(wrapped);
     }
