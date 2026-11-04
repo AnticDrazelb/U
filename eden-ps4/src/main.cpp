@@ -172,6 +172,7 @@ bool g_gpu_display = false;
 bool g_docked = true;
 int g_resolution = 100;
 bool g_shader_cache = false, g_async_shaders = false, g_cpu_unsafe = false, g_gpu_high = false, g_fps_overlay = false;
+bool g_compiled_macros = true; // (04.36) the menu's Compiled GPU Macros
 bool g_unlocked_frames = false;
 bool g_jit_cache = true;  // (04.17) the persistent translation cache
 int g_speed_percent = 100;
@@ -285,7 +286,7 @@ void ApplyLauncherSettings() {
     // to x86 code (on the PS4 into memory mapped executable from the start, patch 0051), not
     // interpreted; EDEN_PS4_MACRO_JIT=0 interprets them
     const char* macro_jit = std::getenv("EDEN_PS4_MACRO_JIT");
-    Settings::values.disable_macro_jit.SetValue(macro_jit && std::string_view{macro_jit} == "0");
+    Settings::values.disable_macro_jit.SetValue(!g_compiled_macros || (macro_jit && std::string_view{macro_jit} == "0"));
     // No Cemuhook (UDP) controller servers: their client would open a host socket at start,
     // for controllers this launcher doesn't use.
     Settings::values.udp_input_servers.SetValue("");
@@ -407,6 +408,10 @@ void SetJitCache(bool on) {
 
 void SetDrawShortcuts(bool on) {
     Common::PS4Perf::gpu_shortcuts.store(on, std::memory_order_relaxed);
+}
+
+void SetCompiledMacros(bool on) {
+    g_compiled_macros = on;
 }
 
 void SetFpsOverlay(bool on) {

@@ -379,6 +379,13 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.36: **a menu switch for the GPU macro compiler.** Settings, Graphics, Compiled GPU Macros
+(`macros=interpreted` in menu.txt when off): off sets `disable_macro_jit` (the MME interpreter).
+Captain Toad's level 3 took the whole PS4 down (blue screen, then black and checkerboard frames
+until a hard reset) in three runs, with CPU Unsafe on and off: each run's last lines four new
+`MacroCodeAllocator` blocks at 49.5 s, then nothing. Little Kitty, Big City's allocator trap
+happens with CPU Unsafe off too: not the translator's extras either.
+
 04.35: **a switch for the 64-bit translator's extras.** Patch 0142: with CPU accuracy Auto (the
 menu's CPU Unsafe off), the A64 cores run without 04.22-04.30's options (`fold_address_offsets`,
 `skip_redundant_extensions`, `split_cold_code`, `elide_dead_nzcv(_abi)`, `return_stack_pc_only`,

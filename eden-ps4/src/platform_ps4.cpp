@@ -1018,6 +1018,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.jit_cache = false;
         else if (line == "draw_shortcuts=off")
             settings.draw_shortcuts = false;
+        else if (line == "macros=interpreted")
+            settings.compiled_macros = false;
         else if (line == "async_shaders=off")
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
@@ -1054,7 +1056,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
-                        "jit_cache=%s\ndraw_shortcuts=%s\n",
+                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1063,7 +1065,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
-                     settings.draw_shortcuts ? "on" : "off");
+                     settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted");
         std::fclose(f);
     }
 }
@@ -1306,6 +1308,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.36: a second test switch, Settings, Graphics, Compiled GPU Macros: off, the GPU's small programs "
+         "are interpreted instead of compiled. Captain Toad's level 3 took the PS4 down right after new ones were "
+         "compiled, three runs out of three, with the CPU switch off too.\n"
          "04.35: a test switch: with CPU Unsafe off, the 64-bit CPU translator runs without any of the PS4 "
          "speed-ups since 04.22 (slower). If a game works with it off and not on, they're the cause.\n"
          "04.34: a crash at 6-8 s into booting (Captain Toad, Little Kitty, Big City): a stick's movement "
@@ -2950,6 +2955,7 @@ void* Run(void*)
         Launcher::SetShaderCache(settings.shader_cache);
         Launcher::SetJitCache(settings.jit_cache);
         Launcher::SetDrawShortcuts(settings.draw_shortcuts);
+        Launcher::SetCompiledMacros(settings.compiled_macros);
         Launcher::SetAsyncShaders(settings.async_shaders);
         Launcher::SetCpuUnsafe(settings.cpu_unsafe);
         Launcher::SetGpuAccuracyHigh(settings.gpu_high);
@@ -2977,12 +2983,13 @@ void* Run(void*)
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
-            "GPU accuracy {}, frame pacing {}, game speed {}%, draw shortcuts {}; CPU {}, {} cores, threads {}, fastmem {}; "
+            "GPU accuracy {}, frame pacing {}, game speed {}%, draw shortcuts {}, GPU macros {}; CPU {}, {} cores, threads {}, fastmem {}; "
             "the Switch's RAM {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
-            settings.draw_shortcuts ? "on" : "off", settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
+            settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
+            settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
             settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.profiler ? "; profiler on" : "");

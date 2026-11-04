@@ -57,6 +57,7 @@ struct MenuSettings
     int resolution = 100;      // what games render at, in percent of the console mode's: 100, 75 or 50
     bool shader_cache = true;  // shaders kept on disk, built while a game loads the next time
     bool draw_shortcuts = true;  // (04.20) 04.15/04.16's pipeline reuse and in-place texture reads
+    bool compiled_macros = true; // (04.36) GPU macros compiled to x86 code; off: interpreted
     bool jit_cache = true;     // (04.17) the CPU code translated kept on disk, loaded when the game starts again
     bool async_shaders = true; // shaders built in the background (a draw waits for none)
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
