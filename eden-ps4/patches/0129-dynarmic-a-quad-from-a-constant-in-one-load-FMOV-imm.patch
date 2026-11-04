@@ -1,0 +1,41 @@
+From 8d8b0e199cd35e4def65724df5043947ec517a6a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 02:55:37 +0000
+Subject: [PATCH 129/130] dynarmic: a quad from a constant in one load (FMOV
+ #imm, MOVI)
+
+ZeroExtendLongToQuad of an immediate is a movq from the constant pool (xorps for 0) instead of a
+128-bit constant load and a movq to clear its upper half. game.c for AArch64: -0.9%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../backend/x64/emit_x64_data_processing.cpp         | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index c7f1fad65d..de4493a0b7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -1644,6 +1644,18 @@ void EmitX64::EmitZeroExtendLongToQuad(EmitContext& ctx, IR::Inst* inst) {
+         ctx.reg_alloc.DefineValue(code, inst, args[0]);
+         return;
+     }
++    if (args[0].IsImmediate()) {
++        // (PS4 04.26) a constant (FMOV #imm, MOVI): one load of it, the other lanes zeroed by it
++        const u64 value = args[0].GetImmediateU64();
++        const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
++        if (value == 0) {
++            code.xorps(result, result);
++        } else {
++            code.movq(result, code.Const(code.qword, value));
++        }
++        ctx.reg_alloc.DefineValue(code, inst, result);
++        return;
++    }
+     if (args[0].GetType() == IR::Type::U32) {
+         // (PS4 04.23, A64EmitX64::PeepholeQuad: a word, its ZeroExtendWordToLong skipped) movd from
+         // a GPR zero-extends to 128 bits; in an XMM, its other lanes cleared
+-- 
+2.43.0
+

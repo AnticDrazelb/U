@@ -69,6 +69,16 @@ def op():
         return [f"fcvt {fr(other)}, {n}"]
     if k < 0.72:
         r = ("w" if kind == "s" else "x") + str(g)
+        if rng.random() < 0.35:
+            # (04.26) constants into a register (a quad widened from an immediate): FMOV #imm, MOVI,
+            # FMOV from the zero register
+            c = rng.random()
+            if c < 0.5:
+                imm = rng.choice(["1.0", "-1.0", "0.5", "2.0", "-1.25", "31.0", "0.125", "-0.1875", "3.0"])
+                return [f"fmov {d}, #{imm}"]
+            if c < 0.8:
+                return [f"movi d{d[1:]}, #{rng.choice(['0', '0xff00ff00ff00ff00', '0xffffffffffffffff', '0x00000000ff0000ff'])}"]
+            return [f"fmov {d}, {'wzr' if kind == 's' else 'xzr'}"]
         return [f"fmov {r}, {n}"] if rng.random() < 0.5 else [f"fmov {d}, {r}"]
     if k < 0.8:
         r = rng.choice("wx") + str(g)

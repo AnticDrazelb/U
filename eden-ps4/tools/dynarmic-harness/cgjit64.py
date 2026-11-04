@@ -48,6 +48,7 @@ for s,sz,name in blocks:
 def classify(t):
     # (cgjit64: A64JitState) x0-x30 0-240, sp 248, pc 256, nzcv 264, fpcr 276, vectors 288-799,
     # halt 808, exclusive 812, rsb_ptr 816, rsb locations 824-887, rsb code pointers 888-951
+    # (04.27: 256 entries: locations 824-2871, code pointers 2872-4919, fpcr_descriptor_bits 4920)
     m=re.search(r'\[r15(?: \+ (\d+))?(?: \+ 8\*r[a-z0-9]+)?(?: \+ (\d+))?\]',t)
     if m:
         off=int(m.group(1) or m.group(2) or 0)

@@ -1,0 +1,104 @@
+From 2a768cf9c8285eab6da34b72ee50827dc6b8b4e1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 03:05:03 +0000
+Subject: [PATCH 130/130] dynarmic A64: a 256-entry return stack, its pointer
+ stepped as a byte
+
+The return stack's pointer is read with movzx from its low byte and stored as a byte: 256 entries
+wrap without the and-mask (a push 7 instructions on the pointer and entries, a pop 3 on the
+pointer, one each fewer), and deeper call chains return through it. A32's stays 8 (the shared push
+keeps the mask there). game.c for AArch64: -1.9%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp  | 14 ++++++--------
+ .../src/dynarmic/backend/x64/a64_jitstate.h    |  3 ++-
+ .../src/dynarmic/backend/x64/emit_x64.cpp      | 18 ++++++++++++++----
+ 3 files changed, 22 insertions(+), 13 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 4d2dba9891..37784845ae 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -483,10 +483,9 @@ void A64EmitX64::GenTerminalHandlers() {
+     } else {
+         calculate_location_descriptor();
+     }
+-    code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+-    code.sub(eax, 1);
+-    code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+-    code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
++    code.movzx(eax, byte[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
++    code.sub(al, 1);  // (256 entries: the byte wraps)
++    code.mov(byte[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], al);
+     code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+         // (with entries of the PC alone, the descriptor is put together on a miss)
+@@ -1022,10 +1021,9 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+             code.and_(rbx, rcx);
+             code.or_(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr_descriptor_bits)]);
+         }
+-        code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+-        code.sub(eax, 1);
+-        code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+-        code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
++        code.movzx(eax, byte[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
++        code.sub(al, 1);  // (256 entries: the byte wraps)
++        code.mov(byte[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], al);
+         code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+         if (e.conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+             code.jne(e.terminal_handler_fast_dispatch_hint);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
+index 8e5ca8a74f..448dc004a9 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
+@@ -32,7 +32,8 @@ struct A64JitState {
+     // Exclusive state stuff
+     static constexpr u64 RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFF0ull;
+     // Return stack buffer
+-    static constexpr size_t RSB_SIZE = 8;  // MUST be a power of 2.
++    // (PS4 04.27) 256: the JIT steps rsb_ptr's low byte alone, which wraps by itself (no mask)
++    static constexpr size_t RSB_SIZE = 256;  // MUST be a power of 2.
+     static constexpr size_t RSB_PTR_MASK = RSB_SIZE - 1;
+ 
+     std::array<u64, 31> reg{};
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+index 7ff83ae102..e062668330 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -101,7 +101,12 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
+                                 ? iter->second.entrypoint
+                                 : code.GetReturnFromRunCodeAddress();
+ 
+-    code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
++    const bool byte_ptr = code.GetJitStateInfo().rsb_ptr_mask == 0xFF;  // (PS4 04.27: A64's 256 entries)
++    if (byte_ptr) {
++        code.movzx(index_reg.cvt32(), code.byte[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
++    } else {
++        code.mov(index_reg.cvt32(), dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr]);
++    }
+     code.mov(loc_desc_reg, RSBEntryFor(target));
+     patch_information[target].Add(PatchInformation::MovRcx, code.getCurr());
+     EmitPatchMovRcx(target_code_ptr);
+@@ -110,9 +115,14 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
+     // Byte size hack
+     DEBUG_ASSERT(code.GetJitStateInfo().rsb_ptr_mask <= 0xFF);
+     code.add(index_reg.cvt32(), 1); //flags trashed, 1 single byte, haswell doesn't care
+-    code.and_(index_reg.cvt32(), u32(code.GetJitStateInfo().rsb_ptr_mask)); //trashes flags
+-    // Results ready and sort by least needed: give OOO some break
+-    code.mov(dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr], index_reg.cvt32());
++    if (byte_ptr) {
++        // (the low byte stored alone: 255 + 1 wraps to 0)
++        code.mov(code.byte[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr], index_reg.cvt8());
++    } else {
++        code.and_(index_reg.cvt32(), u32(code.GetJitStateInfo().rsb_ptr_mask)); //trashes flags
++        // Results ready and sort by least needed: give OOO some break
++        code.mov(dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_rsb_ptr], index_reg.cvt32());
++    }
+ }
+ 
+ #ifndef NDEBUG
+-- 
+2.43.0
+

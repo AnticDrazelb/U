@@ -379,6 +379,20 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.27: **constants in one load; a deeper return stack.** Per 20 steady frames of `game.c` for
+AArch64 with Eden's options: 2,123,983 instructions in 04.26, 2,066,555 now (-2.7%; -38.0% from
+04.22's 3,335,063).
+
+- Patch 0129: a quad widened from a constant (FMOV #imm, MOVI, FMOV from the zero register) is
+  one `movq` from the constant pool (`xorps` for 0) instead of a 128-bit constant load and a `movq`
+  to clear its upper half (-0.9%). `gen12.py` now has those.
+- Patch 0130: **the A64 return stack has 256 entries and its pointer is stepped as a byte**
+  (`movzx` from its low byte, a byte store: the wrap needs no `and`), one instruction fewer for
+  each call and each return, and deeper call chains (and recursion) return through it (-1.9%).
+  A32's stays 8 entries (the shared push keeps its mask there). Tests: gen14 (calls and returns
+  around FPCR changes) with the inlined and the shared pop, with and without return addresses
+  alone, gen8 with and without fastmem, their cache suites; A32's gen7 (calls and returns) and gen2.
+
 04.26: **loads in one instruction: floats into vector registers, sign-extended values.** Per
 20 steady frames of `game.c` for AArch64 with Eden's options: 2,222,553 instructions in 04.25,
 2,123,983 now (-4.4%; -36.3% from 04.22's 3,335,063).

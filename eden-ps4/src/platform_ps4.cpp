@@ -1306,6 +1306,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.27: 64-bit games: float constants in one load, and calls and returns cheaper (a deeper return "
+         "stack, stepped without a mask): the test game 38% leaner than in 04.22.\n"
          "04.26: 64-bit games load floats straight into the PS4's vector registers and sign-extending "
          "values (LDRSW and friends) in one instruction each: the test game is now 36% leaner than in 04.22.\n"
          "04.25: 64-bit games: loads and stores through the same base no longer go through a shared "
