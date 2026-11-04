@@ -1,0 +1,140 @@
+From c816243684c54df9f9f7fc42a2440e67aeb3634b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 00:40:59 +0000
+Subject: [PATCH 118/119] dynarmic: scalar floats stay in vector registers
+ (lane 0 in place; word to quad in one instruction)
+
+VectorGetElement32/64 at lane 0 define their result where the vector is (the upstream TODO): a
+scalar float op reads its low lane there, instead of pextrd/movq to a GPR and movd back; a GPR
+user gets a movd (zero-extending). A64EmitX64::PeepholeQuad: ZeroExtendLongToQuad(
+ZeroExtendWordToLong(w)), as every S-register write is made, takes the word: movd from a GPR (one
+instruction instead of mov r32,r32 + movq), insertps clearing lanes 1-3 in an XMM (instead of
+movd out, mov, movq back).
+
+Tests: gen12 (new: scalar float loads/stores, arithmetic, FMA, conversions, FMOV, FCMP + B.cond,
+FCSEL, lane moves, garbage in the upper lanes) 340 programs, gen6/8/11 with and without fastmem:
+the same as the previous build; A32 against 04.22 (gen2/3/7/9 with fastmem, gen10 ARM). game.c for
+AArch64: 7.9% fewer instructions a frame (10.9% with the previous commit, against 04.22).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 14 +++++++++++++
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |  3 +++
+ .../backend/x64/emit_x64_data_processing.cpp  | 21 +++++++++++++++++++
+ .../dynarmic/backend/x64/emit_x64_vector.cpp  | 14 +++++++------
+ 4 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 3c8ac3b652..f4a59bc62b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -109,6 +109,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     FoldAddressOffsets(ctx, block);
+     FuseCheckBit(block);
+     FuseCondFlags(block);
++    PeepholeQuad(block);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+     constexpr EmitHandlerFn opcode_handlers[] = {
+ #define OPCODE(name, type, ...) &EmitX64::Emit##name,
+@@ -357,6 +358,19 @@ void A64EmitX64::FuseCondFlags(IR::Block& block) {
+     }
+ }
+ 
++void A64EmitX64::PeepholeQuad(IR::Block& block) {
++    for (auto& inst : block.instructions) {
++        if (inst.GetOpcode() != IR::Opcode::ZeroExtendLongToQuad || inst.GetArg(0).IsImmediate())
++            continue;
++        IR::Inst* const widen = inst.GetArg(0).GetInst();
++        if (widen->GetOpcode() != IR::Opcode::ZeroExtendWordToLong || widen->GetArg(0).IsImmediate())
++            continue;
++        inst.SetArg(0, widen->GetArg(0));
++        if (widen->UseCount() == 0)
++            widen->Invalidate();
++    }
++}
++
+ void A64EmitX64::ClearCache() {
+     EmitX64::ClearCache();
+     Ps4BlockMap::Clear(code.getCode(), false);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 1ceacec80b..132da7542a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -106,6 +106,9 @@ public:
+     /// as ARM's, CF as ARM's C), instead of reloading NZCV and turning it back into flags
+     bool if_flags_fused = false;
+     void FuseCondFlags(IR::Block& block);
++    /// (PS4 04.23) ZeroExtendLongToQuad(ZeroExtendWordToLong(w)), as a scalar float result or a
++    /// word loaded into a vector register comes: ZeroExtendLongToQuad(w) (one movd or insertps)
++    void PeepholeQuad(IR::Block& block);
+     FakeCall FastmemCallback(u64 rip);
+ 
+     // Memory access helpers
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index 9e2204b7eb..511e264a42 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -1545,6 +1545,27 @@ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitZeroExtendLongToQuad(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (args[0].GetType() == IR::Type::U32) {
++        // (PS4 04.23, A64EmitX64::PeepholeQuad: a word, its ZeroExtendWordToLong skipped) movd from
++        // a GPR zero-extends to 128 bits; in an XMM, its other lanes cleared
++        if (args[0].IsInGpr(ctx.reg_alloc)) {
++            const Xbyak::Reg32 source = ctx.reg_alloc.UseGpr(code, args[0]).cvt32();
++            const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
++            code.movd(result, source);
++            ctx.reg_alloc.DefineValue(code, inst, result);
++        } else {
++            const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
++            if (code.HasHostFeature(HostFeature::SSE41)) {
++                code.insertps(result, result, 0b00001110);
++            } else {
++                code.movq(result, result);
++                code.psllq(result, 32);
++                code.psrlq(result, 32);
++            }
++            ctx.reg_alloc.DefineValue(code, inst, result);
++        }
++        return;
++    }
+     if (args[0].IsInGpr(ctx.reg_alloc)) {
+         const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+         const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+index 1165abb0e4..dff1b85f2f 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_vector.cpp
+@@ -217,7 +217,12 @@ void EmitX64::EmitVectorGetElement32(EmitContext& ctx, IR::Inst* inst) {
+     ASSERT(args[1].IsImmediate());
+     const u8 index = args[1].GetImmediateU8();
+ 
+-    // TODO: DefineValue directly on Argument for index == 0
++    if (index == 0) {
++        // (PS4 04.23) the element where the vector is: a scalar float op reads its low lane there
++        // (no pextrd and movd back); one wanting it in a GPR gets a movd, which zero-extends
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+ 
+     const Xbyak::Reg32 dest = ctx.reg_alloc.ScratchGpr(code).cvt32();
+ 
+@@ -239,11 +244,8 @@ void EmitX64::EmitVectorGetElement64(EmitContext& ctx, IR::Inst* inst) {
+     const u8 index = args[1].GetImmediateU8();
+ 
+     if (index == 0) {
+-        // TODO: DefineValue directly on Argument for index == 0
+-        const Xbyak::Reg64 dest = ctx.reg_alloc.ScratchGpr(code).cvt64();
+-        auto const source = ctx.reg_alloc.UseXmm(code, args[0]);
+-        code.movq(dest, source);
+-        ctx.reg_alloc.DefineValue(code, inst, dest);
++        // (PS4 04.23) as VectorGetElement32's
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+         return;
+     }
+ 
+-- 
+2.43.0
+

@@ -84,7 +84,12 @@ the blocks used from the cache). For A64 (04.18): `DYNBENCH=dynbench64.cpp ./bui
 thread registers read and written through pointers into the callbacks object, as Eden's;
 `programs/tpidr64.s`), `ctx64.sh gen8.py dynbench64_p5 1 100` (gen5, gen6, gen8). (04.22) `-DHAVE_A64_PORT`: the A64
 options ported from A32, `DYN_FOLD=1 DYN_EXT=1 DYN_COLD=1`; `programs/c/build64.sh` builds `game.c`
-for AArch64 (`dynbench64 image programs/c/game64.bin <frames> fastmem2`). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
+for AArch64 (`dynbench64 image programs/c/game64.bin <frames> fastmem2`). (04.23) `-DHAVE_DEAD_NZCV64`:
+`DYN_NZCV=1` (the flags look-ahead), `DYN_NZCVABI=1` (calls and returns end it; not for gen8, whose
+random functions read the flags a call left); `steady64.sh <harness> [VAR=1...]` counts 20 steady
+frames of `game64.bin` (callgrind, 30 minus 10); `cgjit64.py <dir>` and `cgblock.py <dir> <n>` show
+what the translated code executed by kind and the n-th hottest block (callgrind `--dump-instr=yes`
+into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
 `BUILD=<dir>` into another build directory.
 
 | Generator | Programs of |
@@ -93,6 +98,8 @@ for AArch64 (`dynbench64 image programs/c/game64.bin <frames> fastmem2`). `EDEN_
 | gen2.py, gen3.py | mixed ALU, memory, LDM/STM/PUSH/POP/VLDM/VSTM, calls |
 | gen4.py | A32 exclusives (LDREX/STREX), marked and unmapped pages |
 | gen5.py | A64 exclusives |
+| gen11.py | A64 flag setters right before B.cond, CBZ/CBNZ/TBZ/TBNZ on every bit, edge values (04.23) |
+| gen12.py | A64 scalar floats: arithmetic, conversions, compares, loads and stores of S and D (04.23) |
 | gen6.py | A64 loads/stores sharing a base |
 | gen7.py | A32/Thumb control flow and flags: conditional instructions, IT blocks, loops, calls, VFP compares |
 | gen8.py | A64 control flow and flags |

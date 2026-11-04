@@ -1,0 +1,722 @@
+From 272945a58180718ff86b28d1550bef3fb3e10ef9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 00:59:44 +0000
+Subject: [PATCH 119/119] dynarmic A64: dead flags at a block's exit
+ (look-ahead), conditional branches on a compare's values
+
+As A32's elide_dead_nzcv: a block reads the A64 code its successors start with (along their
+branches, 64 instructions at most); when every path sets the flags before reading them, the
+block doesn't store the flags its last setters make, and a B.cond at its end branches on a
+cmp/cmn/test of the values they came from (CondFlagsSub64/Add64/Test64/NZ64, and A32's 32-bit
+and float forms). With elide_dead_nzcv_abi, calls and returns end a path with the flags dead,
+and a block ending in BL, BLR or RET has them dead at its exit. The code read is added to the
+block's ranges (invalidation, the persistent cache's hash). Eden's 64-bit cores enable both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |   6 +
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |   2 +-
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |   7 +
+ .../dynarmic/backend/x64/a64_interface.cpp    |   7 +-
+ .../src/dynarmic/backend/x64/emit_x64.cpp     |  70 ++++-
+ .../frontend/A64/translate/a64_translate.cpp  | 247 +++++++++++++++++-
+ .../frontend/A64/translate/a64_translate.h    |  10 +
+ .../src/dynarmic/interface/A64/config.h       |  13 +
+ src/dynarmic/src/dynarmic/ir/basic_block.h    |   4 +-
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |   4 +
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |   4 +
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 129 +++++++++
+ 12 files changed, 497 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index c7bbae2a82..85c52dfe67 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -291,6 +291,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.skip_redundant_extensions = true;
+     // each block's rarely run code apart from it: the code that runs packed together
+     config.split_cold_code = true;
++    // (04.23) as the 32-bit cores: the flags a block ends with, when the code it links to sets
++    // them before reading them, aren't stored, and a conditional branch tests its compare's values
++    // directly (cmp; jcc); a call or a return ends the look-ahead with the flags dead (the
++    // procedure call standard has them so), and a block ending in one doesn't store them either
++    config.elide_dead_nzcv = true;
++    config.elide_dead_nzcv_abi = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index af6c5a06db..14a607d0e5 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -215,7 +215,7 @@ finish_this_inst:
+     for (const auto& [start, end] : block.lookahead) {
+         // the code read to tell its flags are dead at its exit (a few instructions each): the
+         // block depends on it as well
+-        block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(start, end - 1), descriptor);
++        block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(u32(start), u32(end - 1)), descriptor);
+     }
+ 
+     auto const bdesc = RegisterBlock(descriptor, entrypoint, size);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index f4a59bc62b..814a735a00 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -106,6 +106,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     }
+ 
+     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
++    nzcv_stored_end = nullptr;
++    host_cond_flags = HostCondFlags::None;
+     FoldAddressOffsets(ctx, block);
+     FuseCheckBit(block);
+     FuseCondFlags(block);
+@@ -188,6 +190,11 @@ finish_this_inst:
+ 
+     const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
+     block_ranges.AddRange(range, descriptor);
++    for (const auto& [start, end] : block.lookahead) {
++        // the code read to tell its flags are dead at its exit (A64DeadNZCVPass): the block
++        // depends on it as well
++        block_ranges.AddRange(boost::icl::discrete_interval<u64>::closed(start, end - 1), descriptor);
++    }
+ 
+     auto bdesc = RegisterBlock(descriptor, entrypoint, size);
+     Ps4BlockMap::Register(code.getCode(), entrypoint, size, IR::LocationDescriptor{descriptor}.Value(),
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 6aa0d10ec7..dff52f868d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -271,7 +271,10 @@ private:
+         ir_block.Reset(arch_descriptor);
+         ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
+         const auto compile_start = std::chrono::steady_clock::now();
+-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
++        A64::TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
++        options.nzcv_lookahead = conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
++        options.nzcv_lookahead_abi = conf.elide_dead_nzcv_abi;
++        A64::Translate(ir_block, arch_descriptor, get_code, options);
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         const auto entrypoint = emitter.Emit(ir_block).entrypoint;
+         ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+@@ -345,6 +348,8 @@ private:
+         add(conf.fold_address_offsets);
+         add(conf.skip_redundant_extensions);
+         add(conf.split_cold_code);
++        add(conf.elide_dead_nzcv);
++        add(conf.elide_dead_nzcv_abi);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+index 4eab3e83fd..5abd376406 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -9,6 +9,7 @@
+ #include "dynarmic/backend/x64/emit_x64.h"
+ 
+ #include <iterator>
++#include <optional>
+ 
+ #include "common/assert.h"
+ #include <boost/variant/detail/apply_visitor_binary.hpp>
+@@ -332,6 +333,71 @@ void EmitX64::EmitCondFlagsNZ32(EmitContext& ctx, IR::Inst* inst) {
+     host_cond_flags = HostCondFlags::Logic;
+ }
+ 
++// (A64DeadNZCVPass: CMP, CMN, TST and the flag-setting forms on X registers)
++namespace {
++// b as an operand for a 64-bit instruction: an immediate that sign-extends from 32 bits, or a
++// register
++Xbyak::Reg64 CondFlagsOperand64(BlockOfCode& code, EmitContext& ctx, Argument& b, std::optional<u32>& imm) {
++    if (b.IsImmediate()) {
++        const u64 value = b.GetImmediateU64();
++        if (mcl::bit::sign_extend<32>(value) == value) {
++            imm = u32(value);
++            return Xbyak::Reg64{0};  // (unused)
++        }
++        const Xbyak::Reg64 r = ctx.reg_alloc.ScratchGpr(code);
++        code.mov(r, value);
++        return r;
++    }
++    return ctx.reg_alloc.UseGpr(code, b);
++}
++}  // namespace
++
++void EmitX64::EmitCondFlagsSub64(EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const Xbyak::Reg64 a = ctx.reg_alloc.UseGpr(code, args[0]);
++    std::optional<u32> imm;
++    const Xbyak::Reg64 b = CondFlagsOperand64(code, ctx, args[1], imm);
++    if (imm) {
++        code.cmp(a, *imm);
++    } else {
++        code.cmp(a, b);
++    }
++    host_cond_flags = HostCondFlags::Sub;
++}
++
++void EmitX64::EmitCondFlagsAdd64(EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const Xbyak::Reg64 a = ctx.reg_alloc.UseScratchGpr(code, args[0]);
++    std::optional<u32> imm;
++    const Xbyak::Reg64 b = CondFlagsOperand64(code, ctx, args[1], imm);
++    if (imm) {
++        code.add(a, *imm);
++    } else {
++        code.add(a, b);
++    }
++    host_cond_flags = HostCondFlags::Add;
++}
++
++void EmitX64::EmitCondFlagsTest64(EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const Xbyak::Reg64 a = ctx.reg_alloc.UseGpr(code, args[0]);
++    std::optional<u32> imm;
++    const Xbyak::Reg64 b = CondFlagsOperand64(code, ctx, args[1], imm);
++    if (imm) {
++        code.test(a, *imm);
++    } else {
++        code.test(a, b);
++    }
++    host_cond_flags = HostCondFlags::Logic;
++}
++
++void EmitX64::EmitCondFlagsNZ64(EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const Xbyak::Reg64 a = ctx.reg_alloc.UseGpr(code, args[0]);
++    code.test(a, a);
++    host_cond_flags = HostCondFlags::Logic;
++}
++
+ void EmitX64::EmitCondFlagsFP32(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const Xbyak::Xmm a = ctx.reg_alloc.UseXmm(code, args[0]);
+@@ -383,7 +449,9 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
+         const HostCondFlags kind = host_cond_flags;
+         host_cond_flags = HostCondFlags::None;
+         nzcv_stored_end = nullptr;
+-        ASSERT(kind != HostCondFlags::Logic || cond == IR::Cond::EQ || cond == IR::Cond::NE || cond == IR::Cond::MI || cond == IR::Cond::PL);
++        // (Logic: N and Z of a value, C and V clear: A32's for EQ, NE, MI, PL only, A64's ANDS
++        // for all but HI and LS)
++        ASSERT(kind != HostCondFlags::Logic || (cond != IR::Cond::HI && cond != IR::Cond::LS));
+         ASSERT(kind != HostCondFlags::Add || (cond != IR::Cond::HI && cond != IR::Cond::LS));
+         switch (cond) {
+         case IR::Cond::EQ: code.jz(pass); break;
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+index 7840c63d79..d0afb8e2f3 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+@@ -14,11 +14,252 @@
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/terminal.h"
+ 
++#include <boost/container/static_vector.hpp>
++
+ namespace Dynarmic::A64 {
+ 
++namespace {
++
++constexpr u32 FlagN = 8, FlagZ = 4, FlagC = 2, FlagV = 1, FlagsAll = 15;
++
++// The flags a condition (an A64 Cond's encoding) reads
++constexpr u32 FlagsReadByCond(u32 cond) {
++    switch (cond >> 1) {
++    case 0: return FlagZ;                  // EQ, NE
++    case 1: return FlagC;                  // CS, CC
++    case 2: return FlagN;                  // MI, PL
++    case 3: return FlagV;                  // VS, VC
++    case 4: return FlagC | FlagZ;          // HI, LS
++    case 5: return FlagN | FlagV;          // GE, LT
++    case 6: return FlagN | FlagZ | FlagV;  // GT, LE
++    default: return 0;                     // AL, NV
++    }
++}
++
++constexpr bool IsCall(u32 inst) {
++    return (inst & 0xFC000000) == 0x94000000 ||  // BL
++           ((inst & 0xFE000000) == 0xD6000000 && ((inst >> 21) & 7) == 1);  // BLR, BLRAA...
++}
++
++constexpr bool IsReturn(u32 inst) {
++    return (inst & 0xFE000000) == 0xD6000000 && ((inst >> 21) & 0xF) == 2;  // RET, RETAA...
++}
++
++// Reads A64 code from a block's successor to tell whether the flags the block ends with can be
++// read there (as A32's FlagsLookahead): along every path, an instruction that reads a flag not set
++// again on that path yet makes them live; one that sets them all ends the path. Branches are
++// followed to their targets; anything it doesn't know (a jump through a register, a system call,
++// an exception, a PSTATE write, SVE...) counts as a read. Calls and returns end a path with the
++// flags set with abi (the procedure call standard: NZCV not preserved across a call, undefined on
++// entry to a function); without it calls are followed like branches and returns count as reads.
++struct FlagsLookahead {
++    const MemoryReadCodeFuncType& read_code;
++    bool abi = false;
++    int budget = 64;  // instructions read, on all paths together
++    boost::container::static_vector<std::pair<u64, u32>, 16> targets;  // (address, flags unset there)
++    boost::container::static_vector<std::pair<u64, u64>, 16> runs;     // the code read: [start, end)
++
++    bool Read(u64 pc) {
++        for (auto& [start, end] : runs) {
++            if (pc >= start && pc < end)
++                return true;
++            if (pc == end) {
++                end += 4;
++                return true;
++            }
++        }
++        if (runs.size() == runs.capacity())
++            return false;
++        runs.emplace_back(pc, pc + 4);
++        return true;
++    }
++
++    bool Seen(u64 pc, u32 unset) {
++        for (const auto& [address, then_unset] : targets) {
++            if (address == pc && (unset & ~then_unset) == 0)
++                return true;
++        }
++        if (targets.size() < targets.capacity())
++            targets.emplace_back(pc, unset);
++        return false;
++    }
++
++    bool Live(u64 pc, u32 unset, int branches) {
++        if (Seen(pc, unset))
++            return false;
++        while (unset != 0) {
++            if (--budget < 0)
++                return true;
++            const auto word = read_code(pc);
++            if (!word || !Read(pc))
++                return true;
++            const u32 inst = *word;
++            u32 reads = 0, sets = 0;
++
++            if ((inst & 0x0A000000) == 0x08000000) {
++                // loads and stores (all of them, SIMD's and the exclusives too)
++            } else if ((inst & 0x1C000000) == 0x10000000) {
++                // data processing (immediate)
++                if ((inst & 0x3F800000) == 0x31000000 ||  // ADDS, SUBS (CMN, CMP)
++                    (inst & 0x7F800000) == 0x72000000)    // ANDS (TST)
++                    sets = FlagsAll;
++            } else if ((inst & 0x0E000000) == 0x0A000000) {
++                // data processing (register)
++                if ((inst & 0x10000000) == 0) {
++                    if ((inst & 0x01000000) == 0) {
++                        if ((inst & 0x60000000) == 0x60000000)
++                            sets = FlagsAll;  // ANDS, BICS (TST)
++                    } else if (inst & 0x20000000) {
++                        sets = FlagsAll;  // ADDS, SUBS (shifted, extended register; CMN, CMP)
++                    }
++                } else if ((inst & 0x01000000) != 0) {
++                    // three sources (MADD, SMULH...)
++                } else {
++                    switch ((inst >> 21) & 0xF) {
++                    case 0b0000:  // ADC, ADCS, SBC, SBCS (RMIF, SETF8, SETF16: unknown)
++                        if ((inst & 0xFC00) != 0)
++                            return true;
++                        reads = FlagC;
++                        sets = (inst & 0x20000000) ? FlagsAll : 0;
++                        break;
++                    case 0b0010:  // CCMN, CCMP: the condition, then all of them
++                        if ((inst & 0x20000000) == 0)
++                            return true;
++                        reads = FlagsReadByCond((inst >> 12) & 0xF);
++                        sets = FlagsAll;
++                        break;
++                    case 0b0100:  // CSEL, CSINC, CSINV, CSNEG (CSET, CINC...)
++                        reads = FlagsReadByCond((inst >> 12) & 0xF);
++                        break;
++                    case 0b0110:  // one and two sources (CLZ, RBIT, REV, UDIV, LSLV, CRC32...)
++                        break;
++                    default:
++                        return true;
++                    }
++                }
++            } else if ((inst & 0x0E000000) == 0x0E000000) {
++                // SIMD and floating point
++                if ((inst & 0xFF20FC07) == 0x1E202000) {  // FCMP, FCMPE
++                    sets = FlagsAll;
++                } else if ((inst & 0xFF200C00) == 0x1E200400) {  // FCCMP, FCCMPE
++                    reads = FlagsReadByCond((inst >> 12) & 0xF);
++                    sets = FlagsAll;
++                } else if ((inst & 0xFF200C00) == 0x1E200C00) {  // FCSEL
++                    reads = FlagsReadByCond((inst >> 12) & 0xF);
++                }
++            } else if ((inst & 0x1C000000) == 0x14000000) {
++                // branches, exception generation, system
++                if ((inst & 0x7C000000) == 0x14000000) {  // B, BL
++                    if ((inst & 0x80000000) && abi)
++                        return false;  // a call
++                    if (branches <= 0)
++                        return true;
++                    const u64 target = pc + u64(s64(s32(inst << 6) >> 4));
++                    if (Seen(target, unset))
++                        return false;
++                    pc = target;
++                    branches--;
++                    continue;
++                }
++                u64 target = 0;
++                bool branch = true;
++                if ((inst & 0xFF000010) == 0x54000000) {  // B.cond
++                    if (FlagsReadByCond(inst & 0xF) & unset)
++                        return true;
++                    target = pc + u64(s64(s32(inst << 8) >> 11));
++                } else if ((inst & 0x7E000000) == 0x34000000) {  // CBZ, CBNZ
++                    target = pc + u64(s64(s32(inst << 8) >> 11));
++                } else if ((inst & 0x7E000000) == 0x36000000) {  // TBZ, TBNZ
++                    target = pc + u64(s64(s32(inst << 13) >> 16));
++                } else if ((inst & 0xFE000000) == 0xD6000000) {  // through a register
++                    if (abi && (IsCall(inst) || IsReturn(inst)))
++                        return false;
++                    return true;  // BR, ERET...: somewhere unknown
++                } else if ((inst & 0xFFFFF01F) == 0xD503201F || (inst & 0xFFFFF01F) == 0xD503301F) {
++                    // hints (NOP, YIELD, BTI, the PAC hints...), CLREX, DSB, DMB, ISB, SB
++                    branch = false;
++                } else if ((inst & 0xFFFFFFE0) == 0xD53B4200) {  // MRS Xt, NZCV
++                    return true;
++                } else if ((inst & 0xFFFFFFE0) == 0xD51B4200) {  // MSR NZCV, Xt
++                    sets = FlagsAll;
++                    branch = false;
++                } else if ((inst & 0xFFF00000) == 0xD5300000 || (inst & 0xFFF00000) == 0xD5100000 ||
++                           (inst & 0xFFF80000) == 0xD5080000) {
++                    // MRS, MSR (register), SYS (DC, IC, TLBI)
++                    branch = false;
++                } else {
++                    return true;  // SVC, BRK, HLT, MSR (immediate: PSTATE, CFINV, XAFLAG...), SYSL...
++                }
++                if (branch) {
++                    if (branches <= 0)
++                        return true;
++                    if (Live(target, unset, branches - 1))
++                        return true;
++                    branches--;
++                }
++            } else {
++                return true;  // SVE, SME, unallocated
++            }
++            if (reads & unset)
++                return true;
++            unset &= ~sets;
++            pc += 4;
++        }
++        return false;
++    }
++};
++
++// IR::Block::nzcv_dead_at_exit for a block ending in links to other code, or (abi) in a call or a
++// return
++void LookAheadForFlags(IR::Block& block, const MemoryReadCodeFuncType& read_code, bool abi) {
++    const LocationDescriptor end{block.EndLocation()};
++    if (abi) {
++        if (const auto last = read_code(end.PC() - 4); last && (IsCall(*last) || IsReturn(*last))) {
++            block.nzcv_dead_at_exit = true;
++            return;
++        }
++    }
++    boost::container::static_vector<LocationDescriptor, 2> successors;
++    const auto leaf = [&](const IR::Term::LeafTerminal& term) {
++        if (const auto* link = std::get_if<IR::Term::LinkBlock>(&term))
++            successors.push_back(LocationDescriptor{link->next});
++        else if (const auto* fast = std::get_if<IR::Term::LinkBlockFast>(&term))
++            successors.push_back(LocationDescriptor{fast->next});
++        else
++            return false;
++        return true;
++    };
++    const auto& terminal = block.GetTerminal();
++    if (const auto* if_ = std::get_if<IR::Term::If>(&terminal)) {
++        if (!leaf(if_->then_) || !leaf(if_->else_))
++            return;
++    } else if (const auto* check = std::get_if<IR::Term::CheckBit>(&terminal)) {
++        if (!leaf(check->then_) || !leaf(check->else_))
++            return;
++    } else if (const auto* l = std::get_if<IR::Term::LeafTerminal>(&terminal)) {
++        if (!leaf(*l))
++            return;
++    } else {
++        return;
++    }
++    for (const auto& next : successors) {
++        if (next.SingleStepping())
++            return;
++    }
++    FlagsLookahead lookahead{read_code, abi};
++    for (const auto& next : successors) {
++        if (lookahead.Live(next.PC(), FlagsAll, 6))
++            return;
++    }
++    block.nzcv_dead_at_exit = true;
++    block.lookahead.assign(lookahead.runs.begin(), lookahead.runs.end());
++}
++
++}  // namespace
++
+ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
+     const bool single_step = descriptor.SingleStepping();
+-    TranslatorVisitor visitor{block, descriptor, std::move(options)};
++    TranslatorVisitor visitor{block, descriptor, options};
+ 
+     bool should_continue = true;
+     do {
+@@ -41,6 +282,10 @@ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFu
+     }
+     ASSERT(block.HasTerminal() && "Terminal has not been set");
+     block.SetEndLocation(*visitor.ir.current_location);
++
++    if (options.nzcv_lookahead && !single_step) {
++        LookAheadForFlags(block, memory_read_code, options.nzcv_lookahead_abi);
++    }
+ }
+ 
+ bool TranslateSingleInstruction(IR::Block& block, LocationDescriptor descriptor, u32 instruction) {
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 61033eb530..3299029356 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -38,6 +38,16 @@ struct TranslationOptions {
+     /// If this is false, we treat the instruction as a NOP.
+     /// If this is true, we emit an ExceptionRaised instruction.
+     bool hook_hint_instructions = true;
++
++    /// A block ending in links to other code reads the code they start with to tell whether the
++    /// condition flags it ends with are dead there (IR::Block::nzcv_dead_at_exit;
++    /// UserConfig::elide_dead_nzcv).
++    bool nzcv_lookahead = false;
++
++    /// With nzcv_lookahead: calls (BL, BLR) and returns (RET) end a path with the flags dead, as
++    /// the procedure call standard has them; a block ending in one has them dead at its exit
++    /// (UserConfig::elide_dead_nzcv_abi).
++    bool nzcv_lookahead_abi = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 5bbfa6a33e..934e83cfde 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -368,6 +368,19 @@ struct UserConfig {
+     /// cache's top down: the code that runs lies together, in fewer cache lines and pages.
+     bool split_cold_code = false;
+ 
++    /// (PS4 04.23, as A32's) A block reads the code its successors start with (a few
++    /// instructions, along their branches): when they set the condition flags before reading
++    /// them, the flags the block ends with are dead. It then doesn't store them, and a
++    /// conditional branch at its end tests the compare's values on the host directly (cmp; jcc)
++    /// instead of the stored flags. Off with cycle counting and with halts on memory accesses.
++    bool elide_dead_nzcv = false;
++
++    /// With elide_dead_nzcv: a call (BL, BLR) or a return (RET) ends a path of the look-ahead
++    /// with the flags dead, and a block ending in one has them dead at its exit, as the procedure
++    /// call standard has NZCV not preserved across calls. Compiled code keeps to that. Off: calls
++    /// are followed, returns count as reads (exact for any code).
++    bool elide_dead_nzcv_abi = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/basic_block.h b/src/dynarmic/src/dynarmic/ir/basic_block.h
+index 4bda2a6388..fd812b5128 100644
+--- a/src/dynarmic/src/dynarmic/ir/basic_block.h
++++ b/src/dynarmic/src/dynarmic/ir/basic_block.h
+@@ -166,7 +166,7 @@ public:
+     /// Number of cycles this block takes to execute.
+     size_t cycle_count = 0;
+     /// The guest code its successors start with sets the condition flags before reading any of
+-    /// them (A32, TranslationOptions::nzcv_lookahead): the flags it ends with are dead, it need not
++    /// them (A32 and A64, TranslationOptions::nzcv_lookahead): the flags it ends with are dead, it need not
+     /// store them. lookahead: the guest code that was read to tell, as runs of consecutive
+     /// instructions (start, end exclusive), for invalidation (the block depends on them as on its
+     /// own code). Each run on its own: one range from the lowest address read to the highest
+@@ -175,7 +175,7 @@ public:
+     /// The same for the FPSCR's NZCV (a VCMP's): its successors set it again (a VCMP, VMSR) before
+     /// any VMRS reads it
+     bool fpscr_nzcv_dead_at_exit = false;
+-    std::vector<std::pair<u32, u32>> lookahead;
++    std::vector<std::pair<u64, u64>> lookahead;
+ };
+ static_assert(sizeof(Block) == 4096);
+ 
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index 4aabd16e72..af9e7bb187 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -614,6 +614,10 @@ constexpr bool IsCondFlagsForTerminal(const Opcode op) noexcept {
+         || op == Opcode::CondFlagsAdd32
+         || op == Opcode::CondFlagsTest32
+         || op == Opcode::CondFlagsNZ32
++        || op == Opcode::CondFlagsSub64
++        || op == Opcode::CondFlagsAdd64
++        || op == Opcode::CondFlagsTest64
++        || op == Opcode::CondFlagsNZ64
+         || op == Opcode::CondFlagsFP32
+         || op == Opcode::CondFlagsFP64;
+ }
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index a2ea9dfae9..386c9b12b1 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -36,6 +36,10 @@ OPCODE(CondFlagsSub32,                                      Void,           U32,
+ OPCODE(CondFlagsAdd32,                                      Void,           U32,            U32                                             )
+ OPCODE(CondFlagsTest32,                                     Void,           U32,            U32                                             )
+ OPCODE(CondFlagsNZ32,                                       Void,           U32                                                             )
++OPCODE(CondFlagsSub64,                                      Void,           U64,            U64                                             )
++OPCODE(CondFlagsAdd64,                                      Void,           U64,            U64                                             )
++OPCODE(CondFlagsTest64,                                     Void,           U64,            U64                                             )
++OPCODE(CondFlagsNZ64,                                       Void,           U64                                                             )
+ // (a float compare: ucomiss/ucomisd of the two, in the order the condition needs: A32DeadNZCVPass)
+ OPCODE(CondFlagsFP32,                                       Void,           U32,            U32                                             )
+ OPCODE(CondFlagsFP64,                                       Void,           U64,            U64                                             )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 49e502eb55..8f2d5cf01e 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -788,6 +788,131 @@ static void A32DeadNZCVPass(IR::Block& block) {
+     drop_unused_compare();
+ }
+ 
++// A64's: a block whose flags are dead at its exit (IR::Block::nzcv_dead_at_exit) doesn't store
++// those its last flag-setting instructions make (after the last instruction that reads them); one
++// that ends in a conditional branch then branches on the host's flags as a compare of the values
++// they came from left them (CondFlags*, the block's last instruction: cmp; jcc). A branch whose
++// flags have no such form (ADCS, CCMP, MSR NZCV) keeps the stored flags.
++static void A64DeadNZCVPass(IR::Block& block) {
++    if (!block.nzcv_dead_at_exit)
++        return;
++    boost::container::small_vector<IR::Inst*, 8> writes;  // the last setters, latest first
++    for (auto it = block.instructions.rbegin(); it != block.instructions.rend(); ++it) {
++        const auto op = it->GetOpcode();
++        if (op == IR::Opcode::A64SetNZCV || op == IR::Opcode::A64SetNZCVRaw) {
++            writes.push_back(&*it);
++            continue;
++        }
++        if (ReadsFromCPSR(op) || CausesCPUException(op))
++            break;
++    }
++    if (writes.empty())
++        return;
++
++    IR::Inst* compare = nullptr;  // a float compare left without uses (DCE keeps them)
++    const auto finish = [&] {
++        for (IR::Inst* const write : writes) {
++            if (write->GetOpcode() == IR::Opcode::A64SetNZCV && !write->GetArg(0).IsImmediate()) {
++                IR::Inst* const flags = write->GetArg(0).GetInst();
++                if (flags->GetOpcode() == IR::Opcode::FPCompare32 || flags->GetOpcode() == IR::Opcode::FPCompare64)
++                    compare = flags;
++            }
++            write->Invalidate();
++        }
++        if (compare && compare->UseCount() == 0)
++            compare->Invalidate();
++    };
++
++    const IR::Term::Terminal terminal = block.GetTerminal();
++    const auto* const if_ = std::get_if<IR::Term::If>(&terminal);
++    if (!if_ || if_->if_ == IR::Cond::AL || if_->if_ == IR::Cond::NV) {
++        finish();
++        return;
++    }
++    const IR::Cond cond = if_->if_;
++    const bool nz_only = cond == IR::Cond::EQ || cond == IR::Cond::NE || cond == IR::Cond::MI || cond == IR::Cond::PL;
++    const bool hi_ls = cond == IR::Cond::HI || cond == IR::Cond::LS;
++    IR::Inst* const last = writes.front();
++    if (last->GetOpcode() != IR::Opcode::A64SetNZCV || last->GetArg(0).IsImmediate())
++        return;
++    IR::Inst* const flags = last->GetArg(0).GetInst();
++
++    if (flags->GetOpcode() == IR::Opcode::FPCompare32 || flags->GetOpcode() == IR::Opcode::FPCompare64) {
++        // FCMP: ucomis of its operands, swapped for the conditions on N or C alone and HI/LS
++        // (EmitCond's FP mapping, the same flags as A32's VCMP)
++        const bool swap = cond == IR::Cond::MI || cond == IR::Cond::PL || cond == IR::Cond::HI || cond == IR::Cond::LS ||
++                          cond == IR::Cond::CS || cond == IR::Cond::CC;
++        const IR::Value x = flags->GetArg(swap ? 1 : 0), y = flags->GetArg(swap ? 0 : 1);
++        block.AppendNewInst(flags->GetOpcode() == IR::Opcode::FPCompare32 ? IR::Opcode::CondFlagsFP32 : IR::Opcode::CondFlagsFP64, {x, y});
++        finish();
++        return;
++    }
++    if (flags->GetOpcode() != IR::Opcode::GetNZCVFromOp || flags->GetArg(0).IsImmediate())
++        return;
++    const IR::Value source = flags->GetArg(0);
++    IR::Inst* const op = source.GetInst();
++    const bool is64 = source.GetType() == IR::Type::U64;
++    if (!is64 && source.GetType() != IR::Type::U32)
++        return;
++    const auto carry_in = [&](bool value) {
++        return op->GetArg(2).IsImmediate() && op->GetArg(2).GetU1() == value;
++    };
++    // the result is wanted anyway (by more than these flags): N and Z from it (test r, r) keep
++    // its operands from having to live to the end
++    const bool result_used = op->UseCount() > 1;
++
++    IR::Opcode cond_flags;
++    boost::container::static_vector<IR::Value, 2> args;
++    switch (op->GetOpcode()) {
++    case IR::Opcode::Sub32:
++    case IR::Opcode::Sub64:
++        if (!carry_in(true))
++            return;  // (SBCS)
++        if (nz_only && result_used) {
++            cond_flags = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
++            args = {source};
++        } else {
++            cond_flags = is64 ? IR::Opcode::CondFlagsSub64 : IR::Opcode::CondFlagsSub32;  // CMP, SUBS
++            args = {op->GetArg(0), op->GetArg(1)};
++        }
++        break;
++    case IR::Opcode::Add32:
++    case IR::Opcode::Add64:
++        if (!carry_in(false))
++            return;  // (ADCS)
++        if (nz_only && result_used) {
++            cond_flags = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
++            args = {source};
++        } else if (!hi_ls) {
++            cond_flags = is64 ? IR::Opcode::CondFlagsAdd64 : IR::Opcode::CondFlagsAdd32;  // CMN, ADDS
++            args = {op->GetArg(0), op->GetArg(1)};
++        } else {
++            return;
++        }
++        break;
++    case IR::Opcode::And32:
++    case IR::Opcode::And64:
++        // ANDS, TST, BICS (an And of a Not): N and Z, C and V clear (no HI, LS: C clear there)
++        if (hi_ls)
++            return;
++        if (result_used) {
++            cond_flags = is64 ? IR::Opcode::CondFlagsNZ64 : IR::Opcode::CondFlagsNZ32;
++            args = {source};
++        } else {
++            cond_flags = is64 ? IR::Opcode::CondFlagsTest64 : IR::Opcode::CondFlagsTest32;
++            args = {op->GetArg(0), op->GetArg(1)};
++        }
++        break;
++    default:
++        return;
++    }
++    if (args.size() == 2)
++        block.AppendNewInst(cond_flags, {args[0], args[1]});
++    else
++        block.AppendNewInst(cond_flags, {args[0]});
++    finish();
++}
++
+ static void A32GetSetElimination(IR::Block& block, A32GetSetEliminationOptions) {
+     FlagsPass(block);
+     RegisterPass(block);
+@@ -1902,6 +2027,10 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+         Optimization::A64SharedWalkPass(block);
+         Optimization::DeadCodeElimination(block);
+     }
++    if (conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access) {
++        Optimization::A64DeadNZCVPass(block);
++        Optimization::DeadCodeElimination(block);
++    }
+     Optimization::IdentityRemovalPass(block);
+     if (!conf.HasOptimization(OptimizationFlag::DisableVerification)) {
+         Optimization::VerificationPass(block);
+-- 
+2.43.0
+

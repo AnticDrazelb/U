@@ -379,6 +379,51 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.23: **64-bit games' CPU code: branches on the host's flags, dead flags, floats in vector
+registers.** Per 20 steady frames of `game.c` built for AArch64 (callgrind, 30 minus 10 frames,
+Eden's options, no frame pointer): 3,415,799 instructions in 04.22, 2,696,927 now (-21.0%).
+What 04.22's profile of that code showed: the guest flags were 11% of what the translated code
+executed (`cmc; lahf; seto; mov [nzcv]` after each compare, `mov eax, [nzcv]; sahf...` before
+each branch), floats went through general registers between instructions, conditional branches
+stored their bit and tested it again.
+
+- Patch 0117: **A64 branches on the host's flags.** CBZ, CBNZ, TBZ, TBNZ test the register
+  (`test r, r`, `test r32, 1 << i`, `bt r64, i`) right before the branch instead of storing the
+  check bit and comparing it (`FuseCheckBit`); a B.cond right after the ADDS/SUBS/CMP/CMN that
+  set its flags branches on the flags the add or subtract left (`FuseCondFlags`: `jz`, `jc`,
+  `jg`..., HI and LS after a `cmc`), when nothing between them changes the host's flags. And an
+  access at a constant address that is inside the fastmem arena skips its range check (-3.2%).
+- Patch 0118: **scalar floats stay in vector registers**: lane 0 of a vector is read in place
+  (no `movd`/`movq` out to a general register and back), and a word widened to a quad (`SetS`)
+  is one `insertps` (-7.7%).
+- Patch 0119: **dead flags (A32's `elide_dead_nzcv`, for A64).** A block reads the code its
+  successors start with (64 instructions at most along their branches: loads, stores and
+  arithmetic pass, a B.cond/CSEL/CCMP/ADC/FCSEL reading a flag not set again ends it as live,
+  CMP/ADDS/ANDS/FCMP/CCMP set them all, anything unknown is a read); when every path sets the
+  flags before reading them, the block doesn't store the flags it ends with, and a B.cond at its
+  end branches on a compare of the values they came from (`CondFlagsSub64/Add64/Test64/NZ64` and
+  the 32-bit and float forms: `cmp; jcc`, `test r, r; jcc` when the result is kept anyway)
+  (-5.9%). With `elide_dead_nzcv_abi`, a call or a return ends a path with the flags dead, and a
+  block ending in BL, BLR or RET doesn't store them (the procedure call standard has NZCV not
+  preserved across calls) (-6.2% more). The code read is part of the block's ranges (invalidation,
+  the translation cache's hash). Flag work is now under 4% of the translated code's instructions.
+- Patch 0120: the 30-second line counts the game's writes to memory the GPU caches by what they
+  cost: to the page the core's last one went to, collected for the GPU's own changes, or
+  invalidating its caches (two locks, the buffer and texture caches' lookups). Echoes of Wisdom
+  made 50-84 thousand a second leave the inline walk (the 04.22 logs), nearly all writes.
+- Tests: the A64 harness's `DYN_NZCV`, `DYN_NZCVABI` (`HAVE_DEAD_NZCV64`). `gen11.py`: flag
+  setters (CMP/CMN/SUBS/ADDS/TST/ANDS, W and X, register, shifted, immediate) right before every
+  B.cond, CBZ/CBNZ/TBZ/TBNZ on every bit, edge values, flag readers after the branches;
+  `gen12.py`: scalar floats. The previous build vs the new: gen11 150 (with calls and returns ending
+  the flags), gen8 250 (no fastmem and a mapped arena; without them: gen8's random functions read
+  the flags a call left, which compiled code doesn't), gen12 100, gen5 60, gen6 100, the cache
+  suites for gen11 and gen8 (60 each), `game.c` for AArch64 the same result; A32 against 04.23's
+  first build (gen2, gen3: 240 programs; the shared emitter changed).
+- `cgjit64.py`, `cgblock.py`: the translated code's instructions by kind and the hottest block,
+  instruction by instruction, from callgrind and the harness's dumps (A64JitState's layout).
+  What's left at the top: guest registers loaded and stored at block edges (18%), register moves
+  (21%), branches (12%).
+
 04.22: **the 32-bit translator's savings for 64-bit games; the FPS counter at the top centre.**
 The tester's 04.21 logs: the code caches got the largest tier everywhere (the system pool had 512
 MiB or more free: 160/96/96/8 MiB), and the flushes are gone (Echoes of Wisdom 0 in 7 minutes,

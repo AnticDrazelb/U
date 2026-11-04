@@ -1306,6 +1306,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.23: 64-bit games' CPU code (Zelda, Silksong, Bluey, Animal Crossing) runs leaner again: a "
+         "conditional branch tests the compare just before it on the PS4's own flags instead of saving the "
+         "Switch's flags and reading them back; flags that no later code reads aren't saved at all (the "
+         "translator reads ahead into the code a block leads to, to tell); floats stay in vector registers "
+         "instead of moving through general ones; an access at a fixed address skips its range check. A "
+         "64-bit test game runs 21% fewer instructions than in 04.22. And the 30-second line now says what "
+         "the game's writes to memory the GPU caches cost (Echoes of Wisdom makes 50-84 thousand a second).\n"
          "04.22: 64-bit games (Zelda, Silksong, Bluey, Animal Crossing) get three of the CPU translator's "
          "savings that only 32-bit games such as Mario Kart had: an address's constant taken into the memory "
          "access itself (no add before it), no second zero-extension after loading a byte or halfword, and the "
@@ -2235,6 +2242,7 @@ std::string PerfLine(double seconds)
     struct Totals
     {
         uint64_t spins, sleeps, sleep_ns, ipcs, ipc_ns, events, late_ns, blocks, full, ranges, slow, slow_writes;
+        uint64_t gpu_same, gpu_collected, gpu_invalidated;
         uint64_t idle_ns[4], all_idle_ns, presents, present_ns, dequeues, dequeue_ns;
         uint64_t ipc_queue_ns, ipc_handle_ns, ipc_resume_ns, ipc_split, compile_ns;
     };
@@ -2253,6 +2261,9 @@ std::string PerfLine(double seconds)
                      P::jit_range_flushes.load(std::memory_order_relaxed),
                      P::SlowMemoryAccesses(),
                      P::Total(P::slow_memory_writes),
+                     P::gpu_cached_writes_same.load(std::memory_order_relaxed),
+                     P::gpu_cached_writes_collected.load(std::memory_order_relaxed),
+                     P::gpu_cached_writes_invalidated.load(std::memory_order_relaxed),
                      {idle_ns[0], idle_ns[1], idle_ns[2], idle_ns[3]},
                      all_idle_ns,
                      P::present_wait.count.load(std::memory_order_relaxed),
@@ -2280,7 +2291,9 @@ std::string PerfLine(double seconds)
         "a second, {:.0f} us late (at most {:.0f}; timed waits overshoot {:.0f} us); the recompiler translated {:.0f} "
         "blocks a second ({:.1f} ms of the emulated cores' time a second), flushed its whole cache {} times and "
         "parts of it {} times; {:.0f} memory accesses a second "
-        "left the inline page table walk ({:.0f} of them writes)",
+        "left the inline page table walk ({:.0f} of them writes); writes to memory the GPU caches, a second: "
+        "{:.0f} to the page the last one went to, {:.0f} collected for the GPU's own changes, {:.0f} "
+        "invalidating its caches",
         rate(now.spins, last.spins), rate(now.sleeps, last.sleeps),
         average_us(now.sleep_ns - last.sleep_ns, now.sleeps - last.sleeps), double(sleep_max) / 1000.0,
         rate(now.ipcs, last.ipcs), average_us(now.ipc_ns - last.ipc_ns, now.ipcs - last.ipcs), double(ipc_max) / 1000.0,
@@ -2291,7 +2304,8 @@ std::string PerfLine(double seconds)
         double(late_max) / 1000.0, double(P::timer_overshoot_ns.load(std::memory_order_relaxed)) / 1000.0,
         rate(now.blocks, last.blocks), double(now.compile_ns - last.compile_ns) / seconds / 1e6,
         now.full - last.full, now.ranges - last.ranges, rate(now.slow, last.slow),
-        rate(now.slow_writes, last.slow_writes));
+        rate(now.slow_writes, last.slow_writes), rate(now.gpu_same, last.gpu_same),
+        rate(now.gpu_collected, last.gpu_collected), rate(now.gpu_invalidated, last.gpu_invalidated));
     // Each emulated core's code cache: what's left of it (a full one is flushed and its code
     // translated again, a stutter), and its whole flushes so far
     {

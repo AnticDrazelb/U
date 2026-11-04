@@ -266,6 +266,13 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.skip_redundant_extensions = std::getenv("DYN_EXT") != nullptr;
     config.split_cold_code = std::getenv("DYN_COLD") != nullptr;
 #endif
+#ifdef HAVE_DEAD_NZCV64  // (04.23) the flags look-ahead (DYN_NZCV), calls and returns end it (DYN_NZCVABI)
+    config.elide_dead_nzcv = std::getenv("DYN_NZCV") != nullptr;
+    config.elide_dead_nzcv_abi = std::getenv("DYN_NZCVABI") != nullptr;
+#endif
+#ifdef HAVE_RSB_PC  // (04.24) return stack entries of the PC alone (DYN_RSBPC)
+    config.return_stack_pc_only = std::getenv("DYN_RSBPC") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |

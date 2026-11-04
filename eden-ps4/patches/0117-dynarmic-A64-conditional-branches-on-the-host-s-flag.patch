@@ -1,0 +1,352 @@
+From a9babbf7793d073eae4973b9a79e21b77ab5fd72 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 23:15:05 +0000
+Subject: [PATCH 117/119] dynarmic A64: conditional branches on the host's
+ flags; constant addresses without the range check
+
+FuseCheckBit: a block ending in CBZ/CBNZ/TBZ/TBNZ (SetCheckBit last, a CheckBit terminal) tests
+the register (test r,r / test r32,mask / bt r,n) and the terminal branches on the flags, instead
+of setcc, movzx, a store to the stack and a compare with it (half the samples in Bluey's hottest
+blocks are in such blocks). FuseCondFlags: a block ending in B.cond after CMP/CMN/SUBS/ADDS/ADCS/
+SBCS with only stores of results between: the If terminal branches on the host's flags (Z, N, V as
+ARM's, CF as ARM's C after EmitAdd/EmitSub; HI/LS after a cmc) instead of reloading NZCV. Not with
+cycle counting (its subtraction comes between). Constant addresses in the fastmem arena (ADRP +
+offset: globals): no range check.
+
+Tests: gen11 (every flag setter right before every B.cond; CBZ/TBZ on every bit; edge values),
+gen5/6/8 x no fastmem, out-of-arena, mapped arena, no walk: 790 programs the same as the previous
+build; cache suites. game.c for AArch64: 3.3% fewer instructions a frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 165 +++++++++++++++++-
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |  12 ++
+ .../backend/x64/emit_x64_memory.cpp.inc       |  24 ++-
+ .../dynarmic/backend/x64/emit_x64_memory.h    |  10 +-
+ 4 files changed, 200 insertions(+), 11 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index ae96434827..3c8ac3b652 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -107,6 +107,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+ 
+     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
+     FoldAddressOffsets(ctx, block);
++    FuseCheckBit(block);
++    FuseCondFlags(block);
+     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
+     constexpr EmitHandlerFn opcode_handlers[] = {
+ #define OPCODE(name, type, ...) &EmitX64::Emit##name,
+@@ -277,6 +279,84 @@ void A64EmitX64::FoldAddressOffsets(A64EmitContext& ctx, IR::Block& block) {
+     }
+ }
+ 
++void A64EmitX64::FuseCheckBit(IR::Block& block) {
++    check_bit_fusion = CheckBitFusion::None;
++    // (cycle counting subtracts from the counter between the last instruction and the terminal:
++    // the flags wouldn't last)
++    if (conf.enable_cycle_counting || block.instructions.empty() ||
++        !std::holds_alternative<IR::Term::CheckBit>(block.GetTerminal()))
++        return;
++    IR::Inst& last = block.instructions.back();
++    if (last.GetOpcode() != IR::Opcode::A64SetCheckBit || last.GetArg(0).IsImmediate())
++        return;
++    IR::Inst* const producer = last.GetArg(0).GetInst();
++    const auto op = producer->GetOpcode();
++    if (producer->UseCount() == 1 && (op == IR::Opcode::IsZero32 || op == IR::Opcode::IsZero64) &&
++        !producer->GetArg(0).IsImmediate()) {
++        // CBZ/CBNZ: test the register itself
++        last.SetArg(0, producer->GetArg(0));
++        producer->Invalidate();
++        check_bit_fusion = op == IR::Opcode::IsZero32 ? CheckBitFusion::Zero32 : CheckBitFusion::Zero64;
++    } else if (producer->UseCount() == 1 && op == IR::Opcode::TestBit && !producer->GetArg(0).IsImmediate() &&
++               producer->GetArg(1).IsImmediate()) {
++        // TBZ/TBNZ: test the bit in the register
++        check_bit_index = u8(producer->GetArg(1).GetU8() & 63);
++        last.SetArg(0, producer->GetArg(0));
++        producer->Invalidate();
++        check_bit_fusion = check_bit_index < 32 ? CheckBitFusion::BitLow : CheckBitFusion::BitHigh;
++    } else {
++        // any other bit: tested in its register, no store
++        check_bit_fusion = CheckBitFusion::Bool;
++    }
++}
++
++void A64EmitX64::FuseCondFlags(IR::Block& block) {
++    if_flags_fused = false;
++    if (conf.enable_cycle_counting || block.instructions.empty())
++        return;
++    const IR::Term::Terminal terminal = block.GetTerminal();
++    const auto* const term = std::get_if<IR::Term::If>(&terminal);
++    if (!term || term->if_ == IR::Cond::AL || term->if_ == IR::Cond::NV)
++        return;
++    // from the end back: SetNZCV(GetNZCVFromOp(op)), with nothing between op and it but stores
++    // of results (plain movs: they leave the flags), and op an add or subtract that makes the
++    // flags itself (EmitAdd/EmitSub with their GetNZCVFromOp: CF is ARM's C after them)
++    auto it = block.instructions.end();
++    --it;
++    if (it->GetOpcode() != IR::Opcode::A64SetNZCV || it->GetArg(0).IsImmediate())
++        return;
++    const IR::Inst* const nzcv = it->GetArg(0).GetInst();
++    if (nzcv->GetOpcode() != IR::Opcode::GetNZCVFromOp || nzcv->GetArg(0).IsImmediate())
++        return;
++    const IR::Inst* const op = nzcv->GetArg(0).GetInst();
++    switch (op->GetOpcode()) {
++    case IR::Opcode::Add32:
++    case IR::Opcode::Add64:
++    case IR::Opcode::Sub32:
++    case IR::Opcode::Sub64:
++        break;
++    default:
++        return;
++    }
++    while (it != block.instructions.begin()) {
++        --it;
++        if (&*it == op) {
++            if_flags_fused = true;
++            return;
++        }
++        switch (it->GetOpcode()) {
++        case IR::Opcode::A64SetW:
++        case IR::Opcode::A64SetX:
++        case IR::Opcode::A64SetSP:
++        case IR::Opcode::GetNZCVFromOp:
++        case IR::Opcode::Void:
++            continue;
++        default:
++            return;
++        }
++    }
++}
++
+ void A64EmitX64::ClearCache() {
+     EmitX64::ClearCache();
+     Ps4BlockMap::Clear(code.getCode(), false);
+@@ -377,8 +457,39 @@ void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+-    const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
+-    code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
++    switch (check_bit_fusion) {
++    case CheckBitFusion::None: {
++        const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
++        code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
++        break;
++    }
++    // (FuseCheckBit: the block's last instruction; the terminal branches on these flags)
++    case CheckBitFusion::Bool: {
++        const Xbyak::Reg8 bit = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
++        code.test(bit, bit);
++        break;
++    }
++    case CheckBitFusion::Zero32: {
++        const Xbyak::Reg32 value = ctx.reg_alloc.UseGpr(code, args[0]).cvt32();
++        code.test(value, value);
++        break;
++    }
++    case CheckBitFusion::Zero64: {
++        const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[0]);
++        code.test(value, value);
++        break;
++    }
++    case CheckBitFusion::BitLow: {
++        const Xbyak::Reg32 value = ctx.reg_alloc.UseGpr(code, args[0]).cvt32();
++        code.test(value, u32(1) << check_bit_index);
++        break;
++    }
++    case CheckBitFusion::BitHigh: {
++        const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[0]);
++        code.bt(value, check_bit_index);
++        break;
++    }
++    }
+ }
+ 
+ void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -859,20 +970,62 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
+     case IR::Cond::NV:
+         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
+         break;
+-    default:
+-        Xbyak::Label pass = e.EmitCond(terminal.if_);
++    default: {
++        Xbyak::Label pass;
++        if (e.if_flags_fused) {
++            // (FuseCondFlags: Z, N, V as ARM's, CF ARM's C; for HI and LS, CF inverted to the
++            // borrow first, so that ja/jbe test C and Z at once)
++            e.if_flags_fused = false;
++            switch (terminal.if_) {
++            case IR::Cond::EQ: e.code.jz(pass); break;
++            case IR::Cond::NE: e.code.jnz(pass); break;
++            case IR::Cond::CS: e.code.jc(pass); break;
++            case IR::Cond::CC: e.code.jnc(pass); break;
++            case IR::Cond::MI: e.code.js(pass); break;
++            case IR::Cond::PL: e.code.jns(pass); break;
++            case IR::Cond::VS: e.code.jo(pass); break;
++            case IR::Cond::VC: e.code.jno(pass); break;
++            case IR::Cond::HI: e.code.cmc(); e.code.ja(pass); break;
++            case IR::Cond::LS: e.code.cmc(); e.code.jbe(pass); break;
++            case IR::Cond::GE: e.code.jge(pass); break;
++            case IR::Cond::LT: e.code.jl(pass); break;
++            case IR::Cond::GT: e.code.jg(pass); break;
++            case IR::Cond::LE: e.code.jle(pass); break;
++            default: UNREACHABLE();
++            }
++        } else {
++            pass = e.EmitCond(terminal.if_);
++        }
+         e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
+         e.code.L(pass);
+         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
+         break;
+     }
++    }
+     return true;
+ }
+ 
+ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+     Xbyak::Label fail;
+-    e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+-    e.code.jz(fail);
++    // the bit false: to else_ (FuseCheckBit: the flags the last instruction's test left)
++    switch (e.check_bit_fusion) {
++    case A64EmitX64::CheckBitFusion::None:
++        e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
++        e.code.jz(fail);
++        break;
++    case A64EmitX64::CheckBitFusion::Bool:
++    case A64EmitX64::CheckBitFusion::BitLow:
++        e.code.jz(fail);  // (the bit, or the tested bit, is 0)
++        break;
++    case A64EmitX64::CheckBitFusion::Zero32:
++    case A64EmitX64::CheckBitFusion::Zero64:
++        e.code.jnz(fail);  // (IsZero false: the register isn't 0)
++        break;
++    case A64EmitX64::CheckBitFusion::BitHigh:
++        e.code.jnc(fail);  // (bt: the bit into CF)
++        break;
++    }
++    e.check_bit_fusion = A64EmitX64::CheckBitFusion::None;
+     e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
+     e.code.L(fail);
+     e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 300c115ae2..1ceacec80b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -94,6 +94,18 @@ public:
+     /// (PS4 04.22) Before a block is emitted: offsets folded into its accesses' displacements and
+     /// redundant zero-extensions taken out (fold_address_offsets, skip_redundant_extensions)
+     void FoldAddressOffsets(A64EmitContext& ctx, IR::Block& block);
++    /// (PS4 04.23) A block ending in CBZ/CBNZ/TBZ/TBNZ (SetCheckBit last, a CheckBit terminal):
++    /// the test that makes the bit sets the host's flags, and the terminal branches on them,
++    /// instead of setcc, movzx, a store to the stack and a compare with it
++    enum class CheckBitFusion { None, Bool, Zero32, Zero64, BitLow, BitHigh };
++    CheckBitFusion check_bit_fusion = CheckBitFusion::None;
++    u8 check_bit_index = 0;
++    void FuseCheckBit(IR::Block& block);
++    /// (PS4 04.23) A block ending in B.cond after CMP/CMN/SUBS/ADDS (the flags' op, then only
++    /// stores of its results): the If terminal branches on the host's flags the op left (Z, N, V
++    /// as ARM's, CF as ARM's C), instead of reloading NZCV and turning it back into flags
++    bool if_flags_fused = false;
++    void FuseCondFlags(IR::Block& block);
+     FakeCall FastmemCallback(u64 rip);
+ 
+     // Memory access helpers
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 1f9e8018a8..5f55ade1ac 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -67,6 +67,22 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+ #endif
+ }
+ 
++// (PS4 04.23) An A64 access at a constant address known to be in the arena (the whole access): its
++// range check is left out
++template<typename Conf>
++[[maybe_unused]] static bool ConstantAddressInArena([[maybe_unused]] const Conf& conf, [[maybe_unused]] const Argument& address,
++                                                    [[maybe_unused]] std::size_t bytes) {
++#ifdef AXX_ADDRESS_64
++    if (!address.IsImmediate() || conf.silently_mirror_fastmem || conf.fastmem_address_space_bits >= 64)
++        return false;
++    const u64 a = address.GetImmediateU64();
++    const u64 limit = u64(1) << conf.fastmem_address_space_bits;
++    return a < limit && bytes <= limit - a;
++#else
++    return false;
++#endif
++}
++
+ template<std::size_t bitsize, auto callback>
+ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+@@ -100,6 +116,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+     }
+ 
++    const bool address_in_arena = ConstantAddressInArena(conf, args[1], bitsize / 8);
+     Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+     const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm(code).getIdx() : ctx.reg_alloc.ScratchGpr(code).getIdx();
+ 
+@@ -158,7 +175,8 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     } else if (fastmem_marker) {
+         // Use fastmem
+         bool require_abort_handling = false;
+-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, 0,
++                                              address_in_arena);
+ 
+         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+ 
+@@ -244,6 +262,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+         ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+     }
+ 
++    const bool address_in_arena = ConstantAddressInArena(conf, args[1], bitsize / 8);
+     Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+     const int value_idx = bitsize == 128
+                             ? ctx.reg_alloc.UseXmm(code, args[2]).getIdx()
+@@ -304,7 +323,8 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+     } else if (fastmem_marker) {
+         // Use fastmem
+         bool require_abort_handling = false;
+-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, 0,
++                                               address_in_arena);
+ 
+         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index e9a46f37cb..bc9fa1be32 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -215,16 +215,20 @@ template<>
+ // (PS4 04.22) disp: a constant folded into the access's displacement (A64EmitX64::
+ // FoldAddressOffsets): the range check then makes sure vaddr + disp is in the arena
+ template<typename EmitContext>
+-Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 disp = 0);
++Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 disp = 0, bool known_in_range = false);
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64, bool) {
+     return r13 + vaddr;
+ }
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 disp) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 disp, bool known_in_range) {
+     auto const unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
++    if (known_in_range && !ctx.conf.silently_mirror_fastmem) {
++        // (PS4 04.23) a constant address (ADRP + offset: globals) in the arena, the access with it
++        return r13 + vaddr;
++    }
+     if (disp != 0) {
+         // folded (only with a range check, unmirrored, under 64 bits): the base below the
+         // arena's size less the constant, so base + constant (no wrap) is in it
+-- 
+2.43.0
+
