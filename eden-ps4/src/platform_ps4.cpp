@@ -1306,6 +1306,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.25: 64-bit games: loads and stores through the same base no longer go through a shared "
+         "page-table lookup when the direct path works (8% fewer instructions on the test game, 33% fewer "
+         "than 04.22), and atomic loads (spin locks, job counters: Unity games use many) are plain loads "
+         "instead of locked operations that bounced the memory between cores.\n"
          "04.24: more of the same for 64-bit games: a CSEL or CSET after a compare picks its value on the "
          "PS4's own flags (cmp; cmov) instead of saving the Switch's flags and reading them back, and a "
          "function's return checks the return address as it is (8 instructions instead of 14). The 64-bit "

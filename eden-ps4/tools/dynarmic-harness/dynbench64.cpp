@@ -276,6 +276,10 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
 #ifdef HAVE_FOLLOW  // (04.24) direct calls and forward branches translated through (DYN_FOLLOW)
     config.follow_direct_branches = std::getenv("DYN_FOLLOW") != nullptr;
 #endif
+#ifdef HAVE_ACQ  // (04.25) load-acquires as plain loads (DYN_ACQ), DMB LD/ST elided (DYN_DMB)
+    config.plain_acquire_loads = std::getenv("DYN_ACQ") != nullptr;
+    config.elide_load_store_only_barriers = std::getenv("DYN_DMB") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |

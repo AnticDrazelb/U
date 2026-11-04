@@ -1,0 +1,32 @@
+From 298bed446decdfb0e90ae921002237d9077048e6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 02:04:46 +0000
+Subject: [PATCH 125/125] PS4: the A64 cores' load-acquires plain, DMB LD/ST
+ without a barrier
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 8025aa70b7..3e6a7adcee 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -300,6 +300,12 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // (04.24) the return stack holds return addresses alone, emptied when the FPCR's rounding or
+     // flush-to-zero bits change: each return checks the PC as it is (8 instructions, not 14)
+     config.return_stack_pc_only = true;
++    // (04.25) a load-acquire (LDAR, LDAXR) is a plain load, as C++'s sequentially consistent
++    // load is on x86 (the store-release before it is an xchg, a full barrier): no locked
++    // exchange-add taking the line exclusive on every atomic load, and no barrier for DMB ISHLD or
++    // ISHST, whose orders x86 keeps anyway
++    config.plain_acquire_loads = true;
++    config.elide_load_store_only_barriers = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

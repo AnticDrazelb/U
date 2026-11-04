@@ -324,6 +324,9 @@ Dynarmic::A32::UserConfig MakeConfig(Env& env, const Options& o) {
 #endif
 #ifdef HAVE_COLD
     config.split_cold_code = std::getenv("DYN_COLD") != nullptr;
+#ifdef HAVE_ACQ
+    config.plain_acquire_loads = std::getenv("DYN_ACQ") != nullptr;
+#endif
 #endif
 #endif
 #endif

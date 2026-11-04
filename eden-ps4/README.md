@@ -379,6 +379,35 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.25: **no shared page walks where fastmem works; atomics without locked loads.** Per 20
+steady frames of `game.c` for AArch64 with Eden's options: 2,425,968 instructions in 04.24,
+2,222,553 now (-8.4%; -33.4% from 04.22's 3,335,063).
+
+- **The shared page walk only for accesses fastmem was declined for.** The A64 JIT grouped every
+  run of loads and stores through one base register (an object's fields, a stack frame) into one
+  page table walk (about 18 instructions, then a test and a branch for each access), fastmem or
+  not; since 04.22's folding an access with fastmem is a `cmp`, a `jae` and the load or store
+  itself, which the walk never beats. Now, with fastmem, only the accesses it was declined for
+  (pages the PS4 can't map at the game's addresses) share walks, from the emitter's list of them
+  after the other passes (`A64SharedWalkForSlowAccesses`, as A32's); without fastmem, as before.
+  The hottest blocks of `game.c` with four field loads went from 30 instructions to 12.
+- **A load-acquire is a plain load** (`plain_acquire_loads`: LDAR, LDAXR, and A32's LDA, off
+  there): it was a locked exchange-add of 0 (`lock xadd`), about 20 cycles and the cache line
+  taken exclusive, so cores polling one atomic (a spin lock, a job counter) bounced it between
+  them. x86's loads aren't reordered with later loads or stores, and the store-release before one
+  is an `xchg` (a full barrier): the sequentially consistent mapping C++ uses on x86. **DMB ISHLD
+  and ISHST are nothing** (`elide_load_store_only_barriers`): x86 keeps loads before loads and
+  stores, and stores before stores; a DMB of all types stays a locked no-op. game.c has neither
+  (single-threaded): the gain is the games' own atomics (Unity's, the engines' job systems).
+- **Indirect jumps' location descriptor** (the fast dispatch lookup of a BLR/BR, and a return
+  stack miss): the PC masked, or'd with the FPCR's part kept in the JIT state by `SetFpcr` (4
+  instructions instead of 7).
+- Tests: `gen15.py` (LDAR/LDARB/LDARH, STLR, LDAXR/STLXR pairs, plain loads and stores and DMBs
+  of every type between them, on ordinary and marked pages) with and without fastmem; gen5
+  (exclusives, acquire forms) with and without; gen6 (accesses sharing a base) and gen8 with
+  fastmem on faulting pages (declines, then their shared walks) and without; gen14 (indirect calls
+  around FPCR changes) with and without the return stack of PCs; the cache suites.
+
 04.24: **selects on the host's flags, returns without the descriptor.** Per 20 steady frames of
 `game.c` for AArch64 with all of Eden's options (the harness's `DYN_FWD`, `DYN_RSB`, `DYN_DISP`
 too, as Eden has them; 04.23's figures were without): 3,335,063 instructions in 04.22, 2,616,091

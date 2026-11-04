@@ -1,0 +1,350 @@
+From 00f24832223a0f847aad1513d78dc8a6db7cae2b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 02:04:45 +0000
+Subject: [PATCH 124/125] dynarmic: shared page walks for fastmem's declined
+ accesses only (A64); plain load-acquires; no barrier for DMB LD/ST;
+ descriptor from a kept FPCR part
+
+A64 with fastmem grouped every run of accesses through one base into one page table walk (about
+18 instructions, then a test and a branch per access), where folded fastmem is a cmp, a jae and
+the access: now only the accesses fastmem was declined for share walks
+(A64SharedWalkForSlowAccesses after Optimize, from the emitter's list), as A32's. With
+plain_acquire_loads a load-acquire is a mov (the C++ seq_cst mapping: the store-release is an
+xchg) instead of lock xadd; elide_load_store_only_barriers drops DMB of the LD or ST type. The
+location descriptor for indirect jumps and return stack misses is the PC masked, or'd with
+fpcr_descriptor_bits (kept by SetFpcr). game.c for AArch64: -8.4% instructions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../dynarmic/backend/x64/a32_interface.cpp    |  1 +
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 27 +++++++------------
+ .../dynarmic/backend/x64/a64_interface.cpp    | 11 ++++++++
+ .../src/dynarmic/backend/x64/a64_jitstate.cpp |  1 +
+ .../src/dynarmic/backend/x64/a64_jitstate.h   |  3 +++
+ .../backend/x64/emit_x64_memory.cpp.inc       | 10 +++----
+ .../frontend/A64/translate/a64_translate.h    |  3 +++
+ .../frontend/A64/translate/impl/system.cpp    |  7 ++++-
+ .../src/dynarmic/interface/A32/config.h       |  7 +++++
+ .../src/dynarmic/interface/A64/config.h       | 12 +++++++++
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 22 +++++++++++----
+ src/dynarmic/src/dynarmic/ir/opt_passes.h     |  3 +++
+ 12 files changed, 78 insertions(+), 29 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index b0f40c3876..c8db3509ac 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -226,6 +226,7 @@ struct Jit::Impl {
+         add(conf.inline_conditional_instructions);
+         add(conf.elide_dead_nzcv);
+         add(conf.elide_dead_nzcv_abi);
++        add(conf.plain_acquire_loads);
+         add(conf.fold_address_offsets);
+         add(conf.skip_redundant_extensions);
+         add(conf.split_cold_code);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 9f8d340337..de2f665efc 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -416,13 +416,10 @@ void A64EmitX64::GenTerminalHandlers() {
+     const auto calculate_location_descriptor = [this] {
+         // This calculation has to match up with A64::LocationDescriptor::UniqueHash
+         // TODO: Optimization is available here based on known state of fpcr.
+-        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++        code.mov(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+         code.mov(rcx, A64::LocationDescriptor::pc_mask);
+-        code.and_(rcx, rdi);
+-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
+-        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+-        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+-        code.or_(rbx, rcx);
++        code.and_(rbx, rcx);
++        code.or_(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr_descriptor_bits)]);
+     };
+ 
+     Xbyak::Label fast_dispatch_cache_miss;
+@@ -963,13 +960,10 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
+             // bits change: the PC as it is; a miss puts the descriptor together)
+             code.mov(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+         } else {
+-            code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++            code.mov(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+             code.mov(rcx, A64::LocationDescriptor::pc_mask);
+-            code.and_(rcx, rdi);
+-            code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
+-            code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+-            code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+-            code.or_(rbx, rcx);
++            code.and_(rbx, rcx);
++            code.or_(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr_descriptor_bits)]);
+         }
+         code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+         code.sub(eax, 1);
+@@ -996,13 +990,10 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
+     } else if (e.conf.inline_fast_dispatch) {
+         // terminal_handler_fast_dispatch_hint, here (its miss path shared): this site's own jump
+         auto& code = e.code;
+-        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
++        code.mov(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+         code.mov(rcx, A64::LocationDescriptor::pc_mask);
+-        code.and_(rcx, rdi);
+-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
+-        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+-        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+-        code.or_(rbx, rcx);
++        code.and_(rbx, rcx);
++        code.or_(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr_descriptor_bits)]);
+         code.mov(r8, u64(e.fast_dispatch_table.data()));
+         code.mov(r12, rbx);
+         if (code.HasHostFeature(HostFeature::SSE42)) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 7bab71ed86..0cff52a4e8 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -276,8 +276,17 @@ private:
+         options.nzcv_lookahead = conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         options.nzcv_lookahead_abi = conf.elide_dead_nzcv_abi;
+         options.follow_direct_branches = conf.follow_direct_branches;
++        options.elide_load_store_only_barriers = conf.elide_load_store_only_barriers;
+         A64::Translate(ir_block, arch_descriptor, get_code, options);
+         Optimization::Optimize(ir_block, conf, polyfill_options);
++        // (PS4 04.25) With fastmem, the accesses it was declined for (pages the PS4 can't map at
++        // the game's addresses) walk the page table: one walk for those through one base
++        if (conf.fastmem_pointer && conf.page_table && conf.page_table_shared_walk && !conf.check_halt_on_memory_access &&
++            emitter.HasAccessWithoutFastmem(descriptor)) {
++            Optimization::A64SharedWalkForSlowAccesses(ir_block, [&](const IR::Inst& inst) {
++                return emitter.AccessWithoutFastmem(descriptor, inst.GetName());
++            });
++        }
+         const auto entrypoint = emitter.Emit(ir_block).entrypoint;
+         ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+             u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+@@ -354,6 +363,8 @@ private:
+         add(conf.elide_dead_nzcv_abi);
+         add(conf.return_stack_pc_only);
+         add(conf.follow_direct_branches);
++        add(conf.plain_acquire_loads);
++        add(conf.elide_load_store_only_barriers);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp
+index d541e4579c..95fa66b8b7 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.cpp
+@@ -63,6 +63,7 @@ void A64JitState::SetFpcr(u32 value) {
+     if (((fpcr ^ value) & A64::LocationDescriptor::fpcr_mask) != 0)
+         ResetRSB();
+     fpcr = value & FPCR_MASK;
++    fpcr_descriptor_bits = u64(fpcr & A64::LocationDescriptor::fpcr_mask) << A64::LocationDescriptor::fpcr_shift;
+ 
+     asimd_MXCSR &= 0x0000003D;
+     guest_MXCSR &= 0x0000003D;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
+index c3d8b04d1e..8e5ca8a74f 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_jitstate.h
+@@ -55,6 +55,9 @@ struct A64JitState {
+     u32 rsb_ptr = 0;
+     std::array<u64, RSB_SIZE> rsb_location_descriptors;
+     std::array<u64, RSB_SIZE> rsb_codeptrs;
++    // (PS4 04.25) The location descriptor's FPCR part ((fpcr & fpcr_mask) << fpcr_shift), kept by
++    // SetFpcr: the JIT's descriptor is the PC masked, or'd with it (four instructions, not seven)
++    u64 fpcr_descriptor_bits = 0;
+ 
+     u32 GetPstate() const {
+         return NZCV::FromX64(cpsr_nzcv);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 5f55ade1ac..bca01b3648 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -139,7 +139,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         bool require_abort_handling = false;
+         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp);
+ 
+-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + disp, ordered);
++        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + disp, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             // (A64: past the arena, the range check comes here and calls the stub as a fault
+@@ -178,7 +178,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, 0,
+                                               address_in_arena);
+ 
+-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
++        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
+@@ -210,7 +210,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         // Use page table
+         ASSERT(conf.page_table);
+         const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, true);
+-        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
++        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
+@@ -519,7 +519,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
+ 
+         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+ 
+-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
++        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+ 
+         fastmem_patch_info.emplace(
+             std::bit_cast<u64>(location),
+@@ -722,7 +722,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryPageTable(AxxEmitContext& ctx, IR::Inst*
+ 
+     SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+     const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr, true);
+-    EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
++    EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered && (bitsize == 128 || !conf.plain_acquire_loads));
+     code.L(*end);
+     ctx.deferred_emits.emplace_back([=, this] {
+         code.L(*abort);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index cd0467c508..a2a481585e 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -53,6 +53,9 @@ struct TranslationOptions {
+     /// is translated into it (up to three times a block, never into code the block already has).
+     /// The block's other pieces of guest code are in IR::Block::lookahead (its ranges).
+     bool follow_direct_branches = false;
++
++    /// DMB of the LD or ST type alone: nothing (UserConfig::elide_load_store_only_barriers)
++    bool elide_load_store_only_barriers = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp
+index c60fdc3ae0..3b1e8e195d 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/system.cpp
+@@ -86,7 +86,12 @@ bool TranslatorVisitor::DSB(Imm<4> /*CRm*/) {
+     return true;
+ }
+ 
+-bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
++bool TranslatorVisitor::DMB(Imm<4> CRm) {
++    // (CRm's low two bits: 01 loads, 10 stores, 11 all; the host keeps the first two orders)
++    const u32 types = CRm.ZeroExtend() & 3;
++    if (options.elide_load_store_only_barriers && (types == 1 || types == 2)) {
++        return true;
++    }
+     ir.DataMemoryBarrier();
+     return true;
+ }
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 652acd4d46..830c8127f2 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -281,6 +281,13 @@ struct UserConfig {
+     /// carries along without reading them.
+     bool elide_dead_nzcv_abi = false;
+ 
++    /// (PS4 04.25) A load-acquire (LDAR, LDAPR, LDAXR; A32's LDA, LDAEX) is a plain load (mov),
++    /// as C++'s sequentially consistent load is on x86-64, instead of a locked exchange-add of 0:
++    /// x86's loads aren't reordered with later loads or stores (acquire), and a store-release
++    /// before it (xchg) is a full barrier already. The locked one also took the cache line
++    /// exclusive: cores polling one atomic bounced it between them. 128-bit ones stay cmpxchg16b.
++    bool plain_acquire_loads = false;
++
+     /// With fastmem: a load or store at a base register plus a constant (LDR r0, [r1, #8]) takes
+     /// the constant in its displacement ([r13 + base + 8]) instead of an add (a LEA) before it.
+     /// The address can then pass 4 GiB in the fastmem arena: it faults there, and the fallback
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index e5a90e6600..89846f1eef 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -394,6 +394,18 @@ struct UserConfig {
+     /// the translation cache's hash).
+     bool follow_direct_branches = false;
+ 
++    /// (PS4 04.25) A load-acquire (LDAR, LDAPR, LDAXR; A32's LDA, LDAEX) is a plain load (mov),
++    /// as C++'s sequentially consistent load is on x86-64, instead of a locked exchange-add of 0:
++    /// x86's loads aren't reordered with later loads or stores (acquire), and a store-release
++    /// before it (xchg) is a full barrier already. The locked one also took the cache line
++    /// exclusive: cores polling one atomic bounced it between them. 128-bit ones stay cmpxchg16b.
++    bool plain_acquire_loads = false;
++
++    /// (PS4 04.25) DMB ISHLD, ISHST (any domain's LD and ST types): nothing on x86-64, whose loads
++    /// aren't reordered with loads or stores nor its stores with stores; a DMB of all access types
++    /// stays a full barrier.
++    bool elide_load_store_only_barriers = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 0649292b0f..262689d179 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -198,7 +198,8 @@ static void A32SharedWalkPass(IR::Block& block, Walks&& walks, size_t min_member
+ // page table walk (A64HostPointer before the first of them), as A32SharedWalkPass. The base is
+ // followed through chains of constant adds and subtracts (a pre-indexed STP's new SP, then the
+ // stores after it), so the accesses of a function's prologue and epilogue form one group.
+-static void A64SharedWalkPass(IR::Block& block) {
++template<typename Walks>
++static void A64SharedWalkPass(IR::Block& block, Walks&& walks) {
+     struct Member {
+         IR::Block::iterator it;
+         s64 offset;
+@@ -239,6 +240,9 @@ static void A64SharedWalkPass(IR::Block& block) {
+         if (acc != IR::AccType::NORMAL && acc != IR::AccType::VEC && acc != IR::AccType::STREAM && acc != IR::AccType::VECSTREAM) {
+             continue;
+         }
++        if (!walks(*it)) {
++            continue;
++        }
+         IR::Value base = resolve(it->GetArg(1));
+         s64 offset = 0;
+         for (int depth = 0; depth < 8 && !base.IsImmediate(); depth++) {
+@@ -2030,6 +2034,12 @@ AddressBase ClassifyAddressBase(const IR::Inst& access) {
+     return AddressBase::Other;
+ }
+ 
++void A64SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks) {
++    Optimization::A64SharedWalkPass(block, walks);
++    Optimization::DeadCodeElimination(block);
++    Optimization::IdentityRemovalPass(block);
++}
++
+ void A32SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks, size_t min_members) {
+     Optimization::A32SharedWalkPass(block, walks, min_members);
+     Optimization::DeadCodeElimination(block);
+@@ -2051,10 +2061,12 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+         Optimization::ConstantPropagation(block);
+         Optimization::DeadCodeElimination(block);
+     }
+-    // (with fastmem too: a group's one walk beats an address and a range check for each access,
+-    // and a lone access still gets fastmem; the walk and the arena reach the same memory)
+-    if (conf.page_table_shared_walk && conf.page_table && !conf.check_halt_on_memory_access) {
+-        Optimization::A64SharedWalkPass(block);
++    // (PS4 04.25) Without fastmem only: with it, an access is a cmp, a jae and the load or store
++    // (the constant folded into it), which the shared walk (18 instructions, then a test and a
++    // branch for each access) never beats; the accesses fastmem was declined for share walks
++    // after this (A64SharedWalkForSlowAccesses, from the emitter's list of them)
++    if (conf.page_table_shared_walk && conf.page_table && !conf.fastmem_pointer && !conf.check_halt_on_memory_access) {
++        Optimization::A64SharedWalkPass(block, [](const IR::Inst&) { return true; });
+         Optimization::DeadCodeElimination(block);
+     }
+     if (conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access) {
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.h b/src/dynarmic/src/dynarmic/ir/opt_passes.h
+index a7a9d6d3bf..03726bd1d4 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.h
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.h
+@@ -41,6 +41,9 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+ /// A32 with fastmem: the loads and stores that fastmem was declined for (`walks`: they walk the page
+ /// table each), when several go through one base register value plus constants, share one walk
+ /// (A32SharedWalkPass); the others keep fastmem
++/// (PS4 04.25) A64: the accesses walks() picks (those fastmem was declined for) share page table
++/// walks, one for each base register value (A64SharedWalkPass)
++void A64SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks);
+ void A32SharedWalkForSlowAccesses(IR::Block& block, const std::function<bool(const IR::Inst&)>& walks,
+                                   std::size_t min_members = 2);
+ 
+-- 
+2.43.0
+
