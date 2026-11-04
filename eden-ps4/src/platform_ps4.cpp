@@ -1306,6 +1306,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.30: 64-bit games: shifts and bit-field instructions (LSL, LSR, UBFX, SBFIZ, ...) in one or two "
+         "PS4 instructions instead of up to nine, and 32-bit results no longer zero-extended again when "
+         "they are zero above 32 bits already. The 64-bit test game: 4.7% fewer instructions than 04.29 "
+         "(46% fewer than 04.22); the Unity-shaped test 3.6%.\n"
          "04.29: forward conditional branches (an if, a bounds check) no longer end a block of CPU code "
          "either: taken, they leave from its middle, and the Switch's flags are saved there only when the "
          "code they go to reads them. The 64-bit test game: 43% fewer instructions than in 04.22.\n"

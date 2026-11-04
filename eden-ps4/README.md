@@ -379,6 +379,26 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.30: **bit-field instructions as shifts; no second zero-extension of 32-bit results.** Per 20
+steady frames of `game.c` for AArch64 with Eden's options: 1,895,226 instructions in 04.29,
+1,806,170 now (-4.7%; -45.8% from 04.22's 3,335,063). unity.c (8 frames minus 3): 381,358 ->
+367,705 (-3.6%).
+
+- Patch 0137: `bitfield_shifts`: SBFM and UBFM by immediate (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ,
+  UXTB, UXTH) as one shift, a shift and an AND with an imm32 mask, or a left shift then a right
+  one, instead of the architecture's rotate and two masks (`rorx`, `movabs`, `and`, `and`; nine
+  instructions for `SBFIZ #n, #32`, an `(int64_t)i << 2` index). The formulas were checked against
+  the architecture's definition for every immr/imms, W and X (471,040 cases). With
+  `skip_redundant_extensions`: a W register's value that is zero above 32 bits in its host register
+  by how it was made (`EmitX64::GprZeroUpper32`: 32-bit x64 operations, `cmov`, `mov r32`,
+  `movzx`, loads of 32 bits or fewer that aren't sign-extended; moves and spills of these widths
+  are 32-bit) is stored as it is (`A64SetW`: no copy and `mov r32, r32` first: they were 3.3% of
+  game.c's instructions) and widened as it is (`ZeroExtendWordToLong`); a `LeastSignificantWord`
+  whose every use reads only the low 32 bits (32-bit ALU operations, shifts, selects, a 32-bit
+  store) is the 64-bit value's register. New generator gen18 (every bitfield encoding; 32-bit
+  results read back as 64 bits, many live at once); a negative control (the extraction's `mov r32,
+  r32` removed) fails it 24 of 30. Patch 0138 turns `bitfield_shifts` on for Eden's 64-bit cores.
+
 04.29: **B.cond side exits, with the flags stored only where the exit's target reads them.**
 Per 20 steady frames of `game.c` for AArch64 with Eden's options: 2,047,039 instructions in
 04.28, 1,895,226 now (-7.4%; -43.2% from 04.22's 3,335,063); 40 frames after 40: -3.4%; blocks

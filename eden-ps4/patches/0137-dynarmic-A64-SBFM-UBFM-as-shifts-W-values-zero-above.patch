@@ -1,0 +1,321 @@
+From ecac2a072ac34b23d87c909d95aca9d87b409775 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 08:49:28 +0000
+Subject: [PATCH 137/138] dynarmic A64: SBFM/UBFM as shifts; W values zero
+ above 32 bits stored and widened as they are
+
+bitfield_shifts: SBFM and UBFM by immediate (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH) as one
+shift, a shift and an AND with an imm32 mask, or a left shift then a right one, instead of the
+architecture's rotate and two masks (rorx, movabs, and, and; nine instructions for SBFIZ #n, #32).
+With skip_redundant_extensions: a W register's value that is zero above 32 bits in its host
+register by how it was made (EmitX64::GprZeroUpper32: 32-bit x64 operations, cmov, mov r32,
+movzx, loads of 32 bits or fewer not sign-extended) is stored as it is, not copied and
+zero-extended first (A64SetW), and widened to 64 bits as it is (ZeroExtendWordToLong); a
+LeastSignificantWord whose every use reads the low 32 bits alone is the 64-bit value's register
+(no mov r32, r32). game.c -4.7% instructions, unity.c -3.6%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 61 +++++++++++++++++++
+ .../dynarmic/backend/x64/a64_interface.cpp    |  2 +
+ .../src/dynarmic/backend/x64/emit_x64.h       | 52 ++++++++++++++++
+ .../backend/x64/emit_x64_data_processing.cpp  | 10 +++
+ .../frontend/A64/translate/a64_translate.h    |  4 ++
+ .../impl/data_processing_bitfield.cpp         | 37 +++++++++++
+ .../src/dynarmic/interface/A64/config.h       |  5 ++
+ 7 files changed, 171 insertions(+)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 6065070b27..37a7c3d4e5 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -66,6 +66,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
+     GenTerminalHandlers();
+     code.PreludeComplete();
+     code.EnableColdCode(this->conf.split_cold_code);
++    zero_extend_known_zero_upper = this->conf.skip_redundant_extensions;
+     ClearFastDispatchTable();
+ 
+     if (conf.fastmem_pointer.has_value()) {
+@@ -469,6 +470,55 @@ void A64EmitX64::PeepholeQuad(A64EmitContext& ctx, IR::Block& block) {
+         if (bits != 0)
+             zero_upper.emplace_back(&inst, bits);
+     }
++    // (PS4 04.30) a LeastSignificantWord whose every use reads the low 32 bits of its register
++    // alone (32-bit x64 operations, cmov, a 32-bit store): the register as it is, no mov r32, r32
++    // and no copy of the 64-bit value to make one
++    low_word_only.clear();
++    if (!conf.skip_redundant_extensions)
++        return;
++    for (auto& inst : block.instructions) {
++        if (inst.GetOpcode() == IR::Opcode::LeastSignificantWord && !inst.GetArg(0).IsImmediate())
++            low_word_only.push_back(&inst);
++    }
++    if (low_word_only.empty())
++        return;
++    for (auto& inst : block.instructions) {
++        const auto op = inst.GetOpcode();
++        for (size_t i = 0; i < inst.NumArgs(); ++i) {
++            const IR::Value arg = inst.GetArg(i);
++            if (arg.IsImmediate() || arg.GetInst()->GetOpcode() != IR::Opcode::LeastSignificantWord)
++                continue;
++            bool low = false;
++            switch (op) {
++            case IR::Opcode::Add32:
++            case IR::Opcode::Sub32:
++            case IR::Opcode::Mul32:
++            case IR::Opcode::And32:
++            case IR::Opcode::AndNot32:
++            case IR::Opcode::Or32:
++            case IR::Opcode::Eor32:
++                low = i < 2;
++                break;
++            case IR::Opcode::Not32:
++            case IR::Opcode::LogicalShiftLeft32:
++            case IR::Opcode::LogicalShiftRight32:
++            case IR::Opcode::ArithmeticShiftRight32:
++                low = i == 0;
++                break;
++            case IR::Opcode::ConditionalSelect32:
++            case IR::Opcode::ConditionalSelectHost32:
++                low = i == 1 || i == 2;
++                break;
++            case IR::Opcode::A64WriteMemory32:
++                low = i == 2;
++                break;
++            default:
++                break;
++            }
++            if (!low)
++                low_word_only.erase(std::remove(low_word_only.begin(), low_word_only.end(), arg.GetInst()), low_word_only.end());
++        }
++    }
+ }
+ 
+ void A64EmitX64::ClearCache() {
+@@ -814,6 +864,17 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
+     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
+     if (args[1].FitsInImmediateS32()) {
+         code.mov(addr, args[1].GetImmediateS32());
++    } else if (conf.skip_redundant_extensions && !args[1].IsImmediate() && args[1].IsInGpr(ctx.reg_alloc) &&
++               GprZeroUpper32(inst->GetArg(1).GetInst())) {
++        // (PS4 04.30) zero above 32 bits in its register already (GprZeroUpper32): stored as it is,
++        // not copied and zero-extended first
++        const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(code, args[1]);
++        code.mov(addr, to_store);
++    } else if (conf.skip_redundant_extensions && args[1].IsImmediate()) {
++        // (PS4 04.30) a constant of 2^31 or more: mov r32, imm32 zero-extends it
++        const Xbyak::Reg64 to_store = ctx.reg_alloc.ScratchGpr(code);
++        code.mov(to_store.cvt32(), args[1].GetImmediateU32());
++        code.mov(addr, to_store);
+     } else {
+         // TODO: zext tracking, xmm variant
+         const Xbyak::Reg64 to_store = ctx.reg_alloc.UseScratchGpr(code, args[1]);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index d101f3a318..8e0ff15310 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -280,6 +280,7 @@ private:
+         options.superblocks = conf.superblocks && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         // (the exits' flags need the look-ahead)
+         options.superblocks_cond = options.superblocks && conf.superblocks_cond && options.nzcv_lookahead;
++        options.bitfield_shifts = conf.bitfield_shifts;
+         A64::Translate(ir_block, arch_descriptor, get_code, options);
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         // (PS4 04.25) With fastmem, the accesses it was declined for (pages the PS4 can't map at
+@@ -370,6 +371,7 @@ private:
+         add(conf.elide_load_store_only_barriers);
+         add(conf.superblocks);
+         add(conf.superblocks_cond);
++        add(conf.bitfield_shifts);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index dce1039673..444886bad1 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -146,6 +146,58 @@ public:
+         }
+         return 0;
+     }
++    // (PS4 04.30) A value of 32 bits or fewer whose host register is zero above 32 bits by how it
++    // was made: a 32-bit x64 operation (add/lea, sub, imul, and, andn, or, xor, not, cmov, shifts
++    // without a carry out, mov r32, movzx) or a load of 32 bits or fewer not sign-extended (mov,
++    // movzx; the fallbacks' ZeroExtendFrom). Moves keep it so (EmitMove: 32-bit moves and spills
++    // for these widths; movd from an XMM). Storing it as a W register or widening it to 64 bits
++    // then needs no mov r32, r32 while it is in a GPR (A64SetW, ZeroExtendWordToLong).
++    // (PS4 04.30) LeastSignificantWords whose uses read the low 32 bits alone (PeepholeQuad): the
++    // 64-bit value's register as it is (EmitLeastSignificantWord); not zero above 32 bits then
++    boost::container::small_vector<const IR::Inst*, 16> low_word_only;
++    bool IsLowWordOnly(const IR::Inst* inst) const {
++        return std::find(low_word_only.begin(), low_word_only.end(), inst) != low_word_only.end();
++    }
++    // (PS4 04.30) ZeroExtendWordToLong of a value GprZeroUpper32 knows in a GPR: that register
++    bool zero_extend_known_zero_upper = false;
++    bool GprZeroUpper32(const IR::Inst* inst) const {
++        // (an extension the pre-passes took out is an Identity of the load now)
++        while (inst->GetOpcode() == IR::Opcode::Identity) {
++            if (inst->GetArg(0).IsImmediate())
++                return false;
++            inst = inst->GetArg(0).GetInst();
++        }
++        switch (inst->GetOpcode()) {
++        case IR::Opcode::Add32:
++        case IR::Opcode::Sub32:
++        case IR::Opcode::Mul32:
++        case IR::Opcode::And32:
++        case IR::Opcode::Eor32:
++        case IR::Opcode::Or32:
++        case IR::Opcode::Not32:
++        case IR::Opcode::AndNot32:
++        case IR::Opcode::ConditionalSelect32:
++        case IR::Opcode::ConditionalSelectHost32:
++        case IR::Opcode::LeastSignificantWord:
++            return !IsLowWordOnly(inst);
++        case IR::Opcode::ZeroExtendByteToWord:
++        case IR::Opcode::ZeroExtendHalfToWord:
++            return true;
++        case IR::Opcode::LogicalShiftLeft32:
++        case IR::Opcode::LogicalShiftRight32:
++        case IR::Opcode::ArithmeticShiftRight32:
++            // (the carry-out forms shift in 64 bits: ASR's movsxd, sar)
++            return !const_cast<IR::Inst*>(inst)->GetAssociatedPseudoOperation(IR::Opcode::GetCarryFromOp);
++        case IR::Opcode::A64GetW:
++            return SignedLoadBits(inst) != 64;
++        case IR::Opcode::A64ReadMemory8:
++        case IR::Opcode::A64ReadMemory16:
++        case IR::Opcode::A64ReadMemory32:
++            return SignedLoadBits(inst) == 0 && !IsXmmLoad(inst);
++        default:
++            return false;
++        }
++    }
+     // (PS4 04.26) A load whose one use sign-extends it (LDRSB, LDRSH, LDRSW), with fastmem: loaded
+     // with movsx/movsxd to 32 or 64 bits, the extension then nothing
+     static constexpr size_t SignedLoadTag32 = 0x200, SignedLoadTag64 = 0x400;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index d719ad3c10..a4cbfc1c65 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -56,6 +56,11 @@ void EmitX64::EmitPack2x64To1x128(EmitContext& ctx, IR::Inst* inst) {
+ void EmitX64::EmitLeastSignificantWord(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+ 
++    if (!args[0].IsImmediate() && IsLowWordOnly(inst)) {
++        // (PS4 04.30) its uses read the low 32 bits alone (A64EmitX64::PeepholeQuad)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     // TODO: DefineValue directly on Argument
+     const Xbyak::Reg64 res = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.mov(res.cvt32(), res.cvt32());
+@@ -1632,6 +1637,11 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (zero_extend_known_zero_upper && !args[0].IsImmediate() && args[0].IsInGpr(ctx.reg_alloc) && GprZeroUpper32(inst->GetArg(0).GetInst())) {
++        // (PS4 04.30) zero above 32 bits in its register already (GprZeroUpper32)
++        ctx.reg_alloc.DefineValue(code, inst, args[0]);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
+     code.mov(result.cvt32(), result.cvt32());  // x64 zeros upper 32 bits on a 32-bit move
+     ctx.reg_alloc.DefineValue(code, inst, result);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 8297708628..ed91407231 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -64,6 +64,10 @@ struct TranslationOptions {
+ 
+     /// With superblocks: a forward B.cond too, its target's need for the flags looked ahead
+     bool superblocks_cond = false;
++
++    /// SBFM and UBFM (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH by immediate) as shifts and
++    /// extensions, not a rotate and two masks (UserConfig::bitfield_shifts)
++    bool bitfield_shifts = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_bitfield.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_bitfield.cpp
+index aec6729ad8..9fb6649ae9 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_bitfield.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/data_processing_bitfield.cpp
+@@ -7,6 +7,34 @@
+ 
+ namespace Dynarmic::A64 {
+ 
++namespace {
++// (PS4 04.30, TranslationOptions::bitfield_shifts) SBFM/UBFM of datasize d with immr R, imms S as
++// shifts: a field S..R (S >= R: SBFX, UBFX, LSR) moved down, or bits S..0 (S < R: SBFIZ, UBFIZ,
++// LSL) moved up to bit d - R, sign- or zero-extended above. One shift (LSL, LSR), a shift and an
++// AND with a mask an imm32 holds (UBFX, UBFIZ, UXTB, UXTH), or a left shift then a right one.
++IR::U32U64 BitfieldShifts(IREmitter& ir, bool is_signed, size_t d, IR::U32U64 src, unsigned R, unsigned S) {
++    const auto mask = [&](unsigned w) { return d == 32 ? IR::U32U64{ir.Imm32(u32((u64{1} << w) - 1))} : IR::U32U64{ir.Imm64((u64{1} << w) - 1)}; };
++    const auto shl = [&](IR::U32U64 v, unsigned n) { return n == 0 ? v : ir.LogicalShiftLeft(v, ir.Imm8(u8(n))); };
++    const auto shr = [&](IR::U32U64 v, unsigned n) {
++        return n == 0 ? v : is_signed ? ir.ArithmeticShiftRight(v, ir.Imm8(u8(n))) : ir.LogicalShiftRight(v, ir.Imm8(u8(n)));
++    };
++    if (S >= R) {
++        const unsigned w = S - R + 1;
++        if (S == d - 1)
++            return shr(src, R);
++        if (!is_signed && w < 32)
++            return ir.And(shr(src, R), mask(w));
++        return shr(shl(src, unsigned(d) - 1 - S), unsigned(d) - w);
++    }
++    const unsigned lsb = unsigned(d) - R, w = S + 1;
++    if (S + 1 == R)
++        return shl(src, lsb);
++    if (!is_signed && w < 32)
++        return shl(ir.And(src, mask(w)), lsb);
++    return shr(shl(src, unsigned(d) - w), unsigned(d) - w - lsb);
++}
++}  // namespace
++
+ bool TranslatorVisitor::SBFM(bool sf, bool N, Imm<6> immr, Imm<6> imms, Reg Rn, Reg Rd) {
+     if (sf && !N) {
+         return ReservedValue();
+@@ -26,6 +54,11 @@ bool TranslatorVisitor::SBFM(bool sf, bool N, Imm<6> immr, Imm<6> imms, Reg Rn,
+     const size_t datasize = sf ? 64 : 32;
+     const auto src = X(datasize, Rn);
+ 
++    if (options.bitfield_shifts) {
++        X(datasize, Rd, BitfieldShifts(ir, true, datasize, src, R, S));
++        return true;
++    }
++
+     auto bot = ir.And(ir.RotateRight(src, ir.Imm8(R)), I(datasize, masks->wmask));
+     auto top = ir.ReplicateBit(src, S);
+ 
+@@ -78,6 +111,10 @@ bool TranslatorVisitor::UBFM(bool sf, bool N, Imm<6> immr, Imm<6> imms, Reg Rn,
+ 
+     const size_t datasize = sf ? 64 : 32;
+     const auto src = X(datasize, Rn);
++    if (options.bitfield_shifts) {
++        X(datasize, Rd, BitfieldShifts(ir, false, datasize, src, R, imms.ZeroExtend<u8>()));
++        return true;
++    }
+     const auto bot = ir.And(ir.RotateRight(src, ir.Imm8(R)), I(datasize, masks->wmask));
+ 
+     X(datasize, Rd, ir.And(bot, I(datasize, masks->tmask)));
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index e4904b9951..146825266e 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -419,6 +419,11 @@ struct UserConfig {
+     /// look-ahead's), its condition on the compare's values right before it where it can be
+     bool superblocks_cond = false;
+ 
++    /// (PS4 04.30) SBFM and UBFM by immediate (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH) as
++    /// one or two shifts or an extension (SBFIZ #n, #32: movsxd and shl) instead of the
++    /// architecture's rotate and two masks (rorx, and, movabs, and; nine instructions for SBFIZ)
++    bool bitfield_shifts = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+-- 
+2.43.0
+

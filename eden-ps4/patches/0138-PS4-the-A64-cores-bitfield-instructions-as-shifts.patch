@@ -1,0 +1,27 @@
+From 6219a208a36e302bccc140bf81bd18c4f90b8261 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 08:49:29 +0000
+Subject: [PATCH 138/138] PS4: the A64 cores' bitfield instructions as shifts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index ad7cf8a749..16d6cb3289 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -311,6 +311,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.superblocks = true;
+     // (04.29) and a forward B.cond, the flags stored before it only when its target reads them
+     config.superblocks_cond = true;
++    // (04.30) LSL, LSR, UBFX, SBFIZ, ... by immediate as shifts, not a rotate and two masks
++    config.bitfield_shifts = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

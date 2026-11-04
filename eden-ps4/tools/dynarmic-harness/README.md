@@ -95,7 +95,8 @@ forward B translated through; measure with Eden's `DYN_FWD=1 DYN_RSB=1 DYN_DISP=
 `DYN_ACQ=1` plain load-acquires, `DYN_DMB=1` LD/ST-only barriers elided; `fastmem2 nowalk` shows
 the shared walk's cost with fastmem; 04.28: `-DHAVE_SUPER`, `DYN_SUPER=1` forward CBZ/TBZ as side
 exits; `programs/c/unity.c` (IL2CPP-shaped) as `unity64.bin`; 04.29: `DYN_SUPERCOND=1` forward
-B.cond as side exits too, `DYN_IRDUMP=1` prints each block's IR as it is compiled) (callgrind `--dump-instr=yes`
+B.cond as side exits too, `DYN_IRDUMP=1` prints each block's IR as it is compiled; 04.30: `-DHAVE_BFS`,
+`DYN_BFS=1` SBFM/UBFM as shifts; `gen18.py` bitfield encodings and W results read as 64 bits) (callgrind `--dump-instr=yes`
 into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
 `BUILD=<dir>` into another build directory.
 
