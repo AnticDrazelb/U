@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.45)
+# Eden for PS4: status (after 04.46)
 
-Install **04.45** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.46** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -56,8 +56,44 @@ programs, 0 failures.
 - **04.43:** the GS and tessellation rings set up as the PS4's system uses them: a 16 MiB off-chip
   tessellation buffer and the largest factor ring (`patches/mesa-ps4-rings.patch`), GS ring sizes
   through `sceGnmSetGsRingSizes(8 MiB, 8 MiB)`; those draws drawn again, still counted.
+- **04.45:** multi indirect draws in the PS4's opcodes: Zelda's GPU hang fixed (below).
+- **04.46:** the pre-flight record and the 2 ms GPU progress record (below).
 
-## 04.45: the GPU hang found (to be confirmed on the console)
+## 04.46: the pre-flight record (Captain Toad level 3)
+
+### 04.45's runs
+- **Zelda: Echoes of Wisdom made it past the cliff scene:** the hang is fixed. It then ran at 10-12
+  fps (boot trace at 390 s: GPU busy 7%, but the CPU waited for it 29 times a second, 20.6 ms each,
+  59% of the time). Next after Toad: why the waits are that long with the GPU that idle.
+- **Captain Toad level 3 still takes the PS4 down,** the same way as 04.41's: the GPU idle 1.9 s
+  (loading), six big buffers (16, 16, 32, 16, 16 MiB garlic, likely Eden's upload staging buffers,
+  and a 16 MiB onion one, a download buffer), then submission 7941: 458 draws, 138 dispatches, 4
+  `WAIT_REG_MEM`, 17 register copies (`COPY_DATA` memory to register: RADV's fast clear value loads;
+  no other of 1288 noted submissions had more than 3), descriptors all in live buffers. 7942-7949
+  (level 3's first frame among them) were queued by 61.517 s; the black box's next line (61.66 s)
+  never came. So the PS4 went down 0.1-0.25 s after 7941 reached the GPU.
+- The black box's "NOTHING FINISHED FOR 82 ms" at 61.408 s was the note's own time (walking 7941
+  before it went to the GPU), not the GPU's: nothing in the log says how far the GPU got into 7941.
+- The note's walk was cut short at 4096 packets (16384 now) and its uconfig list repeated
+  `VGT_PRIMITIVE_TYPE` (the register index bits): fixed.
+
+### 04.46
+- **`gpu/preflight.txt`:** each submission noted after an idle GPU that has 8 or more draws and
+  dispatches: every IB's dwords (top-level, nested, chained, in the CP's order) and the code of each
+  shader it sets (once a period), written and **synced before the submission goes to the GPU**. At
+  most 6 MiB a period; the previous period's in `preflight-previous.txt`. The boot trace says how
+  long each took. `RADV_PS4_PREFLIGHT=0` in settings.txt turns it off.
+- **`gpu/progress.txt`:** every 2 ms while noted submissions run (and 3 s after the last), synced
+  every 10 ms: completed, handed to the system, the last the CP started (its start timestamp), and
+  the trace id the CP passed last, with the longest sync so far.
+- **`tools/gpu-preflight.py <eden-ps4-logs.txt>`:** walks the record as the CP does to the last trace
+  id in the progress record and prints the packets from there, decoded (register names from
+  `tools/gfx7-registers.txt`, Mesa's), with the shaders in effect. `tools/gpu-hang-shaders.py` takes
+  the record's shaders too. Host test: `tools/gpu-tests/preflight.sh`.
+- **Next:** one Toad level 3 run with 04.46: the progress record's last line and the record name the
+  command the GPU was on.
+
+## 04.45: the GPU hang found (confirmed: Zelda runs past it)
 
 - **Cause:** RADV writes multi indirect draws as opcode 0x38 (indexed) / 0x2C in the desktop layout
   (with draw index register and count address). On the PS4's CP firmware 0x38/0x2C are a *short* form

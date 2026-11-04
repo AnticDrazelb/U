@@ -42,7 +42,7 @@ def main():
         keep, inside = [], False
         for l in lines:
             if l.startswith("===== "):
-                inside = "hang-shaders" in l
+                inside = "shaders" in l or "preflight" in l  # hang-, stall-shaders.txt; (04.46) preflight.txt
                 keep.append(l)
             elif inside:
                 keep.append(l)

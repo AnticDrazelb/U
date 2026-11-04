@@ -379,6 +379,18 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.46: **the pre-flight record.** On 04.45 Zelda: Echoes of Wisdom ran past its hang; Captain Toad's
+level 3 still took the PS4 down, 0.1-0.25 s after its first big submission after the loading screen
+(7941: 458 draws, 138 dispatches, 17 `COPY_DATA` register loads) reached the GPU: before the stall
+note (0.3 s) or the hang report (2 s) could say anything. So each submission noted after an idle GPU
+with 8 or more draws and dispatches goes to `gpu/preflight.txt` first: every IB's dwords (nested and
+chained ones too) and the code of the shaders it sets, synced before the submission is handed to the
+system (6 MiB a period at most). `gpu/progress.txt` notes every 2 ms (synced every 10 ms) what
+completed, what was handed to the system, the last submission the CP started and the last trace id
+it passed. `tools/gpu-preflight.py <eden-ps4-logs.txt>` walks the record to that trace id and prints
+the packets from there, decoded, with the shaders in effect (`tools/gpu-tests/preflight.sh` tests the
+record and the decoder on a PC). `RADV_PS4_PREFLIGHT=0` in settings.txt turns the record off.
+
 04.45: **the GPU hang: RADV's multi indirect draws in the PS4's opcodes.** A Zelda: Echoes of Wisdom run
 on 04.43 hung the GPU again, and this time the PS4 survived: the stall note at 0.3 s, the hang report
 at 2 s, `abort()` at 4 s, and the app closed with its crash page (no system crash). Its report has the

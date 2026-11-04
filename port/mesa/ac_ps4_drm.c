@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1755,8 +1756,8 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
             c->config_regs++;
             break;
          case 0x79: /* SET_UCONFIG_REG */
-            for (unsigned k = 1; k < body; k++)
-               ps4_check_note_uconfig(c, b[0] + k - 1);
+            for (unsigned k = 1; k < body; k++) /* (b[0]'s top bits: the register index, not the register) */
+               ps4_check_note_uconfig(c, (b[0] & 0xffff) + k - 1);
             break;
          case 0x37: /* WRITE_DATA */
             if (body >= 1 && ((b[0] >> 8) & 0xf) == 0)
@@ -1880,6 +1881,350 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
       n += (size_t)snprintf(out + n, out_size - n, "%s%#x", u ? "," : "; uconfig ", 0x30000 + c.uconfig[u] * 4);
 }
 
+/* ---- pre-flight record: begin (also built on a PC: eden-ps4/tools/gpu-tests/preflight.sh) ----
+ *
+ * (04.46) Captain Toad's level 3 takes the PS4 down within ~0.25 s of its first big submission
+ * after the loading screen: too soon for the stall note (0.3 s) or the hang report (2 s). So the
+ * big submissions noted after an idle GPU go to gpu/preflight.txt - every IB's dwords (the chained
+ * and nested ones too) and the code of every shader they set - synced BEFORE they go to the GPU.
+ * gpu/progress.txt (ps4_watch_thread) says, every 2 ms while they run, how far the command
+ * processor got. The two name the packet the GPU was on when the PS4 went down
+ * (eden-ps4/tools/gpu-preflight.py). One file of each per idle period, the previous period's in
+ * preflight-previous.txt and progress-previous.txt. */
+
+#define PS4_PF_LIMIT (6ull << 20) /* bytes of gpu/preflight.txt in one period */
+
+struct ps4_pf {
+   int fd;
+   uint64_t bytes;          /* in the file so far */
+   size_t n;                /* in buf */
+   uint32_t lo[PS4_STAGES], hi[PS4_STAGES];
+   unsigned ibs, dwords;
+   bool cut;                /* the limit reached */
+   uint64_t *shaders;       /* the period's, written once each */
+   uint8_t *stages;
+   unsigned *num_shaders, max_shaders;
+   unsigned new_shaders;
+   char buf[16384];         /* (last: everything before it is reset for each submission) */
+};
+
+static void
+ps4_pf_flush(struct ps4_pf *pf)
+{
+   if (pf->n && pf->fd >= 0)
+      (void)!write(pf->fd, pf->buf, pf->n);
+   pf->bytes += pf->n;
+   pf->n = 0;
+}
+
+static void
+ps4_pf_printf(struct ps4_pf *pf, const char *fmt, ...)
+{
+   if (sizeof(pf->buf) - pf->n < 512)
+      ps4_pf_flush(pf);
+   va_list ap;
+   va_start(ap, fmt);
+   const int r = vsnprintf(pf->buf + pf->n, sizeof(pf->buf) - pf->n, fmt, ap);
+   va_end(ap);
+   if (r > 0)
+      pf->n = MIN2(pf->n + (size_t)r, sizeof(pf->buf) - 1);
+}
+
+static bool
+ps4_pf_full(struct ps4_pf *pf)
+{
+   if (!pf->cut && pf->bytes + pf->n >= PS4_PF_LIMIT) {
+      pf->cut = true;
+      ps4_pf_printf(pf, "(the rest left out: the record's %llu MiB for this period are used)\n",
+                    (unsigned long long)(PS4_PF_LIMIT >> 20));
+   }
+   return pf->cut;
+}
+
+/* A shader address set by SET_SH_REG: noted once a period (its code goes after the IBs). */
+static void
+ps4_pf_note_shader(struct ps4_pf *pf, unsigned stage)
+{
+   const uint64_t va = ((uint64_t)pf->lo[stage] << 8) | ((uint64_t)(pf->hi[stage] & 0xff) << 40);
+   if (!va)
+      return;
+   for (unsigned s = 0; s < *pf->num_shaders; s++)
+      if (pf->shaders[s] == va)
+         return;
+   if (*pf->num_shaders >= pf->max_shaders)
+      return;
+   pf->stages[*pf->num_shaders] = (uint8_t)stage;
+   pf->shaders[(*pf->num_shaders)++] = va;
+   pf->new_shaders++;
+}
+
+/* One IB's dwords, "<address>: <8 dwords>" a line, then the IBs it calls (in the order it calls
+ * them) and the one it chains to. */
+static void
+ps4_pf_ib(struct ps4_pf *pf, uint64_t va, unsigned num_dw, int depth)
+{
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      if (ps4_pf_full(pf))
+         return;
+      const uint32_t *ib = ps4_hw_read(va, num_dw * 4ull);
+      pf->ibs++;
+      ps4_pf_printf(pf, "== IB %#llx, %u dwords, depth %d%s\n", (unsigned long long)va, num_dw, depth,
+                    ib ? "" : ": not mapped");
+      if (!ib)
+         return;
+      pf->dwords += num_dw;
+      for (unsigned i = 0; i < num_dw; i += 8) {
+         if (i % 4096 == 0 && ps4_pf_full(pf))
+            return;
+         ps4_pf_printf(pf, "%010llx:", (unsigned long long)(va + 4ull * i));
+         for (unsigned k = i; k < num_dw && k < i + 8; k++)
+            ps4_pf_printf(pf, " %08x", ib[k]);
+         ps4_pf_printf(pf, "\n");
+      }
+      uint64_t next_va = 0;
+      unsigned next_dw = 0;
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2 || h == 0xffff1000u) { /* type-2 and PKT3_NOP_PAD: one dword */
+            i++;
+            continue;
+         }
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         if (h >> 30 != 3 || i + 1 + body > num_dw)
+            break;
+         const uint32_t *b = &ib[i + 1];
+         if ((op == 0x3f || op == 0x33) && body >= 3) {
+            const uint64_t target = b[0] | ((uint64_t)(b[1] & 0xffff) << 32);
+            if (b[2] & (1u << 20)) {
+               next_va = target;
+               next_dw = b[2] & 0xfffff;
+               break;
+            }
+            if (depth < 4)
+               ps4_pf_ib(pf, target, b[2] & 0xfffff, depth + 1);
+         } else if (op == 0x76 && body >= 2) { /* SET_SH_REG: the shader addresses */
+            unsigned set = 0;
+            for (unsigned k = 1; k < body; k++) {
+               const unsigned reg = (b[0] & 0xffff) + k - 1;
+               static const unsigned lo_reg[PS4_STAGES] = {0x148, 0x108, 0x0c8, 0x088, 0x048, 0x008, 0x20c};
+               for (unsigned s = 0; s < PS4_STAGES; s++) {
+                  if (reg == lo_reg[s]) {
+                     pf->lo[s] = b[k];
+                     set |= 1u << s;
+                  } else if (reg == lo_reg[s] + 1) {
+                     pf->hi[s] = b[k];
+                     set |= 1u << s;
+                  }
+               }
+            }
+            for (unsigned s = 0; s < PS4_STAGES; s++)
+               if (set & (1u << s))
+                  ps4_pf_note_shader(pf, s);
+         }
+         i += 1 + body;
+      }
+      if (!next_va)
+         return;
+      va = next_va;
+      num_dw = next_dw;
+   }
+}
+
+/* Submission `seq` (its IBs dcb/sizes) into the record at `fd`; returns the bytes written. The
+ * shaders it sets that the period's record doesn't have yet follow its IBs. */
+static uint64_t
+ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
+                  uint32_t first_trace, uint32_t last_trace, uint64_t *shaders, uint8_t *stages,
+                  unsigned *num_shaders, unsigned max_shaders, uint64_t bytes_before, unsigned *ibs_out,
+                  unsigned *new_shaders_out)
+{
+   static struct ps4_pf pf; /* (under dev->lock) */
+   memset(&pf, 0, offsetof(struct ps4_pf, buf));
+   pf.fd = fd;
+   pf.bytes = bytes_before;
+   pf.shaders = shaders;
+   pf.stages = stages;
+   pf.num_shaders = num_shaders;
+   pf.max_shaders = max_shaders;
+   const unsigned first_shader = *num_shaders;
+   ps4_pf_printf(&pf, "\n==== submission %llu: %u IBs, trace ids %u-%u\n", (unsigned long long)seq, num_ibs,
+                 first_trace, last_trace);
+   for (unsigned i = 0; i < num_ibs && !ps4_pf_full(&pf); i++) {
+      ps4_pf_printf(&pf, "=== top-level IB %u\n", i);
+      ps4_pf_ib(&pf, (uintptr_t)dcb[i], sizes[i] / 4, 0);
+   }
+   ps4_pf_printf(&pf, "=== end of submission %llu (%u IBs in all, %u dwords; %u new shaders)\n",
+                 (unsigned long long)seq, pf.ibs, pf.dwords, pf.new_shaders);
+   ps4_pf_flush(&pf);
+   uint64_t done[1];
+   for (unsigned s = first_shader; s < *num_shaders && pf.bytes < PS4_PF_LIMIT; s++) {
+      unsigned num_done = 0;
+      ps4_dump_shader(fd, shaders[s], stages[s], s, done, &num_done);
+      const off_t at = fd >= 0 ? lseek(fd, 0, SEEK_CUR) : -1;
+      if (at > 0)
+         pf.bytes = (uint64_t)at;
+   }
+   if (ibs_out)
+      *ibs_out = pf.ibs;
+   if (new_shaders_out)
+      *new_shaders_out = pf.new_shaders;
+   return pf.bytes - bytes_before;
+}
+
+/* ---- pre-flight record: end ---- */
+
+static int ps4_pf_fd = -1;            /* gpu/preflight.txt of the current idle period (under dev->lock) */
+static uint64_t ps4_pf_bytes;         /* written to it */
+static uint64_t ps4_pf_shaders[1024]; /* the shaders in it */
+static uint8_t ps4_pf_stages[1024];
+static unsigned ps4_pf_num_shaders;
+static unsigned ps4_pf_period;        /* idle periods so far: the progress thread starts a new file on each */
+static int64_t ps4_watch_until;       /* the progress record runs until then (ns) */
+static uint64_t ps4_handed_seq;       /* the last submission handed to the system (the submission thread) */
+
+static void
+ps4_pf_begin(double idle_s)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *e = getenv("RADV_PS4_PREFLIGHT");
+      enabled = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+   }
+   if (!enabled)
+      return;
+   if (ps4_pf_fd >= 0)
+      close(ps4_pf_fd);
+   char old[256];
+   snprintf(old, sizeof(old), "%s", ps4_gpu_file("preflight.txt"));
+   rename(old, ps4_gpu_file("preflight-previous.txt"));
+   ps4_pf_fd = open(old, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   ps4_pf_bytes = 0;
+   ps4_pf_num_shaders = 0;
+   if (ps4_pf_fd >= 0) {
+      char line[400];
+      const int n = snprintf(line, sizeof(line),
+                             "the GPU was idle %.1f s (idle period %u); the submissions after it with 8 or more "
+                             "draws and dispatches, each written and synced before it went to the GPU: every IB "
+                             "(address: dwords), then the code of the shaders it set that weren't here yet. "
+                             "Trace ids at %#llx. gpu/progress.txt: how far the GPU got "
+                             "(eden-ps4/tools/gpu-preflight.py)\n",
+                             idle_s, ps4_pf_period + 1, (unsigned long long)ps4_trace_va);
+      (void)!write(ps4_pf_fd, line, (size_t)n);
+      ps4_pf_bytes = (uint64_t)n;
+   }
+   __atomic_add_fetch(&ps4_pf_period, 1, __ATOMIC_RELEASE);
+}
+
+static void
+ps4_preflight(uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs, uint32_t first_trace,
+              uint32_t last_trace)
+{
+   if (ps4_pf_fd < 0 || ps4_pf_bytes >= PS4_PF_LIMIT)
+      return;
+   const int64_t t0 = os_time_get_nano();
+   unsigned ibs = 0, new_shaders = 0;
+   const uint64_t bytes = ps4_pf_submission(ps4_pf_fd, seq, dcb, sizes, num_ibs, first_trace, last_trace,
+                                            ps4_pf_shaders, ps4_pf_stages, &ps4_pf_num_shaders,
+                                            ARRAY_SIZE(ps4_pf_shaders), ps4_pf_bytes, &ibs, &new_shaders);
+   ps4_pf_bytes += bytes;
+   fsync(ps4_pf_fd);
+   char line[220];
+   snprintf(line, sizeof(line), "radv/ps4: submission %llu in gpu/preflight.txt before the GPU got it: %u IBs, "
+            "%u new shaders, %llu KiB (%.0f ms with the sync)", (unsigned long long)seq, ibs, new_shaders,
+            (unsigned long long)(bytes >> 10), (os_time_get_nano() - t0) / 1e6);
+   ps4_boot_trace(line);
+}
+
+/* (04.46) Every 2 ms while noted submissions run (synced every 10 ms): what completed, the last
+ * submission handed to the system, the last one the CP started (its timestamp at the start), and
+ * the trace id it passed last. A line when one of them moves, else every 50 ms. */
+static void *
+ps4_watch_thread(void *arg)
+{
+   ac_drm_device *dev = arg;
+   int fd = -1;
+   unsigned period = 0, lines = 0;
+   uint64_t last_done = ~0ull, last_handed = ~0ull, last_started = ~0ull;
+   uint32_t last_trace = ~0u;
+   int64_t start = 0, last_line = 0, last_sync = 0, max_sync = 0;
+   bool dirty = false;
+   for (;;) {
+      const int64_t now = os_time_get_nano();
+      const unsigned p = __atomic_load_n(&ps4_pf_period, __ATOMIC_ACQUIRE);
+      if (p != period) {
+         if (fd >= 0) {
+            fsync(fd);
+            close(fd);
+         }
+         char path[256];
+         snprintf(path, sizeof(path), "%s", ps4_gpu_file("progress.txt"));
+         rename(path, ps4_gpu_file("progress-previous.txt"));
+         fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+         period = p;
+         lines = 0;
+         start = now;
+         last_done = last_handed = last_started = ~0ull;
+         last_trace = ~0u;
+         if (fd >= 0) {
+            char line[300];
+            const int n = snprintf(line, sizeof(line),
+                                   "idle period %u: ms from its first noted submission; completed / handed to "
+                                   "the system / last the CP started (of submitted); the trace id the CP passed "
+                                   "last; the longest sync so far\n", p);
+            (void)!write(fd, line, (size_t)n);
+            dirty = true;
+         }
+      }
+      if (fd < 0 || now >= __atomic_load_n(&ps4_watch_until, __ATOMIC_RELAXED)) {
+         if (fd >= 0 && dirty) {
+            fsync(fd);
+            dirty = false;
+         }
+         sceKernelUsleep(10000);
+         continue;
+      }
+      const uint64_t done = ps4_completed(dev);
+      const uint64_t submitted = dev->last_seq;
+      const uint64_t handed = __atomic_load_n(&ps4_handed_seq, __ATOMIC_ACQUIRE);
+      uint64_t started = done;
+      if (dev->ts_start)
+         for (uint64_t s = handed; s > done && s + FENCE_IB_COUNT > handed; s--)
+            if (dev->ts_start[s % FENCE_IB_COUNT]) {
+               started = s;
+               break;
+            }
+      const volatile uint32_t *t = ps4_trace_va ? ps4_hw_read(ps4_trace_va, 4) : NULL;
+      const uint32_t trace = t ? *t : 0;
+      const bool moved = done != last_done || handed != last_handed || started != last_started ||
+                         trace != last_trace;
+      if ((moved || now - last_line >= 50000000ll) && lines < 40000) {
+         char line[200];
+         const int n = snprintf(line, sizeof(line), "%9.1f: %llu / %llu / %llu (of %llu); trace %u; sync %.1f ms\n",
+                                (now - start) / 1e6, (unsigned long long)done, (unsigned long long)handed,
+                                (unsigned long long)started, (unsigned long long)submitted, trace, max_sync / 1e6);
+         (void)!write(fd, line, (size_t)n);
+         lines++;
+         dirty = true;
+         last_line = now;
+         last_done = done;
+         last_handed = handed;
+         last_started = started;
+         last_trace = trace;
+      }
+      if (dirty && now - last_sync >= 10000000ll) {
+         const int64_t t0 = os_time_get_nano();
+         fsync(fd);
+         const int64_t t1 = os_time_get_nano();
+         max_sync = MAX2(max_sync, t1 - t0);
+         last_sync = t1;
+         dirty = false;
+      }
+      sceKernelUsleep(2000);
+   }
+   return NULL;
+}
+
 /* (04.41) The first submissions after the GPU was idle a while (a game's loading screen), and their
  * completions, in the boot trace (synced within 50 ms by the app): Captain Toad's level 3 takes the
  * PS4 down within a quarter second of its loading, with the GPU idle and caught up just before;
@@ -1899,12 +2244,13 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
       snprintf(line, sizeof(line), "radv/ps4: the GPU was idle %.1f s: its next 40 submissions follow",
                (now - idle) / 1e9);
       ps4_boot_trace(line);
+      ps4_pf_begin((now - idle) / 1e9);
    }
    if (ps4_after_idle_left <= 0)
       return;
    ps4_after_idle_left--;
    __atomic_store_n(&ps4_after_idle_last, seq, __ATOMIC_RELEASE);
-   static struct ps4_pkt pkts[4096];
+   static struct ps4_pkt pkts[16384]; /* (04.46: 4096 cut Toad's level 3 upload short) */
    struct ps4_walk w;
    memset(&w, 0, sizeof(w));
    w.pkts = pkts;
@@ -1939,6 +2285,9 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
             "writes%s%s", (unsigned long long)seq, num_ibs, dwords, draws, dispatches, indirect, waits, first_trace,
             last_trace, ps4_gs_tess_last_draws, ps4_gs_tess_last_rings, w.dropped ? " (walk cut short)" : "", check);
    ps4_boot_trace(line);
+   if (draws + dispatches >= 8)
+      ps4_preflight(seq, dcb, sizes, num_ibs, first_trace, last_trace);
+   __atomic_store_n(&ps4_watch_until, os_time_get_nano() + 3000000000ll, __ATOMIC_RELAXED);
 }
 
 void ac_ps4_gpu_progress(uint64_t *submitted, uint64_t *completed, uint32_t *trace_id, int64_t *stalled_ms);
@@ -2035,6 +2384,8 @@ ps4_start_stall_thread(ac_drm_device *dev)
       pthread_detach(t);
       started = true;
    }
+   if (pthread_create(&t, NULL, ps4_watch_thread, dev) == 0)
+      pthread_detach(t);
 }
 
 /* Crema: how the CPU waits for the GPU, every 5 s in the boot trace (waits per second, their
@@ -4280,6 +4631,7 @@ ps4_submit_thread(void *arg)
                                   job->buffer, job->mode, job->arg);
       else
          r = dev->submit(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes);
+      __atomic_store_n(&ps4_handed_seq, job->seq, __ATOMIC_RELEASE); /* (flips have one too) */
       /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
        * frame): after every flip, else at most every 4 ms */
       const int64_t now = os_time_get_nano();
@@ -4572,6 +4924,8 @@ ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg)
       simple_mtx_lock(&dev->lock);
    }
    const uint64_t seq = ++dev->last_seq;
+   if (dev->ts_start) /* (no start timestamp for a flip: not an older submission's either) */
+      dev->ts_start[seq % FENCE_IB_COUNT] = 0;
    uint32_t *ib = dev->flip_ibs + slot * FLIP_IB_DW, *cs = ib;
    cs = ps4_emit_eop(cs, (uintptr_t)dev->fence, seq, dev->eop_queue != NULL);
    while ((cs - ib) % 8)

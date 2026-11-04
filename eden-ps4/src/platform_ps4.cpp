@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.46: Zelda made it through with 04.45; Captain Toad's level 3 didn't. Its log shows the PS4 going "
+         "down within a quarter of a second of level 3's first big batch of GPU work (uploads: 458 draws, 138 "
+         "compute jobs), too fast for the stall and hang reports. Now each big batch after a loading screen is "
+         "written to gpu/preflight.txt (and synced) before the GPU gets it, and gpu/progress.txt notes every "
+         "2 ms how far the GPU got. Together they name the command the GPU was on when the PS4 went down.\n"
          "04.45: the GPU hang found. Zelda: Echoes of Wisdom's last hang (04.43) stopped the GPU on an indirect "
          "draw. The PS4's GPU reads that command in a shorter form than PC AMD GPUs: it took a register number for "
          "the number of draws, about two billion of them, and walked through memory one byte at a time for their "
