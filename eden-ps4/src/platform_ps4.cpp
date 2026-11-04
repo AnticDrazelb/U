@@ -1317,6 +1317,12 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.49: 04.48's run stopped at the same texture copy in level 3 as 04.46's, and everything it uses checked "
+         "fine. Now, from a quarter of a second without GPU work (a loading screen) until 60 batches later, "
+         "each draw and compute job waits for the one before to finish. If level 3 still goes down, the log "
+         "names the exact one that never finished; if it loads, the crash needs work overlapping, and this is "
+         "the fix. Zelda: 04.48 ran it 29 minutes at 25-40 fps (04.45's 10 fps was the diagnostics, fixed in "
+         "04.47).\n"
          "04.48: 04.46's record caught Captain Toad's level 3: the GPU stopped on one of the copies that "
          "upload a texture's mip levels (a 32x32 one, eight levels) from Eden's staging buffer, the first "
          "batch after the loading screen. What it reads checked fine; where it writes was never checked. Now "

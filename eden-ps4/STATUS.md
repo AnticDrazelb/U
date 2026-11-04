@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.48)
+# Eden for PS4: status (after 04.49)
 
-Install **04.48** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.49** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -60,6 +60,26 @@ programs, 0 failures.
 - **04.46:** the pre-flight record and the 2 ms GPU progress record (below).
 - **04.47:** 04.46's slowdown and crash fixed (both the diagnostics'); "idle" is a 1 s gap (below).
 - **04.48:** render targets checked; descriptors and the buffer list in the record (below).
+- **04.49:** GPU work around a loading screen serialized (below).
+
+## 04.49: GPU work around a loading screen serialized
+
+- **04.48's runs:** Captain Toad at 48-55 fps again (04.47's fix) and Zelda 29 minutes at 25-40 fps
+  (so 04.45's 10-12 fps was the diagnostics too), quit normally; four 2+ s GPU pauses in it, each
+  went on (`gpu/gpu-hang.txt`, to look at).
+- **Toad level 3 on 04.48:** the same six buffers, the same batch (8205: 900 draws, 193 dispatches),
+  and the CP stopped at the same copy chain into 0x43fdcfc100: 461 trace points into the batch
+  (04.46: 464), after 4 of its draws this time (7 then). The render target check found nothing; the
+  record shows the destination in bo 26 (2 MiB garlic, at +0x1bc100), the source texel buffer in bo
+  19 (Eden's 16 MiB staging buffer from boot, 1.25 MB to its end), no overlapping buffers, and
+  register state identical to the 32x32 copy just before that finished (only addresses differ; CB1-3
+  left set but disabled). Not a bad address, not bad state.
+- **04.49:** after 0.25 s with nothing submitted, Mesa's `ac_ps4_flush_all_draws` (Crema's "Flush
+  Caches" check: after each draw and dispatch the GPU waits for it and writes back and invalidates
+  the caches) is on until the 60th submission after. Level 3's batch is recorded inside that window.
+  The trace id in memory is then the last finished draw: the next one is the one that never
+  finished. If level 3 loads instead, the crash needs overlapping work, and this is a fix.
+  `RADV_PS4_SYNC_AFTER_IDLE=0` in settings.txt turns it off.
 
 ## 04.48: where Toad's level 3 stops the GPU (04.46's record)
 

@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.49: **GPU work around a loading screen serialized.** 04.48's Toad run stopped at the same copy chain
+as 04.46's (461 vs 464 trace points into level 3's first batch), with its destination and source well
+inside live buffers and register state identical to a copy that finished. Now from 0.25 s with nothing
+submitted until 60 submissions later, every draw and dispatch is followed by a wait and a full cache
+write-back and invalidate (Mesa's `ac_ps4_flush_all_draws`): the last trace id in memory is the last
+finished one. `RADV_PS4_SYNC_AFTER_IDLE=0` turns it off. 04.48 also ran Zelda for 29 minutes at
+25-40 fps: its 04.45 slowdown was the diagnostics' (fixed in 04.47).
+
 04.48: **render targets checked.** 04.46's record caught Toad's level 3: after a full wait, the CP sent
 7 of 8 draws copying a staging buffer into a 32x32 RGBA16F texture's eight mip levels (RADV's blit2d
 buffer-to-image copy) and stood at the 8th, all its contexts held by draws that never finished. The

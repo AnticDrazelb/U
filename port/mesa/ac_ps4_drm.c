@@ -2242,6 +2242,16 @@ ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes,
 
 /* ---- pre-flight record: end ---- */
 
+static int64_t ps4_last_submit_ns;   /* when the last submission was noted or passed by (under dev->lock) */
+/* (04.49) Draws and dispatches recorded around a loading screen wait for each other (Mesa's
+ * ac_ps4_flush_all_draws: after each, the GPU waits for it and writes back and invalidates the
+ * caches): the watch thread turns it on after 0.25 s with nothing submitted, the 60th submission after
+ * that turns it off. Toad's level 3 stops the GPU inside a run of 4-7 unwaited copy draws; with the
+ * waits the trace id in memory is the last finished draw, and the next one never finished
+ * (RADV_PS4_SYNC_AFTER_IDLE=0: off). */
+extern int ac_ps4_flush_all_draws;
+static bool ps4_sync_by_us;          /* we turned it on */
+static int ps4_sync_left;            /* submissions until it goes off again (under dev->lock) */
 static int ps4_pf_fd = -1;            /* gpu/preflight.txt of the current idle period (under dev->lock) */
 static unsigned ps4_pf_count;         /* submissions in it (at most 16 a period) */
 static uint64_t ps4_pf_bytes;         /* written to it */
@@ -2377,6 +2387,21 @@ ps4_watch_thread(void *arg)
             dirty = true;
          }
       }
+      static int sync_after_idle = -1;
+      if (sync_after_idle < 0) {
+         const char *e = getenv("RADV_PS4_SYNC_AFTER_IDLE");
+         sync_after_idle = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+      }
+      const int64_t last_submit = __atomic_load_n(&ps4_last_submit_ns, __ATOMIC_RELAXED);
+      if (sync_after_idle && last_submit && now - last_submit >= 250000000ll &&
+          !__atomic_load_n(&ps4_sync_by_us, __ATOMIC_ACQUIRE) && !__atomic_load_n(&ac_ps4_flush_all_draws, __ATOMIC_ACQUIRE) &&
+          ps4_completed(dev) >= dev->last_seq) {
+         __atomic_store_n(&ps4_sync_left, 0, __ATOMIC_RELAXED);
+         __atomic_store_n(&ps4_sync_by_us, true, __ATOMIC_RELEASE);
+         __atomic_store_n(&ac_ps4_flush_all_draws, 1, __ATOMIC_RELEASE);
+         ps4_boot_trace("radv/ps4: nothing submitted for 0.25 s: draws and dispatches wait for each other until "
+                        "60 submissions from now");
+      }
       if (fd < 0 || now >= __atomic_load_n(&ps4_watch_until, __ATOMIC_RELAXED)) {
          if (fd >= 0 && dirty) {
             fsync(fd);
@@ -2435,7 +2460,6 @@ ps4_watch_thread(void *arg)
  * slowly (the GPU idle between frames) met every second or so: Zelda's 04.45 run noted 8762
  * submissions in 220 periods, and 04.46's record (MiBs written and synced for each) slowed Captain
  * Toad to 11 fps, which met it more often still. */
-static int64_t ps4_last_submit_ns;   /* when the last submission was noted or passed by (under dev->lock) */
 static int ps4_after_idle_left;      /* submissions still to note (under dev->lock) */
 static uint64_t ps4_after_idle_last; /* the last one noted: completions are noted up to it */
 
@@ -2449,6 +2473,15 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
    }
    const int64_t now = os_time_get_nano();
    const int64_t gap = ps4_last_submit_ns ? now - ps4_last_submit_ns : 0;
+   if (__atomic_load_n(&ps4_sync_by_us, __ATOMIC_ACQUIRE)) {
+      if (!ps4_sync_left) {
+         ps4_sync_left = 60;
+      } else if (--ps4_sync_left == 0) {
+         __atomic_store_n(&ac_ps4_flush_all_draws, 0, __ATOMIC_RELEASE);
+         __atomic_store_n(&ps4_sync_by_us, false, __ATOMIC_RELEASE);
+         ps4_boot_trace("radv/ps4: draws and dispatches no longer wait for each other (60 submissions after the idle GPU)");
+      }
+   }
    if (!ps4_after_idle_left && gap >= min_gap && ps4_completed(dev) + 1 >= seq) {
       ps4_after_idle_left = 40;
       char line[160];
