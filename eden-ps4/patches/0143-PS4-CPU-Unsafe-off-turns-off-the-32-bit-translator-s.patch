@@ -1,0 +1,41 @@
+From 4c8d7eb960959dc810559e49f10ef4fbecd84b3c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 14:39:48 +0000
+Subject: [PATCH] PS4: CPU Unsafe off turns off the 32-bit translator's PS4
+ extras too
+
+As the 64-bit cores' since 04.35: with CPU accuracy Auto the A32 cores run without inline
+conditional instructions, dead flags, folded offsets, skipped extensions and split cold code.
+Captain Toad (32-bit) took the PS4 down on its level 3 with the 64-bit switch alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 08b37697b6..48011db99c 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -245,6 +245,17 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.skip_redundant_extensions = true;
+     // (04.07) each block's rarely run code apart from it: the code that runs packed together
+     config.split_cold_code = true;
++    // (04.38) With CPU Unsafe off (Auto): none of the 32-bit translator's PS4 extras (04.04-04.22),
++    // as the 64-bit cores' since 04.35: a switch to tell whether a 32-bit game's trouble is theirs
++    // (Captain Toad, a 32-bit game, took the whole PS4 down on its level 3)
++    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Unsafe) {
++        config.inline_conditional_instructions = false;
++        config.elide_dead_nzcv = false;
++        config.elide_dead_nzcv_abi = false;
++        config.fold_address_offsets = false;
++        config.skip_redundant_extensions = false;
++        config.split_cold_code = false;
++    }
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

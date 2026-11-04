@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.38: **the CPU Unsafe switch for 32-bit games too.** Patch 0143: with CPU accuracy Auto the
+A32 cores run without `inline_conditional_instructions`, `elide_dead_nzcv(_abi)`,
+`fold_address_offsets`, `skip_redundant_extensions`, `split_cold_code`. Captain Toad is a 32-bit
+game: 04.35's switch (the A64 cores' options) never touched it. 04.37's synced trace shows its
+level 3 going down within 10 s of a 54 fps speed line in three runs (macros interpreted; 50 and
+100%, asynchronous shaders on and off, GPU accuracy normal and high), memory plentiful (3.3 GiB
+of direct, 280 MiB of flexible memory free), the GPU keeping up at its last record.
+
 04.37: **logs that survive a crash of the whole PS4.** `ps4_boot_trace` (`port/ps4_crashlog.cpp`)
 fsyncs its file at most once a second, and the menu's settings are fsynced when saved: Captain
 Toad's level 3 with Compiled GPU Macros off (04.36) took the PS4 down again, and the export after

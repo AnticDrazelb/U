@@ -1311,6 +1311,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.38: CPU Unsafe off now turns off the 32-bit CPU translator's PS4 speed-ups too (Mario Kart, "
+         "Captain Toad are 32-bit games), not only the 64-bit one's.\n"
          "04.37: the boot trace is written through to the disk every second, and the settings when they "
          "change: a crash of the whole PS4 (Captain Toad's level 3) lost the last run's last minute and the "
          "settings changed before it.\n"
