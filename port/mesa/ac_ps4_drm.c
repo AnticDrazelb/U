@@ -1568,6 +1568,10 @@ struct ps4_check {
    unsigned num_uconfig;
    uint8_t unknown_ops[12];
    unsigned num_unknown_ops;
+   /* (04.48) the context registers set so far in the submission (dwords from 0x28000), for the
+    * render targets' check */
+   uint32_t ctx[0x400];
+   uint32_t ctx_seen[0x400 / 32];
 };
 
 static const struct ps4_live_range *
@@ -1600,7 +1604,7 @@ ps4_check_report(struct ps4_check *c, uint64_t seq, const void *packet, const ch
                  uint64_t va, uint64_t bytes, const struct ps4_live_range *r)
 {
    static unsigned session;
-   if (session < 12) {
+   if (session < 32) {
       session++;
       char line[300];
       if (r)
@@ -1682,6 +1686,98 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
    return valid >= 2;
 }
 
+/* (04.48) One render target range: its base inside a live buffer and `bytes` from it not far past
+ * its end. Bases outside the GPU windows (the VideoOut buffers) aren't ours to check. */
+static bool
+ps4_check_range(struct ps4_check *c, uint64_t seq, const void *packet, const char *what, uint64_t va,
+                uint64_t bytes)
+{
+   if (!va || !ps4_in_gpu_windows(c->dev, va))
+      return false;
+   const struct ps4_live_range *r = ps4_live_at(c, va);
+   if (!r) {
+      c->wild++;
+      return ps4_check_report(c, seq, packet, "draw (render target)", what, va, 0, NULL);
+   }
+   if (bytes && va + bytes > r->end + (64u << 10)) {
+      c->overruns++;
+      return ps4_check_report(c, seq, packet, "draw (render target)", what, va, bytes, r);
+   }
+   return false;
+}
+
+static bool
+ps4_ctx_known(const struct ps4_check *c, unsigned reg)
+{
+   return reg < 0x400 && ((c->ctx_seen[reg >> 5] >> (reg & 31)) & 1);
+}
+
+/* Bytes per pixel of a CB_COLOR*_INFO format (V_028C70_COLOR_*); 16 when unknown. */
+static unsigned
+ps4_cb_bpp(unsigned format)
+{
+   switch (format) {
+   case 0x01: return 1;
+   case 0x02: case 0x03: case 0x10: case 0x11: case 0x12: case 0x13: return 2;
+   case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0a: case 0x14: case 0x15: return 4;
+   case 0x0b: case 0x0c: case 0x16: return 8;
+   default: return 16;
+   }
+}
+
+/* (04.48) A draw's render targets, against the live buffers: each enabled color target (its slices up
+ * to the view's last, SLICE_TILE_MAX's 64-pixel tiles each), its CMASK and FMASK when in use, the
+ * depth and stencil surfaces and HTILE. Toad's level 3 hangs the GPU on a draw copying a buffer into a
+ * texture whose source descriptor checked fine (04.46's record): the destination is the next suspect.
+ * Returns true: skip the draw. */
+static bool
+ps4_check_targets(struct ps4_check *c, uint64_t seq, const void *packet)
+{
+   static const char *const color[8] = {"color target 0 at", "color target 1 at", "color target 2 at",
+                                        "color target 3 at", "color target 4 at", "color target 5 at",
+                                        "color target 6 at", "color target 7 at"};
+   bool skip = false;
+   if (ps4_ctx_known(c, 0x202) && ((c->ctx[0x202] >> 4) & 7)) { /* CB_COLOR_CONTROL.MODE: not disabled */
+      for (unsigned i = 0; i < 8; i++) {
+         const unsigned r = 0x318 + i * 15; /* CB_COLOR<i>_BASE */
+         if (!ps4_ctx_known(c, r) || !ps4_ctx_known(c, r + 4))
+            continue;
+         const uint32_t info = c->ctx[r + 4];
+         const unsigned format = (info >> 2) & 0x1f;
+         if (!format || (ps4_ctx_known(c, 0x8e) && !((c->ctx[0x8e] >> (4 * i)) & 0xf))) /* CB_TARGET_MASK */
+            continue;
+         const uint64_t slice = ps4_ctx_known(c, r + 2) ? (uint64_t)((c->ctx[r + 2] & 0x3fffff) + 1) * 64 : 0;
+         const unsigned last = ps4_ctx_known(c, r + 3) ? (c->ctx[r + 3] >> 13) & 0x7ff : 0; /* VIEW.SLICE_MAX */
+         skip |= ps4_check_range(c, seq, packet, color[i], (uint64_t)c->ctx[r] << 8,
+                                 slice * ps4_cb_bpp(format) * (last + 1));
+         if ((info & (3u << 13)) && ps4_ctx_known(c, r + 7)) /* FAST_CLEAR, COMPRESSION: CMASK */
+            skip |= ps4_check_range(c, seq, packet, "its CMASK at", (uint64_t)c->ctx[r + 7] << 8, 0);
+         if ((info & (1u << 14)) && ps4_ctx_known(c, r + 9)) /* COMPRESSION: FMASK */
+            skip |= ps4_check_range(c, seq, packet, "its FMASK at", (uint64_t)c->ctx[r + 9] << 8, 0);
+      }
+   }
+   const uint64_t ds_slice = ps4_ctx_known(c, 0x17) ? (uint64_t)((c->ctx[0x17] & 0x3fffff) + 1) * 64 : 0;
+   const unsigned ds_last = ps4_ctx_known(c, 0x2) ? (c->ctx[0x2] >> 13) & 0x7ff : 0; /* DB_DEPTH_VIEW */
+   const unsigned z = ps4_ctx_known(c, 0x10) ? c->ctx[0x10] & 3 : 0; /* DB_Z_INFO.FORMAT */
+   if (z) {
+      const uint64_t bytes = ds_slice * (z == 1 ? 2 : 4) * (ds_last + 1);
+      if (ps4_ctx_known(c, 0x12))
+         skip |= ps4_check_range(c, seq, packet, "depth (read) at", (uint64_t)c->ctx[0x12] << 8, bytes);
+      if (ps4_ctx_known(c, 0x14))
+         skip |= ps4_check_range(c, seq, packet, "depth (write) at", (uint64_t)c->ctx[0x14] << 8, bytes);
+      if (((c->ctx[0x10] >> 29) & 1) && ps4_ctx_known(c, 0x5)) /* TILE_SURFACE_ENABLE: HTILE */
+         skip |= ps4_check_range(c, seq, packet, "HTILE at", (uint64_t)c->ctx[0x5] << 8, 0);
+   }
+   if (ps4_ctx_known(c, 0x11) && (c->ctx[0x11] & 1)) { /* DB_STENCIL_INFO.FORMAT */
+      const uint64_t bytes = ds_slice * (ds_last + 1);
+      if (ps4_ctx_known(c, 0x13))
+         skip |= ps4_check_range(c, seq, packet, "stencil (read) at", (uint64_t)c->ctx[0x13] << 8, bytes);
+      if (ps4_ctx_known(c, 0x15))
+         skip |= ps4_check_range(c, seq, packet, "stencil (write) at", (uint64_t)c->ctx[0x15] << 8, bytes);
+   }
+   return skip;
+}
+
 /* A draw's or dispatch's user data: 32-bit pointers into the 32-bit window (descriptor sets, vertex
  * buffer tables, push constants; RADV's on gfx7) and 64-bit ones into the 16 GiB window. Values that
  * point into no live buffer are just values (push constants). */
@@ -1751,8 +1847,18 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
             }
             break;
          case 0x27: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x9c: case 0x9d:
+            bad = ps4_check_targets(c, seq, &ib[i]);
             for (unsigned st = 0; st < 6 && !bad; st++)
                bad = ps4_check_user_data(c, seq, &ib[i], stage_name[st], gfx_ud[st]);
+            break;
+         case 0x69: /* SET_CONTEXT_REG: kept for the render targets' check */
+            for (unsigned k = 1; k < body; k++) {
+               const unsigned reg = (b[0] & 0xffff) + k - 1;
+               if (reg < 0x400) {
+                  c->ctx[reg] = b[k];
+                  c->ctx_seen[reg >> 5] |= 1u << (reg & 31);
+               }
+            }
             break;
          case 0x15: case 0x16: /* dispatches */
             bad = ps4_check_user_data(c, seq, &ib[i], "dispatch", compute_ud);
@@ -1805,7 +1911,7 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
          }
          /* the packets RADV emits all the time */
          case 0x10: case 0x11: case 0x12: case 0x13: case 0x26: case 0x28: case 0x2a: case 0x2f: case 0x33:
-         case 0x39: case 0x42: case 0x43: case 0x46: case 0x47: case 0x48: case 0x58: case 0x69: case 0x1e:
+         case 0x39: case 0x42: case 0x43: case 0x46: case 0x47: case 0x48: case 0x58: case 0x1e:
          case 0x22: case 0x23: case 0x20:
             break;
          default:
@@ -1910,6 +2016,10 @@ struct ps4_pf {
    uint8_t *stages;
    unsigned *num_shaders, max_shaders;
    unsigned new_shaders;
+   /* (04.48) what user data points to (descriptor sets, vertex buffer tables): 64 bytes of each */
+   uint64_t va_start, va32_start;
+   unsigned num_mem;
+   uint64_t mem[4096];      /* a hash set (0: empty) */
    char buf[16384];         /* (last: everything before it is reset for each submission) */
 };
 
@@ -1933,6 +2043,34 @@ ps4_pf_printf(struct ps4_pf *pf, const char *fmt, ...)
    va_end(ap);
    if (r > 0)
       pf->n = MIN2(pf->n + (size_t)r, sizeof(pf->buf) - 1);
+}
+
+/* User data values that could be pointers into the GPU windows: 32-bit ones into the 32-bit window
+ * (RADV's descriptor sets on gfx7), and low/high pairs into the 16 GiB one. */
+static void
+ps4_pf_add_mem(struct ps4_pf *pf, uint64_t va)
+{
+   if (!va || (va & 3) || pf->num_mem >= ARRAY_SIZE(pf->mem) / 2)
+      return;
+   for (unsigned h = (unsigned)((va >> 2) * 2654435761u) % ARRAY_SIZE(pf->mem);; h = (h + 1) % ARRAY_SIZE(pf->mem)) {
+      if (pf->mem[h] == va)
+         return;
+      if (!pf->mem[h]) {
+         pf->mem[h] = va;
+         pf->num_mem++;
+         return;
+      }
+   }
+}
+
+static bool
+ps4_pf_is_user_data(unsigned reg)
+{
+   static const unsigned first[7] = {0x00c, 0x04c, 0x08c, 0x0cc, 0x10c, 0x14c, 0x240};
+   for (unsigned s = 0; s < 7; s++)
+      if (reg >= first[s] && reg < first[s] + 16)
+         return true;
+   return false;
 }
 
 static bool
@@ -2012,6 +2150,13 @@ ps4_pf_ib(struct ps4_pf *pf, uint64_t va, unsigned num_dw, int depth)
             unsigned set = 0;
             for (unsigned k = 1; k < body; k++) {
                const unsigned reg = (b[0] & 0xffff) + k - 1;
+               if (ps4_pf_is_user_data(reg)) {
+                  if (pf->va32_start)
+                     ps4_pf_add_mem(pf, pf->va32_start + b[k]);
+                  const uint64_t pair = k + 1 < body ? b[k] | ((uint64_t)b[k + 1] << 32) : 0;
+                  if (pf->va_start && pair >= pf->va_start && pair < pf->va_start + (16ull << 30))
+                     ps4_pf_add_mem(pf, pair);
+               }
                static const unsigned lo_reg[PS4_STAGES] = {0x148, 0x108, 0x0c8, 0x088, 0x048, 0x008, 0x20c};
                for (unsigned s = 0; s < PS4_STAGES; s++) {
                   if (reg == lo_reg[s]) {
@@ -2042,11 +2187,13 @@ static uint64_t
 ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
                   uint32_t first_trace, uint32_t last_trace, uint64_t *shaders, uint8_t *stages,
                   unsigned *num_shaders, unsigned max_shaders, uint64_t bytes_before, unsigned *ibs_out,
-                  unsigned *new_shaders_out)
+                  unsigned *new_shaders_out, uint64_t va_start, uint64_t va32_start)
 {
    static struct ps4_pf pf; /* (under dev->lock) */
    memset(&pf, 0, offsetof(struct ps4_pf, buf));
    pf.fd = fd;
+   pf.va_start = va_start;
+   pf.va32_start = va32_start;
    pf.bytes = bytes_before;
    pf.shaders = shaders;
    pf.stages = stages;
@@ -2059,8 +2206,24 @@ ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes,
       ps4_pf_printf(&pf, "=== top-level IB %u\n", i);
       ps4_pf_ib(&pf, (uintptr_t)dcb[i], sizes[i] / 4, 0);
    }
-   ps4_pf_printf(&pf, "=== end of submission %llu (%u IBs in all, %u dwords; %u new shaders)\n",
-                 (unsigned long long)seq, pf.ibs, pf.dwords, pf.new_shaders);
+   /* (04.48) 64 bytes at each user data pointer, mapped ones: "m <address>: <16 dwords>" */
+   unsigned dumped = 0;
+   if (pf.num_mem && !ps4_pf_full(&pf)) {
+      ps4_pf_printf(&pf, "=== memory at user data pointers (64 bytes each)\n");
+      for (unsigned h = 0; h < ARRAY_SIZE(pf.mem) && !ps4_pf_full(&pf); h++) {
+         const uint32_t *d = pf.mem[h] ? ps4_hw_read(pf.mem[h], 64) : NULL;
+         if (!d)
+            continue;
+         dumped++;
+         ps4_pf_printf(&pf, "m %010llx:", (unsigned long long)pf.mem[h]);
+         for (unsigned k = 0; k < 16; k++)
+            ps4_pf_printf(&pf, " %08x", d[k]);
+         ps4_pf_printf(&pf, "\n");
+      }
+   }
+   ps4_pf_printf(&pf, "=== end of submission %llu (%u IBs in all, %u dwords; %u new shaders; %u of %u user data "
+                 "pointers mapped)\n", (unsigned long long)seq, pf.ibs, pf.dwords, pf.new_shaders, dumped,
+                 pf.num_mem);
    ps4_pf_flush(&pf);
    uint64_t done[1];
    for (unsigned s = first_shader; s < *num_shaders && pf.bytes < PS4_PF_LIMIT; s++) {
@@ -2090,7 +2253,7 @@ static int64_t ps4_watch_until;       /* the progress record runs until then (ns
 static uint64_t ps4_handed_seq;       /* the last submission handed to the system (the submission thread) */
 
 static void
-ps4_pf_begin(double idle_s)
+ps4_pf_begin(const ac_drm_device *dev, double idle_s)
 {
    static int enabled = -1;
    if (enabled < 0) {
@@ -2109,32 +2272,62 @@ ps4_pf_begin(double idle_s)
    ps4_pf_count = 0;
    ps4_pf_num_shaders = 0;
    if (ps4_pf_fd >= 0) {
-      char line[400];
+      char line[640];
       const int n = snprintf(line, sizeof(line),
                              "the GPU was idle %.1f s (idle period %u); the submissions after it with 8 or more "
                              "draws and dispatches, each written and synced before it went to the GPU: every IB "
                              "(address: dwords), then the code of the shaders it set that weren't here yet. "
-                             "Trace ids at %#llx. gpu/progress.txt: how far the GPU got "
-                             "(eden-ps4/tools/gpu-preflight.py)\n",
-                             idle_s, ps4_pf_period + 1, (unsigned long long)ps4_trace_va);
+                             "Trace ids at %#llx. GPU windows %#llx, %#llx. gpu/progress.txt: how far the GPU "
+                             "got (eden-ps4/tools/gpu-preflight.py)\n",
+                             idle_s, ps4_pf_period + 1, (unsigned long long)ps4_trace_va,
+                             (unsigned long long)dev->va_start, (unsigned long long)dev->va32_start);
       (void)!write(ps4_pf_fd, line, (size_t)n);
       ps4_pf_bytes = (uint64_t)n;
    }
    __atomic_add_fetch(&ps4_pf_period, 1, __ATOMIC_RELEASE);
 }
 
+/* (04.48) The live GPU buffers, "b <handle> <address> <size> <garlic|onion>[ tail]", with the first two
+ * recorded submissions of a period (dev->lock held): what each address in the record lies in. */
+static uint64_t
+ps4_pf_buffers(ac_drm_device *dev, int fd)
+{
+   static char buf[16384];
+   size_t n = (size_t)snprintf(buf, sizeof(buf), "=== live GPU buffers\n");
+   uint64_t bytes = 0;
+   for (unsigned h = 1; h < dev->num_bos; h++) {
+      const struct amdgpu_bo *b = dev->bos[h];
+      if (!b || !b->cpu)
+         continue;
+      if (sizeof(buf) - n < 128) {
+         (void)!write(fd, buf, n);
+         bytes += n;
+         n = 0;
+      }
+      n += (size_t)snprintf(buf + n, sizeof(buf) - n, "b %u %010llx %llx %s%s%s\n", b->handle,
+                            (unsigned long long)(uintptr_t)b->cpu, (unsigned long long)b->size,
+                            b->write_combined ? "garlic" : "onion", b->tail_mapped ? " tail" : "",
+                            b->user_mem ? " user" : b->cpu_owned ? " cpu" : "");
+   }
+   (void)!write(fd, buf, n);
+   return bytes + n;
+}
+
 static void
-ps4_preflight(uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs, uint32_t first_trace,
-              uint32_t last_trace)
+ps4_preflight(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
+              uint32_t first_trace, uint32_t last_trace)
 {
    if (ps4_pf_fd < 0 || ps4_pf_bytes >= PS4_PF_LIMIT || ps4_pf_count >= 16)
       return;
    ps4_pf_count++;
    const int64_t t0 = os_time_get_nano();
    unsigned ibs = 0, new_shaders = 0;
-   const uint64_t bytes = ps4_pf_submission(ps4_pf_fd, seq, dcb, sizes, num_ibs, first_trace, last_trace,
-                                            ps4_pf_shaders, ps4_pf_stages, &ps4_pf_num_shaders,
-                                            ARRAY_SIZE(ps4_pf_shaders), ps4_pf_bytes, &ibs, &new_shaders);
+   uint64_t bytes = ps4_pf_submission(ps4_pf_fd, seq, dcb, sizes, num_ibs, first_trace, last_trace,
+                                      ps4_pf_shaders, ps4_pf_stages, &ps4_pf_num_shaders,
+                                      ARRAY_SIZE(ps4_pf_shaders), ps4_pf_bytes, &ibs, &new_shaders,
+                                      dev->va_start, dev->va32_start);
+   if (ps4_pf_count <= 2)
+      bytes += ps4_pf_buffers(dev, ps4_pf_fd);
    ps4_pf_bytes += bytes;
    fsync(ps4_pf_fd);
    char line[220];
@@ -2262,7 +2455,7 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
       snprintf(line, sizeof(line), "radv/ps4: the GPU was idle %.1f s (nothing submitted): its next 40 "
                "submissions follow", gap / 1e9);
       ps4_boot_trace(line);
-      ps4_pf_begin(gap / 1e9);
+      ps4_pf_begin(dev, gap / 1e9);
    }
    if (ps4_after_idle_left <= 0) {
       ps4_last_submit_ns = now;
@@ -2306,7 +2499,7 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
             last_trace, ps4_gs_tess_last_draws, ps4_gs_tess_last_rings, w.dropped ? " (walk cut short)" : "", check);
    ps4_boot_trace(line);
    if (draws + dispatches >= 8)
-      ps4_preflight(seq, dcb, sizes, num_ibs, first_trace, last_trace);
+      ps4_preflight(dev, seq, dcb, sizes, num_ibs, first_trace, last_trace);
    __atomic_store_n(&ps4_watch_until, os_time_get_nano() + 3000000000ll, __ATOMIC_RELAXED);
    ps4_last_submit_ns = os_time_get_nano(); /* (the note's own time is no gap) */
 }

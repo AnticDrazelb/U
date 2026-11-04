@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.48: 04.46's record caught Captain Toad's level 3: the GPU stopped on one of the copies that "
+         "upload a texture's mip levels (a 32x32 one, eight levels) from Eden's staging buffer, the first "
+         "batch after the loading screen. What it reads checked fine; where it writes was never checked. Now "
+         "the render targets are checked too (a draw writing into no GPU buffer is left out and logged: that "
+         "may even get level 3 to load), and the record keeps the descriptors and the list of GPU buffers.\n"
          "04.47: fixes 04.46's slowdown and its crash, both from the GPU diagnostics: they were meant to run "
          "only after a loading screen, but took a game that ran a little slowly for one again and again (every "
          "second or so), and each time checked and wrote out the next 40 batches of GPU work. That made Captain "

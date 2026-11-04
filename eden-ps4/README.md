@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.48: **render targets checked.** 04.46's record caught Toad's level 3: after a full wait, the CP sent
+7 of 8 draws copying a staging buffer into a 32x32 RGBA16F texture's eight mip levels (RADV's blit2d
+buffer-to-image copy) and stood at the 8th, all its contexts held by draws that never finished. The
+copy's source descriptors checked fine; its destination was never checked. Now each draw's color,
+depth/stencil, CMASK/FMASK and HTILE bases are checked against the live buffers too (a draw writing
+into none, or far past its buffer, is logged and skipped), and the record keeps the memory at every
+user data pointer and the live buffer list for `tools/gpu-preflight.py`.
+
 04.47: **04.46's slowdown and crash, both the diagnostics'.** The 40 noted submissions after "the GPU
 was idle 0.5 s" were meant for loading screens, but "idle" was the stall thread finding the GPU done at
 each of its 50 ms looks: a game that idles the GPU between frames met it every second or so (Zelda's

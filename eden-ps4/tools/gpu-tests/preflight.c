@@ -18,6 +18,7 @@
 
 #define MIN2(a, b) ((a) < (b) ? (a) : (b))
 #define MAX2(a, b) ((a) > (b) ? (a) : (b))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 struct region {
     uint64_t va;
@@ -143,6 +144,7 @@ int main(int argc, char** argv) {
         ib_call(&a, 0x4400120000ull, c.n, true);
         // D (submission 2): the vertex shader, two trace ids, then the dispatch the CP is "stuck" on
         shader_regs(&d, 0x048, 0x4400400000ull);
+        set_sh2(&d, 0x00e, 0x10000, 0x3f800000);  // PS user data 2-3: a 32-bit pointer (the trace page), a float
         trace(&d, 6);
         trace(&d, 7);
         shader_regs(&d, 0x20c, 0x4400300000ull);
@@ -156,16 +158,17 @@ int main(int argc, char** argv) {
         uint64_t bytes = sizeof(head) - 1;
         void* dcb1[1] = {(void*)(uintptr_t)0x4400100000ull};
         uint32_t sz1[1] = {a.n * 4};
-        bytes += ps4_pf_submission(fd, 1, dcb1, sz1, 1, 1, 5, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh);
+        bytes += ps4_pf_submission(fd, 1, dcb1, sz1, 1, 1, 5, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull);
         check(ibs == 3 && fresh == 2 && num_shaders == 2, "submission 1: 3 IBs, 2 new shaders");
         void* dcb2[1] = {(void*)(uintptr_t)0x4400130000ull};
         uint32_t sz2[1] = {d.n * 4};
-        bytes += ps4_pf_submission(fd, 2, dcb2, sz2, 1, 6, 8, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh);
+        bytes += ps4_pf_submission(fd, 2, dcb2, sz2, 1, 6, 8, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull);
         check(ibs == 1 && fresh == 1 && num_shaders == 3, "submission 2: 1 IB, 1 new shader (the CS one again isn't)");
         const off_t size = lseek(fd, 0, SEEK_CUR);
         check((uint64_t)size == bytes, "bytes counted = the file's size");
         close(fd);
         check(count(path, "==== shader ") == 3, "3 shaders in the record");
+        check(count(path, "m 4400010000:") == 1, "the memory a user data pointer points to");
         check(count(path, "== IB 0x4400110000, ") == 1 && count(path, "== IB 0x4400120000, ") == 1,
               "the nested and the chained IB in it");
         FILE* p = fopen(progress, "w");
@@ -188,7 +191,7 @@ int main(int argc, char** argv) {
         void* dcb[2] = {(void*)(uintptr_t)0x4401000000ull, (void*)(uintptr_t)0x4401000000ull};
         uint32_t sz[2] = {dw * 4, dw * 4};
         unsigned n2 = 0;
-        const uint64_t bytes = ps4_pf_submission(fd, 9, dcb, sz, 2, 0, 0, shaders, stages, &num_shaders, 64, 0, &ibs, &n2);
+        const uint64_t bytes = ps4_pf_submission(fd, 9, dcb, sz, 2, 0, 0, shaders, stages, &num_shaders, 64, 0, &ibs, &n2, 0, 0);
         close(fd);
         struct stat st;
         stat(big, &st);
@@ -224,7 +227,7 @@ int main(int argc, char** argv) {
         void* dcb[1] = {(void*)(uintptr_t)(base + at * 4)};
         uint32_t sz[1] = {(4096 - at) * 4};
         unsigned n3 = 0, j = 0;
-        ps4_pf_submission(fd, 10, dcb, sz, 1, 0, 0, shaders, stages, &num_shaders, 64, 0, &j, &n3);
+        ps4_pf_submission(fd, 10, dcb, sz, 1, 0, 0, shaders, stages, &num_shaders, 64, 0, &j, &n3, 0x4400000000ull, 0x4402000000ull);
         close(fd);
         reset_regions();
     }

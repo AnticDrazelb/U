@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.47)
+# Eden for PS4: status (after 04.48)
 
-Install **04.47** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.48** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -59,6 +59,32 @@ programs, 0 failures.
 - **04.45:** multi indirect draws in the PS4's opcodes: Zelda's GPU hang fixed (below).
 - **04.46:** the pre-flight record and the 2 ms GPU progress record (below).
 - **04.47:** 04.46's slowdown and crash fixed (both the diagnostics'); "idle" is a 1 s gap (below).
+- **04.48:** render targets checked; descriptors and the buffer list in the record (below).
+
+## 04.48: where Toad's level 3 stops the GPU (04.46's record)
+
+- **The run:** Toad on 04.46 (still with its slowdown), straight to the level 3 load: the same six
+  buffers (16, 16, 32, 16, 16 MiB garlic, 16 MiB onion) at 88.4-88.5 s, then submission 7167 (900
+  draws, 193 dispatches, 17 register copies). The record took 510 ms; the progress record: the CP
+  started 7167, passed trace id 178720 within 3 ms, and never moved again; the PS4 was gone ~0.1 s
+  later (`tools/gpu-preflight.py` on the bundle).
+- **The stop:** after a full wait (PS/CS partial flushes, `SURFACE_SYNC`), 7 draws of one 8-draw
+  chain had gone out and the CP stood at the 8th: the 7 contexts of the CP all held by draws that
+  hadn't finished, so the first of them never did. The chain: RADV's buffer-to-image copy (blit2d:
+  the PS fetches `buffer_load_format_xyzw` at x + y * pitch from a texel buffer, one draw per mip
+  level) into a 32x32 RGBA16F texture at 0x43fdcfc100 with eight levels (32 ... 1, then two more
+  1x1: the guest's level count), 1D-tiled (tile mode 13). An identical chain just before (64x64,
+  nine levels, at 0x43fdcf0d00, right below it in memory) finished.
+- **Not it:** the shaders (the same ones ran 450 times in 7167), the descriptors' bases and ranges
+  (the 04.44 check: 0 wild, 0 overruns). **Never checked:** where the draws write.
+- **04.48:** the descriptor check also checks every draw's render targets: color targets (base, and
+  the slices' size from `CB_COLOR*_SLICE`/`VIEW`), CMASK/FMASK when in use, depth/stencil and HTILE;
+  one in no live buffer, or far past its buffer's end, is logged and its draw skipped. The record
+  keeps 64 bytes at every user data pointer (the descriptor sets) and the live buffer list, and the
+  decoder checks the stuck work's targets and descriptors against it.
+- **Next:** one Toad level 3 run on 04.48. A logged render target: the copy writes outside its
+  memory (an Eden or driver-layer bug about that texture), and level 3 may load with the copy left
+  out. None: the record names the buffers and descriptors of the stuck copy.
 
 ## 04.47: the diagnostics' slowdown and crash
 

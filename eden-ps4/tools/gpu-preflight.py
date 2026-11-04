@@ -84,6 +84,11 @@ class Submission:
         self.seq, self.first, self.last = seq, first, last
         self.top = []      # top-level IB addresses
         self.ibs = {}      # address -> dwords
+        self.mem = {}      # (04.48) address -> 16 dwords at a user data pointer
+        self.buffers = []  # (04.48) (start, size, handle, kind) of the live GPU buffers
+
+
+WINDOWS = [0x4000000000, 0x4400000000]  # the 16 GiB and the 32-bit window (the header says, from 04.48)
 
 
 def parse_preflight(lines):
@@ -93,6 +98,17 @@ def parse_preflight(lines):
         m = re.search(r"Trace ids at (0x[0-9a-f]+)", line)
         if m and trace_va is None:
             trace_va = int(m[1], 16)
+        m = re.search(r"GPU windows (0x[0-9a-f]+), (0x[0-9a-f]+)", line)
+        if m:
+            WINDOWS[:] = [int(m[1], 16), int(m[2], 16)]
+        m = re.match(r"^m ([0-9a-f]{10}):((?: [0-9a-f]{8}){16})\s*$", line)
+        if m and sub:
+            sub.mem[int(m[1], 16)] = [int(w, 16) for w in m[2].split()]
+            continue
+        m = re.match(r"^b (\d+) ([0-9a-f]{10}) ([0-9a-f]+) (\w+)(.*)$", line)
+        if m and sub:
+            sub.buffers.append((int(m[2], 16), int(m[3], 16), int(m[1]), m[4] + m[5]))
+            continue
         m = re.match(r"==== submission (\d+): (\d+) IBs, trace ids (\d+)-(\d+)", line)
         if m:
             sub = Submission(int(m[1]), int(m[3]), int(m[4]))
@@ -253,6 +269,110 @@ def describe(op, b, state, trace_va):
     return text
 
 
+def in_buffer(buffers, va, size=0):
+    """Where `va` (and `size` bytes from it) lies among the live buffers."""
+    if not buffers:
+        return "(no buffer list in the record)"
+    lo, hi = 0, len(buffers)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if buffers[mid][0] <= va:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo:
+        start, bsize, handle, kind = buffers[lo - 1]
+        end = start + bsize + (0x10000 if "tail" in kind else 0)
+        if va < end:
+            over = va + size - end
+            return "in bo %d (%#x, %#x bytes, %s) at +%#x%s" % (
+                handle, start, bsize, kind, va - start, "; RUNS %#x PAST ITS END" % over if over > 0 else "")
+    return "IN NO LIVE BUFFER"
+
+
+CB_BPP = {1: 1, 2: 2, 3: 2, 0x10: 2, 0x11: 2, 0x12: 2, 0x13: 2, 4: 4, 5: 4, 6: 4, 7: 4, 8: 4, 9: 4, 0xA: 4, 0x14: 4,
+          0x15: 4, 0xB: 8, 0xC: 8, 0x16: 8, 0xE: 16}
+
+
+def targets(state, buffers):
+    """The render targets a draw writes, each against the buffers."""
+    out = []
+    ctx = state.ctx
+    if (ctx.get(0x202, 0) >> 4) & 7:
+        for i in range(8):
+            r = 0x318 + i * 15
+            info = ctx.get(r + 4, 0)
+            fmt = (info >> 2) & 0x1F
+            if not fmt or not (ctx.get(0x8E, 0xFFFFFFFF) >> (4 * i)) & 0xF:
+                continue
+            base = ctx.get(r, 0) << 8
+            pitch = ((ctx.get(r + 1, 0) & 0x7FF) + 1) * 8
+            slice_px = ((ctx.get(r + 2, 0) & 0x3FFFFF) + 1) * 64
+            last = (ctx.get(r + 3, 0) >> 13) & 0x7FF
+            size = slice_px * CB_BPP.get(fmt, 16) * (last + 1)
+            out.append("CB%d %#x (pitch %d, %d slices of %#x bytes, format %#x, tile mode %d): %s" % (
+                i, base, pitch, last + 1, slice_px * CB_BPP.get(fmt, 16), fmt, ctx.get(r + 5, 0) & 0x1F,
+                in_buffer(buffers, base, size)))
+            if info & (3 << 13):
+                out.append("  its CMASK %#x: %s" % (ctx.get(r + 7, 0) << 8, in_buffer(buffers, ctx.get(r + 7, 0) << 8)))
+    z = ctx.get(0x10, 0) & 3
+    if z:
+        for reg, what in ((0x12, "depth read"), (0x14, "depth write")):
+            out.append("DB %s %#x: %s" % (what, ctx.get(reg, 0) << 8, in_buffer(buffers, ctx.get(reg, 0) << 8)))
+    if ctx.get(0x11, 0) & 1:
+        for reg, what in ((0x13, "stencil read"), (0x15, "stencil write")):
+            out.append("DB %s %#x: %s" % (what, ctx.get(reg, 0) << 8, in_buffer(buffers, ctx.get(reg, 0) << 8)))
+    return out
+
+
+def descriptors(words, buffers):
+    """V#s and T#s among 16 dwords at a user data pointer, each against the buffers."""
+    out, j = [], 0
+    while j + 4 <= len(words):
+        d = words[j:j + 8]
+        d3 = d[3]
+        if d3 & 0xFFF and d3 >> 30 == 0 and d[2] and (d3 >> 15) & 0xF:
+            base = d[0] | ((d[1] & 0xFFFF) << 32)
+            stride = (d[1] >> 16) & 0x3FFF
+            size = d[2] * stride if stride else d[2]
+            out.append("V# at +%d: %#x, %d records x %d bytes, data format %d: %s" % (
+                4 * j, base, d[2], stride, (d3 >> 15) & 0xF, in_buffer(buffers, base, size)))
+            j += 4
+        elif 9 <= d3 >> 28 <= 15 and j + 8 <= len(words):
+            base = (d[0] | ((d[1] & 0xFF) << 32)) << 8
+            width = ((d[2] & 0x3FFF) + 1)
+            height = ((d[2] >> 14) & 0x3FFF) + 1
+            out.append("T# at +%d: %#x, %dx%d, data format %d, levels %d-%d, tile mode %d, pitch %d, type %d: %s" % (
+                4 * j, base, width, height, (d[1] >> 20) & 0x3F, (d3 >> 12) & 0xF, (d3 >> 16) & 0xF,
+                (d3 >> 20) & 0x1F, ((d[4] >> 13) & 0x3FFF) + 1, d3 >> 28, in_buffer(buffers, base)))
+            j += 8
+        else:
+            j += 4
+    return out
+
+
+USER_DATA = {"PS": 0x00C, "VS": 0x04C, "GS": 0x08C, "ES": 0x0CC, "HS": 0x10C, "LS": 0x14C, "CS": 0x240}
+
+
+def work_details(op, state, sub, buffers):
+    lines = []
+    stages = ["CS"] if op in (0x15, 0x16) else ["VS", "PS"]
+    if op not in (0x15, 0x16):
+        lines += targets(state, buffers)
+    for st in stages:
+        for k in range(16):
+            v = state.sh.get(USER_DATA[st] + k)
+            if v is None:
+                continue
+            for ptr in (WINDOWS[1] + v,):
+                words = sub.mem.get(ptr)
+                if words:
+                    found = descriptors(words, buffers)
+                    lines.append("%s user data %d -> %#x: %s" % (st, k, ptr, "; ".join(found) if found else
+                                                                 " ".join("%08x" % w for w in words[:8]) + " ..."))
+    return lines
+
+
 def main(argv):
     args = [a for a in argv[1:] if not a.startswith("--")]
     opts = argv[1:]
@@ -329,6 +449,38 @@ def main(argv):
         print("%s %s%#x: %s" % (mark, "  " * depth, va, describe(op, b, state, trace_va)))
         state.apply(op, b)
         shown_work += op in WORK
+    # (04.48) the work since the last wait before the stop (it hadn't finished), and the next one:
+    # render targets and descriptors against the live buffers
+    buffers = []
+    for s2 in subs:
+        if s2.buffers:
+            buffers = sorted(s2.buffers)
+        if s2 is sub:
+            break
+    if at >= 0:
+        last_wait = 0
+        for i, (va, op, b, depth) in enumerate(pkts[:at]):
+            if (op == 0x46 and b and (b[0] & 0x3F) in WAITS_EVENTS) or op in (0x3C, 0x39, 0x43):
+                last_wait = i
+        print("\nthe work issued since the last wait before it (%d packets back), and the next:" % (at - last_wait))
+        st2 = State()
+        for earlier in subs:
+            if earlier is sub:
+                break
+            for va, op, b, depth in walk(earlier):
+                st2.apply(op, b)
+        nxt = 0
+        for i, (va, op, b, depth) in enumerate(pkts):
+            st2.apply(op, b)
+            if i < last_wait or op not in WORK:
+                continue
+            print("> %#x: %s" % (va, describe(op, b, st2, trace_va)))
+            for line in work_details(op, st2, sub, buffers):
+                print("    " + line)
+            if i > at:
+                nxt += 1
+                if nxt >= 1:
+                    break
     used = sorted({state.shader(st) for st in PGM if state.shader(st) is not None})
     for va in used:
         s = shaders.get(va)
