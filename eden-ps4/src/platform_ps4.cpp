@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.51: 04.50's check found every page of every GPU buffer mapped exactly as it should be, and level 3 "
+         "still stopped at that one address. Two tests at once now: just before level 3's first batch the GPU "
+         "writes a single value there by itself (if the PS4 dies right there, the GPU can't write that memory at "
+         "all), and the drawing that writes or reads that 16 KiB of memory is left out (if level 3 then loads, "
+         "it's that spot; if not, the log names the next one).\n"
          "04.50: with 04.49's one-at-a-time GPU work, Captain Toad's level 3 still went down, and now the log "
          "is exact: the GPU never finished its very first write to one spot of memory (the same address in all "
          "three runs, whatever it copied there). By the driver's books that memory is fine. Now the PS4's own "

@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.50)
+# Eden for PS4: status (after 04.51)
 
-Install **04.50** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.51** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -62,6 +62,25 @@ programs, 0 failures.
 - **04.48:** render targets checked; descriptors and the buffer list in the record (below).
 - **04.49:** GPU work around a loading screen serialized (below).
 - **04.50:** the mapping audit (below).
+- **04.51:** the probe write and the skip test at Toad's address (below).
+
+## 04.51: a probe write and a skip test at 0x43fdcfc100
+
+- **04.50's run:** the query reports GPU protection (self-test `prot 0x33`); the audit of 2789
+  buffers found 0 wrong pages, five times over the load. bo 26 (phys 0x10820000): the stuck write's
+  physical address 0x109dc100; no physical overlaps between buffers, nor with Eden's RAM chunks.
+  The CP stopped at the same place (456 trace points into the batch). So the page is mapped as it
+  should be, by its own memory, GPU-writable, shared with nothing we know of, and the first copy
+  draw into it still never finishes, in all four recorded runs.
+- **04.51, two tests in one run:**
+  - **Probe:** before the first big submission of a period, an IB of our own: `WRITE_DATA` of 0 to
+    `RADV_PS4_PROBE` (default 0x43fdcfc100) with write confirm, then trace id 0x7fff0001. The GPU
+    stuck at the probe: it can't write that memory at all (a GPU-side mapping the kernel's query
+    doesn't show). Past it: the CP can; the trouble is the draw's.
+  - **Skip:** draws whose render target or descriptors touch `RADV_PS4_SKIP_TARGET` (default
+    0x43fdcfc000:0x4000, the page) are skipped in the noted submissions (via the audit's holes).
+    Level 3 loads: it's that spot. It goes down elsewhere: the record names the next stop.
+  - Both `=0` in settings.txt to turn off.
 
 ## 04.50: the mapping audit
 

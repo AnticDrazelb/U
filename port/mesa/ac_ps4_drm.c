@@ -197,6 +197,7 @@ struct ac_drm_device {
     * clock frequency. */
    volatile uint64_t *ts_start, *ts_end;
    uint32_t *ts_ibs;
+   uint32_t *probe_ib; /* (04.51) the probe write's IB (ps4_probe) */
    uint64_t ts_accounted, ts_prev_end, ts_busy, ts_span_first, ts_span_last;
    uint64_t last_seq; /* last submitted */
 
@@ -1599,10 +1600,15 @@ ps4_check_hole_report(struct ps4_check *c, uint64_t seq, const void *packet, con
    if (session < 24) {
       session++;
       char line[300];
-      snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s: %s %#llx is in bo %u but on memory the kernel "
-               "doesn't map as the bo's ([%#llx, %#llx): see the mapping audit)", (unsigned long long)seq, packet,
-               work, what, (unsigned long long)va, h->handle, (unsigned long long)h->start,
-               (unsigned long long)h->end);
+      if (!h->handle) /* (04.51) the test range */
+         snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s: %s %#llx is in [%#llx, %#llx), the "
+                  "range RADV_PS4_SKIP_TARGET names (a test): skipped", (unsigned long long)seq, packet, work, what,
+                  (unsigned long long)va, (unsigned long long)h->start, (unsigned long long)h->end);
+      else
+         snprintf(line, sizeof(line), "radv/ps4: submission %llu: %p: %s: %s %#llx is in bo %u but on memory the "
+                  "kernel doesn't map as the bo's ([%#llx, %#llx): see the mapping audit)", (unsigned long long)seq,
+                  packet, work, what, (unsigned long long)va, h->handle, (unsigned long long)h->start,
+                  (unsigned long long)h->end);
       ps4_boot_trace(line);
    }
    return true;
@@ -2066,6 +2072,8 @@ ps4_audit_mappings(struct ps4_check *c)
       }
    }
    c->holes_trusted = bad_bos && bad_bos <= 8;
+   if (!c->holes_trusted)
+      c->num_holes = 0;
    static unsigned summaries;
    if (summaries < 8) {
       summaries++;
@@ -2112,6 +2120,26 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    }
    qsort(c.ranges, c.num_ranges, sizeof(*c.ranges), ps4_live_range_cmp);
    ps4_audit_mappings(&c);
+   /* (04.51) a test: work writing or reading [va, va + bytes) is skipped (RADV_PS4_SKIP_TARGET=va:bytes;
+    * default the 16 KiB page of Toad level 3's stuck copy, 0x43fdcfc100; 0 = off) */
+   static uint64_t skip_lo = 1, skip_hi;
+   if (skip_lo == 1) {
+      const char *e = getenv("RADV_PS4_SKIP_TARGET");
+      skip_lo = 0;
+      if (!e)
+         e = "0x43fdcfc000:0x4000";
+      char *end = NULL;
+      const uint64_t va = strtoull(e, &end, 0);
+      const uint64_t bytes = end && *end == ':' ? strtoull(end + 1, NULL, 0) : 0x4000;
+      if (va && bytes) {
+         skip_lo = va;
+         skip_hi = va + bytes;
+      }
+   }
+   if (skip_hi && c.num_holes < ARRAY_SIZE(c.holes)) {
+      c.holes[c.num_holes++] = (struct ps4_hole){skip_lo, skip_hi, 0};
+      c.holes_trusted = true;
+   }
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_check_ib(&c, dcb[i], sizes[i] / 4, seq, 0, skip);
    size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; config regs %u, register "
@@ -2596,6 +2624,12 @@ ps4_watch_thread(void *arg)
  * submissions in 220 periods, and 04.46's record (MiBs written and synced for each) slowed Captain
  * Toad to 11 fps, which met it more often still. */
 static int ps4_after_idle_left;      /* submissions still to note (under dev->lock) */
+/* (04.51) The probe: before the first big submission after an idle GPU, the CP writes one dword to
+ * RADV_PS4_PROBE (default 0x43fdcfc100, the address Toad's level 3 copy never finishes writing; 0 =
+ * off) with a write confirm, then trace id PS4_PROBE_TRACE. The GPU stuck before that trace id: the
+ * GPU can't write there at all; past it: the CP can, and the trouble is the draw's. */
+#define PS4_PROBE_TRACE 0x7fff0001u
+static uint64_t ps4_probe_pending;  /* the address to probe in the next submission (under dev->lock) */
 static uint64_t ps4_after_idle_last; /* the last one noted: completions are noted up to it */
 
 static void
@@ -2669,6 +2703,28 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
    ps4_boot_trace(line);
    if (draws + dispatches >= 8)
       ps4_preflight(dev, seq, dcb, sizes, num_ibs, first_trace, last_trace);
+   static uint64_t probe_va = 1;
+   if (probe_va == 1) {
+      const char *e = getenv("RADV_PS4_PROBE");
+      probe_va = strtoull(e ? e : "0x43fdcfc100", NULL, 0) & ~3ull;
+   }
+   static unsigned probed_period;
+   if (probe_va && draws + dispatches >= 8 && probed_period != ps4_pf_period) { /* the period's first big one */
+      probed_period = ps4_pf_period;
+      bool live = false;
+      for (unsigned h = 1; h < dev->num_bos && !live; h++) {
+         const struct amdgpu_bo *b = dev->bos[h];
+         live = b && b->cpu && !b->user_mem && probe_va >= (uintptr_t)b->cpu &&
+                probe_va + 4 <= (uintptr_t)b->cpu + b->size;
+      }
+      char line[200];
+      snprintf(line, sizeof(line), "radv/ps4: probe: %s %#llx before submission %llu (trace id %#x once written)",
+               live ? "the CP writes" : "no live buffer at", (unsigned long long)probe_va, (unsigned long long)seq,
+               PS4_PROBE_TRACE);
+      ps4_boot_trace(line);
+      if (live)
+         ps4_probe_pending = probe_va;
+   }
    __atomic_store_n(&ps4_watch_until, os_time_get_nano() + 3000000000ll, __ATOMIC_RELAXED);
    ps4_last_submit_ns = os_time_get_nano(); /* (the note's own time is no gap) */
 }
@@ -5188,6 +5244,34 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
    ps4_account_gpu_time(dev);
    const uint64_t seq = ++dev->last_seq;
    ps4_note_submission(dev, seq, dcb, dcb_sizes, num_ibs);
+   if (ps4_probe_pending && num_ibs < ARRAY_SIZE(dcb) - 3) {
+      if (!dev->probe_ib)
+         dev->probe_ib = ps4_map_new(PS4_PAGE, PS4_WB_ONION, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW, NULL);
+      if (dev->probe_ib) {
+         uint32_t *p = dev->probe_ib;
+         const uint64_t va = ps4_probe_pending;
+         *p++ = 0xC0033700; /* WRITE_DATA, memory, write confirm, ME: 0 at the probe address */
+         *p++ = (5u << 8) | (1u << 20);
+         *p++ = (uint32_t)va;
+         *p++ = (uint32_t)(va >> 32);
+         *p++ = 0;
+         if (ps4_trace_va) { /* then the probe's trace id */
+            *p++ = 0xC0033700;
+            *p++ = (5u << 8) | (1u << 20);
+            *p++ = (uint32_t)ps4_trace_va;
+            *p++ = (uint32_t)(ps4_trace_va >> 32);
+            *p++ = PS4_PROBE_TRACE;
+         }
+         while ((p - dev->probe_ib) % 8)
+            *p++ = 0xFFFF1000;
+         memmove(dcb + 1, dcb, sizeof(dcb[0]) * num_ibs);
+         memmove(dcb_sizes + 1, dcb_sizes, sizeof(dcb_sizes[0]) * num_ibs);
+         dcb[0] = dev->probe_ib;
+         dcb_sizes[0] = (uint32_t)(p - dev->probe_ib) * 4;
+         num_ibs++;
+      }
+      ps4_probe_pending = 0;
+   }
    uint32_t *fence_ib = dev->fence_ibs + (seq % FENCE_IB_COUNT) * FENCE_IB_DW;
    uint32_t *cs = fence_ib;
    if (user_fence_addr)

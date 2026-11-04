@@ -425,8 +425,12 @@ def main(argv):
         if not first:
             print("nothing to show")
             return 0
-        print("trace id %s is in none of the recorded submissions after %d: from the start of submission %d" % (
-            trace, done, first.seq))
+        if trace == 0x7FFF0001:  # (04.51) the probe's
+            print("trace id %#x is the probe's: the CP wrote the probe address and stopped before the first trace "
+                  "id of submission %d: from its start" % (trace, first.seq))
+        else:
+            print("trace id %s is in none of the recorded submissions after %d: from the start of submission %d" % (
+                trace, done, first.seq))
         hit = (first, walk(first), -1)
     else:
         print("the CP passed trace id %d last, in submission %d (packet %d of %d, at %#x)" % (

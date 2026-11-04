@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.51: **a probe write and a skip test.** 04.50's audit found all 2789 buffers mapped as they should be
+(own physical pages, GPU-writable, no physical overlaps), and level 3 stopped at the same copy into
+0x43fdcfc100 again. Now the CP writes that address itself (`WRITE_DATA` with write confirm, then trace
+id 0x7fff0001) just before the batch, and draws touching its 16 KiB page are skipped: whether the GPU
+can write there at all, and whether level 3 loads without it (`RADV_PS4_PROBE`, `RADV_PS4_SKIP_TARGET`).
+
 04.50: **the mapping audit.** 04.49 serialized level 3's first batch, and the CP stopped exactly after
 the first copy draw into 0x43fdcfc100 (bo 26 at +0x1bc100), the destination in all three recorded runs
 while the source moved: that memory, not the copy. After a loading screen, every live buffer's pages
