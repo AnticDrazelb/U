@@ -280,6 +280,10 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.plain_acquire_loads = std::getenv("DYN_ACQ") != nullptr;
     config.elide_load_store_only_barriers = std::getenv("DYN_DMB") != nullptr;
 #endif
+    config.very_verbose_debugging_output = std::getenv("DYN_IRDUMP") != nullptr;  // (each block's IR)
+#ifdef HAVE_SUPER  // (04.28) forward CBZ/CBNZ/TBZ/TBNZ as side exits (DYN_SUPER)
+    config.superblocks = std::getenv("DYN_SUPER") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |

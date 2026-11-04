@@ -1,0 +1,29 @@
+From 2083c3b533ff82a8df68660a3947283c65b7959c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 05:56:48 +0000
+Subject: [PATCH 132/133] PS4: the A64 cores' forward CBZ/CBNZ/TBZ/TBNZ as side
+ exits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 3e6a7adcee..ebab676595 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -306,6 +306,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // ISHST, whose orders x86 keeps anyway
+     config.plain_acquire_loads = true;
+     config.elide_load_store_only_barriers = true;
++    // (04.28) a forward CBZ/CBNZ/TBZ/TBNZ (Unity's null checks) leaves the block from its middle
++    // when taken instead of ending it: the code after it in the same block
++    config.superblocks = true;
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+-- 
+2.43.0
+

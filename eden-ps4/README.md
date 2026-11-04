@@ -379,6 +379,46 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.28: **a fix for 04.23-04.27's flags look-ahead; side exits for null checks; float stores from
+vector registers.**
+
+- Patch 0133: **the look-ahead read conditional branches' targets a few bytes off.** 04.23's A64
+  flags look-ahead (patch 0119) took a B.cond's, CBZ/CBNZ's target as `s32(inst << 8) >> 11` and a
+  TBZ/TBNZ's as `<< 13 >> 16`: the two bits under the immediate came along into the target's low
+  bits, the condition's (B.cond with HI and above: +2) or the register's (CBZ/TBZ: +1 to +3). It
+  then decoded the words there, usually as something unknown (live: no harm), but now and then as
+  code that sets the flags, and a block's flags were taken for dead where the real target reads
+  them. Found by 04.28's sweep: one gen8 program of 1,290, an ADC after a CBNZ getting a stale C.
+  Now the immediate is shifted down whole and times 4. **Every 64-bit game since 04.23 could hit
+  it** (rarely: a wrong branch or a value off by one); 04.28 replaces them. `gen17.py` puts flag
+  readers at those targets (the misread is too random for it to catch the old build reliably: the
+  sweeps and gen8 are what found it). With the targets right, more flags are found dead: unity.c
+  403,729 -> 383,938 instructions (-4.9%), game.c 2,057,617 -> 2,046,682 (-0.5%; -38.6% from
+  04.22's 3,335,063).
+
+A new test program,
+`programs/c/unity.c`, shaped like Unity's IL2CPP output (Silksong, Bluey: objects with a class and
+a vtable, virtual calls, a null check before each field access and a bounds check before each array
+element to throw helpers that never run, write barriers, Vector3 math, a dictionary, an Interlocked
+add), built by `build64.sh` as `unity64.bin`. Its profile: blocks ending in CBZ were 22.5% of the
+blocks entered, 2.4 guest instructions each (game.c's: 1.3%); up to 53% of block changes were a
+conditional branch falling through.
+
+- Patch 0131: **forward CBZ, CBNZ, TBZ, TBNZ as side exits** (`superblocks`): the branch doesn't end
+  the block; `A64ExitIfZero32/64`, `A64ExitIfTestBit` test the register (`test r, r`, `test`/`bt`)
+  and jump to a link of their own in the cold code when taken, and the code after them is translated
+  on into the block (eight a block at most, in its first 64 instructions). What was set before an
+  exit is stored before it (A64GetSetElimination keeps those sets; the values stay known after),
+  and the dead flags pass stops at it. B.cond stays a block end: as a side exit it had to keep the
+  flags stored for the code it leaves to (04.26's try). unity.c: 22% fewer blocks entered, -1.5%
+  instructions; game.c the same within 0.2%. **Float stores from XMM registers**: a 32- or 64-bit
+  store whose value is in an XMM (STR S/D, STP of D registers in prologues, a float result) is a
+  `movd`/`movq [mem], xmm` (new fallback stubs) instead of a `movq rax, xmm` first: unity.c -1.5%,
+  game.c -0.4%. Patch 0132 turns the side exits on for Eden's 64-bit cores.
+- Tests: gen11 (CBZ/CBNZ/TBZ/TBNZ on every bit, flags) 250, gen8 200, gen13, gen14, gen12 in all three
+  memory modes and with its data on marked pages (the new store stubs), the cache suites; the full
+  set again (every generator, both modes, the cache suites); A32's gen3.
+
 04.27: **constants in one load; a deeper return stack.** Per 20 steady frames of `game.c` for
 AArch64 with Eden's options: 2,123,983 instructions in 04.26, 2,066,555 now (-2.7%; -38.0% from
 04.22's 3,335,063).

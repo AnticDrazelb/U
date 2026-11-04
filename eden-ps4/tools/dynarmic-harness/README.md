@@ -93,7 +93,8 @@ what the translated code executed by kind and the n-th hottest block (04.24: `-D
 forward B translated through; measure with Eden's `DYN_FWD=1 DYN_RSB=1 DYN_DISP=1 DYN_NOFRAME=1` too;
 `blockstats64.py <dir>`: block entries and host instructions per entry; 04.25: `-DHAVE_ACQ`,
 `DYN_ACQ=1` plain load-acquires, `DYN_DMB=1` LD/ST-only barriers elided; `fastmem2 nowalk` shows
-the shared walk's cost with fastmem) (callgrind `--dump-instr=yes`
+the shared walk's cost with fastmem; 04.28: `-DHAVE_SUPER`, `DYN_SUPER=1` forward CBZ/TBZ as side
+exits; `programs/c/unity.c` (IL2CPP-shaped) as `unity64.bin`) (callgrind `--dump-instr=yes`
 into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
 `BUILD=<dir>` into another build directory.
 
@@ -109,6 +110,7 @@ into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `E
 | gen14.py | A64 calls and returns around FPCR changes (the return stack across mode changes) (04.24) |
 | gen15.py | A64 load-acquires, store-releases, exclusive pairs and DMBs of every type, ordinary and marked pages (04.25) |
 | gen16.py | A64 sign extensions: LDRSB/LDRSH/LDRSW, SXTB/SXTH/SXTW (again), SMULL/SMADDL, extended-register ADD/SUB (04.26) |
+| gen17.py | A64 conditional branches of every kind and register to flag readers, setters on the other path (04.28) |
 | gen6.py | A64 loads/stores sharing a base |
 | gen7.py | A32/Thumb control flow and flags: conditional instructions, IT blocks, loops, calls, VFP compares |
 | gen8.py | A64 control flow and flags |

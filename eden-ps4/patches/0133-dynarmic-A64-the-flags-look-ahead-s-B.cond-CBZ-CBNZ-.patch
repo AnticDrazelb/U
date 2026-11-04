@@ -1,0 +1,46 @@
+From e80da7e951b14725af724895bb71c51453c45bed Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 06:37:31 +0000
+Subject: [PATCH 133/133] dynarmic A64: the flags look-ahead's
+ B.cond/CBZ/CBNZ/TBZ/TBNZ targets without the bits under the immediate
+
+The look-ahead took a conditional branch's target as s32(inst << 8) >> 11 (TBZ: << 13 >> 16):
+the two bits under the immediate came along into the target's low bits, the condition's
+(B.cond with HI and above) or the register's (CBZ, TBZ). It then read the code 1 to 3 bytes off,
+decoded whatever that was, and could take the flags for dead where the real target reads them (a
+stale C for an ADC in a gen8 program, 1 of 1,290 in the 04.28 sweep). Now the immediate is shifted
+down whole and times 4. In 04.23-04.27 (patch 0119).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/frontend/A64/translate/a64_translate.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+index f128a35d16..1a9eea5afb 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+@@ -163,14 +163,16 @@ struct FlagsLookahead {
+                 }
+                 u64 target = 0;
+                 bool branch = true;
++                // (the immediate shifted down whole, then times 4: the bits under it, the condition or
++                // the register, must not come along; 04.23-04.28 had them in the target's low bits)
+                 if ((inst & 0xFF000010) == 0x54000000) {  // B.cond
+                     if (FlagsReadByCond(inst & 0xF) & unset)
+                         return true;
+-                    target = pc + u64(s64(s32(inst << 8) >> 11));
++                    target = pc + (u64(s64(s32(inst << 8) >> 13)) << 2);
+                 } else if ((inst & 0x7E000000) == 0x34000000) {  // CBZ, CBNZ
+-                    target = pc + u64(s64(s32(inst << 8) >> 11));
++                    target = pc + (u64(s64(s32(inst << 8) >> 13)) << 2);
+                 } else if ((inst & 0x7E000000) == 0x36000000) {  // TBZ, TBNZ
+-                    target = pc + u64(s64(s32(inst << 13) >> 16));
++                    target = pc + (u64(s64(s32(inst << 13) >> 18)) << 2);
+                 } else if ((inst & 0xFE000000) == 0xD6000000) {  // through a register
+                     if (abi && (IsCall(inst) || IsReturn(inst)))
+                         return false;
+-- 
+2.43.0
+

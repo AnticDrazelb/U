@@ -1306,6 +1306,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.28: a fix for 04.23-04.27: the CPU translator could, rarely, wrongly drop the saving of a "
+         "result's flags before a branch (its look-ahead read the branch's target a few bytes off): a 64-bit "
+         "game could then take a wrong turn. Install this one over them. Also aimed at Unity games "
+         "(Silksong, Bluey): their null checks no longer cut the CPU code into "
+         "blocks of two or three instructions (a check that fails leaves from the middle instead), and float "
+         "values are stored straight from the vector registers. A Unity-shaped test: 22% fewer block "
+         "changes, 8% fewer instructions with the fix.\n"
          "04.27: 64-bit games: float constants in one load, and calls and returns cheaper (a deeper return "
          "stack, stepped without a mask): the test game 38% leaner than in 04.22.\n"
          "04.26: 64-bit games load floats straight into the PS4's vector registers and sign-extending "

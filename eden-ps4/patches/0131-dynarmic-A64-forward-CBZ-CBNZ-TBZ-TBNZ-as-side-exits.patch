@@ -1,0 +1,469 @@
+From c382c4fd870a894835511c6a5fd64fbc29c79a40 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 4 Nov 2026 05:56:47 +0000
+Subject: [PATCH 131/133] dynarmic A64: forward CBZ/CBNZ/TBZ/TBNZ as side
+ exits; float stores straight from XMM registers
+
+superblocks: a forward CBZ, CBNZ, TBZ or TBNZ (IL2CPP's null checks, flag tests: each a block of
+two or three instructions before) doesn't end the block: A64ExitIfZero32/64 and A64ExitIfTestBit
+(test r, r or test/bt; a jcc to a link of its own in the cold code), the code after it translated
+on into the block (eight a block at most, its first 64 instructions); A64GetSetElimination keeps
+what was set before each exit, the dead flags pass stops at it. A 32- or 64-bit plain store whose
+value is in an XMM (STR S/D, a float result) is a movd/movq from it (new fallback stubs) instead of
+a move to a general register first. unity.c (IL2CPP-shaped): 22% fewer block entries, -3.0%
+instructions; game.c -0.4%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01REmpC53sSK3VTcKMxWFSSb
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 52 +++++++++++++++++++
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |  1 +
+ .../backend/x64/a64_emit_x64_memory.cpp       | 21 ++++++++
+ .../dynarmic/backend/x64/a64_interface.cpp    |  2 +
+ .../backend/x64/emit_x64_memory.cpp.inc       | 33 +++++++++---
+ .../dynarmic/backend/x64/emit_x64_memory.h    | 13 +++++
+ .../dynarmic/frontend/A64/a64_ir_emitter.h    |  8 +++
+ .../frontend/A64/translate/a64_translate.h    |  5 ++
+ .../A64/translate/impl/a64_branch.cpp         | 24 +++++++++
+ .../frontend/A64/translate/impl/impl.h        |  3 ++
+ .../src/dynarmic/interface/A64/config.h       |  8 +++
+ src/dynarmic/src/dynarmic/ir/opcodes.h        | 11 ++++
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |  7 +++
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   | 13 +++++
+ 14 files changed, 194 insertions(+), 7 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 37784845ae..7065d22fd4 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -550,6 +550,58 @@ void A64EmitX64::EmitPushRSB(EmitContext& ctx, IR::Inst* inst) {
+     EmitX64::EmitPushRSB(ctx, inst);
+ }
+ 
++// (PS4 04.28, superblocks) A side exit: the condition tested here, taken, a link to the target in
++// the cold code (the guest registers and flags were stored before this: A64GetSetElimination
++// keeps them)
++void A64EmitX64::EmitSideExitLink(A64EmitContext& ctx, Xbyak::Label& taken, IR::LocationDescriptor target) {
++    const IR::LocationDescriptor initial_location = ctx.block.Location();
++    ctx.deferred_emits.emplace_back([this, taken, target, initial_location]() mutable {
++        code.L(taken);
++        if (conf.jit_frame_pointer)
++            code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
++        EmitLeafTerminal(IR::Term::LinkBlock{target}, initial_location, false);
++    });
++}
++
++void A64EmitX64::EmitA64ExitIfZero32(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const bool when_zero = args[1].GetImmediateU1();
++    const IR::LocationDescriptor target{args[2].GetImmediateU64()};
++    const Xbyak::Reg32 value = ctx.reg_alloc.UseGpr(code, args[0]).cvt32();
++    Xbyak::Label taken;
++    code.test(value, value);
++    when_zero ? code.jz(taken, code.T_NEAR) : code.jnz(taken, code.T_NEAR);
++    EmitSideExitLink(ctx, taken, target);
++}
++
++void A64EmitX64::EmitA64ExitIfZero64(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const bool when_zero = args[1].GetImmediateU1();
++    const IR::LocationDescriptor target{args[2].GetImmediateU64()};
++    const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[0]);
++    Xbyak::Label taken;
++    code.test(value, value);
++    when_zero ? code.jz(taken, code.T_NEAR) : code.jnz(taken, code.T_NEAR);
++    EmitSideExitLink(ctx, taken, target);
++}
++
++void A64EmitX64::EmitA64ExitIfTestBit(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u8 bit = args[1].GetImmediateU8();
++    const bool when_set = args[2].GetImmediateU1();
++    const IR::LocationDescriptor target{args[3].GetImmediateU64()};
++    const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[0]);
++    Xbyak::Label taken;
++    if (bit < 32) {
++        code.test(value.cvt32(), u32(1) << bit);
++        when_set ? code.jnz(taken, code.T_NEAR) : code.jz(taken, code.T_NEAR);
++    } else {
++        code.bt(value, bit);
++        when_set ? code.jc(taken, code.T_NEAR) : code.jnc(taken, code.T_NEAR);
++    }
++    EmitSideExitLink(ctx, taken, target);
++}
++
+ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     switch (check_bit_fusion) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index d3876859c2..7122ec77b3 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -109,6 +109,7 @@ public:
+     /// (PS4 04.23) ZeroExtendLongToQuad(ZeroExtendWordToLong(w)), as a scalar float result or a
+     /// word loaded into a vector register comes: ZeroExtendLongToQuad(w) (one movd or insertps)
+     void PeepholeQuad(A64EmitContext& ctx, IR::Block& block);
++    void EmitSideExitLink(A64EmitContext& ctx, Xbyak::Label& taken, IR::LocationDescriptor target);
+     u64 RSBEntryFor(IR::LocationDescriptor target) const override;
+     FakeCall FastmemCallback(u64 rip);
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 5bdc3be4db..c5013a3ba6 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -220,6 +220,27 @@ void A64EmitX64::GenFastmemFallbacks() {
+                         code.ret();
+                         PerfMapRegister(read_fallbacks[key], code.getCurr(), fmt::format("a64_read_fallback_xmm_{}", bitsize));
+                     }
++                    // (PS4 04.28) 32- and 64-bit plain stores from an XMM (EmitWriteMemoryMovXmm)
++                    for (const size_t bitsize : {size_t(32), size_t(64)}) {
++                        const auto key = std::make_tuple(false, bitsize | XmmLoadTag, vaddr_idx, value_idx);
++                        code.align();
++                        write_fallbacks[key] = code.getCurr<void (*)()>();
++                        ABI_PushCallerSaveRegistersAndAdjustStack(code);
++                        // params = { this, vaddr, value, size }
++                        if (vaddr_idx != code.ABI_PARAM2.getIdx()) {
++                            code.mov(code.ABI_PARAM2, Xbyak::Reg64{vaddr_idx});
++                        }
++                        if (bitsize == 32) {
++                            code.movd(code.ABI_PARAM3.cvt32(), Xbyak::Xmm{value_idx});
++                        } else {
++                            code.movq(code.ABI_PARAM3, Xbyak::Xmm{value_idx});
++                        }
++                        code.mov(code.ABI_PARAM4, bitsize / CHAR_BIT);
++                        Devirtualize<&A64::UserCallbacks::MemoryWrite>(conf.callbacks).EmitCall(code);
++                        ABI_PopCallerSaveRegistersAndAdjustStack(code);
++                        code.ret();
++                        PerfMapRegister(write_fallbacks[key], code.getCurr(), fmt::format("a64_write_fallback_xmm_{}", bitsize));
++                    }
+                 }
+ 
+                 if (value_idx == 4 || value_idx == 15) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 0cff52a4e8..b9c979f210 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -277,6 +277,7 @@ private:
+         options.nzcv_lookahead_abi = conf.elide_dead_nzcv_abi;
+         options.follow_direct_branches = conf.follow_direct_branches;
+         options.elide_load_store_only_barriers = conf.elide_load_store_only_barriers;
++        options.superblocks = conf.superblocks && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         A64::Translate(ir_block, arch_descriptor, get_code, options);
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         // (PS4 04.25) With fastmem, the accesses it was declined for (pages the PS4 can't map at
+@@ -365,6 +366,7 @@ private:
+         add(conf.follow_direct_branches);
+         add(conf.plain_acquire_loads);
+         add(conf.elide_load_store_only_barriers);
++        add(conf.superblocks);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+         for (const auto& object : conf.code_cache_objects)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index b23b515c7e..2a4d5e9e29 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -289,21 +289,27 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+ 
+     const bool address_in_arena = ConstantAddressInArena(conf, args[1], bitsize / 8);
+     Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+-    const int value_idx = bitsize == 128
++#ifdef AXX_ADDRESS_64
++    // (PS4 04.28) a 32- or 64-bit value in an XMM already (STR S/D, a float result): stored from it
++    const bool from_xmm = (bitsize == 32 || bitsize == 64) && fastmem_marker && !ordered && args[2].IsInXmm(ctx.reg_alloc);
++#else
++    constexpr bool from_xmm = false;
++#endif
++    const int value_idx = (bitsize == 128 || from_xmm)
+                             ? ctx.reg_alloc.UseXmm(code, args[2]).getIdx()
+                             : (ordered ? ctx.reg_alloc.UseScratchGpr(code, args[2]).getIdx() : ctx.reg_alloc.UseGpr(code, args[2]).getIdx());
+ 
+     // (an address folded into the displacement: whole again where the access needs it whole,
+     // or where the value is in the base's register, which the fallback would overwrite)
+     u32 disp = FoldedDisp(inst);
+-    if (disp != 0 && (!fastmem_marker || ordered || bitsize == 128 || value_idx == vaddr.getIdx())) {
++    if (disp != 0 && (!fastmem_marker || ordered || bitsize == 128 || (!from_xmm && value_idx == vaddr.getIdx()))) {
+         const Xbyak::Reg64 whole = ctx.reg_alloc.ScratchGpr(code);
+         EmitWholeAddress(code, whole, vaddr, disp);
+         vaddr = whole;
+         disp = 0;
+     }
+ 
+-    const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
++    const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, from_xmm ? (bitsize | XmmLoadTag) : bitsize, vaddr.getIdx(), value_idx)];
+ 
+     SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+ 
+@@ -313,7 +319,13 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+         bool require_abort_handling = false;
+         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp);
+ 
+-        const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr + disp, value_idx, ordered);
++        const void* location;
++        if constexpr (bitsize == 32 || bitsize == 64) {
++            location = from_xmm ? EmitWriteMemoryMovXmm<bitsize>(code, dest_ptr + disp, value_idx)
++                                : EmitWriteMemoryMov<bitsize>(code, dest_ptr + disp, value_idx, ordered);
++        } else {
++            location = EmitWriteMemoryMov<bitsize>(code, dest_ptr + disp, value_idx, ordered);
++        }
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             // (A64: past the arena, the range check comes here and calls the stub, as for reads)
+@@ -351,13 +363,20 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, 0,
+                                                address_in_arena);
+ 
+-        const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
++        const void* location;
++        if constexpr (bitsize == 32 || bitsize == 64) {
++            location = from_xmm ? EmitWriteMemoryMovXmm<bitsize>(code, dest_ptr, value_idx)
++                                : EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
++        } else {
++            location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
++        }
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
+ #ifdef AXX_FASTMEM_RANGE_WALK
+-            // (only the range check jumps here: past the arena, the page table walk)
+-            if (require_abort_handling && conf.page_table && !(ordered && bitsize == 128)) {
++            // (only the range check jumps here: past the arena, the page table walk; from an XMM,
++            // the fallback)
++            if (require_abort_handling && conf.page_table && !(ordered && bitsize == 128) && !from_xmm) {
+                 EmitA64FastmemRangeWalk(code, conf, bitsize, vaddr, value_idx, true, ordered, wrapped_fn, *end);
+             } else {
+                 code.call(wrapped_fn);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index c87316ed3b..9a546de97a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -288,6 +288,19 @@ const void* EmitReadMemoryMovSigned(BlockOfCode& code, int value_idx, const Xbya
+     return fastmem_location;
+ }
+ 
++// (PS4 04.28) A 32- or 64-bit plain store from an XMM's low lane
++template<std::size_t bitsize>
++const void* EmitWriteMemoryMovXmm(BlockOfCode& code, const Xbyak::RegExp& addr, int value_idx) {
++    static_assert(bitsize == 32 || bitsize == 64);
++    const void* fastmem_location = code.getCurr();
++    if constexpr (bitsize == 32) {
++        code.movd(dword[addr], Xbyak::Xmm(value_idx));
++    } else {
++        code.movq(qword[addr], Xbyak::Xmm(value_idx));
++    }
++    return fastmem_location;
++}
++
+ // (PS4 04.26) A 32- or 64-bit plain load into an XMM (its other lanes zeroed)
+ template<std::size_t bitsize>
+ const void* EmitReadMemoryMovXmm(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr) {
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h b/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
+index 21bd9250dd..c2848404a4 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
+@@ -49,6 +49,14 @@ public:
+         Inst(Opcode::A64SetCheckBit, value);
+     }
+ 
++    void ExitIfZero(const IR::U32U64& value, bool when_zero, const LocationDescriptor& target) noexcept {
++        Inst(value.GetType() == IR::Type::U32 ? Opcode::A64ExitIfZero32 : Opcode::A64ExitIfZero64, value, IR::Value{when_zero}, IR::Value{target.UniqueHash()});
++    }
++
++    void ExitIfTestBit(const IR::U64& value, u8 bit, bool when_set, const LocationDescriptor& target) noexcept {
++        Inst(Opcode::A64ExitIfTestBit, value, IR::Value{bit}, IR::Value{when_set}, IR::Value{target.UniqueHash()});
++    }
++
+     IR::U1 GetCFlag() noexcept {
+         return Inst<IR::U1>(Opcode::A64GetCFlag);
+     }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index a2a481585e..721e7829d1 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -56,6 +56,11 @@ struct TranslationOptions {
+ 
+     /// DMB of the LD or ST type alone: nothing (UserConfig::elide_load_store_only_barriers)
+     bool elide_load_store_only_barriers = false;
++
++    /// A forward CBZ, CBNZ, TBZ or TBNZ doesn't end the block: it is a side exit and the code
++    /// after it is translated on into the block (eight times a block at most, in its first 64
++    /// instructions)
++    bool superblocks = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index bf97fe9657..019f2bc664 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -94,11 +94,23 @@ bool TranslatorVisitor::RET(Reg Rn) {
+     return false;
+ }
+ 
++bool TranslatorVisitor::MaySideExit(u64 target) {
++    if (!options.superblocks || target <= ir.PC() || side_exits_left <= 0 || instructions >= 64 ||
++        ir.current_location->SingleStepping())
++        return false;
++    side_exits_left--;
++    return true;
++}
++
+ bool TranslatorVisitor::CBZ(bool sf, Imm<19> imm19, Reg Rt) {
+     const size_t datasize = sf ? 64 : 32;
+     const s64 offset = concatenate(imm19, Imm<2>{0}).SignExtend<s64>();
+ 
+     const IR::U32U64 operand1 = X(datasize, Rt);
++    if (MaySideExit(ir.PC() + offset)) {
++        ir.ExitIfZero(operand1, true, ir.current_location->SetPC(ir.PC() + offset));
++        return true;
++    }
+ 
+     ir.SetCheckBit(ir.IsZero(operand1));
+ 
+@@ -114,6 +126,10 @@ bool TranslatorVisitor::CBNZ(bool sf, Imm<19> imm19, Reg Rt) {
+     const s64 offset = concatenate(imm19, Imm<2>{0}).SignExtend<s64>();
+ 
+     const IR::U32U64 operand1 = X(datasize, Rt);
++    if (MaySideExit(ir.PC() + offset)) {
++        ir.ExitIfZero(operand1, false, ir.current_location->SetPC(ir.PC() + offset));
++        return true;
++    }
+ 
+     ir.SetCheckBit(ir.IsZero(operand1));
+ 
+@@ -129,6 +145,10 @@ bool TranslatorVisitor::TBZ(Imm<1> b5, Imm<5> b40, Imm<14> imm14, Reg Rt) {
+     const u8 bit_pos = concatenate(b5, b40).ZeroExtend<u8>();
+     const s64 offset = concatenate(imm14, Imm<2>{0}).SignExtend<s64>();
+ 
++    if (MaySideExit(ir.PC() + offset)) {
++        ir.ExitIfTestBit(X(64, Rt), bit_pos, false, ir.current_location->SetPC(ir.PC() + offset));
++        return true;
++    }
+     const auto operand = X(datasize, Rt);
+ 
+     ir.SetCheckBit(ir.TestBit(operand, ir.Imm8(bit_pos)));
+@@ -145,6 +165,10 @@ bool TranslatorVisitor::TBNZ(Imm<1> b5, Imm<5> b40, Imm<14> imm14, Reg Rt) {
+     const u8 bit_pos = concatenate(b5, b40).ZeroExtend<u8>();
+     const s64 offset = concatenate(imm14, Imm<2>{0}).SignExtend<s64>();
+ 
++    if (MaySideExit(ir.PC() + offset)) {
++        ir.ExitIfTestBit(X(64, Rt), bit_pos, true, ir.current_location->SetPC(ir.PC() + offset));
++        return true;
++    }
+     const auto operand = X(datasize, Rt);
+ 
+     ir.SetCheckBit(ir.TestBit(operand, ir.Imm8(bit_pos)));
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+index aeda7b92cb..732a51b932 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+@@ -34,6 +34,9 @@ struct TranslatorVisitor final {
+     boost::container::static_vector<std::pair<u64, u64>, 4> pieces;
+     u64 piece_start = 0;
+     int follows_left = 3;
++    int side_exits_left = 8;
++    // A side exit to target here, if the block may have one more (superblocks)
++    bool MaySideExit(u64 target);
+     size_t instructions = 0;
+     // Continues the block at target (a BL's, a forward B's) if it may: the current piece ends
+     // after this instruction
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 89846f1eef..47779b2acc 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -406,6 +406,14 @@ struct UserConfig {
+     /// stays a full barrier.
+     bool elide_load_store_only_barriers = false;
+ 
++    /// (PS4 04.28) A forward CBZ, CBNZ, TBZ or TBNZ (a null check, a flag test: IL2CPP's code is
++    /// full of them, each a block of two or three instructions) doesn't end a block: it leaves it
++    /// from the middle when taken (a jump to a link of its own, in the cold code) and the code
++    /// after it is translated on into the same block, keeping the guest registers it has in host
++    /// registers (eight a block at most, in its first 64 instructions). What the guest registers
++    /// and flags were set to before such an exit is stored before it.
++    bool superblocks = false;
++
+     /// This option allows you to disable cycle counting. If this is set to false,
+     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
+     bool enable_cycle_counting = true;
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index 37684b0631..3e6a0de314 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -209,6 +209,9 @@ constexpr bool ReadsFromCPSR(const Opcode op) noexcept {
+     case Opcode::A32UpdateUpperLocationDescriptor:
+     case Opcode::A64GetCFlag:
+     case Opcode::A64GetNZCVRaw:
++    case Opcode::A64ExitIfZero32:
++    case Opcode::A64ExitIfZero64:
++    case Opcode::A64ExitIfTestBit:
+     case Opcode::ConditionalSelect32:
+     case Opcode::ConditionalSelect64:
+     case Opcode::ConditionalSelectNZCV:
+@@ -608,6 +611,13 @@ constexpr bool IsSetCheckBitOperation(const Opcode op) noexcept {
+         || op == Opcode::A64SetCheckBit;
+ }
+ 
++/// @brief (PS4 04.28) Determines whether or not this instruction may leave the block (superblocks).
++constexpr bool IsSideExit(const Opcode op) noexcept {
++    return op == Opcode::A64ExitIfZero32
++        || op == Opcode::A64ExitIfZero64
++        || op == Opcode::A64ExitIfTestBit;
++}
++
+ /// @brief Determines whether or not this instruction sets the host's flags for the terminal.
+ constexpr bool IsCondFlagsForTerminal(const Opcode op) noexcept {
+     return op == Opcode::CondFlagsSub32
+@@ -634,6 +644,7 @@ constexpr bool MayHaveSideEffects(const Opcode op) noexcept {
+         || op == Opcode::A64DataCacheOperationRaised
+         || op == Opcode::A64InstructionCacheOperationRaised
+         || IsSetCheckBitOperation(op)
++        || IsSideExit(op)
+         || IsBarrier(op)
+         || CausesCPUException(op)
+         || WritesToCoreRegister(op)
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index 94834dec21..e081ff89fc 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -673,6 +673,13 @@ OPCODE(FPVectorToUnsignedFixed64,                           U128,           U128
+ 
+ // A64 Context getters/setters
+ A64OPC(SetCheckBit,                                         Void,           U1                                                              )
++// (PS4 04.28) A forward CBZ/CBNZ/TBZ/TBNZ in the middle of a block (superblocks): the condition
++// true, the block is left for the target (a location descriptor) as a LinkBlock would; else on.
++// ExitIfZero: the value zero (or not: the U1, an immediate, says which leaves); ExitIfTestBit: the
++// bit (an immediate U8) set (or clear)
++A64OPC(ExitIfZero32,                                        Void,           U32,            U1,             U64                             )
++A64OPC(ExitIfZero64,                                        Void,           U64,            U1,             U64                             )
++A64OPC(ExitIfTestBit,                                       Void,           U64,            U8,             U1,             U64             )
+ A64OPC(GetCFlag,                                            U1,                                                                             )
+ A64OPC(GetNZCVRaw,                                          U32,                                                                            )
+ A64OPC(SetNZCVRaw,                                          Void,           U32                                                             )
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 262689d179..0f240ee127 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -1129,6 +1129,19 @@ static void A64GetSetElimination(IR::Block& block) {
+             do_set(nzcv_info, inst->GetArg(0), inst, TrackingType::NZCVRaw);
+             break;
+         }
++        case IR::Opcode::A64ExitIfZero32:
++        case IR::Opcode::A64ExitIfZero64:
++        case IR::Opcode::A64ExitIfTestBit: {
++            // (PS4 04.28) the block may leave here: what was set before stays set (a later set of
++            // the same register doesn't make it redundant), the values known stay known after
++            for (auto& info : reg_info)
++                info.set_instruction_present = false;
++            for (auto& info : vec_info)
++                info.set_instruction_present = false;
++            sp_info.set_instruction_present = false;
++            nzcv_info.set_instruction_present = false;
++            break;
++        }
+         default: {
+             if (ReadsFromCPSR(opcode) || WritesToCPSR(opcode)) {
+                 nzcv_info = {};
+-- 
+2.43.0
+
