@@ -1311,6 +1311,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.39: the GPU hang that takes the whole PS4 down (Captain Toad's level 3, Zelda: Echoes of Wisdom "
+         "after the cliff scene): the hang report now shows where the GPU stopped and which shaders were "
+         "running, and the app ends a few seconds into a hang instead of waiting ~40 s for the PS4's system "
+         "software to crash. The PS4 may then close just the app (error CE-34878-0) instead of crashing.\n"
          "04.38: CPU Unsafe off now turns off the 32-bit CPU translator's PS4 speed-ups too (Mario Kart, "
          "Captain Toad are 32-bit games), not only the 64-bit one's.\n"
          "04.37: the boot trace is written through to the disk every second, and the settings when they "
@@ -2925,6 +2929,14 @@ void* Run(void*)
     // session's log kept: it starts a new one, and a crash restarts the app)
     setenv("RADV_PS4_DIR", (std::string(kDataDir) + "/gpu").c_str(), 0);
     KeepPrevious(std::string(kDataDir) + "/gpu/radv-ps4", ".log");
+    // (04.39) the GPU hang (Captain Toad's level 3, Zelda: Echoes of Wisdom after the cliff scene):
+    // RADV writes a number as the GPU's command processor reaches each draw, dispatch and cache
+    // flush, so gpu/gpu-hang.txt shows where it stopped and which shaders were running
+    // (gpu/hang-shaders.txt); and the app ends once a hang is sure, instead of waiting until the
+    // PS4's system software crashes (CE-36329-3, ~40 s later). settings.txt can turn either off:
+    // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
+    setenv("RADV_PS4_TRACE", "ids", 0);
+    setenv("RADV_PS4_HANG_EXIT", "1", 0);
     // Eden's Vulkan renderer on the PS4's GPU when Mesa's RADV is linked, unless System Settings
     // (or settings.txt, EDEN_PS4_RENDERER=null) chose the software renderer, or Vulkan didn't
     // start this session

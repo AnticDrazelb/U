@@ -408,6 +408,14 @@ extern "C" void ps4_boot_trace(const char* stage) {
         fsync(fd);
 }
 
+// (Eden 04.39) The boot trace on the disk now, not within a second: Mesa's PS4 layer
+// (port/mesa/ac_ps4_drm.c) ends the app on a GPU hang, and the PS4 may still crash after it.
+extern "C" void ps4_boot_trace_sync() {
+    const int fd = traceFd();
+    if (fd >= 0)
+        fsync(fd);
+}
+
 // Every open() and close() of the app's own code (Cemu, Mesa, libc++, and the C library's fopen,
 // which calls open; linker --wrap, toolchain/ps4-love-style.cmake): the path, when, and the code
 // addresses that opened it, so files left open can be named with their opener. The PS4 refuses

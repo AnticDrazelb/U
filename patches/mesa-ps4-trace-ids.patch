@@ -1,0 +1,51 @@
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index f49b802..cea0298 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -1429,7 +1429,15 @@ radv_cmd_buffer_trace_emit(struct radv_cmd_buffer *cmd_buffer)
+    else
+       va += offsetof(struct radv_trace_data, secondary_id);
+ 
++#ifdef __PS4__
++   /* A number no other trace point has (one count for every command buffer, not one each): the
++    * PS4 layer's GPU hang report finds the one in memory among all the unfinished submissions'
++    * (Eden submits two command buffers at a time, whose own counts both start at 1). */
++   static uint32_t ps4_trace_count;
++   cmd_buffer->state.trace_id = __atomic_add_fetch(&ps4_trace_count, 1, __ATOMIC_RELAXED);
++#else
+    ++cmd_buffer->state.trace_id;
++#endif
+    radv_write_data(cmd_buffer, V_370_ME, va, 1, &cmd_buffer->state.trace_id, false);
+ 
+    radeon_check_space(device->ws, cs->b, 2);
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index fc63006..3d6ad79 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -670,10 +670,23 @@ radv_device_init_device_fault_detection(struct radv_device *device)
+ 
+    if (!radv_device_fault_detection_enabled(device)) {
+ #ifdef __PS4__
+-      if (os_get_option("RADV_PS4_TRACE")) {
+-         if (!radv_init_trace(device))
++      const char *ps4_trace = os_get_option("RADV_PS4_TRACE");
++      if (ps4_trace && ps4_trace[0] && strcmp(ps4_trace, "0") && strcmp(ps4_trace, "off")) {
++         if (!strcmp(ps4_trace, "ids")) {
++            /* Only the trace ids (the PS4 layer's GPU hang report follows them): the trace buffer
++             * without radv_init_trace's address binding report, a list of every buffer's binding
++             * that only grows, on a C heap that runs near full. */
++            if (radv_bo_create(device, NULL, sizeof(struct radv_trace_data), 8, RADEON_DOMAIN_VRAM,
++                               RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM |
++                                  RADEON_FLAG_GL2_BYPASS,
++                               RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &device->trace_bo) != VK_SUCCESS ||
++                device->ws->buffer_make_resident(device->ws, device->trace_bo, true) != VK_SUCCESS ||
++                !(device->trace_data = radv_buffer_map(device->ws, device->trace_bo)))
++               return VK_ERROR_INITIALIZATION_FAILED;
++         } else if (!radv_init_trace(device)) {
+             return VK_ERROR_INITIALIZATION_FAILED;
+-         /* The PS4 layer's flight recorder follows the GPU's progress through these ids. */
++         }
++         /* The PS4 layer's flight recorder and hang report follow the GPU's progress through these ids. */
+          extern void ac_ps4_set_trace_va(uint64_t va);
+          ac_ps4_set_trace_va(radv_buffer_get_va(device->trace_bo) + offsetof(struct radv_trace_data, primary_id));
+       }

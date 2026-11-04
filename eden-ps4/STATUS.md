@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.38)
+# Eden for PS4: status (after 04.39)
 
-Install **04.38** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.39** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0143). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -46,6 +46,8 @@ programs, 0 failures.
 - **04.36:** menu switch "Compiled GPU Macros" (off: interpreted).
 - **04.37:** the boot trace is fsynced every second and the settings when saved, so logs survive
   a crash of the whole PS4.
+- **04.39:** the GPU hang: the report now shows where the GPU stopped, and the app ends instead of
+  the PS4 (below).
 
 ## Where we are: the open problem
 
@@ -60,18 +62,25 @@ checkerboard screen, sometimes a hard reset).
   - asynchronous shaders, resolution, GPU accuracy
   - memory (GBs of direct memory free)
 - **The Zelda log has the evidence:** Mesa's `ac_ps4_drm.c` reported "GPU hang? waiting for
-  30753, completed 30752". `gpu/gpu-hang.txt` holds that submission.
-  - Its IB 1 ends with RADV's wait-for-idle pairs (EVENT_WRITE_EOP 0 then 1, then WAIT_REG_MEM
-    == 1, all at 0x43fdb4c000) and meta compute dispatches.
-  - Every pair writes the same address, so the report can't show which draw or dispatch never
-    finished.
-  - The system crash came about 30 s later, while Eden was still waiting.
+  30753, completed 30752". `gpu/gpu-hang.txt` holds that submission: 135 draws, 199 dispatches.
+  - Its only progress markers were Eden's `WaitForIdle` (`vkCmdSetEvent` + `vkCmdWaitEvents` on one
+    event at 0x43fdb4c000, never reset): every one writes 1, so the report couldn't show which draw
+    or dispatch never finished.
+  - The system crash came about 30-40 s later, while Eden was still waiting.
 
-### Next steps (Mesa: `/root/cemups4-build/src/mesa/src/amd/common/ac_ps4_drm.c`)
-1. **Stop the system crashes:** after `ps4_report_hang()`, end the app (abort, so the crash
-   screen shows) instead of waiting. The PS4 may then close the app cleanly instead of crashing.
-2. **Find the cause:** make each EOP marker in a submission write a unique value, so the hang
-   report names the draw or dispatch that hung. Then fix it in Eden's GPU emulation or in RADV.
+### 04.39: both next steps from 04.38, in one build (`port/mesa/ac_ps4_drm.c`, `patches/mesa-ps4-trace-ids.patch`)
+1. **Find the cause:** RADV's trace ids are on (`RADV_PS4_TRACE=ids`): a number, unique per write,
+   as the command processor reaches each draw, dispatch and cache flush. The hang report's new first
+   section, "where the GPU stopped", names the last trace id passed, the wait the CP is stuck at, the
+   suspect draws and dispatches with their shaders, and writes those shaders' code to
+   `gpu/hang-shaders.txt` (`tools/gpu-hang-shaders.py`).
+2. **Stop the system crashes:** `RADV_PS4_HANG_EXIT=1`: if the GPU hasn't finished anything 2 s
+   after the report started (about 4 s into the hang), `abort()`. The PS4 may then close just the app.
+
+### Next
+- One run into a hang (Captain Toad level 3 is the quickest), then send the logs. Whether the PS4
+  survived it (app-closed error CE-34878-0, or the system crash again) says if step 2 works.
+- From the report: the shader or packet that hangs, then a fix in Eden's GPU emulation or in RADV.
 
 ### Also open
 - **Little Kitty, Big City:** a black screen. The game's allocator traps

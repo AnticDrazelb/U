@@ -255,6 +255,27 @@ static void ps4_do_va_free(amdgpu_va_handle va);
 /* Guards the address-space heaps (va_range_free has no device argument). */
 static simple_mtx_t ps4_va_lock = SIMPLE_MTX_INITIALIZER;
 
+/* RADV's trace ids (ac_ps4_set_trace_va): where the command processor writes them, and the word. */
+static volatile const uint32_t *ps4_trace_id;
+static uint64_t ps4_trace_va;
+
+/* RADV_PS4_TRACE: "ids" turns on only RADV's trace ids (cheap: a number written as the command
+ * processor reaches each draw, dispatch and cache flush, which the GPU hang report follows); any
+ * other value (Crema's ps4.ini radv_trace=on sets 1) also the flight recorder, which writes every
+ * submission's commands to the disk. "0" or "off": neither. */
+static bool
+ps4_trace_option(bool *flight_recorder)
+{
+   const char *t = getenv("RADV_PS4_TRACE");
+   const bool on = t && t[0] && strcmp(t, "0") != 0 && strcmp(t, "off") != 0;
+   if (flight_recorder)
+      *flight_recorder = on && strcmp(t, "ids") != 0;
+   return on;
+}
+
+/* radv-ps4.log's descriptor (-2: not opened yet), fsynced before the app ends on a GPU hang. */
+static int ps4_log_fd = -2;
+
 static void
 ps4_log(const char *fmt, ...)
 {
@@ -269,13 +290,13 @@ ps4_log(const char *fmt, ...)
     * here every line opened (and truncated) the file again and never closed it, ~one descriptor
     * per 7 s in Tekken Tag Tournament 2 until the PS4's ~250 open file limit stopped the game's own
     * file loads (Crema 1.71-1.77). */
-   static int fd = -2;
-   int current = __atomic_load_n(&fd, __ATOMIC_ACQUIRE);
+   int *const fd = &ps4_log_fd;
+   int current = __atomic_load_n(fd, __ATOMIC_ACQUIRE);
    if (current == -2) {
       mkdir(ps4_gpu_dir(), 0777);
       int opened = open(ps4_gpu_file("radv-ps4.log"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
       int expected = -2;
-      if (__atomic_compare_exchange_n(&fd, &expected, opened, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      if (__atomic_compare_exchange_n(fd, &expected, opened, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
          current = opened;
       } else {
          /* another thread opened it first */
@@ -476,26 +497,861 @@ ps4_walk_ib(ac_drm_device *dev, FILE *f, const uint32_t *ib, unsigned num_dw, in
    }
 }
 
-/* Writes the command buffers of the first submission the GPU hasn't finished, decoded by Mesa's
- * IB parser, to /data/Crema/gpu/gpu-hang.txt (once). */
+/* ---- hang walker: begin (also built on a PC: eden-ps4/tools/gpu-tests/hangwalk.sh) ----
+ *
+ * Where the GPU stopped, for the hang report. Every packet of the unfinished submissions that the
+ * command processor (CP) acts on - draws, dispatches, waits, cache flushes, memory writes - in the
+ * CP's order, with the shaders bound at each draw and dispatch. RADV's trace ids (RADV_PS4_TRACE)
+ * are WRITE_DATAs of a number, different for every write (mesa-ps4-trace-ids.patch), to one
+ * address after each draw, dispatch and cache flush; the CP does each as it gets to it, so the one
+ * whose number is in memory is the last place the CP passed. The CP doesn't wait for a draw or a
+ * dispatch to finish, only at waits (partial flushes, SURFACE_SYNC, WAIT_REG_MEM): it stopped at the
+ * first wait after that trace id (or on a packet before the next trace id, if there is no wait in
+ * between), and the work that never finished was issued before that wait. Memory is read through
+ * ps4_hw_read() (NULL: not mapped). */
+
+static const void *ps4_hw_read(uint64_t va, uint64_t bytes);
+void ps4_boot_trace(const char *stage); /* the app's (port/ps4_crashlog.cpp) */
+
+/* the shader stages, as the hang report names them; CS: compute */
+enum { PS4_LS, PS4_HS, PS4_ES, PS4_GS, PS4_VS, PS4_PS, PS4_CS, PS4_STAGES };
+static const char ps4_stage_name[PS4_STAGES][3] = {"LS", "HS", "ES", "GS", "VS", "PS", "CS"};
+
+struct ps4_pkt {
+   uint64_t va;            /* the packet */
+   uint64_t addr;          /* memory it writes, waits on, or reads its arguments from */
+   uint64_t sh[PS4_STAGES]; /* draws and dispatches: the shaders they run (0: none) */
+   uint32_t v[8];          /* the packet's values (see ps4_pkt_text) */
+   uint8_t op, depth, sub;
+   int8_t done;            /* the memory check: 1 done (or satisfied), 0 not, -1 none */
+};
+
+struct ps4_walk {
+   struct ps4_pkt *pkts;
+   unsigned count, max, dropped;
+   uint32_t lo[PS4_STAGES], hi[PS4_STAGES]; /* SPI_SHADER_PGM_LO/HI_*, COMPUTE_PGM_LO/HI */
+   uint32_t stages_en;                      /* VGT_SHADER_STAGES_EN */
+   uint32_t threads[3];                     /* COMPUTE_NUM_THREAD_X/Y/Z */
+   uint32_t instances;                      /* NUM_INSTANCES */
+   uint64_t base[4];                        /* SET_BASE */
+   uint8_t sub;                             /* the submission being walked (index) */
+};
+
+static uint32_t
+ps4_hw_read32(uint64_t va, bool *ok)
+{
+   const volatile uint32_t *p = ps4_hw_read(va & ~3ull, 4);
+   *ok = p != NULL;
+   return p ? *p : 0;
+}
+
+static uint64_t
+ps4_hw_read64(uint64_t va, bool *ok)
+{
+   const volatile uint32_t *p = ps4_hw_read(va & ~3ull, 8);
+   *ok = p != NULL;
+   return p ? p[0] | ((uint64_t)p[1] << 32) : 0;
+}
+
+static uint64_t
+ps4_walk_shader(const struct ps4_walk *w, unsigned stage)
+{
+   return ((uint64_t)w->lo[stage] << 8) | ((uint64_t)(w->hi[stage] & 0xff) << 40);
+}
+
+static struct ps4_pkt *
+ps4_walk_add(struct ps4_walk *w, uint64_t va, unsigned op, int depth)
+{
+   if (w->count >= w->max) {
+      w->dropped++;
+      return NULL;
+   }
+   struct ps4_pkt *p = &w->pkts[w->count++];
+   memset(p, 0, sizeof(*p));
+   p->va = va;
+   p->op = (uint8_t)op;
+   p->depth = (uint8_t)depth;
+   p->sub = w->sub;
+   p->done = -1;
+   return p;
+}
+
+/* The shaders a draw runs: VGT_SHADER_STAGES_EN picks the hardware stages in use. */
+static void
+ps4_walk_draw_shaders(const struct ps4_walk *w, struct ps4_pkt *p)
+{
+   const uint32_t en = w->stages_en;
+   if (en & 3) /* LS_EN */
+      p->sh[PS4_LS] = ps4_walk_shader(w, PS4_LS);
+   if (en & 4) /* HS_EN */
+      p->sh[PS4_HS] = ps4_walk_shader(w, PS4_HS);
+   if ((en >> 3) & 3) /* ES_EN */
+      p->sh[PS4_ES] = ps4_walk_shader(w, PS4_ES);
+   if (en & (1u << 5)) /* GS_EN */
+      p->sh[PS4_GS] = ps4_walk_shader(w, PS4_GS);
+   p->sh[PS4_VS] = ps4_walk_shader(w, PS4_VS);
+   p->sh[PS4_PS] = ps4_walk_shader(w, PS4_PS);
+}
+
+/* Indirect draws and dispatches: their arguments, read from memory (v[6] = 1 when read). */
+static void
+ps4_walk_args(struct ps4_pkt *p, uint64_t va, unsigned dwords)
+{
+   p->addr = va;
+   const uint32_t *a = ps4_hw_read(va, dwords * 4ull);
+   if (!a)
+      return;
+   for (unsigned k = 0; k < dwords && k < 5; k++)
+      p->v[k] = a[k];
+   p->v[6] = 1;
+}
+
+static void
+ps4_walk_collect(struct ps4_walk *w, uint64_t ib_va, unsigned num_dw, int depth)
+{
+   for (unsigned link = 0; link < 256 && num_dw; link++) {
+      const uint32_t *ib = ps4_hw_read(ib_va, num_dw * 4ull);
+      if (!ib) {
+         struct ps4_pkt *p = ps4_walk_add(w, ib_va, 0xff, depth); /* "not mapped" */
+         if (p)
+            p->v[0] = num_dw;
+         return;
+      }
+      uint64_t next_va = 0;
+      unsigned next_dw = 0;
+      for (unsigned i = 0; i < num_dw;) {
+         const uint32_t h = ib[i];
+         if (h >> 30 == 2) {
+            i++;
+            continue;
+         }
+         const unsigned op = (h >> 8) & 0xff;
+         const unsigned body = ((h >> 16) & 0x3fff) + 1;
+         const uint64_t va = ib_va + 4ull * i;
+         if (h >> 30 != 3 || i + 1 + body > num_dw) {
+            struct ps4_pkt *p = ps4_walk_add(w, va, 0xfe, depth); /* "not a packet" */
+            if (p)
+               p->v[0] = h;
+            return;
+         }
+         const uint32_t *b = &ib[i + 1];
+         struct ps4_pkt *p = NULL;
+         bool ok = false;
+         switch (op) {
+         case 0x3f: /* INDIRECT_BUFFER */
+         case 0x33: /* INDIRECT_BUFFER_CONST */
+            if (body >= 3) {
+               const uint64_t target = b[0] | ((uint64_t)(b[1] & 0xffff) << 32);
+               const unsigned size = b[2] & 0xfffff;
+               if (b[2] & (1u << 20)) { /* chained: the rest of this IB is there */
+                  next_va = target;
+                  next_dw = size;
+               } else if (depth < 4) {
+                  ps4_walk_collect(w, target, size, depth + 1);
+               }
+            }
+            break;
+         case 0x76: /* SET_SH_REG: shader addresses, compute workgroup size */
+            for (unsigned k = 1; k < body; k++) {
+               const uint32_t v = b[k];
+               switch (b[0] + k - 1) {
+               case 0x008: w->lo[PS4_PS] = v; break;
+               case 0x009: w->hi[PS4_PS] = v; break;
+               case 0x048: w->lo[PS4_VS] = v; break;
+               case 0x049: w->hi[PS4_VS] = v; break;
+               case 0x088: w->lo[PS4_GS] = v; break;
+               case 0x089: w->hi[PS4_GS] = v; break;
+               case 0x0c8: w->lo[PS4_ES] = v; break;
+               case 0x0c9: w->hi[PS4_ES] = v; break;
+               case 0x108: w->lo[PS4_HS] = v; break;
+               case 0x109: w->hi[PS4_HS] = v; break;
+               case 0x148: w->lo[PS4_LS] = v; break;
+               case 0x149: w->hi[PS4_LS] = v; break;
+               case 0x207: w->threads[0] = v; break;
+               case 0x208: w->threads[1] = v; break;
+               case 0x209: w->threads[2] = v; break;
+               case 0x20c: w->lo[PS4_CS] = v; break;
+               case 0x20d: w->hi[PS4_CS] = v; break;
+               default: break;
+               }
+            }
+            break;
+         case 0x69: /* SET_CONTEXT_REG */
+            for (unsigned k = 1; k < body; k++)
+               if (b[0] + k - 1 == 0x2d5) /* VGT_SHADER_STAGES_EN */
+                  w->stages_en = b[k];
+            break;
+         case 0x11: /* SET_BASE */
+            if (body >= 3)
+               w->base[b[0] & 3] = b[1] | ((uint64_t)(b[2] & 0xffff) << 32);
+            break;
+         case 0x2f: /* NUM_INSTANCES */
+            w->instances = b[0];
+            break;
+         case 0x15: /* DISPATCH_DIRECT */
+         case 0x16: /* DISPATCH_INDIRECT */
+            if ((p = ps4_walk_add(w, va, op, depth))) {
+               p->sh[PS4_CS] = ps4_walk_shader(w, PS4_CS);
+               if (op == 0x15 && body >= 3) {
+                  p->v[0] = b[0];
+                  p->v[1] = b[1];
+                  p->v[2] = b[2];
+                  p->v[6] = 1;
+               } else {
+                  ps4_walk_args(p, w->base[1] + b[0], 3);
+               }
+               p->v[3] = w->threads[0];
+               p->v[4] = w->threads[1];
+               p->v[5] = w->threads[2];
+            }
+            break;
+         case 0x27: /* DRAW_INDEX_2 */
+         case 0x2d: /* DRAW_INDEX_AUTO */
+         case 0x35: /* DRAW_INDEX_OFFSET_2 */
+            if ((p = ps4_walk_add(w, va, op, depth))) {
+               ps4_walk_draw_shaders(w, p);
+               p->v[0] = op == 0x27 && body >= 4 ? b[3] : op == 0x35 && body >= 3 ? b[2] : b[0];
+               p->v[1] = w->instances;
+               if (op == 0x27 && body >= 3)
+                  p->addr = b[1] | ((uint64_t)b[2] << 32);
+            }
+            break;
+         case 0x24: /* DRAW_INDIRECT */
+         case 0x25: /* DRAW_INDEX_INDIRECT */
+         case 0x2c: /* DRAW_INDIRECT_MULTI */
+         case 0x38: /* DRAW_INDEX_INDIRECT_MULTI */
+            if ((p = ps4_walk_add(w, va, op, depth))) {
+               ps4_walk_draw_shaders(w, p);
+               const bool indexed = op == 0x25 || op == 0x38;
+               ps4_walk_args(p, w->base[1] + b[0], indexed ? 5 : 4);
+               p->v[5] = 1; /* draws */
+               if ((op == 0x2c || op == 0x38) && body >= 8) {
+                  p->v[5] = b[4];
+                  p->v[7] = b[7]; /* stride */
+                  if (b[3] & (1u << 30)) { /* COUNT_INDIRECT_ENABLE: the count from memory */
+                     const uint32_t count = ps4_hw_read32(b[5] | ((uint64_t)b[6] << 32), &ok);
+                     p->v[5] = ok ? MIN2(count, b[4]) : 0xffffffffu;
+                  }
+               }
+            }
+            break;
+         case 0x37: /* WRITE_DATA (to memory only) */
+            if (body >= 4) {
+               const unsigned dst = (b[0] >> 8) & 0xf;
+               if ((dst == 1 || dst == 2 || dst == 5) && (p = ps4_walk_add(w, va, op, depth))) {
+                  p->addr = b[1] | ((uint64_t)b[2] << 32);
+                  p->v[0] = b[3];
+                  p->v[1] = body - 3;
+                  const uint32_t now = ps4_hw_read32(p->addr, &ok);
+                  p->v[2] = now;
+                  p->done = ok ? now == b[3] : -1;
+               }
+            }
+            break;
+         case 0x46: /* EVENT_WRITE */
+            if ((p = ps4_walk_add(w, va, op, depth))) {
+               p->v[0] = b[0];
+               if (body >= 3) {
+                  p->addr = b[1] | ((uint64_t)(b[2] & 0xffff) << 32);
+                  if ((b[0] & 0x3f) == 0x15) { /* ZPASS_DONE: the DBs' counts, bit 63 = written */
+                     const uint64_t now = ps4_hw_read64(p->addr, &ok);
+                     p->done = ok ? (int8_t)(now >> 63) : -1;
+                  }
+               }
+            }
+            break;
+         case 0x47: /* EVENT_WRITE_EOP */
+         case 0x48: /* EVENT_WRITE_EOS */
+            if (body >= 4 && (p = ps4_walk_add(w, va, op, depth))) {
+               p->v[0] = b[0];
+               p->addr = b[1] | ((uint64_t)(b[2] & 0xffff) << 32);
+               p->v[1] = b[3];
+               p->v[3] = op == 0x47 ? b[2] >> 29 : 1; /* DATA_SEL (EOS: its data, 32 bits) */
+               if (p->v[3] == 1 || p->v[3] == 2) {
+                  const uint32_t now = ps4_hw_read32(p->addr, &ok);
+                  p->v[2] = now;
+                  p->done = ok ? now == b[3] : -1;
+               }
+            }
+            break;
+         case 0x3c: /* WAIT_REG_MEM */
+            if (body >= 5 && (p = ps4_walk_add(w, va, op, depth))) {
+               p->v[0] = b[0] & 7;          /* function */
+               p->v[3] = (b[0] >> 4) & 1;   /* memory (1) or register */
+               p->v[1] = b[3];              /* reference */
+               p->v[2] = b[4];              /* mask */
+               if (p->v[3]) {
+                  p->addr = (b[1] & ~3u) | ((uint64_t)b[2] << 32);
+                  const uint32_t now = ps4_hw_read32(p->addr, &ok) & b[4];
+                  p->v[4] = now;
+                  const uint32_t ref = b[3];
+                  const bool met = p->v[0] == 0 ? true : p->v[0] == 1 ? now < ref
+                                   : p->v[0] == 2 ? now <= ref : p->v[0] == 3 ? now == ref
+                                   : p->v[0] == 4 ? now != ref : p->v[0] == 5 ? now >= ref
+                                   : p->v[0] == 6 ? now > ref : false;
+                  p->done = ok ? met : -1;
+               } else {
+                  p->v[4] = b[1]; /* the register */
+               }
+            }
+            break;
+         case 0x39: /* MEM_SEMAPHORE */
+            if (body >= 3 && (p = ps4_walk_add(w, va, op, depth))) {
+               p->addr = b[0] | ((uint64_t)(b[1] & 0xffff) << 32);
+               p->v[0] = b[2];
+            }
+            break;
+         case 0x43: /* SURFACE_SYNC */
+         case 0x58: /* ACQUIRE_MEM */
+         case 0x42: /* PFP_SYNC_ME */
+         case 0x1e: /* ATOMIC_MEM */
+         case 0x22: /* COND_EXEC */
+         case 0x23: /* PRED_EXEC */
+         case 0x20: /* SET_PREDICATION */
+            if ((p = ps4_walk_add(w, va, op, depth)))
+               p->v[0] = b[0];
+            break;
+         case 0x40: /* COPY_DATA */
+            if (body >= 5 && (p = ps4_walk_add(w, va, op, depth))) {
+               p->v[0] = b[0];
+               p->v[1] = b[1];
+               p->v[2] = b[2];
+               p->addr = b[3] | ((uint64_t)b[4] << 32);
+            }
+            break;
+         case 0x50: /* DMA_DATA */
+            if (body >= 6 && (p = ps4_walk_add(w, va, op, depth))) {
+               p->v[0] = b[0];
+               p->v[1] = b[1];
+               p->v[2] = b[2];
+               p->v[3] = b[5] & 0x1fffff;
+               p->addr = b[3] | ((uint64_t)b[4] << 32);
+            }
+            break;
+         default:
+            break;
+         }
+         if (next_va)
+            break;
+         i += 1 + body;
+      }
+      if (!next_va)
+         return;
+      ib_va = next_va;
+      num_dw = next_dw;
+   }
+}
+
+static const char *
+ps4_event_name(unsigned type)
+{
+   switch (type) {
+   case 0x04: return "CACHE_FLUSH_TS";
+   case 0x06: return "CACHE_FLUSH";
+   case 0x07: return "CS_PARTIAL_FLUSH";
+   case 0x08: return "VGT_STREAMOUT_SYNC";
+   case 0x0f: return "VS_PARTIAL_FLUSH";
+   case 0x10: return "PS_PARTIAL_FLUSH";
+   case 0x14: return "CACHE_FLUSH_AND_INV_TS";
+   case 0x15: return "ZPASS_DONE";
+   case 0x16: return "CACHE_FLUSH_AND_INV";
+   case 0x19: return "PIPELINESTAT_START";
+   case 0x1a: return "PIPELINESTAT_STOP";
+   case 0x1e: return "SAMPLE_PIPELINESTAT";
+   case 0x24: return "VGT_FLUSH";
+   case 0x28: return "BOTTOM_OF_PIPE_TS";
+   case 0x2c: return "FLUSH_AND_INV_DB_META";
+   case 0x2d: return "FLUSH_AND_INV_CB_DATA_TS";
+   case 0x2e: return "FLUSH_AND_INV_CB_META";
+   case 0x2f: return "CS_DONE";
+   case 0x30: return "PS_DONE";
+   default: return NULL;
+   }
+}
+
+/* Packets the CP waits at until earlier work has finished. */
+static bool
+ps4_pkt_is_wait(const struct ps4_pkt *p)
+{
+   if (p->op == 0x46) {
+      const unsigned type = p->v[0] & 0x3f;
+      return type == 0x07 || type == 0x0f || type == 0x10; /* CS, VS, PS partial flushes */
+   }
+   if (p->op == 0x43 || p->op == 0x58) /* SURFACE_SYNC, ACQUIRE_MEM: wait when DEST_BASE / CB / DB */
+      return (p->v[0] & 0x7fc0) != 0 || (p->v[0] & (1u << 25)) || (p->v[0] & (1u << 26));
+   return p->op == 0x3c || p->op == 0x39; /* WAIT_REG_MEM, MEM_SEMAPHORE */
+}
+
+static bool
+ps4_pkt_is_work(const struct ps4_pkt *p)
+{
+   switch (p->op) {
+   case 0x15: case 0x16: case 0x24: case 0x25: case 0x27: case 0x2c: case 0x2d: case 0x35: case 0x38:
+      return true;
+   default:
+      return false;
+   }
+}
+
+struct ps4_line {
+   char s[400];
+   size_t n;
+};
+
+static void
+ps4_line_add(struct ps4_line *l, const char *fmt, ...)
+{
+   if (l->n + 1 >= sizeof(l->s))
+      return;
+   va_list ap;
+   va_start(ap, fmt);
+   const int r = vsnprintf(l->s + l->n, sizeof(l->s) - l->n, fmt, ap);
+   va_end(ap);
+   if (r > 0)
+      l->n = MIN2(l->n + (size_t)r, sizeof(l->s) - 1);
+}
+
+static void
+ps4_line_shaders(struct ps4_line *l, const struct ps4_pkt *p)
+{
+   for (unsigned s = 0; s < PS4_STAGES; s++)
+      if (p->sh[s])
+         ps4_line_add(l, ", %s %#llx", ps4_stage_name[s], (unsigned long long)p->sh[s]);
+}
+
+static const char *
+ps4_done_text(int done, const char *yes, const char *no)
+{
+   return done < 0 ? "" : done ? yes : no;
+}
+
+static void
+ps4_pkt_text(struct ps4_line *l, const struct ps4_pkt *p, uint64_t trace_va)
+{
+   const uint32_t *v = p->v;
+   switch (p->op) {
+   case 0x15:
+   case 0x16:
+      ps4_line_add(l, "%s ", p->op == 0x15 ? "DISPATCH_DIRECT" : "DISPATCH_INDIRECT");
+      if (p->op == 0x16)
+         ps4_line_add(l, "(arguments at %#llx) ", (unsigned long long)p->addr);
+      if (v[6])
+         ps4_line_add(l, "%ux%ux%u groups", v[0], v[1], v[2]);
+      else
+         ps4_line_add(l, "(arguments not readable)");
+      ps4_line_add(l, " of %ux%ux%u", v[3] & 0xffff, v[4] & 0xffff, v[5] & 0xffff);
+      ps4_line_shaders(l, p);
+      break;
+   case 0x27:
+   case 0x2d:
+   case 0x35:
+      ps4_line_add(l, "%s %u %s x %u instances", p->op == 0x27 ? "DRAW_INDEX_2" : p->op == 0x2d ? "DRAW_INDEX_AUTO" : "DRAW_INDEX_OFFSET_2",
+                   v[0], p->op == 0x2d ? "vertices" : "indices", v[1]);
+      if (p->op == 0x27)
+         ps4_line_add(l, " (indices at %#llx)", (unsigned long long)p->addr);
+      ps4_line_shaders(l, p);
+      break;
+   case 0x24:
+   case 0x25:
+   case 0x2c:
+   case 0x38: {
+      static const char *const names[] = {"DRAW_INDIRECT", "DRAW_INDEX_INDIRECT"};
+      const bool indexed = p->op == 0x25 || p->op == 0x38;
+      const bool multi = p->op == 0x2c || p->op == 0x38;
+      ps4_line_add(l, "%s%s (arguments at %#llx", names[indexed], multi ? "_MULTI" : "",
+                   (unsigned long long)p->addr);
+      if (multi)
+         ps4_line_add(l, ", %u draws, stride %u", v[5], v[7]);
+      ps4_line_add(l, ")");
+      if (!v[6])
+         ps4_line_add(l, " arguments not readable");
+      else if (indexed)
+         ps4_line_add(l, " %u indices x %u instances, first index %u, vertex offset %d, first instance %u",
+                      v[0], v[1], v[2], (int)v[3], v[4]);
+      else
+         ps4_line_add(l, " %u vertices x %u instances, first vertex %u, first instance %u", v[0], v[1], v[2], v[3]);
+      ps4_line_shaders(l, p);
+      break;
+   }
+   case 0x37:
+      if (trace_va && p->addr == trace_va) /* (passed or not: see where it is from the one in memory) */
+         ps4_line_add(l, "trace id %u%s", v[0], p->done == 1 ? " (in memory now)" : "");
+      else
+         ps4_line_add(l, "WRITE_DATA %#llx <- %#x%s, memory %#x %s", (unsigned long long)p->addr, v[0],
+                      v[1] > 1 ? " ..." : "", v[2], ps4_done_text(p->done, "done", "NOT DONE"));
+      break;
+   case 0x46: {
+      const char *name = ps4_event_name(v[0] & 0x3f);
+      if (name)
+         ps4_line_add(l, "EVENT_WRITE %s", name);
+      else
+         ps4_line_add(l, "EVENT_WRITE event %#x", v[0] & 0x3f);
+      if (p->addr)
+         ps4_line_add(l, " -> %#llx %s", (unsigned long long)p->addr, ps4_done_text(p->done, "(written)", "(NOT written)"));
+      if (ps4_pkt_is_wait(p))
+         ps4_line_add(l, " (waits)");
+      break;
+   }
+   case 0x47:
+   case 0x48: {
+      const char *name = ps4_event_name(v[0] & 0x3f);
+      ps4_line_add(l, "%s %s -> %#llx", p->op == 0x47 ? "EVENT_WRITE_EOP" : "EVENT_WRITE_EOS",
+                   name ? name : "?", (unsigned long long)p->addr);
+      if (p->done >= 0)
+         ps4_line_add(l, " <- %#x, memory %#x %s", v[1], v[2], p->done ? "done" : "NOT DONE");
+      break;
+   }
+   case 0x3c: {
+      static const char *const ops[] = {"always", "<", "<=", "==", "!=", ">=", ">", "?"};
+      if (v[3])
+         ps4_line_add(l, "WAIT_REG_MEM memory %#llx & %#x %s %#x: now %#x, %s", (unsigned long long)p->addr, v[2],
+                      ops[v[0] & 7], v[1], v[4], ps4_done_text(p->done, "satisfied", "NOT SATISFIED (waits for it)"));
+      else
+         ps4_line_add(l, "WAIT_REG_MEM register %#x & %#x %s %#x", v[4], v[2], ops[v[0] & 7], v[1]);
+      break;
+   }
+   case 0x39:
+      ps4_line_add(l, "MEM_SEMAPHORE %#llx, %#x", (unsigned long long)p->addr, v[0]);
+      break;
+   case 0x43:
+   case 0x58:
+      ps4_line_add(l, "%s %#x%s", p->op == 0x43 ? "SURFACE_SYNC" : "ACQUIRE_MEM", v[0], ps4_pkt_is_wait(p) ? " (waits)" : "");
+      break;
+   case 0x42: ps4_line_add(l, "PFP_SYNC_ME"); break;
+   case 0x1e: ps4_line_add(l, "ATOMIC_MEM %#x", v[0]); break;
+   case 0x22: ps4_line_add(l, "COND_EXEC"); break;
+   case 0x23: ps4_line_add(l, "PRED_EXEC"); break;
+   case 0x20: ps4_line_add(l, "SET_PREDICATION %#x", v[0]); break;
+   case 0x40:
+      ps4_line_add(l, "COPY_DATA %#x: %#llx -> %#llx", v[0], (unsigned long long)(v[1] | ((uint64_t)v[2] << 32)),
+                   (unsigned long long)p->addr);
+      break;
+   case 0x50: {
+      const uint64_t src = v[1] | ((uint64_t)v[2] << 32);
+      if (src == p->addr)
+         ps4_line_add(l, "DMA_DATA prefetch %u bytes at %#llx", v[3], (unsigned long long)p->addr);
+      else
+         ps4_line_add(l, "DMA_DATA %u bytes %#llx -> %#llx", v[3], (unsigned long long)src, (unsigned long long)p->addr);
+      break;
+   }
+   case 0xfe: ps4_line_add(l, "not a packet (%#x): the walk stops", v[0]); break;
+   case 0xff: ps4_line_add(l, "an IB of %u dwords that isn't mapped", v[0]); break;
+   default: ps4_line_add(l, "packet %#x", p->op); break;
+   }
+}
+
+static void
+ps4_pkt_print(FILE *f, const struct ps4_pkt *p, uint64_t trace_va, const char *mark)
+{
+   struct ps4_line l = {{0}, 0};
+   ps4_pkt_text(&l, p, trace_va);
+   fprintf(f, "%s%*s%#llx: %s\n", mark, p->depth * 2, "", (unsigned long long)p->va, l.s);
+}
+
+/* The code of each shader a suspect runs, to `fd` (gpu/hang-shaders.txt, which the log bundle
+ * takes along): a "==== shader <stage> <address> (<bytes> bytes, packet <n>)" line, then its
+ * dwords in hex, 8 a line, up to its s_endpgm and 256 bytes past it (at most 64 KiB), for
+ * llvm-mc --disassemble (eden-ps4/tools/gpu-hang-shaders.py). */
+static void
+ps4_dump_shader(int fd, uint64_t va, unsigned stage, unsigned packet, uint64_t *done, unsigned *num_done)
+{
+   if (fd < 0 || !va)
+      return;
+   for (unsigned d = 0; d < *num_done; d++)
+      if (done[d] == va)
+         return;
+   if (*num_done < 64)
+      done[(*num_done)++] = va;
+   unsigned bytes = 0;
+   bool end = false;
+   for (; bytes < 65536 && !end; bytes += 256) {
+      const uint32_t *chunk = ps4_hw_read(va + bytes, 256);
+      if (!chunk)
+         break;
+      for (unsigned k = 0; k < 64; k++)
+         end |= chunk[k] == 0xbf810000; /* s_endpgm */
+   }
+   if (end && bytes < 65536 && ps4_hw_read(va + bytes, 256))
+      bytes += 256;
+   char line[128];
+   int n = snprintf(line, sizeof(line), "==== shader %s %#llx (%u bytes, packet %u)\n",
+                    ps4_stage_name[stage < PS4_STAGES ? stage : PS4_CS], (unsigned long long)va, bytes, packet);
+   (void)!write(fd, line, (size_t)n);
+   for (unsigned at = 0; at < bytes; at += 32) {
+      const uint32_t *d = ps4_hw_read(va + at, 32);
+      if (!d)
+         break;
+      n = snprintf(line, sizeof(line), "%08x %08x %08x %08x %08x %08x %08x %08x\n", d[0], d[1], d[2], d[3], d[4],
+                   d[5], d[6], d[7]);
+      (void)!write(fd, line, (size_t)n);
+   }
+}
+
+/* The analysis: `w` holds the unfinished submissions' packets (seqs[i] for sub i). */
+static void
+ps4_walk_analyze(FILE *f, const struct ps4_walk *w, const uint64_t *seqs, uint64_t trace_va, uint32_t trace_now,
+                 int shader_fd)
+{
+   if (w->dropped)
+      fprintf(f, "(only the first %u packets kept, %u more not)\n", w->count, w->dropped);
+   int match = -1;
+   unsigned matches = 0;
+   for (unsigned i = 0; trace_va && i < w->count; i++) {
+      const struct ps4_pkt *p = &w->pkts[i];
+      if (p->op == 0x37 && p->addr == trace_va && p->v[0] == trace_now) {
+         if (match < 0)
+            match = (int)i;
+         matches++;
+      }
+   }
+   if (!trace_va) {
+      fprintf(f, "no trace ids (RADV_PS4_TRACE unset): where the GPU stopped can't be told; waits that "
+                 "aren't satisfied:\n");
+      for (unsigned i = 0; i < w->count; i++)
+         if (w->pkts[i].op == 0x3c && w->pkts[i].done == 0)
+            ps4_pkt_print(f, &w->pkts[i], 0, "  ");
+      return;
+   }
+   if (match < 0) {
+      fprintf(f, "the last trace id the command processor wrote is %u, in none of the unfinished submissions: it "
+                 "hasn't reached the first trace point of any (or is in one that isn't listed)\n", trace_now);
+      unsigned shown = 0;
+      for (unsigned i = 0; i < w->count && shown < 48; i++, shown++)
+         ps4_pkt_print(f, &w->pkts[i], trace_va, "  ");
+      return;
+   }
+   const struct ps4_pkt *m = &w->pkts[match];
+   fprintf(f, "the command processor passed trace id %u at %#llx, in submission %llu%s\n", trace_now,
+           (unsigned long long)m->va, (unsigned long long)seqs[m->sub],
+           matches > 1 ? " (that id is there more than once: the first is taken)" : "");
+   int next_trace = -1, next_wait = -1, stuck_wait = -1;
+   for (unsigned i = match + 1; i < w->count; i++) {
+      const struct ps4_pkt *p = &w->pkts[i];
+      if (next_trace < 0 && p->op == 0x37 && p->addr == trace_va)
+         next_trace = (int)i;
+      if (next_wait < 0 && ps4_pkt_is_wait(p))
+         next_wait = (int)i;
+      if (stuck_wait < 0 && p->op == 0x3c && p->done == 0)
+         stuck_wait = (int)i;
+   }
+   int stop = -1; /* the packet the CP is most likely on */
+   if (next_wait >= 0 && (next_trace < 0 || next_wait < next_trace)) {
+      stop = next_wait;
+      struct ps4_line l = {{0}, 0};
+      ps4_pkt_text(&l, &w->pkts[stop], trace_va);
+      fprintf(f, "it waits at %#llx: %s\n", (unsigned long long)w->pkts[stop].va, l.s);
+      if (w->pkts[stop].op == 0x3c && w->pkts[stop].done == 0)
+         fprintf(f, "  - a wait on memory that isn't satisfied: nothing may ever write it\n");
+      else
+         fprintf(f, "  - for the work issued before it (the suspects below) to finish\n");
+   } else if (next_trace >= 0) {
+      stop = next_trace;
+      fprintf(f, "it hasn't reached the next trace id (%u, at %#llx) and there is no wait between: it is stuck on "
+                 "one of the packets in between\n", w->pkts[next_trace].v[0], (unsigned long long)w->pkts[next_trace].va);
+   } else {
+      fprintf(f, "no wait and no trace id after it: the CP got to the end; the work still running is the suspects "
+                 "below\n");
+   }
+   if (stuck_wait >= 0 && stuck_wait != stop) {
+      struct ps4_line l = {{0}, 0};
+      ps4_pkt_text(&l, &w->pkts[stuck_wait], trace_va);
+      fprintf(f, "a later wait isn't satisfied either: %#llx: %s\n", (unsigned long long)w->pkts[stuck_wait].va, l.s);
+   }
+   /* The suspects: the draws and dispatches from the last wait before the trace id the CP passed
+    * (work before it had finished: the CP got past that wait) to where it stopped. */
+   const unsigned end = stop >= 0 ? (unsigned)stop : w->count;
+   unsigned from = 0;
+   for (int i = match; i >= 0; i--)
+      if (ps4_pkt_is_wait(&w->pkts[i])) {
+         from = (unsigned)i;
+         break;
+      }
+   unsigned suspects = 0, first_suspect = end;
+   for (unsigned i = end; i-- > from && suspects < 24;)
+      if (ps4_pkt_is_work(&w->pkts[i])) {
+         suspects++;
+         first_suspect = i;
+      }
+   fprintf(f, "\n-- the suspects: %u draws and dispatches%s, their shaders' code in hang-shaders.txt --\n", suspects,
+           suspects == 24 ? " (the last 24)" : "");
+   uint64_t dumped[64];
+   unsigned num_dumped = 0;
+   for (unsigned i = first_suspect; i < end; i++) {
+      const struct ps4_pkt *p = &w->pkts[i];
+      if (!ps4_pkt_is_work(p))
+         continue;
+      ps4_pkt_print(f, p, trace_va, "  ");
+      for (unsigned s = 0; s < PS4_STAGES; s++)
+         ps4_dump_shader(shader_fd, p->sh[s], s, i, dumped, &num_dumped);
+   }
+   /* The packets around it, in the CP's order. */
+   const unsigned lo = (unsigned)MAX2(0, MIN2((int)first_suspect, match) - 16);
+   const unsigned hi = MIN2(w->count, MAX2(end, (unsigned)match + 1) + 12);
+   fprintf(f, "\n-- the packets around it (> the trace id the CP passed, * where it stopped) --\n");
+   unsigned sub = 0xff;
+   for (unsigned i = lo; i < hi; i++) {
+      const struct ps4_pkt *p = &w->pkts[i];
+      if (p->sub != sub) {
+         sub = p->sub;
+         fprintf(f, "submission %llu:\n", (unsigned long long)seqs[sub]);
+      }
+      ps4_pkt_print(f, p, trace_va, (int)i == match ? "> " : (int)i == stop ? "* " : "  ");
+   }
+}
+
+/* ---- hang walker: end ---- */
+
+static const void *
+ps4_hw_read(uint64_t va, uint64_t bytes)
+{
+   return va && ps4_mapped((const void *)(uintptr_t)va, bytes) ? (const void *)(uintptr_t)va : NULL;
+}
+
+/* "Where the GPU stopped": the unfinished submissions walked, which of them the CP has started
+ * (its timestamp at the start of each, ts_start), and the analysis above. */
+static void
+ps4_report_stop_point(ac_drm_device *dev, FILE *f, uint64_t completed, int shader_fd)
+{
+   fprintf(f, "==== where the GPU stopped ====\n");
+   struct ps4_walk w;
+   memset(&w, 0, sizeof(w));
+   w.max = 16384;
+   w.pkts = malloc(w.max * sizeof(*w.pkts));
+   if (!w.pkts) {
+      w.max = 2048;
+      w.pkts = malloc(w.max * sizeof(*w.pkts));
+   }
+   if (!w.pkts) {
+      fprintf(f, "(no memory for the walk)\n\n");
+      return;
+   }
+   uint64_t seqs[ARRAY_SIZE(dev->recent)];
+   unsigned num = 0;
+   const uint64_t last = dev->last_seq;
+   for (uint64_t s = completed + 1; s <= last && num < ARRAY_SIZE(seqs); s++) {
+      const unsigned r = s % ARRAY_SIZE(dev->recent);
+      const bool reached = dev->ts_start && dev->ts_start[s % FENCE_IB_COUNT] != 0;
+      if (dev->recent[r].seq != s) {
+         fprintf(f, "submission %llu: a flip (or not recorded)\n", (unsigned long long)s);
+         continue;
+      }
+      fprintf(f, "submission %llu: %u IBs; the command processor %s it\n", (unsigned long long)s,
+              dev->recent[r].num_ibs, reached ? "started" : "hasn't started");
+      w.sub = (uint8_t)num;
+      seqs[num++] = s;
+      for (unsigned i = 0; i < dev->recent[r].num_ibs; i++)
+         ps4_walk_collect(&w, dev->recent[r].va[i], dev->recent[r].bytes[i] / 4, 0);
+   }
+   /* (through the mapping check: a game's RADV device, and its trace buffer, may be gone) */
+   const volatile uint32_t *trace = ps4_trace_va ? ps4_hw_read(ps4_trace_va, 4) : NULL;
+   if (ps4_trace_va && !trace)
+      fprintf(f, "(the trace id's memory at %#llx isn't mapped)\n", (unsigned long long)ps4_trace_va);
+   ps4_walk_analyze(f, &w, seqs, trace ? ps4_trace_va : 0, trace ? *trace : 0, shader_fd);
+   free(w.pkts);
+   fprintf(f, "\n");
+}
+
+/* RADV_PS4_HANG_EXIT=1 (Eden for PS4 sets it): on a hang, end the app unless the GPU finishes
+ * something within 2 s of the report's start. Waiting on hung GPU work, Eden stayed up ~40 s until
+ * the PS4's own system software crashed (CE-36329-3, Eden 04.38: Zelda: Echoes of Wisdom after the
+ * cliff scene), and Captain Toad's level 3 took the PS4 down within 10 s; ended while the GPU is
+ * stuck, the system may reset the GPU and close just the app. A thread of its own decides, so the
+ * long part of the report (the decode) doesn't hold it up: "where the GPU stopped" is on the disk
+ * before it starts, the decode may be cut short. */
+extern void ps4_boot_trace_sync(void) __attribute__((weak)); /* port/ps4_crashlog.cpp, 04.39 on */
+
+struct ps4_hang_watch {
+   ac_drm_device *dev;
+   uint64_t completed;
+   int64_t since;
+   volatile int verdict; /* 0 deciding, 1 the GPU went on */
+};
+
+static bool
+ps4_hang_exit_wanted(void)
+{
+   const char *e = getenv("RADV_PS4_HANG_EXIT");
+   return e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "off") != 0;
+}
+
+static void *
+ps4_hang_watch_thread(void *arg)
+{
+   struct ps4_hang_watch *w = arg;
+   while (ps4_completed(w->dev) == w->completed && os_time_get_nano() - w->since < 2000000000ll)
+      sceKernelUsleep(50000);
+   if (ps4_completed(w->dev) != w->completed) {
+      ps4_log("radv/ps4: the GPU went on (completed %llu, was %llu): slow, not stuck - the app goes on\n",
+              (unsigned long long)ps4_completed(w->dev), (unsigned long long)w->completed);
+      w->verdict = 1;
+      return NULL;
+   }
+   char line[240];
+   snprintf(line, sizeof(line),
+            "radv/ps4: GPU hang: submission %llu unfinished for %.0f s (gpu/gpu-hang.txt) - ending the app before "
+            "the PS4's system software crashes",
+            (unsigned long long)(w->completed + 1), (os_time_get_nano() - w->since) / 1e9 + 2.0);
+   ps4_log("%s\n", line);
+   if (ps4_log_fd >= 0)
+      fsync(ps4_log_fd);
+   ps4_boot_trace(line);
+   if (ps4_boot_trace_sync)
+      ps4_boot_trace_sync();
+   abort();
+   return NULL;
+}
+
+/* Writes where the GPU stopped, and the command buffers of the first submission the GPU hasn't
+ * finished decoded by Mesa's IB parser, to gpu/gpu-hang.txt (once; again only after the GPU went
+ * on); with RADV_PS4_HANG_EXIT, the app may end meanwhile (ps4_hang_watch_thread). */
 static void
 ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
 {
-   if (dev->hang_reported)
+   if (__atomic_exchange_n(&dev->hang_reported, true, __ATOMIC_ACQ_REL))
       return;
-   dev->hang_reported = true;
-   const uint64_t completed = ps4_completed(dev);
+   static struct ps4_hang_watch watch;
+   watch.dev = dev;
+   watch.since = os_time_get_nano();
+   watch.completed = ps4_completed(dev);
+   watch.verdict = 0;
+   const int64_t since = watch.since;
+   const uint64_t completed = watch.completed;
+   const bool exit_wanted = ps4_hang_exit_wanted();
    ps4_log("radv/ps4: GPU hang? waiting for %llu, completed %llu, submitted %llu - writing "
            "%s\n",
            (unsigned long long)waited_seq, (unsigned long long)completed,
            (unsigned long long)dev->last_seq, ps4_gpu_file("gpu-hang.txt"));
    FILE *f = fopen(ps4_gpu_file("gpu-hang.txt"), "w");
-   if (!f)
-      return;
-   fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
-           (unsigned long long)waited_seq, (unsigned long long)completed,
-           (unsigned long long)dev->last_seq);
-   for (unsigned r = 0; r < ARRAY_SIZE(dev->recent); r++) {
+   if (f) {
+      fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
+              (unsigned long long)waited_seq, (unsigned long long)completed,
+              (unsigned long long)dev->last_seq);
+      const int shader_fd = open(ps4_gpu_file("hang-shaders.txt"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      ps4_report_stop_point(dev, f, completed, shader_fd);
+      if (shader_fd >= 0) {
+         fsync(shader_fd);
+         close(shader_fd);
+      }
+      fflush(f);
+      fsync(fileno(f)); /* the summary on the disk before the long part */
+   }
+   {
+      char line[200];
+      snprintf(line, sizeof(line), "radv/ps4: GPU hang? submission %llu not finished in 2 s: where the GPU stopped "
+               "in gpu/gpu-hang.txt (%.1f s to write)", (unsigned long long)(completed + 1),
+               (os_time_get_nano() - since) / 1e9);
+      ps4_boot_trace(line);
+      if (ps4_boot_trace_sync)
+         ps4_boot_trace_sync();
+   }
+   bool watching = false;
+   if (exit_wanted) {
+      pthread_t t;
+      watching = pthread_create(&t, NULL, ps4_hang_watch_thread, &watch) == 0;
+      if (watching)
+         pthread_detach(t);
+   }
+   for (unsigned r = 0; f && r < ARRAY_SIZE(dev->recent); r++) {
       if (dev->recent[r].seq != completed + 1)
          continue;
       fprintf(f, "==== buffers ====\n");
@@ -530,8 +1386,20 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
          ac_parse_ib(&ib, name);
       }
    }
-   fclose(f);
-   ps4_log("radv/ps4: hang report written\n");
+   if (f) {
+      fflush(f);
+      fsync(fileno(f));
+      fclose(f);
+   }
+   ps4_log("radv/ps4: hang report written (%.1f s)\n", (os_time_get_nano() - since) / 1e9);
+   if (exit_wanted && !watching)
+      ps4_hang_watch_thread(&watch); /* no thread: decide here, after the decode */
+   /* wait for the verdict (an abort doesn't come back); the GPU went on: a later hang is reported too */
+   while (exit_wanted && !watch.verdict)
+      sceKernelUsleep(50000);
+   static unsigned again;
+   if (watch.verdict && again++ < 3)
+      __atomic_store_n(&dev->hang_reported, false, __ATOMIC_RELEASE);
 }
 
 /* Crema: how the CPU waits for the GPU, every 5 s in the boot trace (waits per second, their
@@ -758,9 +1626,9 @@ ps4_find_symbol(const char *name)
 }
 
 /* ---------------------------------------------------------------------------------------------
- * Flight recorder (with RADV_PS4_TRACE, ps4.ini radv_trace=on). Nothing reports a GPU fault on a
- * retail PS4 - the app is just gone, and its core dump is encrypted - but data written with
- * write() sits in the kernel's page cache and survives the kill. So:
+ * Flight recorder (with RADV_PS4_TRACE other than "ids", ps4.ini radv_trace=on). Nothing reports
+ * a GPU fault on a retail PS4 - the app is just gone, and its core dump is encrypted - but data
+ * written with write() sits in the kernel's page cache and survives the kill. So:
  *  - /data/Crema/gpu/flight/ib-N.bin: the complete command stream of each submission (every IB,
  *    chained and nested), in a ring of 8 files (N = submission % 8);
  *  - /data/Crema/gpu/flight/progress.log: submissions, the GPU's completed submission, and the
@@ -768,13 +1636,13 @@ ps4_find_symbol(const char *name)
  * After a kill, the last trace id locates the draw the GPU died on inside the saved stream.
  */
 #include <sys/stat.h>
-static volatile const uint32_t *ps4_trace_id;
 static int ps4_progress_fd = -1;
 
 void ac_ps4_set_trace_va(uint64_t va);
 void
 ac_ps4_set_trace_va(uint64_t va)
 {
+   ps4_trace_va = va;
    ps4_trace_id = (volatile const uint32_t *)(uintptr_t)va;
 }
 
@@ -1011,7 +1879,9 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
 static void
 ps4_start_flight_recorder(ac_drm_device *dev)
 {
-   if (!getenv("RADV_PS4_TRACE") || ps4_progress_fd >= 0)
+   bool flight = false;
+   ps4_trace_option(&flight);
+   if (!flight || ps4_progress_fd >= 0)
       return;
    mkdir(ps4_gpu_dir(), 0777);
    mkdir(ps4_gpu_file("flight"), 0777);
@@ -2981,8 +3851,11 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
    /* Only with the flight recorder (Crema: GPU Fault Recorder): the tails are in write-combined
     * memory, slow to read, and every live buffer's took ~2% of Breath of the Wild's GPU thread. */
    static int trace_tails = -1;
-   if (trace_tails < 0)
-      trace_tails = getenv("RADV_PS4_TRACE") != NULL;
+   if (trace_tails < 0) {
+      bool flight = false;
+      ps4_trace_option(&flight);
+      trace_tails = flight;
+   }
    if (trace_tails && seq % 256 == 0)
       ps4_scan_tails(dev);
    ps4_run_deferred(dev);

@@ -13,7 +13,8 @@ step() { [ -f "$ST/$1" ] && { echo "== $1 (done before)"; return; }; echo "== $1
 ln -sfn "$REPO" "$HOME/cemups4"
 git -C "$REPO" config core.fileMode false
 chmod +x "$REPO"/scripts/*.sh "$REPO"/toolchain/*.sh "$REPO"/toolchain/bin/* "$REPO"/eden-ps4/*.sh \
-    "$REPO"/eden-ps4/tools/*.sh "$REPO"/eden-ps4/tools/dynarmic-harness/*.sh 2>/dev/null || true
+    "$REPO"/eden-ps4/tools/*.sh "$REPO"/eden-ps4/tools/*.py "$REPO"/eden-ps4/tools/gpu-tests/*.sh \
+    "$REPO"/eden-ps4/tools/dynarmic-harness/*.sh "$REPO"/eden-ps4/nx/*.sh 2>/dev/null || true
 
 packages() {
     curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
@@ -48,7 +49,7 @@ mesa() {
     [ -d "$PSB/src/mesa" ] || git clone -q --depth 1 --branch mesa-26.0.8 https://gitlab.freedesktop.org/mesa/mesa.git "$PSB/src/mesa"
     if [ ! -f "$PSB/src/mesa/.ps4-patched" ]; then
         for p in mesa-ps4 mesa-ps4-aligned-vertex-fetch mesa-ps4-vertex-fetch-switch mesa-ps4-flush-all-draws \
-                 mesa-ps4-gs-ring-probe mesa-ps4-cs-grow-oom; do
+                 mesa-ps4-gs-ring-probe mesa-ps4-cs-grow-oom mesa-ps4-trace-ids; do
             git -C "$PSB/src/mesa" apply --exclude=src/amd/common/ac_ps4_drm.c "$REPO/patches/$p.patch"
         done
         touch "$PSB/src/mesa/.ps4-patched"

@@ -379,6 +379,41 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.39: **the GPU hang: where it stopped, and the app ends instead of the PS4.** 04.38's Zelda log
+(Echoes of Wisdom, after the cliff scene) and Captain Toad's level 3 with CPU Auto went down the same
+way: a submission the GPU never finished (`radv/ps4: GPU hang? waiting for 30753, completed
+30752`), the game waiting on it, and ~40 s later the PS4's system software crashed (CE-36329-3).
+Its report couldn't say which of the submission's 135 draws and 199 dispatches hung: the only
+progress markers in it were Eden's `WaitForIdle` (`vkCmdSetEvent` + `vkCmdWaitEvents` on one event,
+never reset), whose writes are all 1. Three changes (`port/mesa/ac_ps4_drm.c`,
+`../patches/mesa-ps4-trace-ids.patch`):
+- **RADV's trace ids, cheaply** (`RADV_PS4_TRACE=ids`, Eden's default): RADV writes a number to one
+  address as the command processor (CP) reaches each draw, dispatch and cache flush. Before, they
+  came only with Crema's flight recorder (every submission's commands to the disk) and
+  `radv_init_trace`'s address binding report (a list of every buffer's binding that only grows);
+  `ids` makes the trace buffer alone. Each write now gets its own number from one count (RADV's count
+  is per command buffer, and Eden submits two at a time, both counting from 1).
+- **"Where the GPU stopped"** at the top of `gpu/gpu-hang.txt`: every packet of the unfinished
+  submissions the CP acts on, in its order, with the shaders bound at each draw and dispatch, and
+  memory checks (WAIT_REG_MEM satisfied or not, ZPASS_DONE written, WRITE_DATA done); the trace id in
+  memory is the last place the CP passed. The CP doesn't wait for draws or dispatches, only at waits
+  (partial flushes, SURFACE_SYNC, WAIT_REG_MEM), so it stopped at the first wait after that id (or on
+  a packet before the next id when there's none between). The suspects (the draws and dispatches
+  since the last wait before the id) are listed, and their shaders' code is written to
+  `gpu/hang-shaders.txt` (hex, in the log bundle; `tools/gpu-hang-shaders.py` splits it out and
+  disassembles it with CLRX's `clrxdisasm`: LLVM can't disassemble gfx7). Tested on the PC by
+  `tools/gpu-tests/hangwalk.sh`: hand-made streams (a dispatch that never ends, a WAIT_REG_MEM on
+  memory nothing writes, a stuck packet with no wait, two submissions), 04.38's Zelda submission
+  rebuilt from its decode, and 20,000 random streams under ASan/UBSan.
+- **The app ends on a sure hang** (`RADV_PS4_HANG_EXIT=1`, Eden's default): a wait that's 2 s old
+  starts the report; "where the GPU stopped" is fsynced first, then a thread of its own waits 2 s
+  more, and if the GPU hasn't finished anything by then, a boot trace line (synced:
+  `ps4_boot_trace_sync`, `port/ps4_crashlog.cpp`) and `abort()`, even with the report's long decode
+  still being written. Captain Toad's level 3 took the PS4 down within 10 s, Zelda's after ~40 s. With
+  the GPU stuck the PS4 may then reset it and close just the app (CE-34878-0); if the GPU goes on, it
+  was slow, and the app goes on. settings.txt turns either off (`RADV_PS4_TRACE=0`, `RADV_PS4_HANG_EXIT=0`).
+  Crema sets neither: its behaviour is unchanged.
+
 04.38: **the CPU Unsafe switch for 32-bit games too.** Patch 0143: with CPU accuracy Auto the
 A32 cores run without `inline_conditional_instructions`, `elide_dead_nzcv(_abi)`,
 `fold_address_offsets`, `skip_redundant_extensions`, `split_cold_code`. Captain Toad is a 32-bit
