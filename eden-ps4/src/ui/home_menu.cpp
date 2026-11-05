@@ -350,7 +350,7 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
                 default: {
                     Dialog dialog;
                     dialog.kind = DialogKind::Quit;
-                    dialog.title = "Close Eden for PS4?";
+                    dialog.title = "Close New Eden?";
                     dialog.text = "The PS4's home screen comes back. (In a game, L3 + R3 held for a second "
                                   "stops it and returns here.)";
                     dialog.buttons = {"Cancel", "Close"};
@@ -815,20 +815,20 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "instead of when they first appear: a longer start, less stutter once it runs.",
              [](MenuSettings& s) { s.shader_cache = !s.shader_cache; }},
             {"Translation Cache", on_off(settings.jit_cache),
-             "The game's CPU code Eden translated is kept in /data/eden-ps4/cache/jit when you leave the game, "
-             "and used again from its start the next time instead of translated again as it runs (the first "
-             "race's stutter), 32-bit and 64-bit games alike. Kept for this version of Eden for PS4 only; "
-             "deleted unused if the last run that used it crashed or was closed from the PS4's menu.",
+             "The game's CPU code New Eden translated is kept in /data/eden-ps4/cache/jit when you leave the "
+             "game, and used again from its start the next time instead of translated again as it runs (less "
+             "stutter early on), 32-bit and 64-bit games alike. Kept for this version of New Eden only; deleted "
+             "unused if the last run that used it crashed or was closed from the PS4's menu.",
              [](MenuSettings& s) { s.jit_cache = !s.jit_cache; }},
             {"Draw Shortcuts", on_off(settings.draw_shortcuts),
-             "Two savings on every draw from 04.15 and 04.16: the last graphics pipeline used again when none of "
-             "what picks it changed, and textures' descriptors read where they are. Off: as before them (a little "
-             "slower), to check whether a game's glitch or freeze comes from them.",
+             "Two savings on every draw: the last graphics pipeline used again when nothing that picks it "
+             "changed, and textures' descriptors read where they are. Off: without them (a little slower), to "
+             "check whether a game's glitch or freeze comes from them.",
              [](MenuSettings& s) { s.draw_shortcuts = !s.draw_shortcuts; }},
             {"Compiled GPU Macros", on_off(settings.compiled_macros),
              "The small programs a game gives the Switch's GPU for its draws are compiled to the PS4's own code. "
-             "Off: they are interpreted (a little slower), to check whether a game's crash or GPU hang comes "
-             "from their compiler (Captain Toad's level 3 took the PS4 down right after new ones were compiled).",
+             "Off: they are interpreted (a little slower), to check whether a game's crash or GPU freeze comes "
+             "from their compiler.",
              [](MenuSettings& s) { s.compiled_macros = !s.compiled_macros; }},
             {"Asynchronous Shaders", on_off(settings.async_shaders),
              "New shaders are built in the background instead of stopping the game while they compile (slow on "
@@ -836,9 +836,9 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              [](MenuSettings& s) { s.async_shaders = !s.async_shaders; }},
             {"Draw Order", settings.serial_draws ? "One at a Time" : "Parallel",
              "Parallel: the PS4's GPU works on several of a game's draws at once, as normal. One at a Time: each "
-             "draw waits for the one before, and the GPU's caches are emptied in between: slower, but it kept "
-             "Captain Toad's levels 3 and 4 running (04.58). If a game closes with a GPU hang, try the other one "
-             "and send the logs.",
+             "draw waits for the one before, and the GPU's caches are emptied in between: slower, but it can keep "
+             "a game running that freezes the GPU otherwise. If a game closes with a GPU error, try the other "
+             "one.",
              [](MenuSettings& s) { s.serial_draws = !s.serial_draws; }},
             {"FPS Counter", on_off(settings.fps_overlay),
              "The frames shown each second, at the top centre of the picture while a game runs (a game's own target is "
@@ -848,7 +848,7 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "60 Hz: as the Switch, a finished frame is shown at the next vsync, so a game that misses one waits "
              "for the next (60, 30, 20, 15 fps). Unlocked: each frame is shown the moment it's done, so a game "
              "below 60 loses no time waiting. A game whose speed follows its frames may run faster than it should "
-             "where it can go above 60 (menus). The log's 30-second line says how long frames waited.",
+             "where it can go above 60 (menus).",
              [](MenuSettings& s) { s.unlocked_frames = !s.unlocked_frames; }},
             {"Game Speed", settings.speed == 200 ? "2.0x" : settings.speed == 150 ? "1.5x" : "1.0x",
              "How fast the Switch's clock of frames runs: at 1.5x or 2.0x its vsyncs come that much more often, "
@@ -861,8 +861,7 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
             {"GPU Accuracy", settings.gpu_high ? "High" : "Normal",
              "How closely the CPU waits for the GPU. High reads back what the GPU drew whenever the game's CPU code "
              "might look at it, and makes the CPU's every access to such memory take a slow path: needed by a few "
-             "games (effects, screenshots), a large cost on the PS4's CPU for the rest. Normal is Eden's choice on "
-             "phones.",
+             "games (effects, screenshots), a large cost on the PS4's CPU for the rest.",
              [](MenuSettings& s) { s.gpu_high = !s.gpu_high; }},
         };
     }
@@ -870,25 +869,24 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
         return {
             {"Accuracy", settings.cpu_unsafe ? "Unsafe" : "Auto",
              "How exactly the Switch's CPU is followed. Unsafe skips some exactness in floating-point maths and in "
-             "how cores share memory: about 10% faster on vector maths on the PS4 (measured), no faster on the "
+             "how cores share memory: about 10% faster on vector maths on the PS4, no faster on the "
              "rest, and some games misbehave with it.",
              [](MenuSettings& s) { s.cpu_unsafe = !s.cpu_unsafe; }},
             {"CPU Cores", settings.seventh_core ? "7 (with the shared one)" : "6",
-             "A PS4 app has 6 cores to itself and may use a 7th that the system shares. With 7, Eden's threads "
+             "A PS4 app has 6 cores to itself and may use a 7th that the system shares. With 7, New Eden's threads "
              "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "
              "system needs its core.",
              [](MenuSettings& s) { s.seventh_core = !s.seventh_core; }},
             {"Thread Placement", settings.pin_threads ? "Pinned" : "Free",
              "Pinned: the three emulated CPU cores a game runs on and the GPU thread each have a core of the "
-             "PS4's first module (four cores sharing one cache) to themselves, and Eden's other threads run on "
+             "PS4's first module (four cores sharing one cache) to themselves, and New Eden's other threads run on "
              "the second: the game's threads stay where their cache is warm. Free: every thread on any core, the "
              "system's choice.",
              [](MenuSettings& s) { s.pin_threads = !s.pin_threads; }},
             {"Fastmem", on_off(settings.fastmem),
-             "The Switch's memory mapped at its own addresses a second time (the PS4 allows it once asked, "
-             "sceKernelEnableDmemAliasing), so the game's loads and stores are single instructions instead of "
-             "a table lookup each: the biggest speedup there is for the game's own code. Off: the lookup, as "
-             "before 03.84 (if a game crashes or misbehaves with it on).",
+             "The Switch's memory mapped at its own addresses a second time, so the game's loads and stores are "
+             "single instructions instead of a table lookup each: the biggest speedup there is for the game's own "
+             "code. Off: the lookup (if a game crashes or misbehaves with it on).",
              [](MenuSettings& s) { s.fastmem = !s.fastmem; }},
             {"Profiler", on_off(settings.profiler),
              "While a game runs, where the emulated CPU cores, the GPU thread and the Vulkan thread spend their "
@@ -906,13 +904,13 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
                 {"Switch Memory", settings.ram_on_demand ? "As the game uses it" : "All 4 GB up front",
                  "The Switch's 4 GB of RAM come out of the PS4's memory as the game first uses them, so what it "
                  "doesn't use is left to the PS4's GPU for textures and buffers: often a few GB instead of about "
-                 "half of one. All 4 GB up front is how it was before 03.70: try it if a game fails with this on.",
+                 "half of one. All 4 GB up front: try it if a game fails with this on.",
                  [](MenuSettings& s) { s.ram_on_demand = !s.ram_on_demand; }},
                 {"Touchpad", settings.touchpad_minus ? "Minus Button" : "Touch Screen",
                  "Touch Screen: the controller's touchpad is the Switch's touch screen. A finger resting on it shows "
                  "a pointer where it would touch (the touchpad is the picture, corner to corner); click the "
                  "touchpad to touch there, and hold the click to drag; a quick tap touches too. A click with two "
-                 "fingers is the Minus button. Minus Button: any click is Minus, as before 04.59.",
+                 "fingers is the Minus button. Minus Button: any click is Minus.",
                  [](MenuSettings& s) { s.touchpad_minus = !s.touchpad_minus; }}};
     default:
         return {};
@@ -991,7 +989,7 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
     y = items.empty() ? kListTop : rows_bottom;
     std::string description;
     if (items.empty())
-        description = "Eden for PS4 " + version + "\nThe Nintendo Switch emulator Eden (eden-emu.dev), on the PS4.\n\n"
+        description = "New Eden " + version + "\nA Nintendo Switch emulator for the PS4, based on Eden (eden-emu.dev).\n\n"
                       "Renderer: " + renderer + "\nData folder: /data/eden-ps4\n\nGPL-3.0-or-later. The font is "
                       "Inter (rsms.me/inter), under the SIL Open Font License.";
     else

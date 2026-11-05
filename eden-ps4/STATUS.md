@@ -1,7 +1,7 @@
-# Eden for PS4: status (after 04.60)
+# New Eden (formerly Eden for PS4): status (after 04.61)
 
-Install **04.60** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
-The patches are in `eden-ps4/patches` (up to 0145). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.61** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0146). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -76,6 +76,23 @@ programs, 0 failures.
 - **04.59:** the touchpad as the Switch's touch screen, with a pointer (below).
 - **04.60:** the kitchen sink off; draw serialization a HOME menu choice (Draw Order), Parallel by
   default (below).
+- **04.61:** the app renamed New Eden; a dark icon; the touchpad pointer a ring; the news and the
+  settings' descriptions made generic (below).
+
+## 04.61: New Eden
+
+- **The name:** the package title (`build.sh`: `make-pkg.sh ... "New Eden"`, title ID EDNP00001 kept, so
+  it installs over Eden for PS4), the HOME menu (About, the close dialog), the web page, the news title
+  and the log bundle's first line say New Eden; the About page credits Eden (eden-emu.dev). Data
+  folders (`/data/eden-ps4`), log prefixes and the code's names are unchanged.
+- **The icon:** `sce_sys/icon0.png`'s white background flood-filled to black from the edges (the PS4's
+  app launch background), the grey edge pixels re-blended against black; the Joy-Con untouched.
+- **The pointer:** patch 0146 draws it as Crema does: a ring (radius picture height / 50) with a dot in
+  its middle, dark outlines, white resting, red touching; circles from one clear rectangle a row.
+- **The text:** the news is a short generic changelog (recent versions, then "Earlier" by ranges) and the
+  help sections; the settings' descriptions lost their version references, game names and "Eden's choice
+  on phones".
+
 
 ## 04.60: back to 04.48's GPU settings
 

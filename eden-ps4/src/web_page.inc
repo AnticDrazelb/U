@@ -6,7 +6,7 @@ constexpr std::string_view kWebPage = R"PAGE(<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Eden for PS4</title>
+<title>New Eden</title>
 <style>
   :root { --bg: #2d2d2d; --card: #3a3a3a; --text: #f2f2f2; --dim: #b4b4b4; --accent: #18c8e8;
           --good: #3cc864; --bad: #e8463c; --line: #4c4c4c; }
@@ -41,7 +41,7 @@ constexpr std::string_view kWebPage = R"PAGE(<!doctype html>
 </head>
 <body>
 <main>
-  <h1>Eden for PS4</h1>
+  <h1>New Eden</h1>
   <p class="sub" id="version">Connecting to the PS4&hellip;</p>
   <div class="chips" id="chips"></div>
 
@@ -109,7 +109,7 @@ async function refresh() {
     $("log-list").innerHTML = s.logs.map((l) =>
       `<li><a href="/files/${encodeURI(l.name)}" target="_blank">${esc(l.name)}</a><span class="size">${size(l.size)}</span></li>`).join("");
   } catch (e) {
-    $("version").textContent = "The PS4 doesn't answer: is Eden for PS4 open?";
+    $("version").textContent = "The PS4 doesn't answer: is New Eden open?";
   }
 }
 function esc(t) { return t.replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])); }

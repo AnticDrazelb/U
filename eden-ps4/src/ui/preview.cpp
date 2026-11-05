@@ -77,7 +77,7 @@ HomeMenu MakeMenu(bool white)
     menu.SetKeysPresent(false);
     menu.SetControllerTest("/app0/padtest.nro");
     menu.SetFolderPlaces({"/data/eden-ps4", "/mnt/usb0", "/mnt/usb1", "/mnt/ext0", "/mnt/ext1", "/mnt"});
-    menu.SetNews({{"Eden for PS4 03.20", "A HOME menu laid out as the Switch's: your software in a row, All Software "
+    menu.SetNews({{"New Eden 03.20", "A HOME menu laid out as the Switch's: your software in a row, All Software "
                                          "for everything, and the system's round buttons below.\nGames on USB drives "
                                          "appear here too."},
                   {"The PS4's GPU", "Games are drawn with the PS4's GPU through Mesa's RADV. If Vulkan doesn't start, "
@@ -131,7 +131,10 @@ int main(int argc, char** argv)
     Press(menu, kRight);
     Press(menu, kDown);
     Shot(menu, "settings-cpu");
-    Press(menu, kCircle);
+    Press(menu, kCircle);  // the categories
+    Press(menu, kDown);    // Console
+    Press(menu, kDown);    // About
+    Shot(menu, "settings-about");
     Press(menu, kCircle);
     Press(menu, kLeft);
     Press(menu, kLeft);

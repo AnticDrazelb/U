@@ -1,0 +1,119 @@
+From 4cc810ed6248037c10084165ca4c93f30090fe04 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 04:26:59 +0000
+Subject: [PATCH] PS4: the touchpad's pointer as a ring, as Crema's
+
+The touchpad's pointer was a cross. It is now drawn as Crema (the Wii U
+emulator's PS4 port) draws its own: a ring of radius picture height / 50
+with a dot in its middle, each with a dark outline. White while the
+finger rests, red while it touches. The circles are drawn as one clear
+rectangle per row.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ .../present/window_adapt_pass.cpp             | 67 +++++++++++--------
+ 1 file changed, 40 insertions(+), 27 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+index c8cb30a16e..182465eab6 100644
+--- a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
++++ b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <string>
+ #include <vector>
+ 
+@@ -117,38 +118,50 @@ void FpsRects(u32 value, VkExtent2D area, std::vector<VkClearRect>& box, std::ve
+ }
+ 
+ // (PS4) The touchpad's pointer: where a finger on the PS4 controller's touchpad would touch the
+-// screen, drawn over the picture with clears (as the FPS counter) - a cross, white while the finger
+-// rests, yellow while it touches. The frontend sets it (eden-ps4's PadThread, through
+-// Launcher::SetTouch).
++// screen, drawn over the picture with clears (as the FPS counter) as Crema draws its own: a ring
++// with a dot in its middle, each with a dark outline - white while the finger rests, red while it
++// touches. Circles from one clear rectangle a row. The frontend sets it (eden-ps4's PadThread,
++// through Launcher::SetTouch).
+ void PointerRects(u64 pointer, const Layout::FramebufferLayout& layout, VkExtent2D area,
+                   std::vector<VkClearRect>& dark, std::vector<VkClearRect>& light) {
+     const auto& screen = layout.screen;
+     const f32 fx = static_cast<f32>(pointer & 0xFFFF) / 65535.0f;
+     const f32 fy = static_cast<f32>((pointer >> 16) & 0xFFFF) / 65535.0f;
+-    const s32 cx = static_cast<s32>(screen.left) + static_cast<s32>(fx * static_cast<f32>(screen.GetWidth()));
+-    const s32 cy = static_cast<s32>(screen.top) + static_cast<s32>(fy * static_cast<f32>(screen.GetHeight()));
+-    const s32 arm = std::max<s32>(static_cast<s32>(area.height) / 48, 7);
+-    const s32 thick = std::max<s32>(arm / 4, 2);
+-    const s32 edge = std::max<s32>(thick / 2, 1);
+-    const auto rect = [&](s32 x, s32 y, s32 w, s32 h) {
+-        const s32 left = std::max<s32>(x, 0), top = std::max<s32>(y, 0);
+-        const s32 right = std::min<s32>(x + w, static_cast<s32>(area.width));
+-        const s32 bottom = std::min<s32>(y + h, static_cast<s32>(area.height));
+-        if (right <= left || bottom <= top) {
+-            return VkClearRect{};
++    const f32 cx = static_cast<f32>(screen.left) + fx * static_cast<f32>(screen.GetWidth());
++    const f32 cy = static_cast<f32>(screen.top) + fy * static_cast<f32>(screen.GetHeight());
++    const f32 radius = std::max(static_cast<f32>(screen.GetHeight()) / 50.0f, 8.0f);
++    const auto span = [&](std::vector<VkClearRect>& out, f32 left, f32 right, s32 row) {
++        const s32 x0 = std::max<s32>(static_cast<s32>(std::floor(left + 0.5f)), 0);
++        const s32 x1 = std::min<s32>(static_cast<s32>(std::floor(right + 0.5f)), static_cast<s32>(area.width));
++        if (row < 0 || row >= static_cast<s32>(area.height) || x1 <= x0) {
++            return;
++        }
++        out.push_back(VkClearRect{.rect = {.offset = {x0, row}, .extent = {static_cast<u32>(x1 - x0), 1}},
++                                  .baseArrayLayer = 0,
++                                  .layerCount = 1});
++    };
++    // a ring from radius `inner` to `outer` (inner 0: a disc), a span or two each row
++    const auto ring = [&](std::vector<VkClearRect>& out, f32 inner, f32 outer) {
++        const s32 top = static_cast<s32>(std::floor(cy - outer)), bottom = static_cast<s32>(std::ceil(cy + outer));
++        for (s32 row = top; row <= bottom; row++) {
++            const f32 dy = static_cast<f32>(row) + 0.5f - cy;
++            if (std::abs(dy) > outer) {
++                continue;
++            }
++            const f32 xo = std::sqrt(outer * outer - dy * dy);
++            if (std::abs(dy) >= inner) {
++                span(out, cx - xo, cx + xo, row);
++            } else {
++                const f32 xi = std::sqrt(inner * inner - dy * dy);
++                span(out, cx - xo, cx - xi, row);
++                span(out, cx + xi, cx + xo, row);
++            }
+         }
+-        return VkClearRect{.rect = {.offset = {left, top},
+-                                    .extent = {static_cast<u32>(right - left), static_cast<u32>(bottom - top)}},
+-                           .baseArrayLayer = 0,
+-                           .layerCount = 1};
+     };
+-    const s32 half = thick / 2;
+-    dark.push_back(rect(cx - arm - edge, cy - half - edge, arm * 2 + thick + edge * 2, thick + edge * 2));
+-    dark.push_back(rect(cx - half - edge, cy - arm - edge, thick + edge * 2, arm * 2 + thick + edge * 2));
+-    light.push_back(rect(cx - arm, cy - half, arm * 2 + thick, thick));
+-    light.push_back(rect(cx - half, cy - arm, thick, arm * 2 + thick));
+-    std::erase_if(dark, [](const VkClearRect& r) { return r.rect.extent.width == 0; });
+-    std::erase_if(light, [](const VkClearRect& r) { return r.rect.extent.width == 0; });
++    ring(dark, radius - 3.0f, radius + 3.0f);
++    ring(dark, 0.0f, radius / 4.0f + 1.5f);
++    ring(light, radius - 1.5f, radius + 1.5f);
++    ring(light, 0.0f, radius / 4.0f);
+ }
+ 
+ } // namespace
+@@ -274,8 +287,8 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+             const VkClearAttachment light{
+                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                 .colorAttachment = 0,
+-                .clearValue = {.color = {.float32 = {1.0f, pointer_touching ? 0.85f : 1.0f,
+-                                                     pointer_touching ? 0.1f : 1.0f, 1.0f}}}};
++                .clearValue = {.color = {.float32 = {1.0f, pointer_touching ? 0.27f : 1.0f,
++                                                     pointer_touching ? 0.27f : 1.0f, 1.0f}}}};
+             cmdbuf.ClearAttachments({dark}, pointer_dark);
+             if (!pointer_light.empty()) {
+                 cmdbuf.ClearAttachments({light}, pointer_light);
+-- 
+2.43.0
+

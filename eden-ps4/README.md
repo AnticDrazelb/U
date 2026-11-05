@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.61: **New Eden.** The app is called New Eden (package title, HOME menu, web page, news; title ID
+and data folders unchanged), with a black icon background and the touchpad pointer drawn as Crema's ring
+(patch 0146). The news is a short generic changelog, and the settings' descriptions no longer name games,
+versions or Eden's phone defaults.
+
 04.60: **04.48's GPU settings again.** On 04.58 Zelda and Mario Kart hung (they ran on 04.48), as did
 one of Toad's sessions, with the kitchen sink on and every draw serialized. The kitchen sink is off
 by default now (`RADV_PS4_MITIGATE` 0 unless settings.txt sets it), and the serialization is the HOME

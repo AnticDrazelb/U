@@ -315,7 +315,7 @@ bool WriteBundle(const fs::path& data, const std::string& version, const Symbols
                  const std::function<bool(std::string_view)>& write)
 {
     const size_t limit = running ? kLogLimitWhileRunning : kLogLimit;
-    std::string head = "Eden for PS4 " + version + ": every log in " + data.string() + "\n";
+    std::string head = "New Eden " + version + ": every log in " + data.string() + "\n";
     if (running)
         head += "(a program is running: each log's last 2 MiB, code addresses without names; for names, "
                 "download them again from the HOME menu)\n";

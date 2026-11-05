@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds Eden's core with the PS4 launcher (src/) as an out-of-tree frontend.
 #   build.sh host   desktop build in ~/eden-host (run: ~/eden-host/bin/eden-ps4 <program.nro>)
-#   build.sh ps4    eboot.bin in ~/eden-ps4-build, packaged as out/EdenPS4.pkg in this repo
+#   build.sh ps4    eboot.bin in ~/eden-ps4-build, packaged as out/NewEden.pkg in this repo
 # Needs Eden at EDEN_DIR (eb88a40 with patches/ applied), its dependencies from fetch-deps.sh in
 # EDEN_DEPS, CMake 3.31 or newer (CMAKE=...), and for the PS4 build Crema's PS4 sysroot and
 # toolchain (docs/BUILDING.md) and FFmpeg from build-ffmpeg.sh.
@@ -82,10 +82,10 @@ ps4)
     # base PS4 mode (Pro mode hung the GPU for Eden4), Cross confirms, 7-CPU mode: the app may use
     # the 7th core, which the system shares (System Settings, CPU Cores, chooses whether it does)
     pkg="$(SFO_STYLE=plain SFO_ATTRIBUTE=0x10002 NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR="$build/no-modules" \
-        "$HERE/../scripts/make-pkg.sh" "$stage" EDNP00001 "Eden for PS4" "$version" EDENPS4 "$build/out" |
+        "$HERE/../scripts/make-pkg.sh" "$stage" EDNP00001 "New Eden" "$version" EDENPS4 "$build/out" |
         tail -1)"
-    cp "$pkg" "$HERE/../out/EdenPS4.pkg"
-    echo "$HERE/../out/EdenPS4.pkg"
+    cp "$pkg" "$HERE/../out/NewEden.pkg"
+    echo "$HERE/../out/NewEden.pkg"
     ;;
 *)
     echo "usage: build.sh host|ps4" >&2
