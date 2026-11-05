@@ -2696,6 +2696,39 @@ static int64_t ps4_last_submit_ns;   /* when the last submission was noted or pa
  * (RADV_PS4_SYNC_AFTER_IDLE=0: off). */
 extern int ac_ps4_flush_all_draws;
 static bool ps4_sync_by_us;          /* we turned it on */
+/* (04.58) RADV_PS4_SERIALIZE: "loads" (04.49-04.57: after a loading gap only, as above), "full" (all the
+ * time, the wait and the cache flushes: ac_ps4_flush_all_draws 1), "wait" (all the time, the wait only:
+ * 2), "off". Default "full": Captain Toad's level 3 ran while its draws waited for each other and hung
+ * within 0.5-7 s of their going off, inside a run of 12 scene draws in flight together. */
+static void
+ps4_serialize_init(void)
+{
+   const char *e = getenv("RADV_PS4_SERIALIZE");
+   if (!e || !e[0])
+      e = "full";
+   const int mode = !strcmp(e, "full") ? 1 : !strcmp(e, "wait") ? 2 : 0;
+   if (mode)
+      __atomic_store_n(&ac_ps4_flush_all_draws, mode, __ATOMIC_RELEASE);
+   char line[200];
+   snprintf(line, sizeof(line), "radv/ps4: RADV_PS4_SERIALIZE=%s: %s", e,
+            mode == 1 ? "every draw and dispatch waits for the one before and flushes every cache, all the time"
+            : mode == 2 ? "every draw and dispatch waits for the one before (no cache flushes), all the time"
+            : !strcmp(e, "loads") ? "draws and dispatches wait for each other after a loading gap only"
+            : "draws and dispatches don't wait for each other");
+   ps4_boot_trace(line);
+}
+
+static bool
+ps4_serialize_after_idle(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_PS4_SERIALIZE");
+      const char *i = getenv("RADV_PS4_SYNC_AFTER_IDLE");
+      v = e && !strcmp(e, "loads") && !(i && (!strcmp(i, "0") || !strcmp(i, "off")));
+   }
+   return v;
+}
 static int ps4_sync_left;            /* submissions until it goes off again (under dev->lock) */
 static int ps4_pf_fd = -1;            /* gpu/preflight.txt of the current idle period (under dev->lock) */
 static unsigned ps4_pf_count;         /* submissions in it (at most 16 a period) */
@@ -2833,11 +2866,7 @@ ps4_watch_thread(void *arg)
             dirty = true;
          }
       }
-      static int sync_after_idle = -1;
-      if (sync_after_idle < 0) {
-         const char *e = getenv("RADV_PS4_SYNC_AFTER_IDLE");
-         sync_after_idle = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
-      }
+      const bool sync_after_idle = ps4_serialize_after_idle();
       const int64_t last_submit = __atomic_load_n(&ps4_last_submit_ns, __ATOMIC_RELAXED);
       if (sync_after_idle && last_submit && now - last_submit >= 250000000ll &&
           !__atomic_load_n(&ps4_sync_by_us, __ATOMIC_ACQUIRE) && !__atomic_load_n(&ac_ps4_flush_all_draws, __ATOMIC_ACQUIRE) &&
@@ -3777,6 +3806,7 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
       goto fail;
    ps4_log("radv/ps4: GPU address windows %#llx (16 GiB), %#llx (32-bit)\n",
            (unsigned long long)dev->va_start, (unsigned long long)dev->va32_start);
+   ps4_serialize_init();
    util_vma_heap_init(&dev->va_heap, dev->va_start, PS4_VA_SIZE);
    util_vma_heap_init(&dev->va32_heap, dev->va32_start, PS4_VA32_SIZE);
 

@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.57)
+# Eden for PS4: status (after 04.58)
 
-Install **04.57** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.58** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -71,6 +71,27 @@ programs, 0 failures.
 - **04.56:** the kitchen sink plus trivial shaders for the scene draws after a loading gap (below).
 - **04.57:** the cause: shaders from 03.84's pipeline cache, built for another 32-bit GPU window;
   the window now in RADV's cache UUID (below).
+- **04.58:** level 3 loads; it hangs once draws overlap again: every draw serialized, all the time
+  (`RADV_PS4_SERIALIZE`, below).
+
+## 04.58: draws serialized all the time
+
+- **04.57's runs (two):** level 3 loaded both times. No shader for another window anywhere (the
+  pre-flight records: every `s_movk_i32` high half 0x44; none named), so the UUID fix worked. Level 3's
+  first batch (8099 / 8431) finished, and the 60 serialized submissions after the loading gap ran. Then
+  `GPU hang: ... ending the app` (the hang exit: crash.log `abort` from `ps4_hang_watch_thread`, the PS4
+  stayed up): 0.5 s after the serialization went off in one run (submission 8231), 7 s in the other
+  (10309). 8231: the CP waits at the `PS_PARTIAL_FLUSH` after 12 scene draws in flight together
+  (G-buffer: 4 targets 8_8_8_8 / 2_10_10_10 / 16_16 F / 10_11_11 F, Z32F without HTILE, early Z, an
+  occlusion query; 4 PS, 3 VS, all `s_movk_i32 ..., 0x44`). The same 12 draws ran in the serialized
+  batch.
+- **04.58:** `RADV_PS4_SERIALIZE` (default `full`): every draw and dispatch waits for the one before and
+  flushes every cache, all the time (`ac_ps4_flush_all_draws` 1 from device start); `wait`: the wait only
+  (`../patches/mesa-ps4-serialize-wait.patch`: `ac_ps4_flush_all_draws` 2); `loads`: 04.49-04.57's
+  after-a-loading-gap only; `off`. With a wait after each draw the last trace id is the last finished
+  draw, so a hang names its draw.
+- **Reading it:** level 3 stays up: overlapping draws (then `wait`, then narrower). Still hangs: the
+  hang report's draw.
 
 ## 04.57: shaders built for another GPU window (the cause)
 

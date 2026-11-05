@@ -1,0 +1,32 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] PS4: ac_ps4_flush_all_draws 2 - the wait after every draw without
+ the cache flushes
+
+1 (as before): after every draw and dispatch the GPU waits for it and writes back and invalidates
+every cache. 2: only the wait (RADV_DEBUG=syncshaders' work). Captain Toad's level 3 ran with 1
+and hung within seconds of it going off: 2 tells overlapping draws from the caches.
+
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -1709,11 +1709,14 @@
+     * the GPU waits, writes back and invalidates every cache (colour/depth, shader, vertex/texture, L2),
+     * to tell a missing cache flush on Liverpool from other causes of a picture drawn wrong. */
+    extern int ac_ps4_flush_all_draws;
+-   const bool ps4_flush_all = ac_ps4_flush_all_draws;
++   /* (Eden for PS4 04.58) 1: the wait and every cache flushed (as before); 2: the wait only (what
++    * RADV_DEBUG=syncshaders does), to tell overlapping draws from caches */
++   const int ps4_flush_mode = ac_ps4_flush_all_draws;
++   const bool ps4_flush_all = ps4_flush_mode == 1;
+    if (ps4_flush_all)
+       flags |= RADV_CMD_FLUSH_AND_INV_FRAMEBUFFER | RADV_CMD_FLAG_INV_ICACHE | RADV_CMD_FLAG_INV_SCACHE |
+                RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_WB_L2;
+-   if ((instance->debug_flags & RADV_DEBUG_SYNC_SHADERS) || ps4_flush_all) {
++   if ((instance->debug_flags & RADV_DEBUG_SYNC_SHADERS) || ps4_flush_mode) {
+ #else
+    if (instance->debug_flags & RADV_DEBUG_SYNC_SHADERS) {
+ #endif

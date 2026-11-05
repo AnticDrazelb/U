@@ -48,7 +48,7 @@ made executable (`git config core.fileMode false` keeps that out of git):
    (`git apply --exclude=src/amd/common/ac_ps4_drm.c`; `build-mesa.sh` copies
    `port/mesa/ac_ps4_drm.c` in): `mesa-ps4`, `mesa-ps4-aligned-vertex-fetch`,
    `mesa-ps4-vertex-fetch-switch`, `mesa-ps4-flush-all-draws`, `mesa-ps4-gs-ring-probe`,
-   `mesa-ps4-cs-grow-oom`, `mesa-ps4-trace-ids`, `mesa-ps4-rings`, `mesa-ps4-indirect-draws`, `mesa-ps4-mitigate`, `mesa-ps4-cache-uuid-window`. The
+   `mesa-ps4-cs-grow-oom`, `mesa-ps4-trace-ids`, `mesa-ps4-rings`, `mesa-ps4-indirect-draws`, `mesa-ps4-mitigate`, `mesa-ps4-cache-uuid-window`, `mesa-ps4-serialize-wait`. The
    first five are needed: Crema's settings reference `ac_ps4_flush_all_draws`, `ac_ps4_gs_ring_min`
    and `ac_ps4_unaligned_vertex_fetch`. The sixth makes a command buffer that runs out of GPU memory
    fail with `VK_ERROR_OUT_OF_DEVICE_MEMORY` instead of writing past its IB (an upstream error
@@ -60,7 +60,8 @@ made executable (`git config core.fileMode false` keeps that out of git):
    The tenth adds `RADV_PS4_MITIGATE` (Eden for PS4 04.55's test switches). The eleventh puts the
    32-bit GPU window's upper half (`address32_hi`, compiled into every shader) into RADV's cache
    UUID: the PS4 window is wherever the kernel reserved it, and a pipeline cache file from a session
-   with another window gave shaders that read unmapped memory (a GPU fault).
+   with another window gave shaders that read unmapped memory (a GPU fault). The twelfth adds
+   `ac_ps4_flush_all_draws` 2: the wait after every draw without the cache flushes.
    libdrm `libdrm-2.4.125` (headers only) in `~/cemups4-build/src/libdrm`. Then
    `scripts/build-mesa.sh setup`.
 4. Cemu at `patches/BASE.txt`'s commit + `patches/cemu-ps4.patch`, with the ZArchive, imgui and

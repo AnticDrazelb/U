@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.58: 04.57 got level 3 loaded: the old shaders are gone. It then stopped a few seconds later, "
+         "after the draws went back to running side by side (right after a loading screen they wait for each "
+         "other, and level 3 ran fine while they did). This build makes every draw wait for the one before "
+         "all the time, in every game, so expect lower frame rates. If level 3 stays up, the next build tries "
+         "a lighter version of the wait; if it still stops, the log names the exact draw.\n"
          "04.57: found it. Some of Captain Toad's shaders came from the shader cache Eden 03.84 made, when "
          "fastmem had pushed the GPU's memory window to another address. Those shaders still read their "
          "textures and buffers from the old address, which the GPU no longer has: level 3's scene shaders are "

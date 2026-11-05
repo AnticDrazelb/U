@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.58: **draws serialized all the time.** 04.57 loaded level 3 (no old-window shader left), which then
+hung 0.5-7 s after the post-loading serialization ended, inside a run of 12 scene draws in flight
+together; the same draws ran while serialized. `RADV_PS4_SERIALIZE` (default `full`: wait and flush
+every cache after every draw and dispatch, all the time; `wait`: the wait only,
+`../patches/mesa-ps4-serialize-wait.patch`; `loads`: after loading gaps only, as before; `off`).
+
 04.57: **the cause: shaders built for another GPU window.** 04.56's trivial shaders got the GPU past
 the scene draws; it then faulted (the system closed the app) on a post-processing pixel shader whose
 code builds its descriptor pointer with 0x96 as the upper half, while this session's 32-bit GPU window
