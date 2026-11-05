@@ -379,6 +379,10 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.67: **Little Kitty, Big City runs**: its code is translated without Eden's IR passes (get/set
+elimination, constant propagation), with which its heap went wrong ~9 s into the boot (04.66 found
+it). Other games are unchanged.
+
 04.66: **the next test build** for Little Kitty, Big City: 04.65 found it runs with every
 recompiler optimisation off; each boot now turns off one group of them (patch 0151).
 

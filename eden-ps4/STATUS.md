@@ -83,6 +83,21 @@ programs, 0 failures.
 - **04.64:** the User Page (nickname and icon, as games see the Switch user) and motion controls (below).
 - **04.65:** a test build for Little Kitty, Big City's heap failure (below).
 - **04.66:** its next round: the translator's shortcuts one group at a time (below).
+- **04.67:** Little Kitty, Big City runs with the IR passes off (below).
+
+## 04.67: Little Kitty, Big City: the IR passes off
+
+- **04.66's result:** of the five groups, only "ir" (`GetSetElimination`, `ConstProp`, `MiscIROpt`
+  off) got past the heap failure: no guest exception, 806 memory calls (the failing four: 103, then
+  the trap at 11-15 s), still loading when stopped at 44 s. In the 64-bit pipeline those flags gate
+  `A64GetSetElimination` and `ConstantPropagation` (each with a dead code elimination after it); the
+  port's changes to `A64GetSetElimination` (04.28-04.29) only act at superblock exits, which are off
+  with CPU Auto. So it's Eden's own pass or the code it leads the x64 emitter to on the PS4's host
+  features (no BMI2/AVX2), not a PS4 pass.
+- **04.67:** `GameProfile` (`platform_ps4.cpp`, by title id in the file name) sets
+  `EDEN_PS4_JIT_TEST=ir` for it; the test rotation, memory call log and loading screen's test line
+  are gone. Next, if wanted: which of the two passes (one launch each), then the instruction pattern
+  (a desktop differential test of the two passes under `DYNARMIC_HOST_FEATURES_MASK`'s Jaguar set).
 
 ## 04.66: Little Kitty, Big City: which translator shortcut
 

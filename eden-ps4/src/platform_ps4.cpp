@@ -1494,9 +1494,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
-         "04.66: a test build: the next round of diagnostics for a game that stops while it loads. Nothing else "
-         "changes.\n"
-         "04.65: a test build: extra diagnostics for a game that stops while it loads. Nothing else changes.\n"
+         "04.67: a game that stopped while loading now runs: its code is translated with fewer optimisations. "
+         "Other games are unchanged.\n"
+         "04.65-04.66: test builds for it.\n"
          "04.64: a User Page: choose the top left icon for the nickname and icon games show for you, from 30 "
          "characters on 12 colours, with an on-screen keyboard. Motion controls: the controller's motion "
          "sensors work in games that steer or aim by tilting (System Settings, Console, to turn them off).\n"
@@ -1950,44 +1950,38 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     return choice;
 }
 
-// (04.65) A test build's rotation for a game whose heap goes wrong early (Little Kitty, Big City,
-// 01000A4019FA2000): each boot of it logs its memory calls and dumps what its registers point at
-// when its heap check fails (EDEN_PS4_MEM_LOG), and tries the next setup in turn, from a count kept
-// in game-test-2.txt. 04.65's three found it runs with CPU accuracy Paranoid (every recompiler
-// optimisation off) and no other way; (04.66) so each boot now turns one group of them off
-// (EDEN_PS4_JIT_TEST, arm_dynarmic_64.cpp), the most likely first: the one that runs names it.
-// Other games: nothing changes. Returns the test's description.
-std::string GameTest(const std::string& program)
+// (04.67) Games that need the translator set apart from the rest, by the title id in their file's
+// name. Little Kitty, Big City (01000A4019FA2000): its SDK heap rejects a block it frees ~9 s into
+// the boot (04.48-04.66), with or without fastmem; 04.65's tests found it runs with every recompiler
+// optimisation off (CPU accuracy Paranoid), 04.66's that the IR passes alone do it (get/set
+// elimination and constant propagation off, EDEN_PS4_JIT_TEST=ir, arm_dynarmic_64.cpp: one of them,
+// or the code it leads the x64 emitter to, computes something wrong for it). Returns what's set.
+std::string GameProfile(const std::string& program)
 {
     unsetenv("EDEN_PS4_MEM_LOG");
     unsetenv("EDEN_PS4_ALIGNED_REST");
     unsetenv("EDEN_PS4_CPU_ACCURACY");
     unsetenv("EDEN_PS4_JIT_TEST");
-    if (program.find("01000A4019FA2000") == std::string::npos && program.find("01000a4019fa2000") == std::string::npos)
-        return {};
-    const std::string path = std::string(kDataDir) + "/game-test-2.txt";
-    unsigned count = 0;
-    for (const std::string& line : ReadLines(path.c_str()))
-        count = unsigned(std::strtoul(line.c_str(), nullptr, 10));
-    if (FILE* f = std::fopen(path.c_str(), "w"))
+    struct Profile
     {
-        std::fprintf(f, "%u\n", count + 1);
-        std::fflush(f);
-        fsync(fileno(f));
-        std::fclose(f);
-    }
-    setenv("EDEN_PS4_MEM_LOG", "1", 1);
-    static const std::pair<const char*, const char*> tests[] = {
-        {"monitor", "the cores' exclusive accesses checked against each other"},
-        {"dispatch", "no inline return and indirect jump lookups, forward links checking for halts"},
-        {"ir", "no IR optimisation passes"},
-        {"linking", "no block linking, return stack or fast dispatch"},
-        {"fma", "fused multiply-adds kept fused"},
+        const char* title_id;
+        const char* jit_off;
+        const char* what;
     };
-    constexpr unsigned kTests = sizeof(tests) / sizeof(tests[0]);
-    const auto& [name, what] = tests[count % kTests];
-    setenv("EDEN_PS4_JIT_TEST", name, 1);
-    return fmt::format("game test {} ({} of {}): {} ({})", count + 1, count % kTests + 1, kTests, what, name);
+    static const Profile profiles[] = {
+        {"01000A4019FA2000", "ir", "the translator's IR passes off (with them, its heap goes wrong as it loads)"},
+    };
+    std::string upper = program;
+    for (char& c : upper)
+        c = char(std::toupper(static_cast<unsigned char>(c)));
+    for (const Profile& profile : profiles)
+    {
+        if (upper.find(profile.title_id) == std::string::npos)
+            continue;
+        setenv("EDEN_PS4_JIT_TEST", profile.jit_off, 1);
+        return fmt::format("game profile {}: {}", profile.title_id, profile.what);
+    }
+    return {};
 }
 
 // (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on
@@ -3042,9 +3036,8 @@ void* Run(void*)
         setenv("EDEN_PS4_PIN_THREADS", settings.pin_threads ? "1" : "0", 1);
         // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
         setenv("EDEN_PS4_FASTMEM", settings.fastmem ? "1" : "0", 1);
-        const std::string game_test = GameTest(program);
-        if (!game_test.empty())
-            Trace(game_test);
+        if (const std::string profile = GameProfile(program); !profile.empty())
+            Trace(profile);
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
@@ -3083,9 +3076,6 @@ void* Run(void*)
             {
                 std::lock_guard lock{g_loading_mutex};
                 g_loading = LoadingScreenFor(program, settings.white_theme);
-                // (04.65) which of the test build's three setups this boot is
-                if (const size_t at = game_test.find('('); at != std::string::npos)
-                    g_loading.publisher = "Test " + game_test.substr(at + 1, game_test.find(')') - at - 1);
                 g_loading_start = Seconds();
             }
             Common::PS4Diagnostics::loading_stage = 1;
