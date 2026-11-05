@@ -48,7 +48,7 @@ made executable (`git config core.fileMode false` keeps that out of git):
    (`git apply --exclude=src/amd/common/ac_ps4_drm.c`; `build-mesa.sh` copies
    `port/mesa/ac_ps4_drm.c` in): `mesa-ps4`, `mesa-ps4-aligned-vertex-fetch`,
    `mesa-ps4-vertex-fetch-switch`, `mesa-ps4-flush-all-draws`, `mesa-ps4-gs-ring-probe`,
-   `mesa-ps4-cs-grow-oom`, `mesa-ps4-trace-ids`, `mesa-ps4-rings`, `mesa-ps4-indirect-draws`. The
+   `mesa-ps4-cs-grow-oom`, `mesa-ps4-trace-ids`, `mesa-ps4-rings`, `mesa-ps4-indirect-draws`, `mesa-ps4-mitigate`. The
    first five are needed: Crema's settings reference `ac_ps4_flush_all_draws`, `ac_ps4_gs_ring_min`
    and `ac_ps4_unaligned_vertex_fetch`. The sixth makes a command buffer that runs out of GPU memory
    fail with `VK_ERROR_OUT_OF_DEVICE_MEMORY` instead of writing past its IB (an upstream error

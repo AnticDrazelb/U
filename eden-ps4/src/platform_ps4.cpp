@@ -1317,6 +1317,12 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.55: the kitchen sink. 04.54's run cleared the four images and the depth buffer: level 3's scene "
+         "draws still lock the GPU with one image and no depth. What they do that every draw that worked doesn't: "
+         "pass 5-7 values from the vertex to the pixel shader, and read textures. This build switches on every "
+         "safe fix for that at once (vertex shader waves wait for their output space, no shader prefetch, the "
+         "safe primitive distribution, no depth compression or fast clears, new GPU memory zeroed), each named in "
+         "the log. If level 3 loads, the log says which were on, and we take them away one by one.\n"
          "04.54: turning off the depth compression didn't help (it's back on now). Level 3's scene draws "
          "finish, but the GPU locks up within a few steps of the first one. This build tries three things "
          "at once after a loading screen: checks every texture those draws read against its memory (and leaves "
@@ -3106,8 +3112,18 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
-    // (04.53 set RADV_DEBUG=nohiz here: no HTILE on any depth buffer. 04.53's run hung the same way
-    // without it, so 04.54 leaves HTILE on again; RADV_DEBUG=nohiz in settings.txt still turns it off.)
+    // (04.55) The kitchen sink against Captain Toad's level 3 GPU hang: RADV_PS4_MITIGATE (hex bits,
+    // default ff) - Mesa: 1 no CP DMA prefetch, 2 no VS late alloc, 4 conservative IA_MULTI_VGT_PARAM;
+    // the driver layer: 0x10 new buffers zeroed; here: 0x20 RADV_DEBUG=nohiz,nofastclears (unless
+    // settings.txt sets RADV_DEBUG). Each one in the boot trace; RADV_PS4_MITIGATE=0 for none.
+    {
+        const char* bits = std::getenv("RADV_PS4_MITIGATE");
+        const unsigned long mitigate = bits && bits[0] ? std::strtoul(bits, nullptr, 16) : 0xff;
+        if ((mitigate & 0x20) && !std::getenv("RADV_DEBUG"))
+            setenv("RADV_DEBUG", "nohiz,nofastclears", 1);
+        const char* debug = std::getenv("RADV_DEBUG");
+        Trace(fmt::format("kitchen sink: RADV_PS4_MITIGATE={:x}, RADV_DEBUG={}", mitigate, debug ? debug : "(none)"));
+    }
     // (04.42) draws with a geometry shader or tessellation, and RADV's writes of those rings'
     // registers (the system's on the PS4), are counted and the first ones logged; with
     // RADV_PS4_SKIP_GS_TESS=1 in settings.txt they become no-ops (04.42's test, its default). 04.43

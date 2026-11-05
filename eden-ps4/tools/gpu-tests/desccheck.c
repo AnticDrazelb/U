@@ -179,7 +179,7 @@ int main(void) {
     vsharp(cs, 0x10100000ull, 0x100);
     tsharp(cs + 4, 0x10200000ull);
     vsharp(cs + 12, 0x10100000ull, 0x110000);
-    run("a buffer range 1 MiB past its buffer", 0x800, 0, 1, true);
+    run("a buffer range 1 MiB past its buffer (04.55: reported, not skipped)", 0x800, 0, 1, false);
     // set D: all valid
     uint32_t* dset = sets + 0xc00 / 4;
     vsharp(dset, 0x10100000ull, 0x10000);
@@ -195,7 +195,7 @@ int main(void) {
     eset[12 + 1] |= 10u << 20;                    // 8_8_8_8
     eset[12 + 2] = 1023u | (1023u << 14);         // 1024x1024
     eset[12 + 4] = 1023u << 13;                   // pitch 1024
-    run("an image descriptor 4 MiB over its 256 KiB buffer", 0xe00, 0, 1, true);
+    run("an image descriptor 4 MiB over its 256 KiB buffer (reported, not skipped)", 0xe00, 0, 1, false);
     // (04.48) render targets: the image buffer is 0x600000200000 + 256 KiB
     run_rt("a color target in a live buffer (32x32, 8 bytes a pixel)", 0x10200100ull, 15, 1, 0, 0, 0, false);
     run_rt("a color target in no buffer", 0x10300000ull, 15, 1, 0, 1, 0, true);

@@ -1,0 +1,96 @@
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -1674,6 +1674,15 @@
+    unsigned late_alloc_wave64, cu_mask;
+    ac_compute_late_alloc(&pdev->info, false, false, shader->config.scratch_bytes_per_wave > 0, &late_alloc_wave64,
+                          &cu_mask);
++#ifdef __PS4__
++   {
++      extern unsigned radv_ps4_mitigations(void);
++      if (radv_ps4_mitigations() & 2) { /* no late alloc: VS waves get their export space first, on every CU */
++         late_alloc_wave64 = 0;
++         cu_mask = 0xffff;
++      }
++   }
++#endif
+ 
+    if (pdev->info.gfx_level >= GFX7) {
+       regs->vs.spi_shader_pgm_rsrc3_vs =
+--- a/src/amd/vulkan/radv_cp_dma.c
++++ b/src/amd/vulkan/radv_cp_dma.c
+@@ -16,6 +16,13 @@
+ #include "radv_sqtt.h"
+ #include "sid.h"
+ 
++#ifdef __PS4__
++#include "util/os_misc.h"
++#include <stdio.h>
++#include <stdlib.h>
++unsigned radv_ps4_mitigations(void);
++#endif
++
+ /* Set this if you want the 3D engine to wait until CP DMA is done.
+  * It should be set on the last CP DMA packet. */
+ #define CP_DMA_SYNC (1 << 0)
+@@ -152,6 +159,10 @@
+ radv_cs_cp_dma_prefetch(const struct radv_device *device, struct radv_cmd_stream *cs, uint64_t va, unsigned size,
+                         bool predicating)
+ {
++#ifdef __PS4__
++   if (radv_ps4_mitigations() & 1)
++      return;
++#endif
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    struct radeon_winsys *ws = device->ws;
+    enum amd_gfx_level gfx_level = pdev->info.gfx_level;
+@@ -188,6 +199,30 @@
+    radeon_end();
+ }
+ 
++#ifdef __PS4__
++/* PS4 (Eden for PS4 04.55): the "kitchen sink" against Captain Toad's level 3 GPU hang, each a bit of
++ * RADV_PS4_MITIGATE (hex, default all): 1 = no CP DMA prefetch (shaders, vertex buffer descriptors),
++ * 2 = no late alloc for VS waves (all CUs), 4 = conservative IA_MULTI_VGT_PARAM (SWITCH_ON_EOP,
++ * WD_SWITCH_ON_EOP, PARTIAL_VS_WAVE_ON, PARTIAL_ES_WAVE_ON). The driver layer and the frontend have
++ * their own bits (ac_ps4_drm.c, platform_ps4.cpp). */
++void ps4_boot_trace(const char *stage);
++unsigned radv_ps4_mitigations(void);
++unsigned
++radv_ps4_mitigations(void)
++{
++   static int bits = -1;
++   if (bits < 0) {
++      const char *e = os_get_option("RADV_PS4_MITIGATE");
++      bits = e && e[0] ? (int)strtoul(e, NULL, 16) : 0xff;
++      char line[200];
++      snprintf(line, sizeof(line), "radv/ps4: mitigations %#x: CP DMA prefetch %s, VS late alloc %s, IA %s",
++               bits, (bits & 1) ? "off" : "on", (bits & 2) ? "off" : "on", (bits & 4) ? "conservative" : "as RADV");
++      ps4_boot_trace(line);
++   }
++   return (unsigned)bits;
++}
++#endif
++
+ void
+ radv_cp_dma_prefetch(struct radv_cmd_buffer *cmd_buffer, uint64_t va, unsigned size)
+ {
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -7079,6 +7079,17 @@
+       partial_vs_wave = true;
+    }
+ 
++#ifdef __PS4__
++   {
++      extern unsigned radv_ps4_mitigations(void);
++      if (radv_ps4_mitigations() & 4) { /* the safe (slow) primitive distribution */
++         ia_switch_on_eop = true;
++         wd_switch_on_eop = true;
++         partial_vs_wave = true;
++         partial_es_wave = true;
++      }
++   }
++#endif
+    return cmd_buffer->state.ia_multi_vgt_param.base | S_028AA8_PRIMGROUP_SIZE(primgroup_size - 1) |
+           S_028AA8_SWITCH_ON_EOP(ia_switch_on_eop) | S_028AA8_SWITCH_ON_EOI(ia_switch_on_eoi) |
+           S_028AA8_PARTIAL_VS_WAVE_ON(partial_vs_wave) | S_028AA8_PARTIAL_ES_WAVE_ON(partial_es_wave) |

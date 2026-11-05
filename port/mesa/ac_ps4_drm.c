@@ -1776,7 +1776,9 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
    c->wild += bad_wild;
    c->overruns += bad_over;
    ps4_check_report(c, seq, packet, work, first_what, first_va, first_bytes, first_r);
-   return valid >= 2;
+   /* (04.55) overruns are only reported: the 1 KiB scanned runs past a set into the upload buffer's
+    * stale data, half descriptors among them (04.54 skipped 376 draws on those) */
+   return valid >= 2 && bad_wild;
 }
 
 /* (04.48) One render target range: its base inside a live buffer and `bytes` from it not far past
@@ -2225,7 +2227,7 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    static int arms = -1;
    if (arms < 0) {
       const char *e = getenv("RADV_PS4_TEST_ARMS");
-      arms = e ? (int)strtoul(e, NULL, 0) : 3; /* (04.54: both on by default) */
+      arms = e ? (int)strtoul(e, NULL, 0) : 0; /* (04.55: off by default; 04.54's run ruled both out) */
    }
    c.arms = (unsigned)arms;
    if (first_big && skip_to) {
@@ -4132,6 +4134,16 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
       int r = sceKernelMapDirectMemory(&a, map_size,
                                        PS4_PROT_CPU_RW | (gpu_ro ? PS4_PROT_GPU_READ : PS4_PROT_GPU_RW),
                                        PS4_MAP_FIXED, b->phys + offset, PS4_PAGE);
+      /* (04.55) the kitchen sink's bit 0x10 (RADV_PS4_MITIGATE): new buffers zeroed, as amdgpu's
+       * VRAM_CLEARED would (nothing reads an earlier owner's data) */
+      static int zero_new = -1;
+      if (zero_new < 0) {
+         const char *e = getenv("RADV_PS4_MITIGATE");
+         zero_new = ((e && e[0] ? strtoul(e, NULL, 16) : 0xff) & 0x10) != 0;
+         ps4_log("radv/ps4: new buffers %s\n", zero_new ? "zeroed (RADV_PS4_MITIGATE bit 0x10)" : "not zeroed");
+      }
+      if (!r && whole && a == (void *)(uintptr_t)addr && zero_new)
+         memset(a, 0, size);
       /* write-combined memory: no stale cached lines of an earlier owner (see ps4_flush_cpu_cache) */
       if (!r && whole && a == (void *)(uintptr_t)addr && b->write_combined)
          ps4_flush_cpu_cache(a, map_size);

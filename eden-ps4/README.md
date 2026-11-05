@@ -379,6 +379,14 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.55: **the kitchen sink.** 04.54's run had level 3's first scene draw with one color target and no
+depth, and the GPU still stopped after it: not the targets, not the depth. Those draws pass 5-7 values
+from the vertex to the pixel shader (every draw that worked: 0-1), with RADV's VS late alloc of 28, and
+read textures. `RADV_PS4_MITIGATE` (hex bits, default ff) now turns on: no CP DMA prefetch (1), no VS
+late alloc (2), conservative IA_MULTI_VGT_PARAM (4) (`../patches/mesa-ps4-mitigate.patch`), new buffers
+zeroed (0x10), and `RADV_DEBUG=nohiz,nofastclears` (0x20). Overrun findings are report-only now (04.54's
+footprint check misread stale descriptor memory and skipped 376 draws).
+
 04.54: **not HTILE; three tests in one run.** 04.53 ran with HTILE off and stopped the same way, 2 trace
 ids after the first 4-target scene draw. After a loading gap, image descriptors' footprints are now
 checked against their buffers (a draw whose texture runs off its buffer is skipped), multi-target draws

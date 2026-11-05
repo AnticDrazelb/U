@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.54)
+# Eden for PS4: status (after 04.55)
 
-Install **04.54** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.55** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -67,6 +67,32 @@ programs, 0 failures.
 - **04.53:** no HTILE on any depth buffer (`RADV_DEBUG=nohiz`): not the fix (below).
 - **04.54:** image descriptor footprints checked; test arms (MRT0 only, no Z32F depth); full PS
   descriptor sets in the record; HTILE back on (below).
+- **04.55:** the kitchen sink (`RADV_PS4_MITIGATE`, below).
+
+## 04.55: the kitchen sink
+
+- **04.54's run:** the footprint check misfired: the 1 KiB scanned from a set runs past it into the
+  upload buffer's stale data (half T#s next to V#s: pitch 13857, slices 67-128), 952 "overruns", 376
+  draws skipped. The scene draw at 455 was not among them and ran with the arms on: **MRT0 only, no
+  depth** (33 target masks cut, 55 Z32F depths detached). The CP still stopped right after it (at
+  457, the flush after a skipped copy). So not the 4 targets and not the Z32F depth.
+- **What the scene draws do that the draws that worked don't** (the game's depth-only draws at
+  25-277 included): export 5-7 parameters from the VS (`SPI_VS_OUT_CONFIG` 0x8/0xc; the others 0)
+  read by 5-7 interpolants (`SPI_PS_IN_CONTROL` 5/7), with VS late alloc 28 (`SPI_SHADER_LATE_ALLOC_VS`
+  0x1c, CU0 off for VS: RADV's (min_good_cu_per_sa - 2) x 4 with 9 CUs per SH) — late alloc with
+  parameter exports is a known GCN deadlock, and the PS4's system may keep CUs for itself — and
+  sample textures: a BC3 cube (128x128, 8 levels, 1D-tiled), a 1D R32F (64), a 2x2 BC1, and the
+  256x256 BC1 the copy chain at 437-445 had just uploaded (0x43fdcf0d00).
+- **04.55**, everything at once, each bit of `RADV_PS4_MITIGATE` (hex, default ff; 0 = none), in the
+  boot trace at startup:
+  - 1 (Mesa, `patches/mesa-ps4-mitigate.patch`): no CP DMA prefetch (shaders, VBO descriptors);
+  - 2 (Mesa): no VS late alloc (LIMIT 0, VS on all CUs);
+  - 4 (Mesa): conservative `IA_MULTI_VGT_PARAM` (SWITCH_ON_EOP, WD_SWITCH_ON_EOP, PARTIAL_VS/ES_WAVE_ON);
+  - 0x10 (driver layer): new buffers zeroed at their first mapping;
+  - 0x20 (frontend): `RADV_DEBUG=nohiz,nofastclears` unless settings.txt sets `RADV_DEBUG`;
+  - still on: the serialized post-loading window, the record, the audit. The overrun findings are
+    report-only now (the stale-data misfire), the 04.54 arms off.
+- **Next:** one Toad level 3 run. Through: take the bits away one at a time (late alloc first).
 
 ## 04.54: not HTILE; three tests in one run
 
