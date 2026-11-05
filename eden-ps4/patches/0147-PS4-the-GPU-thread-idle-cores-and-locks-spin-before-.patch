@@ -1,0 +1,105 @@
+From 38782cfb7db1d65527f62540f32ec660c301717a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 08:25:38 +0000
+Subject: [PATCH] PS4: the GPU thread, idle cores and locks spin before
+ sleeping
+
+On the PS4 a sleeping thread takes hundreds of microseconds to wake,
+and a game's frame often waits on the GPU thread and on its own other
+threads.
+
+- The GPU thread spins up to 2 ms for the game's next batch before it
+  sleeps. With threads pinned it has a core of its own.
+- The pinned emulated cores 0-2 spin 5 ms when idle (1 ms before).
+- A contended host lock spins 100 us before it sleeps (20 us before).
+  The scheduler lock's sleeps took about 190 us each.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/common/ps4_spin_lock.h            |  3 ++-
+ src/core/hle/kernel/physical_core.cpp |  4 +++-
+ src/video_core/gpu_thread.cpp         | 29 +++++++++++++++++++++++++++
+ 3 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/ps4_spin_lock.h b/src/common/ps4_spin_lock.h
+index aaf797a654..a888a96ca1 100644
+--- a/src/common/ps4_spin_lock.h
++++ b/src/common/ps4_spin_lock.h
+@@ -27,7 +27,8 @@ inline void SpinThenLock(std::mutex& m, PS4Perf::LockStats* stats) {
+ #ifdef __OPENORBIS__
+     if (m.try_lock())
+         return;
+-    constexpr int64_t SpinNs = 20'000;
++    // (New Eden 04.62) 100 us (20 before): the scheduler lock's sleeps took ~190 us each
++    constexpr int64_t SpinNs = 100'000;
+     const int64_t begin = g_wall_clock.GetTimeNS().count();
+     int64_t now = begin;
+     do {
+diff --git a/src/core/hle/kernel/physical_core.cpp b/src/core/hle/kernel/physical_core.cpp
+index 2a1b7d8d8a..f264d9f73e 100644
+--- a/src/core/hle/kernel/physical_core.cpp
++++ b/src/core/hle/kernel/physical_core.cpp
+@@ -37,7 +37,9 @@ PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
+     // audio and the Vulkan worker: a short spin.
+     const char* pinned = std::getenv("EDEN_PS4_PIN_THREADS");
+     if (core_index < 3 && (!pinned || pinned[0] != '0')) {
+-        m_idle_spin = std::chrono::microseconds(1000);
++        // (New Eden 04.62) 5 ms (1 before): a game's frame waits on the GPU thread and its other
++        // threads often outlast 1 ms, and each wake-up after a sleep cost ~0.5 ms
++        m_idle_spin = std::chrono::microseconds(5000);
+     }
+ #endif
+ }
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index a01375e7be..6a95e9a454 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -8,6 +8,11 @@
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
++#ifdef __OPENORBIS__
++#include <cstdlib>
++#include <immintrin.h>
++#include "common/cpu_features.h"
++#endif
+ #include "core/core.h"
+ #include "core/frontend/graphics_context.h"
+ #include "video_core/control/scheduler.h"
+@@ -35,8 +40,32 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+ 
+         auto current_context = context.Acquire();
+         CommandDataContainer next;
++#ifdef __OPENORBIS__
++        // (PS4) With threads pinned the GPU thread has a core of its own: it spins up to 2 ms for
++        // the game's next batch before it sleeps, and picks it up within microseconds instead of a
++        // sleeping thread's wake-up (hundreds of microseconds on the PS4), on the game's way to its
++        // next frame: the game's waits for the GPU end when this thread has done its commands.
++        const char* pinned = std::getenv("EDEN_PS4_PIN_THREADS");
++        const bool spin = !pinned || pinned[0] != '0';
++#endif
+         while (!stop_token.stop_requested()) {
++#ifdef __OPENORBIS__
++            bool got = state.queue.TryPop(next);
++            if (!got && spin) {
++                const auto spin_end = Common::g_wall_clock.GetTimeNS() + std::chrono::microseconds(2000);
++                do {
++                    for (int i = 0; i < 16; i++) {
++                        _mm_pause();
++                    }
++                    got = state.queue.TryPop(next);
++                } while (!got && !stop_token.stop_requested() && Common::g_wall_clock.GetTimeNS() < spin_end);
++            }
++            if (!got) {
++                state.queue.PopWait(next, stop_token);
++            }
++#else
+             state.queue.PopWait(next, stop_token);
++#endif
+             if (stop_token.stop_requested()) {
+                 break;
+             }
+-- 
+2.43.0
+

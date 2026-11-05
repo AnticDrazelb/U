@@ -1508,11 +1508,18 @@ static unsigned ps4_gs_tess_last_draws, ps4_gs_tess_last_rings; /* the last subm
 static void
 ps4_filter_gs_tess(void *const *dcb, const uint32_t *sizes, unsigned num_ibs, uint64_t seq)
 {
-   static int skip = -1;
+   static int skip = -1, count = -1;
    if (skip < 0) {
       const char *e = getenv("RADV_PS4_SKIP_GS_TESS");
       skip = e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "off") != 0;
+      /* (New Eden 04.62) walking every packet of every submission cost the Vulkan worker ~2% (it
+       * found no fault): only with RADV_PS4_SKIP_GS_TESS or RADV_PS4_GS_TESS_COUNT=1 */
+      const char *c = getenv("RADV_PS4_GS_TESS_COUNT");
+      count = skip || (c && c[0] == '1');
    }
+   ps4_gs_tess_last_draws = ps4_gs_tess_last_rings = 0;
+   if (!count)
+      return;
    static struct ps4_pkt pkts[8192];
    static uint64_t total_draws, total_rings, submissions;
    static unsigned described;
@@ -2971,7 +2978,15 @@ ps4_note_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const ui
          ps4_boot_trace("radv/ps4: draws and dispatches no longer wait for each other (60 submissions after the idle GPU)");
       }
    }
-   if (!ps4_after_idle_left && gap >= min_gap && ps4_completed(dev) + 1 >= seq) {
+   /* (New Eden 04.62) the record and checks after a loading gap (04.44-04.61: a GPU hang hunt; the
+    * record's MiBs written and synced held each loading screen's first frame back ~0.5 s): only with
+    * RADV_PS4_LOAD_CHECKS=1 */
+   static int load_checks = -1;
+   if (load_checks < 0) {
+      const char *e = getenv("RADV_PS4_LOAD_CHECKS");
+      load_checks = e && e[0] == '1';
+   }
+   if (load_checks && !ps4_after_idle_left && gap >= min_gap && ps4_completed(dev) + 1 >= seq) {
       ps4_after_idle_left = 40;
       char line[160];
       snprintf(line, sizeof(line), "radv/ps4: the GPU was idle %.1f s (nothing submitted): its next 40 "
@@ -5210,6 +5225,18 @@ ps4_scan_writes(ac_drm_device *dev, uint32_t *ib, unsigned num_dw, uint64_t seq,
  * data.) Follows only the chain link in each IB's last 4 dwords - a few reads per IB. On failure,
  * appends what it found to ib-corrupt.txt; returns false. */
 static unsigned ps4_corrupt_reports;
+/* (New Eden 04.62) the system call for each chain link, on every submission's way to the GPU: only
+ * with RADV_PS4_IB_CHECK=full (the chain link inside a GPU window is still checked) */
+static bool
+ps4_ib_vq_check(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_PS4_IB_CHECK");
+      v = e && !strcmp(e, "full");
+   }
+   return v;
+}
 static bool
 ps4_check_ib_chain(ac_drm_device *dev, const uint32_t *ib, unsigned num_dw, uint64_t seq)
 {
@@ -5231,7 +5258,7 @@ ps4_check_ib_chain(ac_drm_device *dev, const uint32_t *ib, unsigned num_dw, uint
          memset(&vq, 0, sizeof(vq));
          if (!info.valid)
             problem = "chains to an address outside the GPU windows";
-         else if (ps4_vq_ok &&
+         else if (ps4_vq_ok && ps4_ib_vq_check() &&
                   (sceKernelVirtualQuery((void *)(uintptr_t)next, 0, &vq, sizeof(vq)) ||
                    !vq.is_direct || (uintptr_t)vq.end < next + next_dw * 4ull))
             problem = "chains to memory that isn't mapped";

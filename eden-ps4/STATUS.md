@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.61)
+# New Eden (formerly Eden for PS4): status (after 04.62)
 
-Install **04.61** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0146). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.62** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0147). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -78,6 +78,27 @@ programs, 0 failures.
   default (below).
 - **04.61:** the app renamed New Eden; a dark icon; the touchpad pointer a ring; the news and the
   settings' descriptions made generic (below).
+- **04.62:** speed, part 1: wake-up latency and per-submission checks (below).
+
+## 04.62: speed, part 1 (latency)
+
+- **From the logs (profiler on):** Zelda at ~32 fps (04.48): the main game thread ran 44% of the time;
+  29 waits a second on GPU events (`NvEvent`) of ~10 ms; the PS4's GPU busy 10%, Eden's GPU thread
+  busy ~22%. Eden's fence manager releases a syncpoint as soon as its GPU thread has processed the
+  commands (`SignalFence`, `delay_fence` off at Normal GPU accuracy), so the game waits on the GPU
+  thread's work, and on wake-ups: idle emulated cores woken after a sleep took 538 us (358 a second;
+  12931 caught while spinning); the scheduler lock's sleeps 186 us each (270 a second). Mario Kart:
+  main core waiting 44%, GPU thread 93%, ~11% of the Vulkan worker in the driver layer.
+- **04.62:** Eden patch 0147: the GPU thread spins up to 2 ms for the next batch before sleeping
+  (pinned: a core of its own); idle emulated cores 0-2 spin 5 ms (1 before); `SpinThenLock` 100 us (20
+  before). `port/ps4_runtime.cpp`: with `EDEN_PS4_PIN_THREADS=1` a new thread starts on the second
+  module (unnamed helpers - the sampler, the driver's watcher, the pad poller - kept off the game's
+  cores). The driver layer: the GS/tessellation walk of every submission only with
+  `RADV_PS4_SKIP_GS_TESS` or `RADV_PS4_GS_TESS_COUNT=1`; the chain link's `sceKernelVirtualQuery`
+  only with `RADV_PS4_IB_CHECK=full`; the record and checks after a loading gap (04.44-04.61) only
+  with `RADV_PS4_LOAD_CHECKS=1`.
+- **To measure:** the same scene before and after, profiler off (it samples every thread 1000 times a
+  second); the 30-second lines' fps, waits and wake-ups.
 
 ## 04.61: New Eden
 

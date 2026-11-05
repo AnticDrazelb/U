@@ -1406,6 +1406,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.62: faster: the GPU thread and idle CPU cores take on new work sooner, fewer background "
+         "checks on the GPU's work, and no pause after loading screens.\n"
          "04.61: the app is now New Eden, with a new icon. The touchpad pointer is a circle. Tidier settings "
          "and news.\n"
          "04.60: faster GPU settings. New in System Settings, Graphics: Draw Order (One at a Time can help a game "

@@ -1079,8 +1079,19 @@ struct ThreadStart {
 void* startOnAppCores(void* raw) {
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
+    // (New Eden 04.62) With Eden's threads pinned (EDEN_PS4_PIN_THREADS=1, set by the launcher before a
+    // game boots), a new thread starts on the second module's cores, as Eden's named threads go there
+    // (ps4_place_thread): the first module's are the emulated CPU cores' and the GPU thread's, and a
+    // helper that never names itself (the profiler's sampler, the driver layer's watcher, the pad
+    // poller) running there made a woken core wait for it to be switched out (~0.5 ms a wake-up).
+    // The game's own threads move to their cores as they name themselves.
+    const char* pin = getenv("EDEN_PS4_PIN_THREADS");
+    const bool eden_pinned = pin && pin[0] == '1';
+    const uint64_t module1 = (g_app_cores & kModule1Cores) ? (g_app_cores & kModule1Cores) : g_app_cores;
     reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(),
-                                                            g_crema_core_layout == 2 ? kModule1Cores : g_app_cores);
+                                                            g_crema_core_layout == 2 ? kModule1Cores
+                                                            : eden_pinned            ? module1
+                                                                                     : g_app_cores);
     ps4_install_signal_stack();
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
     // (SetThreadName) updates the name
