@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.62)
+# New Eden (formerly Eden for PS4): status (after 04.63)
 
-Install **04.62** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0147). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.63** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0149). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -79,6 +79,29 @@ programs, 0 failures.
 - **04.61:** the app renamed New Eden; a dark icon; the touchpad pointer a ring; the news and the
   settings' descriptions made generic (below).
 - **04.62:** speed, part 1: wake-up latency and per-submission checks (below).
+- **04.63:** a live loading screen until a game's first frame (below).
+
+## 04.63: the loading screen
+
+- **Before:** black from choosing a game until its first frame (Captain Toad: ~27 s - 5.7 s loading the
+  game, 7.7 s rebuilding 3249 pipelines, ~13 s its own start). The launcher gave its screen up before
+  booting; the Vulkan display (`vk_swapchain_ps4.cpp`) could show a still `loading_picture`, which
+  the launcher never set.
+- **04.63:** `ui/loading_screen.cpp` draws it (the game's cached name, publisher and icon, else its
+  file's name and a plain tile; the stage; a bar: filling while shaders build, else a moving
+  segment), in the HOME menu's theme. The launcher draws it on its own screen (`LoadingThread`, ~7 a
+  second) until the display opens: patch 0148's swapchain calls
+  `Common::PS4Diagnostics::release_screen` before `sceVideoOutOpen` (`ReleaseScreenForGame`: the
+  thread stops, the screen is given up), then a thread of its own draws `draw_loading`'s frames
+  (`DrawLoadingInto`, at the display's size) into buffers 0 and 1 in turn and flips them, until the
+  first `AcquireNextImage` stops it. Stages from `main.cpp`: 1 loading (from the boot), 2 building
+  shaders (`LoadDiskResources`' callback: built of total), 3 starting. Program lines aren't drawn
+  over it (`g_loading_shown`). A boot that stops before the display opens keeps the launcher's
+  screen. The menu preview has `loading-shaders.png` and `loading-game.png`.
+- **Shorter:** patch 0149: `LoadDiskResources` rebuilds the cache on a temporary pool of five
+  `VkPipelineBoot` workers (`EDEN_PS4_BOOT_PIPELINE_WORKERS`), which `ps4_place_thread` lets run on
+  every core (the game's CPU and GPU threads aren't running yet; the work is mostly the SPIR-V
+  translation, the driver's cache having the pipelines). Three in play, as before (0054).
 
 ## 04.62: speed, part 1 (latency)
 

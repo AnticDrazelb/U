@@ -1223,6 +1223,9 @@ extern "C" void ps4_place_thread(const char* name) {
         mask = 1ull << (name[8] - '0');
     else if (strcmp(name, "GPU") == 0)
         mask = 1ull << 3;
+    // (New Eden 04.63) the shader cache's rebuild at boot, before the game runs: every core
+    else if (strcmp(name, "VkPipelineBoot") == 0)
+        mask = g_app_cores;
     else
         mask = (g_app_cores & kModule1Cores) ? (g_app_cores & kModule1Cores) : g_app_cores;
     reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), mask);

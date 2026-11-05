@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ui/home_menu.h"
+#include "ui/loading_screen.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #include "ui/stb/stb_image_write.h"
@@ -100,6 +101,29 @@ int main(int argc, char** argv)
         return 1;
     }
     g_out = argv[1];
+
+    // (04.63) the loading screen: building shaders (an icon), then loading (none, white theme)
+    {
+        LoadingScreen loading;
+        loading.name = "A Sample Game";
+        loading.publisher = "Sample Publisher";
+        loading.icon.width = loading.icon.height = 64;
+        for (int y = 0; y < 64; y++)
+            for (int x = 0; x < 64; x++)
+                loading.icon.pixels.push_back(Rgb(((x * 4) << 16) | ((y * 4) << 8) | 0xC0));
+        Canvas canvas(1920, 1080, 1.5f);
+        DrawLoadingScreen(canvas, loading, 2, 1234, 3249, 3.0);
+        std::string path = g_out + "/loading-shaders.png";
+        stbi_write_png(path.c_str(), canvas.Width(), canvas.Height(), 4, canvas.Pixels(), canvas.Width() * 4);
+        std::printf("%s\n", path.c_str());
+        loading.icon = {};
+        loading.white_theme = true;
+        Canvas small(1280, 720, 1.0f);
+        DrawLoadingScreen(small, loading, 1, 0, 0, 0.7);
+        path = g_out + "/loading-game.png";
+        stbi_write_png(path.c_str(), small.Width(), small.Height(), 4, small.Pixels(), small.Width() * 4);
+        std::printf("%s\n", path.c_str());
+    }
 
     HomeMenu menu = MakeMenu(false);
     Shot(menu, "home");

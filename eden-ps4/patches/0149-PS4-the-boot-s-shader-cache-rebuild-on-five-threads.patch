@@ -1,0 +1,86 @@
+From af7faeb20d91321ae3a0c73a106ff725e639e664 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 10:11:12 +0000
+Subject: [PATCH] PS4: the boot's shader cache rebuild on five threads
+
+LoadDiskResources builds every pipeline of the game's shader cache
+before the game starts. On the PS4 that ran on the three workers used
+in play: Captain Toad took 7.7 s, with 22.2 s of translation to SPIR-V
+summed over the threads and 0.2 s of driver creation (cache hits).
+
+During the boot the game's CPU and GPU threads aren't running, so
+their cores are free. A temporary pool of five VkPipelineBoot workers
+does the rebuild (EDEN_PS4_BOOT_PIPELINE_WORKERS sets the count), and
+the launcher lets those threads run on every core.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 26 ++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index bd32fe0232..8e7605f1df 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -10,6 +10,8 @@
+ #include <fstream>
+ #include <iostream>
+ #include <memory>
++#include <optional>
++#include <cstdlib>
+ #include <span>
+ #include <thread>
+ #include <vector>
+@@ -716,11 +718,29 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
+         state.statistics = std::make_unique<PipelineStatistics>(device);
+     }
++#ifdef __OPENORBIS__
++    // (New Eden 04.63) The boot's rebuild on more threads (5; EDEN_PS4_BOOT_PIPELINE_WORKERS): the
++    // game hasn't started yet, so the cores its CPU and GPU threads take later are free (the
++    // launcher lets VkPipelineBoot run on every core), and its pipelines are mostly in the driver's
++    // cache: the work is Eden's translation to SPIR-V, not the driver's compiles that hold the most
++    // memory (the reason for three workers in play)
++    std::optional<Common::ThreadWorker> boot_workers;
++    {
++        const char* env = std::getenv("EDEN_PS4_BOOT_PIPELINE_WORKERS");
++        const size_t count = env && env[0] ? std::strtoul(env, nullptr, 10) : 5;
++        if (count > GetTotalPipelineWorkers() && !device.HasBrokenParallelShaderCompiling()) {
++            boot_workers.emplace(count, std::string("VkPipelineBoot"));
++        }
++    }
++    Common::ThreadWorker& pool = boot_workers ? *boot_workers : workers;
++#else
++    Common::ThreadWorker& pool = workers;
++#endif
+     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
+         ComputePipelineCacheKey key;
+         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+ 
+-        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
++        pool.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
+             ShaderPools pools;
+             auto pipeline{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
+             std::scoped_lock lock{state.mutex};
+@@ -766,7 +786,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+             return;
+         }
+ 
+-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
++        pool.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
+             ShaderPools pools;
+             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+             for (auto& env : envs_) {
+@@ -796,7 +816,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     state.has_loaded = true;
+     lock.unlock();
+ 
+-    workers.WaitForRequests(stop_loading);
++    pool.WaitForRequests(stop_loading);
+ 
+     if (use_vulkan_pipeline_cache) {
+         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+-- 
+2.43.0
+

@@ -750,6 +750,12 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     LoadJitCaches(system, data_dir, game_id);
                 system.GPU().Start();
                 system.GetCpuManager().OnGpuReady();
+#ifdef __OPENORBIS__
+                // (04.63) the loading screen's stage: starting it, when no shader cache is built first
+                if (!(Settings::values.use_disk_shader_cache.GetValue() &&
+                      Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan))
+                    Common::PS4Diagnostics::loading_stage = 3;
+#endif
                 // the shaders this game used before, built now (as yuzu-cmd does): a longer start,
                 // no stutter for them later (title id 0, as homebrew without one: no cache)
                 if (Settings::values.use_disk_shader_cache.GetValue() &&
@@ -760,7 +766,22 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     Output(LineKind::Status, fmt::format("loading the shader cache of {:016x}", title_id));
                     const auto shader_start = std::chrono::steady_clock::now();
                     system.Renderer().ReadRasterizer()->LoadDiskResources(
-                        title_id, std::stop_token{}, [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+                        title_id, std::stop_token{}, [](VideoCore::LoadCallbackStage, size_t done, size_t total) {
+#ifdef __OPENORBIS__
+                            // (04.63) the loading screen's progress bar
+                            if (total) {
+                                Common::PS4Diagnostics::loading_done = u32(done);
+                                Common::PS4Diagnostics::loading_total = u32(total);
+                                Common::PS4Diagnostics::loading_stage = 2;
+                            }
+#else
+                            (void)done;
+                            (void)total;
+#endif
+                        });
+#ifdef __OPENORBIS__
+                    Common::PS4Diagnostics::loading_stage = 3;
+#endif
 #ifdef __OPENORBIS__
                     {
                         // (04.17) what that took: the pipelines rebuilt, Eden's translation of their

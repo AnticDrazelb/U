@@ -56,6 +56,7 @@
 #include "launcher.h"
 #include "ui/canvas.h"
 #include "ui/home_menu.h"
+#include "ui/loading_screen.h"
 #include "ui/nro.h"
 #include "usb_import.h"
 #include "log_tools.h"
@@ -1406,6 +1407,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.63: a loading screen instead of a black one from choosing a game until it shows its first "
+         "frame: the game's name and icon, what it's doing, and a progress bar while its shaders build. "
+         "The shaders build faster at the start, on more of the PS4's cores.\n"
          "04.62: faster: the GPU thread and idle CPU cores take on new work sooner, fewer background "
          "checks on the GPU's work, and no pause after loading screens.\n"
          "04.61: the app is now New Eden, with a new icon. The touchpad pointer is a circle. Tidier settings "
@@ -1853,6 +1857,111 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     return choice;
 }
 
+// (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on
+// the launcher's screen until the game display opens (Common::PS4Diagnostics::release_screen, which
+// it calls first), then by the display into its own buffers (draw_loading). What it shows, under
+// g_loading_mutex (both threads that draw it read it).
+std::mutex g_loading_mutex;
+Ui::LoadingScreen g_loading;
+double g_loading_start = 0;
+std::atomic<bool> g_loading_shown{false}; // the launcher's screen shows it: the program's lines aren't drawn
+std::atomic<bool> g_loading_stop{false};
+pthread_t g_loading_thread;
+bool g_loading_running = false;
+
+void ShowLine(Launcher::LineKind kind, std::string_view text);
+
+// One frame of it into `canvas`
+void DrawLoadingFrame(Ui::Canvas& canvas)
+{
+    namespace D = Common::PS4Diagnostics;
+    std::lock_guard lock{g_loading_mutex};
+    Ui::DrawLoadingScreen(canvas, g_loading, D::loading_stage.load(), D::loading_done.load(), D::loading_total.load(),
+                          Seconds() - g_loading_start);
+}
+
+// On the launcher's screen, about 7 times a second, until stopped
+void* LoadingThread(void*)
+{
+    Ui::Canvas canvas(1920, 1080, 1.5f);
+    while (!g_loading_stop.load())
+    {
+        DrawLoadingFrame(canvas);
+        {
+            std::lock_guard lock{g_mutex};
+            if (g_loading_stop.load())
+                break;
+            g_screen.DrawFrame({canvas.Pixels(), size_t(canvas.Width()) * canvas.Height()}, uint32_t(canvas.Width()),
+                               uint32_t(canvas.Height()));
+        }
+        for (int i = 0; i < 15 && !g_loading_stop.load(); i++)
+            usleep(10000);
+    }
+    return nullptr;
+}
+
+void StopLoadingThread()
+{
+    g_loading_stop = true;
+    if (g_loading_running)
+        pthread_join(g_loading_thread, nullptr);
+    g_loading_running = false;
+}
+
+// The game display opens: the launcher's screen goes to it (the loading screen continues there)
+void ReleaseScreenForGame()
+{
+    StopLoadingThread();
+    std::lock_guard lock{g_mutex};
+    g_screen.Release();
+    g_loading_shown = false;
+}
+
+// The game display's frames of it: drawn at its size, copied into its buffer row by row
+void DrawLoadingInto(uint32_t* pixels, uint32_t width, uint32_t height, uint32_t pitch, bool argb)
+{
+    static std::unique_ptr<Ui::Canvas> canvas;
+    if (!canvas || uint32_t(canvas->Width()) != width || uint32_t(canvas->Height()) != height)
+        canvas = std::make_unique<Ui::Canvas>(int(width), int(height), float(width) / 1280.0f);
+    DrawLoadingFrame(*canvas);
+    const uint32_t* src = canvas->Pixels();
+    for (uint32_t y = 0; y < height; y++)
+    {
+        const uint32_t* row = src + size_t(y) * width;
+        uint32_t* out = pixels + size_t(y) * pitch;
+        if (!argb)
+        {
+            std::memcpy(out, row, width * sizeof(uint32_t));
+            continue;
+        }
+        for (uint32_t x = 0; x < width; x++)
+        {
+            const uint32_t p = row[x];
+            out[x] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
+        }
+    }
+}
+
+// What the loading screen shows for `program`: what its last boot left (name, publisher, icon), else
+// its file's name
+Ui::LoadingScreen LoadingScreenFor(const std::string& program, bool white_theme)
+{
+    Ui::LoadingScreen screen;
+    screen.white_theme = white_theme;
+    const std::vector<std::string> cached = ReadLines(Launcher::TitleCachePath(kDataDir, program, "txt").c_str());
+    if (!cached.empty() && !cached[0].empty())
+    {
+        screen.name = cached[0];
+        screen.publisher = cached.size() > 1 ? cached[1] : "";
+        const std::vector<uint8_t> icon = ReadFile(Launcher::TitleCachePath(kDataDir, program, "jpg").string());
+        if (!icon.empty())
+            screen.icon = Ui::DecodeImage(icon.data(), icon.size());
+    }
+    if (screen.name.empty())
+        screen.name = NameFromFile(std::filesystem::path(program));
+    return screen;
+}
+
 void ShowLine(Launcher::LineKind kind, std::string_view text)
 {
     std::lock_guard lock{g_mutex};
@@ -1876,7 +1985,7 @@ void ShowLine(Launcher::LineKind kind, std::string_view text)
         return;
     }
     // while the program draws, its frames have the screen: the lines are kept for later
-    g_screen.Add(std::string(text), color, !g_drawing);
+    g_screen.Add(std::string(text), color, !g_drawing && !g_loading_shown);
 }
 
 // Settings for the console, where there's no shell to set environment variables: each line of
@@ -2827,9 +2936,21 @@ void* Run(void*)
         pthread_create(&pad_thread, nullptr, PadThread, nullptr);
         if (gpu)
         {
-            // the program's display takes the screen: what it prints still goes to log.txt
-            std::lock_guard lock{g_mutex};
-            g_screen.Release();
+            // (04.63) the loading screen until the game's first frame: here until the program's
+            // display takes the screen (what it prints still goes to log.txt)
+            {
+                std::lock_guard lock{g_loading_mutex};
+                g_loading = LoadingScreenFor(program, settings.white_theme);
+                g_loading_start = Seconds();
+            }
+            Common::PS4Diagnostics::loading_stage = 1;
+            Common::PS4Diagnostics::loading_done = 0;
+            Common::PS4Diagnostics::loading_total = 0;
+            g_loading_shown = true;
+            g_loading_stop = false;
+            g_loading_running = pthread_create(&g_loading_thread, nullptr, LoadingThread, nullptr) == 0;
+            Common::PS4Diagnostics::draw_loading = DrawLoadingInto;
+            Common::PS4Diagnostics::release_screen = ReleaseScreenForGame;
         }
         // The C heap's overflow (once its 384 MiB are full) leaves direct memory to the GPU: the
         // Switch's 4 GiB leave about 480 MiB of it, and RADV needs most of what's left
@@ -2844,8 +2965,16 @@ void* Run(void*)
         watchdog.Stop();
         if (gpu)
         {
+            // (04.63) the display never took the screen (the boot stopped before it opened): the
+            // launcher's is still open
+            Common::PS4Diagnostics::draw_loading = nullptr;
+            const bool still_ours = Common::PS4Diagnostics::release_screen.exchange(nullptr) != nullptr;
+            StopLoadingThread();
+            g_loading_shown = false;
+            Common::PS4Diagnostics::loading_stage = 0;
             std::lock_guard lock{g_mutex};
-            Trace(g_screen.Open() ? "screen open again" : "no screen (video out failed)");
+            if (!still_ours)
+                Trace(g_screen.Open() ? "screen open again" : "no screen (video out failed)");
             g_screen.Draw();
         }
         if (gpu && result.status == Launcher::BootResult::Status::LoadFailed &&

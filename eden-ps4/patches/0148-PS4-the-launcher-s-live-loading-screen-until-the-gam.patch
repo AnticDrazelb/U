@@ -1,0 +1,139 @@
+From 38a055aea19a3254bfacc45f87d8f9f372194d5a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 10:08:38 +0000
+Subject: [PATCH] PS4: the launcher's live loading screen until the game's
+ first frame
+
+Until now the screen was black from the moment a game was chosen until
+its first frame: the launcher gave its screen up before booting, and
+the game display showed nothing until the game presented.
+
+- Common::PS4Diagnostics gains release_screen, draw_loading and the
+  loading stage and progress.
+- The PS4 swapchain calls release_screen before it opens VideoOut, so
+  the launcher's loading screen stays up until then.
+- It then draws draw_loading's frames into buffers 0 and 1 in turn
+  (the one off screen) every ~150 ms and flips them.
+- The first AcquireNextImage stops and joins that thread and carries
+  on from its flips.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/common/ps4_diagnostics.h                  |  9 ++++
+ .../renderer_vulkan/vk_swapchain_ps4.cpp      | 43 +++++++++++++++++++
+ 2 files changed, 52 insertions(+)
+
+diff --git a/src/common/ps4_diagnostics.h b/src/common/ps4_diagnostics.h
+index 22121109cb..f38af6f2bb 100644
+--- a/src/common/ps4_diagnostics.h
++++ b/src/common/ps4_diagnostics.h
+@@ -31,6 +31,15 @@ inline std::atomic<bool> output_1080{false};
+ // The launcher's loading screen (1920x1080, 0xAABBGGRR): the game display shows it as its first
+ // frame, so it stays up while the game boots. Taken (and freed) by whoever exchanges it out.
+ inline std::atomic<std::vector<u32>*> loading_picture{nullptr};
++// (New Eden 04.63) The live loading screen until a game's first frame. The launcher draws it on its
++// own screen until the game display opens: the display calls release_screen first (the launcher
++// gives its screen up), then calls draw_loading for each frame of it, every ~150 ms, into its own
++// buffers (pixels: width x height, `pitch` pixels a row; bytes R, G, B, A, or B, G, R, A when argb)
++// until the game's first frame. The boot sets the stage and the progress as it goes.
++inline std::atomic<void (*)()> release_screen{nullptr};
++inline std::atomic<void (*)(u32* pixels, u32 width, u32 height, u32 pitch, bool argb)> draw_loading{nullptr};
++inline std::atomic<int> loading_stage{0}; // 0 none, 1 loading the game, 2 building shaders, 3 starting it
++inline std::atomic<u32> loading_done{0}, loading_total{0};
+ // What VideoOut accepted for the launcher (PS4 Pro mode may refuse its first setup): the game
+ // display follows it.
+ inline std::atomic<bool> videoout_needs_1080{false};
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp b/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
+index 1c68efe1b7..789d0fae57 100644
+--- a/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
++++ b/src/video_core/renderer_vulkan/vk_swapchain_ps4.cpp
+@@ -2,9 +2,11 @@
+ // VideoOut presentation follows DolphinPS4's RADV integration (GPL-2.0-or-later).
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <memory>
+ #include <array>
+ #include <limits>
++#include <thread>
+ #include <orbis/VideoOut.h>
+ #include <unistd.h>
+ #include "common/alignment.h"
+@@ -27,6 +29,7 @@ constexpr VkDeviceSize BufferAlignment = 2 * 1024 * 1024;
+ struct Swapchain::PS4State {
+     explicit PS4State(const vk::Device& logical_) : logical{logical_} {}
+     ~PS4State() {
++        StopLoading();
+         void(logical.WaitIdle());
+         if (video >= 0) sceVideoOutClose(video);
+         const auto& api = logical.Dispatch();
+@@ -44,6 +47,14 @@ struct Swapchain::PS4State {
+     std::array<s64, BufferCount> last_flip{};
+     s64 submitted{};
+     bool gpu_flips{true};
++    // (New Eden 04.63) the launcher's loading screen, drawn into the buffers until the first frame
++    std::jthread loading;
++    void StopLoading() {
++        if (loading.joinable()) {
++            loading.request_stop();
++            loading.join();
++        }
++    }
+ };
+ 
+ Swapchain::Swapchain(VkSurfaceKHR_T* surface_, const Device& device_, Scheduler& scheduler_,
+@@ -70,6 +81,10 @@ void Swapchain::Create(VkSurfaceKHR_T* surface_, u32 width_, u32 height_) {
+     is_outdated = false;
+     is_suboptimal = false;
+     ps4 = std::make_unique<PS4State>(device.GetLogical());
++    // (New Eden 04.63) the launcher's screen (its loading screen) up to here: given up now
++    if (auto* const release = Common::PS4Diagnostics::release_screen.exchange(nullptr)) {
++        release();
++    }
+     ps4->video = sceVideoOutOpen(0xff, 0, 0, nullptr);
+     if (ps4->video < 0) {
+         LOG_ERROR(Render_Vulkan, "PS4 VideoOut open failed: {:#x}", u32(ps4->video));
+@@ -170,11 +185,39 @@ void Swapchain::Create(VkSurfaceKHR_T* surface_, u32 width_, u32 height_) {
+             LOG_INFO(Render_Vulkan, "PS4 display: loading screen shown until the first game frame");
+         }
+     }
++    if (auto* const draw = Common::PS4Diagnostics::draw_loading.load(); draw && ps4->submitted == 0) {
++        // (New Eden 04.63) the launcher's loading screen, live, until the game's first frame: drawn
++        // every ~150 ms into buffers 0 and 1 in turn (the one off screen) and flipped; stopped (and
++        // joined) by the first AcquireNextImage, which then goes on from these flips
++        PS4State* const state = ps4.get();
++        const u32 w = extent.width, h = extent.height;
++        ps4->loading = std::jthread([this, state, draw, addresses, pitch, argb, w, h](std::stop_token stop) {
++            u32 buffer = 0;
++            while (!stop.stop_requested()) {
++                draw(static_cast<u32*>(addresses[buffer]), w, h, pitch, argb);
++                __builtin_ia32_sfence();
++                const s64 argument = state->submitted + 1;
++                if (sceVideoOutSubmitFlip(state->video, static_cast<int>(buffer), ORBIS_VIDEO_OUT_FLIP_VSYNC,
++                                          argument) >= 0) {
++                    state->submitted = argument;
++                    state->last_flip[buffer] = argument;
++                    frame_index = (buffer + 1) % BufferCount;
++                }
++                buffer ^= 1;
++                for (int i = 0; i < 15 && !stop.stop_requested(); ++i) {
++                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++                }
++            }
++        });
++        LOG_INFO(Render_Vulkan, "PS4 display: the live loading screen until the first game frame");
++    }
+     LOG_INFO(Render_Vulkan, "PS4 RADV display ready: {}x{}, {} buffers, pitch {}",
+              extent.width, extent.height, image_count, pitch);
+ }
+ 
+ bool Swapchain::AcquireNextImage() {
++    // (New Eden 04.63) the game's first frame: the loading screen stops (its flips set frame_index)
++    ps4->StopLoading();
+     image_index = frame_index;
+     const s64 previous = ps4->last_flip[image_index];
+     if (previous != 0) {
+-- 
+2.43.0
+

@@ -30,7 +30,7 @@ if (PS4)
         INCLUDE_DIRECTORIES ${EDEN_PS4_REPO}/port)
 
     # The HOME menu (ui/), with its fonts (../ui-fonts) included whole
-    set(EDEN_PS4_UI_SOURCES ui/canvas.cpp ui/fonts.cpp ui/art.cpp ui/home_menu.cpp ui/nro.cpp)
+    set(EDEN_PS4_UI_SOURCES ui/canvas.cpp ui/fonts.cpp ui/art.cpp ui/home_menu.cpp ui/nro.cpp ui/loading_screen.cpp)
     set(EDEN_PS4_UI_FONTS ${CMAKE_CURRENT_LIST_DIR}/../ui-fonts)
     set_source_files_properties(ui/fonts.cpp PROPERTIES
         COMPILE_DEFINITIONS EDEN_PS4_UI_FONTS="${EDEN_PS4_UI_FONTS}"

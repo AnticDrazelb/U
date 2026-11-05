@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.63: **a loading screen.** From choosing a game until its first frame the screen shows its name and
+icon, what it's doing (loading, building shaders with a progress bar, starting) instead of black:
+the launcher draws it until the game display opens, then the display draws it (patch 0148,
+`ui/loading_screen.cpp`). The boot's shader cache rebuild runs on five workers on every core
+(patch 0149; three in play).
+
 04.62: **speed, part 1.** The game's frames wait on Eden's GPU thread and on wake-ups: the GPU thread
 now spins up to 2 ms for new work before sleeping, idle emulated cores 5 ms, contended locks 100 us
 (patch 0147), unnamed helper threads start off the game's cores, and the driver layer's per-submission
