@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.56)
+# Eden for PS4: status (after 04.57)
 
-Install **04.56** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.57** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -69,6 +69,32 @@ programs, 0 failures.
   descriptor sets in the record; HTILE back on (below).
 - **04.55:** the kitchen sink (`RADV_PS4_MITIGATE`, below).
 - **04.56:** the kitchen sink plus trivial shaders for the scene draws after a loading gap (below).
+- **04.57:** the cause: shaders from 03.84's pipeline cache, built for another 32-bit GPU window;
+  the window now in RADV's cache UUID (below).
+
+## 04.57: shaders built for another GPU window (the cause)
+
+- **04.56's run:** the trivial shaders let the CP past the scene draws (61 PS and 61 main VS
+  replaced): it got to trace offset 1453 of 1628 (before: 439-455), then stopped after trace 392145
+  (an EOP wait, then a 320x180 buffer-to-image copy draw). This time the system closed just the app (no
+  crash report, 0.13 s after the GPU stopped): a GPU fault.
+- **The cause:** the last draw that finished, a post-processing pass, ran PS 0x44ffde9e00, which starts
+  `s_mov_b32 s6, s3; s_movk_i32 s3, 0x96; s_load_dwordx8 s[8:15], s[2:3], 0x8`: its descriptor set
+  pointer gets **0x96** as its upper half. RADV puts the 32-bit window's upper half (`address32_hi`)
+  into the code, and this session's window is 0x4400000000 (every log since 04.38); the other shaders
+  have `s_movk_i32 …, 0x44`. In the record, 5 PS have 0x96 (04.55's record: 13, among them level 3's
+  scene VS 0x44ffde7900 and PS 0x44ffde7c00). 03.84 (fastmem's arena reserved low) had the windows at
+  0x9164a00000 and **0x9600000000** (03.85's commit): the pipelines Eden built at that boot from its
+  shader cache went into `vulkan_pipelines.bin`, and RADV accepted that file ever since: its cache UUID
+  is only the driver build's. Those shaders read descriptors from unmapped memory: a GPU fault
+  (whole-PS4 crashes when the garbage got as far as a texture fetch, a closed app here).
+- **04.57:** `../patches/mesa-ps4-cache-uuid-window.patch`: `address32_hi` in RADV's cache UUID, so
+  the pipeline cache header (`vk_pipeline_cache_load` compares it whole) and the disk cache keys
+  change with the window, and a cache built for another window is ignored and rebuilt (each game's
+  first start builds its pipelines again). The pre-flight record names any shader built for another
+  window (`s_movk_i32 s<odd>, imm` with a scalar load from that pair within 8 dwords; boot trace
+  "built for a 32-bit GPU window at …", host-tested in `preflight.sh`). Test arms off
+  (`RADV_PS4_TEST_ARMS` default 0); the kitchen sink stays on for this run, to come off next.
 
 ## 04.56: trivial shaders for the scene draws
 

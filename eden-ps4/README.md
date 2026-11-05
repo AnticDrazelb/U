@@ -379,6 +379,15 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.57: **the cause: shaders built for another GPU window.** 04.56's trivial shaders got the GPU past
+the scene draws; it then faulted (the system closed the app) on a post-processing pixel shader whose
+code builds its descriptor pointer with 0x96 as the upper half, while this session's 32-bit GPU window
+is at 0x4400000000. 03.84 had that window at 0x9600000000 (fastmem's arena pushed it up); pipelines
+built then stayed in `vulkan_pipelines.bin`, which RADV kept accepting (its cache UUID is only the
+driver build's). `../patches/mesa-ps4-cache-uuid-window.patch` puts the window into the UUID: a cache
+built for another window is ignored and rebuilt. The pre-flight record names any such shader. Test
+arms off; the kitchen sink still on for this run.
+
 04.56: **trivial shaders.** With 04.55's kitchen sink on, the first scene draw itself never finished: the
 cause is in that draw. On top of the kitchen sink, after a loading gap the scene draws' (3+ interpolants)
 pixel shaders are now overwritten with ones exporting zeros, and their main vertex shaders with ones that

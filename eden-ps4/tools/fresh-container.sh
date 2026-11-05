@@ -50,7 +50,7 @@ mesa() {
     if [ ! -f "$PSB/src/mesa/.ps4-patched" ]; then
         for p in mesa-ps4 mesa-ps4-aligned-vertex-fetch mesa-ps4-vertex-fetch-switch mesa-ps4-flush-all-draws \
                  mesa-ps4-gs-ring-probe mesa-ps4-cs-grow-oom mesa-ps4-trace-ids \
-                 mesa-ps4-rings mesa-ps4-indirect-draws mesa-ps4-mitigate; do
+                 mesa-ps4-rings mesa-ps4-indirect-draws mesa-ps4-mitigate mesa-ps4-cache-uuid-window; do
             git -C "$PSB/src/mesa" apply --exclude=src/amd/common/ac_ps4_drm.c "$REPO/patches/$p.patch"
         done
         touch "$PSB/src/mesa/.ps4-patched"

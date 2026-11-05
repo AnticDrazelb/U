@@ -1129,6 +1129,37 @@ ps4_dump_shader(int fd, uint64_t va, unsigned stage, unsigned packet, uint64_t *
    }
 }
 
+/* (04.57) A shader built for another 32-bit GPU window: an "s_movk_i32 s<odd>, imm" (a window's upper
+ * half into the high dword of a pointer pair) with a scalar load from that pair within the next 8
+ * dwords, imm not `hi` (this window's). Returns imm, or 0. RADV puts address32_hi into the code; the
+ * window is wherever the kernel reserved it that session, and a pipeline cache file from a session
+ * with another window (Eden 03.84: 0x96) gave Captain Toad's level 3 shaders reading descriptors from
+ * unmapped memory - GPU faults (mesa-ps4-cache-uuid-window.patch: such a cache is ignored now). */
+static uint32_t
+ps4_shader_other_window(uint64_t va, uint32_t hi)
+{
+   const uint32_t *code = va ? ps4_hw_read(va, 256) : NULL;
+   if (!code)
+      return 0;
+   for (unsigned i = 0; i < 64; i++) {
+      const uint32_t x = code[i];
+      if (x == 0xbf810000u) /* s_endpgm */
+         break;
+      if ((x >> 23) != 0x160) /* SOPK s_movk_i32 */
+         continue;
+      const unsigned sdst = (x >> 16) & 0x7f;
+      const uint32_t imm = x & 0xffff;
+      if (!(sdst & 1) || sdst > 103 || imm == hi || imm < 0x10 || imm > 0xff)
+         continue;
+      for (unsigned k = i + 1; k < i + 9 && k < 64; k++)
+         if ((code[k] >> 27) == 0x18 && ((code[k] >> 9) & 0x3f) * 2 == (sdst & ~1u)) /* SMRD from the pair */
+            return imm;
+   }
+   return 0;
+}
+
+static unsigned ps4_other_window_shaders; /* found so far (the session) */
+
 /* The analysis: `w` holds the unfinished submissions' packets (seqs[i] for sub i). */
 static void
 ps4_walk_analyze(FILE *f, const struct ps4_walk *w, const uint64_t *seqs, uint64_t trace_va, uint32_t trace_now,
@@ -2337,7 +2368,7 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    static int arms = -1;
    if (arms < 0) {
       const char *e = getenv("RADV_PS4_TEST_ARMS");
-      arms = e ? (int)strtoul(e, NULL, 0) : 0xc; /* (04.56: the trivial PS and main VS on by default) */
+      arms = e ? (int)strtoul(e, NULL, 0) : 0; /* (04.56: 0xc by default; 04.57: off - the cause found) */
    }
    c.arms = (unsigned)arms;
    if (first_big && skip_to) {
@@ -2629,6 +2660,17 @@ ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes,
                  pf.num_mem);
    ps4_pf_flush(&pf);
    uint64_t done[1];
+   for (unsigned s = first_shader; s < *num_shaders; s++) {
+      const uint32_t other = ps4_shader_other_window(shaders[s], (uint32_t)(va32_start >> 32));
+      if (other && ps4_other_window_shaders++ < 8) {
+         char line[240];
+         snprintf(line, sizeof(line), "radv/ps4: the %s at %#llx was built for a 32-bit GPU window at %#llx, not "
+                  "this one (%#llx): from another session's pipeline cache", ps4_stage_name[stages[s] < PS4_STAGES ?
+                  stages[s] : PS4_CS], (unsigned long long)shaders[s], (unsigned long long)other << 32,
+                  (unsigned long long)va32_start);
+         ps4_boot_trace(line);
+      }
+   }
    for (unsigned s = first_shader; s < *num_shaders && pf.bytes < PS4_PF_LIMIT; s++) {
       unsigned num_done = 0;
       ps4_dump_shader(fd, shaders[s], stages[s], s, done, &num_done);

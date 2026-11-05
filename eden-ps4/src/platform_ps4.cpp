@@ -1317,6 +1317,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.57: found it. Some of Captain Toad's shaders came from the shader cache Eden 03.84 made, when "
+         "fastmem had pushed the GPU's memory window to another address. Those shaders still read their "
+         "textures and buffers from the old address, which the GPU no longer has: level 3's scene shaders are "
+         "among them (the blank shaders of 04.56 got past them, then the GPU hit the next old one). The "
+         "driver's cache now carries the window's address, so a cache made with another one is thrown away and "
+         "rebuilt: each game's first start takes longer while its shaders build again. The blank-shader test "
+         "is off; 04.55's safety fixes stay on for this run.\n"
          "04.56: 04.55's fixes all ran, and level 3's first scene draw now never finished at all (before it "
          "finished and the GPU stopped right after): the cause is in that draw. This build keeps every 04.55 fix "
          "and, right after a loading screen, swaps the scene draws' shaders for blank ones (no textures, nothing "

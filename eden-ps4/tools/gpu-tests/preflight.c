@@ -29,6 +29,7 @@ static struct region g_regions[64];
 static int g_num_regions;
 
 static const void* ps4_hw_read(uint64_t va, uint64_t bytes);
+void ps4_boot_trace(const char* stage);
 #include "walker.inc"
 #include "preflight.inc"
 
@@ -39,6 +40,13 @@ static const void* ps4_hw_read(uint64_t va, uint64_t bytes) {
             return (const char*)r->data + (va - r->va);
     }
     return NULL;
+}
+
+// (04.57) the app's boot trace: lines counted, and those naming a shader built for the 0x96 window
+static int g_boot_traces, g_other_window;
+void ps4_boot_trace(const char* stage) {
+    g_boot_traces++;
+    g_other_window += strstr(stage, "built for a 32-bit GPU window at 0x9600000000, not this one (0x4400000000)") != NULL;
 }
 
 static uint32_t* add_region(uint64_t va, size_t dwords) {
@@ -123,6 +131,12 @@ int main(int argc, char** argv) {
         shader_at(0x4400200000ull, 40);  // PS
         shader_at(0x4400300000ull, 24);  // CS
         shader_at(0x4400400000ull, 32);  // VS
+        // (04.57) the PS built for another 32-bit window (s_mov_b32 s6, s3; s_movk_i32 s3, 0x96;
+        // s_load_dwordx8 s[8:15], s[2:3], 0x8), the CS for this one (0x44): only the PS is named
+        static const uint32_t other_window[3] = {0xbe860303u, 0xb0030096u, 0xc0c40308u};
+        static const uint32_t this_window[3] = {0xbe840303u, 0xb0030044u, 0xc0c40300u};
+        memcpy((void*)ps4_hw_read(0x4400200000ull, 12), other_window, 12);
+        memcpy((void*)ps4_hw_read(0x4400300000ull, 12), this_window, 12);
         struct cs a = {add_region(0x4400100000ull, 256), 0}, b = {add_region(0x4400110000ull, 256), 0},
                   c = {add_region(0x4400120000ull, 256), 0}, d = {add_region(0x4400130000ull, 256), 0};
         // B (called from A): the compute shader and a dispatch
@@ -164,6 +178,7 @@ int main(int argc, char** argv) {
         uint32_t sz2[1] = {d.n * 4};
         bytes += ps4_pf_submission(fd, 2, dcb2, sz2, 1, 6, 8, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull, true);
         check(ibs == 1 && fresh == 1 && num_shaders == 3, "submission 2: 1 IB, 1 new shader (the CS one again isn't)");
+        check(g_other_window == 1 && g_boot_traces == 1, "the PS built for the 0x96 window named, only it");
         const off_t size = lseek(fd, 0, SEEK_CUR);
         check((uint64_t)size == bytes, "bytes counted = the file's size");
         close(fd);
