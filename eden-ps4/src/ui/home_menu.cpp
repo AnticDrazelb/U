@@ -2,6 +2,8 @@
 
 #include "ui/home_menu.h"
 
+#include "ui/avatars.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -46,6 +48,39 @@ constexpr SystemButton kButtons[] = {
 constexpr int kButtonCount = int(sizeof(kButtons) / sizeof(kButtons[0]));
 
 const char* const kCategories[] = {"Themes", "Graphics", "CPU", "Console", "About"};
+
+// (04.64) The user's icon at the top left of the HOME screen
+constexpr float kUserX = 66, kUserY = 52, kUserRadius = 25;
+// The icon's choice: the characters in a grid, then the colours in a row
+constexpr int kIconColumns = 10;
+constexpr float kIconCell = 96, kIconGapX = 18, kIconRow = 136, kIconTop = 140;
+constexpr float kSwatchRadius = 30, kSwatchGap = 22, kSwatchY = 548;
+// The keyboard: four rows of 11 keys, and Shift, Space, Delete and OK under them
+const char* const kKeyRows[4] = {"1234567890-", "qwertyuiop_", "asdfghjkl'.", "zxcvbnm,!?@"};
+constexpr int kKeyColumns = 11, kKeyRowCount = 5;
+constexpr float kKeyW = 84, kKeyH = 62, kKeyGap = 10, kKeyTop = 266;
+constexpr float kKeyLeft = (1280 - (kKeyColumns * kKeyW + (kKeyColumns - 1) * kKeyGap)) / 2;
+struct WideKey
+{
+    const char* label;
+    int first, span; // the columns it spans
+};
+constexpr WideKey kWideKeys[] = {{"Shift", 0, 2}, {"Space", 2, 5}, {"Delete", 7, 2}, {"OK", 9, 2}};
+constexpr int kWideKeyCount = 4;
+int WideKeyAt(int column)
+{
+    for (int i = kWideKeyCount - 1; i >= 0; i--)
+        if (column >= kWideKeys[i].first)
+            return i;
+    return 0;
+}
+std::string Trimmed(const std::string& text)
+{
+    const size_t first = text.find_first_not_of(' ');
+    if (first == std::string::npos)
+        return {};
+    return text.substr(first, text.find_last_not_of(' ') - first + 1);
+}
 constexpr int kCategoryCount = 5;
 
 float Smooth(float current, float target, float dt)
@@ -296,7 +331,18 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
     switch (screen)
     {
     case Screen::Home:
-        if (home_row == 0)
+        if (home_row < 0)
+        {
+            // (04.64) the user's icon: its User Page
+            if (moves & kDown)
+                home_row = 0;
+            if (pressed & kCross)
+            {
+                screen = Screen::User;
+                user_item = 0;
+            }
+        }
+        else if (home_row == 0)
         {
             if ((moves & kLeft) && home_tile > 0)
                 home_tile--;
@@ -304,6 +350,8 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
                 home_tile++;
             if (moves & kDown)
                 home_row = 1;
+            if (moves & kUp)
+                home_row = -1;
             if (pressed & kCross)
             {
                 if (home_tile == HomeCount())
@@ -361,6 +409,69 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
             }
         }
         return {};
+
+    case Screen::User:
+        if (pressed & kCircle)
+            screen = Screen::Home;
+        if (moves & kUp)
+            user_item = 0;
+        if (moves & kDown)
+            user_item = 1;
+        if (pressed & kCross)
+        {
+            if (user_item == 0)
+            {
+                screen = Screen::Keyboard;
+                keyboard_text = settings.nickname;
+                key_shift = keyboard_text.empty();
+                key_row = 1;
+                key_column = 0;
+            }
+            else
+            {
+                screen = Screen::Icon;
+                icon_step = 0;
+                icon_character = std::clamp(settings.avatar, 0, AvatarCount() - 1);
+                icon_color = std::clamp(settings.avatar_color, 0, AvatarColorCount() - 1);
+            }
+        }
+        return {};
+
+    case Screen::Icon:
+        if (icon_step == 0)
+        {
+            const int count = AvatarCount();
+            if ((moves & kLeft) && icon_character % kIconColumns > 0)
+                icon_character--;
+            if ((moves & kRight) && icon_character % kIconColumns < kIconColumns - 1 && icon_character + 1 < count)
+                icon_character++;
+            if ((moves & kUp) && icon_character >= kIconColumns)
+                icon_character -= kIconColumns;
+            if ((moves & kDown) && icon_character + kIconColumns < count)
+                icon_character += kIconColumns;
+            if (pressed & kCross)
+                icon_step = 1;
+            if (pressed & kCircle)
+                screen = Screen::User;
+            return {};
+        }
+        if (moves & kLeft)
+            icon_color = std::max(0, icon_color - 1);
+        if (moves & kRight)
+            icon_color = std::min(AvatarColorCount() - 1, icon_color + 1);
+        if (pressed & kCircle)
+            icon_step = 0;
+        if (pressed & kCross)
+        {
+            settings.avatar = icon_character;
+            settings.avatar_color = icon_color;
+            screen = Screen::User;
+            return {MenuAction::Kind::SettingsChanged, {}};
+        }
+        return {};
+
+    case Screen::Keyboard:
+        return KeyboardPress(pressed, moves);
 
     case Screen::AllSoftware: {
         if (pressed & kCircle)
@@ -626,6 +737,15 @@ void HomeMenu::Draw(Canvas& c, double now)
     case Screen::Folder:
         DrawFolder(c, now);
         break;
+    case Screen::User:
+        DrawUser(c, now);
+        break;
+    case Screen::Icon:
+        DrawIconPicker(c, now);
+        break;
+    case Screen::Keyboard:
+        DrawKeyboard(c, now);
+        break;
     }
     if (countdown >= 0)
     {
@@ -666,12 +786,17 @@ void HomeMenu::DrawHome(Canvas& c, double now)
     const Theme& t = CurrentTheme();
     const uint32_t cursor = Cursor(now);
 
-    // the user and the time
-    c.Circle(66, 52, 25, Rgb(0x4FA3E8));
-    DrawIcon(c, Icon::User, 66, 54, 36, Rgb(0xFFFFFF));
-    c.Ring(66, 52, 25, 1.5f, Fade(Rgb(0xFFFFFF), 0.5f));
+    // the user (04.64: its icon, and its User Page when chosen) and the time
+    c.DrawImage(kUserX - kUserRadius, kUserY - kUserRadius, kUserRadius * 2, kUserRadius * 2,
+                Avatar(settings.avatar, settings.avatar_color, kUserRadius * 2, c.Scale()));
+    c.Ring(kUserX, kUserY, kUserRadius, 1.5f, Fade(Rgb(0xFFFFFF), 0.5f));
+    if (home_row < 0)
+    {
+        c.Ring(kUserX, kUserY, kUserRadius + 9, 5, cursor);
+        c.Text(108, 60, settings.nickname + "'s User Page", 21, Weight::SemiBold, t.accent);
+    }
     // where a browser on the network reaches the app's web page (keys, firmware, games, logs)
-    if (!web_address.empty())
+    else if (!web_address.empty())
         c.Text(108, 60, "From a PC or phone: " + web_address, 19, Weight::Regular, t.dim);
     c.Text(1188, 62, clock, 22, Weight::SemiBold, t.text, Align::Right);
     DrawIcon(c, Icon::WiFi, 1219, 52, 26, t.text);
@@ -911,7 +1036,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
                  "a pointer where it would touch (the touchpad is the picture, corner to corner); click the "
                  "touchpad to touch there, and hold the click to drag; a quick tap touches too. A click with two "
                  "fingers is the Minus button. Minus Button: any click is Minus.",
-                 [](MenuSettings& s) { s.touchpad_minus = !s.touchpad_minus; }}};
+                 [](MenuSettings& s) { s.touchpad_minus = !s.touchpad_minus; }},
+                {"Motion Controls", on_off(settings.motion_controls),
+                 "The controller's motion sensors are the Switch controller's: games that steer, aim or play by "
+                 "tilting and turning the controller (when they offer it) follow the PS4 controller. Off: games see "
+                 "a controller without them.",
+                 [](MenuSettings& s) { s.motion_controls = !s.motion_controls; }}};
     default:
         return {};
     }
@@ -1122,19 +1252,26 @@ void HomeMenu::DrawControllers(Canvas& c, double now)
         {Glyph::Options, true, "", "+"},
         {Glyph::L1, false, touch ? "Touchpad, 2 fingers" : "Touchpad click", "\xE2\x88\x92"},
         {Glyph::L1, false, "Touchpad, 1 finger", "Touch screen"},
+        {Glyph::L1, false, "Tilting, turning", "Motion controls"},
         {Glyph::L1, false, "L3 + R3, held 1 s", "Stops the software"},
     };
+    const auto shown = [&](const Row& row) {
+        return !(!touch && std::string_view(row.sw) == "Touch screen") &&
+               !(!settings.motion_controls && std::string_view(row.sw) == "Motion controls");
+    };
+    const int rows_shown = int(std::count_if(std::begin(rows), std::end(rows), shown));
+    const float step = std::min(40.0f, 372.0f / float(rows_shown)); // (all of them above the Test button)
     float y = 150;
     for (const Row& row : rows)
     {
-        if (!touch && std::string_view(row.sw) == "Touch screen")
+        if (!shown(row))
             continue;
         if (row.has_glyph)
             DrawGlyph(c, row.glyph, 690, y - 7, t.text, t.bg);
         else
             c.Text(676, y, row.ps4, 18, Weight::Regular, t.text);
         c.Text(900, y, row.sw, 19, Weight::SemiBold, t.accent);
-        y += touch ? 36 : 40; // (the touch screen's row in the same height)
+        y += step;
     }
     c.Text(676, y + 6, "PS4 button", 15, Weight::Regular, t.dim);
     c.Text(900, y + 6, "Switch button", 15, Weight::Regular, t.dim);
@@ -1240,6 +1377,239 @@ void HomeMenu::DrawDialog(Canvas& c, double now)
         c.Text(bx + bw / 2, by + 46, dialog.buttons[i], 21, Weight::SemiBold, selected ? t.accent : t.text,
                Align::Center);
     }
+}
+
+// (04.64) The user's icon, round, size units across (made once for each size and colour)
+const Image& HomeMenu::Avatar(int character, int color, float size, float scale)
+{
+    const int pixels = std::max(1, int(std::lround(size * scale)));
+    const auto key = std::make_tuple(character, color, pixels);
+    auto it = avatars.find(key);
+    if (it == avatars.end())
+    {
+        if (avatars.size() > 160)
+            avatars.clear(); // (each is used as soon as it's returned)
+        it = avatars.emplace(key, MakeAvatar(character, color, pixels, true)).first;
+    }
+    return it->second;
+}
+
+// The User Page: the user, as games see it (its icon and nickname), and the two to change
+void HomeMenu::DrawUser(Canvas& c, double now)
+{
+    const Theme& t = CurrentTheme();
+    const uint32_t cursor = Cursor(now);
+    DrawHeader(c, Icon::User, t.text, "User Page");
+    constexpr float kCx = 290, kCy = 318, kSize = 232;
+    c.DrawImage(kCx - kSize / 2, kCy - kSize / 2, kSize, kSize,
+                Avatar(settings.avatar, settings.avatar_color, kSize, c.Scale()));
+    c.Text(kCx, kCy + kSize / 2 + 58, settings.nickname, 32, Weight::SemiBold, t.text, Align::Center, 440);
+    c.Text(kCx, kCy + kSize / 2 + 90, "Switch user", 17, Weight::Regular, t.dim, Align::Center);
+    c.Line(560, kHeaderLine + 12, 560, kBottomLine - 12, 1.2f, t.line);
+
+    constexpr float kLeft = 620, kRight = 1230, kTop = 150;
+    c.Text(kLeft, kTop - 4, "User Settings", 24, Weight::SemiBold, t.text);
+    const std::string values[2] = {settings.nickname, AvatarName(settings.avatar)};
+    const char* const labels[2] = {"Nickname", "Icon"};
+    float y = kTop + 22;
+    for (int i = 0; i < 2; i++)
+    {
+        c.Line(kLeft, y, kRight, y, 1.0f, t.line);
+        if (user_item == i)
+            c.RoundRectOutline(kLeft - 8, y + 4, kRight - kLeft + 16, kItemHeight - 8, 6, 4.5f, cursor);
+        c.Text(kLeft + 16, y + 40, labels[i], 20, Weight::Regular, t.text);
+        const float value_width = c.Text(kRight - 16, y + 40, values[i], 20, Weight::Regular, t.accent, Align::Right);
+        if (i == 1)
+            c.DrawImage(kRight - 16 - value_width - 48, y + 14, 36, 36,
+                        Avatar(settings.avatar, settings.avatar_color, 36, c.Scale()));
+        c.Line(kLeft, y + kItemHeight, kRight, y + kItemHeight, 1.0f, t.line);
+        y += kItemHeight;
+    }
+    y += 40;
+    const char* const help =
+        "Games see this nickname and icon as the Switch user's, wherever they show who's playing. Changing them "
+        "keeps the user's saves.";
+    for (const std::string& line : c.Wrap(help, 17, Weight::Regular, kRight - kLeft - 16))
+    {
+        c.Text(kLeft + 8, y, line, 17, Weight::Regular, t.dim);
+        y += 26;
+    }
+    DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "Change"}});
+}
+
+// The icon's choice: a character from the grid, then its background colour
+void HomeMenu::DrawIconPicker(Canvas& c, double now)
+{
+    const Theme& t = CurrentTheme();
+    const uint32_t cursor = Cursor(now);
+    DrawHeader(c, Icon::User, t.text, icon_step == 0 ? "Choose a Character" : "Choose a Background Colour");
+    if (icon_step == 0)
+    {
+        const float left = (1280 - (kIconColumns * kIconCell + (kIconColumns - 1) * kIconGapX)) / 2;
+        for (int i = 0; i < AvatarCount(); i++)
+        {
+            const float x = left + float(i % kIconColumns) * (kIconCell + kIconGapX);
+            const float y = kIconTop + float(i / kIconColumns) * kIconRow;
+            c.DrawImage(x, y, kIconCell, kIconCell, Avatar(i, icon_color, kIconCell, c.Scale()));
+            if (i == icon_character)
+                c.Ring(x + kIconCell / 2, y + kIconCell / 2, kIconCell / 2 + 9, 5, cursor);
+        }
+        const int rows = (AvatarCount() + kIconColumns - 1) / kIconColumns;
+        c.Text(640, kIconTop + rows * kIconRow + 30, AvatarName(icon_character), 24, Weight::SemiBold, t.accent,
+               Align::Center);
+        DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "Next"}});
+        return;
+    }
+    constexpr float kSize = 260, kCy = 290;
+    c.DrawImage(640 - kSize / 2, kCy - kSize / 2, kSize, kSize, Avatar(icon_character, icon_color, kSize, c.Scale()));
+    c.Text(640, kCy + kSize / 2 + 44, AvatarName(icon_character), 24, Weight::SemiBold, t.text, Align::Center);
+    const int count = AvatarColorCount();
+    const float total = count * kSwatchRadius * 2 + (count - 1) * kSwatchGap;
+    for (int i = 0; i < count; i++)
+    {
+        const float cx = 640 - total / 2 + kSwatchRadius + float(i) * (kSwatchRadius * 2 + kSwatchGap);
+        c.Circle(cx, kSwatchY, kSwatchRadius, AvatarColor(i));
+        c.Ring(cx, kSwatchY, kSwatchRadius, 1.5f, Fade(t.text, 0.2f));
+        if (i == icon_color)
+            c.Ring(cx, kSwatchY, kSwatchRadius + 9, 5, cursor);
+    }
+    DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "OK"}});
+}
+
+// The keyboard, for the nickname: its keys chosen with the D-pad and pressed with Cross
+MenuAction HomeMenu::KeyboardPress(uint32_t pressed, uint32_t moves)
+{
+    const auto commit = [&]() -> MenuAction {
+        const std::string name = Trimmed(keyboard_text);
+        if (name.empty())
+            return {}; // (a nickname needs something in it)
+        settings.nickname = name;
+        screen = Screen::User;
+        return {MenuAction::Kind::SettingsChanged, {}};
+    };
+    const auto erase = [&] {
+        if (!keyboard_text.empty())
+            keyboard_text.pop_back();
+        if (keyboard_text.empty())
+            key_shift = true;
+    };
+    if (key_row == kKeyRowCount - 1)
+    {
+        const int key = WideKeyAt(key_column);
+        if ((moves & kLeft) && key > 0)
+            key_column = kWideKeys[key - 1].first;
+        if ((moves & kRight) && key < kWideKeyCount - 1)
+            key_column = kWideKeys[key + 1].first;
+    }
+    else
+    {
+        if (moves & kLeft)
+            key_column = std::max(0, key_column - 1);
+        if (moves & kRight)
+            key_column = std::min(kKeyColumns - 1, key_column + 1);
+    }
+    if (moves & kUp)
+        key_row = std::max(0, key_row - 1);
+    if (moves & kDown)
+        key_row = std::min(kKeyRowCount - 1, key_row + 1);
+    if (pressed & kTriangle)
+    {
+        screen = Screen::User; // (unchanged)
+        return {};
+    }
+    if (pressed & kCircle)
+    {
+        if (keyboard_text.empty())
+            screen = Screen::User;
+        else
+            erase();
+        return {};
+    }
+    if (pressed & kOptions)
+        return commit();
+    if (!(pressed & kCross))
+        return {};
+    if (key_row < kKeyRowCount - 1)
+    {
+        char ch = kKeyRows[key_row][key_column];
+        if (key_shift && ch >= 'a' && ch <= 'z')
+        {
+            ch = char(ch - 'a' + 'A');
+            key_shift = false;
+        }
+        if (keyboard_text.size() < kNicknameLength)
+            keyboard_text += ch;
+        return {};
+    }
+    switch (WideKeyAt(key_column))
+    {
+    case 0:
+        key_shift = !key_shift;
+        break;
+    case 1:
+        if (keyboard_text.size() < kNicknameLength && !keyboard_text.empty())
+            keyboard_text += ' ';
+        break;
+    case 2:
+        erase();
+        break;
+    default:
+        return commit();
+    }
+    return {};
+}
+
+void HomeMenu::DrawKeyboard(Canvas& c, double now)
+{
+    const Theme& t = CurrentTheme();
+    const uint32_t cursor = Cursor(now);
+    DrawHeader(c, Icon::User, t.text, "Nickname");
+    // the text, its caret blinking, and how many characters it may have
+    constexpr float kFieldX = 290, kFieldY = 136, kFieldW = 700, kFieldH = 72;
+    c.RoundRect(kFieldX, kFieldY, kFieldW, kFieldH, 10, t.panel);
+    c.RoundRectOutline(kFieldX, kFieldY, kFieldW, kFieldH, 10, 2, t.accent);
+    const float text_width = c.Text(kFieldX + 24, kFieldY + 48, keyboard_text, 32, Weight::Regular, t.text);
+    if (std::fmod(now, 1.0) < 0.6)
+        c.Rect(kFieldX + 26 + text_width, kFieldY + 16, 2.5f, 40, t.accent);
+    if (keyboard_text.empty())
+        c.Text(kFieldX + 34, kFieldY + 48, "A nickname", 32, Weight::Regular, Fade(t.dim, 0.6f));
+    c.Text(kFieldX + kFieldW, kFieldY + kFieldH + 26,
+           std::to_string(keyboard_text.size()) + " / " + std::to_string(kNicknameLength), 17, Weight::Regular, t.dim,
+           Align::Right);
+    // the keys
+    const auto key_x = [](int column) { return kKeyLeft + float(column) * (kKeyW + kKeyGap); };
+    for (int row = 0; row < kKeyRowCount; row++)
+    {
+        const float y = kKeyTop + float(row) * (kKeyH + kKeyGap);
+        if (row < kKeyRowCount - 1)
+        {
+            for (int column = 0; column < kKeyColumns; column++)
+            {
+                char ch = kKeyRows[row][column];
+                if (key_shift && ch >= 'a' && ch <= 'z')
+                    ch = char(ch - 'a' + 'A');
+                const float x = key_x(column);
+                c.RoundRect(x, y, kKeyW, kKeyH, 8, t.button);
+                c.Text(x + kKeyW / 2, y + kKeyH / 2 + 10, std::string(1, ch), 26, Weight::Regular, t.text, Align::Center);
+                if (row == key_row && column == key_column)
+                    c.RoundRectOutline(x - 6, y - 6, kKeyW + 12, kKeyH + 12, 10, 4.5f, cursor);
+            }
+            continue;
+        }
+        for (int i = 0; i < kWideKeyCount; i++)
+        {
+            const WideKey& key = kWideKeys[i];
+            const float x = key_x(key.first), w = key_x(key.first + key.span - 1) + kKeyW - x;
+            const bool ok = i == kWideKeyCount - 1, lit = (i == 0 && key_shift) || ok;
+            c.RoundRect(x, y, w, kKeyH, 8, ok ? t.accent : lit ? Mix(t.button, t.accent, 0.35f) : t.button);
+            c.Text(x + w / 2, y + kKeyH / 2 + 8, key.label, 21, Weight::SemiBold, ok ? Rgb(0xFFFFFF) : t.text,
+                   Align::Center);
+            if (row == key_row && WideKeyAt(key_column) == i)
+                c.RoundRectOutline(x - 6, y - 6, w + 12, kKeyH + 12, 10, 4.5f, cursor);
+        }
+    }
+    DrawBottomBar(c, {{Glyph::Triangle, "Cancel"}, {Glyph::Circle, "Delete"}, {Glyph::Options, "OK"},
+                      {Glyph::Cross, "Enter"}});
 }
 
 } // namespace Ui

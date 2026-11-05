@@ -37,6 +37,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
@@ -196,6 +197,11 @@ PadState g_pad_state;
 // touchpad touches it now; both under g_pad_mutex
 InputCommon::TouchScreen* g_touch = nullptr;
 bool g_touching = false;
+// (04.64) The controller's motion sensors on player 1's controller; the Switch user's nickname and
+// icon (SetUser)
+bool g_motion_controls = true;
+std::string g_user_nickname;
+std::vector<uint8_t> g_user_icon;
 
 std::mutex g_output_mutex;
 LineSink g_sink = nullptr;
@@ -321,8 +327,10 @@ void ApplyLauncherSettings() {
         player.analogs[i] = fmt::format(
             "engine:virtual_gamepad,port:0,axis_x:{},axis_y:{},deadzone:0.0,range:1.0", i * 2, i * 2 + 1);
     }
+    // (04.64) both motion sensors (a Pro Controller reads the first; a pair of Joy-Con, both) from
+    // the PS4 controller's (SetMotion)
     for (auto& motion : player.motions) {
-        motion = "";
+        motion = g_motion_controls ? "engine:virtual_gamepad,port:0,motion:0" : "";
     }
     // (04.59) The touch screen, from the PS4 controller's touchpad (SetTouch), at Eden's own defaults
     // (frontend_common/config.cpp; this launcher doesn't read its config files)
@@ -331,6 +339,47 @@ void ApplyLauncherSettings() {
     Settings::values.touchscreen.diameter_x = 90;
     Settings::values.touchscreen.diameter_y = 90;
     Settings::values.touchscreen.rotation_angle = 0;
+}
+
+// (04.64) The Switch user every game sees (SetUser): the launcher's nickname and icon on Eden's first
+// user, whose id (and so whose saves) stays; written only when they differ from what's there.
+void ApplyUser(Core::System& system) {
+    auto& profiles = system.GetProfileManager();
+    const auto uuid = profiles.GetUser(0);
+    if (!uuid) {
+        return;
+    }
+    Service::Account::ProfileBase base{};
+    if (!g_user_nickname.empty() && profiles.GetProfileBase(*uuid, base)) {
+        Service::Account::ProfileUsername name{};
+        std::copy_n(g_user_nickname.begin(), std::min(g_user_nickname.size(), name.size()), name.begin());
+        if (name != base.username) {
+            base.username = name;
+            profiles.SetProfileBase(*uuid, base); // (writes profiles.dat)
+        }
+    }
+    if (!g_user_icon.empty()) {
+        // where the account service reads it (core/hle/service/acc/acc.cpp, GetImagePath)
+        const std::filesystem::path path = Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir) /
+                                           "system/save/8000000000000010/su/avators" /
+                                           (uuid->FormattedString() + ".jpg");
+        std::vector<uint8_t> current;
+        std::error_code size_error;
+        const auto size = std::filesystem::file_size(path, size_error);
+        if (std::FILE* f = size_error ? nullptr : std::fopen(path.c_str(), "rb")) {
+            current.resize(size_t(size));
+            current.resize(std::fread(current.data(), 1, current.size(), f));
+            std::fclose(f);
+        }
+        if (current != g_user_icon) {
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(g_user_icon.data(), 1, g_user_icon.size(), f);
+                std::fclose(f);
+            }
+        }
+    }
 }
 
 // Why a game didn't load, in words that say what to do about it: the keys and the firmware
@@ -482,6 +531,24 @@ void SetPad(const PadState& state) {
         g_gamepad->SetStickPosition(0, Stick::Right, state.rx, state.ry);
     }
     g_pad_state = state;
+}
+
+void SetMotion(const MotionState& state) {
+    std::scoped_lock lock{g_pad_mutex};
+    if (!g_gamepad || !g_motion_controls) {
+        return;
+    }
+    g_gamepad->SetMotionState(0, state.delta_us, state.gyro_x, state.gyro_y, state.gyro_z, state.accel_x,
+                              state.accel_y, state.accel_z);
+}
+
+void SetMotionControls(bool on) {
+    g_motion_controls = on;
+}
+
+void SetUser(std::string nickname, std::vector<uint8_t> icon_jpeg) {
+    g_user_nickname = std::move(nickname);
+    g_user_icon = std::move(icon_jpeg);
 }
 
 void SetTouch(const TouchState& state) {
@@ -713,6 +780,7 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             Core::System system;
             system.Initialize();
             system.ApplySettings();
+            ApplyUser(system);
             HeadlessWindow headless{frames};
             ConsoleWindow console;
             Core::Frontend::EmuWindow& window = g_gpu_display ? static_cast<Core::Frontend::EmuWindow&>(console)

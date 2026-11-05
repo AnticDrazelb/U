@@ -7,7 +7,7 @@ OUT="${OUT:-$PWD/ui-preview-out}"
 CXX="${CXX:-clang++}"
 mkdir -p "$OUT"
 bin="$OUT/ui-preview"
-"$CXX" -std=c++20 -O2 -I"$HERE/src" -DEDEN_PS4_UI_FONTS="\"$HERE/ui-fonts\"" \
-    "$HERE/src/ui/canvas.cpp" "$HERE/src/ui/fonts.cpp" "$HERE/src/ui/art.cpp" "$HERE/src/ui/home_menu.cpp" "$HERE/src/ui/loading_screen.cpp" \
+"$CXX" -std=c++20 -O2 -I"$HERE/src" -DEDEN_PS4_UI_FONTS="\"$HERE/ui-fonts\"" -DEDEN_PS4_UI_ART="\"$HERE/ui-art\"" \
+    "$HERE/src/ui/canvas.cpp" "$HERE/src/ui/fonts.cpp" "$HERE/src/ui/art.cpp" "$HERE/src/ui/home_menu.cpp" "$HERE/src/ui/loading_screen.cpp" "$HERE/src/ui/avatars.cpp" \
     "$HERE/src/ui/preview.cpp" -o "$bin"
 "$bin" "$OUT"

@@ -30,11 +30,18 @@ if (PS4)
         INCLUDE_DIRECTORIES ${EDEN_PS4_REPO}/port)
 
     # The HOME menu (ui/), with its fonts (../ui-fonts) included whole
-    set(EDEN_PS4_UI_SOURCES ui/canvas.cpp ui/fonts.cpp ui/art.cpp ui/home_menu.cpp ui/nro.cpp ui/loading_screen.cpp)
+    set(EDEN_PS4_UI_SOURCES ui/canvas.cpp ui/fonts.cpp ui/art.cpp ui/home_menu.cpp ui/nro.cpp ui/loading_screen.cpp
+                            ui/avatars.cpp)
     set(EDEN_PS4_UI_FONTS ${CMAKE_CURRENT_LIST_DIR}/../ui-fonts)
     set_source_files_properties(ui/fonts.cpp PROPERTIES
         COMPILE_DEFINITIONS EDEN_PS4_UI_FONTS="${EDEN_PS4_UI_FONTS}"
         OBJECT_DEPENDS "${EDEN_PS4_UI_FONTS}/Inter-Regular.otf;${EDEN_PS4_UI_FONTS}/Inter-SemiBold.otf")
+    # (04.64) the user icons' art (../ui-art, made by ../tools/avatars), included whole; stb's JPEG writer
+    set(EDEN_PS4_UI_ART ${CMAKE_CURRENT_LIST_DIR}/../ui-art)
+    set_source_files_properties(ui/avatars.cpp PROPERTIES
+        COMPILE_DEFINITIONS EDEN_PS4_UI_ART="${EDEN_PS4_UI_ART}"
+        OBJECT_DEPENDS "${EDEN_PS4_UI_ART}/avatars.png"
+        COMPILE_OPTIONS "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")
     # (stb's single-file libraries, compiled in canvas.cpp, aren't warning-clean)
     set_source_files_properties(ui/canvas.cpp PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")

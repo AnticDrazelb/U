@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace Launcher {
 
@@ -63,6 +64,21 @@ struct TouchState {
     float x = 0, y = 0;
 };
 void SetTouch(const TouchState& state);
+/// (04.64) The controller's motion sensors, in Eden's units and axes (as its SDL driver gives
+/// them): gyro in turns a second, accel in G; `delta_us` since the last sample. Any thread;
+/// ignored while no program runs.
+struct MotionState {
+    float gyro_x = 0, gyro_y = 0, gyro_z = 0;
+    float accel_x = 0, accel_y = 0, accel_z = 0;
+    uint64_t delta_us = 0;
+};
+void SetMotion(const MotionState& state);
+/// (04.64) Player 1's controller has motion sensors (off: games see none). Set it before Boot.
+void SetMotionControls(bool on);
+/// (04.64) The Switch user every game sees: the nickname (at most 10 characters, as the
+/// Switch's) and the icon, a 256x256 JPEG (empty: Eden's own). Set it before Boot; the user
+/// keeps its id (its saves), only these change.
+void SetUser(std::string nickname, std::vector<uint8_t> icon_jpeg);
 
 /// The PS4's own display for programs: Eden's Vulkan renderer draws on the console's GPU (Mesa's
 /// RADV) straight to the screen, which the platform gives up while a program runs, and nothing

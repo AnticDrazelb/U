@@ -225,5 +225,45 @@ int main(int argc, char** argv)
     HomeMenu white = MakeMenu(true);
     Press(white, kRight);
     Shot(white, "home-white");
+
+    // (04.64) the user's icon, its User Page, the icon's choice and the keyboard
+    HomeMenu user = MakeMenu(false);
+    Press(user, kUp);
+    Shot(user, "user-home");
+    Press(user, kCross);
+    Shot(user, "user-page");
+    Press(user, kDown);
+    Press(user, kCross);
+    for (int i = 0; i < 3; i++)
+        Press(user, kRight);
+    Press(user, kDown);
+    Shot(user, "user-icon-character");
+    Press(user, kCross);
+    for (int i = 0; i < 4; i++)
+        Press(user, kRight);
+    Shot(user, "user-icon-colour");
+    const MenuAction chosen = user.Update(kCross, g_now);
+    std::printf("icon chosen: %s, %d on %d\n", chosen.kind == MenuAction::Kind::SettingsChanged ? "saved" : "not saved",
+                user.Settings().avatar, user.Settings().avatar_color);
+    user.Update(0, g_now += 0.05);
+    Press(user, kUp);
+    Press(user, kCross);
+    for (int i = 0; i < 6; i++)
+        Press(user, kCircle); // "Player" deleted
+    // "Alex", the cursor left on Shift
+    for (const uint32_t key : {kDown, kCross, kRight, kRight, kRight, kRight, kRight, kRight, kRight, kRight, kCross,
+                               kUp, kLeft, kLeft, kLeft, kLeft, kLeft, kLeft, kCross, kDown, kDown, kLeft, kCross, kDown})
+        Press(user, key);
+    Shot(user, "user-keyboard");
+    const MenuAction named = user.Update(kOptions, g_now);
+    std::printf("nickname: %s (%s)\n", user.Settings().nickname.c_str(),
+                named.kind == MenuAction::Kind::SettingsChanged ? "saved" : "not saved");
+    user.Update(0, g_now += 0.05);
+    Shot(user, "user-page-changed");
+    HomeMenu user_white = MakeMenu(true);
+    Press(user_white, kUp);
+    Press(user_white, kCross);
+    Press(user_white, kCross);
+    Shot(user_white, "user-keyboard-white");
     return 0;
 }

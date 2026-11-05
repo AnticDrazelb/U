@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.64: **a User Page and motion controls.** The HOME screen's user icon opens the User Page: the
+nickname and icon games show for the player (an on-screen keyboard; 30 original characters on 12
+colours), set as Eden's user at each boot. The controller's motion sensors are the Switch controller's
+(System Settings, Console, Motion Controls).
+
 04.63: **a loading screen.** From choosing a game until its first frame the screen shows its name and
 icon, what it's doing (loading, building shaders with a progress bar, starting) instead of black:
 the launcher draws it until the game display opens, then the display draws it (patch 0148,

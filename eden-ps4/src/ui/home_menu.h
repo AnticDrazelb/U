@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -49,6 +50,9 @@ struct Title
     Image icon;            // its own icon, when known (else its art, else a cover)
 };
 
+// The Switch's limit for a user's nickname
+constexpr size_t kNicknameLength = 10;
+
 struct MenuSettings
 {
     bool white_theme = false;
@@ -72,6 +76,11 @@ struct MenuSettings
     int speed = 100;              // game speed in percent of the Switch's: 100, 150 or 200
     bool touchpad_minus = false;  // (04.59) the touchpad's click is the Minus button; off: the touch screen
     bool serial_draws = false;    // (04.60) Draw Order: One at a Time (each draw waits, caches flushed); off: Parallel
+    bool motion_controls = true;  // (04.64) the controller's motion sensors are the Switch controller's
+    // (04.64) the Switch user, as games see it: the nickname (at most kNicknameLength characters) and
+    // the icon, a character on a background colour (ui/avatars.h)
+    std::string nickname = "Player";
+    int avatar = 0, avatar_color = 0;
     std::string games_folder;  // Game Folder: games, keys and firmware also looked for here, in all its
                                // folders (as Crema's): a USB drive or any folder (empty: none)
 };
@@ -136,7 +145,7 @@ public:
     void Draw(Canvas& canvas, double now);
 
 private:
-    enum class Screen { Home, AllSoftware, Settings, News, Games, Controllers, Report, Folder };
+    enum class Screen { Home, AllSoftware, Settings, News, Games, Controllers, Report, Folder, User, Icon, Keyboard };
     enum class DialogKind { Message, Quit, TitleInfo, NoKeys, ConfirmDelete };
     struct Dialog
     {
@@ -188,6 +197,13 @@ private:
     void DrawReport(Canvas& c);
     void DrawFolder(Canvas& c, double now);
     void DrawDialog(Canvas& c, double now);
+    // (04.64) the User Page, its icon's choice (a character, then its colour) and the keyboard
+    void DrawUser(Canvas& c, double now);
+    void DrawIconPicker(Canvas& c, double now);
+    void DrawKeyboard(Canvas& c, double now);
+    MenuAction KeyboardPress(uint32_t pressed, uint32_t moves);
+    // the user's icon, size x size units, round (made once for each size and colour)
+    const Image& Avatar(int character, int color, float size, float scale);
     void DrawHeader(Canvas& c, Icon icon, uint32_t icon_color, const std::string& text);
     void DrawBottomBar(Canvas& c, const std::vector<std::pair<Glyph, std::string>>& hints);
     uint32_t Cursor(double now) const;
@@ -204,7 +220,8 @@ private:
 
     Screen screen = Screen::Home;
     std::vector<Dialog> dialogs;
-    // Home: the row (0, tiles) or the buttons (1); the tile (HomeCount() is All Software) and button
+    // Home: the user's icon (-1), the row (0, tiles) or the buttons (1); the tile (HomeCount() is All
+    // Software) and button
     int home_row = 0;
     size_t home_tile = 0;
     int home_button = 0;
@@ -227,6 +244,15 @@ private:
     std::vector<FolderRow> folder_rows;
     int folder_selected = 0;
     float folder_scroll = 0;
+    // (04.64) the User Page's item (0 nickname, 1 icon); the icon's choice: its step (0 the
+    // character, 1 the colour) and what's chosen so far; the keyboard: the text, the key (row, column),
+    // whether the next letter is a capital
+    int user_item = 0;
+    int icon_step = 0, icon_character = 0, icon_color = 0;
+    std::string keyboard_text;
+    int key_row = 1, key_column = 0;
+    bool key_shift = true;
+    std::map<std::tuple<int, int, int>, Image> avatars;
     // Buttons held before, and when a held direction repeats
     uint32_t held_before = 0;
     double repeat_at = 0, last_draw = 0;

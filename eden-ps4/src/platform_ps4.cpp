@@ -54,6 +54,7 @@
 #include "common/ps4_diagnostics.h"
 #include "common/ps4_perf.h"
 #include "launcher.h"
+#include "ui/avatars.h"
 #include "ui/canvas.h"
 #include "ui/home_menu.h"
 #include "ui/loading_screen.h"
@@ -605,6 +606,11 @@ void OpenPad()
             g_touch_max_y = float(info.touchResolutionY - 1);
         }
         Trace(fmt::format("pad: touchpad {}x{}", g_touch_max_x + 1, g_touch_max_y + 1));
+        // (04.64) the motion sensors on (the header declares it without its parameters: the handle and
+        // whether they're on)
+        using SetMotionSensorState = int32_t (*)(int32_t handle, bool enable);
+        const int32_t motion = reinterpret_cast<SetMotionSensorState>(&scePadSetMotionSensorState)(g_pad, true);
+        Trace(fmt::format("pad: scePadSetMotionSensorState = {:#x}", uint32_t(motion)));
     }
 }
 uint32_t PadButtons()
@@ -643,6 +649,64 @@ Launcher::PadState ToSwitchPad(const OrbisPadData& pad)
     state.rx = axis(pad.rightStick.x);
     state.ry = -axis(pad.rightStick.y);
     return state;
+}
+
+// (04.64) The controller's motion sensors, as Eden's SDL driver turns SDL's into its own: the PS4's
+// axes are SDL's for a controller held in front of you (x to the right, y up out of its face, z
+// towards you), the acceleration in G and the angular velocity in radians a second; Eden's are
+// turns a second and G, its y and z SDL's z and y. Which of the two vectors after the orientation
+// is the accelerometer isn't left to the header's names: at rest it reads about 1 G and the other
+// about nothing, so the first 40 samples that say so decide (and the boot trace says which).
+struct MotionReader
+{
+    uint64_t last_timestamp = 0;
+    float last[6] = {};
+    double last_time = 0;
+    int votes_first = 0, votes_second = 0;
+    int accel = -1; // -1: not known yet; 0: the first vector (the SDK's order), 1: the second
+};
+bool ReadMotion(const OrbisPadData& pad, MotionReader& reader, Launcher::MotionState& out)
+{
+    const float v1[3] = {pad.vel.x, pad.vel.y, pad.vel.z}, v2[3] = {pad.acell.x, pad.acell.y, pad.acell.z};
+    // the same sample as the last poll's (its time and readings unchanged)
+    if (pad.timestamp == reader.last_timestamp && std::equal(v1, v1 + 3, reader.last) &&
+        std::equal(v2, v2 + 3, reader.last + 3))
+        return false;
+    reader.last_timestamp = pad.timestamp;
+    std::copy(v1, v1 + 3, reader.last);
+    std::copy(v2, v2 + 3, reader.last + 3);
+    const auto length = [](const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+    if (reader.accel < 0)
+    {
+        const float l1 = length(v1), l2 = length(v2);
+        if (l1 > 0.85f && l1 < 1.15f && l2 < 0.25f)
+            reader.votes_first++;
+        else if (l2 > 0.85f && l2 < 1.15f && l1 < 0.25f)
+            reader.votes_second++;
+        if (std::max(reader.votes_first, reader.votes_second) < 40)
+            return false;
+        reader.accel = reader.votes_first >= reader.votes_second ? 0 : 1;
+        Trace(fmt::format("pad: motion sensors: the accelerometer is the {} vector ({} to {} samples at rest); "
+                          "acceleration ({:.2f}, {:.2f}, {:.2f}) G",
+                          reader.accel == 0 ? "first" : "second", std::max(reader.votes_first, reader.votes_second),
+                          std::min(reader.votes_first, reader.votes_second), (reader.accel ? v2 : v1)[0],
+                          (reader.accel ? v2 : v1)[1], (reader.accel ? v2 : v1)[2]));
+    }
+    const float* a = reader.accel == 0 ? v1 : v2;
+    const float* w = reader.accel == 0 ? v2 : v1;
+    const double now = Seconds();
+    const double elapsed = reader.last_time > 0 ? now - reader.last_time : 0.004;
+    reader.last_time = now;
+    constexpr float kTurn = 2 * 3.14159265f;
+    out.accel_x = -a[0];
+    out.accel_y = a[2];
+    out.accel_z = -a[1];
+    out.gyro_x = w[0] / kTurn;
+    out.gyro_y = -w[2] / kTurn;
+    out.gyro_z = w[1] / kTurn;
+    // (a pause, as the menu's, doesn't count as one long turn)
+    out.delta_us = uint64_t(std::clamp(elapsed, 0.0005, 0.05) * 1e6);
+    return true;
 }
 
 // (04.59) The Switch's touch screen from the touchpad, as Crema does the Wii U GamePad's: a finger
@@ -778,6 +842,7 @@ void* PadThread(void*)
     constexpr uint32_t kStopButtons = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
     double stop_held_since = -1;
     TouchpadTap tap;
+    MotionReader motion_reader;
     while (g_running)
     {
         union {
@@ -788,6 +853,9 @@ void* PadThread(void*)
         {
             Launcher::SetPad(ToSwitchPad(state.data));
             Launcher::SetTouch(ToSwitchTouch(state.data, tap));
+            Launcher::MotionState motion;
+            if (ReadMotion(state.data, motion_reader, motion))
+                Launcher::SetMotion(motion);
             if ((state.data.buttons & kStopButtons) != kStopButtons)
                 stop_held_since = -1;
             else if (stop_held_since < 0)
@@ -1139,8 +1207,24 @@ Ui::MenuSettings LoadMenuSettings()
             settings.touchpad_minus = true;
         else if (line == "draws=serial")
             settings.serial_draws = true;
+        else if (line == "motion=off")
+            settings.motion_controls = false;
         else if (line.starts_with("games_folder="))
             settings.games_folder = line.substr(13);
+        else if (line.starts_with("nickname="))
+        {
+            // (04.64) printable ASCII, as the keyboard types, and the Switch's length
+            std::string name;
+            for (const char ch : line.substr(9))
+                if (ch >= ' ' && ch <= '~' && name.size() < Ui::kNicknameLength)
+                    name += ch;
+            if (name.find_first_not_of(' ') != std::string::npos)
+                settings.nickname = name;
+        }
+        else if (line.starts_with("avatar="))
+            settings.avatar = std::clamp(std::atoi(line.c_str() + 7), 0, Ui::AvatarCount() - 1);
+        else if (line.starts_with("avatar_color="))
+            settings.avatar_color = std::clamp(std::atoi(line.c_str() + 13), 0, Ui::AvatarColorCount() - 1);
     }
     return settings;
 }
@@ -1151,7 +1235,8 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
-                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\ndraws=%s\n",
+                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\ndraws=%s\nmotion=%s\n"
+                        "nickname=%s\navatar=%d\navatar_color=%d\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1161,7 +1246,9 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
                      settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
-                     settings.touchpad_minus ? "minus" : "touch", settings.serial_draws ? "serial" : "parallel");
+                     settings.touchpad_minus ? "minus" : "touch", settings.serial_draws ? "serial" : "parallel",
+                     settings.motion_controls ? "on" : "off", settings.nickname.c_str(), settings.avatar,
+                     settings.avatar_color);
         // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
         std::fflush(f);
         fsync(fileno(f));
@@ -1407,6 +1494,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.64: a User Page: choose the top left icon for the nickname and icon games show for you, from 30 "
+         "characters on 12 colours, with an on-screen keyboard. Motion controls: the controller's motion "
+         "sensors work in games that steer or aim by tilting (System Settings, Console, to turn them off).\n"
          "04.63: a loading screen instead of a black one from choosing a game until it shows its first "
          "frame: the game's name and icon, what it's doing, and a progress bar while its shaders build. "
          "The shaders build faster at the start, on more of the PS4's cores.\n"
@@ -2881,6 +2971,12 @@ void* Run(void*)
         Launcher::SetUnlockedFrames(settings.unlocked_frames);
         Launcher::SetSpeedPercent(settings.speed);
         g_touchpad_minus = settings.touchpad_minus;
+        Launcher::SetMotionControls(settings.motion_controls);
+        // (04.64) the Switch user games see: the nickname and icon from the User Page (the art is
+        // freed after: the game needs the memory more, and the menu makes it again when it's back)
+        Launcher::SetUser(settings.nickname,
+                          Ui::EncodeJpeg(Ui::MakeAvatar(settings.avatar, settings.avatar_color, 256, false)));
+        Ui::ReleaseAvatarArt();
         // (04.60) read by the driver layer as the game's Vulkan device starts (port/mesa/ac_ps4_drm.c,
         // ps4_serialize_init): One at a Time, every draw waits for the one before and the GPU's caches
         // are flushed in between (04.58-04.59 for every game); Parallel, as up to 04.48
@@ -2907,7 +3003,7 @@ void* Run(void*)
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
             "GPU accuracy {}, frame pacing {}, game speed {}%, draw shortcuts {}, GPU macros {}; CPU {}, {} cores, threads {}, fastmem {}; "
-            "the Switch's RAM {}; touchpad: {}; draw order: {}{}",
+            "the Switch's RAM {}; touchpad: {}; draw order: {}; motion controls {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
@@ -2916,7 +3012,7 @@ void* Run(void*)
             settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.touchpad_minus ? "the Minus button" : "the touch screen",
-            settings.serial_draws ? "one at a time" : "parallel",
+            settings.serial_draws ? "one at a time" : "parallel", settings.motion_controls ? "on" : "off",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
         dynarmic_ps4_block_map_enable(settings.profiler ? 1 : 0);

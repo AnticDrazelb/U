@@ -80,6 +80,25 @@ programs, 0 failures.
   settings' descriptions made generic (below).
 - **04.62:** speed, part 1: wake-up latency and per-submission checks (below).
 - **04.63:** a live loading screen until a game's first frame (below).
+- **04.64:** the User Page (nickname and icon, as games see the Switch user) and motion controls (below).
+
+## 04.64: the User Page, motion controls
+
+- **User Page:** the HOME screen's user icon (Up from the titles) opens it: the user's icon and
+  nickname, and Nickname (an on-screen keyboard, 10 characters as the Switch's) and Icon (one of 30
+  original characters, `ui-art/avatars.png` from `tools/avatars`, then one of 12 background colours).
+  Kept in `menu.txt` (`nickname=`, `avatar=`, `avatar_color=`). At each boot the launcher gives them
+  to `main.cpp` (`SetUser`), which sets Eden's first user's nickname (`ProfileManager::SetProfileBase`,
+  `profiles.dat`) and writes its icon as a 256x256 JPEG where the account service reads it
+  (`nand/system/save/8000000000000010/su/avators/<uuid>.jpg`); the user's id, and so its saves, stays.
+  Before this the nickname was Eden's default, "Eden". The Switch's local users have no birthday
+  (that's the Nintendo Account's).
+- **Motion controls:** the pad's motion sensors are turned on (`scePadSetMotionSensorState`) and each
+  new sample goes to Eden's virtual gamepad (`SetMotionState`, motion 0, mapped to both of player 1's
+  motions) with SDL's axis conversion (the PS4's axes are SDL's; gyro rad/s to turns/s, accel in G).
+  Which of `OrbisPadData`'s two vectors is the accelerometer is decided at the start of each run
+  (about 1 G at rest; the boot trace says which). System Settings, Console, Motion Controls (on by
+  default) turns them off. Controllers lists them.
 
 ## 04.63: the loading screen
 
