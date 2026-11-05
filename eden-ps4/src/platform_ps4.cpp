@@ -52,6 +52,7 @@
 #include "common/cpu_features.h"
 #include "common/orbis_memory.h"
 #include "common/ps4_diagnostics.h"
+#include "common/ps4_game_state.h"
 #include "common/ps4_perf.h"
 #include "launcher.h"
 #include "ui/avatars.h"
@@ -1494,6 +1495,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.69: the loading screen says when a game has stopped with an error, and how to leave it. A test "
+         "build for a game that stops while loading.\n"
          "04.68: two fixes in the CPU translation: a multiply and a sign extension that could get the upper half "
          "of a 64-bit result wrong, and a division by zero that didn't give zero. Games that stopped or "
          "misbehaved because of them can run, at full speed.\n"
@@ -1952,38 +1955,38 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
 }
 
 // (04.67) Games that need the translator set apart from the rest, by the title id in their file's
-// name. None since 04.68: Little Kitty, Big City (01000A4019FA2000), whose SDK heap rejected a block
-// it freed ~9 s into the boot (04.48-04.66), ran with the IR passes off in 04.67; the desktop
-// differential test (tools/jit-difftest) then found what they exposed: the PS4's sign-extended W
-// register reads (04.26) lost their upper half when moved before their use (SMADDL, SMULL, SXTW of a
-// W register get/set elimination read earlier), and Eden's SDIV by zero gave the dividend; both are
-// fixed in the translator (patch 0152). Returns what's set.
+// name; (04.69) and a test build's rotation for one. Little Kitty, Big City (01000A4019FA2000):
+// its SDK heap rejects a block it frees ~9 s into the boot with Eden's IR passes on (04.48-04.66,
+// and 04.68 after patch 0152 fixed what the desktop test found); with them off it gets past that
+// (04.66). Each boot of it now turns off one of the two (EDEN_PS4_JIT_TEST getset, constprop) in
+// turn, counted in game-test-4.txt: the one it runs without is where the rest of the bug is.
+// Other games: nothing changes. Returns what's set.
 std::string GameProfile(const std::string& program)
 {
     unsetenv("EDEN_PS4_MEM_LOG");
     unsetenv("EDEN_PS4_ALIGNED_REST");
     unsetenv("EDEN_PS4_CPU_ACCURACY");
     unsetenv("EDEN_PS4_JIT_TEST");
-    struct Profile
-    {
-        const char* title_id;
-        const char* jit_off;
-        const char* what;
-    };
-    static const Profile profiles[] = {
-        {nullptr, nullptr, nullptr},
-    };
     std::string upper = program;
     for (char& c : upper)
         c = char(std::toupper(static_cast<unsigned char>(c)));
-    for (const Profile& profile : profiles)
+    if (upper.find("01000A4019FA2000") == std::string::npos)
+        return {};
+    const std::string path = std::string(kDataDir) + "/game-test-4.txt";
+    unsigned count = 0;
+    for (const std::string& line : ReadLines(path.c_str()))
+        count = unsigned(std::strtoul(line.c_str(), nullptr, 10));
+    if (FILE* f = std::fopen(path.c_str(), "w"))
     {
-        if (!profile.title_id || upper.find(profile.title_id) == std::string::npos)
-            continue;
-        setenv("EDEN_PS4_JIT_TEST", profile.jit_off, 1);
-        return fmt::format("game profile {}: {}", profile.title_id, profile.what);
+        std::fprintf(f, "%u\n", count + 1);
+        std::fflush(f);
+        fsync(fileno(f));
+        std::fclose(f);
     }
-    return {};
+    const bool getset = count % 2 == 0;
+    setenv("EDEN_PS4_JIT_TEST", getset ? "getset" : "constprop", 1);
+    return fmt::format("game test {} ({} of 2): {}", count + 1, count % 2 + 1,
+                       getset ? "no get/set elimination (getset)" : "no constant propagation (constprop)");
 }
 
 // (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on
@@ -2006,7 +2009,7 @@ void DrawLoadingFrame(Ui::Canvas& canvas)
     namespace D = Common::PS4Diagnostics;
     std::lock_guard lock{g_loading_mutex};
     Ui::DrawLoadingScreen(canvas, g_loading, D::loading_stage.load(), D::loading_done.load(), D::loading_total.load(),
-                          Seconds() - g_loading_start);
+                          Seconds() - g_loading_start, D::guest_exceptions.load() + D::guest_aborts.load() != 0);
 }
 
 // On the launcher's screen, about 7 times a second, until stopped
@@ -3038,8 +3041,9 @@ void* Run(void*)
         setenv("EDEN_PS4_PIN_THREADS", settings.pin_threads ? "1" : "0", 1);
         // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
         setenv("EDEN_PS4_FASTMEM", settings.fastmem ? "1" : "0", 1);
-        if (const std::string profile = GameProfile(program); !profile.empty())
-            Trace(profile);
+        const std::string game_test = GameProfile(program);
+        if (!game_test.empty())
+            Trace(game_test);
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
@@ -3078,6 +3082,9 @@ void* Run(void*)
             {
                 std::lock_guard lock{g_loading_mutex};
                 g_loading = LoadingScreenFor(program, settings.white_theme);
+                // (04.69) which of the test build's setups this boot is
+                if (const size_t at = game_test.find('('); at != std::string::npos)
+                    g_loading.publisher = "Test " + game_test.substr(at + 1, game_test.find(')') - at - 1);
                 g_loading_start = Seconds();
             }
             Common::PS4Diagnostics::loading_stage = 1;

@@ -379,6 +379,9 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.69: **the loading screen says when a game has stopped with an error** (and to hold L3 + R3);
+past 3 minutes, a hint. A test of Little Kitty, Big City's two IR passes apart.
+
 04.68: **two CPU translation bugs fixed** (patch 0152), found with a desktop differential test of
 the translator (`tools/jit-difftest`): the PS4's sign-extended register reads lost their upper half
 when moved (a wrong upper half in SMADDL/SMULL/SXTW results: what broke Little Kitty, Big City's

@@ -85,6 +85,18 @@ programs, 0 failures.
 - **04.66:** its next round: the translator's shortcuts one group at a time (below).
 - **04.67:** Little Kitty, Big City runs with the IR passes off (below).
 - **04.68:** the two translator bugs behind it fixed; no per-game profile (below).
+- **04.69:** the loading screen tells a failed game; Little Kitty's test of the two IR passes apart (below).
+
+## 04.69: the loading screen says when a game failed; the two IR passes apart
+
+- **04.68 on the console:** Little Kitty, Big City still breaks at 15.8 s on the same pointer
+  (`0x1180704800`): patch 0152's bugs were real, not all of it. The harness then got the PS4's
+  memory (an arena with every fourth page left out, the full-offset page table, each block run twice
+  so the declined accesses' walks run) and exclusives: 0 differences in 240,000 more blocks.
+- **04.69:** `Common::PS4Diagnostics::guest_exceptions`/`guest_aborts` (patch 0153): the loading
+  screen says "The game stopped with an error" and to hold L3 + R3; past 3 minutes without a first
+  frame, a hint that it may not be working. Little Kitty's boots alternate get/set elimination off and
+  constant propagation off (`game-test-4.txt`, "Test N of 2").
 
 ## 04.68: two translator bugs fixed (tools/jit-difftest)
 

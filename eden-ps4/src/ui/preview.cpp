@@ -118,6 +118,19 @@ int main(int argc, char** argv)
         std::printf("%s\n", path.c_str());
         loading.icon = {};
         loading.white_theme = true;
+        // (04.69) a game that stopped with an error, and one taking a long time
+        {
+            Canvas failed(1920, 1080, 1.5f);
+            DrawLoadingScreen(failed, loading, 3, 0, 0, 20.0, true);
+            const std::string fail_path = g_out + "/loading-failed.png";
+            stbi_write_png(fail_path.c_str(), failed.Width(), failed.Height(), 4, failed.Pixels(), failed.Width() * 4);
+            std::printf("%s\n", fail_path.c_str());
+            Canvas slow(1920, 1080, 1.5f);
+            DrawLoadingScreen(slow, loading, 3, 0, 0, 200.0, false);
+            const std::string slow_path = g_out + "/loading-slow.png";
+            stbi_write_png(slow_path.c_str(), slow.Width(), slow.Height(), 4, slow.Pixels(), slow.Width() * 4);
+            std::printf("%s\n", slow_path.c_str());
+        }
         Canvas small(1280, 720, 1.0f);
         DrawLoadingScreen(small, loading, 1, 0, 0, 0.7);
         path = g_out + "/loading-game.png";

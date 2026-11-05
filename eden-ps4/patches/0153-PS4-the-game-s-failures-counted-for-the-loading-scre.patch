@@ -1,0 +1,94 @@
+From 84c03dee93b738bc7ca4caa60dce6f74b52cf0d0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 16:44:19 +0000
+Subject: [PATCH] PS4: the game's failures counted for the loading screen;
+ EDEN_PS4_JIT_TEST getset and constprop
+
+Common::PS4Diagnostics::guest_exceptions (ExceptionRaised that isn't a hint) and guest_aborts
+(svcBreak that isn't a notification): the launcher's loading screen says the game stopped with an
+error. The game test's two IR passes apart: getset (GetSetElimination off), constprop (ConstProp off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/common/ps4_game_state.h               | 12 ++++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp |  8 +++++++-
+ src/core/hle/kernel/svc/svc_exception.cpp |  3 +++
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+ create mode 100644 src/common/ps4_game_state.h
+
+diff --git a/src/common/ps4_game_state.h b/src/common/ps4_game_state.h
+new file mode 100644
+index 0000000000..bd657c596b
+--- /dev/null
++++ b/src/common/ps4_game_state.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++
++namespace Common::PS4Diagnostics {
++// (New Eden 04.69) Signs that the running game has failed, for the launcher's loading screen: guest
++// exceptions that aren't hints (an undefined instruction or a breakpoint: a game's own checks, as
++// Little Kitty, Big City's heap break), and svcBreak calls that aren't notifications (a game's abort)
++inline std::atomic<unsigned> guest_exceptions{0}, guest_aborts{0};
++} // namespace Common::PS4Diagnostics
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index d3bc2eac3b..a4c74521e5 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -18,6 +18,7 @@
+ #include <vector>
+ #include "common/ps4_perf.h"
+ #include "common/ps4_mem_log.h"
++#include "common/ps4_game_state.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_64.h"
+@@ -219,6 +220,7 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
+         } else {
+             m_parent.LogBacktrace(m_process);
+             LOG_CRITICAL(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X})", static_cast<std::size_t>(exception), pc, m_memory.Read32(pc));
++            Common::PS4Diagnostics::guest_exceptions.fetch_add(1, std::memory_order_relaxed);
+             if (Common::PS4Diagnostics::MemLogOn()) {
+                 Kernel::Svc::ThreadContext ctx{};
+                 m_parent.GetContext(ctx);
+@@ -529,7 +531,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         using Dynarmic::OptimizationFlag;
+         const std::string_view name{test};
+         const bool linking = name == "linking";
+-        if (name == "monitor") {
++        if (name == "getset") {
++            config.optimizations &= ~OptimizationFlag::GetSetElimination;
++        } else if (name == "constprop") {
++            config.optimizations &= ~OptimizationFlag::ConstProp;
++        } else if (name == "monitor") {
+             config.optimizations &= ~OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+         } else if (name == "fma") {
+             config.optimizations &= ~OptimizationFlag::Unsafe_UnfuseFMA;
+diff --git a/src/core/hle/kernel/svc/svc_exception.cpp b/src/core/hle/kernel/svc/svc_exception.cpp
+index 4f214c6142..3b552d09f5 100644
+--- a/src/core/hle/kernel/svc/svc_exception.cpp
++++ b/src/core/hle/kernel/svc/svc_exception.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cctype>
++#include "common/ps4_game_state.h"
+ #include "core/core.h"
+ #include "core/debugger/debugger.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -21,6 +22,8 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
+     BreakReason break_reason =
+         reason & static_cast<BreakReason>(~BreakReason::NotificationOnlyFlag);
+     bool notification_only = True(reason & BreakReason::NotificationOnlyFlag);
++    if (!notification_only)
++        Common::PS4Diagnostics::guest_aborts.fetch_add(1, std::memory_order_relaxed);
+ 
+     bool has_dumped_buffer{};
+     std::vector<u8> debug_buffer;
+-- 
+2.43.0
+
