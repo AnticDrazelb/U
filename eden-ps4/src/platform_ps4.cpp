@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <csignal>
 #include <setjmp.h>
 #include <signal.h>
@@ -578,6 +579,11 @@ std::vector<std::string> LastCrash(const std::vector<std::string>& log, const La
 
 // The pad of the user who started the app, or none.
 int g_pad = -1;
+// (04.59) The touchpad's coordinate range (the DualShock 4's 1920x943 unless the pad says otherwise),
+// and the HOME menu's Touchpad setting: true, its click is the Minus button (as before 04.59); false,
+// the Switch's touch screen
+float g_touch_max_x = 1919.0f, g_touch_max_y = 942.0f;
+std::atomic<bool> g_touchpad_minus{false};
 void OpenPad()
 {
     Trace("pad: sceUserServiceInitialize");
@@ -589,6 +595,16 @@ void OpenPad()
     scePadInit();
     g_pad = scePadOpen(user, 0, 0, nullptr);
     Trace(fmt::format("pad: scePadOpen = {:#x}", uint32_t(g_pad)));
+    if (g_pad >= 0)
+    {
+        OrbisPadInformation info{};
+        if (scePadGetControllerInformation(g_pad, &info) == 0 && info.touchResolutionX > 1 && info.touchResolutionY > 1)
+        {
+            g_touch_max_x = float(info.touchResolutionX - 1);
+            g_touch_max_y = float(info.touchResolutionY - 1);
+        }
+        Trace(fmt::format("pad: touchpad {}x{}", g_touch_max_x + 1, g_touch_max_y + 1));
+    }
 }
 uint32_t PadButtons()
 {
@@ -602,7 +618,8 @@ uint32_t PadButtons()
 }
 
 // Player 1's controller from the PS4 pad, by the PS4's conventions: Cross is A (confirm),
-// Circle B, Square Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -.
+// Circle B, Square Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -
+// (04.59: with the touch screen on the touchpad, a click with two fingers; one finger touches).
 Launcher::PadState ToSwitchPad(const OrbisPadData& pad)
 {
     static const std::pair<uint32_t, uint32_t> map[] = {
@@ -615,14 +632,79 @@ Launcher::PadState ToSwitchPad(const OrbisPadData& pad)
         {ORBIS_PAD_BUTTON_UP, Launcher::ButtonUp},         {ORBIS_PAD_BUTTON_DOWN, Launcher::ButtonDown},
         {ORBIS_PAD_BUTTON_LEFT, Launcher::ButtonLeft},     {ORBIS_PAD_BUTTON_RIGHT, Launcher::ButtonRight}};
     Launcher::PadState state;
+    const bool touch_click = !g_touchpad_minus.load(std::memory_order_relaxed) && pad.touch.fingers == 1;
     for (const auto& [ps4, nx] : map)
-        if (pad.buttons & ps4)
+        if ((pad.buttons & ps4) && !(ps4 == ORBIS_PAD_BUTTON_TOUCH_PAD && touch_click))
             state.buttons |= nx;
     const auto axis = [](uint8_t v) { return std::clamp((int(v) - 128) / 127.0f, -1.0f, 1.0f); };
     state.lx = axis(pad.leftStick.x);
     state.ly = -axis(pad.leftStick.y);
     state.rx = axis(pad.rightStick.x);
     state.ry = -axis(pad.rightStick.y);
+    return state;
+}
+
+// (04.59) The Switch's touch screen from the touchpad, as Crema does the Wii U GamePad's: a finger
+// resting on it shows a pointer where it would touch (the touchpad is the picture, corner to
+// corner); a click with that one finger touches there, for as long as it's held (sliding drags); a
+// quick tap (down and up within 0.3 s without sliding) touches there for 0.12 s, as on a phone.
+// Two fingers: no touch (their click is the Minus button).
+struct TouchpadTap
+{
+    bool down = false, moved = false;
+    double start = 0, until = 0;
+    float start_x = 0, start_y = 0, x = 0, y = 0;
+};
+Launcher::TouchState ToSwitchTouch(const OrbisPadData& pad, TouchpadTap& tap)
+{
+    Launcher::TouchState state;
+    if (g_touchpad_minus.load(std::memory_order_relaxed))
+        return state;
+    const int fingers = pad.touch.fingers;
+    const bool finger = fingers > 0;
+    float x = 0, y = 0;
+    if (finger)
+    {
+        x = std::clamp(float(pad.touch.touch[0].x) / g_touch_max_x, 0.0f, 1.0f);
+        y = std::clamp(float(pad.touch.touch[0].y) / g_touch_max_y, 0.0f, 1.0f);
+    }
+    bool touching = fingers == 1 && (pad.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD);
+    const double now = Seconds();
+    if (touching)
+        tap.down = false; // a click is a touch already
+    else if (finger)
+    {
+        if (!tap.down)
+        {
+            tap.down = true;
+            tap.moved = fingers != 1;
+            tap.start = now;
+            tap.start_x = x;
+            tap.start_y = y;
+        }
+        else if (fingers != 1 || std::abs(x - tap.start_x) > 0.04f || std::abs(y - tap.start_y) > 0.06f)
+            tap.moved = true;
+    }
+    else if (tap.down)
+    {
+        if (!tap.moved && now - tap.start < 0.3)
+        {
+            tap.until = now + 0.12;
+            tap.x = tap.start_x;
+            tap.y = tap.start_y;
+        }
+        tap.down = false;
+    }
+    if (!touching && now < tap.until)
+    {
+        touching = true;
+        x = tap.x;
+        y = tap.y;
+    }
+    state.pointer = finger || touching;
+    state.touching = touching;
+    state.x = x;
+    state.y = y;
     return state;
 }
 
@@ -694,6 +776,7 @@ void* PadThread(void*)
     scePthreadSetprio(scePthreadSelf(), 600);
     constexpr uint32_t kStopButtons = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
     double stop_held_since = -1;
+    TouchpadTap tap;
     while (g_running)
     {
         union {
@@ -703,6 +786,7 @@ void* PadThread(void*)
         if (g_pad >= 0 && scePadReadState(g_pad, &state.data) == 0 && state.data.connected)
         {
             Launcher::SetPad(ToSwitchPad(state.data));
+            Launcher::SetTouch(ToSwitchTouch(state.data, tap));
             if ((state.data.buttons & kStopButtons) != kStopButtons)
                 stop_held_since = -1;
             else if (stop_held_since < 0)
@@ -1050,6 +1134,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.speed = 150;
         else if (line == "speed=200")
             settings.speed = 200;
+        else if (line == "touchpad=minus")
+            settings.touchpad_minus = true;
         else if (line.starts_with("games_folder="))
             settings.games_folder = line.substr(13);
     }
@@ -1062,7 +1148,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
-                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\n",
+                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1071,7 +1157,8 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.games_folder.c_str(), settings.fps_overlay ? "on" : "off",
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
-                     settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted");
+                     settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
+                     settings.touchpad_minus ? "minus" : "touch");
         // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
         std::fflush(f);
         fsync(fileno(f));
@@ -1317,6 +1404,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.59: the touchpad is the Switch's touch screen (Captain Toad's level 4 needs one). Rest a finger "
+         "on it and a pointer shows where it would touch: the touchpad is the picture, corner to corner. Click "
+         "the touchpad to touch there, and hold the click to drag; a quick tap touches too. The Minus button "
+         "is now a click with two fingers. System Settings, Console, Touchpad: Minus Button puts it back as "
+         "before. Everything else is as 04.58.\n"
          "04.58: 04.57 got level 3 loaded: the old shaders are gone. It then stopped a few seconds later, "
          "after the draws went back to running side by side (right after a loading screen they wait for each "
          "other, and level 3 ran fine while they did). This build makes every draw wait for the one before "
@@ -3197,6 +3289,7 @@ void* Run(void*)
         Launcher::SetFpsOverlay(settings.fps_overlay);
         Launcher::SetUnlockedFrames(settings.unlocked_frames);
         Launcher::SetSpeedPercent(settings.speed);
+        g_touchpad_minus = settings.touchpad_minus;
         {
             // keys and firmware on a USB drive are used from there, else the user folder's
             const Launcher::UsbKeysAndFirmware usb = KeysAndFirmwareOnUsb();
@@ -3219,7 +3312,7 @@ void* Run(void*)
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
             "GPU accuracy {}, frame pacing {}, game speed {}%, draw shortcuts {}, GPU macros {}; CPU {}, {} cores, threads {}, fastmem {}; "
-            "the Switch's RAM {}{}",
+            "the Switch's RAM {}; touchpad: {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
@@ -3227,6 +3320,7 @@ void* Run(void*)
             settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
             settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
+            settings.touchpad_minus ? "the Minus button" : "the touch screen",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
         dynarmic_ps4_block_map_enable(settings.profiler ? 1 : 0);

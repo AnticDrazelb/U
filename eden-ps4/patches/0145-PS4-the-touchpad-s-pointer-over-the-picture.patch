@@ -1,0 +1,115 @@
+From 1ffd440d810d05e065d2631f1842e99ecb7ecf56 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 03:02:42 +0000
+Subject: [PATCH] PS4: the touchpad's pointer over the picture
+
+The PS4 controller's touchpad is the Switch's touch screen (eden-ps4's
+frontend): where a finger rests on it, the present pass draws a cross
+over the picture with clears, as the FPS counter - white while it
+rests, yellow while it touches. The frontend sets
+Vulkan::g_touch_pointer (x and y across the game's picture, shown,
+touching).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ .../present/window_adapt_pass.cpp             | 60 +++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+index f4a78c8c76..c8cb30a16e 100644
+--- a/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
++++ b/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <string>
+ #include <vector>
+@@ -115,8 +116,46 @@ void FpsRects(u32 value, VkExtent2D area, std::vector<VkClearRect>& box, std::ve
+     std::erase_if(box, [](const VkClearRect& r) { return r.rect.extent.width == 0; });
+ }
+ 
++// (PS4) The touchpad's pointer: where a finger on the PS4 controller's touchpad would touch the
++// screen, drawn over the picture with clears (as the FPS counter) - a cross, white while the finger
++// rests, yellow while it touches. The frontend sets it (eden-ps4's PadThread, through
++// Launcher::SetTouch).
++void PointerRects(u64 pointer, const Layout::FramebufferLayout& layout, VkExtent2D area,
++                  std::vector<VkClearRect>& dark, std::vector<VkClearRect>& light) {
++    const auto& screen = layout.screen;
++    const f32 fx = static_cast<f32>(pointer & 0xFFFF) / 65535.0f;
++    const f32 fy = static_cast<f32>((pointer >> 16) & 0xFFFF) / 65535.0f;
++    const s32 cx = static_cast<s32>(screen.left) + static_cast<s32>(fx * static_cast<f32>(screen.GetWidth()));
++    const s32 cy = static_cast<s32>(screen.top) + static_cast<s32>(fy * static_cast<f32>(screen.GetHeight()));
++    const s32 arm = std::max<s32>(static_cast<s32>(area.height) / 48, 7);
++    const s32 thick = std::max<s32>(arm / 4, 2);
++    const s32 edge = std::max<s32>(thick / 2, 1);
++    const auto rect = [&](s32 x, s32 y, s32 w, s32 h) {
++        const s32 left = std::max<s32>(x, 0), top = std::max<s32>(y, 0);
++        const s32 right = std::min<s32>(x + w, static_cast<s32>(area.width));
++        const s32 bottom = std::min<s32>(y + h, static_cast<s32>(area.height));
++        if (right <= left || bottom <= top) {
++            return VkClearRect{};
++        }
++        return VkClearRect{.rect = {.offset = {left, top},
++                                    .extent = {static_cast<u32>(right - left), static_cast<u32>(bottom - top)}},
++                           .baseArrayLayer = 0,
++                           .layerCount = 1};
++    };
++    const s32 half = thick / 2;
++    dark.push_back(rect(cx - arm - edge, cy - half - edge, arm * 2 + thick + edge * 2, thick + edge * 2));
++    dark.push_back(rect(cx - half - edge, cy - arm - edge, thick + edge * 2, arm * 2 + thick + edge * 2));
++    light.push_back(rect(cx - arm, cy - half, arm * 2 + thick, thick));
++    light.push_back(rect(cx - half, cy - arm, thick, arm * 2 + thick));
++    std::erase_if(dark, [](const VkClearRect& r) { return r.rect.extent.width == 0; });
++    std::erase_if(light, [](const VkClearRect& r) { return r.rect.extent.width == 0; });
++}
++
+ } // namespace
+ 
++// (PS4) bits 0-15 x, 16-31 y (0-65535 across the game's picture), bit 32: shown, bit 33: touching
++std::atomic<u64> g_touch_pointer{0};
++
+ WindowAdaptPass::WindowAdaptPass(const Device& device, VkFormat frame_format, vk::Sampler&& sampler_, vk::ShaderModule&& fragment_shader_)
+     : sampler(std::move(sampler_))
+     , fragment_shader(std::move(fragment_shader_))
+@@ -174,6 +213,12 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+         FpsRects(CountFrame(buffer), render_area, fps_box, fps_digits);
+     }
+     const bool fps_red = std::chrono::steady_clock::now() < fps_counter.red_until;
++    std::vector<VkClearRect> pointer_dark, pointer_light;
++    const u64 pointer = g_touch_pointer.load(std::memory_order_relaxed);
++    if (pointer & (u64{1} << 32)) {
++        PointerRects(pointer, layout, render_area, pointer_dark, pointer_light);
++    }
++    const bool pointer_touching = (pointer >> 33) & 1;
+ 
+     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+         const f32 bg_red = Settings::values.bg_red.GetValue() / 255.0f;
+@@ -222,6 +267,21 @@ void WindowAdaptPass::Draw(const Device& device, RasterizerVulkan& rasterizer, S
+             }
+         }
+ 
++        if (!pointer_dark.empty()) {
++            const VkClearAttachment dark{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                                         .colorAttachment = 0,
++                                         .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}}};
++            const VkClearAttachment light{
++                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .colorAttachment = 0,
++                .clearValue = {.color = {.float32 = {1.0f, pointer_touching ? 0.85f : 1.0f,
++                                                     pointer_touching ? 0.1f : 1.0f, 1.0f}}}};
++            cmdbuf.ClearAttachments({dark}, pointer_dark);
++            if (!pointer_light.empty()) {
++                cmdbuf.ClearAttachments({light}, pointer_light);
++            }
++        }
++
+         cmdbuf.EndRenderPass();
+     });
+ }
+-- 
+2.43.0
+

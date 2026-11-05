@@ -7,7 +7,9 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +40,7 @@
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
+#include "input_common/drivers/touch_screen.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "launcher.h"
@@ -52,6 +55,12 @@
 #include "common/orbis_memory.h"
 #endif
 #endif
+
+// (04.59) the touchpad's pointer, drawn by Eden's present pass (renderer_vulkan/present/window_adapt_pass.cpp,
+// patch 0145): bits 0-15 x, 16-31 y (0-65535 across the picture), bit 32 shown, bit 33 touching
+namespace Vulkan {
+extern std::atomic<u64> g_touch_pointer;
+}
 
 namespace Launcher {
 namespace {
@@ -183,6 +192,10 @@ std::string g_keys_dir, g_firmware_dir; // (empty: the user folder's)
 std::mutex g_pad_mutex;
 InputCommon::VirtualGamepad* g_gamepad = nullptr;
 PadState g_pad_state;
+// (04.59) The touch screen (Eden's "touch" engine, which the emulated console reads) and whether the
+// touchpad touches it now; both under g_pad_mutex
+InputCommon::TouchScreen* g_touch = nullptr;
+bool g_touching = false;
 
 std::mutex g_output_mutex;
 LineSink g_sink = nullptr;
@@ -311,6 +324,13 @@ void ApplyLauncherSettings() {
     for (auto& motion : player.motions) {
         motion = "";
     }
+    // (04.59) The touch screen, from the PS4 controller's touchpad (SetTouch), at Eden's own defaults
+    // (frontend_common/config.cpp; this launcher doesn't read its config files)
+    Settings::values.touchscreen.enabled = true;
+    Settings::values.touchscreen.finger = 0;
+    Settings::values.touchscreen.diameter_x = 90;
+    Settings::values.touchscreen.diameter_y = 90;
+    Settings::values.touchscreen.rotation_angle = 0;
 }
 
 // Why a game didn't load, in words that say what to do about it: the keys and the firmware
@@ -462,6 +482,25 @@ void SetPad(const PadState& state) {
         g_gamepad->SetStickPosition(0, Stick::Right, state.rx, state.ry);
     }
     g_pad_state = state;
+}
+
+void SetTouch(const TouchState& state) {
+    std::scoped_lock lock{g_pad_mutex};
+    const float x = std::clamp(state.x, 0.0f, 1.0f), y = std::clamp(state.y, 0.0f, 1.0f);
+    const bool show = g_touch && (state.pointer || state.touching);
+    Vulkan::g_touch_pointer.store(show ? u64(std::lround(x * 65535.0f)) | (u64(std::lround(y * 65535.0f)) << 16) |
+                                             (u64{1} << 32) | (u64(state.touching) << 33)
+                                       : 0,
+                                  std::memory_order_relaxed);
+    if (!g_touch) {
+        return;
+    }
+    if (state.touching) {
+        g_touch->TouchPressed(x, y, 0); // (moves it when it's down already)
+    } else if (g_touching) {
+        g_touch->TouchReleased(0);
+    }
+    g_touching = state.touching;
 }
 
 namespace {
@@ -667,6 +706,8 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
             std::scoped_lock lock{g_pad_mutex};
             g_gamepad = input.GetVirtualGamepad();
             g_pad_state = {};
+            g_touch = input.GetTouchScreen();
+            g_touching = false;
         }
         {
             Core::System system;
@@ -859,6 +900,8 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
                     // services' stacks through the controllers' callbacks)
                     std::scoped_lock pad_lock{g_pad_mutex};
                     g_gamepad = nullptr;
+                    g_touch = nullptr;
+                    Vulkan::g_touch_pointer.store(0, std::memory_order_relaxed);
                 }
                 system.ShutdownMainProcess();
 #ifdef __OPENORBIS__
@@ -869,6 +912,8 @@ BootResult Boot(const std::filesystem::path& program, const std::filesystem::pat
         {
             std::scoped_lock lock{g_pad_mutex};
             g_gamepad = nullptr;
+            g_touch = nullptr;
+            Vulkan::g_touch_pointer.store(0, std::memory_order_relaxed);
         }
         input.Shutdown();
     }

@@ -45,7 +45,7 @@ What runs it:
   there's no GPU emulation.
 - **Controller.** The PS4 pad, read every 4 ms, is player 1's Pro Controller, through Eden's virtual
   gamepad input engine (`Launcher::SetPad`). By the PS4's conventions: Cross is A, Circle B, Square
-  Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, the touchpad's click -, and both sticks.
+  Y, Triangle X; L1/R1 L/R, L2/R2 ZL/ZR, OPTIONS +, a two-finger touchpad click - (04.59; one finger: the touch screen, with a pointer), and both sticks.
 - **Sound.** Patch 0009 adds a frontend sink to Eden's audio (`AudioEngine::Frontend`): each audio
   stream a program opens (`audout`, `audren`) plays through an output the frontend gives it, from a
   thread of its own, in 512-frame buffers. On the PS4 that's an AudioOut port (the system user's
@@ -378,6 +378,12 @@ The boot trace now has a `memory before booting` and `memory after the program` 
 use, flexible memory free, the largest free block of direct memory), and the last session's
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
+
+04.59: **the touchpad is the touch screen.** A finger resting on the PS4 controller's touchpad shows a
+pointer where it would touch (the touchpad maps onto the picture, corner to corner); a click with
+that finger touches there while held (sliding drags), and a quick tap touches too. A two-finger click
+is the Minus button. System Settings, Console, Touchpad: Minus Button restores the old mapping (any
+click is Minus). The pointer is drawn by Eden's present pass (patch 0145).
 
 04.58: **draws serialized all the time.** 04.57 loaded level 3 (no old-window shader left), which then
 hung 0.5-7 s after the post-loading serialization ended, inside a run of 12 scene draws in flight

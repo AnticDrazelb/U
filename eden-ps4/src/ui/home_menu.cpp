@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <string_view>
 #include <dirent.h>
 #include <filesystem>
 #include <sys/stat.h>
@@ -900,7 +901,13 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
                  "The Switch's 4 GB of RAM come out of the PS4's memory as the game first uses them, so what it "
                  "doesn't use is left to the PS4's GPU for textures and buffers: often a few GB instead of about "
                  "half of one. All 4 GB up front is how it was before 03.70: try it if a game fails with this on.",
-                 [](MenuSettings& s) { s.ram_on_demand = !s.ram_on_demand; }}};
+                 [](MenuSettings& s) { s.ram_on_demand = !s.ram_on_demand; }},
+                {"Touchpad", settings.touchpad_minus ? "Minus Button" : "Touch Screen",
+                 "Touch Screen: the controller's touchpad is the Switch's touch screen. A finger resting on it shows "
+                 "a pointer where it would touch (the touchpad is the picture, corner to corner); click the "
+                 "touchpad to touch there, and hold the click to drag; a quick tap touches too. A click with two "
+                 "fingers is the Minus button. Minus Button: any click is Minus, as before 04.59.",
+                 [](MenuSettings& s) { s.touchpad_minus = !s.touchpad_minus; }}};
     default:
         return {};
     }
@@ -1102,22 +1109,28 @@ void HomeMenu::DrawControllers(Canvas& c, double now)
         const char* ps4;
         const char* sw;
     };
+    // (04.59) the touchpad: the touch screen (System Settings, Console, Touchpad), or Minus as before
+    const bool touch = !settings.touchpad_minus;
     const Row rows[] = {
         {Glyph::Cross, true, "", "A"},          {Glyph::Circle, true, "", "B"},
         {Glyph::Triangle, true, "", "X"},       {Glyph::Square, true, "", "Y"},
         {Glyph::L1, false, "L1 / R1", "L / R"}, {Glyph::L1, false, "L2 / R2", "ZL / ZR"},
-        {Glyph::Options, true, "", "+"},        {Glyph::L1, false, "Touchpad click", "\xE2\x88\x92"},
+        {Glyph::Options, true, "", "+"},
+        {Glyph::L1, false, touch ? "Touchpad, 2 fingers" : "Touchpad click", "\xE2\x88\x92"},
+        {Glyph::L1, false, "Touchpad, 1 finger", "Touch screen"},
         {Glyph::L1, false, "L3 + R3, held 1 s", "Stops the software"},
     };
     float y = 150;
     for (const Row& row : rows)
     {
+        if (!touch && std::string_view(row.sw) == "Touch screen")
+            continue;
         if (row.has_glyph)
             DrawGlyph(c, row.glyph, 690, y - 7, t.text, t.bg);
         else
             c.Text(676, y, row.ps4, 18, Weight::Regular, t.text);
         c.Text(900, y, row.sw, 19, Weight::SemiBold, t.accent);
-        y += 40;
+        y += touch ? 36 : 40; // (the touch screen's row in the same height)
     }
     c.Text(676, y + 6, "PS4 button", 15, Weight::Regular, t.dim);
     c.Text(900, y + 6, "Switch button", 15, Weight::Regular, t.dim);

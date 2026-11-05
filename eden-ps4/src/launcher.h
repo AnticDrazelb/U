@@ -54,6 +54,15 @@ struct PadState {
 };
 /// Sets player 1's controller state. Any thread; ignored while no program runs.
 void SetPad(const PadState& state);
+/// (04.59) The Switch's touch screen, from the PS4 controller's touchpad: `touching` presses it at
+/// (x, y) (0-1 across the picture, from the top left); `pointer` shows a pointer there (Eden's Vulkan
+/// renderer draws it). Any thread; ignored while no program runs.
+struct TouchState {
+    bool pointer = false;
+    bool touching = false;
+    float x = 0, y = 0;
+};
+void SetTouch(const TouchState& state);
 
 /// The PS4's own display for programs: Eden's Vulkan renderer draws on the console's GPU (Mesa's
 /// RADV) straight to the screen, which the platform gives up while a program runs, and nothing

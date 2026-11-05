@@ -1,7 +1,7 @@
-# Eden for PS4: status (after 04.58)
+# Eden for PS4: status (after 04.59)
 
-Install **04.58** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
-The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.59** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+The patches are in `eden-ps4/patches` (up to 0145). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -73,6 +73,24 @@ programs, 0 failures.
   the window now in RADV's cache UUID (below).
 - **04.58:** level 3 loads; it hangs once draws overlap again: every draw serialized, all the time
   (`RADV_PS4_SERIALIZE`, below).
+- **04.59:** the touchpad as the Switch's touch screen, with a pointer (below).
+
+## 04.59: the touchpad as the touch screen
+
+- **04.58 on a console (no logs sent):** level 3 crashed on its first load, then loaded and was
+  completed twice in the same run; level 4 plays, but needs the touch screen.
+- **04.59:** the frontend's pad thread (`ToSwitchTouch`, platform_ps4.cpp) does what Crema does for
+  the Wii U GamePad: one finger resting shows a pointer (the touchpad, 1920x943 or what
+  `scePadGetControllerInformation` says, mapped corner to corner onto the picture); a one-finger
+  click touches there while held (sliding drags); a tap (down and up within 0.3 s, moved less than
+  4% / 6%) touches for 0.12 s. A two-finger click (or one with no finger reported) is Minus. The
+  touch goes to Eden's "touch" engine (`InputSubsystem::GetTouchScreen()`, which the emulated
+  console reads for the HID touch screen), through `Launcher::SetTouch` (main.cpp; touch screen
+  settings at Eden's defaults: diameter 90, angle 0). The pointer: patch 0145 draws a cross with
+  clears in the present pass (`window_adapt_pass.cpp`, as the FPS counter) from
+  `Vulkan::g_touch_pointer`; white resting, yellow touching. System Settings, Console, Touchpad:
+  Minus Button (`touchpad=minus` in menu.txt) is the old mapping; the Controllers page shows which.
+  Not on the software renderer's frames (no pointer there; the touch still works).
 
 ## 04.58: draws serialized all the time
 
