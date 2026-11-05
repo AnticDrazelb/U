@@ -1583,6 +1583,9 @@ struct ps4_check {
    uint64_t trace_va;
    uint32_t first_trace, cur_trace;
    unsigned skip_from, skip_to, skipped_by_place;
+   /* (04.54) the test arms (RADV_PS4_TEST_ARMS, bits): 1 = CB_TARGET_MASK cut to MRT0, 2 = Z32F depth
+    * detached (DB_Z_INFO format to Z_INVALID); how many register writes each changed */
+   unsigned arms, arm_cb, arm_z;
 };
 
 /* The hole that [va, va + bytes) touches, or NULL. */
@@ -1666,6 +1669,31 @@ ps4_check_report(struct ps4_check *c, uint64_t seq, const void *packet, const ch
    return true;
 }
 
+/* (04.54) An image descriptor's (T#'s, gfx7) smallest possible footprint in bytes: level 0's pitch x
+ * height x bits per texel x its slices (array layers or 3D depth), without tiling padding or the other
+ * levels; 0 when the data format isn't a plain one. */
+static uint64_t
+ps4_tsharp_min_bytes(const uint32_t *t)
+{
+   static const uint8_t bits[64] = {
+      [1] = 8, [2] = 16, [3] = 16, [4] = 32, [5] = 32, [6] = 32, [7] = 32, [8] = 32, [9] = 32, [10] = 32,
+      [11] = 64, [12] = 64, [13] = 96, [14] = 128, [16] = 16, [17] = 16, [18] = 16, [19] = 16, [20] = 32,
+      [21] = 32, [22] = 64, [34] = 32, [35] = 4, [36] = 8, [37] = 8, [38] = 4, [39] = 8, [40] = 8, [41] = 8,
+   };
+   const unsigned b = bits[(t[1] >> 20) & 0x3f];
+   if (!b)
+      return 0;
+   const uint64_t height = ((t[2] >> 14) & 0x3fff) + 1;
+   const uint64_t pitch = ((t[4] >> 13) & 0x3fff) + 1;
+   const unsigned type = t[3] >> 28;
+   uint64_t slices = 1;
+   if (type == 10) /* 3D */
+      slices = (t[4] & 0x1fff) + 1;
+   else if (type == 11 || type == 12 || type == 13 || type == 15) /* cube, arrays */
+      slices = ((t[5] >> 13) & 0x1fff) + 1;
+   return pitch * height * b / 8 * slices;
+}
+
 /* A descriptor set (or table) at `ptr`: its V#s and T#s, each one's base checked. A quad is taken
  * for a descriptor only when it looks like one (channel selects set; a V# with records and a data
  * format, a T# of an image type) and its base is inside the GPU windows; and a bad one only counts in
@@ -1720,10 +1748,18 @@ ps4_check_set(struct ps4_check *c, uint64_t seq, const void *packet, const char 
          const uint64_t base = (d[j] | ((uint64_t)(d1 & 0xff) << 32)) << 8;
          if (base && ps4_in_gpu_windows(c->dev, base)) {
             const struct ps4_hole *h = ps4_hole_at(c, base, 1);
+            const struct ps4_live_range *r = ps4_live_at(c, base);
+            /* (04.54) the least the image can cover: level 0's pitch x height x slices x bits per
+             * texel (no padding, no further levels); past its buffer by more than 64 KiB, the TA
+             * reads off the end (as bad a wedge for it as a bad address) */
+            const uint64_t lower = ps4_tsharp_min_bytes(&d[j]);
             if (h) {
                holes_hit++;
                ps4_check_hole_report(c, seq, packet, work, "image descriptor at", base, h);
-            } else if (ps4_live_at(c, base))
+            } else if (r && lower && base + lower > r->end + (64u << 10)) {
+               if (!bad_over++ && !bad_wild)
+                  first_va = base, first_bytes = lower, first_r = r, first_what = "image descriptor";
+            } else if (r)
                valid++;
             else if (!bad_wild++ && !bad_over)
                first_va = base, first_bytes = 0, first_r = NULL, first_what = "image descriptor at";
@@ -1942,6 +1978,21 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
          case 0x69: /* SET_CONTEXT_REG: kept for the render targets' check */
             for (unsigned k = 1; k < body; k++) {
                const unsigned reg = (b[0] & 0xffff) + k - 1;
+               if (c->arms && skip) { /* (04.54) the test arms: rewritten in place */
+                  uint32_t v = b[k];
+                  if ((c->arms & 1) && reg == 0x8e && (v & ~0xfu)) {
+                     v &= 0xf;
+                     c->arm_cb++;
+                  }
+                  if ((c->arms & 2) && reg == 0x10 && (v & 3) == 3) {
+                     v &= ~3u;
+                     c->arm_z++;
+                  }
+                  if (v != b[k]) {
+                     b[k] = v;
+                     ps4_flush_cpu_cache(&b[k], 4);
+                  }
+               }
                if (reg < 0x400) {
                   c->ctx[reg] = b[k];
                   c->ctx_seen[reg >> 5] |= 1u << (reg & 31);
@@ -2171,6 +2222,12 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
       if (skip_to <= skip_from)
          skip_from = skip_to = 0;
    }
+   static int arms = -1;
+   if (arms < 0) {
+      const char *e = getenv("RADV_PS4_TEST_ARMS");
+      arms = e ? (int)strtoul(e, NULL, 0) : 3; /* (04.54: both on by default) */
+   }
+   c.arms = (unsigned)arms;
    if (first_big && skip_to) {
       c.trace_va = ps4_trace_va;
       c.first_trace = first_trace;
@@ -2199,10 +2256,11 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    }
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_check_ib(&c, dcb[i], sizes[i] / 4, seq, 0, skip);
-   size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; config regs %u, register "
+   size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; test arms: %u target "
+                               "masks cut, %u Z32F depths detached; config regs %u, register "
                                "writes %u, waits %u, copies %u, GDS %u, streamout %u, register loads %u, other %u",
-                               c.wild, c.overruns, c.skipped, c.config_regs, c.reg_writes, c.reg_waits, c.reg_copies,
-                               c.gds, c.streamout, c.loads, c.unknown);
+                               c.wild, c.overruns, c.skipped, c.arm_cb, c.arm_z, c.config_regs, c.reg_writes,
+                               c.reg_waits, c.reg_copies, c.gds, c.streamout, c.loads, c.unknown);
    for (unsigned u = 0; u < c.num_unknown_ops && n < out_size; u++)
       n += (size_t)snprintf(out + n, out_size - n, "%s%#x", u ? "," : " (", c.unknown_ops[u]);
    if (c.num_unknown_ops && n < out_size)
@@ -2235,10 +2293,12 @@ struct ps4_pf {
    uint8_t *stages;
    unsigned *num_shaders, max_shaders;
    unsigned new_shaders;
-   /* (04.48) what user data points to (descriptor sets, vertex buffer tables): 64 bytes of each */
+   /* (04.48) what user data points to (descriptor sets, vertex buffer tables): 64 bytes of each; (04.54)
+    * as 64-byte-aligned chunks, 1 KiB from each pixel shader pointer in the period's first record */
    uint64_t va_start, va32_start;
    unsigned num_mem;
-   uint64_t mem[4096];      /* a hash set (0: empty) */
+   bool big;
+   uint64_t mem[16384];     /* a hash set of chunk addresses (0: empty) */
    char buf[16384];         /* (last: everything before it is reset for each submission) */
 };
 
@@ -2267,9 +2327,9 @@ ps4_pf_printf(struct ps4_pf *pf, const char *fmt, ...)
 /* User data values that could be pointers into the GPU windows: 32-bit ones into the 32-bit window
  * (RADV's descriptor sets on gfx7), and low/high pairs into the 16 GiB one. */
 static void
-ps4_pf_add_mem(struct ps4_pf *pf, uint64_t va)
+ps4_pf_add_chunk(struct ps4_pf *pf, uint64_t va)
 {
-   if (!va || (va & 3) || pf->num_mem >= ARRAY_SIZE(pf->mem) / 2)
+   if (!va || pf->num_mem >= ARRAY_SIZE(pf->mem) / 2)
       return;
    for (unsigned h = (unsigned)((va >> 2) * 2654435761u) % ARRAY_SIZE(pf->mem);; h = (h + 1) % ARRAY_SIZE(pf->mem)) {
       if (pf->mem[h] == va)
@@ -2280,6 +2340,15 @@ ps4_pf_add_mem(struct ps4_pf *pf, uint64_t va)
          return;
       }
    }
+}
+
+static void
+ps4_pf_add_mem(struct ps4_pf *pf, uint64_t va, unsigned bytes)
+{
+   if (!va || (va & 3))
+      return;
+   for (uint64_t c = va & ~63ull; c < va + bytes; c += 64)
+      ps4_pf_add_chunk(pf, c);
 }
 
 static bool
@@ -2370,11 +2439,12 @@ ps4_pf_ib(struct ps4_pf *pf, uint64_t va, unsigned num_dw, int depth)
             for (unsigned k = 1; k < body; k++) {
                const unsigned reg = (b[0] & 0xffff) + k - 1;
                if (ps4_pf_is_user_data(reg)) {
+                  const unsigned bytes = pf->big && reg >= 0x00c && reg < 0x01c ? 1024 : 64;
                   if (pf->va32_start)
-                     ps4_pf_add_mem(pf, pf->va32_start + b[k]);
+                     ps4_pf_add_mem(pf, pf->va32_start + b[k], bytes);
                   const uint64_t pair = k + 1 < body ? b[k] | ((uint64_t)b[k + 1] << 32) : 0;
                   if (pf->va_start && pair >= pf->va_start && pair < pf->va_start + (16ull << 30))
-                     ps4_pf_add_mem(pf, pair);
+                     ps4_pf_add_mem(pf, pair, bytes);
                }
                static const unsigned lo_reg[PS4_STAGES] = {0x148, 0x108, 0x0c8, 0x088, 0x048, 0x008, 0x20c};
                for (unsigned s = 0; s < PS4_STAGES; s++) {
@@ -2406,13 +2476,14 @@ static uint64_t
 ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes, unsigned num_ibs,
                   uint32_t first_trace, uint32_t last_trace, uint64_t *shaders, uint8_t *stages,
                   unsigned *num_shaders, unsigned max_shaders, uint64_t bytes_before, unsigned *ibs_out,
-                  unsigned *new_shaders_out, uint64_t va_start, uint64_t va32_start)
+                  unsigned *new_shaders_out, uint64_t va_start, uint64_t va32_start, bool big)
 {
    static struct ps4_pf pf; /* (under dev->lock) */
    memset(&pf, 0, offsetof(struct ps4_pf, buf));
    pf.fd = fd;
    pf.va_start = va_start;
    pf.va32_start = va32_start;
+   pf.big = big;
    pf.bytes = bytes_before;
    pf.shaders = shaders;
    pf.stages = stages;
@@ -2428,7 +2499,7 @@ ps4_pf_submission(int fd, uint64_t seq, void *const *dcb, const uint32_t *sizes,
    /* (04.48) 64 bytes at each user data pointer, mapped ones: "m <address>: <16 dwords>" */
    unsigned dumped = 0;
    if (pf.num_mem && !ps4_pf_full(&pf)) {
-      ps4_pf_printf(&pf, "=== memory at user data pointers (64 bytes each)\n");
+      ps4_pf_printf(&pf, "=== memory at user data pointers (64-byte chunks)\n");
       for (unsigned h = 0; h < ARRAY_SIZE(pf.mem) && !ps4_pf_full(&pf); h++) {
          const uint32_t *d = pf.mem[h] ? ps4_hw_read(pf.mem[h], 64) : NULL;
          if (!d)
@@ -2555,7 +2626,7 @@ ps4_preflight(ac_drm_device *dev, uint64_t seq, void *const *dcb, const uint32_t
    uint64_t bytes = ps4_pf_submission(ps4_pf_fd, seq, dcb, sizes, num_ibs, first_trace, last_trace,
                                       ps4_pf_shaders, ps4_pf_stages, &ps4_pf_num_shaders,
                                       ARRAY_SIZE(ps4_pf_shaders), ps4_pf_bytes, &ibs, &new_shaders,
-                                      dev->va_start, dev->va32_start);
+                                      dev->va_start, dev->va32_start, ps4_pf_count == 1);
    if (ps4_pf_count <= 2)
       bytes += ps4_pf_buffers(dev, ps4_pf_fd);
    ps4_pf_bytes += bytes;

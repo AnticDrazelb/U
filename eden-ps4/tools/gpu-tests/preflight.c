@@ -158,11 +158,11 @@ int main(int argc, char** argv) {
         uint64_t bytes = sizeof(head) - 1;
         void* dcb1[1] = {(void*)(uintptr_t)0x4400100000ull};
         uint32_t sz1[1] = {a.n * 4};
-        bytes += ps4_pf_submission(fd, 1, dcb1, sz1, 1, 1, 5, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull);
+        bytes += ps4_pf_submission(fd, 1, dcb1, sz1, 1, 1, 5, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull, true);
         check(ibs == 3 && fresh == 2 && num_shaders == 2, "submission 1: 3 IBs, 2 new shaders");
         void* dcb2[1] = {(void*)(uintptr_t)0x4400130000ull};
         uint32_t sz2[1] = {d.n * 4};
-        bytes += ps4_pf_submission(fd, 2, dcb2, sz2, 1, 6, 8, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull);
+        bytes += ps4_pf_submission(fd, 2, dcb2, sz2, 1, 6, 8, shaders, stages, &num_shaders, 64, bytes, &ibs, &fresh, 0x4400000000ull, 0x4400000000ull, true);
         check(ibs == 1 && fresh == 1 && num_shaders == 3, "submission 2: 1 IB, 1 new shader (the CS one again isn't)");
         const off_t size = lseek(fd, 0, SEEK_CUR);
         check((uint64_t)size == bytes, "bytes counted = the file's size");
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
         void* dcb[2] = {(void*)(uintptr_t)0x4401000000ull, (void*)(uintptr_t)0x4401000000ull};
         uint32_t sz[2] = {dw * 4, dw * 4};
         unsigned n2 = 0;
-        const uint64_t bytes = ps4_pf_submission(fd, 9, dcb, sz, 2, 0, 0, shaders, stages, &num_shaders, 64, 0, &ibs, &n2, 0, 0);
+        const uint64_t bytes = ps4_pf_submission(fd, 9, dcb, sz, 2, 0, 0, shaders, stages, &num_shaders, 64, 0, &ibs, &n2, 0, 0, false);
         close(fd);
         struct stat st;
         stat(big, &st);
@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
         void* dcb[1] = {(void*)(uintptr_t)(base + at * 4)};
         uint32_t sz[1] = {(4096 - at) * 4};
         unsigned n3 = 0, j = 0;
-        ps4_pf_submission(fd, 10, dcb, sz, 1, 0, 0, shaders, stages, &num_shaders, 64, 0, &j, &n3, 0x4400000000ull, 0x4402000000ull);
+        ps4_pf_submission(fd, 10, dcb, sz, 1, 0, 0, shaders, stages, &num_shaders, 64, 0, &j, &n3, 0x4400000000ull, 0x4402000000ull, true);
         close(fd);
         reset_regions();
     }

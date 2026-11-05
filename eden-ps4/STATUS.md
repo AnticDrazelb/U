@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.53)
+# Eden for PS4: status (after 04.54)
 
-Install **04.53** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.54** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -64,7 +64,31 @@ programs, 0 failures.
 - **04.50:** the mapping audit (below).
 - **04.51:** the probe write and the skip test at Toad's address (below).
 - **04.52:** the test skip of level 3's first 4-target scene draw (below).
-- **04.53:** no HTILE on any depth buffer (`RADV_DEBUG=nohiz`): the likely fix (below).
+- **04.53:** no HTILE on any depth buffer (`RADV_DEBUG=nohiz`): not the fix (below).
+- **04.54:** image descriptor footprints checked; test arms (MRT0 only, no Z32F depth); full PS
+  descriptor sets in the record; HTILE back on (below).
+
+## 04.54: not HTILE; three tests in one run
+
+- **04.53's run:** HTILE was off (every depth draw's `DB_Z_INFO` without TILE_SURFACE_ENABLE:
+  0x80000001 / 0x80000003), and level 3 stopped as before: the first 4-target scene draw (at 439 in
+  this run) finished and the CP stopped 2 trace ids later, on the copy into 0x43fdcfc100 again. So not
+  HTILE. Not occlusion counting or real depth tests either: the game's depth-only draws (Z16, offsets
+  25-277, `DB_COUNT_CONTROL` 0x11000102, ZFUNC LEQUAL) all finished. The border color table
+  (`TA_BC_BASE_ADDR`) is set and mapped. Left: the 4 color targets, the Z32F depth test, and the
+  scene shaders' texture fetches (`IMAGE_SAMPLE`/`_L`, T#s loaded from 192-688 bytes into the
+  descriptor set, past the record's 64 bytes). A wedged TA fits the stops best: the draw finishes and
+  the next texture-unit work (a copy's buffer load, or 04.51 run 1's TC flush) never does.
+- **04.54** (all in the noted submissions after a loading gap):
+  - the descriptor check also checks each image descriptor's least footprint (level 0's pitch x
+    height x bits x slices) against its buffer: far past it, the draw is skipped and logged;
+  - test arms (`RADV_PS4_TEST_ARMS`, bits, default 3): 1 = `CB_TARGET_MASK` cut to MRT0, 2 = Z32F
+    depth detached (`DB_Z_INFO` format to Z_INVALID); counted in each note;
+  - the record keeps 1 KiB at every pixel shader user data pointer in the period's first record
+    (64-byte chunks), so `gpu-preflight.py` decodes every T# (with its footprint) the scene reads;
+  - HTILE back on (`RADV_DEBUG=nohiz` in settings.txt to turn it off).
+- **Reading the next run:** a T# footprint line: likely the cause. Level 3 through without one: CB or
+  DB (then one arm at a time). Still stuck: the texture side; the record has the descriptors.
 
 ## 04.53: HTILE off (the first real depth tests on a Z32F + HTILE buffer hang the GPU)
 

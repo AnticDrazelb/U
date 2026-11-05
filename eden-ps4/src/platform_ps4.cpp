@@ -1317,6 +1317,12 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.54: turning off the depth compression didn't help (it's back on now). Level 3's scene draws "
+         "finish, but the GPU locks up within a few steps of the first one. This build tries three things "
+         "at once after a loading screen: checks every texture those draws read against its memory (and leaves "
+         "out a draw whose texture runs off the end), draws them into one image instead of four, and without "
+         "their depth buffer. Expect level 3's first frames to look wrong if it gets through. If it still "
+         "stops, the record now has every texture and sampler the scene reads.\n"
          "04.53: 04.52's run moved the stop to exactly the next draw of the same kind, and this time that draw "
          "itself never finished: level 3's scene drawing is the cause. Those draws are the first real depth "
          "tests on a 32-bit depth buffer with the GPU's depth compression data (HTILE); everything that worked "
@@ -3100,11 +3106,8 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
-    // (04.53) No HTILE (the depth unit's compression and hierarchical Z data) for any depth buffer:
-    // Captain Toad's level 3 hangs the GPU on its first real depth tests (LEQUAL) of a Z32F depth
-    // buffer with HTILE; RADV's own ZFUNC=ALWAYS clears and copies on it work. RADV_DEBUG= (empty) in
-    // settings.txt brings HTILE back.
-    setenv("RADV_DEBUG", "nohiz", 0);
+    // (04.53 set RADV_DEBUG=nohiz here: no HTILE on any depth buffer. 04.53's run hung the same way
+    // without it, so 04.54 leaves HTILE on again; RADV_DEBUG=nohiz in settings.txt still turns it off.)
     // (04.42) draws with a geometry shader or tessellation, and RADV's writes of those rings'
     // registers (the system's on the PS4), are counted and the first ones logged; with
     // RADV_PS4_SKIP_GS_TESS=1 in settings.txt they become no-ops (04.42's test, its default). 04.43

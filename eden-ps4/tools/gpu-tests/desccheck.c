@@ -187,6 +187,15 @@ int main(void) {
     run("a valid set", 0xc00, 0, 0, false);
     // a value pointing into no buffer: nothing
     run("a push constant that is no pointer", 0x12345678, 0, 0, false);
+    // (04.54) set E: two valid, and a 1024x1024 RGBA8 T# (4 MiB at least) in the 256 KiB image buffer
+    uint32_t* eset = sets + 0xe00 / 4;
+    vsharp(eset, 0x10100000ull, 0x100);
+    tsharp(eset + 4, 0x10200000ull);
+    tsharp(eset + 12, 0x10200000ull);
+    eset[12 + 1] |= 10u << 20;                    // 8_8_8_8
+    eset[12 + 2] = 1023u | (1023u << 14);         // 1024x1024
+    eset[12 + 4] = 1023u << 13;                   // pitch 1024
+    run("an image descriptor 4 MiB over its 256 KiB buffer", 0xe00, 0, 1, true);
     // (04.48) render targets: the image buffer is 0x600000200000 + 256 KiB
     run_rt("a color target in a live buffer (32x32, 8 bytes a pixel)", 0x10200100ull, 15, 1, 0, 0, 0, false);
     run_rt("a color target in no buffer", 0x10300000ull, 15, 1, 0, 1, 0, true);

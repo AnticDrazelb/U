@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.54: **not HTILE; three tests in one run.** 04.53 ran with HTILE off and stopped the same way, 2 trace
+ids after the first 4-target scene draw. After a loading gap, image descriptors' footprints are now
+checked against their buffers (a draw whose texture runs off its buffer is skipped), multi-target draws
+write MRT0 only and Z32F depth is detached (`RADV_PS4_TEST_ARMS`, default 3), and the period's first
+record keeps 1 KiB at every pixel shader user data pointer. HTILE is back on.
+
 04.53: **HTILE off.** With 04.52's draw left out, the stop moved exactly to the next draw of the same
 kind, which itself never finished: level 3's 4-target scene draws. They are the first real depth tests
 (LEQUAL, with an occlusion query) on a Z32F depth buffer with HTILE; the draws that worked on it before

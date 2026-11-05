@@ -325,6 +325,37 @@ def targets(state, buffers):
     return out
 
 
+IMG_BITS = {1: 8, 2: 16, 3: 16, 4: 32, 5: 32, 6: 32, 7: 32, 8: 32, 9: 32, 10: 32, 11: 64, 12: 64, 13: 96, 14: 128,
+            16: 16, 17: 16, 18: 16, 19: 16, 20: 32, 21: 32, 22: 64, 34: 32, 35: 4, 36: 8, 37: 8, 38: 4, 39: 8, 40: 8,
+            41: 8}
+
+
+def tsharp_min_bytes(d):
+    """The least an image descriptor can cover (as ac_ps4_drm.c's ps4_tsharp_min_bytes)."""
+    b = IMG_BITS.get((d[1] >> 20) & 0x3F)
+    if not b:
+        return 0
+    height = ((d[2] >> 14) & 0x3FFF) + 1
+    pitch = ((d[4] >> 13) & 0x3FFF) + 1
+    t = d[3] >> 28
+    slices = (d[4] & 0x1FFF) + 1 if t == 10 else ((d[5] >> 13) & 0x1FFF) + 1 if t in (11, 12, 13, 15) else 1
+    return pitch * height * b // 8 * slices
+
+
+def mem_read(sub, ptr, ndw):
+    """Dwords at `ptr` from the record: 64-byte chunks (04.54), or the exact pointer's 64 bytes before."""
+    if ptr in sub.mem and ptr % 64:
+        return sub.mem[ptr][:ndw]
+    out = []
+    for i in range(ndw):
+        a = ptr + 4 * i
+        c = sub.mem.get(a & ~63)
+        if c is None:
+            break
+        out.append(c[(a & 63) // 4])
+    return out
+
+
 def descriptors(words, buffers):
     """V#s and T#s among 16 dwords at a user data pointer, each against the buffers."""
     out, j = [], 0
@@ -342,9 +373,12 @@ def descriptors(words, buffers):
             base = (d[0] | ((d[1] & 0xFF) << 32)) << 8
             width = ((d[2] & 0x3FFF) + 1)
             height = ((d[2] >> 14) & 0x3FFF) + 1
-            out.append("T# at +%d: %#x, %dx%d, data format %d, levels %d-%d, tile mode %d, pitch %d, type %d: %s" % (
+            lower = tsharp_min_bytes(d)
+            out.append("T# at +%d: %#x, %dx%d, data format %d, levels %d-%d, tile mode %d, pitch %d, type %d, "
+                       "slices %d-%d, at least %#x bytes: %s" % (
                 4 * j, base, width, height, (d[1] >> 20) & 0x3F, (d3 >> 12) & 0xF, (d3 >> 16) & 0xF,
-                (d3 >> 20) & 0x1F, ((d[4] >> 13) & 0x3FFF) + 1, d3 >> 28, in_buffer(buffers, base)))
+                (d3 >> 20) & 0x1F, ((d[4] >> 13) & 0x3FFF) + 1, d3 >> 28, d[5] & 0x1FFF, (d[5] >> 13) & 0x1FFF,
+                lower, in_buffer(buffers, base, lower)))
             j += 8
         else:
             j += 4
@@ -365,7 +399,7 @@ def work_details(op, state, sub, buffers):
             if v is None:
                 continue
             for ptr in (WINDOWS[1] + v,):
-                words = sub.mem.get(ptr)
+                words = mem_read(sub, ptr, 256 if st == "PS" else 16)
                 if words:
                     found = descriptors(words, buffers)
                     lines.append("%s user data %d -> %#x: %s" % (st, k, ptr, "; ".join(found) if found else
