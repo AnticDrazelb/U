@@ -379,6 +379,9 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.66: **the next test build** for Little Kitty, Big City: 04.65 found it runs with every
+recompiler optimisation off; each boot now turns off one group of them (patch 0151).
+
 04.65: **a test build** for Little Kitty, Big City, which stops ~9 s into its boot on a heap check:
 each boot of it logs its memory calls and tries one of three setups in turn (patch 0150).
 

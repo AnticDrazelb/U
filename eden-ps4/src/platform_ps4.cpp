@@ -1494,6 +1494,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.66: a test build: the next round of diagnostics for a game that stops while it loads. Nothing else "
+         "changes.\n"
          "04.65: a test build: extra diagnostics for a game that stops while it loads. Nothing else changes.\n"
          "04.64: a User Page: choose the top left icon for the nickname and icon games show for you, from 30 "
          "characters on 12 colours, with an on-screen keyboard. Motion controls: the controller's motion "
@@ -1950,18 +1952,20 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
 
 // (04.65) A test build's rotation for a game whose heap goes wrong early (Little Kitty, Big City,
 // 01000A4019FA2000): each boot of it logs its memory calls and dumps what its registers point at
-// when its heap check fails (EDEN_PS4_MEM_LOG), and tries the next of three setups in turn, from a
-// count kept in game-test.txt: 1 as set; 2 Eden's own single-page allocation in place of the PS4's
-// 16 KiB-aligned one (EDEN_PS4_ALIGNED_REST=0); 3 every recompiler optimisation off
-// (EDEN_PS4_CPU_ACCURACY=paranoid). Other games: nothing changes. Returns the test's description.
+// when its heap check fails (EDEN_PS4_MEM_LOG), and tries the next setup in turn, from a count kept
+// in game-test-2.txt. 04.65's three found it runs with CPU accuracy Paranoid (every recompiler
+// optimisation off) and no other way; (04.66) so each boot now turns one group of them off
+// (EDEN_PS4_JIT_TEST, arm_dynarmic_64.cpp), the most likely first: the one that runs names it.
+// Other games: nothing changes. Returns the test's description.
 std::string GameTest(const std::string& program)
 {
     unsetenv("EDEN_PS4_MEM_LOG");
     unsetenv("EDEN_PS4_ALIGNED_REST");
     unsetenv("EDEN_PS4_CPU_ACCURACY");
+    unsetenv("EDEN_PS4_JIT_TEST");
     if (program.find("01000A4019FA2000") == std::string::npos && program.find("01000a4019fa2000") == std::string::npos)
         return {};
-    const std::string path = std::string(kDataDir) + "/game-test.txt";
+    const std::string path = std::string(kDataDir) + "/game-test-2.txt";
     unsigned count = 0;
     for (const std::string& line : ReadLines(path.c_str()))
         count = unsigned(std::strtoul(line.c_str(), nullptr, 10));
@@ -1973,18 +1977,17 @@ std::string GameTest(const std::string& program)
         std::fclose(f);
     }
     setenv("EDEN_PS4_MEM_LOG", "1", 1);
-    switch (count % 3)
-    {
-    case 1:
-        setenv("EDEN_PS4_ALIGNED_REST", "0", 1);
-        return fmt::format("game test {} (2 of 3): Eden's own page allocation (no 16 KiB-aligned rests)", count + 1);
-    case 2:
-        setenv("EDEN_PS4_CPU_ACCURACY", "paranoid", 1);
-        return fmt::format("game test {} (3 of 3): CPU accuracy paranoid (every recompiler optimisation off)",
-                           count + 1);
-    default:
-        return fmt::format("game test {} (1 of 3): the settings as set", count + 1);
-    }
+    static const std::pair<const char*, const char*> tests[] = {
+        {"monitor", "the cores' exclusive accesses checked against each other"},
+        {"dispatch", "no inline return and indirect jump lookups, forward links checking for halts"},
+        {"ir", "no IR optimisation passes"},
+        {"linking", "no block linking, return stack or fast dispatch"},
+        {"fma", "fused multiply-adds kept fused"},
+    };
+    constexpr unsigned kTests = sizeof(tests) / sizeof(tests[0]);
+    const auto& [name, what] = tests[count % kTests];
+    setenv("EDEN_PS4_JIT_TEST", name, 1);
+    return fmt::format("game test {} ({} of {}): {} ({})", count + 1, count % kTests + 1, kTests, what, name);
 }
 
 // (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on

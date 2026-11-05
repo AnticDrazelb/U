@@ -1,0 +1,71 @@
+From 5bb84a6136a5281deaf96b15d1af0ef99629c571 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 14:05:56 +0000
+Subject: [PATCH] PS4: EDEN_PS4_JIT_TEST, one group of the 64-bit translator's
+ shortcuts off (a game test)
+
+monitor (Unsafe_IgnoreGlobalMonitor), fma (Unsafe_UnfuseFMA), ir (get/set elimination, constant
+propagation, misc), dispatch (the PS4's inline RSB pop and fast dispatch, forward links without the
+halt check), linking (block linking, RSB, fast dispatch, and the PS4's three): Little Kitty, Big City
+runs only with CPU accuracy Paranoid.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 33 +++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 530d921ab3..d3bc2eac3b 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ #include "common/ps4_perf.h"
+ #include "common/ps4_mem_log.h"
+@@ -517,6 +518,38 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     default:
+         break;
+     }
++    // (New Eden 04.66) EDEN_PS4_JIT_TEST: one group of the translator's shortcuts off, the launcher's
++    // test of a game that runs only with all of them off (Little Kitty, Big City with Paranoid):
++    // "monitor" the cores' exclusive accesses checked against each other again (Auto's
++    // Unsafe_IgnoreGlobalMonitor off), "fma" fused multiply-adds as such (Unsafe_UnfuseFMA off), "ir"
++    // the IR passes (get/set elimination, constant propagation, the others), "dispatch" the PS4's
++    // inline return and indirect jump lookups and forward links without the halt check, "linking"
++    // block linking, the return stack and fast dispatch (and the PS4's three with them)
++    if (const char* test = std::getenv("EDEN_PS4_JIT_TEST"); test && test[0]) {
++        using Dynarmic::OptimizationFlag;
++        const std::string_view name{test};
++        const bool linking = name == "linking";
++        if (name == "monitor") {
++            config.optimizations &= ~OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
++        } else if (name == "fma") {
++            config.optimizations &= ~OptimizationFlag::Unsafe_UnfuseFMA;
++        } else if (name == "ir") {
++            config.optimizations &= ~OptimizationFlag::GetSetElimination;
++            config.optimizations &= ~OptimizationFlag::ConstProp;
++            config.optimizations &= ~OptimizationFlag::MiscIROpt;
++        } else if (linking) {
++            config.optimizations &= ~OptimizationFlag::BlockLinking;
++            config.optimizations &= ~OptimizationFlag::ReturnStackBuffer;
++            config.optimizations &= ~OptimizationFlag::FastDispatch;
++        }
++        if (linking || name == "dispatch") {
++            config.link_forward_without_halt_check = false;
++            config.inline_rsb_pop = false;
++            config.inline_fast_dispatch = false;
++        }
++        LOG_WARNING(Core_ARM, "jit test {} on core {}: optimizations {:#x}", name, m_core_index,
++                    static_cast<u32>(config.optimizations));
++    }
+ #ifdef __OPENORBIS__
+     // The arena covers 2^bits of the Switch's addresses (Auto's 64, no check, would reach past it)
+     config.fastmem_address_space_bits =
+-- 
+2.43.0
+

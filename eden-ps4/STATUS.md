@@ -82,6 +82,21 @@ programs, 0 failures.
 - **04.63:** a live loading screen until a game's first frame (below).
 - **04.64:** the User Page (nickname and icon, as games see the Switch user) and motion controls (below).
 - **04.65:** a test build for Little Kitty, Big City's heap failure (below).
+- **04.66:** its next round: the translator's shortcuts one group at a time (below).
+
+## 04.66: Little Kitty, Big City: which translator shortcut
+
+- **04.65's result:** test 3 (CPU accuracy Paranoid, `Dynarmic::no_optimizations`, fastmem kept)
+  reached the main menu and loaded the first level, slowly; tests 1 (as set) and 2 (Eden's own
+  allocation) stopped as before. So one of the 64-bit translator's shortcuts that Auto has and
+  Paranoid doesn't breaks the game: Auto's `Unsafe_IgnoreGlobalMonitor` and `Unsafe_UnfuseFMA`,
+  the IR passes (`GetSetElimination`, `ConstProp`, `MiscIROpt`), `BlockLinking`,
+  `ReturnStackBuffer`, `FastDispatch`, and the PS4's `inline_rsb_pop`, `inline_fast_dispatch` and
+  `link_forward_without_halt_check` (gated on those). (The PS4's 04.22-04.30 extras are already off
+  with Auto.)
+- **04.66:** patch 0151, `EDEN_PS4_JIT_TEST` (monitor, dispatch, ir, linking, fma): each boot of the
+  game turns one group off, in that order (`game-test-2.txt`; the loading screen says "Test N of 5").
+  The translation cache's fingerprint has the flags, so each test translates afresh.
 
 ## 04.65: Little Kitty, Big City's test build
 
