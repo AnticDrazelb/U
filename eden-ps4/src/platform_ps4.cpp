@@ -1317,6 +1317,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.56: 04.55's fixes all ran, and level 3's first scene draw now never finished at all (before it "
+         "finished and the GPU stopped right after): the cause is in that draw. This build keeps every 04.55 fix "
+         "and, right after a loading screen, swaps the scene draws' shaders for blank ones (no textures, nothing "
+         "drawn). Level 3 will look empty if it gets through; that tells us the shaders are the cause.\n"
          "04.55: the kitchen sink. 04.54's run cleared the four images and the depth buffer: level 3's scene "
          "draws still lock the GPU with one image and no depth. What they do that every draw that worked doesn't: "
          "pass 5-7 values from the vertex to the pixel shader, and read textures. This build switches on every "

@@ -1586,7 +1586,113 @@ struct ps4_check {
    /* (04.54) the test arms (RADV_PS4_TEST_ARMS, bits): 1 = CB_TARGET_MASK cut to MRT0, 2 = Z32F depth
     * detached (DB_Z_INFO format to Z_INVALID); how many register writes each changed */
    unsigned arms, arm_cb, arm_z;
+   /* (04.56) arms 4 and 8: the scene draws' pixel shader / main vertex shader replaced by a trivial
+    * one; the PS program address as set so far, how many shaders were replaced */
+   uint32_t pgm_ps[2];
+   unsigned arm_ps, arm_vs;
 };
+
+static const struct ps4_live_range *ps4_live_at(const struct ps4_check *c, uint64_t va);
+
+/* (04.56) Shaders already replaced (their addresses; for the session). */
+static uint64_t ps4_patched_shaders[512];
+static unsigned ps4_num_patched_shaders;
+
+/* Writes `n` dwords of `code` over the shader at `va`, once: only where it lies in a live buffer, is
+ * mapped and is longer than `code` (no s_endpgm in its first n dwords). */
+static bool
+ps4_patch_shader(struct ps4_check *c, uint64_t va, const uint32_t *code, unsigned n, const char *what)
+{
+   if (!va)
+      return false;
+   for (unsigned i = 0; i < ps4_num_patched_shaders; i++)
+      if (ps4_patched_shaders[i] == va)
+         return true;
+   const struct ps4_live_range *r = ps4_live_at(c, va);
+   uint32_t *p = (uint32_t *)(uintptr_t)va;
+   if (!r || va + 4ull * n > r->end || !ps4_mapped(p, 4ull * n) ||
+       ps4_num_patched_shaders >= ARRAY_SIZE(ps4_patched_shaders))
+      return false;
+   for (unsigned k = 0; k < n; k++)
+      if (p[k] == 0xbf810000u) /* s_endpgm: shorter than the replacement */
+         return false;
+   memcpy(p, code, 4ull * n);
+   ps4_flush_cpu_cache(p, 4ull * n);
+   ps4_patched_shaders[ps4_num_patched_shaders++] = va;
+   static unsigned logged;
+   if (logged < 24) {
+      logged++;
+      char line[200];
+      snprintf(line, sizeof(line), "radv/ps4: test arm: the %s at %#llx replaced by a trivial one (%u dwords)", what,
+               (unsigned long long)va, n);
+      ps4_boot_trace(line);
+   }
+   return true;
+}
+
+/* A pixel shader exporting zeros to each target SPI_SHADER_COL_FORMAT has (or the null target). */
+static unsigned
+ps4_trivial_ps(uint32_t col_format, uint32_t *code)
+{
+   unsigned n = 0, last = 8;
+   code[n++] = 0x7e000280; /* v_mov_b32 v0, 0 */
+   for (unsigned t = 0; t < 8; t++)
+      if ((col_format >> (4 * t)) & 0xf)
+         last = t;
+   for (unsigned t = 0; t < 8 && last < 8; t++) {
+      const unsigned f = (col_format >> (4 * t)) & 0xf;
+      if (!f)
+         continue;
+      const bool compr = f >= 4 && f <= 8;
+      const unsigned en = compr ? 0xf : f == 1 ? 0x1 : f == 2 ? 0x3 : f == 3 ? 0x9 : 0xf;
+      code[n++] = 0xf8000000u | (t == last ? (1u << 11) | (1u << 12) : 0) | (compr ? 1u << 10 : 0) | (t << 4) | en;
+      code[n++] = 0; /* v0 for every source */
+   }
+   if (last == 8) { /* exp null off, off, off, off done vm */
+      code[n++] = 0xf8001890;
+      code[n++] = 0;
+   }
+   code[n++] = 0xbf810000; /* s_endpgm */
+   return n;
+}
+
+/* A main vertex shader exporting `params` zero parameters and position (0, 0, 0, 1): nothing drawn. */
+static unsigned
+ps4_trivial_vs(unsigned params, uint32_t *code)
+{
+   unsigned n = 0;
+   code[n++] = 0x7e000280; /* v_mov_b32 v0, 0 */
+   code[n++] = 0x7e0202f2; /* v_mov_b32 v1, 1.0 */
+   for (unsigned i = 0; i < params && i < 32; i++) {
+      code[n++] = 0xf800020fu + (i << 4); /* exp param<i> v0, v0, v0, v0 */
+      code[n++] = 0;
+   }
+   code[n++] = 0xf80008cf; /* exp pos0 v0, v0, v0, v1 done */
+   code[n++] = 0x01000000;
+   code[n++] = 0xbf810000; /* s_endpgm */
+   return n;
+}
+
+/* The arms on a draw with 3 or more interpolants (the scene draws; the copies have 1): PS (4) and main
+ * VS (8, the address the vertex prolog jumps to: VS user data 2-3). */
+static void
+ps4_check_arm_shaders(struct ps4_check *c, const uint32_t *vs_ud)
+{
+   if (!(c->arms & 0xc) || (c->ctx[0x1b6] & 0x3f) < 3) /* SPI_PS_IN_CONTROL.NUM_INTERP */
+      return;
+   uint32_t code[80];
+   if ((c->arms & 4) && !c->ctx[0x1c4]) { /* SPI_SHADER_Z_FORMAT: no depth export */
+      const uint64_t ps = ((uint64_t)c->pgm_ps[0] << 8) | ((uint64_t)(c->pgm_ps[1] & 0xff) << 40);
+      const unsigned n = ps4_trivial_ps(c->ctx[0x1c5], code);
+      c->arm_ps += ps4_patch_shader(c, ps, code, n, "pixel shader");
+   }
+   if ((c->arms & 8) && (c->ctx[0x1c3] & ~0xfu) == 0 && !(c->ctx[0x207] & 0x7000000)) {
+      /* SPI_SHADER_POS_FORMAT: POS0 only; PA_CL_VS_OUT_CNTL: no misc or clip distance vectors */
+      const uint64_t vs = vs_ud[2] | ((uint64_t)vs_ud[3] << 32);
+      const unsigned n = ps4_trivial_vs(((c->ctx[0x1b1] >> 1) & 0x1f) + 1, code);
+      c->arm_vs += ps4_patch_shader(c, vs, code, n, "main vertex shader");
+   }
+}
 
 /* The hole that [va, va + bytes) touches, or NULL. */
 static const struct ps4_hole *
@@ -1961,6 +2067,8 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
          case 0x76: /* SET_SH_REG */
             for (unsigned k = 1; k < body; k++) {
                const unsigned reg = b[0] + k - 1;
+               if (reg == 0x008 || reg == 0x009) /* SPI_SHADER_PGM_LO/HI_PS */
+                  c->pgm_ps[reg - 0x008] = b[k];
                if (reg >= 0x240 && reg < 0x250)
                   compute_ud[reg - 0x240] = b[k];
                for (unsigned st = 0; st < 6; st++)
@@ -1973,6 +2081,8 @@ ps4_check_ib(struct ps4_check *c, uint32_t *ib, unsigned num_dw, uint64_t seq, i
                bad = true;
                break;
             }
+            if (skip)
+               ps4_check_arm_shaders(c, gfx_ud[1]);
             bad = ps4_check_targets(c, seq, &ib[i]);
             for (unsigned st = 0; st < 6 && !bad; st++)
                bad = ps4_check_user_data(c, seq, &ib[i], stage_name[st], gfx_ud[st]);
@@ -2227,7 +2337,7 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    static int arms = -1;
    if (arms < 0) {
       const char *e = getenv("RADV_PS4_TEST_ARMS");
-      arms = e ? (int)strtoul(e, NULL, 0) : 0; /* (04.55: off by default; 04.54's run ruled both out) */
+      arms = e ? (int)strtoul(e, NULL, 0) : 0xc; /* (04.56: the trivial PS and main VS on by default) */
    }
    c.arms = (unsigned)arms;
    if (first_big && skip_to) {
@@ -2258,11 +2368,12 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    }
    for (unsigned i = 0; i < num_ibs; i++)
       ps4_check_ib(&c, dcb[i], sizes[i] / 4, seq, 0, skip);
-   size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; test arms: %u target "
-                               "masks cut, %u Z32F depths detached; config regs %u, register "
-                               "writes %u, waits %u, copies %u, GDS %u, streamout %u, register loads %u, other %u",
-                               c.wild, c.overruns, c.skipped, c.arm_cb, c.arm_z, c.config_regs, c.reg_writes,
-                               c.reg_waits, c.reg_copies, c.gds, c.streamout, c.loads, c.unknown);
+   size_t n = (size_t)snprintf(out, out_size, "; check: %u wild, %u overruns, %u skipped; test arms %#x: %u target "
+                               "masks cut, %u Z32F depths detached, %u pixel and %u vertex shaders replaced; config "
+                               "regs %u, register writes %u, waits %u, copies %u, GDS %u, streamout %u, register "
+                               "loads %u, other %u", c.wild, c.overruns, c.skipped, c.arms, c.arm_cb, c.arm_z, c.arm_ps,
+                               c.arm_vs, c.config_regs, c.reg_writes, c.reg_waits, c.reg_copies, c.gds, c.streamout,
+                               c.loads, c.unknown);
    for (unsigned u = 0; u < c.num_unknown_ops && n < out_size; u++)
       n += (size_t)snprintf(out + n, out_size - n, "%s%#x", u ? "," : " (", c.unknown_ops[u]);
    if (c.num_unknown_ops && n < out_size)

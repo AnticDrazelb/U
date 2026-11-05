@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.55)
+# Eden for PS4: status (after 04.56)
 
-Install **04.55** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.56** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -68,6 +68,24 @@ programs, 0 failures.
 - **04.54:** image descriptor footprints checked; test arms (MRT0 only, no Z32F depth); full PS
   descriptor sets in the record; HTILE back on (below).
 - **04.55:** the kitchen sink (`RADV_PS4_MITIGATE`, below).
+- **04.56:** the kitchen sink plus trivial shaders for the scene draws after a loading gap (below).
+
+## 04.56: trivial shaders for the scene draws
+
+- **04.55's run:** every bit on (boot trace: `mitigations 0xff`, `RADV_DEBUG=nohiz,nofastclears`, new
+  buffers zeroed; the scene draw's `SPI_SHADER_LATE_ALLOC_VS` 0, `RSRC3_VS` 0x3fffff, `IA_MULTI_VGT_PARAM`
+  0x17007f). The CP stopped at offset 439, and this time the first 4-target scene draw itself never
+  finished (before: it finished and the CP stopped 1-10 steps later). So none of those, and the cause is
+  in that draw. Its vertex input: a prolog fetching a 32_32_32 position and a 2_10_10_10 SNORM attribute
+  (the depth-only game draws that work use prologs too, without the 10-bit one).
+- **04.56:** all of 04.55, and test arms 4 + 8 (`RADV_PS4_TEST_ARMS`, default 0xc) in the noted
+  submissions: on every draw with 3 or more interpolants, the pixel shader is overwritten with one that
+  exports zeros to each `SPI_SHADER_COL_FORMAT` target (no texture fetch, no interpolation), and the
+  main vertex shader (VS user data 2-3, where the prolog jumps) with one exporting zero parameters and
+  position (0, 0, 0, 1) (nothing rasterized). The prolog's vertex fetch still runs. Each replacement is
+  in the boot trace; the note counts them. Host-tested (`desccheck.sh`).
+- **Reading it:** level 3 through (empty scene): the shaders (then PS alone, then VS alone). Still
+  stuck: the vertex fetch or fixed function.
 
 ## 04.55: the kitchen sink
 

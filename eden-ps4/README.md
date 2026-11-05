@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.56: **trivial shaders.** With 04.55's kitchen sink on, the first scene draw itself never finished: the
+cause is in that draw. On top of the kitchen sink, after a loading gap the scene draws' (3+ interpolants)
+pixel shaders are now overwritten with ones exporting zeros, and their main vertex shaders with ones that
+draw nothing (`RADV_PS4_TEST_ARMS`, default 0xc); the vertex prolog's fetch still runs.
+
 04.55: **the kitchen sink.** 04.54's run had level 3's first scene draw with one color target and no
 depth, and the GPU still stopped after it: not the targets, not the depth. Those draws pass 5-7 values
 from the vertex to the pixel shader (every draw that worked: 0-1), with RADV's VS late alloc of 28, and

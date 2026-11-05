@@ -240,6 +240,52 @@ int main(void) {
             g_failures++;
         }
     }
+    // (04.56) the trivial shader arms: a scene-like draw (5 interpolants, 4 FP16 targets, 5 VS params)
+    {
+        uint32_t* code = g_bos[1]->cpu;  // the 32-bit window's buffer: shaders at +0x8000 (PS), +0x9000 (VS)
+        uint32_t* ps = code + 0x8000 / 4;
+        uint32_t* vs = code + 0x9000 / 4;
+        for (unsigned k = 0; k < 200; k++)
+            ps[k] = vs[k] = 0xbf800000u;  // s_nop
+        uint32_t ib[64];
+        unsigned n = 0;
+        ctx_reg(ib, &n, 0x1b6, 5);       // SPI_PS_IN_CONTROL
+        ctx_reg(ib, &n, 0x1c5, 0x4444);  // SPI_SHADER_COL_FORMAT
+        ctx_reg(ib, &n, 0x1b1, 0x8);     // SPI_VS_OUT_CONFIG: 5 params
+        ctx_reg(ib, &n, 0x1c3, 0x4);     // SPI_SHADER_POS_FORMAT
+        ib[n++] = 0xc0000000u | (2u << 16) | (0x76u << 8);  // SET_SH_REG PGM_LO/HI_PS
+        ib[n++] = 0x008;
+        ib[n++] = (uint32_t)((0x40000000ull + 0x8000) >> 8);
+        ib[n++] = 0;
+        ib[n++] = 0xc0000000u | (2u << 16) | (0x76u << 8);  // SET_SH_REG VS user data 2-3: the main VS
+        ib[n++] = 0x4e;
+        ib[n++] = 0x40000000u + 0x9000;
+        ib[n++] = 0;
+        ib[n++] = 0xc0000000u | (1u << 16) | (0x2du << 8);  // DRAW_INDEX_AUTO
+        ib[n++] = 3;
+        ib[n++] = 2;
+        struct ps4_live_range ranges[16];
+        struct ps4_check c;
+        memset(&c, 0, sizeof(c));
+        c.dev = &g_dev;
+        c.ranges = ranges;
+        for (unsigned h = 1; h < g_dev.num_bos; h++) {
+            const uint64_t start = (uintptr_t)g_bos[h]->cpu;
+            ranges[c.num_ranges++] = (struct ps4_live_range){start, start + g_bos[h]->size, g_bos[h]->size, h};
+        }
+        qsort(ranges, c.num_ranges, sizeof(ranges[0]), ps4_live_range_cmp);
+        c.arms = 0xc;
+        printf("-- the trivial pixel and main vertex shader\n");
+        ps4_check_ib(&c, ib, n, 11, 0, true);
+        const bool ps_ok = ps[0] == 0x7e000280u && ps[1] == 0xf800040fu && ps[3] == 0xf800041fu && ps[5] == 0xf800042fu &&
+                           ps[7] == 0xf8001c3fu && ps[9] == 0xbf810000u;
+        const bool vs_ok = vs[0] == 0x7e000280u && vs[1] == 0x7e0202f2u && vs[2] == 0xf800020fu && vs[10] == 0xf800024fu &&
+                           vs[12] == 0xf80008cfu && vs[13] == 0x01000000u && vs[14] == 0xbf810000u;
+        if (!ps_ok || !vs_ok || c.arm_ps != 1 || c.arm_vs != 1) {
+            printf("FAIL trivial shaders: ps %d vs %d (%u, %u)\n", ps_ok, vs_ok, c.arm_ps, c.arm_vs);
+            g_failures++;
+        }
+    }
     // random data: never skipped, rarely described
     uint64_t rng = 88172645463325252ull;
     unsigned skips = 0, described = 0;
