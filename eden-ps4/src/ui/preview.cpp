@@ -130,6 +130,12 @@ int main(int argc, char** argv)
             const std::string slow_path = g_out + "/loading-slow.png";
             stbi_write_png(slow_path.c_str(), slow.Width(), slow.Height(), 4, slow.Pixels(), slow.Width() * 4);
             std::printf("%s\n", slow_path.c_str());
+            // (04.71) the boot watcher starting it again
+            Canvas retry(1920, 1080, 1.5f);
+            DrawLoadingScreen(retry, loading, 3, 0, 0, 20.0, true, true);
+            const std::string retry_path = g_out + "/loading-retry.png";
+            stbi_write_png(retry_path.c_str(), retry.Width(), retry.Height(), 4, retry.Pixels(), retry.Width() * 4);
+            std::printf("%s\n", retry_path.c_str());
         }
         Canvas small(1280, 720, 1.0f);
         DrawLoadingScreen(small, loading, 1, 0, 0, 0.7);

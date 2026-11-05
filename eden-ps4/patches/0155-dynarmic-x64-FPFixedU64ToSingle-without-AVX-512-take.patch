@@ -1,0 +1,44 @@
+From 7d22fc08e736077474414f730d41e2f577e5cdd4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 20:11:27 +0000
+Subject: [PATCH] dynarmic x64: FPFixedU64ToSingle without AVX-512 takes its
+ scratch register before the branch
+
+The fallback (cvtsi2ss with the halving trick for values with the top bit set) asked the register
+allocator for a scratch register after the sign test's jump, on the negative path only. An
+allocation may move a live value out of the register it takes; that move ran on one path only, so
+on the other the value's new home held whatever was there before. On the PS4's Jaguar (no AVX-512)
+a block of Little Kitty, Big City kept its stack pointer in that register: after a ucvtf of a
+positive value its next stores went to a stale host address, the game's heap check failed and it
+stopped while loading (04.48-04.70, with get/set elimination on, which keeps SP in a register
+across the block). Desktop CPUs with AVX-512 take vcvtusi2ss and never reach it.
+---
+ .../src/dynarmic/backend/x64/emit_x64_floating_point.cpp     | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp
+index 756a6f0a36..4aea431d67 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp
+@@ -2060,6 +2060,10 @@ void EmitX64::EmitFPFixedU64ToSingle(EmitContext& ctx, IR::Inst* inst) {
+         code.vcvtusi2ss(result, result, from);
+     } else {
+         const Xbyak::Reg64 from = ctx.reg_alloc.UseScratchGpr(code, args[0]);
++        // (PS4 04.71) allocated before the branch: an allocation may move a live value out of the
++        // register it takes, and that move made on one path only left the other path's copy stale
++        // (the CPUs without AVX-512: a block's stack pointer lost, its stores going astray)
++        const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
+         code.pxor(result, result);
+ 
+         Xbyak::Label negative;
+@@ -2072,7 +2076,6 @@ void EmitX64::EmitFPFixedU64ToSingle(EmitContext& ctx, IR::Inst* inst) {
+         code.jmp(end);
+ 
+         code.L(negative);
+-        const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
+         code.mov(tmp, from);
+         code.shr(tmp, 1);
+         code.and_(from.cvt32(), 1);
+-- 
+2.43.0
+

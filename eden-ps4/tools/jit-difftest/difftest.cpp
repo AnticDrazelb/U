@@ -6,9 +6,15 @@
 //   jit-difftest [iterations] [seed] [int|all] [only-getset|only-constprop]
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <csetjmp>
 #include <exception>
 #include <sys/mman.h>
+#include <sys/time.h>
+#include <ucontext.h>
+#include <sys/wait.h>
+#include <csignal>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -30,11 +36,13 @@
 #include "dynarmic/ir/opcodes.h"
 #include "dynarmic/tests/A64/testenv.h"
 #include "dynarmic/tests/fuzz_util.h"
+#include <fmt/format.h>
 
 using namespace Dynarmic;
 
 extern bool g_assert_throws, g_assert_hit;
 std::vector<u32> g_current_block;  // (printed if the emitter terminates the test)
+volatile int crash_stage = 0;  // (a forked state's runner: its exit code if the JIT aborts)
 extern std::jmp_buf* g_assert_jump;
 
 namespace {
@@ -91,7 +99,10 @@ public:
     }
 
     u64 window_callbacks = 0;  // accesses to the window through the callbacks (the fallbacks)
+    bool trace = false;        // (DIFFTEST_TRACE: each callback access printed)
     u64 MemoryRead(u64 vaddr, size_t size) override {
+        if (trace && size > 1)
+            std::printf("      read%zu %#llx\n", size * 8, (unsigned long long)vaddr);
         if (InWindow(vaddr) && size > 1)
             window_callbacks++;
         if (size == 1)
@@ -102,6 +113,8 @@ public:
         return value;
     }
     void MemoryWrite(u64 vaddr, u64 value, size_t size) override {
+        if (trace && size > 1)
+            std::printf("      write%zu %#llx = %#llx\n", size * 8, (unsigned long long)vaddr, (unsigned long long)value);
         if (InWindow(vaddr) && size > 1)
             window_callbacks++;
         for (size_t i = 0; i < size; i++) {
@@ -260,6 +273,10 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
     c.inline_rsb_pop = true;
     c.inline_fast_dispatch = true;
     c.code_cache_size = 64 * 1024 * 1024;
+    if (std::getenv("DIFFTEST_DUMP")) {  // each block's IR, as translated and as emitted (to stderr)
+        c.dump_pc_lo = 0;
+        c.dump_pc_hi = ~u64{0};
+    }
     return c;
 }
 
@@ -368,6 +385,55 @@ std::string Describe(u32 inst) {
 
 }  // namespace
 
+// (compile, DIFFTEST_PROFILE=1) where the translator's time goes: the program counter sampled every
+// 50 us of CPU time, then the functions named (addr2line) with their share
+static std::vector<uintptr_t> g_samples;
+static void ProfileTick(int, siginfo_t*, void* context) {
+    if (g_samples.size() < g_samples.capacity())
+        g_samples.push_back(uintptr_t(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]));
+}
+static void ProfileReport() {
+    std::map<uintptr_t, size_t> counts;
+    for (uintptr_t pc : g_samples)
+        counts[pc]++;
+    // the executable's own addresses (position independent: its load address off)
+    uintptr_t base = 0;
+    if (std::FILE* maps = std::fopen("/proc/self/maps", "r")) {
+        char line[512];
+        if (std::fgets(line, sizeof(line), maps))
+            base = std::strtoull(line, nullptr, 16);
+        std::fclose(maps);
+    }
+    const std::string list = "/tmp/difftest-pcs.txt";
+    if (std::FILE* out = std::fopen(list.c_str(), "w")) {
+        for (const auto& [pc, n] : counts)
+            std::fprintf(out, "%#llx\n", (unsigned long long)(pc - base));
+        std::fclose(out);
+    }
+    const std::string cmd = "addr2line -f -C -e /proc/" + std::to_string(getpid()) + "/exe < " + list;
+    std::map<std::string, size_t> by_function;
+    if (std::FILE* p = popen(cmd.c_str(), "r")) {
+        char fn[4096], loc[4096];
+        auto it = counts.begin();
+        while (it != counts.end() && std::fgets(fn, sizeof(fn), p) && std::fgets(loc, sizeof(loc), p)) {
+            std::string name = fn;
+            name.erase(name.find_last_not_of("\n") + 1);
+            if (name.size() > 150)
+                name = name.substr(0, 150);
+            by_function[name] += it->second;
+            ++it;
+        }
+        pclose(p);
+    }
+    std::vector<std::pair<size_t, std::string>> sorted;
+    for (const auto& [name, n] : by_function)
+        sorted.push_back({n, name});
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::printf("%zu samples:\n", g_samples.size());
+    for (size_t k = 0; k < sorted.size() && k < 40; k++)
+        std::printf("  %5.1f%%  %s\n", 100.0 * double(sorted[k].first) / double(g_samples.size()), sorted[k].second.c_str());
+}
+
 int main(int argc, char** argv) {
     const u64 iterations = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 100000;
     const u64 seed = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 1;
@@ -379,6 +445,12 @@ int main(int argc, char** argv) {
     if (argc > 4 && std::string(argv[4]) == "only-constprop")
         remove = OptimizationFlag::ConstProp;
     rng.seed(seed);
+    // (a forked state whose JIT aborts (dynarmic's segfault report, then abort): its runner as the exit)
+    std::signal(SIGABRT, [](int) {
+        if (crash_stage)
+            _exit(crash_stage);
+        std::_Exit(134);
+    });
     std::set_terminate([] {
         std::fprintf(stderr, "terminated in the block:\n");
         for (const u32 inst : g_current_block)
@@ -403,6 +475,73 @@ int main(int argc, char** argv) {
         c.optimizations = no_optimizations;
         c.unsafe_optimizations = false;
         bare.jit.emplace(c);
+    }
+
+    // (compile) jit-difftest <blocks> <stride> compile <nro> [passes off: 1]: the translator's
+    // speed: blocks starting every <stride> bytes of an NRO's code (from its start, at the game's
+    // 0x80000000), each translated (and emitted) and not run, timed; as the PS4's CPU Auto
+    if (argc > 4 && std::string(argv[3]) == "compile") {
+        std::FILE* f = std::fopen(argv[4], "rb");
+        if (!f)
+            return 2;
+        std::vector<u8> file;
+        u8 buffer[65536];
+        for (size_t n; (n = std::fread(buffer, 1, sizeof(buffer), f)) > 0;)
+            file.insert(file.end(), buffer, buffer + n);
+        std::fclose(f);
+        u32 text_off = 0, text_size = 0;
+        if (file.size() >= 0x30 && std::memcmp(file.data() + 0x10, "NRO0", 4) == 0) {
+            std::memcpy(&text_off, file.data() + 0x20, 4);
+            std::memcpy(&text_size, file.data() + 0x24, 4);
+        } else {
+            text_size = u32(file.size());  // (raw code)
+        }
+        Runner& r = argc > 5 && std::string(argv[5]) == "1" ? off : on;
+        r.env.Reset();
+        r.env.code_mem.assign(text_size / 4, 0);
+        std::memcpy(r.env.code_mem.data(), file.data() + text_off, text_size & ~3u);
+        r.env.code_mem_start_address = 0x80000000;
+        const u64 blocks = std::strtoull(argv[1], nullptr, 0), stride = std::max<u64>(4, std::strtoull(argv[2], nullptr, 0)) & ~3ull;
+        u64 done = 0;
+        const bool profile = std::getenv("DIFFTEST_PROFILE") != nullptr;
+        if (profile) {
+            g_samples.reserve(4 << 20);
+            struct sigaction sa{};
+            sa.sa_sigaction = ProfileTick;
+            sa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigaction(SIGPROF, &sa, nullptr);
+            const itimerval every{{0, 50}, {0, 50}};
+            setitimer(ITIMER_PROF, &every, nullptr);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (u64 at = 0; done < blocks && at + 4 <= text_size; at += stride, done++) {
+            r.jit->SetPC(0x80000000 + at);
+            r.jit->SetPstate(0);
+            r.jit->SetFpcr(0);
+            r.jit->CompileCurrentBlock();
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (profile) {
+            const itimerval never{};
+            setitimer(ITIMER_PROF, &never, nullptr);
+            ProfileReport();
+        }
+        std::printf("%llu blocks of %u KiB of code: %.1f ms, %.1f us a block\n", (unsigned long long)done,
+                    text_size / 1024, s * 1000, s * 1e6 / double(std::max<u64>(done, 1)));
+        if (std::getenv("DIFFTEST_HASH")) {
+            // what was emitted, as the persistent cache saves it (run with setarch -R: the code
+            // buffer's addresses, in the code, then match from run to run)
+            u64 hash = 1469598103934665603ull, bytes = 0;
+            r.jit->SaveCodeCache([&](const void* data, size_t size) {
+                const auto* p = static_cast<const u8*>(data);
+                for (size_t k = 0; k < size; k++)
+                    hash = (hash ^ p[k]) * 1099511628211ull;
+                bytes += size;
+                return true;
+            });
+            std::printf("emitted: %llu bytes saved, hash %016llx\n", (unsigned long long)bytes, (unsigned long long)hash);
+        }
+        return 0;
     }
 
     // (directed) jit-difftest 0 0 via: STR X0, [X0, #8]; STR X0, [X0, #16] with X0 on a page the
@@ -436,6 +575,172 @@ int main(int argc, char** argv) {
             failures += !(x == z);
         }
         return failures;
+    }
+
+    // (blocks) jit-difftest <states> <seed> blocks <file>: real blocks (each line its start address
+    // and its instructions, hex: the console's 'jit dump'), each run from <states> random states
+    if (argc > 4 && std::string(argv[3]) == "blocks") {
+        std::FILE* f = std::fopen(argv[4], "r");
+        if (!f)
+            return 2;
+        char line[8192];
+        unsigned failing = 0;
+        while (std::fgets(line, sizeof(line), f)) {
+            char* p = line;
+            const u64 start = std::strtoull(p, &p, 16);
+            std::vector<u32> code;
+            while (true) {
+                char* q = p;
+                const unsigned long w = std::strtoul(p, &q, 16);
+                if (q == p)
+                    break;
+                code.push_back(u32(w));
+                p = q;
+            }
+            if (code.empty())
+                continue;
+            unsigned on_bad = 0, off_bad = 0, unclear = 0, crashes[4] = {};
+            std::string first;
+            for (u64 i = 0; i < iterations; i++) {
+                State st;
+                st.start = start;
+                for (auto& r : st.regs)
+                    r = RandomValue();
+                for (auto& v : st.vecs)
+                    v = Rand(0, 1) ? Vector{rng(), rng()} : Vector{u64(std::bit_cast<u64>(double(Rand(0, 1000)) / 8)), 0};
+                st.sp = (kWindow + kWindowSize / 2 + Rand(0, kWindowSize / 4)) & ~u64(15);
+                st.pstate = u32(Rand(0, 15)) << 28;
+                if (std::getenv("DIFFTEST_FORK")) {
+                    // (each state in a child: a crash of one of the three is counted, not fatal; which
+                    // one crashed, by the child's exit: 10 + the runner)
+                    std::fflush(stdout);
+                    const pid_t child = fork();
+                    if (child == 0) {
+                        crash_stage = 10;
+                        const Result x = on.Run(code, st);
+                        crash_stage = 11;
+                        const Result y = off.Run(code, st);
+                        crash_stage = 12;
+                        const Result z = bare.Run(code, st);
+                        _exit(x == y && y == z ? 0 : !(x == z) && y == z ? 1 : !(y == z) && x == z ? 2 : 3);
+                    }
+                    int status = 0;
+                    waitpid(child, &status, 0);
+                    const int code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                    if (code_ == 1) on_bad++;
+                    else if (code_ == 2) off_bad++;
+                    else if (code_ == 3) unclear++;
+                    else if (code_ >= 10) crashes[code_ - 10]++;
+                    else if (code_ == -1) crashes[3]++;
+                    continue;
+                }
+                const Result x = on.Run(code, st), y = off.Run(code, st);
+                if (x == y)
+                    continue;
+                const Result z = bare.Run(code, st);
+                const bool xb = !(x == z) && y == z, yb = !(y == z) && x == z;
+                (xb ? on_bad : yb ? off_bad : unclear)++;
+                if (first.empty()) {
+                    for (size_t r = 0; r < 31; r++)
+                        if (x.regs[r] != y.regs[r] || x.regs[r] != z.regs[r])
+                            first += fmt::format(" x{} start {:#x}: on {:#x} off {:#x} bare {:#x};", r, st.regs[r],
+                                                 x.regs[r], y.regs[r], z.regs[r]);
+                    for (size_t r = 0; r < 32; r++)
+                        if (x.vecs[r] != y.vecs[r] || x.vecs[r] != z.vecs[r])
+                            first += fmt::format(" v{} on {:#x}{:016x} off {:#x}{:016x} bare {:#x}{:016x};", r,
+                                                 x.vecs[r][1], x.vecs[r][0], y.vecs[r][1], y.vecs[r][0], z.vecs[r][1],
+                                                 z.vecs[r][0]);
+                    if (x.nzcv != y.nzcv || x.nzcv != z.nzcv)
+                        first += fmt::format(" nzcv on {:x} off {:x} bare {:x};", x.nzcv, y.nzcv, z.nzcv);
+                    if (!(x.memory == y.memory) || !(x.memory == z.memory))
+                        first += " memory differs;";
+                    if (x.pc != y.pc || x.pc != z.pc)
+                        first += fmt::format(" pc on {:#x} off {:#x} bare {:#x};", x.pc, y.pc, z.pc);
+                }
+            }
+            // (shrink: the first failing state, the fewest instructions that still fail with it)
+            if (on_bad != 0 && std::getenv("DIFFTEST_SHRINK")) {
+                rng.seed(seed);
+                for (u64 i = 0; i < iterations; i++) {
+                    State st;
+                    st.start = start;
+                    for (auto& r : st.regs)
+                        r = RandomValue();
+                    for (auto& v : st.vecs)
+                        v = Rand(0, 1) ? Vector{rng(), rng()} : Vector{u64(std::bit_cast<u64>(double(Rand(0, 1000)) / 8)), 0};
+                    st.sp = (kWindow + kWindowSize / 2 + Rand(0, kWindowSize / 4)) & ~u64(15);
+                    st.pstate = u32(Rand(0, 15)) << 28;
+                    // (each candidate in a child process: one that crashes the JIT is just not it)
+                    const auto bad = [&](const std::vector<u32>& c) {
+                        std::fflush(stdout);
+                        const pid_t child = fork();
+                        if (child == 0) {
+                            const Result x = on.Run(c, st), z = bare.Run(c, st);
+                            _exit(!(x == z) && off.Run(c, st) == z ? 1 : 0);
+                        }
+                        int status = 0;
+                        waitpid(child, &status, 0);
+                        return WIFEXITED(status) && WEXITSTATUS(status) == 1;
+                    };
+                    if (!bad(code))
+                        continue;
+                    std::vector<u32> small = code;
+                    for (bool shrunk = true; shrunk && small.size() > 1;) {
+                        shrunk = false;
+                        for (size_t k = 0; k < small.size(); k++) {
+                            std::vector<u32> c = small;
+                            c.erase(c.begin() + k);
+                            if (bad(c)) {
+                                small = c;
+                                shrunk = true;
+                                break;
+                            }
+                        }
+                    }
+                    std::fflush(stdout);
+                    if (fork() != 0) {
+                        int status = 0;
+                        wait(&status);
+                        break;
+                    }
+                    on.env.trace = bare.env.trace = std::getenv("DIFFTEST_TRACE") != nullptr;
+                    std::printf("  the passes' run (first, then second), its callback accesses:\n");
+                    const Result x = on.Run(small, st);
+                    std::printf("  bare's:\n");
+                    const Result z = bare.Run(small, st);
+                    on.env.trace = bare.env.trace = false;
+                    std::printf("  smallest failing (%zu instructions), sp %#llx:\n", small.size(), (unsigned long long)st.sp);
+                    for (const u32 inst : small)
+                        std::printf("     %08x %s\n", inst, Describe(inst).c_str());
+                    for (size_t r = 0; r < 31; r++)
+                        std::printf("     x%-2zu %#018llx%s\n", r, (unsigned long long)st.regs[r],
+                                    x.regs[r] != z.regs[r] ? "  <<< differs after" : "");
+                    std::map<u64, std::pair<int, int>> mem;
+                    for (const auto& [a, b] : x.memory) mem[a].first = b + 1;
+                    for (const auto& [a, b] : z.memory) mem[a].second = b + 1;
+                    for (const auto& [a, v] : mem)
+                        if (v.first != v.second)
+                            std::printf("     memory %#llx: on %02x, bare %02x\n", (unsigned long long)a, v.first - 1,
+                                        v.second - 1);
+                    std::fflush(stdout);
+                    _exit(0);
+                }
+            }
+            if (crashes[0] + crashes[1] + crashes[2] + crashes[3])
+                std::printf("  crashes: with the passes %u, without %u, bare %u, unknown %u\n", crashes[0], crashes[1],
+                            crashes[2], crashes[3]);
+            std::printf("%#llx (%zu instructions): %s", (unsigned long long)start, code.size(),
+                        on_bad + off_bad + unclear == 0 ? "same\n" : "");
+            if (on_bad + off_bad + unclear != 0) {
+                failing++;
+                std::printf("DIFFERENT: the pass wrong %u, without it wrong %u, unclear %u of %llu\n   %s\n", on_bad,
+                            off_bad, unclear, (unsigned long long)iterations, first.c_str());
+                for (const u32 inst : code)
+                    std::printf("     %08x %s\n", inst, Describe(inst).c_str());
+            }
+        }
+        std::fclose(f);
+        return int(failing);
     }
 
     u64 on_wrong = 0, off_wrong = 0, other = 0;

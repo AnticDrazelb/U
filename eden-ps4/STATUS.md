@@ -87,6 +87,49 @@ programs, 0 failures.
 - **04.68:** the two translator bugs behind it fixed; no per-game profile (below).
 - **04.69:** the loading screen tells a failed game; Little Kitty's test of the two IR passes apart (below).
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
+- **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
+
+## 04.71: the bug, the translator's speed, the boot watcher
+
+- **The bug (patch 0155).** 04.70's search ended at 0x80a7f000-0x80a7f400 (fails with the pass on
+  there alone) and dumped its 31 blocks. In the desktop harness, block 0x80a7f23c (38 instructions)
+  went wrong in 141 of 300 states with the PS4's host features (mask 16b00f, or 0), never with all
+  of them; shrunk to 11 instructions, a `stp x10, x11, [sp, #80]` wrote to a host address instead.
+  `EmitFPFixedU64ToSingle` (the `ucvtf s0, x9` between) without AVX-512 asked for its scratch
+  register after the sign test's jump: the allocator's move of a live value (the block's SP, kept in
+  a register by get/set elimination) ran on the negative path only, and on the other the value's
+  new home held something stale. Fixed by taking the register before the branch; a scan of the x64
+  backend found no other allocation inside a runtime branch. All 31 blocks the same (one unclear:
+  its `madd` makes addresses outside the harness's memory), 5000 random blocks clean with either
+  feature set. Little Kitty runs with every pass again: no profile, no search (`GetSetSearch` gone).
+- **The translator's speed (patch 0156).** `jit-difftest <blocks> <stride> compile <nro>`
+  translates blocks without running them (`Jit::CompileCurrentBlock`), timed; `DIFFTEST_PROFILE=1`
+  samples where the time goes, `DIFFTEST_HASH=1` hashes what was emitted (the persistent cache's
+  bytes; `setarch -R` and the same environment for comparable runs). 6000 blocks of breakout.nro:
+  550 ms before, 82 ms after, the same code out:
+  - the decoders' masks are compile-time constants: with clang `GetMaskAndExpect` is `constexpr`
+    and each use parsed its bitstring at run time: the A64 table took 0.35 s when first needed (in
+    every process, so every game's boot on the PS4), and the A32 decoders' linear scans (Thumb,
+    VFP, ASIMD) parsed every matcher's bitstring again for each instruction;
+  - `EndOfAllocScope` releases only the host locations the instruction touched (LocInfo marks
+    them), not all ~100 after every IR instruction (20% of the time; the emitted code byte for byte
+    the same, old and new run in one binary, 20000 blocks, both feature sets);
+  - `DefineValueImpl`'s duplicate-definition checks (full scans) in debug builds only.
+  On the console, 04.70's log had the recompiler at 514 ms of core 0's time a second while Little
+  Kitty loaded (4185 blocks a second, 123 us each).
+- **The boot watcher** (`SafeBoot`, `platform_ps4.cpp`). Every game starts with the normal
+  settings; until two minutes past its first frame the launcher watches for its error
+  (`guest_exceptions`/`guest_aborts`) or the app crashing (`pending` still set at the next start).
+  A failure stops the game and starts it again by itself (a fresh process), one step safer: the IR
+  passes off (`EDEN_PS4_JIT_TEST=ir`), CPU accuracy Accurate, then Paranoid; the loading screen
+  says so ("Starting it again with safer settings..."). The step that got a game running is
+  remembered for it in this build (`safe-boot.txt`; a new build tries the normal settings first
+  again). L3 + R3 stops the steps with the game; if none works, the HOME menu says so once.
+- **Crashes go back to the HOME menu.** `ps4_crash_restart` (the runtime's hook, after crash.log is
+  written) restarts the app while a game runs (not in the menu itself: no loop) and the HOME menu
+  says which game closed; a restart that hasn't happened 10 s on ends the process as before. 04.70's
+  search ended on such a crash: `KThread::EndWait` on a waiter whose wait queue (on its own stack)
+  was gone, in `KProcess::Terminate` as the game was stopped after its error (Eden's shutdown).
 
 ## 04.70: the search for the block get/set elimination is wrong for
 

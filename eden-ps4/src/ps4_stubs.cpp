@@ -53,7 +53,7 @@ void ps4_crash_guest_regs(int) {}
 // ps4_crash_jit_info, ps4_jit_owner and ps4_jit_dump_function: Eden's dynarmic
 // (backend/x64/ps4_block_map.cpp), the guest block of a JIT address while the profiler is on
 void ps4_crash_note() {}
-void ps4_crash_restart() {}
+// ps4_crash_restart: platform_ps4.cpp (04.71: back into the app after a game's crash)
 void ps4_recompiler_status(int) {}
 void ps4_hang_guest_threads(int) {}
 

@@ -21,3 +21,29 @@ moved them (SMADDL, SMULL, SXTW of a negative value: Little Kitty, Big City's he
 blocks with all host features and 200,000 with the Jaguar's. (`all` stops at instructions the
 Switch's Cortex-A57 doesn't have, FP16 among them, which the translator asserts on: not used by
 games.)
+
+## Since 04.69
+
+Memory as on the PS4: a fastmem arena (every 4th page of a 2 MiB window left out, as pages the PS4
+declines), the page table of absolute offsets (inline and shared walks), exclusives; each block run
+twice from the same state (the second run is what the PS4 runs once a declined page is known).
+
+    jit-difftest <states> <seed> blocks <file>        # real blocks: lines of "<start> <hex words>..."
+                                                      # (the console's 'jit dump', EDEN_PS4_DUMP_RANGE)
+      DIFFTEST_FORK=1     each state in a child process (a crash costs that state only)
+      DIFFTEST_SHRINK=1   a failing block shrunk to the fewest instructions that still fail
+      DIFFTEST_TRACE=1    the shrunk block's callback accesses, passes on and bare
+      DIFFTEST_DUMP=1     every block's IR, as translated and as emitted (stderr)
+    jit-difftest <blocks> <stride> compile <nro> [1]  # the translator's speed: blocks every <stride>
+                                                      # bytes of the NRO's code, translated, not run
+      DIFFTEST_PROFILE=1  where the time goes (sampled, addr2line)
+      DIFFTEST_HASH=1     a hash of what was emitted (setarch -R, the same environment: comparable)
+
+What 04.71 found with them: Little Kitty, Big City's block 0x80a7f23c (from 04.70's on-console
+search) wrong in 141 of 300 states with the Jaguar's features only; shrunk to 11 instructions, a
+store went to a host address: `EmitFPFixedU64ToSingle` without AVX-512 took a scratch register
+inside one branch of its sign test, and the allocator's move of the block's SP (get/set
+elimination keeps it in a register) happened on that path only (patch 0155). And the translator's
+time: 0.35 s of decoder table set-up per process and ~33 us a block, now under 1 ms and ~14 us,
+the same code out (patch 0156).
+

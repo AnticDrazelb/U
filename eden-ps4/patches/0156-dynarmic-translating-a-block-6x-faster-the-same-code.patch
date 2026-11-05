@@ -1,0 +1,173 @@
+From 01ee3e6e90e41e8709628ab5eacce92825f8acc2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 20:29:45 +0000
+Subject: [PATCH] dynarmic: translating a block ~6x faster (the same code out)
+
+Measured on a desktop CPU with the PS4's host features, 6000 blocks of a homebrew NRO's code
+(tools/jit-difftest compile): 550 ms before, 82 ms after; the emitted code byte for byte the same
+(the persistent cache's bytes hashed, the old and new release run in one binary).
+
+- The decoders' masks are constants (DYNARMIC_DECODER_GET_MATCHER): with clang GetMaskAndExpect
+  is constexpr, not consteval, and each use parsed its bitstring at run time: the A64 decoder's
+  table (4096 buckets, each parsing all ~600 bitstrings) took 0.35 s when first needed, in every
+  process (on the PS4, every game's boot), and the A32 decoders' linear scans (Thumb, VFP, ASIMD)
+  parsed each matcher's bitstring again for every instruction.
+- RegAlloc::EndOfAllocScope releases only the host locations the instruction touched (LocInfo
+  marks them) instead of all ~100 (registers, flags, 64 spill slots) after every IR instruction:
+  an untouched one was released at the end of the instruction before, and releasing it again
+  changes nothing. 20% of the time.
+- DefineValueImpl's checks that a value isn't defined twice (each a scan of every host location,
+  two or three a define) are debug builds' only.
+- Jit::CompileCurrentBlock: a block translated without running it, for the desktop benchmark.
+---
+ .../src/dynarmic/backend/x64/a64_interface.cpp    |  9 +++++++++
+ .../src/dynarmic/backend/x64/reg_alloc.cpp        |  8 +++++---
+ src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h | 15 +++++++++++++--
+ .../dynarmic/frontend/decoder/decoder_detail.h    | 10 +++++++++-
+ src/dynarmic/src/dynarmic/interface/A64/a64.h     |  4 ++++
+ 5 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index b029315fc1..f162fc4c52 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -78,6 +78,10 @@ public:
+ 
+     ~Impl() = default;
+ 
++    void CompileCurrentBlock() {
++        void(GetBlock(GetCurrentLocation()));
++    }
++
+     HaltReason Run() {
+         ASSERT(!is_executing);
+         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
+@@ -245,6 +249,7 @@ private:
+         return GetBlock(GetCurrentLocation());
+     }
+ 
++
+     CodePtr GetCurrentSingleStep() {
+         return GetBlock(A64::LocationDescriptor{GetCurrentLocation()}.SetSingleStepping(true));
+     }
+@@ -610,6 +615,10 @@ std::string Jit::Disassemble() const {
+     return impl->Disassemble();
+ }
+ 
++void Jit::CompileCurrentBlock() {
++    impl->CompileCurrentBlock();
++}
++
+ bool Jit::SaveCodeCache(const std::function<bool(const void* data, std::size_t size)>& write) {
+     return impl->SaveCodeCache(write);
+ }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+index fb0f9240eb..7b32d5bf99 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.cpp
+@@ -475,14 +475,16 @@ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const noex
+     return std::nullopt;
+ }
+ 
++// (PS4 04.71) the checks that scan every host location for a value just defined: debug builds only
++// (each define scanned all ~100 locations at least twice, for a value not yet in any)
+ void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, HostLoc host_loc) noexcept {
+-    ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
++    DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+     LocInfo(host_loc).AddValue(host_loc, def_inst);
+-    ASSERT(*ValueLocation(def_inst) == host_loc);
++    DEBUG_ASSERT(*ValueLocation(def_inst) == host_loc);
+ }
+ 
+ void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, const IR::Value& use_inst) noexcept {
+-    ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
++    DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+     if (use_inst.IsImmediate()) {
+         const HostLoc location = ScratchImpl(code, gpr_order);
+         DefineValueImpl(code, def_inst, location);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+index c25a97dbe9..f902b174a5 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+@@ -8,6 +8,8 @@
+ 
+ #pragma once
+ 
++#include <bit>
++
+ #include <array>
+ #include <functional>
+ #include <optional>
+@@ -217,8 +219,14 @@ public:
+     void ReleaseStackSpace(BlockOfCode& code, const size_t stack_space) noexcept;
+ 
+     inline void EndOfAllocScope() noexcept {
+-        for (auto& iter : hostloc_info)
+-            iter.ReleaseAll();
++        // (PS4 04.71) only the host locations this instruction touched (LocInfo): an untouched
++        // one was released at the end of the instruction before, and releasing it again changes
++        // nothing (all ~100 of them, after every IR instruction, were 20% of translating a block)
++        for (size_t w = 0; w < touched.size(); w++) {
++            for (u64 bits = touched[w]; bits != 0; bits &= bits - 1)
++                hostloc_info[w * 64 + size_t(std::countr_zero(bits))].ReleaseAll();
++            touched[w] = 0;
++        }
+     }
+     inline void AssertNoMoreUses() noexcept {
+         ASSERT(std::all_of(hostloc_info.begin(), hostloc_info.end(), [](const auto& i) noexcept { return i.IsEmpty(); }));
+@@ -253,6 +261,7 @@ private:
+ 
+     inline HostLocInfo& LocInfo(const HostLoc loc) noexcept {
+         DEBUG_ASSERT(loc != HostLoc::RSP && loc != ABI_JIT_PTR);
++        touched[size_t(loc) / 64] |= u64(1) << (size_t(loc) % 64);
+         return hostloc_info[size_t(loc)];
+     }
+     inline const HostLocInfo& LocInfo(const HostLoc loc) const noexcept {
+@@ -265,6 +274,8 @@ private:
+ 
+ //data
+     alignas(64) std::array<HostLocInfo, NonSpillHostLocCount + SpillCount> hostloc_info;
++    // (PS4 04.71) the host locations LocInfo gave out since the last EndOfAllocScope
++    std::array<u64, (NonSpillHostLocCount + SpillCount + 63) / 64> touched{};
+     std::bitset<32> gpr_order;
+     std::bitset<32> xmm_order;
+     size_t reserved_stack_space = 0;
+diff --git a/src/dynarmic/src/dynarmic/frontend/decoder/decoder_detail.h b/src/dynarmic/src/dynarmic/frontend/decoder/decoder_detail.h
+index e383fb0262..d861f2ce9d 100644
+--- a/src/dynarmic/src/dynarmic/frontend/decoder/decoder_detail.h
++++ b/src/dynarmic/src/dynarmic/frontend/decoder/decoder_detail.h
+@@ -124,7 +124,15 @@ struct detail {
+     }
+ };
+ 
+-#define DYNARMIC_DECODER_GET_MATCHER(MatcherT, fn, name, bitstring) Decoder::detail::detail<MatcherT<V>>::GetMaskAndExpect(bitstring)
++// (PS4 04.71) a constant, worked out as the code compiles: with clang (GetMaskAndExpect constexpr
++// there, not consteval) each use parsed its bitstring at run time, the A64 decoder's table
++// (4096 buckets, each parsing all ~600 bitstrings) taking 0.35 s on a desktop CPU when first
++// needed, and the A32 decoders' linear scans parsing each matcher's again for every instruction
++#define DYNARMIC_DECODER_GET_MATCHER(MatcherT, fn, name, bitstring) \
++    ([]() { \
++        constexpr auto mask_and_expect_ = Decoder::detail::detail<MatcherT<V>>::GetMaskAndExpect(bitstring); \
++        return mask_and_expect_; \
++    }())
+ 
+ #define DYNARMIC_DECODER_GET_MATCHER_FUNCTION(MatcherT, fn, name, bitstring) Decoder::detail::detail<MatcherT<V>>::template GetMatcherFunction<bitstring, V>(visitor, instruction, &V::fn)
+ 
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/a64.h b/src/dynarmic/src/dynarmic/interface/A64/a64.h
+index 7a703441a4..deaa82986e 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/a64.h
+@@ -140,6 +140,10 @@ public:
+     };
+     CodeCacheUse GetCodeCacheUse() const;
+ 
++    /// (PS4 04.71) Translates the block at the current pc (as Run would first) without running it:
++    /// the translator's desktop benchmark (tools/jit-difftest, "compile")
++    void CompileCurrentBlock();
++
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl;
+-- 
+2.43.0
+

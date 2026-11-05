@@ -24,7 +24,7 @@ std::string Thousands(unsigned value)
 } // namespace
 
 void DrawLoadingScreen(Canvas& c, const LoadingScreen& screen, int stage, unsigned done, unsigned total, double now,
-                       bool failed)
+                       bool failed, bool retrying)
 {
     // the HOME menu's Basic Black and Basic White colours
     const bool white = screen.white_theme;
@@ -53,6 +53,14 @@ void DrawLoadingScreen(Canvas& c, const LoadingScreen& screen, int stage, unsign
         c.Text(640, 482, screen.publisher, 19, Weight::Regular, dim, Align::Center, 1000);
 
     constexpr float kBarW = 420, kBarH = 6, kBarX = (1280 - kBarW) / 2, kBarY = 598;
+    if (failed && retrying)
+    {
+        // (04.71) the boot watcher takes it from here
+        c.Text(640, 574, "The game stopped with an error", 21, Weight::SemiBold, text, Align::Center);
+        c.RoundRect(kBarX, kBarY, kBarW, kBarH, kBarH / 2, track);
+        c.Text(640, 640, "Starting it again with safer settings...", 18, Weight::Regular, dim, Align::Center);
+        return;
+    }
     if (failed)
     {
         // (04.69) it won't get further: say so, and how to leave

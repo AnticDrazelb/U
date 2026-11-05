@@ -835,79 +835,81 @@ std::unique_ptr<Launcher::AudioOutput> MakeAudioOutput()
 std::atomic<bool> g_running{false};
 // The last program that didn't load, and why (the HOME menu says so when it comes back)
 std::string g_load_failure_name, g_load_failure;
-// (04.70) The search for the block get/set elimination mistranslates in a game: Little Kitty, Big
-// City runs only with that pass off (04.69), and the desktop tests (tools/jit-difftest) haven't
-// found why. Each boot of the game turns the pass on only for the blocks that start in the lower
-// half of the range left (EDEN_PS4_GETSET_RANGE, arm_dynarmic_64.cpp), off for the rest: the game
-// failing (its heap check, a guest exception) puts the block there, 60 s past its start without
-// failing in the upper half. The launcher decides, stops the game and boots it again by itself
-// (a fresh process each time) until the range is 1 KiB, then once more with those blocks' guest
-// code and IR in the log (EDEN_PS4_DUMP_RANGE). The state and its history are in
-// getset-search.txt (in the log bundle). L3 + R3 cancels it; a boot that never decided (a crash)
-// counts as failing. After it, the game runs without the pass (the profile that works).
-struct GetSetSearch
+std::atomic<uint64_t> g_frames_shown{0}; // (for the hang watchdog)
+
+// (04.71) The boot watcher. Every game starts with the normal settings; while it starts (until two
+// minutes past its first frame) the launcher watches for it failing: the game's own error (its
+// abort, an exception it didn't handle: Common::PS4Diagnostics::guest_exceptions/guest_aborts) or
+// the app crashing (ps4_crash_restart below). A failure stops it and starts it again by itself, a
+// fresh process each time, one step safer: the recompiler's IR passes off, then CPU accuracy
+// Accurate, then Paranoid. The step that gets it running is remembered for that game in this
+// build (a new build tries the normal settings first again: its fixes may be what it needed).
+// Little Kitty, Big City was the reason (04.66-04.70: one recompiler bug, fixed in 04.71). L3 + R3
+// while it watches stops the game as usual and the steps with it. State: safe-boot.txt.
+struct SafeBoot
 {
-    bool active = false, finished = false, cancelled = false, pending = false, reported = false;
+    bool active = false, pending = false;
     std::string program;
-    uint64_t lo = 0, hi = 0, mid = 0;
-    unsigned step = 0;
-    int phase = 0; // 0: the whole range on (it has to fail), 1: halving, 2: the final range's dump
+    int level = 0; // the step being tried (SafeBootLevels)
+    std::string notice; // what the HOME menu says once when it next shows ("title|text")
+    std::vector<std::string> remembered; // "build|level|program": a step that got a game running
     std::vector<std::string> history;
 };
-constexpr const char* kSearchFile = "/data/eden-ps4/getset-search.txt";
-constexpr uint64_t kSearchCodeLo = 0x80000000, kSearchCodeHi = 0x90000000; // (the game's modules)
-constexpr uint64_t kSearchAllHi = uint64_t(1) << 39;
-constexpr uint64_t kSearchFinal = 0x400;  // the range at which it stops halving
-constexpr double kSearchPassSeconds = 60; // past the game's start without failing: a pass
-
-GetSetSearch LoadSearch()
+constexpr const char* kSafeBootFile = "/data/eden-ps4/safe-boot.txt";
+constexpr double kSafeBootWatchSeconds = 120; // past the first frame without failing: it works
+struct SafeBootLevel
 {
-    GetSetSearch s;
-    for (const std::string& line : ReadLines(kSearchFile, 256 * 1024))
+    const char* jit_test;  // EDEN_PS4_JIT_TEST
+    const char* accuracy;  // EDEN_PS4_CPU_ACCURACY
+    const char* label;     // the log's
+    const char* screen;    // the loading screen's
+};
+constexpr SafeBootLevel kSafeBootLevels[] = {
+    {"", "", "the normal settings", ""},
+    {"ir", "", "the recompiler's IR passes off", "Starting it again with safer settings (step 2 of 4)"},
+    {"", "accurate", "CPU accuracy Accurate", "Starting it again with safer settings (step 3 of 4)"},
+    {"", "paranoid", "CPU accuracy Paranoid", "Starting it again with the safest settings (step 4 of 4)"},
+};
+constexpr int kSafeBootLevelCount = int(sizeof(kSafeBootLevels) / sizeof(kSafeBootLevels[0]));
+
+SafeBoot LoadSafeBoot()
+{
+    SafeBoot s;
+    for (const std::string& line : ReadLines(kSafeBootFile, 256 * 1024))
     {
         const size_t eq = line.find('=');
         if (eq == std::string::npos)
             continue;
         const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
-        const uint64_t number = std::strtoull(value.c_str(), nullptr, 16);
         if (key == "active")
-            s.active = number != 0;
-        else if (key == "finished")
-            s.finished = number != 0;
-        else if (key == "cancelled")
-            s.cancelled = number != 0;
+            s.active = value == "1";
         else if (key == "pending")
-            s.pending = number != 0;
-        else if (key == "reported")
-            s.reported = number != 0;
+            s.pending = value == "1";
         else if (key == "program")
             s.program = value;
-        else if (key == "lo")
-            s.lo = number;
-        else if (key == "hi")
-            s.hi = number;
-        else if (key == "mid")
-            s.mid = number;
-        else if (key == "step")
-            s.step = unsigned(number);
-        else if (key == "phase")
-            s.phase = int(number);
+        else if (key == "level")
+            s.level = std::clamp(std::atoi(value.c_str()), 0, kSafeBootLevelCount - 1);
+        else if (key == "notice")
+            s.notice = value;
+        else if (key == "remembered")
+            s.remembered.push_back(value);
         else if (key == "history")
             s.history.push_back(value);
     }
     return s;
 }
 
-void SaveSearch(const GetSetSearch& s)
+void SaveSafeBoot(SafeBoot s)
 {
-    if (FILE* f = std::fopen(kSearchFile, "w"))
+    // (the last 40 lines of history are plenty)
+    if (s.history.size() > 40)
+        s.history.erase(s.history.begin(), s.history.end() - 40);
+    if (FILE* f = std::fopen(kSafeBootFile, "w"))
     {
-        std::fprintf(f, "active=%x\nfinished=%x\ncancelled=%x\npending=%x\nreported=%x\nprogram=%s\nlo=%llx\n"
-                        "hi=%llx\nmid=%llx\nstep=%x\nphase=%x\n",
-                     unsigned(s.active), unsigned(s.finished), unsigned(s.cancelled), unsigned(s.pending),
-                     unsigned(s.reported),
-                     s.program.c_str(), (unsigned long long)s.lo, (unsigned long long)s.hi,
-                     (unsigned long long)s.mid, s.step, unsigned(s.phase));
+        std::fprintf(f, "active=%d\npending=%d\nprogram=%s\nlevel=%d\nnotice=%s\n", int(s.active), int(s.pending),
+                     s.program.c_str(), s.level, s.notice.c_str());
+        for (const std::string& r : s.remembered)
+            std::fprintf(f, "remembered=%s\n", r.c_str());
         for (const std::string& h : s.history)
             std::fprintf(f, "history=%s\n", h.c_str());
         std::fflush(f);
@@ -916,69 +918,128 @@ void SaveSearch(const GetSetSearch& s)
     }
 }
 
-// The boot in flight's result: where the block is now
-void SearchRecord(GetSetSearch& s, bool failed, const char* why)
+// The step remembered for a game in this build (0: none, the normal settings)
+int SafeBootRemembered(const SafeBoot& s, const std::string& program)
 {
-    const uint64_t on_hi = s.phase == 1 ? s.mid : s.hi;
-    s.history.push_back(fmt::format("step {} (phase {}): get/set on for {:#x}-{:#x}: {} ({})", s.step, s.phase, s.lo,
-                                    on_hi, failed ? "failed" : "passed", why));
-    s.pending = false;
-    s.step++;
-    if (s.phase == 0)
+    const std::string prefix = std::string(EDEN_PS4_VERSION) + "|";
+    for (const std::string& r : s.remembered)
     {
-        if (failed)
-            s.phase = 1;
-        else if (s.lo == kSearchCodeLo && s.hi == kSearchCodeHi)
-            s.lo = 0, s.hi = kSearchAllHi; // (not in the modules' range: everywhere, once)
-        else
-        {
-            s.active = false;
-            s.finished = true;
-            s.history.push_back("it didn't fail with the pass on everywhere");
-        }
+        if (r.compare(0, prefix.size(), prefix) != 0)
+            continue;
+        const size_t bar = r.find('|', prefix.size());
+        if (bar != std::string::npos && r.substr(bar + 1) == program)
+            return std::clamp(std::atoi(r.c_str() + prefix.size()), 0, kSafeBootLevelCount - 1);
     }
-    else if (s.phase == 1)
+    return 0;
+}
+
+void SafeBootRemember(SafeBoot& s, const std::string& program, int level)
+{
+    // this game's entries go (and other builds' entries: their steps don't apply to this one)
+    const std::string prefix = std::string(EDEN_PS4_VERSION) + "|";
+    std::erase_if(s.remembered, [&](const std::string& r) {
+        const size_t bar = r.find('|', r.find('|') + 1);
+        return r.compare(0, prefix.size(), prefix) != 0 || (bar != std::string::npos && r.substr(bar + 1) == program);
+    });
+    if (level > 0)
+        s.remembered.push_back(fmt::format("{}|{}|{}", EDEN_PS4_VERSION, level, program));
+}
+
+// The boot in flight failed: the next step, or the end of them
+void SafeBootFailed(SafeBoot& s, const char* why)
+{
+    s.history.push_back(fmt::format("{}: {} failed ({})", std::filesystem::path(s.program).stem().string(),
+                                    kSafeBootLevels[s.level].label, why));
+    s.pending = false;
+    if (s.level + 1 < kSafeBootLevelCount)
     {
-        (failed ? s.hi : s.lo) = s.mid;
-        if (s.hi - s.lo <= kSearchFinal)
-            s.phase = 2;
+        s.level++;
     }
     else
     {
         s.active = false;
-        s.finished = true;
-        s.history.push_back(fmt::format("the block: {:#x}-{:#x} ({} with the pass on there alone; its code is in "
-                                        "log.txt, 'jit dump')",
-                                        s.lo, s.hi, failed ? "fails" : "doesn't fail"));
+        s.history.push_back("no step got it running");
+        s.notice = std::filesystem::path(s.program).stem().string() +
+                   " couldn't start|It stopped with an error with the normal settings and with each safer one. "
+                   "Send the logs as usual: they say where.";
+        SafeBootRemember(s, s.program, 0);
     }
-    SaveSearch(s);
+    SaveSafeBoot(s);
 }
 
-std::atomic<bool> g_search_boot{false}, g_search_decided{false};
+// (04.71) A crash while a game runs: the app starts again (ps4_crash_restart, below) and the HOME
+// menu says which game it was (crash-notice.txt, the game's name). The name is set before each boot
+// (the crash handler only reads it).
+constexpr const char* kCrashNoticeFile = "/data/eden-ps4/crash-notice.txt";
+char g_crash_program[256];
+std::atomic<bool> g_crash_restart_armed{false};
+
+void ArmCrashRestart(const std::string& program)
+{
+    const std::string name = std::filesystem::path(program).stem().string();
+    std::snprintf(g_crash_program, sizeof(g_crash_program), "%s", name.c_str());
+    g_crash_restart_armed = true;
+}
+
+// The name the last crash left, once (empty: none)
+std::string TakeCrashNotice()
+{
+    const std::vector<std::string> lines = ReadLines(kCrashNoticeFile, 4096);
+    if (lines.empty())
+        return {};
+    std::remove(kCrashNoticeFile);
+    return lines[0].empty() ? std::string("The game") : lines[0];
+}
+
+std::atomic<bool> g_safe_boot_watching{false}, g_safe_boot_decided{false};
+std::atomic<bool> g_safe_boot_retrying{false}; // (the loading screen: stopped, about to start again)
 // (the HOME menu says this once when it next shows)
 std::string g_menu_message_title, g_menu_message_text;
 
-// The pad thread's look at a search boot: the game failed, or ran past the pass time
-void SearchWatch(double& started)
+// The pad thread's look at a watched boot: the game failed, or ran long enough past its first
+// frame (`first_frame`: when it came, Seconds(); -1 until then)
+void SafeBootWatch(double& first_frame, uint64_t frames_at_boot)
 {
     namespace D = Common::PS4Diagnostics;
-    if (!g_search_boot.load() || g_search_decided.load())
+    if (!g_safe_boot_watching.load() || g_safe_boot_decided.load())
         return;
     const bool failed = D::guest_exceptions.load() + D::guest_aborts.load() != 0;
     if (!failed)
     {
-        if (started < 0 && D::loading_stage.load() >= 3)
-            started = Seconds();
-        if (started < 0 || Seconds() - started < kSearchPassSeconds)
+        const uint64_t frames = D::composites.load(std::memory_order_relaxed) +
+                                g_frames_shown.load(std::memory_order_relaxed);
+        if (first_frame < 0 && frames > frames_at_boot)
+            first_frame = Seconds();
+        if (first_frame < 0 || Seconds() - first_frame < kSafeBootWatchSeconds)
             return;
     }
-    if (g_search_decided.exchange(true))
+    if (g_safe_boot_decided.exchange(true))
         return;
-    GetSetSearch s = LoadSearch();
-    SearchRecord(s, failed, failed ? "its error" : "60 s without one");
-    Trace(fmt::format("get/set search: {}; next {:#x}-{:#x}{}", s.history.back(), s.lo, s.hi,
-                      s.active ? "" : " (finished)"));
-    Launcher::Stop();
+    SafeBoot s = LoadSafeBoot();
+    if (!failed)
+    {
+        s.active = false;
+        s.pending = false;
+        s.history.push_back(fmt::format("{}: {} work", std::filesystem::path(s.program).stem().string(),
+                                        kSafeBootLevels[s.level].label));
+        SafeBootRemember(s, s.program, s.level);
+        SaveSafeBoot(s);
+        Trace(fmt::format("boot watcher: {}", s.history.back()));
+        return;
+    }
+    const int tried = s.level;
+    SafeBootFailed(s, "the game's error");
+    Trace(fmt::format("boot watcher: {}; {}", s.history.back(),
+                      s.active ? fmt::format("starting it again with {}", kSafeBootLevels[s.level].label)
+                               : std::string("stopping it")));
+    if (s.active)
+    {
+        // stopped, and started again by the run loop (a fresh process)
+        g_safe_boot_retrying = true;
+        Launcher::Stop();
+    }
+    // (every step failed: the loading screen says so and how to leave, and the HOME menu once after)
+    (void)tried;
 }
 
 void* PadThread(void*)
@@ -990,10 +1051,11 @@ void* PadThread(void*)
     double stop_held_since = -1;
     TouchpadTap tap;
     MotionReader motion_reader;
-    double search_started = -1;
+    double first_frame = -1;
+    const uint64_t frames_at_boot = Common::PS4Diagnostics::composites.load() + g_frames_shown.load();
     while (g_running)
     {
-        SearchWatch(search_started);
+        SafeBootWatch(first_frame, frames_at_boot);
         union {
             OrbisPadData data;
             unsigned char room[512]; // in case the system's structure is larger than the header's
@@ -1012,16 +1074,16 @@ void* PadThread(void*)
             else if (Seconds() - stop_held_since >= 1)
             {
                 Trace("L3 + R3 held: stopping the program");
-                if (g_search_boot.load() && !g_search_decided.exchange(true))
+                if (g_safe_boot_watching.load() && !g_safe_boot_decided.exchange(true))
                 {
-                    // (04.70) the search cancelled: the game runs as it does without it from now on
-                    GetSetSearch s = LoadSearch();
+                    // (04.71) the boot watcher's steps stop with the game (nothing remembered)
+                    SafeBoot s = LoadSafeBoot();
                     s.active = false;
-                    s.cancelled = true;
                     s.pending = false;
-                    s.history.push_back("cancelled (L3 + R3)");
-                    SaveSearch(s);
-                    Trace("get/set search cancelled");
+                    s.history.push_back(fmt::format("{}: stopped (L3 + R3) with {}",
+                                                    std::filesystem::path(s.program).stem().string(),
+                                                    kSafeBootLevels[s.level].label));
+                    SaveSafeBoot(s);
                 }
                 Launcher::Stop();
                 stop_held_since = 1e18; // once
@@ -1038,7 +1100,6 @@ void* PadThread(void*)
 std::atomic<bool> g_drawing{false};
 // What draws the Switch's GPU work, for the start page (Run sets it)
 std::string g_renderer_label = "the software renderer";
-std::atomic<uint64_t> g_frames_shown{0}; // (for the hang watchdog)
 void ShowFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height)
 {
     g_frames_shown.fetch_add(1, std::memory_order_relaxed);
@@ -1654,8 +1715,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
-         "04.70: a game that stopped while loading runs. Its first start in this version searches for the cause "
-         "by itself (about 20 restarts): leave it running.\n"
+         "04.71: the CPU translation prepares a game's code about six times faster, so games load faster. "
+         "Little Kitty, Big City runs without the slow workaround (the cause of its stop while loading, found "
+         "by 04.70's search, is fixed: a CPU translation bug that could affect any game). A boot watcher: a game that "
+         "stops with an error while it starts is started again by itself with safer settings, and the ones "
+         "that worked are remembered. A crash while a game runs goes back to the HOME menu instead of the "
+         "PS4's error screen.\n"
+         "04.70: a search for why a game stopped while loading.\n"
          "04.69: the loading screen says when a game has stopped with an error, and how to leave it.\n"
          "04.68: two fixes in the CPU translation: a multiply and a sign extension that could get the upper half "
          "of a 64-bit result wrong, and a division by zero that didn't give zero. Games that stopped or "
@@ -1858,7 +1924,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         menu.SetFolderPlaces(std::move(places));
     }
     std::vector<Ui::Title> titles = LoadTitles();
-    // (04.70) what the launcher has to say once (a search that finished)
+    // what the launcher has to say once (04.71: the boot watcher, a crash)
     if (!g_menu_message_title.empty())
     {
         menu.ShowMessage(g_menu_message_title, g_menu_message_text);
@@ -2120,11 +2186,9 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     return choice;
 }
 
-// (04.67) Games that need the translator set apart from the rest, by the title id in their file's
-// name. Little Kitty, Big City (01000A4019FA2000): its SDK heap rejects a block it frees ~9 s into
-// the boot with get/set elimination on (04.48-04.68; 04.69 found the pass), so it runs without it;
-// (04.70) unless the search for the block the pass is wrong for is under way (GetSetSearch), which
-// its first boot in this build starts. Returns what's set; text in [] is the loading screen's line.
+// (04.67) The translator's settings for a game: (04.71) the boot watcher's step for it (SafeBoot):
+// the normal settings unless a step it's taking or one remembered for it in this build says
+// otherwise. Returns what's set for the log; text in [] is the loading screen's line.
 std::string GameProfile(const std::string& program)
 {
     unsetenv("EDEN_PS4_MEM_LOG");
@@ -2133,45 +2197,30 @@ std::string GameProfile(const std::string& program)
     unsetenv("EDEN_PS4_JIT_TEST");
     unsetenv("EDEN_PS4_GETSET_RANGE");
     unsetenv("EDEN_PS4_DUMP_RANGE");
-    g_search_boot = false;
-    g_search_decided = false;
-    std::string upper = program;
-    for (char& c : upper)
-        c = char(std::toupper(static_cast<unsigned char>(c)));
-    if (upper.find("01000A4019FA2000") == std::string::npos)
-        return {};
-    GetSetSearch search = LoadSearch();
-    if (!search.active && !search.finished && !search.cancelled)
+    g_safe_boot_decided = false;
+    g_safe_boot_retrying = false;
+    SafeBoot s = LoadSafeBoot();
+    const bool fresh = !s.active || s.program != program;
+    if (fresh)
     {
-        search = {};
-        search.active = true;
-        search.program = program;
-        search.lo = kSearchCodeLo;
-        search.hi = kSearchCodeHi;
-        search.history.push_back("started");
+        // a new boot of it: normal first, unless a safer step got it running in this build
+        s.active = true;
+        s.program = program;
+        s.level = SafeBootRemembered(s, program);
     }
-    if (search.active && search.program == program)
-    {
-        if (search.phase == 1)
-            search.mid = search.lo + (((search.hi - search.lo) / 2) & ~uint64_t(3));
-        const uint64_t on_hi = search.phase == 1 ? search.mid : search.hi;
-        setenv("EDEN_PS4_GETSET_RANGE", fmt::format("{:x}-{:x}", search.lo, on_hi).c_str(), 1);
-        if (search.phase == 2)
-            setenv("EDEN_PS4_DUMP_RANGE", fmt::format("{:x}-{:x}", search.lo, search.hi).c_str(), 1);
-        search.pending = true;
-        SaveSearch(search);
-        Launcher::SetJitCache(false);    // (each step translates afresh)
-        Launcher::SetShaderCache(false); // (no rebuild of its shaders first: it fails before drawing)
-        g_search_boot = true;
-        unsigned left = search.phase == 2 ? 1 : 1 + (search.phase == 0 ? 1 : 0);
-        for (uint64_t size = search.hi - search.lo; search.phase != 2 && size > kSearchFinal; size /= 2)
-            left++;
-        return fmt::format("get/set search step {}: on for {:#x}-{:#x} [Finding the faulty code: step {}, about {} "
-                           "left. Leave it running]",
-                           search.step, search.lo, on_hi, search.step + 1, left);
-    }
-    setenv("EDEN_PS4_JIT_TEST", "getset", 1);
-    return "game profile 01000A4019FA2000: no get/set elimination (with it, its heap goes wrong as it loads)";
+    s.pending = true;
+    SaveSafeBoot(s);
+    g_safe_boot_watching = true;
+    const SafeBootLevel& level = kSafeBootLevels[s.level];
+    if (level.jit_test[0])
+        setenv("EDEN_PS4_JIT_TEST", level.jit_test, 1);
+    if (level.accuracy[0])
+        setenv("EDEN_PS4_CPU_ACCURACY", level.accuracy, 1);
+    if (s.level == 0)
+        return "boot watcher: the normal settings";
+    // (a step remembered from an earlier boot says so more plainly than one being tried now)
+    return fmt::format("boot watcher: {} [{}]", level.label,
+                       fresh ? "With safer settings (it needed them before)" : level.screen);
 }
 
 // (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on
@@ -2194,7 +2243,8 @@ void DrawLoadingFrame(Ui::Canvas& canvas)
     namespace D = Common::PS4Diagnostics;
     std::lock_guard lock{g_loading_mutex};
     Ui::DrawLoadingScreen(canvas, g_loading, D::loading_stage.load(), D::loading_done.load(), D::loading_total.load(),
-                          Seconds() - g_loading_start, D::guest_exceptions.load() + D::guest_aborts.load() != 0);
+                          Seconds() - g_loading_start, D::guest_exceptions.load() + D::guest_aborts.load() != 0,
+                          g_safe_boot_retrying.load());
 }
 
 // On the launcher's screen, about 7 times a second, until stopped
@@ -3180,31 +3230,40 @@ void* Run(void*)
     Trace("renderer: " + g_renderer_label);
     for (bool first = true;; first = false)
     {
-        // (04.70) a get/set search under way boots its game by itself (a step that never decided,
-        // a crash, counts as failing); one that finished says so in the HOME menu, once
+        // (04.71) the boot watcher: a boot that never decided (the app crashed or closed) failed;
+        // a step under way boots its game by itself; what it found, the HOME menu says once
         MenuChoice choice;
         {
-            GetSetSearch search = LoadSearch();
-            if (search.active && search.pending)
-                SearchRecord(search, true, "no decision: a crash, or the app closed");
-            if (search.active && !search.program.empty())
+            SafeBoot boot = LoadSafeBoot();
+            if (boot.active && boot.pending)
             {
-                Trace(fmt::format("get/set search: booting {} again by itself (step {})", search.program, search.step));
+                SafeBootFailed(boot, "the app crashed or closed");
+                Trace(fmt::format("boot watcher: {}", boot.history.back()));
+            }
+            if (boot.active && !boot.program.empty())
+            {
+                Trace(fmt::format("boot watcher: starting {} again by itself with {}", boot.program,
+                                  kSafeBootLevels[boot.level].label));
                 if (first)
                 {
                     std::unique_lock lock{g_mutex};
                     OpenPad();
                 }
-                choice = MenuChoice{search.program, settings};
+                choice = MenuChoice{boot.program, settings};
             }
-            else if ((search.finished || search.cancelled) && !search.reported && !search.program.empty())
+            else if (!boot.notice.empty())
             {
-                search.reported = true;
-                SaveSearch(search);
-                g_menu_message_title = search.finished ? "The search has finished" : "The search was cancelled";
-                g_menu_message_text = search.finished
-                    ? "Send the logs as usual: they hold what it found. The game runs as before meanwhile."
-                    : "The game runs as before. Starting it doesn't search again.";
+                const size_t bar = boot.notice.find('|');
+                g_menu_message_title = boot.notice.substr(0, bar);
+                g_menu_message_text = bar == std::string::npos ? std::string() : boot.notice.substr(bar + 1);
+                boot.notice.clear();
+                SaveSafeBoot(boot);
+            }
+            else if (const std::string crashed = TakeCrashNotice(); !crashed.empty())
+            {
+                // (04.71) a game the app crashed in (ps4_crash_restart started it again)
+                g_menu_message_title = crashed + " closed because of an error";
+                g_menu_message_text = "New Eden started again by itself. The logs are saved: send them as usual.";
             }
         }
         if (choice.program.empty())
@@ -3295,7 +3354,7 @@ void* Run(void*)
             {
                 std::lock_guard lock{g_loading_mutex};
                 g_loading = LoadingScreenFor(program, settings.white_theme);
-                // (04.70) a search step's line
+                // (04.71) the boot watcher's line, when it's taking a safer step
                 if (const size_t at = game_test.find('['); at != std::string::npos)
                     g_loading.publisher = game_test.substr(at + 1, game_test.find(']') - at - 1);
                 g_loading_start = Seconds();
@@ -3317,7 +3376,9 @@ void* Run(void*)
         watchdog.Start(program);
         BlackBox black_box;
         black_box.Start(program);
+        ArmCrashRestart(program);
         auto result = Launcher::Boot(program, kDataDir, ShowLine, ShowFrame, std::chrono::hours(24));
+        g_crash_restart_armed = false;
         black_box.Stop();
         watchdog.Stop();
         if (gpu)
@@ -3362,6 +3423,18 @@ void* Run(void*)
         pthread_join(pad_thread, nullptr);
         g_drawing = false;
         Trace(fmt::format("boot returned: status {}", int(result.status)));
+        {
+            // (04.71) a boot that ended before the watcher decided: a game that exited by itself or
+            // didn't load isn't the translator's failure; the watch ends with it
+            SafeBoot boot = LoadSafeBoot();
+            if (boot.active && boot.pending && !g_safe_boot_retrying.load())
+            {
+                boot.active = false;
+                boot.pending = false;
+                SaveSafeBoot(boot);
+            }
+            g_safe_boot_watching = false;
+        }
         if (FILE* f = std::fopen(kLogFile, "a"))
         {
             std::fprintf(f, "%s\n", kFinishedLine);
@@ -3382,6 +3455,32 @@ void* Run(void*)
 }
 
 } // namespace
+
+// (04.71) The crash handler's last step (port/ps4_crashlog.cpp, once crash.log is written): while a
+// game runs, the app starts again (the HOME menu, or the boot watcher's next step) instead of the
+// system's error screen, and the HOME menu says what happened. Not while the menu itself runs (a
+// crash there would come back each time). A restart that hasn't happened 10 s on ends the process
+// as before.
+extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+extern "C" void ps4_crash_restart()
+{
+    static std::atomic<bool> tried{false};
+    if (!g_crash_restart_armed.load() || tried.exchange(true))
+        return;
+    const int fd = open(kCrashNoticeFile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0)
+    {
+        const ssize_t written = write(fd, g_crash_program, strlen(g_crash_program));
+        (void)written;
+        close(fd);
+    }
+    pthread_t timer;
+    __real_pthread_create(&timer, nullptr, [](void*) -> void* {
+        sleep(10);
+        _exit(126);
+    }, nullptr);
+    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+}
 
 // Can the PS4 map the same direct memory at two addresses for this app? Fastmem (Eden's recompiler
 // reading and writing guest memory without walking a page table) needs the emulated RAM mapped

@@ -19,8 +19,9 @@ struct LoadingScreen
 // One frame of it, `now` seconds into the loading (its bar moves with it). Stage 1: loading the
 // game; 2: building its shaders, `done` of `total`; 3: starting it. (04.69) `failed`: the game hit
 // an error (its own check failing, its abort): said so, and how to leave; past 3 minutes without
-// that or a first frame, a hint that it may not be working.
+// that or a first frame, a hint that it may not be working. (04.71) `retrying`: the launcher's boot
+// watcher is starting it again with safer settings (said instead of how to leave).
 void DrawLoadingScreen(Canvas& c, const LoadingScreen& screen, int stage, unsigned done, unsigned total, double now,
-                       bool failed = false);
+                       bool failed = false, bool retrying = false);
 
 } // namespace Ui
