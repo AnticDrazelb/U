@@ -1,0 +1,102 @@
+From 5e0414064a1afafcd0ad1ebd58c578ea38a50ddb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 21:43:20 +0000
+Subject: [PATCH] PS4: the fastmem arena maps whole 2 MiB blocks where they
+ qualify (large pages), when switched on
+
+A fault in a 2 MiB block of the arena whose 512 guest pages are all ordinary memory (or all
+read-only cached memory, for a read), back to back in the DRAM from a 2 MiB-aligned offset whose
+direct memory is 2 MiB aligned too, maps the block in one sceKernelMapDirectMemory, 2 MiB aligned:
+a large page if the kernel gives one, fewer address translation misses for games that spread over
+gigabytes (Little Kitty, Big City: a flat profile over ~1.8 GiB). SetFastmemLargePages turns it on
+(the launcher measures whether the PS4 gives large pages first); FastmemLargeBlocks counts them.
+Otherwise, or when a block doesn't qualify, the 16 KiB runs as before.
+---
+ src/common/orbis_memory.cpp | 37 ++++++++++++++++++++++++++++++++++++-
+ src/common/orbis_memory.h   |  6 ++++++
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 375ffe0539..5ed0d9f37e 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -211,6 +211,8 @@ struct FastmemArena {
+     // why declined: not memory (unmapped, a debug page), a write to a page the GPU caches, a 16 KiB
+     // page whose guest pages aren't back to back in the DRAM, anything else
+     std::atomic<size_t> declined_unmapped{0}, declined_cached_write{0}, declined_split{0}, declined_other{0};
++    std::atomic<bool> large_pages{false}; // (04.72) whole 2 MiB blocks when they qualify
++    std::atomic<size_t> large_blocks{0};
+ };
+ FastmemArena arena;
+ std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
+@@ -322,9 +324,34 @@ bool ResolveArenaFault(uintptr_t address, bool write) noexcept {
+     Decline why = Decline::None;
+     const size_t source = ArenaPageSource(*table, va, read_only, &why, &padded);
+     bool mapped = false;
++    // (04.72) the whole 2 MiB block around it, when every 16 KiB of it follows on from a 2 MiB-
++    // aligned place in the DRAM, alike (all writable, or all read-only and this a read), and that
++    // place's direct memory is 2 MiB aligned too: one mapping, which can be a large page
++    if (source != SIZE_MAX && !(write && read_only) && !padded && arena.large_pages.load(std::memory_order_relaxed)) {
++        const u64 block = va & ~u64(OnDemandChunk - 1);
++        const size_t block_source = source - size_t(va - block);
++        bool qualifies = source >= size_t(va - block) && block_source % OnDemandChunk == 0 &&
++                         block + OnDemandChunk <= arena.size;
++        for (size_t off = 0; qualifies && off < OnDemandChunk; off += ArenaPage) {
++            bool page_read_only = false, page_padded = false;
++            qualifies = ArenaPageSource(*table, block + off, page_read_only, nullptr, &page_padded) == block_source + off &&
++                        page_read_only == read_only && !page_padded;
++        }
++        const off_t block_phys = qualifies ? PhysOf(block_source) : -1;
++        if (block_phys >= 0 && block_phys % off_t(OnDemandChunk) == 0) {
++            void* at = reinterpret_cast<void*>(base + block);
++            mapped = sceKernelMapDirectMemory(&at, OnDemandChunk, read_only ? ProtCpuRead : ProtCpuReadWrite, MapFixed,
++                                              block_phys, OnDemandChunk) == 0 &&
++                     at == reinterpret_cast<void*>(base + block);
++            if (mapped) {
++                arena.mapped.fetch_add(OnDemandChunk, std::memory_order_relaxed);
++                arena.large_blocks.fetch_add(1, std::memory_order_relaxed);
++            }
++        }
++    }
+     // (a write to a page the GPU caches: declined, the write goes through the page table walk and
+     // the callbacks, which tell the GPU's caches)
+-    if (source != SIZE_MAX && !(write && read_only)) {
++    if (!mapped && source != SIZE_MAX && !(write && read_only)) {
+         // and the pages after it, as far as they follow on in the DRAM, in the same chunk, alike
+         size_t length = ArenaPage;
+         bool next_read_only = false;
+@@ -691,6 +718,14 @@ void InvalidateArena(size_t offset, size_t length) {
+     sceKernelMprotect(reinterpret_cast<void*>(base + begin), end - begin, 0);
+ }
+ 
++void SetFastmemLargePages(bool on) {
++    arena.large_pages.store(on, std::memory_order_relaxed);
++}
++
++size_t FastmemLargeBlocks() {
++    return arena.large_blocks.load(std::memory_order_relaxed);
++}
++
+ size_t FastmemMappedBytes() {
+     return arena.mapped.load(std::memory_order_relaxed);
+ }
+diff --git a/src/common/orbis_memory.h b/src/common/orbis_memory.h
+index 81c0e83035..c11777839e 100644
+--- a/src/common/orbis_memory.h
++++ b/src/common/orbis_memory.h
+@@ -93,6 +93,12 @@ bool ResolveFault(std::uintptr_t address, bool write);
+ /// Whether pages the GPU caches may be mapped in the arena for reads (without reactive flushing
+ /// the page table walk reads them inline too)
+ void SetFastmemCachedReads(bool on);
++/// (PS4 04.72) A fault in a 2 MiB block of the arena whose 512 guest pages are all ordinary memory,
++/// back to back in the DRAM at a 2 MiB-aligned place there, maps the whole block at once, 2 MiB
++/// aligned (a large page, when the kernel gives one: fewer address translation misses). Off unless
++/// set (the launcher measures whether the PS4 gives large pages first). Blocks mapped so.
++void SetFastmemLargePages(bool on);
++std::size_t FastmemLargeBlocks();
+ 
+ /// Arena padding: the free guest pages beside a stack the kernel lined up with the PS4's 16 KiB
+ /// pages (core/hle/kernel: a stack the game maps with svcMapMemory gets memory at the same place in
+-- 
+2.43.0
+

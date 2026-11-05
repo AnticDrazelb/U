@@ -88,6 +88,34 @@ programs, 0 failures.
 - **04.69:** the loading screen tells a failed game; Little Kitty's test of the two IR passes apart (below).
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
+- **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+
+## 04.72: Little Kitty's profile; large pages
+
+- **04.71 on the console:** Little Kitty, Big City boots with the normal settings (the boot watcher
+  recorded it three times) and plays at ~7 fps, CPU Unsafe or not; L3 + R3 then hit 04.70's
+  shutdown crash (`KThread::EndWait`, after an assert that `KThreadLocalPage::Finalize`'s page
+  table lock wasn't the current thread's: a guest thread held it when the cores stopped), and
+  `ps4_crash_restart` brought the app back to the HOME menu. Now a crash while a game is being
+  closed (`shutting_down`) shows no message.
+- **The profile (profiler on, 197 s):** the game's two busy threads (cores 0 and 1) spend ~75% of
+  their time in translated code, spread thin (the hottest block under 1%); Eden's own code is
+  small there (scheduler, idle, timing); the GPU thread waits 82% of the time. In the top 512
+  blocks: memcpy/memset (the SDK's, 0x89c71xxx) 27%, PLT stubs 11%, nn::os locks 10%, the game
+  45%; over the whole run, memcpy/memset are 6-8% of translated time and the game's own code ~87%.
+  The hot blocks' host code: ~4.3 host instructions a guest one; compute 31%, guest register loads
+  and stores at block edges 19%, branches and links 16%, NZCV through memory 9%, fastmem accesses
+  7% and their range checks 7%, page table walks 3%. 17% of the top blocks' samples are blocks
+  that branch to their own start (loops paying a block exit and entry each time round). The SDK's
+  memcpy/memset and locks walk the page table: sites recompiled once a write went to memory the
+  GPU caches (~14,700 sites by the end), for every later call.
+- **Large pages:** a random-read probe at the app's start, once a version (`large-pages.txt`),
+  through three mappings of the same 128 MiB of direct memory: 2 MiB aligned, misaligned on
+  purpose, and 2 MiB aligned but built of 512 KiB pieces (the arena's way). If the aligned one is
+  >15% faster than the misaligned one, `SetFastmemLargePages` turns on patch 0157: a fault in a
+  2 MiB block of the arena whose pages all follow on from a 2 MiB-aligned DRAM offset (aligned
+  direct memory too) maps the whole block at once. The stats line says how much is in such blocks.
+  A "measuring" line first: a crash while measuring isn't tried again.
 
 ## 04.71: the bug, the translator's speed, the boot watcher
 

@@ -1715,6 +1715,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.72: a test of the PS4's large memory pages when the app starts (once a version, a fraction of a "
+         "second): where they're faster, games' memory is mapped in 2 MiB blocks. A game closed with L3 + R3 "
+         "no longer shows an error when Eden trips while shutting it down.\n"
          "04.71: the CPU translation prepares a game's code about six times faster, so games load faster. "
          "Little Kitty, Big City runs without the slow workaround (the cause of its stop while loading, found "
          "by 04.70's search, is fixed: a CPU translation bug that could affect any game). A boot watcher: a game that "
@@ -2879,6 +2882,9 @@ std::string PerfLine(double seconds)
                                 double(resolved - last_resolved) / seconds, double(declined - last_declined) / seconds,
                                 per_second(why[0], last_why[0]), per_second(why[1], last_why[1]),
                                 per_second(why[2], last_why[2]), per_second(why[3], last_why[3]));
+            // (04.72) of what's mapped, whole 2 MiB blocks (large pages when the PS4 gives them)
+            if (const size_t blocks = Common::Orbis::FastmemLargeBlocks(); blocks != 0)
+                line += fmt::format(", {} MiB of it in 2 MiB blocks", blocks * 2);
             // the game's aliased memory (thread stacks) lined up with the PS4's pages for it
             const uint64_t aliases = P::aliases.load(std::memory_order_relaxed);
             if (aliases != 0) {
@@ -3261,9 +3267,17 @@ void* Run(void*)
             }
             else if (const std::string crashed = TakeCrashNotice(); !crashed.empty())
             {
-                // (04.71) a game the app crashed in (ps4_crash_restart started it again)
-                g_menu_message_title = crashed + " closed because of an error";
-                g_menu_message_text = "New Eden started again by itself. The logs are saved: send them as usual.";
+                // (04.71) a game the app crashed in (ps4_crash_restart started it again); (04.72)
+                // not one being closed (the crash was Eden's shutdown's: nothing to tell)
+                if (crashed.rfind("closing|", 0) == 0)
+                {
+                    Trace("the last game crashed while it was being closed (Eden's shutdown): started again");
+                }
+                else
+                {
+                    g_menu_message_title = crashed + " closed because of an error";
+                    g_menu_message_text = "New Eden started again by itself. The logs are saved: send them as usual.";
+                }
             }
         }
         if (choice.program.empty())
@@ -3470,6 +3484,13 @@ extern "C" void ps4_crash_restart()
     const int fd = open(kCrashNoticeFile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd >= 0)
     {
+        // (04.72) a crash while the game was being closed (Eden's shutdown: 04.70-04.71's
+        // KThread::EndWait) isn't the game's error: marked, and the HOME menu says nothing
+        if (Common::PS4Diagnostics::shutting_down.load(std::memory_order_relaxed))
+        {
+            const ssize_t marked = write(fd, "closing|", 8);
+            (void)marked;
+        }
         const ssize_t written = write(fd, g_crash_program, strlen(g_crash_program));
         (void)written;
         close(fd);
@@ -3601,11 +3622,149 @@ static void ProbeDoubleMapping()
                       g_dmem_aliasing ? "fastmem is possible" : "no way found yet"));
 }
 
+// (04.72) Does the PS4 give 2 MiB pages to a direct memory mapping that could have them? A game
+// like Little Kitty, Big City runs a flat profile over ~1.8 GiB of memory (and 200+ MiB of
+// translated code): if every access pays for 4 KiB address translations (TLB misses), mapping the
+// emulated RAM in 2 MiB pieces could be worth more than any translator change. Random reads over
+// 128 MiB, timed through three mappings of the same memory: one 2 MiB aligned (virtual and
+// physical: a large page is possible), one misaligned on purpose (it isn't), and one 2 MiB aligned
+// but made of 512 KiB pieces, as the fastmem arena maps the game's memory. Once per version (the
+// result is kept in large-pages.txt; ~0.3 s).
+static bool ProbeLargePages()
+{
+    constexpr const char* kFile = "/data/eden-ps4/large-pages.txt";
+    // (this version's last line: its result, or "measuring" if the app never got past it: then
+    // it's not tried again, and large pages stay off)
+    std::string before;
+    for (const std::string& line : ReadLines(kFile, 16384))
+        if (line.rfind(std::string(EDEN_PS4_VERSION) + ": ", 0) == 0)
+            before = line.substr(std::strlen(EDEN_PS4_VERSION) + 2);
+    if (!before.empty())
+    {
+        Trace("large pages (measured before): " + before);
+        return before.find("large pages help") != std::string::npos;
+    }
+    if (FILE* f = std::fopen(kFile, "a"))
+    {
+        std::fprintf(f, "%s: measuring (the app stopped while it measured: not tried again)\n", EDEN_PS4_VERSION);
+        std::fflush(f);
+        fsync(fileno(f));
+        std::fclose(f);
+    }
+    constexpr size_t kSize = 128 * MB, kLarge = 2 * MB, kPiece = 512 * 1024;
+    off_t phys = 0;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kSize + kLarge, kLarge, 0, &phys) != 0)
+    {
+        Trace("large pages: no direct memory to measure with");
+        return false;
+    }
+    void* aligned = nullptr;
+    void* misaligned = nullptr;
+    void* pieces = nullptr;
+    const bool a_ok = sceKernelMapDirectMemory(&aligned, kSize, 0x03, 0, phys, kLarge) == 0;
+    // (the same memory 16 KiB on: a virtual address 2 MiB aligned over a physical one that isn't)
+    const bool m_ok = g_dmem_aliasing && sceKernelMapDirectMemory(&misaligned, kSize, 0x03, 0, phys + 16 * 1024, kLarge) == 0;
+    bool p_ok = g_dmem_aliasing && sceKernelMapDirectMemory(&pieces, kSize, 0x03, 0, phys, kLarge) == 0;
+    if (p_ok)
+    {
+        // (unmapped and mapped again in pieces where it was, as the arena's faults map runs)
+        sceKernelMunmap(pieces, kSize);
+        for (size_t at = 0; p_ok && at < kSize; at += kPiece)
+        {
+            void* where = static_cast<char*>(pieces) + at;
+            p_ok = sceKernelMapDirectMemory(&where, kPiece, 0x03, 0x10, phys + off_t(at), 16 * 1024) == 0 &&
+                   where == static_cast<char*>(pieces) + at;
+        }
+    }
+    std::string report;
+    // (a fault while measuring is caught, reported, and the memory given back)
+    struct sigaction guard {}, old_segv {}, old_bus {};
+    guard.sa_sigaction = ProbeFault;
+    guard.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&guard.sa_mask);
+    sigaction(SIGSEGV, &guard, &old_segv);
+    sigaction(SIGBUS, &guard, &old_bus);
+    if (const int sig = sigsetjmp(g_probe_jump, 1); sig != 0)
+    {
+        g_probe_guarded = 0;
+        report = fmt::format("a read faulted while measuring (signal {})", sig);
+    }
+    else if (a_ok)
+    {
+        g_probe_guarded = 1;
+        // a random cycle through one cache line in every 512 bytes, as offsets from the memory's
+        // start (from 16 KiB on: the misaligned view starts there)
+        constexpr uint32_t kFirst = 32, kNodes = kSize / 512 - kFirst;
+        auto* const node = static_cast<uint32_t*>(aligned);
+        std::vector<uint32_t> order(kNodes);
+        for (uint32_t i = 0; i < kNodes; i++)
+            order[i] = kFirst + i;
+        uint64_t seed = 0x9E3779B97F4A7C15ull;
+        for (uint32_t i = kNodes - 1; i > 0; i--)
+        {
+            seed ^= seed << 13, seed ^= seed >> 7, seed ^= seed << 17;
+            std::swap(order[i], order[seed % i]); // (Sattolo: one cycle through all of them)
+        }
+        for (uint32_t i = 0; i < kNodes; i++)
+            node[size_t(order[i]) * 128] = order[(i + 1) % kNodes] * 128;
+        const auto chase = [&](const void* base) {
+            const auto* const words = static_cast<const volatile uint32_t*>(base);
+            constexpr int kHops = 400000;
+            uint32_t at = order[0] * 128;
+            for (int i = 0; i < 20000; i++) // (warm up)
+                at = words[at];
+            const double start = Seconds();
+            for (int i = 0; i < kHops; i++)
+                at = words[at];
+            const double ns = (Seconds() - start) * 1e9 / kHops;
+            return at == 0xFFFFFFFFu ? -1.0 : ns;
+        };
+        const double t_aligned = chase(aligned);
+        // (the misaligned view's first byte is the memory's 16 KiB: its start is 16 KiB before it)
+        const double t_mis = m_ok ? chase(static_cast<const char*>(misaligned) - 16 * 1024) : -1;
+        const double t_pieces = p_ok ? chase(pieces) : -1;
+        report = fmt::format("random reads over 128 MiB: {:.0f} ns each through a 2 MiB-aligned mapping, {} through a "
+                             "misaligned one, {} through 512 KiB pieces (as the arena)",
+                             t_aligned, t_mis < 0 ? std::string("-") : fmt::format("{:.0f} ns", t_mis),
+                             t_pieces < 0 ? std::string("-") : fmt::format("{:.0f} ns", t_pieces));
+        if (t_mis > 0)
+            report += fmt::format(" -> {}", t_aligned < t_mis * 0.85 ? "large pages help" : "no large-page gain");
+        g_probe_guarded = 0;
+    }
+    else
+    {
+        report = "the aligned mapping failed";
+    }
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
+    if (aligned)
+        sceKernelMunmap(aligned, kSize);
+    if (misaligned)
+        sceKernelMunmap(misaligned, kSize);
+    if (pieces)
+        sceKernelMunmap(pieces, kSize);
+    sceKernelReleaseDirectMemory(phys, kSize + kLarge);
+    Trace("large pages: " + report);
+    if (FILE* f = std::fopen(kFile, "a"))
+    {
+        std::fprintf(f, "%s: %s\n", EDEN_PS4_VERSION, report.c_str());
+        std::fclose(f);
+    }
+    return report.find("large pages help") != std::string::npos;
+}
+
 int main()
 {
     mkdir(kDataDir, 0777);
     Trace("started");
     ProbeDoubleMapping();
+    // (04.72) the fastmem arena maps whole 2 MiB blocks where it can, if the PS4 gives them large pages
+    {
+        const bool large = g_dmem_aliasing && ProbeLargePages();
+        Common::Orbis::SetFastmemLargePages(large);
+        Trace(large ? "fastmem: 2 MiB blocks (large pages) where the game's memory allows"
+                    : "fastmem: 16 KiB pages only (no large-page gain measured)");
+    }
     // a browser that goes away mid-transfer would otherwise end the app (the web server)
     std::signal(SIGPIPE, SIG_IGN);
     LoadSystemModules();

@@ -379,6 +379,10 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.72: **a large-page probe** at the app's start (once a version): where the PS4's 2 MiB pages
+measure faster, the fastmem arena maps games' memory in whole 2 MiB blocks (patch 0157). A crash
+while a game is being closed no longer shows a message. STATUS.md has Little Kitty's profile.
+
 04.71: **the bug behind Little Kitty, Big City's stop fixed** (patch 0155: the u64-to-float
 conversion without AVX-512 took a register inside a branch, and the block's stack pointer was lost:
 found from 04.70's search with the desktop harness); it runs with every optimisation again. **The
