@@ -1494,9 +1494,10 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
-         "04.67: a game that stopped while loading now runs: its code is translated with fewer optimisations. "
-         "Other games are unchanged.\n"
-         "04.65-04.66: test builds for it.\n"
+         "04.68: two fixes in the CPU translation: a multiply and a sign extension that could get the upper half "
+         "of a 64-bit result wrong, and a division by zero that didn't give zero. Games that stopped or "
+         "misbehaved because of them can run, at full speed.\n"
+         "04.67: a game that stopped while loading now runs (04.65-04.66: test builds for it).\n"
          "04.64: a User Page: choose the top left icon for the nickname and icon games show for you, from 30 "
          "characters on 12 colours, with an on-screen keyboard. Motion controls: the controller's motion "
          "sensors work in games that steer or aim by tilting (System Settings, Console, to turn them off).\n"
@@ -1951,11 +1952,12 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
 }
 
 // (04.67) Games that need the translator set apart from the rest, by the title id in their file's
-// name. Little Kitty, Big City (01000A4019FA2000): its SDK heap rejects a block it frees ~9 s into
-// the boot (04.48-04.66), with or without fastmem; 04.65's tests found it runs with every recompiler
-// optimisation off (CPU accuracy Paranoid), 04.66's that the IR passes alone do it (get/set
-// elimination and constant propagation off, EDEN_PS4_JIT_TEST=ir, arm_dynarmic_64.cpp: one of them,
-// or the code it leads the x64 emitter to, computes something wrong for it). Returns what's set.
+// name. None since 04.68: Little Kitty, Big City (01000A4019FA2000), whose SDK heap rejected a block
+// it freed ~9 s into the boot (04.48-04.66), ran with the IR passes off in 04.67; the desktop
+// differential test (tools/jit-difftest) then found what they exposed: the PS4's sign-extended W
+// register reads (04.26) lost their upper half when moved before their use (SMADDL, SMULL, SXTW of a
+// W register get/set elimination read earlier), and Eden's SDIV by zero gave the dividend; both are
+// fixed in the translator (patch 0152). Returns what's set.
 std::string GameProfile(const std::string& program)
 {
     unsetenv("EDEN_PS4_MEM_LOG");
@@ -1969,14 +1971,14 @@ std::string GameProfile(const std::string& program)
         const char* what;
     };
     static const Profile profiles[] = {
-        {"01000A4019FA2000", "ir", "the translator's IR passes off (with them, its heap goes wrong as it loads)"},
+        {nullptr, nullptr, nullptr},
     };
     std::string upper = program;
     for (char& c : upper)
         c = char(std::toupper(static_cast<unsigned char>(c)));
     for (const Profile& profile : profiles)
     {
-        if (upper.find(profile.title_id) == std::string::npos)
+        if (!profile.title_id || upper.find(profile.title_id) == std::string::npos)
             continue;
         setenv("EDEN_PS4_JIT_TEST", profile.jit_off, 1);
         return fmt::format("game profile {}: {}", profile.title_id, profile.what);

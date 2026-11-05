@@ -1,0 +1,25 @@
+# The 64-bit translator against itself on the desktop (README.md):
+#   cmake -S eden-ps4/tools/jit-difftest -B ~/dyn-host -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#     -DCMAKE_PREFIX_PATH=<fmt and xbyak installed> -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
+cmake_minimum_required(VERSION 3.22)
+project(jit-difftest CXX C)
+include(CMakeDependentOption)
+set(CMAKE_CXX_STANDARD 20)
+set(EDEN_DIR "$ENV{HOME}/eden" CACHE PATH "Eden's tree (its src/dynarmic, src/common headers)")
+set(BOOST_HEADERS "$ENV{HOME}/eden-deps/boost_headers/include" CACHE PATH "Boost's headers")
+find_package(fmt CONFIG REQUIRED)
+add_compile_definitions(ARCHITECTURE_x86_64=1)
+set(ARCHITECTURE x86_64)
+# Eden's common library, which its Dynarmic links: its logging and asserts, stubbed
+add_library(common STATIC ${CMAKE_CURRENT_LIST_DIR}/common_stub.cpp)
+target_include_directories(common PUBLIC ${EDEN_DIR}/src ${BOOST_HEADERS})
+target_link_libraries(common PUBLIC fmt::fmt)
+add_subdirectory(${EDEN_DIR}/src/dynarmic dynarmic)
+target_include_directories(dynarmic PUBLIC ${EDEN_DIR}/src ${BOOST_HEADERS})
+target_link_libraries(dynarmic PUBLIC fmt::fmt)
+add_executable(jit-difftest difftest.cpp ${EDEN_DIR}/src/dynarmic/tests/fuzz_util.cpp)
+target_include_directories(jit-difftest PRIVATE ${EDEN_DIR}/src/dynarmic/src ${EDEN_DIR}/src/dynarmic)
+target_link_libraries(jit-difftest PRIVATE dynarmic fmt::fmt)
+add_executable(jit-irdump irdump.cpp)
+target_include_directories(jit-irdump PRIVATE ${EDEN_DIR}/src/dynarmic/src ${EDEN_DIR}/src/dynarmic)
+target_link_libraries(jit-irdump PRIVATE dynarmic fmt::fmt)

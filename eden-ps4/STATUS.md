@@ -84,6 +84,26 @@ programs, 0 failures.
 - **04.65:** a test build for Little Kitty, Big City's heap failure (below).
 - **04.66:** its next round: the translator's shortcuts one group at a time (below).
 - **04.67:** Little Kitty, Big City runs with the IR passes off (below).
+- **04.68:** the two translator bugs behind it fixed; no per-game profile (below).
+
+## 04.68: two translator bugs fixed (tools/jit-difftest)
+
+- **The harness:** `tools/jit-difftest` builds Eden's Dynarmic on the desktop and runs random A64
+  blocks as the PS4's CPU Auto translates them, without the IR passes, and with no optimisation (the
+  referee); differences are shrunk and printed (README there). 20,000 integer blocks: 67 differences.
+- **Bug 1 (the port's, 04.26):** `PeepholeQuad` marks a W register read used only by a
+  `SignExtendWordToLong` as read with `movsxd` (and fastmem loads used only by a sign extension as
+  `movsx`/`movsxd`), the extension then nothing. The value stays a U32 (U8/U16) to the register
+  allocator, whose moves and spills of it are 32 bits: moved before its use, it lost the extension.
+  With get/set elimination the W register is read at its first use in the block, often far from
+  the SMADDL/SMSUBL/SMULL/SXTW that extends it, so the upper half of `x = sext(w)*...` came out wrong
+  for negative values: Little Kitty, Big City's heap (its index arithmetic), 04.48-04.67. Fix:
+  `RegAlloc::WidenValue` (the location's `max_bit_width` raised), called where those values are made.
+- **Bug 2 (Eden's, #3517):** `EmitSignedDiv32` left the dividend in eax for a zero divisor: SDIV by
+  a zero W register gave the dividend instead of 0. Fix: 0 there (the 64-bit one was right).
+- **After:** 0 differences in 200,000 integer blocks with all host features and 200,000 with the
+  Jaguar's (`DYNARMIC_HOST_FEATURES_MASK=16b00f`). `GameProfile` has no entries; Little Kitty runs
+  with every optimisation.
 
 ## 04.67: Little Kitty, Big City: the IR passes off
 

@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.68: **two CPU translation bugs fixed** (patch 0152), found with a desktop differential test of
+the translator (`tools/jit-difftest`): the PS4's sign-extended register reads lost their upper half
+when moved (a wrong upper half in SMADDL/SMULL/SXTW results: what broke Little Kitty, Big City's
+heap), and Eden's 32-bit SDIV by zero gave the dividend instead of 0. Little Kitty runs with every
+optimisation again.
+
 04.67: **Little Kitty, Big City runs**: its code is translated without Eden's IR passes (get/set
 elimination, constant propagation), with which its heap went wrong ~9 s into the boot (04.66 found
 it). Other games are unchanged.

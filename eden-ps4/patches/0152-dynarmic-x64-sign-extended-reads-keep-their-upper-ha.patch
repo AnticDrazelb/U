@@ -1,0 +1,115 @@
+From ac73f06666d9d1e4a533d72b3ccc68eb7ee63be7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 16:19:13 +0000
+Subject: [PATCH] dynarmic x64: sign-extended reads keep their upper half when
+ moved; SDIV (32-bit) by zero is 0
+
+PS4 04.26's sign-extended W register reads (A64GetW read with movsxd for the SignExtendWordToLong
+that uses it) and fastmem loads (movsx/movsxd) left a U32 (or narrower) value whose register held
+the 64-bit extension: a 32-bit move or spill of it before its use (get/set elimination reads a W
+register at its first use in the block) dropped the upper half, and SMADDL, SMSUBL, SMULL and SXTW
+of a negative value got a wrong upper half (Little Kitty, Big City's heap, 04.48-04.67).
+RegAlloc::WidenValue makes every move and spill of such a value keep its bits.
+
+EmitSignedDiv32 (#3517) returned the dividend for a zero divisor (eax holds it there): now 0, as
+SDIV by zero is.
+
+Found by tools/jit-difftest (eden-ps4): random A64 blocks with the IR passes and without, the
+optimisations-off translation the referee; 0 differences in 400,000 integer blocks after this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp       |  1 +
+ .../backend/x64/emit_x64_data_processing.cpp        |  8 ++++++--
+ .../dynarmic/backend/x64/emit_x64_memory.cpp.inc    |  3 +++
+ src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h   | 13 +++++++++++++
+ 4 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 37a7c3d4e5..7bc6431dff 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -792,6 +792,7 @@ void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
+         const Xbyak::Reg64 wide = ctx.reg_alloc.ScratchGpr(code);
+         code.movsxd(wide, dword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+         ctx.reg_alloc.DefineValue(code, inst, wide);
++        ctx.reg_alloc.WidenValue(inst, 64);  // (04.68: moved before its use, all 64 bits)
+         return;
+     }
+     const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index a4cbfc1c65..ff7470cda5 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -1305,9 +1305,9 @@ void EmitX64::EmitSignedDiv32(EmitContext& ctx, IR::Inst* inst) {
+     ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+     ctx.reg_alloc.UseScratch(code, args[0], HostLoc::RAX);
+     auto const divisor = ctx.reg_alloc.UseGpr(code, args[1]).cvt32();
+-    Xbyak::Label end, ok;
++    Xbyak::Label end, ok, zero;
+     code.test(divisor, divisor);
+-    code.jz(end, code.T_NEAR);
++    code.jz(zero, code.T_NEAR);
+     code.cmp(divisor, u32(-1)); // is sign extended
+     code.jne(ok, code.T_NEAR);
+     code.cmp(eax, u32(1ULL << 31));
+@@ -1315,6 +1315,10 @@ void EmitX64::EmitSignedDiv32(EmitContext& ctx, IR::Inst* inst) {
+     code.L(ok);
+     code.cdq();
+     code.idiv(divisor);
++    code.jmp(end, code.T_NEAR);
++    // (PS4 04.68) a division by zero is 0 (eax holds the dividend here: #3517 returned it)
++    code.L(zero);
++    code.xor_(eax, eax);
+     code.L(end);
+     ctx.reg_alloc.DefineValue(code, inst, eax);
+ }
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 2a4d5e9e29..89c7065221 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -250,6 +250,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         ctx.reg_alloc.DefineValue(code, inst, Xbyak::Xmm{value_idx});
+     } else {
+         ctx.reg_alloc.DefineValue(code, inst, Xbyak::Reg64{value_idx});
++        // (04.68) sign-extended as read: moved before its extension, all of those bits
++        if (sx != 0)
++            ctx.reg_alloc.WidenValue(inst, sx);
+     }
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+index 6a20618f19..c25a97dbe9 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/reg_alloc.h
+@@ -66,6 +66,10 @@ public:
+     void ReleaseOne() noexcept;
+     void ReleaseAll() noexcept;
+     constexpr size_t GetMaxBitWidth() const noexcept { return 1 << max_bit_width; }
++    /// (PS4 04.68) Its register holds `bits` that matter, more than its values' types say
++    void Widen(size_t bits) noexcept {
++        max_bit_width = std::max<uint8_t>(max_bit_width, uint8_t(std::countr_zero(bits)));
++    }
+     void AddValue(HostLoc loc, IR::Inst* inst) noexcept;
+     /// Checks if the given instruction is in our values set
+     /// SAFETY: Const is casted away, irrelevant since this is only used for checking
+@@ -174,6 +178,15 @@ public:
+ 
+     void DefineValue(BlockOfCode& code, IR::Inst* inst, const Xbyak::Reg& reg) noexcept;
+     void DefineValue(BlockOfCode& code, IR::Inst* inst, Argument& arg) noexcept;
++    /// (PS4 04.68) A value whose register holds more bits than its type has (a W register or a
++    /// load read sign-extended to 64 bits for the extension that uses it, A64EmitX64::PeepholeQuad):
++    /// every move and spill of it keeps `bits`, else a 32-bit move of a U32 drops the extension
++    /// (SMULL, SMADDL and SXTW of a W register the get/set elimination read further up then had
++    /// the wrong upper half: Little Kitty, Big City's heap, 04.48-04.67)
++    void WidenValue(const IR::Inst* inst, size_t bits) noexcept {
++        if (const auto loc = ValueLocation(inst))
++            LocInfo(*loc).Widen(bits);
++    }
+ 
+     void Release(const Xbyak::Reg& reg) noexcept;
+ 
+-- 
+2.43.0
+
