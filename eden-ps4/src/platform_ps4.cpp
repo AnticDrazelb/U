@@ -1136,6 +1136,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.speed = 200;
         else if (line == "touchpad=minus")
             settings.touchpad_minus = true;
+        else if (line == "draws=serial")
+            settings.serial_draws = true;
         else if (line.starts_with("games_folder="))
             settings.games_folder = line.substr(13);
     }
@@ -1148,7 +1150,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
     {
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
-                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\n",
+                        "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\ndraws=%s\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1158,7 +1160,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.pin_threads ? "pinned" : "free", settings.unlocked_frames ? "unlocked" : "60hz", settings.speed,
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
                      settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
-                     settings.touchpad_minus ? "minus" : "touch");
+                     settings.touchpad_minus ? "minus" : "touch", settings.serial_draws ? "serial" : "parallel");
         // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
         std::fflush(f);
         fsync(fileno(f));
@@ -1404,6 +1406,13 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.60: back to 04.48's GPU settings, with the shader-cache fix and the touchpad kept. 04.58's "
+         "logs: Zelda and Mario Kart locked the GPU with 04.55's safety fixes on and every draw waiting, and "
+         "they ran on 04.48 without either. The safety fixes are off now, and whether draws wait is a menu "
+         "choice: System Settings, Graphics, Draw Order (Parallel, the default and as on 04.48, or One at a "
+         "Time, which got Toad through levels 3 and 4). Try Captain Toad on Parallel first; if it closes with "
+         "a GPU hang, switch to One at a Time. Send the logs either way: the last two hang reports are kept "
+         "now.\n"
          "04.59: the touchpad is the Switch's touch screen (Captain Toad's level 4 needs one). Rest a finger "
          "on it and a pointer shows where it would touch: the touchpad is the picture, corner to corner. Click "
          "the touchpad to touch there, and hold the click to drag; a quick tap touches too. The Minus button "
@@ -3220,13 +3229,15 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
-    // (04.55) The kitchen sink against Captain Toad's level 3 GPU hang: RADV_PS4_MITIGATE (hex bits,
-    // default ff) - Mesa: 1 no CP DMA prefetch, 2 no VS late alloc, 4 conservative IA_MULTI_VGT_PARAM;
-    // the driver layer: 0x10 new buffers zeroed; here: 0x20 RADV_DEBUG=nohiz,nofastclears (unless
-    // settings.txt sets RADV_DEBUG). Each one in the boot trace; RADV_PS4_MITIGATE=0 for none.
+    // (04.55) The kitchen sink against Captain Toad's level 3 GPU hang: RADV_PS4_MITIGATE (hex bits)
+    // - Mesa: 1 no CP DMA prefetch, 2 no VS late alloc, 4 conservative IA_MULTI_VGT_PARAM; the driver
+    // layer: 0x10 new buffers zeroed; here: 0x20 RADV_DEBUG=nohiz,nofastclears (unless settings.txt
+    // sets RADV_DEBUG). Each one in the boot trace. (04.60) Off unless settings.txt sets it (04.55-04.59:
+    // ff): Toad's level 3 hang was its shaders from another GPU window (04.57), and with it on Zelda
+    // and Mario Kart hung, which ran on 04.48 without it.
     {
         const char* bits = std::getenv("RADV_PS4_MITIGATE");
-        const unsigned long mitigate = bits && bits[0] ? std::strtoul(bits, nullptr, 16) : 0xff;
+        const unsigned long mitigate = bits && bits[0] ? std::strtoul(bits, nullptr, 16) : 0;
         if ((mitigate & 0x20) && !std::getenv("RADV_DEBUG"))
             setenv("RADV_DEBUG", "nohiz,nofastclears", 1);
         const char* debug = std::getenv("RADV_DEBUG");
@@ -3290,6 +3301,10 @@ void* Run(void*)
         Launcher::SetUnlockedFrames(settings.unlocked_frames);
         Launcher::SetSpeedPercent(settings.speed);
         g_touchpad_minus = settings.touchpad_minus;
+        // (04.60) read by the driver layer as the game's Vulkan device starts (port/mesa/ac_ps4_drm.c,
+        // ps4_serialize_init): One at a Time, every draw waits for the one before and the GPU's caches
+        // are flushed in between (04.58-04.59 for every game); Parallel, as up to 04.48
+        setenv("RADV_PS4_SERIALIZE", settings.serial_draws ? "full" : "off", 1);
         {
             // keys and firmware on a USB drive are used from there, else the user folder's
             const Launcher::UsbKeysAndFirmware usb = KeysAndFirmwareOnUsb();
@@ -3312,7 +3327,7 @@ void* Run(void*)
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
             "GPU accuracy {}, frame pacing {}, game speed {}%, draw shortcuts {}, GPU macros {}; CPU {}, {} cores, threads {}, fastmem {}; "
-            "the Switch's RAM {}; touchpad: {}{}",
+            "the Switch's RAM {}; touchpad: {}; draw order: {}{}",
             g_renderer_label, settings.docked ? "docked" : "handheld", settings.resolution,
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
@@ -3321,6 +3336,7 @@ void* Run(void*)
             settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.touchpad_minus ? "the Minus button" : "the touch screen",
+            settings.serial_draws ? "one at a time" : "parallel",
             settings.profiler ? "; profiler on" : "");
         Trace(setup);
         dynarmic_ps4_block_map_enable(settings.profiler ? 1 : 0);

@@ -49,7 +49,7 @@
  
 +#ifdef __PS4__
 +/* PS4 (Eden for PS4 04.55): the "kitchen sink" against Captain Toad's level 3 GPU hang, each a bit of
-+ * RADV_PS4_MITIGATE (hex, default all): 1 = no CP DMA prefetch (shaders, vertex buffer descriptors),
++ * RADV_PS4_MITIGATE (hex, default none - 04.55-04.59: all): 1 = no CP DMA prefetch (shaders, vertex buffer descriptors),
 + * 2 = no late alloc for VS waves (all CUs), 4 = conservative IA_MULTI_VGT_PARAM (SWITCH_ON_EOP,
 + * WD_SWITCH_ON_EOP, PARTIAL_VS_WAVE_ON, PARTIAL_ES_WAVE_ON). The driver layer and the frontend have
 + * their own bits (ac_ps4_drm.c, platform_ps4.cpp). */
@@ -61,7 +61,7 @@
 +   static int bits = -1;
 +   if (bits < 0) {
 +      const char *e = os_get_option("RADV_PS4_MITIGATE");
-+      bits = e && e[0] ? (int)strtoul(e, NULL, 16) : 0xff;
++      bits = e && e[0] ? (int)strtoul(e, NULL, 16) : 0; /* (04.60: off unless asked; 04.55-04.59: 0xff) */
 +      char line[200];
 +      snprintf(line, sizeof(line), "radv/ps4: mitigations %#x: CP DMA prefetch %s, VS late alloc %s, IA %s",
 +               bits, (bits & 1) ? "off" : "on", (bits & 2) ? "off" : "on", (bits & 4) ? "conservative" : "as RADV");

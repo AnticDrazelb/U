@@ -834,6 +834,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "New shaders are built in the background instead of stopping the game while they compile (slow on "
              "the PS4's CPU): what needs one is missing for a moment instead of the game freezing.",
              [](MenuSettings& s) { s.async_shaders = !s.async_shaders; }},
+            {"Draw Order", settings.serial_draws ? "One at a Time" : "Parallel",
+             "Parallel: the PS4's GPU works on several of a game's draws at once, as normal. One at a Time: each "
+             "draw waits for the one before, and the GPU's caches are emptied in between: slower, but it kept "
+             "Captain Toad's levels 3 and 4 running (04.58). If a game closes with a GPU hang, try the other one "
+             "and send the logs.",
+             [](MenuSettings& s) { s.serial_draws = !s.serial_draws; }},
             {"FPS Counter", on_off(settings.fps_overlay),
              "The frames shown each second, at the top centre of the picture while a game runs (a game's own target is "
              "usually 30 or 60).",

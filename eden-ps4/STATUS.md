@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.59)
+# Eden for PS4: status (after 04.60)
 
-Install **04.59** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.60** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0145). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -74,6 +74,31 @@ programs, 0 failures.
 - **04.58:** level 3 loads; it hangs once draws overlap again: every draw serialized, all the time
   (`RADV_PS4_SERIALIZE`, below).
 - **04.59:** the touchpad as the Switch's touch screen, with a pointer (below).
+- **04.60:** the kitchen sink off; draw serialization a HOME menu choice (Draw Order), Parallel by
+  default (below).
+
+## 04.60: back to 04.48's GPU settings
+
+- **04.58's logs (five sessions):** Toad: one session hung at ~106 s (submission 14409, its report lost),
+  the next completed level 3 twice and played level 4 (status 3: stopped from the frontend, L3 + R3). Mario Kart hung at
+  ~125 s (17803) and Zelda at ~238 s (15130; its first frame came after 95 s: every pipeline rebuilt
+  for 04.57's new cache UUID). All three: the hang exit (crash.log `abort` in `ps4_hang_watch_thread`),
+  with every draw serialized and the kitchen sink on (`RADV_PS4_MITIGATE=ff`, `nohiz,nofastclears`;
+  `IA_MULTI_VGT_PARAM` 0x17007f). Zelda's stop: one draw, a `DRAW_INDEX_INDIRECT_COUNT_MULTI` (0x9D,
+  count 1) of 867 indices x 36 instances, VS prolog 0x44ff1b1600 (main VS 0x44ffc3d400), PS
+  0x44ffc3d300 (all `s_movk_i32 ..., 0x44`); the same shaders' draw before it (non-instanced) and an
+  indirect one of 0 instances finished. Each hang report overwrote the last.
+- **The user's runs:** Zelda and Mario Kart ran on 04.48 (no kitchen sink, no serialization); 04.56
+  (the trivial-shader arms, which overwrote shaders in every game) and 04.58 hung both. Toad never
+  ran level 3 without the kitchen sink (before 04.57 the 0x96 shaders stopped it first).
+- **04.60:** `RADV_PS4_MITIGATE` defaults to 0 everywhere (Mesa `radv_ps4_mitigations`, the driver
+  layer's new-buffer zeroing, the frontend's `RADV_DEBUG`); `RADV_PS4_SERIALIZE` defaults to `off` in
+  the driver layer (Crema's own Flush Caches setting untouched), and Eden for PS4 sets it from System
+  Settings, Graphics, Draw Order before each boot: Parallel (`off`, the default) or One at a Time
+  (`full`). The hang report renames the last one to `gpu/gpu-hang-previous.txt` first.
+- **Reading it:** Zelda / Mario Kart fine on Parallel: the kitchen sink or the serialization broke them.
+  Toad on Parallel: fine, the kitchen sink was in the way there too; a hang, Toad's draws need One at a
+  Time (then: why, from its report).
 
 ## 04.59: the touchpad as the touch screen
 

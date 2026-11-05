@@ -71,6 +71,7 @@ struct MenuSettings
     bool unlocked_frames = false; // frames shown as soon as they're done, not at the next 60 Hz vsync
     int speed = 100;              // game speed in percent of the Switch's: 100, 150 or 200
     bool touchpad_minus = false;  // (04.59) the touchpad's click is the Minus button; off: the touch screen
+    bool serial_draws = false;    // (04.60) Draw Order: One at a Time (each draw waits, caches flushed); off: Parallel
     std::string games_folder;  // Game Folder: games, keys and firmware also looked for here, in all its
                                // folders (as Crema's): a USB drive or any folder (empty: none)
 };

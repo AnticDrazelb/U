@@ -1394,6 +1394,13 @@ ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
            "%s\n",
            (unsigned long long)waited_seq, (unsigned long long)completed,
            (unsigned long long)dev->last_seq, ps4_gpu_file("gpu-hang.txt"));
+   /* (04.60) the session before's report kept (each hang wrote over the last: 04.58's Mario Kart and
+    * Toad reports were lost to Zelda's) */
+   {
+      char previous[256];
+      snprintf(previous, sizeof(previous), "%s", ps4_gpu_file("gpu-hang-previous.txt"));
+      rename(ps4_gpu_file("gpu-hang.txt"), previous);
+   }
    FILE *f = fopen(ps4_gpu_file("gpu-hang.txt"), "w");
    if (f) {
       fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
@@ -2698,14 +2705,15 @@ extern int ac_ps4_flush_all_draws;
 static bool ps4_sync_by_us;          /* we turned it on */
 /* (04.58) RADV_PS4_SERIALIZE: "loads" (04.49-04.57: after a loading gap only, as above), "full" (all the
  * time, the wait and the cache flushes: ac_ps4_flush_all_draws 1), "wait" (all the time, the wait only:
- * 2), "off". Default "full": Captain Toad's level 3 ran while its draws waited for each other and hung
- * within 0.5-7 s of their going off, inside a run of 12 scene draws in flight together. */
+ * 2), "off". 04.58-04.59's default "full": Captain Toad's level 3 ran while its draws waited for each
+ * other and hung within 0.5-7 s of their going off. (04.60) Default "off" (as up to 04.48; Crema's own
+ * Flush Caches setting is left alone): Eden for PS4 sets it from the HOME menu's Draw Order. */
 static void
 ps4_serialize_init(void)
 {
    const char *e = getenv("RADV_PS4_SERIALIZE");
    if (!e || !e[0])
-      e = "full";
+      e = "off";
    const int mode = !strcmp(e, "full") ? 1 : !strcmp(e, "wait") ? 2 : 0;
    if (mode)
       __atomic_store_n(&ac_ps4_flush_all_draws, mode, __ATOMIC_RELEASE);
@@ -4322,7 +4330,7 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
       static int zero_new = -1;
       if (zero_new < 0) {
          const char *e = getenv("RADV_PS4_MITIGATE");
-         zero_new = ((e && e[0] ? strtoul(e, NULL, 16) : 0xff) & 0x10) != 0;
+         zero_new = ((e && e[0] ? strtoul(e, NULL, 16) : 0) & 0x10) != 0; /* (04.60: off unless asked) */
          ps4_log("radv/ps4: new buffers %s\n", zero_new ? "zeroed (RADV_PS4_MITIGATE bit 0x10)" : "not zeroed");
       }
       if (!r && whole && a == (void *)(uintptr_t)addr && zero_new)

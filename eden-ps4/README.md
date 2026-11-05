@@ -379,6 +379,13 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.60: **04.48's GPU settings again.** On 04.58 Zelda and Mario Kart hung (they ran on 04.48), as did
+one of Toad's sessions, with the kitchen sink on and every draw serialized. The kitchen sink is off
+by default now (`RADV_PS4_MITIGATE` 0 unless settings.txt sets it), and the serialization is the HOME
+menu's System Settings, Graphics, Draw Order: Parallel (default, as up to 04.48) or One at a Time
+(04.58's: each draw waits for the one before, caches flushed). The previous hang report is kept as
+`gpu/gpu-hang-previous.txt`.
+
 04.59: **the touchpad is the touch screen.** A finger resting on the PS4 controller's touchpad shows a
 pointer where it would touch (the touchpad maps onto the picture, corner to corner); a click with
 that finger touches there while held (sliding drags), and a quick tap touches too. A two-finger click
