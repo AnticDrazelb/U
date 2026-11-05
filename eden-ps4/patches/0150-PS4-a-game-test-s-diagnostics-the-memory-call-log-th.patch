@@ -1,0 +1,359 @@
+From 8ff1e422d5237b9d14e84cc14b484b00ba69e20e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 13:40:52 +0000
+Subject: [PATCH] PS4: a game test's diagnostics: the memory call log, the
+ first guest exception's memory dump, the aligned rest switch
+
+EDEN_PS4_MEM_LOG=1: SetHeapSize, Map/UnmapPhysicalMemory (with the physical pieces each mapping
+got), Map/UnmapMemory, SetMemoryPermission/Attribute and the memory GetInfos, with their results, in
+log.txt (the first 6000; GetInfo's 400); at the first guest exception that isn't a hint, what its
+registers point at (block, physical page, bytes) and the memory map. EDEN_PS4_ALIGNED_REST=0: Eden's
+own single pages for an allocation's rest under 64 KiB, in place of the PS4's 16 KiB-aligned run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/common/ps4_mem_log.h                      | 22 +++++
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     | 80 +++++++++++++++++++
+ src/core/hle/kernel/k_memory_manager.cpp      |  8 +-
+ src/core/hle/kernel/k_page_table_base.cpp     | 14 ++++
+ src/core/hle/kernel/svc/svc_info.cpp          | 19 ++++-
+ src/core/hle/kernel/svc/svc_memory.cpp        | 25 +++++-
+ .../hle/kernel/svc/svc_physical_memory.cpp    | 17 +++-
+ 7 files changed, 176 insertions(+), 9 deletions(-)
+ create mode 100644 src/common/ps4_mem_log.h
+
+diff --git a/src/common/ps4_mem_log.h b/src/common/ps4_mem_log.h
+new file mode 100644
+index 0000000000..8d79dec3a6
+--- /dev/null
++++ b/src/common/ps4_mem_log.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstdlib>
++
++namespace Common::PS4Diagnostics {
++// (New Eden 04.65) The game's memory calls in log.txt with their results (EDEN_PS4_MEM_LOG=1, the
++// launcher's test of a game that corrupts its heap): the first 6000 of them (GetInfo's, 400)
++inline bool MemLogOn() {
++    static const bool on = [] {
++        const char* e = std::getenv("EDEN_PS4_MEM_LOG");
++        return e && e[0] == '1';
++    }();
++    return on;
++}
++inline std::atomic<int> mem_log_left{6000}, mem_info_log_left{400};
++inline bool MemLogTake(bool info = false) {
++    return MemLogOn() && (info ? mem_info_log_left : mem_log_left).fetch_sub(1, std::memory_order_relaxed) > 0;
++}
++} // namespace Common::PS4Diagnostics
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 120f052e0b..530d921ab3 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -11,13 +11,20 @@
+ #include <cstring>
+ #include "common/orbis_memory.h"
+ #endif
++#include <algorithm>
++#include <atomic>
++#include <string>
++#include <vector>
+ #include "common/ps4_perf.h"
++#include "common/ps4_mem_log.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_64.h"
+ #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+ #include "core/core_timing.h"
+ #include "core/hle/kernel/k_process.h"
++#include "core/hle/kernel/k_memory_block.h"
++#include "core/memory.h"
+ #include "dynarmic/interface/A64/config.h"
+ 
+ namespace Core {
+@@ -124,6 +131,74 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
+     m_parent.m_jit->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
+ }
+ 
++namespace {
++// (New Eden 04.65) The first guest exception that isn't a hint (as a game's heap check failing):
++// what its registers point at (the block, the physical page, the bytes there) and the process's
++// memory map, in log.txt, once per process
++void DumpForDiagnosis(Core::Memory::Memory& memory, Kernel::KProcess* process,
++                      const Kernel::Svc::ThreadContext& ctx) {
++    static std::atomic<bool> done{false};
++    if (process == nullptr || done.exchange(true)) {
++        return;
++    }
++    auto& table = process->GetPageTable();
++    const u64 space_start = GetInteger(table.GetAddressSpaceStart());
++    const u64 space_end = space_start + table.GetAddressSpaceSize();
++    const auto query = [&](u64 address, Kernel::KMemoryInfo& info) {
++        Kernel::Svc::PageInfo page_info{};
++        return R_SUCCEEDED(table.QueryInfo(&info, &page_info, address));
++    };
++    LOG_WARNING(Core_ARM, "diag: the first guest exception, at pc {:#x}: what its registers point at", ctx.pc);
++    for (size_t r = 0; r < 32; r++) {
++        const u64 value = r < 29 ? ctx.r[r] : r == 29 ? ctx.fp : r == 30 ? ctx.lr : ctx.sp;
++        const std::string name = r < 29 ? fmt::format("x{}", r) : r == 29 ? "fp" : r == 30 ? "lr" : "sp";
++        Kernel::KMemoryInfo info{};
++        if (value < space_start || value >= space_end || !query(value, info) ||
++            info.GetState() == Kernel::KMemoryState::Free) {
++            continue;
++        }
++        Kernel::KPhysicalAddress physical{};
++        const bool has_physical = table.GetPhysicalAddress(&physical, value);
++        LOG_WARNING(Core_ARM, "diag: {} = {:#x}: block {:#x}+{:#x}, state {:#x}, permission {:#x}, attribute {:#x}; "
++                    "physical {}", name, value, info.GetAddress(), info.GetSize(), u32(info.GetState()),
++                    u32(info.GetPermission()), u32(info.GetAttribute()),
++                    has_physical ? fmt::format("{:#x}", GetInteger(physical)) : std::string("none"));
++        if (!True(info.GetPermission() & Kernel::KMemoryPermission::UserRead)) {
++            continue;
++        }
++        const u64 begin = (std::max)(value & ~u64(63), u64(info.GetAddress()));
++        const u64 end = (std::min)(begin + (r < 2 ? 256 : 64), u64(info.GetEndAddress()));
++        std::vector<u8> bytes(end - begin);
++        if (bytes.empty() || !memory.ReadBlock(begin, bytes.data(), bytes.size())) {
++            continue;
++        }
++        for (size_t at = 0; at < bytes.size(); at += 32) {
++            std::string line;
++            for (size_t i = at; i < (std::min)(at + 32, bytes.size()); i++) {
++                line += fmt::format("{:02x}{}", bytes[i], (i % 8) == 7 ? "  " : " ");
++            }
++            LOG_WARNING(Core_ARM, "diag:   {:#x}: {}", begin + at, line);
++        }
++    }
++    // the memory map (what isn't free)
++    size_t blocks = 0;
++    for (u64 at = space_start; at < space_end && blocks < 800;) {
++        Kernel::KMemoryInfo info{};
++        if (!query(at, info) || info.GetEndAddress() <= at) {
++            break;
++        }
++        if (info.GetState() != Kernel::KMemoryState::Free) {
++            LOG_WARNING(Core_ARM, "diag: map {:#x}+{:#x}: state {:#x}, permission {:#x}, attribute {:#x}",
++                        info.GetAddress(), info.GetSize(), u32(info.GetState()), u32(info.GetPermission()),
++                        u32(info.GetAttribute()));
++            blocks++;
++        }
++        at = info.GetEndAddress();
++    }
++    LOG_WARNING(Core_ARM, "diag: {} blocks mapped", blocks);
++}
++} // namespace
++
+ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+     switch (exception) {
+     case Dynarmic::A64::Exception::WaitForInterrupt:
+@@ -143,6 +218,11 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
+         } else {
+             m_parent.LogBacktrace(m_process);
+             LOG_CRITICAL(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X})", static_cast<std::size_t>(exception), pc, m_memory.Read32(pc));
++            if (Common::PS4Diagnostics::MemLogOn()) {
++                Kernel::Svc::ThreadContext ctx{};
++                m_parent.GetContext(ctx);
++                DumpForDiagnosis(m_memory, m_process, ctx);
++            }
+         }
+     }
+ }
+diff --git a/src/core/hle/kernel/k_memory_manager.cpp b/src/core/hle/kernel/k_memory_manager.cpp
+index 9a0fcfbc8e..87aec49fdf 100644
+--- a/src/core/hle/kernel/k_memory_manager.cpp
++++ b/src/core/hle/kernel/k_memory_manager.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <algorithm>
+ 
+ #include "common/alignment.h"
+@@ -269,7 +270,12 @@ Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages,
+         // The PS4's fastmem maps 16 KiB pages, each from 16 KiB of the DRAM: the rest under the
+         // smallest block but one (64 KiB) as one run at a 16 KiB boundary rather than single 4 KiB
+         // pages anywhere, so that it maps too (a code region's end, its globals, often is that rest)
+-        if (index == 0 && num_pages > 1) {
++        // ((New Eden 04.65) EDEN_PS4_ALIGNED_REST=0: Eden's own single pages, a test)
++        static const bool aligned_rest = [] {
++            const char* e = std::getenv("EDEN_PS4_ALIGNED_REST");
++            return !(e && e[0] == '0');
++        }();
++        if (aligned_rest && index == 0 && num_pages > 1) {
+             constexpr size_t ArenaPages = 4;
+             const s32 aligned_index = KPageHeap::GetAlignedBlockIndex(num_pages, ArenaPages);
+             for (Impl* cur_manager = this->GetFirstManager(pool, dir);
+diff --git a/src/core/hle/kernel/k_page_table_base.cpp b/src/core/hle/kernel/k_page_table_base.cpp
+index d36602bd63..8bbf69afc0 100644
+--- a/src/core/hle/kernel/k_page_table_base.cpp
++++ b/src/core/hle/kernel/k_page_table_base.cpp
+@@ -11,6 +11,7 @@
+ #include "core/hle/kernel/k_page_table_base.h"
+ #include "core/hle/kernel/k_scoped_resource_reservation.h"
+ #include "core/hle/kernel/k_system_resource.h"
++#include "common/ps4_mem_log.h"
+ #ifdef EDEN_ARENA_LINE_UP
+ #include <cstring>
+ #include "core/device_memory.h"
+@@ -5562,6 +5563,19 @@ Result KPageTableBase::MapPhysicalMemory(KProcessAddress address, size_t size) {
+             R_TRY(m_system.Kernel().MemoryManager().AllocateForProcess(
+                 std::addressof(pg), (size - mapped_size) / PageSize, m_allocate_option,
+                 GetCurrentProcess(m_system.Kernel()).GetId(), m_heap_fill_value));
++            // ((New Eden 04.65) the memory it got, for the memory call log)
++            if (Common::PS4Diagnostics::MemLogTake()) {
++                std::string blocks;
++                size_t shown = 0, count = 0;
++                for (const auto& block : pg) {
++                    if (shown++ < 12) {
++                        blocks += fmt::format(" {:#x}+{:#x}", GetInteger(block.GetAddress()), block.GetSize());
++                    }
++                    count++;
++                }
++                LOG_WARNING(Kernel, "mem:   for {:#x}+{:#x} ({:#x} already mapped): {} pieces:{}{}",
++                            GetInteger(address), size, mapped_size, count, blocks, count > 12 ? " ..." : "");
++            }
+ 
+             // If we fail in the next bit (or retry), we need to cleanup the pages.
+             auto pg_guard = SCOPE_GUARD {
+diff --git a/src/core/hle/kernel/svc/svc_info.cpp b/src/core/hle/kernel/svc/svc_info.cpp
+index 863bb58fa8..b5168a45d7 100644
+--- a/src/core/hle/kernel/svc/svc_info.cpp
++++ b/src/core/hle/kernel/svc/svc_info.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "core/core.h"
++#include "common/ps4_mem_log.h"
+ #include "core/core_timing.h"
+ #include "core/hle/kernel/k_memory_manager.h"
+ #include "core/hle/kernel/k_process.h"
+@@ -310,7 +311,23 @@ Result GetSystemInfo(Core::System& system, uint64_t* out, SystemInfoType info_ty
+ 
+ Result GetInfo64(Core::System& system, uint64_t* out, InfoType info_type, Handle handle,
+                  uint64_t info_subtype) {
+-    R_RETURN(GetInfo(system, out, info_type, handle, info_subtype));
++    const Result result = GetInfo(system, out, info_type, handle, info_subtype);
++    // (the memory's: regions and sizes)
++    switch (info_type) {
++    case InfoType::AliasRegionAddress: case InfoType::AliasRegionSize: case InfoType::HeapRegionAddress:
++    case InfoType::HeapRegionSize: case InfoType::TotalMemorySize: case InfoType::UsedMemorySize:
++    case InfoType::AslrRegionAddress: case InfoType::AslrRegionSize: case InfoType::StackRegionAddress:
++    case InfoType::StackRegionSize: case InfoType::SystemResourceSizeTotal: case InfoType::SystemResourceSizeUsed:
++    case InfoType::TotalNonSystemMemorySize: case InfoType::UsedNonSystemMemorySize:
++    case InfoType::AliasRegionExtraSize:
++        if (Common::PS4Diagnostics::MemLogTake(true))
++            LOG_WARNING(Kernel_SVC, "mem: GetInfo({}, {:#x}) = {:#x}: {:#x}", u32(info_type), info_subtype, result.raw,
++                        result.IsSuccess() ? *out : 0);
++        break;
++    default:
++        break;
++    }
++    R_RETURN(result);
+ }
+ 
+ Result GetSystemInfo64(Core::System& system, uint64_t* out, SystemInfoType info_type, Handle handle,
+diff --git a/src/core/hle/kernel/svc/svc_memory.cpp b/src/core/hle/kernel/svc/svc_memory.cpp
+index 970912fe50..aaf516e5c1 100644
+--- a/src/core/hle/kernel/svc/svc_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_memory.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "core/core.h"
++#include "common/ps4_mem_log.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/svc.h"
+ 
+@@ -162,22 +163,38 @@ Result UnmapMemory(Core::System& system, u64 dst_addr, u64 src_addr, u64 size) {
+ 
+ Result SetMemoryPermission64(Core::System& system, uint64_t address, uint64_t size,
+                              MemoryPermission perm) {
+-    R_RETURN(SetMemoryPermission(system, address, size, perm));
++    const Result result = SetMemoryPermission(system, address, size, perm);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: SetMemoryPermission({:#x}, {:#x}, {:#x}) = {:#x}", address, size, u32(perm),
++                    result.raw);
++    R_RETURN(result);
+ }
+ 
+ Result SetMemoryAttribute64(Core::System& system, uint64_t address, uint64_t size, uint32_t mask,
+                             uint32_t attr) {
+-    R_RETURN(SetMemoryAttribute(system, address, size, mask, attr));
++    const Result result = SetMemoryAttribute(system, address, size, mask, attr);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: SetMemoryAttribute({:#x}, {:#x}, mask {:#x}, {:#x}) = {:#x}", address, size, mask,
++                    attr, result.raw);
++    R_RETURN(result);
+ }
+ 
+ Result MapMemory64(Core::System& system, uint64_t dst_address, uint64_t src_address,
+                    uint64_t size) {
+-    R_RETURN(MapMemory(system, dst_address, src_address, size));
++    const Result result = MapMemory(system, dst_address, src_address, size);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: MapMemory({:#x} <- {:#x}, {:#x}) = {:#x}", dst_address, src_address, size,
++                    result.raw);
++    R_RETURN(result);
+ }
+ 
+ Result UnmapMemory64(Core::System& system, uint64_t dst_address, uint64_t src_address,
+                      uint64_t size) {
+-    R_RETURN(UnmapMemory(system, dst_address, src_address, size));
++    const Result result = UnmapMemory(system, dst_address, src_address, size);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: UnmapMemory({:#x} <- {:#x}, {:#x}) = {:#x}", dst_address, src_address, size,
++                    result.raw);
++    R_RETURN(result);
+ }
+ 
+ Result SetMemoryPermission64From32(Core::System& system, uint32_t address, uint32_t size,
+diff --git a/src/core/hle/kernel/svc/svc_physical_memory.cpp b/src/core/hle/kernel/svc/svc_physical_memory.cpp
+index 48915b2b1e..279a0cb2ef 100644
+--- a/src/core/hle/kernel/svc/svc_physical_memory.cpp
++++ b/src/core/hle/kernel/svc/svc_physical_memory.cpp
+@@ -7,6 +7,7 @@
+ #include "core/core.h"
+ #include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/svc.h"
++#include "common/ps4_mem_log.h"
+ 
+ namespace Kernel::Svc {
+ 
+@@ -143,15 +144,25 @@ Result SetUnsafeLimit(Core::System& system, uint64_t limit) {
+ }
+ 
+ Result SetHeapSize64(Core::System& system, uint64_t* out_address, uint64_t size) {
+-    R_RETURN(SetHeapSize(system, out_address, size));
++    const Result result = SetHeapSize(system, out_address, size);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: SetHeapSize({:#x}) = {:#x}, heap at {:#x}", size, result.raw,
++                    result.IsSuccess() ? *out_address : 0);
++    R_RETURN(result);
+ }
+ 
+ Result MapPhysicalMemory64(Core::System& system, uint64_t address, uint64_t size) {
+-    R_RETURN(MapPhysicalMemory(system, address, size));
++    const Result result = MapPhysicalMemory(system, address, size);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: MapPhysicalMemory({:#x}, {:#x}) = {:#x}", address, size, result.raw);
++    R_RETURN(result);
+ }
+ 
+ Result UnmapPhysicalMemory64(Core::System& system, uint64_t address, uint64_t size) {
+-    R_RETURN(UnmapPhysicalMemory(system, address, size));
++    const Result result = UnmapPhysicalMemory(system, address, size);
++    if (Common::PS4Diagnostics::MemLogTake())
++        LOG_WARNING(Kernel_SVC, "mem: UnmapPhysicalMemory({:#x}, {:#x}) = {:#x}", address, size, result.raw);
++    R_RETURN(result);
+ }
+ 
+ Result MapPhysicalMemoryUnsafe64(Core::System& system, uint64_t address, uint64_t size) {
+-- 
+2.43.0
+

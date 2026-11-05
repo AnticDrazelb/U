@@ -81,6 +81,27 @@ programs, 0 failures.
 - **04.62:** speed, part 1: wake-up latency and per-submission checks (below).
 - **04.63:** a live loading screen until a game's first frame (below).
 - **04.64:** the User Page (nickname and icon, as games see the Switch user) and motion controls (below).
+- **04.65:** a test build for Little Kitty, Big City's heap failure (below).
+
+## 04.65: Little Kitty, Big City's test build
+
+- **The failure (every run since 04.48):** ~9 s into the boot, before its first frame, the game frees
+  `0x1180704800` and its SDK heap (`nn::nlibsdk::heap::TlsHeapCentral::UncacheSmallMemory_`, from
+  `CentralHeap::Free`, from the Unity player) rejects it: `nnmem_nlib_debug_break` 16 times, then
+  `nn::diag::detail::Abort`. Fastmem off: Eden crashes in the same Unity function at host address
+  0x50 (the game following a null pointer, which the PS4's inline page table walk doesn't send to the
+  callbacks); all RAM up front: Eden runs out of memory loading the game. So the game read a wrong
+  value before, with or without fastmem. Not the stack alias copies (off with fastmem off), nor a
+  physical page handed out twice (`OpenFirst`'s assert never fired). The shader cache has 0 pipelines:
+  the loading screen goes from loading to starting.
+- **04.65:** patch 0150 and `GameTest` (`platform_ps4.cpp`): each boot of this game (its title id in
+  the file name) logs its memory calls with their results and the physical pieces each
+  `MapPhysicalMemory` got (`EDEN_PS4_MEM_LOG`, `common/ps4_mem_log.h`), and at the first guest
+  exception dumps what its registers point at and the memory map; and tries the next of three setups
+  (`game-test.txt` counts them; the loading screen says "Test N of 3"): as set; Eden's own single
+  pages for an allocation's rest (`EDEN_PS4_ALIGNED_REST=0`, the one PS4 kernel change on with fastmem
+  off); CPU accuracy Paranoid (`EDEN_PS4_CPU_ACCURACY=paranoid`: no recompiler optimisations, fastmem
+  kept). Other games: nothing changes.
 
 ## 04.64: the User Page, motion controls
 

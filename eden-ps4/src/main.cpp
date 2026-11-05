@@ -266,6 +266,14 @@ void ApplyLauncherSettings() {
     Settings::values.use_disk_shader_cache.SetValue(g_shader_cache);
     Settings::values.use_asynchronous_shaders.SetValue(g_async_shaders);
     Settings::values.cpu_accuracy.SetValue(g_cpu_unsafe ? Settings::CpuAccuracy::Unsafe : Settings::CpuAccuracy::Auto);
+    // (04.65) EDEN_PS4_CPU_ACCURACY=paranoid (every recompiler optimisation off) or accurate: the
+    // launcher's test of a game whose memory goes wrong (platform_ps4.cpp, GameTest)
+    if (const char* accuracy = std::getenv("EDEN_PS4_CPU_ACCURACY"); accuracy && accuracy[0]) {
+        if (std::string_view{accuracy} == "paranoid")
+            Settings::values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Paranoid);
+        else if (std::string_view{accuracy} == "accurate")
+            Settings::values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Accurate);
+    }
     // EDEN_PS4_FASTMEM=0: no fastmem on the desktop either, so that guest memory goes through the
     // recompiler's page table walk, as on the PS4 (which can't map memory twice): Debugging
     // accuracy, with the optimisations Auto has otherwise

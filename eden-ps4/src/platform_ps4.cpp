@@ -1494,6 +1494,7 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.65: a test build: extra diagnostics for a game that stops while it loads. Nothing else changes.\n"
          "04.64: a User Page: choose the top left icon for the nickname and icon games show for you, from 30 "
          "characters on 12 colours, with an on-screen keyboard. Motion controls: the controller's motion "
          "sensors work in games that steer or aim by tilting (System Settings, Console, to turn them off).\n"
@@ -1945,6 +1946,45 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     g_screen.Clear();
     g_screen.SetScale(2.0f);
     return choice;
+}
+
+// (04.65) A test build's rotation for a game whose heap goes wrong early (Little Kitty, Big City,
+// 01000A4019FA2000): each boot of it logs its memory calls and dumps what its registers point at
+// when its heap check fails (EDEN_PS4_MEM_LOG), and tries the next of three setups in turn, from a
+// count kept in game-test.txt: 1 as set; 2 Eden's own single-page allocation in place of the PS4's
+// 16 KiB-aligned one (EDEN_PS4_ALIGNED_REST=0); 3 every recompiler optimisation off
+// (EDEN_PS4_CPU_ACCURACY=paranoid). Other games: nothing changes. Returns the test's description.
+std::string GameTest(const std::string& program)
+{
+    unsetenv("EDEN_PS4_MEM_LOG");
+    unsetenv("EDEN_PS4_ALIGNED_REST");
+    unsetenv("EDEN_PS4_CPU_ACCURACY");
+    if (program.find("01000A4019FA2000") == std::string::npos && program.find("01000a4019fa2000") == std::string::npos)
+        return {};
+    const std::string path = std::string(kDataDir) + "/game-test.txt";
+    unsigned count = 0;
+    for (const std::string& line : ReadLines(path.c_str()))
+        count = unsigned(std::strtoul(line.c_str(), nullptr, 10));
+    if (FILE* f = std::fopen(path.c_str(), "w"))
+    {
+        std::fprintf(f, "%u\n", count + 1);
+        std::fflush(f);
+        fsync(fileno(f));
+        std::fclose(f);
+    }
+    setenv("EDEN_PS4_MEM_LOG", "1", 1);
+    switch (count % 3)
+    {
+    case 1:
+        setenv("EDEN_PS4_ALIGNED_REST", "0", 1);
+        return fmt::format("game test {} (2 of 3): Eden's own page allocation (no 16 KiB-aligned rests)", count + 1);
+    case 2:
+        setenv("EDEN_PS4_CPU_ACCURACY", "paranoid", 1);
+        return fmt::format("game test {} (3 of 3): CPU accuracy paranoid (every recompiler optimisation off)",
+                           count + 1);
+    default:
+        return fmt::format("game test {} (1 of 3): the settings as set", count + 1);
+    }
 }
 
 // (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on
@@ -2999,6 +3039,9 @@ void* Run(void*)
         setenv("EDEN_PS4_PIN_THREADS", settings.pin_threads ? "1" : "0", 1);
         // read by Eden's HostMemory as it maps the Switch's RAM (common/host_memory.cpp)
         setenv("EDEN_PS4_FASTMEM", settings.fastmem ? "1" : "0", 1);
+        const std::string game_test = GameTest(program);
+        if (!game_test.empty())
+            Trace(game_test);
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
@@ -3037,6 +3080,9 @@ void* Run(void*)
             {
                 std::lock_guard lock{g_loading_mutex};
                 g_loading = LoadingScreenFor(program, settings.white_theme);
+                // (04.65) which of the test build's three setups this boot is
+                if (const size_t at = game_test.find('('); at != std::string::npos)
+                    g_loading.publisher = "Test " + game_test.substr(at + 1, game_test.find(')') - at - 1);
                 g_loading_start = Seconds();
             }
             Common::PS4Diagnostics::loading_stage = 1;

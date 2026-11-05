@@ -379,6 +379,9 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.65: **a test build** for Little Kitty, Big City, which stops ~9 s into its boot on a heap check:
+each boot of it logs its memory calls and tries one of three setups in turn (patch 0150).
+
 04.64: **a User Page and motion controls.** The HOME screen's user icon opens the User Page: the
 nickname and icon games show for the player (an on-screen keyboard; 30 original characters on 12
 colours), set as Eden's user at each boot. The controller's motion sensors are the Switch controller's
