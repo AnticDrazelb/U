@@ -835,6 +835,152 @@ std::unique_ptr<Launcher::AudioOutput> MakeAudioOutput()
 std::atomic<bool> g_running{false};
 // The last program that didn't load, and why (the HOME menu says so when it comes back)
 std::string g_load_failure_name, g_load_failure;
+// (04.70) The search for the block get/set elimination mistranslates in a game: Little Kitty, Big
+// City runs only with that pass off (04.69), and the desktop tests (tools/jit-difftest) haven't
+// found why. Each boot of the game turns the pass on only for the blocks that start in the lower
+// half of the range left (EDEN_PS4_GETSET_RANGE, arm_dynarmic_64.cpp), off for the rest: the game
+// failing (its heap check, a guest exception) puts the block there, 60 s past its start without
+// failing in the upper half. The launcher decides, stops the game and boots it again by itself
+// (a fresh process each time) until the range is 1 KiB, then once more with those blocks' guest
+// code and IR in the log (EDEN_PS4_DUMP_RANGE). The state and its history are in
+// getset-search.txt (in the log bundle). L3 + R3 cancels it; a boot that never decided (a crash)
+// counts as failing. After it, the game runs without the pass (the profile that works).
+struct GetSetSearch
+{
+    bool active = false, finished = false, cancelled = false, pending = false, reported = false;
+    std::string program;
+    uint64_t lo = 0, hi = 0, mid = 0;
+    unsigned step = 0;
+    int phase = 0; // 0: the whole range on (it has to fail), 1: halving, 2: the final range's dump
+    std::vector<std::string> history;
+};
+constexpr const char* kSearchFile = "/data/eden-ps4/getset-search.txt";
+constexpr uint64_t kSearchCodeLo = 0x80000000, kSearchCodeHi = 0x90000000; // (the game's modules)
+constexpr uint64_t kSearchAllHi = uint64_t(1) << 39;
+constexpr uint64_t kSearchFinal = 0x400;  // the range at which it stops halving
+constexpr double kSearchPassSeconds = 60; // past the game's start without failing: a pass
+
+GetSetSearch LoadSearch()
+{
+    GetSetSearch s;
+    for (const std::string& line : ReadLines(kSearchFile, 256 * 1024))
+    {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos)
+            continue;
+        const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+        const uint64_t number = std::strtoull(value.c_str(), nullptr, 16);
+        if (key == "active")
+            s.active = number != 0;
+        else if (key == "finished")
+            s.finished = number != 0;
+        else if (key == "cancelled")
+            s.cancelled = number != 0;
+        else if (key == "pending")
+            s.pending = number != 0;
+        else if (key == "reported")
+            s.reported = number != 0;
+        else if (key == "program")
+            s.program = value;
+        else if (key == "lo")
+            s.lo = number;
+        else if (key == "hi")
+            s.hi = number;
+        else if (key == "mid")
+            s.mid = number;
+        else if (key == "step")
+            s.step = unsigned(number);
+        else if (key == "phase")
+            s.phase = int(number);
+        else if (key == "history")
+            s.history.push_back(value);
+    }
+    return s;
+}
+
+void SaveSearch(const GetSetSearch& s)
+{
+    if (FILE* f = std::fopen(kSearchFile, "w"))
+    {
+        std::fprintf(f, "active=%x\nfinished=%x\ncancelled=%x\npending=%x\nreported=%x\nprogram=%s\nlo=%llx\n"
+                        "hi=%llx\nmid=%llx\nstep=%x\nphase=%x\n",
+                     unsigned(s.active), unsigned(s.finished), unsigned(s.cancelled), unsigned(s.pending),
+                     unsigned(s.reported),
+                     s.program.c_str(), (unsigned long long)s.lo, (unsigned long long)s.hi,
+                     (unsigned long long)s.mid, s.step, unsigned(s.phase));
+        for (const std::string& h : s.history)
+            std::fprintf(f, "history=%s\n", h.c_str());
+        std::fflush(f);
+        fsync(fileno(f));
+        std::fclose(f);
+    }
+}
+
+// The boot in flight's result: where the block is now
+void SearchRecord(GetSetSearch& s, bool failed, const char* why)
+{
+    const uint64_t on_hi = s.phase == 1 ? s.mid : s.hi;
+    s.history.push_back(fmt::format("step {} (phase {}): get/set on for {:#x}-{:#x}: {} ({})", s.step, s.phase, s.lo,
+                                    on_hi, failed ? "failed" : "passed", why));
+    s.pending = false;
+    s.step++;
+    if (s.phase == 0)
+    {
+        if (failed)
+            s.phase = 1;
+        else if (s.lo == kSearchCodeLo && s.hi == kSearchCodeHi)
+            s.lo = 0, s.hi = kSearchAllHi; // (not in the modules' range: everywhere, once)
+        else
+        {
+            s.active = false;
+            s.finished = true;
+            s.history.push_back("it didn't fail with the pass on everywhere");
+        }
+    }
+    else if (s.phase == 1)
+    {
+        (failed ? s.hi : s.lo) = s.mid;
+        if (s.hi - s.lo <= kSearchFinal)
+            s.phase = 2;
+    }
+    else
+    {
+        s.active = false;
+        s.finished = true;
+        s.history.push_back(fmt::format("the block: {:#x}-{:#x} ({} with the pass on there alone; its code is in "
+                                        "log.txt, 'jit dump')",
+                                        s.lo, s.hi, failed ? "fails" : "doesn't fail"));
+    }
+    SaveSearch(s);
+}
+
+std::atomic<bool> g_search_boot{false}, g_search_decided{false};
+// (the HOME menu says this once when it next shows)
+std::string g_menu_message_title, g_menu_message_text;
+
+// The pad thread's look at a search boot: the game failed, or ran past the pass time
+void SearchWatch(double& started)
+{
+    namespace D = Common::PS4Diagnostics;
+    if (!g_search_boot.load() || g_search_decided.load())
+        return;
+    const bool failed = D::guest_exceptions.load() + D::guest_aborts.load() != 0;
+    if (!failed)
+    {
+        if (started < 0 && D::loading_stage.load() >= 3)
+            started = Seconds();
+        if (started < 0 || Seconds() - started < kSearchPassSeconds)
+            return;
+    }
+    if (g_search_decided.exchange(true))
+        return;
+    GetSetSearch s = LoadSearch();
+    SearchRecord(s, failed, failed ? "its error" : "60 s without one");
+    Trace(fmt::format("get/set search: {}; next {:#x}-{:#x}{}", s.history.back(), s.lo, s.hi,
+                      s.active ? "" : " (finished)"));
+    Launcher::Stop();
+}
+
 void* PadThread(void*)
 {
     // above the emulation's busy threads (650): a poll is a moment's work, and with all seven
@@ -844,8 +990,10 @@ void* PadThread(void*)
     double stop_held_since = -1;
     TouchpadTap tap;
     MotionReader motion_reader;
+    double search_started = -1;
     while (g_running)
     {
+        SearchWatch(search_started);
         union {
             OrbisPadData data;
             unsigned char room[512]; // in case the system's structure is larger than the header's
@@ -864,6 +1012,17 @@ void* PadThread(void*)
             else if (Seconds() - stop_held_since >= 1)
             {
                 Trace("L3 + R3 held: stopping the program");
+                if (g_search_boot.load() && !g_search_decided.exchange(true))
+                {
+                    // (04.70) the search cancelled: the game runs as it does without it from now on
+                    GetSetSearch s = LoadSearch();
+                    s.active = false;
+                    s.cancelled = true;
+                    s.pending = false;
+                    s.history.push_back("cancelled (L3 + R3)");
+                    SaveSearch(s);
+                    Trace("get/set search cancelled");
+                }
                 Launcher::Stop();
                 stop_held_since = 1e18; // once
             }
@@ -1495,8 +1654,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
-         "04.69: the loading screen says when a game has stopped with an error, and how to leave it. A test "
-         "build for a game that stops while loading.\n"
+         "04.70: a game that stopped while loading runs. Its first start in this version searches for the cause "
+         "by itself (about 20 restarts): leave it running.\n"
+         "04.69: the loading screen says when a game has stopped with an error, and how to leave it.\n"
          "04.68: two fixes in the CPU translation: a multiply and a sign extension that could get the upper half "
          "of a 64-bit result wrong, and a division by zero that didn't give zero. Games that stopped or "
          "misbehaved because of them can run, at full speed.\n"
@@ -1698,6 +1858,12 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         menu.SetFolderPlaces(std::move(places));
     }
     std::vector<Ui::Title> titles = LoadTitles();
+    // (04.70) what the launcher has to say once (a search that finished)
+    if (!g_menu_message_title.empty())
+    {
+        menu.ShowMessage(g_menu_message_title, g_menu_message_text);
+        g_menu_message_title.clear();
+    }
     Ui::StatusRow software_status = SoftwareStatus(titles);
     std::string web_url = WebUrl();
     menu.SetWebAddress(web_url);
@@ -1955,38 +2121,57 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
 }
 
 // (04.67) Games that need the translator set apart from the rest, by the title id in their file's
-// name; (04.69) and a test build's rotation for one. Little Kitty, Big City (01000A4019FA2000):
-// its SDK heap rejects a block it frees ~9 s into the boot with Eden's IR passes on (04.48-04.66,
-// and 04.68 after patch 0152 fixed what the desktop test found); with them off it gets past that
-// (04.66). Each boot of it now turns off one of the two (EDEN_PS4_JIT_TEST getset, constprop) in
-// turn, counted in game-test-4.txt: the one it runs without is where the rest of the bug is.
-// Other games: nothing changes. Returns what's set.
+// name. Little Kitty, Big City (01000A4019FA2000): its SDK heap rejects a block it frees ~9 s into
+// the boot with get/set elimination on (04.48-04.68; 04.69 found the pass), so it runs without it;
+// (04.70) unless the search for the block the pass is wrong for is under way (GetSetSearch), which
+// its first boot in this build starts. Returns what's set; text in [] is the loading screen's line.
 std::string GameProfile(const std::string& program)
 {
     unsetenv("EDEN_PS4_MEM_LOG");
     unsetenv("EDEN_PS4_ALIGNED_REST");
     unsetenv("EDEN_PS4_CPU_ACCURACY");
     unsetenv("EDEN_PS4_JIT_TEST");
+    unsetenv("EDEN_PS4_GETSET_RANGE");
+    unsetenv("EDEN_PS4_DUMP_RANGE");
+    g_search_boot = false;
+    g_search_decided = false;
     std::string upper = program;
     for (char& c : upper)
         c = char(std::toupper(static_cast<unsigned char>(c)));
     if (upper.find("01000A4019FA2000") == std::string::npos)
         return {};
-    const std::string path = std::string(kDataDir) + "/game-test-4.txt";
-    unsigned count = 0;
-    for (const std::string& line : ReadLines(path.c_str()))
-        count = unsigned(std::strtoul(line.c_str(), nullptr, 10));
-    if (FILE* f = std::fopen(path.c_str(), "w"))
+    GetSetSearch search = LoadSearch();
+    if (!search.active && !search.finished && !search.cancelled)
     {
-        std::fprintf(f, "%u\n", count + 1);
-        std::fflush(f);
-        fsync(fileno(f));
-        std::fclose(f);
+        search = {};
+        search.active = true;
+        search.program = program;
+        search.lo = kSearchCodeLo;
+        search.hi = kSearchCodeHi;
+        search.history.push_back("started");
     }
-    const bool getset = count % 2 == 0;
-    setenv("EDEN_PS4_JIT_TEST", getset ? "getset" : "constprop", 1);
-    return fmt::format("game test {} ({} of 2): {}", count + 1, count % 2 + 1,
-                       getset ? "no get/set elimination (getset)" : "no constant propagation (constprop)");
+    if (search.active && search.program == program)
+    {
+        if (search.phase == 1)
+            search.mid = search.lo + (((search.hi - search.lo) / 2) & ~uint64_t(3));
+        const uint64_t on_hi = search.phase == 1 ? search.mid : search.hi;
+        setenv("EDEN_PS4_GETSET_RANGE", fmt::format("{:x}-{:x}", search.lo, on_hi).c_str(), 1);
+        if (search.phase == 2)
+            setenv("EDEN_PS4_DUMP_RANGE", fmt::format("{:x}-{:x}", search.lo, search.hi).c_str(), 1);
+        search.pending = true;
+        SaveSearch(search);
+        Launcher::SetJitCache(false);    // (each step translates afresh)
+        Launcher::SetShaderCache(false); // (no rebuild of its shaders first: it fails before drawing)
+        g_search_boot = true;
+        unsigned left = search.phase == 2 ? 1 : 1 + (search.phase == 0 ? 1 : 0);
+        for (uint64_t size = search.hi - search.lo; search.phase != 2 && size > kSearchFinal; size /= 2)
+            left++;
+        return fmt::format("get/set search step {}: on for {:#x}-{:#x} [Finding the faulty code: step {}, about {} "
+                           "left. Leave it running]",
+                           search.step, search.lo, on_hi, search.step + 1, left);
+    }
+    setenv("EDEN_PS4_JIT_TEST", "getset", 1);
+    return "game profile 01000A4019FA2000: no get/set elimination (with it, its heap goes wrong as it loads)";
 }
 
 // (04.63) The loading screen, from the moment a game is chosen until its first frame: drawn here on
@@ -2995,7 +3180,35 @@ void* Run(void*)
     Trace("renderer: " + g_renderer_label);
     for (bool first = true;; first = false)
     {
-        const MenuChoice choice = ShowHomeMenu(first, radv, settings);
+        // (04.70) a get/set search under way boots its game by itself (a step that never decided,
+        // a crash, counts as failing); one that finished says so in the HOME menu, once
+        MenuChoice choice;
+        {
+            GetSetSearch search = LoadSearch();
+            if (search.active && search.pending)
+                SearchRecord(search, true, "no decision: a crash, or the app closed");
+            if (search.active && !search.program.empty())
+            {
+                Trace(fmt::format("get/set search: booting {} again by itself (step {})", search.program, search.step));
+                if (first)
+                {
+                    std::unique_lock lock{g_mutex};
+                    OpenPad();
+                }
+                choice = MenuChoice{search.program, settings};
+            }
+            else if ((search.finished || search.cancelled) && !search.reported && !search.program.empty())
+            {
+                search.reported = true;
+                SaveSearch(search);
+                g_menu_message_title = search.finished ? "The search has finished" : "The search was cancelled";
+                g_menu_message_text = search.finished
+                    ? "Send the logs as usual: they hold what it found. The game runs as before meanwhile."
+                    : "The game runs as before. Starting it doesn't search again.";
+            }
+        }
+        if (choice.program.empty())
+            choice = ShowHomeMenu(first, radv, settings);
         const std::string& program = choice.program;
         settings = choice.settings;
         gpu = choose_renderer();
@@ -3082,9 +3295,9 @@ void* Run(void*)
             {
                 std::lock_guard lock{g_loading_mutex};
                 g_loading = LoadingScreenFor(program, settings.white_theme);
-                // (04.69) which of the test build's setups this boot is
-                if (const size_t at = game_test.find('('); at != std::string::npos)
-                    g_loading.publisher = "Test " + game_test.substr(at + 1, game_test.find(')') - at - 1);
+                // (04.70) a search step's line
+                if (const size_t at = game_test.find('['); at != std::string::npos)
+                    g_loading.publisher = game_test.substr(at + 1, game_test.find(']') - at - 1);
                 g_loading_start = Seconds();
             }
             Common::PS4Diagnostics::loading_stage = 1;

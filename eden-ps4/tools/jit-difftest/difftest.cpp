@@ -6,6 +6,8 @@
 //   jit-difftest [iterations] [seed] [int|all] [only-getset|only-constprop]
 
 #include <algorithm>
+#include <csetjmp>
+#include <exception>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstdio>
@@ -30,6 +32,10 @@
 #include "dynarmic/tests/fuzz_util.h"
 
 using namespace Dynarmic;
+
+extern bool g_assert_throws, g_assert_hit;
+std::vector<u32> g_current_block;  // (printed if the emitter terminates the test)
+extern std::jmp_buf* g_assert_jump;
 
 namespace {
 
@@ -133,7 +139,20 @@ public:
 bool Testable(u32 instruction, u64 pc, bool last) {
     const A64::LocationDescriptor location{pc, {}};
     IR::Block block{location};
-    const bool goes_on = A64::TranslateSingleInstruction(block, location, instruction);
+    bool goes_on = false;
+    // (an instruction the translator asserts on, as ARMv8.2's FP16 forms the Switch's A57 lacks: skipped)
+    std::jmp_buf jump;
+    g_assert_hit = false;
+    g_assert_jump = &jump;
+    g_assert_throws = true;
+    if (setjmp(jump) != 0) {
+        g_assert_throws = false;
+        return false;
+    }
+    goes_on = A64::TranslateSingleInstruction(block, location, instruction);
+    g_assert_throws = false;
+    if (g_assert_hit)
+        return false;
     if (!goes_on && !last)
         return false;
     for (const auto& inst : block.instructions) {
@@ -171,9 +190,21 @@ Generators MakeGenerators(bool integer_only) {
         "ADDS_shift|SUB_shift|SUBS_shift|ADD_imm|ADDS_imm|SUB_imm|SUBS_imm|CBZ|CBNZ|TBZ|TBNZ|ADR|ADRP|STP_LDP_gen|"
         "STRx_reg|LDRx_reg|STURx_LDURx|STRx_LDRx_imm_1|STRx_LDRx_imm_2|LDR_lit_gen|LDRSW_lit|SXTB_1|SXTB_2|SXTH_1|"
         "SXTH_2|SXTW|RMIF|SETF8|SETF16|CRC32|LDAR|STLR|LDTR|STTR|B_uncond|BL|BR|BLR|RET|"
-        "LDXR|STXR|LDAXR|STLXR|LDXP|STXP|LDAXP|STLXP|CLREX)$");
+        "LDXR|STXR|LDAXR|STLXR|LDXP|STXP|LDAXP|STLXP|CLREX|"
+        // (the vector loads, stores and moves memcpy and memset are made of)
+        "STP_LDP_fpsimd|STR_imm_fpsimd_1|LDR_imm_fpsimd_1|STR_imm_fpsimd_2|LDR_imm_fpsimd_2|STUR_fpsimd|"
+        "LDUR_fpsimd|STR_reg_fpsimd|LDR_reg_fpsimd|LDR_lit_fpsimd|STNP_LDNP_fpsimd|FMOV_float_gen|UMOV|SMOV|"
+        "INS_gen|INS_elt|DUP_gen|DUP_elt_1|DUP_elt_2|MOVI|ORR_asimd_reg|AND_asimd|EOR_asimd|BIC_asimd_reg|"
+        "ORN_asimd|EXT|ADD_vector|SUB_vector|CMEQ_reg_2|CMEQ_zero_2|UMAXV|UMINV|ADDV|ADDP_vec|XTN|UZP1|UZP2|"
+        "ZIP1|ZIP2|TRN1|TRN2|LD1R_1|LD1R_2|LD1_sngl_1|ST1_sngl_1|LD1_sngl_2|ST1_sngl_2|CMEQ_reg_1|ADDP_pair|"
+        "STx_mult_1|STx_mult_2|LDx_mult_1|LDx_mult_2)$");
     static const std::vector<std::string> never{"UnallocatedEncoding", "STLLR", "LDLAR", "MSR_reg", "MSR_imm",
-                                                "MRS", "SVC", "BRK", "HLT", "WFI", "WFE", "YIELD", "SEV", "SEVL"};
+                                                "MRS", "SVC", "BRK", "HLT", "WFI", "WFE", "YIELD", "SEV", "SEVL",
+                                                // (ARMv8.2's crypto, which the Switch's A57 lacks)
+                                                "SM3SS1", "SM3TT1A", "SM3TT1B", "SM3TT2A", "SM3TT2B",
+                                                "SM3PARTW1", "SM3PARTW2", "SM4E", "SM4EKEY", "SHA512H",
+                                                "SHA512H2", "SHA512SU0", "SHA512SU1", "EOR3", "BCAX", "RAX1",
+                                                "XAR"};
     Generators g;
     for (const auto& [fn, bits] : all) {
         if (std::find(never.begin(), never.end(), fn) != never.end())
@@ -348,6 +379,12 @@ int main(int argc, char** argv) {
     if (argc > 4 && std::string(argv[4]) == "only-constprop")
         remove = OptimizationFlag::ConstProp;
     rng.seed(seed);
+    std::set_terminate([] {
+        std::fprintf(stderr, "terminated in the block:\n");
+        for (const u32 inst : g_current_block)
+            std::fprintf(stderr, "  %08x %s\n", inst, Describe(inst).c_str());
+        std::abort();
+    });
     const Generators generators = MakeGenerators(integer_only);
     std::printf("%zu instruction kinds; host features mask %s\n", generators.list.size(),
                 std::getenv("DYNARMIC_HOST_FEATURES_MASK") ? std::getenv("DYNARMIC_HOST_FEATURES_MASK") : "(all)");
@@ -417,7 +454,26 @@ int main(int argc, char** argv) {
         s.sp = (kWindow + kWindowSize / 2 + Rand(0, kWindowSize / 4)) & ~u64(15);
         s.pstate = u32(Rand(0, 15)) << 28;
 
-        const Result a = on.Run(code, s), b = off.Run(code, s);
+        g_current_block = code;
+        Result a, b;
+        try {
+            a = on.Run(code, s);
+            b = off.Run(code, s);
+        } catch (const std::exception& e) {
+            // (the emitter refused the block: what, once per first instruction kind; the JITs made
+            // again, as one left mid-compile can't be trusted)
+            std::string key = std::string("EMITTER ERROR: ") + e.what() + ":";
+            for (const u32 inst : code)
+                key += " | " + Describe(inst);
+            if (kinds[key]++ == 0)
+                std::printf("\n%s (iteration %llu, start %#llx)\n", key.c_str(), (unsigned long long)it,
+                            (unsigned long long)s.start);
+            on.jit.reset();
+            off.jit.reset();
+            on.jit.emplace(Config(on.env, *on.monitor, OptimizationFlag{}));
+            off.jit.emplace(Config(off.env, *off.monitor, remove));
+            continue;
+        }
         if (a == b)
             continue;
         const Result c = bare.Run(code, s);

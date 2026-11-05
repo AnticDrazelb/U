@@ -1,0 +1,154 @@
+From 67e1fe4eb4fcbb65c53f1bf6d93351b14dbc27f8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 18:23:04 +0000
+Subject: [PATCH] PS4: get/set elimination for a range of blocks; a range's
+ guest code and IR to the log
+
+A64::UserConfig getset_pc_lo/hi (in the translation cache's fingerprint): the pass only for blocks
+that start there; dump_pc_lo/hi: those blocks' guest instructions and IR (translated, emitted) as
+'jit dump' warnings. EDEN_PS4_GETSET_RANGE and EDEN_PS4_DUMP_RANGE (hex lo-hi) set them: the
+launcher's search for the block the pass is wrong for in Little Kitty, Big City.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     | 18 +++++++++++
+ .../dynarmic/backend/x64/a64_interface.cpp    | 30 +++++++++++++++++++
+ .../src/dynarmic/interface/A64/config.h       |  7 +++++
+ src/dynarmic/src/dynarmic/ir/opt_passes.cpp   |  4 ++-
+ 4 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index a4c74521e5..9be51ecba8 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -12,6 +12,7 @@
+ #include "common/orbis_memory.h"
+ #endif
+ #include <algorithm>
++#include <cstdlib>
+ #include <atomic>
+ #include <string>
+ #include <string_view>
+@@ -520,6 +521,23 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     default:
+         break;
+     }
++    // (New Eden 04.70) The launcher's search for a block get/set elimination mistranslates:
++    // EDEN_PS4_GETSET_RANGE=lo-hi (hex) the blocks starting there have it, the others not;
++    // EDEN_PS4_DUMP_RANGE=lo-hi those blocks' guest code and IR in the log
++    const auto range = [](const char* name, u64& lo, u64& hi) {
++        const char* e = std::getenv(name);
++        if (!e || !e[0])
++            return false;
++        char* end = nullptr;
++        lo = std::strtoull(e, &end, 16);
++        hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : lo;
++        return true;
++    };
++    if (range("EDEN_PS4_GETSET_RANGE", config.getset_pc_lo, config.getset_pc_hi) && m_core_index == 0)
++        LOG_WARNING(Core_ARM, "get/set elimination only for blocks at {:#x}-{:#x}", config.getset_pc_lo,
++                    config.getset_pc_hi);
++    if (range("EDEN_PS4_DUMP_RANGE", config.dump_pc_lo, config.dump_pc_hi) && m_core_index == 0)
++        LOG_WARNING(Core_ARM, "dumping the blocks at {:#x}-{:#x}", config.dump_pc_lo, config.dump_pc_hi);
+     // (New Eden 04.66) EDEN_PS4_JIT_TEST: one group of the translator's shortcuts off, the launcher's
+     // test of a game that runs only with all of them off (Little Kitty, Big City with Paranoid):
+     // "monitor" the cores' exclusive accesses checked against each other again (Auto's
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 8e0ff15310..b029315fc1 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <boost/icl/interval_set.hpp>
+ #include "common/assert.h"
++#include "common/logging.h"
+ #include "common/ps4_perf.h"
+ #include "dynarmic/common/fp/fpcr.h"
+ #include "dynarmic/common/llvm_disassemble.h"
+@@ -282,6 +283,10 @@ private:
+         options.superblocks_cond = options.superblocks && conf.superblocks_cond && options.nzcv_lookahead;
+         options.bitfield_shifts = conf.bitfield_shifts;
+         A64::Translate(ir_block, arch_descriptor, get_code, options);
++        // (PS4 04.70) the launcher's search: this block's guest code and IR before and after
++        const u64 block_pc = arch_descriptor.PC();
++        const bool dump = block_pc >= conf.dump_pc_lo && block_pc < conf.dump_pc_hi;
++        const std::string ir_before = dump ? IR::DumpBlock(ir_block) : std::string{};
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         // (PS4 04.25) With fastmem, the accesses it was declined for (pages the PS4 can't map at
+         // the game's addresses) walk the page table: one walk for those through one base
+@@ -291,6 +296,29 @@ private:
+                 return emitter.AccessWithoutFastmem(descriptor, inst.GetName());
+             });
+         }
++        if (dump) {
++            // (PS4 04.70) the guest instructions, then the IR as translated and as it's emitted
++            const u64 end_pc = A64::LocationDescriptor{ir_block.EndLocation()}.PC();
++            std::string words;
++            for (u64 pc = block_pc; pc < end_pc && pc < block_pc + 4 * 256; pc += 4)
++                words += fmt::format(" {:08x}", get_code(pc).value_or(0));
++            LOG_WARNING(Core_ARM, "jit dump: block {:#x}-{:#x} (getset {}):{}", block_pc, end_pc,
++                        block_pc >= conf.getset_pc_lo && block_pc < conf.getset_pc_hi ? "on" : "off", words);
++            const auto log_lines = [&](const char* what, const std::string& text) {
++                size_t at = 0;
++                while (at < text.size()) {
++                    const size_t nl = text.find('\n', at);
++                    const std::string line = text.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
++                    if (!line.empty())
++                        LOG_WARNING(Core_ARM, "jit dump {:#x} {}: {}", block_pc, what, line);
++                    if (nl == std::string::npos)
++                        break;
++                    at = nl + 1;
++                }
++            };
++            log_lines("translated", ir_before);
++            log_lines("emitted", IR::DumpBlock(ir_block));
++        }
+         const auto entrypoint = emitter.Emit(ir_block).entrypoint;
+         ::Common::PS4Perf::jit_cache_free_kib[conf.processor_id & 3].store(
+             u32(block_of_code.SpaceRemaining() >> 10), std::memory_order_relaxed);
+@@ -356,6 +384,8 @@ private:
+         add(conf.check_halt_on_memory_access);
+         add(conf.page_table_inline_exclusives);
+         add(conf.page_table_shared_walk);
++        add(conf.getset_pc_lo);
++        add(conf.getset_pc_hi);
+         add(conf.jit_frame_pointer);
+         add(conf.link_forward_without_halt_check);
+         add(conf.inline_rsb_pop);
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 146825266e..4be4caa468 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -331,6 +331,13 @@ struct UserConfig {
+     /// a page table and without fastmem.
+     bool page_table_shared_walk = true;
+ 
++    /// (PS4 04.70) GetSetElimination only for the blocks that start in [getset_pc_lo, getset_pc_hi):
++    /// the launcher's search for a block it's mistranslated in
++    std::uint64_t getset_pc_lo = 0, getset_pc_hi = ~std::uint64_t{0};
++    /// (PS4 04.70) The blocks that start in [dump_pc_lo, dump_pc_hi): their guest code and IR,
++    /// before and after the passes, in the log
++    std::uint64_t dump_pc_lo = 0, dump_pc_hi = 0;
++
+     /// Each block saves %rbp and points it at the JIT's stack frame on entry, restoring it on exit,
+     /// so that a host debugger or profiler walking frame pointers can step through the JIT's
+     /// frames. Three instructions a block; without them %rbp keeps its caller's value.
+diff --git a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+index 9bbd48e100..e4f478ea9d 100644
+--- a/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
++++ b/src/dynarmic/src/dynarmic/ir/opt_passes.cpp
+@@ -2079,7 +2079,9 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
+     if (conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access) {
+         Optimization::A64SelectOnHostFlagsPass(block);
+     }
+-    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
++    const u64 block_pc = A64::LocationDescriptor{block.Location()}.PC();
++    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access &&
++        block_pc >= conf.getset_pc_lo && block_pc < conf.getset_pc_hi) {
+         Optimization::A64GetSetElimination(block);
+         Optimization::DeadCodeElimination(block);
+     }
+-- 
+2.43.0
+

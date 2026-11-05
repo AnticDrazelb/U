@@ -86,6 +86,24 @@ programs, 0 failures.
 - **04.67:** Little Kitty, Big City runs with the IR passes off (below).
 - **04.68:** the two translator bugs behind it fixed; no per-game profile (below).
 - **04.69:** the loading screen tells a failed game; Little Kitty's test of the two IR passes apart (below).
+- **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
+
+## 04.70: the search for the block get/set elimination is wrong for
+
+- **04.69's result:** with get/set elimination off (test 1) Little Kitty, Big City runs: first frame
+  ~95 s after boot, the menu ~23 fps, the first level ~7 fps (two guest threads 88-91% busy, the GPU
+  2-3%). The desktop harness, now with vector loads, stores and moves and the whole instruction set
+  (FP16 and ARMv8.2's crypto, which the Switch's A57 lacks, skipped), finds no difference with the
+  pass alone either.
+- **04.70:** patch 0154 (`getset_pc_lo/hi`, `dump_pc_lo/hi` in the A64 config, from
+  `EDEN_PS4_GETSET_RANGE` / `EDEN_PS4_DUMP_RANGE`) and `GetSetSearch` (`platform_ps4.cpp`): the
+  game's first boot in this build starts a search that halves the range of block start addresses
+  with the pass on (0x80000000-0x90000000, everything if that doesn't fail), each boot decided by
+  the launcher (a guest exception: failed; 60 s past the game's start without one: passed), the
+  game stopped and booted again by itself (translation and shader caches off for these boots) to
+  1 KiB, then once more with those blocks' guest code and IR in log.txt ('jit dump'). About 20 boots;
+  `getset-search.txt` has the state and history; L3 + R3 cancels. Otherwise (after it, or cancelled)
+  the game runs with the pass off.
 
 ## 04.69: the loading screen says when a game failed; the two IR passes apart
 
