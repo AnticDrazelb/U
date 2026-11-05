@@ -1317,6 +1317,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"Eden for PS4 " EDEN_PS4_VERSION,
+         "04.53: 04.52's run moved the stop to exactly the next draw of the same kind, and this time that draw "
+         "itself never finished: level 3's scene drawing is the cause. Those draws are the first real depth "
+         "tests on a 32-bit depth buffer with the GPU's depth compression data (HTILE); everything that worked "
+         "on that buffer before only wrote it. This build turns that compression off for every depth buffer "
+         "(a little slower, nothing missing). If level 3 loads, that's the fix.\n"
          "04.52: 04.51's two tests: the GPU can write that address itself, and with the copies into it left out, "
          "level 3 still stopped a step or so later. So it isn't that memory. Every run stops within ten steps "
          "after the same draw: level 3's first scene draw into four images at once (with depth), the first of "
@@ -3095,6 +3100,11 @@ void* Run(void*)
     // RADV_PS4_TRACE=0, RADV_PS4_HANG_EXIT=0 (RADV_PS4_TRACE=1: Crema's flight recorder as well).
     setenv("RADV_PS4_TRACE", "ids", 0);
     setenv("RADV_PS4_HANG_EXIT", "1", 0);
+    // (04.53) No HTILE (the depth unit's compression and hierarchical Z data) for any depth buffer:
+    // Captain Toad's level 3 hangs the GPU on its first real depth tests (LEQUAL) of a Z32F depth
+    // buffer with HTILE; RADV's own ZFUNC=ALWAYS clears and copies on it work. RADV_DEBUG= (empty) in
+    // settings.txt brings HTILE back.
+    setenv("RADV_DEBUG", "nohiz", 0);
     // (04.42) draws with a geometry shader or tessellation, and RADV's writes of those rings'
     // registers (the system's on the PS4), are counted and the first ones logged; with
     // RADV_PS4_SKIP_GS_TESS=1 in settings.txt they become no-ops (04.42's test, its default). 04.43

@@ -1,6 +1,6 @@
-# Eden for PS4: status (after 04.52)
+# Eden for PS4: status (after 04.53)
 
-Install **04.52** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
+Install **04.53** (newest). Packages are built to `out/EdenPS4-<version>.pkg`. They are not in git.
 The patches are in `eden-ps4/patches` (up to 0144). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -64,6 +64,25 @@ programs, 0 failures.
 - **04.50:** the mapping audit (below).
 - **04.51:** the probe write and the skip test at Toad's address (below).
 - **04.52:** the test skip of level 3's first 4-target scene draw (below).
+- **04.53:** no HTILE on any depth buffer (`RADV_DEBUG=nohiz`): the likely fix (below).
+
+## 04.53: HTILE off (the first real depth tests on a Z32F + HTILE buffer hang the GPU)
+
+- **04.52's run:** the draw at 455 left out (logged), the stop moved from 456-466 to 499. Serialized,
+  so exactly: the 4-target scene draw at 498 (the next of its kind, VS 0x44ffe1d600 / PS
+  0x44ffde9800) finished, and the one right after it, at 499 (also 4 targets, VS 0x44ffe1d700 / PS
+  0x44ffde9000), never did. The PS exports match the targets (MRT0/1/3 four FP16 channels, MRT2 two,
+  `done` on the last); targets, depth, HTILE, index and vertex buffers all in live buffers.
+- **What these draws have that every draw that worked on the same Z32F depth buffer (0x43ea508000,
+  HTILE initialized with 0xfffc000f) lacks:** a real depth test (`DB_DEPTH_CONTROL` 0x700736:
+  Z enable, Z write, ZFUNC LEQUAL), with an occlusion query counting (`DB_COUNT_CONTROL`
+  0x11000102). The earlier ones (355-363) are RADV's clears and copies, ZFUNC ALWAYS, no query. A
+  depth test makes the DB read HTILE (hierarchical Z); a write-only pass doesn't. So: a DB/HTILE
+  hang, and the first draw of the kind can finish and leave the DB wedged for the next DB work (the
+  meta flushes after a skipped copy in 04.51's run 1).
+- **04.53:** the frontend sets `RADV_DEBUG=nohiz` (no HTILE on any depth buffer; `RADV_DEBUG=` in
+  settings.txt brings it back). The 455-456 skip is off. If level 3 loads: HTILE on this depth buffer
+  is it; then narrow it (Z32F only, or with queries only) to get HTILE back elsewhere.
 
 ## 04.52: not the memory; the stop follows level 3's first scene draw
 

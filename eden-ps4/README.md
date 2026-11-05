@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.53: **HTILE off.** With 04.52's draw left out, the stop moved exactly to the next draw of the same
+kind, which itself never finished: level 3's 4-target scene draws. They are the first real depth tests
+(LEQUAL, with an occlusion query) on a Z32F depth buffer with HTILE; the draws that worked on it before
+were RADV's ZFUNC ALWAYS clears and copies, which don't read HTILE. The frontend now sets
+`RADV_DEBUG=nohiz` (no HTILE anywhere; `RADV_DEBUG=` in settings.txt brings it back).
+
 04.52: **not the memory: level 3's first scene draw.** 04.51's probe wrote the address fine, and with
 the copies into its page skipped, level 3 stopped a step or so later anyway. In all six recorded runs
 the stop comes 1-10 steps after offset 455 of the batch: the first draw of level 3's scene shaders, the

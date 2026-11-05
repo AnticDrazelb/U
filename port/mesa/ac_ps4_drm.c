@@ -2164,7 +2164,7 @@ ps4_check_submission(ac_drm_device *dev, uint64_t seq, void *const *dcb, const u
    if (skip_from < 0) {
       const char *e = getenv("RADV_PS4_SKIP_DRAWS");
       if (!e)
-         e = "455-456";
+         e = "0"; /* (04.53: off by default; 04.52's run settled it) */
       char *end = NULL;
       skip_from = (int)strtoul(e, &end, 0);
       skip_to = end && *end == '-' ? (int)strtoul(end + 1, NULL, 0) : 0;
