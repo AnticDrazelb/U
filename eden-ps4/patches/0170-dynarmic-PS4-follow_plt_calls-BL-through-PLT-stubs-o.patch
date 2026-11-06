@@ -1,0 +1,258 @@
+From 8aee85b4e5a71b4b0a39977f5b490c70da8608ab Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 15:11:05 +0000
+Subject: [PATCH 170/171] dynarmic: PS4 follow_plt_calls (BL through PLT stubs,
+ on into short leaves behind them)
+
+With follow_leaf_calls, a BL to a PLT stub (ADRP X16; LDR X17, [X16, #o]; ADD X16; BR X17) is
+translated on into the stub; its BR then ends the block (guarded_indirect_links: a link to the
+GOT slot's function). If the slot's function, as PeekCode reads it when translated (Translate's
+new peek), is a short leaf and superblocks are on, the BR becomes a side exit taken when X17 isn't
+that function (a block at the BR dispatches), the leaf is translated on, and its RET goes back
+after the BL. A short leaf may read TPIDRRO_EL0/TPIDR_EL0 (MRS). Up to six branches followed and
+eight pieces a block (two such calls), and a leaf call's pieces may repeat (two calls to one stub).
+Bluey's "current thread" (MRS X8, TPIDRRO_EL0; LDR X0, [X8, #504]; RET) through a stub was 29%
+of its samples; the harness's plt64: 186 host instructions an iteration (two calls) -> 100.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ .../dynarmic/backend/x64/a64_interface.cpp    |  5 +-
+ .../frontend/A64/translate/a64_translate.cpp  |  4 +-
+ .../frontend/A64/translate/a64_translate.h    |  8 ++-
+ .../A64/translate/impl/a64_branch.cpp         | 62 +++++++++++++++++--
+ .../frontend/A64/translate/impl/impl.h        | 15 ++++-
+ .../src/dynarmic/interface/A64/config.h       | 10 +++
+ 6 files changed, 95 insertions(+), 9 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index bc0b1a74f0..bb3d28925d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -332,6 +332,7 @@ private:
+         // (the exits' flags need the look-ahead)
+         options.superblocks_cond = options.superblocks && conf.superblocks_cond && options.nzcv_lookahead;
+         options.superblocks_backward = options.superblocks && conf.superblocks_backward;
++        options.follow_plt_calls = conf.follow_leaf_calls && conf.follow_plt_calls;
+         options.bitfield_shifts = conf.bitfield_shifts;
+         const int native = conf.native_functions && !arch_descriptor.SingleStepping()
+                                ? conf.callbacks->NativeFunction(arch_descriptor.PC())
+@@ -348,7 +349,8 @@ private:
+             ir_block.SetEndLocation(arch_descriptor.AdvancePC(4));
+             ir_block.lookahead.emplace_back(arch_descriptor.PC(), arch_descriptor.PC() + 64);
+         } else {
+-            A64::Translate(ir_block, arch_descriptor, get_code, options);
++            const A64::MemoryReadCodeFuncType peek = [this](u64 vaddr) { return conf.callbacks->PeekCode(vaddr); };
++            A64::Translate(ir_block, arch_descriptor, get_code, options, &peek);
+         }
+         // (PS4 04.70) the launcher's search: this block's guest code and IR before and after
+         const u64 block_pc = arch_descriptor.PC();
+@@ -477,6 +479,7 @@ private:
+         add(conf.superblocks);
+         add(conf.superblocks_cond);
+         add(conf.superblocks_backward);
++        add(conf.follow_plt_calls);
+         add(conf.bitfield_shifts);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+index 3bc38d4e13..dbc35730b9 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+@@ -259,10 +259,12 @@ void LookAheadForFlags(IR::Block& block, const MemoryReadCodeFuncType& read_code
+ 
+ }  // namespace
+ 
+-void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
++void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options,
++               const MemoryReadCodeFuncType* peek) {
+     const bool single_step = descriptor.SingleStepping();
+     TranslatorVisitor visitor{block, descriptor, options};
+     visitor.read_code = &memory_read_code;
++    visitor.peek = peek;
+ 
+     bool should_continue = true;
+     visitor.piece_start = descriptor.PC();
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 241185d77c..a44d255c59 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -79,6 +79,9 @@ struct TranslationOptions {
+     /// With superblocks: a backward one too, unless to the block's own start (UserConfig::superblocks_backward)
+     bool superblocks_backward = false;
+ 
++    /// With follow_leaf_calls: BL into a PLT stub, and on into its target if a short leaf (UserConfig::follow_plt_calls)
++    bool follow_plt_calls = false;
++
+     /// SBFM and UBFM (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH by immediate) as shifts and
+     /// extensions, not a rotate and two masks (UserConfig::bitfield_shifts)
+     bool bitfield_shifts = false;
+@@ -91,7 +94,10 @@ struct TranslationOptions {
+  * @param options Configures how certain instructions are translated.
+  * @return A translated basic block in the intermediate representation.
+  */
+-void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options);
++/// (PS4 04.81) peek: memory as it is now, without side effects (UserCallbacks::PeekCode): a PLT
++/// stub's GOT slot (follow_plt_calls); none, no slot is read
++void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options,
++               const MemoryReadCodeFuncType* peek = nullptr);
+ 
+ /**
+  * This function translates a single provided instruction into our intermediate representation.
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index 2bad58e7e0..1200c6251d 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -45,9 +45,13 @@ bool TranslatorVisitor::Follow(u64 target, bool leaf_call) {
+     const u64 pc = ir.PC();
+     if (target >= piece_start && target <= pc)
+         return false;
+-    for (const auto& [start, end] : pieces) {
+-        if (target >= start && target < end)
+-            return false;
++    // (a piece the block has already: not again, as a loop would be unrolled; but a leaf call's (a
++    // leaf, a PLT stub, the way back) may be: none of them branches back, follows_left bounds them)
++    if (!leaf_call) {
++        for (const auto& [start, end] : pieces) {
++            if (target >= start && target < end)
++                return false;
++        }
+     }
+     if (pieces.size() == pieces.capacity())
+         return false;
+@@ -70,10 +74,44 @@ bool TranslatorVisitor::BL(Imm<26> imm26) {
+                                        : options.follow_leaf_calls && IsShortLeaf(target) && Follow(target, true)) {
+         return true;
+     }
++    if (options.follow_plt_calls && FollowPltCall(target))
++        return true;
+     ir.SetTerm(IR::Term::LinkBlockFast{ir.current_location->SetPC(target)});
+     return false;
+ }
+ 
++// (PS4 04.81, follow_plt_calls) ADRP X16, page; LDR X17, [X16, #o]; ADD X16, X16, #o; BR X17
++bool TranslatorVisitor::FollowPltCall(u64 stub) {
++    if (!read_code || (stub & 3) != 0 || ir.current_location->SingleStepping())
++        return false;
++    u32 w[4];
++    for (u64 i = 0; i < 4; i++) {
++        const auto word = (*read_code)(stub + 4 * i);
++        if (!word)
++            return false;
++        w[i] = *word;
++    }
++    if ((w[0] & 0x9F00001F) != 0x90000010 || (w[1] & 0xFFC003FF) != 0xF9400211 || (w[2] & 0xFFC003FF) != 0x91000210 ||
++        w[3] != 0xD61F0220)
++        return false;
++    // the slot: ADRP's page plus LDR's scaled offset (the ADD's offset, the same, isn't needed)
++    const u64 immlo = (w[0] >> 29) & 3, immhi = (w[0] >> 5) & 0x7FFFF;
++    const s64 page_offset = s64((immhi << 2 | immlo) << 43) >> 31;  // (21 bits sign-extended, times 4096)
++    const u64 slot = (stub & ~u64(0xFFF)) + u64(page_offset) + (((w[1] >> 10) & 0xFFF) << 3);
++    plt_leaf.reset();
++    if (options.superblocks && side_exits_left > 0 && peek) {
++        const auto lo = (*peek)(slot), hi = (*peek)(slot + 4);
++        const u64 value = lo && hi ? (u64(*lo) | u64(*hi) << 32) : 0;
++        if (value != 0 && (value & 3) == 0 && IsShortLeaf(value))
++            plt_leaf = PltLeaf{stub + 12, value};
++    }
++    if (!Follow(stub, true)) {
++        plt_leaf.reset();
++        return false;
++    }
++    return true;
++}
++
+ // (PS4 04.75: a RET within five instructions: up to four of the callee's; unity64 lost ~1% with
+ // six to twelve - longer leaves pushed blocks to their limits - and game64 gains 2.3% with five)
+ constexpr u64 kLeafMax = 5;
+@@ -93,7 +131,9 @@ bool TranslatorVisitor::IsShortLeaf(u64 target) const {
+             (inst & 0x7E000000) == 0x36000000 ||  // TBZ, TBNZ
+             (inst & 0xFF000010) == 0x54000000 ||  // B.cond
+             (inst & 0xFF000000) == 0xD4000000 ||  // SVC, HVC, SMC, BRK, HLT
+-            (inst & 0xFFC00000) == 0xD5000000 ||  // system: MSR, MRS, hints, barriers, SYS
++            ((inst & 0xFFC00000) == 0xD5000000 &&  // system: MSR, MRS, hints, barriers, SYS
++             // (04.81) but MRS of TPIDRRO_EL0 or TPIDR_EL0: a read of the thread pointer
++             (inst & 0xFFFFFFE0) != 0xD53BD060 && (inst & 0xFFFFFFE0) != 0xD53BD040) ||
+             (inst & 0x1F) == 30 ||                // X30 its first register field (a write, or a store of it)
+             ((inst >> 5) & 0x1F) == 30 ||         // or its second (a base written back, a source)
+             ((inst & 0x3A000000) == 0x28000000 && ((inst >> 10) & 0x1F) == 30))  // LDP/STP's second
+@@ -116,6 +156,20 @@ bool TranslatorVisitor::BLR(Reg Rn) {
+ bool TranslatorVisitor::BR(Reg Rn) {
+     const auto target = X(64, Rn);
+ 
++    // (PS4 04.81, follow_plt_calls) a followed stub's BR to its short leaf: out here when X17 holds
++    // another function (a block of its own at this BR dispatches to it), else on into the leaf
++    if (plt_leaf && Rn == Reg::R17 && ir.PC() == plt_leaf->br_pc) {
++        const u64 leaf = plt_leaf->target;
++        plt_leaf.reset();
++        if (side_exits_left > 0 && instructions < 64) {
++            side_exits_left--;
++            ir.ExitIfZero(ir.Sub(IR::U64{target}, ir.Imm64(leaf)), false, *ir.current_location);
++            if (Follow(leaf, true))
++                return true;
++            // (not followed after all: the BR's own way below, X17 the leaf when it gets there)
++        }
++    }
++
+     ir.SetPC(target);
+     ir.SetTerm(IR::Term::FastDispatchHint{});
+     return false;
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+index 9969c3dd9e..251e5cdac8 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+@@ -31,9 +31,11 @@ struct TranslatorVisitor final {
+ 
+     // (options.follow_direct_branches) The block's guest code so far: the pieces before the
+     // current one ([start, end)), the current one's start, and how many more branches it may follow
+-    boost::container::static_vector<std::pair<u64, u64>, 4> pieces;
++    // (04.81: up to six followed, eight pieces: two calls through PLT stubs into leaves take three
++    // each - into the stub, into the leaf, back)
++    boost::container::static_vector<std::pair<u64, u64>, 8> pieces;
+     u64 piece_start = 0;
+-    int follows_left = 3;
++    int follows_left = 6;
+     int side_exits_left = 8;
+     // A side exit to target here, if the block may have one more (superblocks)
+     bool MaySideExit(u64 target);
+@@ -44,7 +46,16 @@ struct TranslatorVisitor final {
+     // (PS4 04.74, follow_leaf_calls) the code the block is translated from, and whether a BL's
+     // target is a short leaf function
+     const MemoryReadCodeFuncType* read_code = nullptr;
++    // (PS4 04.81) memory as it is now (PeekCode): a PLT stub's GOT slot
++    const MemoryReadCodeFuncType* peek = nullptr;
+     bool IsShortLeaf(u64 target) const;
++    // (PS4 04.81, follow_plt_calls) a BL to a PLT stub followed into it; the stub's BR (at br_pc)
++    // then goes on into its slot's function if that is a short leaf (leaf set)
++    bool FollowPltCall(u64 stub);
++    struct PltLeaf {
++        u64 br_pc = 0, target = 0;
++    };
++    std::optional<PltLeaf> plt_leaf;
+     // (PS4 04.73, follow_known_returns) X30's value if the block set it to a constant last
+     std::optional<u64> KnownLinkRegister() const;
+ 
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 292dca097e..08da2d732e 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -491,6 +491,16 @@ struct UserConfig {
+     /// and the registers it carries from one part to the next stay in host registers.
+     bool superblocks_backward = false;
+ 
++    /// (PS4 04.81) With follow_leaf_calls: a BL to a PLT stub (ADRP X16; LDR X17, [X16, #o];
++    /// ADD X16, X16, #o; BR X17) is translated on into the stub, whose BR then ends the block
++    /// (guarded_indirect_links makes it a link to the function its GOT slot holds). If that function
++    /// (the slot's value when translated) is a short leaf, and superblocks are on: on into it too,
++    /// the BR a side exit for when X17 isn't it (a block of its own there dispatches), and back
++    /// after the BL at its RET. A short leaf may read TPIDRRO_EL0 and TPIDR_EL0 (MRS) too. Bluey's
++    /// "current thread" (MRS X8, TPIDRRO_EL0; LDR X0, [X8, #504]; RET), called through a stub, was
++    /// 29% of its samples with the stub.
++    bool follow_plt_calls = false;
++
+     /// (PS4 04.30) SBFM and UBFM by immediate (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH) as
+     /// one or two shifts or an extension (SBFIZ #n, #32: movsxd and shl) instead of the
+     /// architecture's rotate and two masks (rorx, and, movabs, and; nine instructions for SBFIZ)
+-- 
+2.43.0
+

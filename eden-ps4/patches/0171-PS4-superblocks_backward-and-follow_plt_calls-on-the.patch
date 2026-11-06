@@ -1,0 +1,122 @@
+From 1e4aed58a29f2e98815ee7e9b318421f2c1f174c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 15:11:06 +0000
+Subject: [PATCH 171/171] PS4: superblocks_backward and follow_plt_calls on;
+ the Vulkan scheduler's waits re-checked every 50 ms
+
+arm_dynarmic_64: superblocks_backward (Little Kitty's GC loop one block) and follow_plt_calls
+(Bluey's stub calls) on under Auto/Unsafe; off with the extras off, follow_plt_calls also with
+EDEN_PS4_JIT_OFF=leaf, superblocks_backward with extras.
+
+vk_scheduler: WaitWorker and the worker's wait for work re-check every 50 ms (WaitWorker nudging
+the worker, and not waiting on a stopped one): Echoes of Wisdom's exit (and Animal Crossing's in
+04.78) hung with the GPU thread waiting for the queue to drain and the worker waiting for work on
+the same condition variable - a lost wake-up now costs 50 ms instead of the app.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp      | 13 ++++++++++++-
+ .../renderer_vulkan/vk_scheduler.cpp           | 18 +++++++++++++++---
+ 2 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 524c5014bb..c2389c4d8a 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -444,6 +444,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.superblocks = true;
+     // (04.29) and a forward B.cond, the flags stored before it only when its target reads them
+     config.superblocks_cond = true;
++    // (04.81) and a backward one, but to the block's own start: a loop whose exits branch back
++    // (Unity's GC mark loop, a quarter of Little Kitty's time) one block, its registers pinned
++    config.superblocks_backward = true;
+     // (04.30) LSL, LSR, UBFX, SBFIZ, ... by immediate as shifts, not a rotate and two masks
+     config.bitfield_shifts = true;
+     // (04.73) a loop's busiest guest registers in host registers from its start to its exits
+@@ -453,6 +456,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.guarded_indirect_links = true;
+     // (04.75) a BL to a leaf function of up to four instructions: translated into the caller's block
+     config.follow_leaf_calls = true;
++    // (04.81) a BL to a PLT stub: the stub too, and the leaf behind it (its GOT slot's, checked as
++    // it runs) when short (Bluey's "current thread" through a stub: 29% of its time)
++    config.follow_plt_calls = true;
+     // (04.75) memcpy, memmove and memset (the SDK's) run on the host (DynarmicCallbacks64::Native*)
+     config.native_functions = true;
+ #if defined(__OPENORBIS__)
+@@ -487,7 +493,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         config.elide_load_store_only_barriers = false;
+         config.superblocks = false;
+         config.superblocks_cond = false;
++        config.superblocks_backward = false;
+         config.bitfield_shifts = false;
++        config.follow_plt_calls = false;
+     }
+     if (JitOff("pins"))
+         config.loop_register_pins = false;
+@@ -495,8 +503,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         config.fastmem_range_check_reuse = false;
+     if (JitOff("guard"))
+         config.guarded_indirect_links = false;
+-    if (JitOff("leaf"))
++    if (JitOff("leaf")) {
+         config.follow_leaf_calls = false;
++        config.follow_plt_calls = false;
++    }
+     if (JitOff("native"))
+         config.native_functions = false;
+     if (JitOff("extras")) {
+@@ -510,6 +520,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         config.elide_load_store_only_barriers = false;
+         config.superblocks = false;
+         config.superblocks_cond = false;
++        config.superblocks_backward = false;
+         config.bitfield_shifts = false;
+     }
+     if (const char* off = std::getenv("EDEN_PS4_JIT_OFF"); off && m_core_index == 0)
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 35a98cdb96..a9a2a47331 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <chrono>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -76,7 +77,15 @@ void Scheduler::WaitWorker() {
+     // Ensure the queue is drained.
+     {
+         std::unique_lock ql{queue_mutex};
+-        event_cv.wait(ql, [this] { return work_queue.empty(); });
++        // (PS4 04.81) re-checked every 50 ms, the worker nudged again: a lost wake-up costs 50 ms,
++        // not the app (Echoes of Wisdom's exit, and Animal Crossing's in 04.78, hung with this
++        // thread waiting for the queue to drain and the worker waiting for work, on the same
++        // condition variable); and a worker that has stopped (shutting down) isn't waited for
++        while (!event_cv.wait_for(ql, std::chrono::milliseconds(50), [this] { return work_queue.empty(); })) {
++            if (worker_thread.get_stop_token().stop_requested())
++                break;
++            event_cv.notify_all();
++        }
+     }
+ 
+     // Now wait for execution to finish.
+@@ -291,8 +300,11 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+         {
+             std::unique_lock lk{queue_mutex};
+ 
+-            // Wait for work.
+-            event_cv.wait(lk, stop_token, [&] { return TryPopQueue(work); });
++            // Wait for work. (PS4 04.81) re-checked every 50 ms (WaitWorker's lost wake-ups)
++            while (!event_cv.wait_for(lk, stop_token, std::chrono::milliseconds(50), [&] { return TryPopQueue(work); })) {
++                if (stop_token.stop_requested())
++                    break;
++            }
+ 
+             // If we've been asked to stop, we're done.
+             if (stop_token.stop_requested()) {
+-- 
+2.43.0
+

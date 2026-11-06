@@ -301,6 +301,10 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
 #endif
 #ifdef HAVE_SUPERBACK  // (04.81) backward branches as side exits too, but to the block's own start (DYN_SUPERBACK)
     config.superblocks_backward = std::getenv("DYN_SUPERBACK") != nullptr;
+    // (04.81) BL through PLT stubs, on into short leaves (DYN_PLT); TPIDRRO_EL0's value (DYN_TPIDRRO)
+    config.follow_plt_calls = std::getenv("DYN_PLT") != nullptr;
+    if (const char* t = std::getenv("DYN_TPIDRRO"))
+        env.tpidrro_el0 = std::strtoull(t, nullptr, 0);
 #endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;

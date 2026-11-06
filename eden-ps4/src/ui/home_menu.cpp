@@ -57,7 +57,8 @@ const Speedup kSpeedups[kSpeedupCount] = {
     {"Translator Shortcuts", "extras",
      "Shorter, faster translations of common patterns in a game's code: address arithmetic folded into the "
      "memory access that uses it, condition flags kept only when something reads them, short branches "
-     "joined into one block of code, and more. The biggest gain of these."},
+     "joined into one block of code, a loop translated as one piece even when its exits jump backwards, "
+     "and more. The biggest gain of these."},
     {"Loop Registers", "pins",
      "A loop keeps the values it uses most in the PS4's own registers, instead of storing them to memory "
      "and loading them back on every pass."},
@@ -69,7 +70,8 @@ const Speedup kSpeedups[kSpeedupCount] = {
      "where it is every time (checked each time, so a call that has moved still goes to the right place)."},
     {"Small Functions Inlined", "leaf",
      "Very small functions (four instructions or fewer) are translated into the code that calls them, "
-     "saving the jump there and back."},
+     "saving the jump there and back, also when they're called through a system library's jump table "
+     "(checked as the game runs, in case the table changes)."},
     {"Native Memory Copies", "native",
      "Copying, clearing and comparing memory (memcpy, memmove, memset, memcmp) is done by the PS4 directly "
      "instead of being translated. Memory the GPU uses still goes through the emulator's usual path, so the GPU sees "

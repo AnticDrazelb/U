@@ -1737,6 +1737,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.81: faster calls to tiny system functions through library jump tables (Unity games such as "
+         "Bluey call one to ask which thread they're on constantly); Unity's garbage collector loop translated "
+         "as one piece; fixed a freeze when quitting a game (Echoes of Wisdom).\n"
          "04.80: faster CPU in games that read their thread's own storage often (Unity games: Silksong, Little "
          "Kitty): it is now read directly instead of looked up each time; native memory copies found in every "
          "game (Silksong's weren't), and comparing memory (memcmp) runs natively too.\n"

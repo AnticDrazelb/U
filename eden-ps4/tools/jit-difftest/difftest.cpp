@@ -319,6 +319,8 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
     c.guarded_indirect_links = std::getenv("DIFFTEST_NO_GUARD") == nullptr;
     // (04.74) BLs to short leaf functions followed, and their RETs back (DIFFTEST_NO_LEAF=1: not)
     c.follow_leaf_calls = std::getenv("DIFFTEST_NO_LEAF") == nullptr;
+    // (04.81) BLs through PLT stubs, on into short leaves behind them (DIFFTEST_NO_PLTFOLLOW=1: not)
+    c.follow_plt_calls = c.follow_leaf_calls && std::getenv("DIFFTEST_NO_PLTFOLLOW") == nullptr;
     c.native_functions = std::getenv("DIFFTEST_NO_NATIVE") == nullptr;
     // (DIFFTEST_FOLLOW=1) BL and forward B translated through, and known returns followed
     c.follow_direct_branches = c.follow_known_returns = std::getenv("DIFFTEST_FOLLOW") != nullptr;
@@ -378,6 +380,7 @@ void MakeBare(A64::UserConfig& c) {
     c.fastmem_range_check_reuse = false;
     c.guarded_indirect_links = false;
     c.follow_leaf_calls = false;
+    c.follow_plt_calls = false;
     c.native_functions = false;
     c.link_forward_without_halt_check = c.inline_rsb_pop = c.inline_fast_dispatch = false;
 }
@@ -1253,10 +1256,21 @@ int main(int argc, char** argv) {
                 const u64 page = kWindow + (Rand(0, 1) ? 1 : 3) * kPage;  // (in the arena or not)
                 const u32 off = u32(Rand(0, 511)) * 8;
                 const u64 slot = page + off;
+                // (04.81) half of them as a real PLT stub is, X16's page from ADRP (follow_plt_calls
+                // knows that one): the code then just below the window, in ADRP's reach
+                const bool use_adrp = Rand(0, 1) == 0;
+                if (use_adrp)
+                    s.start = (kWindow - 0x100000 - Rand(0, 0xffff) * 16) & ~u64(3);
                 const auto x16_sequence = [&](std::vector<u32>& out) {
-                    out.push_back(0xD2800000u | (u32(page & 0xffff) << 5) | 16);
-                    out.push_back(0xF2800000u | (1u << 21) | (u32((page >> 16) & 0xffff) << 5) | 16);
-                    out.push_back(0xF2800000u | (2u << 21) | (u32((page >> 32) & 0xffff) << 5) | 16);
+                    if (use_adrp) {
+                        const u64 pc = s.start + 4 * out.size();
+                        const s64 pages = s64(page >> 12) - s64(pc >> 12);
+                        out.push_back(0x90000000u | (u32(pages & 3) << 29) | (u32((pages >> 2) & 0x7ffff) << 5) | 16);
+                    } else {
+                        out.push_back(0xD2800000u | (u32(page & 0xffff) << 5) | 16);
+                        out.push_back(0xF2800000u | (1u << 21) | (u32((page >> 16) & 0xffff) << 5) | 16);
+                        out.push_back(0xF2800000u | (2u << 21) | (u32((page >> 32) & 0xffff) << 5) | 16);
+                    }
                     out.push_back(0xF9400000u | ((off / 8) << 10) | (16 << 5) | 17);  // ldr x17, [x16, #off]
                     out.push_back(0x91000000u | ((off & 0xfff) << 10) | (16 << 5) | 16);  // add x16, x16, #off
                 };
@@ -1266,10 +1280,23 @@ int main(int argc, char** argv) {
                 // build: main with the call sites, svc, stub, leaf A, leaf B
                 std::vector<u32> main_code;
                 size_t call_index[2]{};
+                // (04.81) now and then the slot pointed at leaf B right before the first call: the
+                // translator's guess (A, a short leaf, followed into) wrong when it runs, its guard's
+                // side exit taken
+                const bool prepoint = Rand(0, 2) == 0;
+                size_t prepoint_adr = 0;
                 for (size_t i = 0; i <= code.size(); i++) {
                     for (int k = 0; k < 2; k++) {
                         if ((k == 0 ? at1 : at2) != i)
                             continue;
+                        if (k == 0 && prepoint) {
+                            main_code.push_back(0xD2800000u | (u32(slot & 0xffff) << 5) | 10);  // x10 = the slot
+                            main_code.push_back(0xF2800000u | (1u << 21) | (u32((slot >> 16) & 0xffff) << 5) | 10);
+                            main_code.push_back(0xF2800000u | (2u << 21) | (u32((slot >> 32) & 0xffff) << 5) | 10);
+                            prepoint_adr = main_code.size();
+                            main_code.push_back(0u);           // adr x9, leaf B (below)
+                            main_code.push_back(0xF9000149u);  // str x9, [x10]
+                        }
                         call_index[k] = main_code.size();
                         if (stubbed[k]) {
                             main_code.push_back(0u);  // (bl stub, below)
@@ -1325,6 +1352,10 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 2; k++)
                     if (stubbed[k])
                         main_code[call_index[k]] = 0x94000000u | (u32(stub_at - call_index[k]) & 0x3ffffff);
+                if (prepoint) {
+                    const s64 rel = (s64(leaf_b) - s64(prepoint_adr)) * 4;
+                    main_code[prepoint_adr] = 0x10000000u | (u32(rel & 3) << 29) | (u32((rel >> 2) & 0x7ffff) << 5) | 9;
+                }
                 code = main_code;
                 const u64 first = Rand(0, 15) == 0 ? (RandomValue() & ~u64(3)) : s.start + 4 * leaf_a;
                 g_preset.push_back({slot, first});

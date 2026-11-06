@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.81:** tiny functions behind PLT stubs inlined (Bluey); GC loops one block; the exit freeze (below).
 - **04.80:** thread-local storage on fastmem; native copies found in every game; native memcmp (below).
 - **04.79:** CPU > Speed-ups is a page: each speed-up by name, what it does, a switch (below).
 - **04.78:** the native memcpy's copies to and from GPU-cached memory happen (they didn't: flicker).
@@ -98,6 +99,37 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.81: calls through PLT stubs into tiny functions inlined, GC loops one block, the exit freeze
+
+- **04.80 on the console:** no FPS change (Mario Kart 36.7, Echoes ~33, Little Kitty 8.1, as 04.78)
+  though its changes worked (no page walks left in the profile, natives found everywhere); Captain
+  Toad 59.9 fps median (04.60: 39.4); Animal Crossing on GPU Accuracy Normal: no stall in three runs.
+  Bluey: 45-55 fps in menus, 5-9 in play, all three cores busy, the GPU idle.
+- **Bluey's profile:** 17% of its samples in a three-instruction function (`MRS X8, TPIDRRO_EL0;
+  LDR X0, [X8, #504]; RET`: the current thread) and 12% in the PLT stub calling it; 23% in PLT
+  stubs altogether. Each call: the BL's return stack push, the stub's guarded link, the function, a
+  return stack pop - about 35 host instructions and three blocks for one load.
+- **follow_plt_calls** (patch 0170): a BL to a PLT stub (`ADRP X16; LDR X17, [X16, #o]; ADD X16;
+  BR X17`) is translated on into the stub (its BR ending the block as a guarded link); if the GOT
+  slot's function (PeekCode, when translated) is a short leaf, the BR becomes a side exit for when
+  X17 holds another function and the leaf is translated on, back after the BL at its RET. Short
+  leaves may read TPIDRRO_EL0/TPIDR_EL0 (MRS). Six branches followed and eight pieces a block (two
+  such calls; a leaf call's pieces may repeat). `programs/plt64.s` (two calls a round): 186 host
+  instructions a round -> 100. On with Small Functions Inlined (`leaf`).
+- **superblocks_backward** (patch 0169, on in 0171): Little Kitty's hottest code (25% of its 04.80
+  samples) is Unity's GC mark loop, three blocks a pass (its exits branch backward); backward
+  branches are side exits now unless to the block's own start: one block, its registers pinned
+  (`programs/gcmark64.s`: 8% fewer host instructions; its CCMP's flags are the rest). With the
+  translator shortcuts (`extras`).
+- **The exit freeze** (0171): Echoes of Wisdom's exit (and Animal Crossing's in 04.78) hung with
+  the GPU thread in `Scheduler::WaitWorker` (the queue to drain) and the Vulkan worker waiting for
+  work, on the same condition variable: a lost wake-up. Both waits re-check every 50 ms now
+  (WaitWorker nudging the worker, and not waiting on a stopped one).
+- **Tests:** the differential test's PLT mode with ADRP stubs (follow_plt_calls' pattern) and the
+  slot repointed before the first call (the guard's exit taken): 20,000 blocks, 0 wrong (860 stubs
+  and 244 leaves followed a thousand); calls mode 10,000, all extras 10,000, loops with backward
+  exits 4,000: 0 wrong. `test.sh`: 0 failed.
 
 ## 04.80: thread-local storage on fastmem, native copies in every game, native memcmp
 

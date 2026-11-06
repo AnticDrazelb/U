@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.81: **tiny functions behind PLT stubs inlined; GC loops one block; the exit freeze fixed.** A call
+through a system library's stub to a function of a few instructions (Bluey's "current thread": 29% of
+its time with the stub) is translated into the caller, checked as it runs (patch 0170); Unity's GC mark
+loop is one block (0169); the Vulkan scheduler's waits re-check every 50 ms, so a lost wake-up no
+longer freezes a game's exit (0171).
+
 04.80: **thread-local storage on fastmem; native copies in every game; native memcmp.** Thread-local
 pages come four at a time from a 16 KiB group (patch 0168), which the PS4's fastmem maps, so reads
 through TPIDRRO_EL0 (Unity games: 14% of Silksong's hot samples) no longer walk the page table. The

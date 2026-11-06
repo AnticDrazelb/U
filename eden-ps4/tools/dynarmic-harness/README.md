@@ -154,3 +154,8 @@ from the third block to the first), x19 = scans of 4 KiB. Built with `OPTS="... 
 block's own start: the loop one block, pinned). With the PS4's options (callgrind, Jaguar mask):
 13,416 host instructions a scan without it, 12,284 with (8% fewer); what remains is mostly CCMP's
 flags (lahf/sahf and a store of NZCV). `DUMP_JIT` works in bench mode too.
+
+`programs/plt64.s` (04.81): Bluey's calls through a PLT stub to a three-instruction "current thread"
+function, two a round; `DYN_PLT=1` turns on `follow_plt_calls`, `DYN_TPIDRRO=0x10300000` points
+TPIDRRO_EL0 at the data. Eden's options as the PS4 has them (no `DYN_FOLLOW`, no `DYN_RET`): 186
+host instructions a round without, 100 with.

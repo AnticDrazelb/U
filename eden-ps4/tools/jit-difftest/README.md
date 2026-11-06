@@ -70,6 +70,10 @@ More of the PS4's configuration, and every run checked:
         in bare too, for loops with no FP instruction). DIFFTEST_LOOP_ONLY=<i>, DIFFTEST_LOOP_FROM=<i>,
         DIFFTEST_LOOP_CODE="<hex>...": one loop, from one on, or given code with that loop's state.
         6,000 loops with pins and 6,000 without: 0 wrong (149 in the FPSR alone).
+    DIFFTEST_PLT=1 (04.81): half of the stubs with ADRP (the code put below the window, in reach),
+    as follow_plt_calls matches them, and a third of the blocks point the slot at leaf B before
+    the first call (the translator's guess wrong, the guard's side exit taken); follow_plt_calls
+    on unless DIFFTEST_NO_PLTFOLLOW=1. With DIFFTEST_FULL=1: 20,000 blocks, 0 wrong.
     jit-difftest 0 0 loopbench                   a few loops timed with pins and without
     DIFFTEST_PLT=1        half of the blocks (those without DIFFTEST_CALLS's call) make two calls
                           through a GOT slot in the window, each through a PLT stub (BL to ADRP-like
