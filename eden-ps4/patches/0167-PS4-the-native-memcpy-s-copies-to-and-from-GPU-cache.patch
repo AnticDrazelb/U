@@ -1,0 +1,205 @@
+From 88b1e8b34826bd24a7d8b5763306abcb1399f6d1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 11:07:40 +0000
+Subject: [PATCH] PS4: the native memcpy's copies to and from GPU-cached memory
+ happen; Memory::CopyBlock fixed
+
+- Memory::CopyBlock walked the destination and wrote each piece of it onto itself: nothing was copied
+  (inherited; its only callers were the kernel's I/O memory reads and writes). 04.75's native
+  memcpy/memmove copied every piece touching a page that isn't plain memory (one the GPU caches) with
+  it, so those copies did nothing: stale vertex/index/constant data (Echoes of Wisdom's flicker, its
+  crash on a garbage index buffer, VK_ERROR_OUT_OF_DEVICE_MEMORY). Now the native copy takes such a
+  piece through a page buffer with ReadBlock and WriteBlock (the GPU's notifications), and CopyBlock
+  walks the source and writes at the same offset in the destination.
+- Move and Fill are templates over the memory type (tools/native-test checks them against memmove and
+  memset with plain and GPU-cached pages: the 04.75 code 22% wrong, now none).
+- EDEN_PS4_JIT_OFF=<names>: extras, pins, reuse, guard, leaf, native, each off alone (the menu's CPU >
+  Speed-ups), logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 34 +++++++++++++++++
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 45 +++++++++++++++++++++++
+ src/core/arm/dynarmic/native_functions.h  | 20 +++++++---
+ src/core/memory.cpp                       |  4 +-
+ 4 files changed, 96 insertions(+), 7 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index ff767fa625..708900e982 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -44,6 +44,26 @@ u64 DynarmicCallbacks32::MemoryRead(u32 vaddr, size_t size) {
+     }
+ }
+ 
++// (04.78) EDEN_PS4_JIT_OFF=<names, comma-separated>: those speed-ups alone off (the menu's CPU >
++// Speed-ups, to find the one behind a game's trouble): extras (the translator's PS4 shortcuts),
++// pins (loop registers), reuse (stack range checks), guard (direct calls), leaf (tiny functions),
++// native (memcpy/memmove/memset on the host)
++static bool JitOff(std::string_view name) {
++    const char* const list = std::getenv("EDEN_PS4_JIT_OFF");
++    if (list == nullptr)
++        return false;
++    std::string_view rest{list};
++    while (!rest.empty()) {
++        const size_t comma = rest.find(',');
++        if (rest.substr(0, comma) == name)
++            return true;
++        if (comma == std::string_view::npos)
++            break;
++        rest.remove_prefix(comma + 1);
++    }
++    return false;
++}
++
+ int DynarmicCallbacks32::NativeFunction(u32 vaddr) {
+     if (m_debugger_enabled || m_process == nullptr)
+         return 0;
+@@ -299,6 +319,20 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+         config.skip_redundant_extensions = false;
+         config.split_cold_code = false;
+     }
++    if (JitOff("pins"))
++        config.loop_register_pins = false;
++    if (JitOff("guard"))
++        config.guarded_indirect_links = false;
++    if (JitOff("native"))
++        config.native_functions = false;
++    if (JitOff("extras")) {
++        config.inline_conditional_instructions = false;
++        config.elide_dead_nzcv = false;
++        config.elide_dead_nzcv_abi = false;
++        config.fold_address_offsets = false;
++        config.skip_redundant_extensions = false;
++        config.split_cold_code = false;
++    }
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index b9a315ed8f..c0a79163c1 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -116,6 +116,26 @@ bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vect
+             m_memory.WriteExclusive128(vaddr, value, expected);
+ }
+ 
++// (04.78) EDEN_PS4_JIT_OFF=<names, comma-separated>: those speed-ups alone off (the menu's CPU >
++// Speed-ups, to find the one behind a game's trouble): extras (the translator's PS4 shortcuts),
++// pins (loop registers), reuse (stack range checks), guard (direct calls), leaf (tiny functions),
++// native (memcpy/memmove/memset on the host)
++static bool JitOff(std::string_view name) {
++    const char* const list = std::getenv("EDEN_PS4_JIT_OFF");
++    if (list == nullptr)
++        return false;
++    std::string_view rest{list};
++    while (!rest.empty()) {
++        const size_t comma = rest.find(',');
++        if (rest.substr(0, comma) == name)
++            return true;
++        if (comma == std::string_view::npos)
++            break;
++        rest.remove_prefix(comma + 1);
++    }
++    return false;
++}
++
+ int DynarmicCallbacks64::NativeFunction(u64 vaddr) {
+     if (m_debugger_enabled || m_process == nullptr)  // (the debugger's watchpoints see every access)
+         return 0;
+@@ -465,6 +485,31 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+         config.superblocks_cond = false;
+         config.bitfield_shifts = false;
+     }
++    if (JitOff("pins"))
++        config.loop_register_pins = false;
++    if (JitOff("reuse"))
++        config.fastmem_range_check_reuse = false;
++    if (JitOff("guard"))
++        config.guarded_indirect_links = false;
++    if (JitOff("leaf"))
++        config.follow_leaf_calls = false;
++    if (JitOff("native"))
++        config.native_functions = false;
++    if (JitOff("extras")) {
++        config.fold_address_offsets = false;
++        config.skip_redundant_extensions = false;
++        config.split_cold_code = false;
++        config.elide_dead_nzcv = false;
++        config.elide_dead_nzcv_abi = false;
++        config.return_stack_pc_only = false;
++        config.plain_acquire_loads = false;
++        config.elide_load_store_only_barriers = false;
++        config.superblocks = false;
++        config.superblocks_cond = false;
++        config.bitfield_shifts = false;
++    }
++    if (const char* off = std::getenv("EDEN_PS4_JIT_OFF"); off && m_core_index == 0)
++        LOG_WARNING(Core_ARM, "speed-ups off (the menu): {}", off);
+ 
+     // Code cache size
+ #if defined(__OPENORBIS__)
+diff --git a/src/core/arm/dynarmic/native_functions.h b/src/core/arm/dynarmic/native_functions.h
+index 582ddf1e00..e2c1381d4e 100644
+--- a/src/core/arm/dynarmic/native_functions.h
++++ b/src/core/arm/dynarmic/native_functions.h
+@@ -108,9 +108,11 @@ inline Table Find(Kernel::KProcess* process, Core::Memory::Memory& memory, bool
+ 
+ // Plain memory (its page table entry has a host pointer) is read and written directly, a page at a
+ // time; anything else (memory the GPU caches, which needs its notifications; unmapped) through
+-// ReadBlock, WriteBlock and CopyBlock, as the guest's own loads and stores would be. memmove's result
++// ReadBlock and WriteBlock (a page at a time through a buffer), as the guest's own loads and stores
++// would be, with the GPU's notifications. memmove's result
+ // (memcpy's too, whose overlap is undefined).
+-inline void Move(Core::Memory::Memory& memory, u64 dest, u64 src, u64 n) {
++template <typename Memory>
++inline void Move(Memory& memory, u64 dest, u64 src, u64 n) {
+     using Core::Memory::YUZU_PAGEMASK;
+     using Core::Memory::YUZU_PAGESIZE;
+     if (n == 0 || dest == src)
+@@ -136,15 +138,21 @@ inline void Move(Core::Memory::Memory& memory, u64 dest, u64 src, u64 n) {
+             (std::min)({n - done, YUZU_PAGESIZE - (from_addr & YUZU_PAGEMASK), YUZU_PAGESIZE - (to_addr & YUZU_PAGEMASK)});
+         u8* const to = memory.GetPlainPointer(to_addr);
+         const u8* const from = memory.GetPlainPointer(from_addr);
+-        if (to && from)
++        if (to && from) {
+             std::memcpy(to, from, chunk);
+-        else
+-            memory.CopyBlock(to_addr, from_addr, chunk);
++        } else {
++            // (04.78: not CopyBlock, which walked the destination and copied it onto itself, so a copy
++            // to or from memory the GPU caches did nothing: Echoes of Wisdom's flicker and crash)
++            std::array<u8, YUZU_PAGESIZE> buffer;
++            memory.ReadBlock(from_addr, buffer.data(), chunk);
++            memory.WriteBlock(to_addr, buffer.data(), chunk);
++        }
+         done += chunk;
+     }
+ }
+ 
+-inline void Fill(Core::Memory::Memory& memory, u64 dest, u8 c, u64 n) {
++template <typename Memory>
++inline void Fill(Memory& memory, u64 dest, u8 c, u64 n) {
+     using Core::Memory::YUZU_PAGEMASK;
+     using Core::Memory::YUZU_PAGESIZE;
+     for (u64 done = 0; done < n;) {
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index ded87210b8..caf1d4838f 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -352,8 +352,10 @@ struct Memory::Impl {
+         });
+     }
+ 
++    // (PS4 04.78) the source walked, each piece written at the same offset in the destination: it
++    // walked the destination, so each piece was copied onto itself and nothing was copied
+     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
+-        return WalkBlock(dest_addr, size,
++        return WalkBlock(src_addr, size,
+         [&](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
+             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(src_addr), size);
+             ZeroBlock(dest_addr + offset, copy_amount);
+-- 
+2.43.0
+

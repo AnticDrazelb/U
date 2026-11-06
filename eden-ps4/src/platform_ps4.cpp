@@ -1407,8 +1407,12 @@ Ui::MenuSettings LoadMenuSettings()
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
             settings.cpu_unsafe = true;
-        else if (line == "speedups=off")
-            settings.cpu_speedups = false;
+        else if (line.rfind("speedups=", 0) == 0)
+        {
+            for (int m = 0; m < Ui::kSpeedupModeCount; m++)
+                if (line.substr(9) == Ui::kSpeedupModes[m].name)
+                    settings.speedups = m;
+        }
         else if (line == "gpu=high")
             settings.gpu_high = true;
         else if (line == "cores=6")
@@ -1473,7 +1477,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
                      settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
                      settings.touchpad_minus ? "minus" : "touch", settings.serial_draws ? "serial" : "parallel",
-                     settings.motion_controls ? "on" : "off", settings.cpu_speedups ? "on" : "off",
+                     settings.motion_controls ? "on" : "off", Ui::kSpeedupModes[settings.speedups % Ui::kSpeedupModeCount].name,
                      settings.nickname.c_str(), settings.avatar, settings.avatar_color);
         // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
         std::fflush(f);
@@ -1720,6 +1724,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.78: fixed flickering and crashes from 04.75's faster memory copies (Echoes of Wisdom): copies to "
+         "and from memory the GPU uses did nothing. CPU > Speed-ups can also turn off one group or one of them.\n"
          "04.77: CPU > Speed-ups: on by default; off runs the translator as before 04.73, to tell whether a "
          "game's trouble comes from the speed-ups.\n"
          "04.76: Frame Pacing: Unlocked shows each frame as soon as it's done but no sooner than the game asks, "
@@ -3351,10 +3357,17 @@ void* Run(void*)
             Trace(game_test);
         // (04.77) Speed-ups off: the translator as 04.72 had it under Auto (the boot watcher's first
         // safer step, arm_dynarmic_64.cpp/arm_dynarmic_32.cpp), unless a step of its set something safer
-        if (!settings.cpu_speedups && std::getenv("EDEN_PS4_JIT_TEST") == nullptr)
+        unsetenv("EDEN_PS4_JIT_OFF");
+        if (settings.speedups == 1 && std::getenv("EDEN_PS4_JIT_TEST") == nullptr)
         {
             setenv("EDEN_PS4_JIT_TEST", "extras", 1);
             Trace("CPU speed-ups off (the menu): the translator as in 04.72");
+        }
+        else if (settings.speedups > 1 && settings.speedups < Ui::kSpeedupModeCount)
+        {
+            // (04.78) one group or one of them off (arm_dynarmic_64.cpp, arm_dynarmic_32.cpp: JitOff)
+            setenv("EDEN_PS4_JIT_OFF", Ui::kSpeedupModes[settings.speedups].off, 1);
+            Trace(fmt::format("CPU speed-ups (the menu): {}", Ui::kSpeedupModes[settings.speedups].label));
         }
         NoteRecent(program);
         const std::string setup = fmt::format(
@@ -3365,7 +3378,9 @@ void* Run(void*)
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
             settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
-            fmt::format("{}{}", settings.cpu_unsafe ? "unsafe" : "auto", settings.cpu_speedups ? "" : " (speed-ups off)"),
+            fmt::format("{}{}", settings.cpu_unsafe ? "unsafe" : "auto",
+                        settings.speedups == 0 ? std::string{} :
+                        fmt::format(" (speed-ups: {})", Ui::kSpeedupModes[settings.speedups % Ui::kSpeedupModeCount].label)),
             settings.seventh_core ? 7 : 6, settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.touchpad_minus ? "the Minus button" : "the touch screen",

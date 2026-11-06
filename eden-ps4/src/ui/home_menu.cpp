@@ -49,6 +49,24 @@ constexpr int kButtonCount = int(sizeof(kButtons) / sizeof(kButtons[0]));
 
 const char* const kCategories[] = {"Themes", "Graphics", "CPU", "Console", "About"};
 
+}  // namespace
+
+// (04.78) CPU > Speed-ups' choices: label, EDEN_PS4_JIT_OFF (all off: EDEN_PS4_JIT_TEST=extras)
+const SpeedupMode kSpeedupModes[kSpeedupModeCount] = {
+    {"On", "", "on"},
+    {"Off", "", "off"},
+    {"Without 04.75's", "native,leaf", "no-0475"},
+    {"Without native copies", "native", "no-native"},
+    {"Without tiny functions", "leaf", "no-leaf"},
+    {"Without 04.73's", "extras,pins,reuse,guard", "no-0473"},
+    {"Without direct calls", "guard", "no-guard"},
+    {"Without loop registers", "pins", "no-pins"},
+    {"Without stack checks", "reuse", "no-reuse"},
+    {"Without shortcuts", "extras", "no-extras"},
+};
+
+namespace {
+
 // (04.64) The user's icon at the top left of the HOME screen
 constexpr float kUserX = 66, kUserY = 52, kUserRadius = 25;
 // The icon's choice: the characters in a grid, then the colours in a row
@@ -997,12 +1015,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "how cores share memory: about 10% faster on vector maths on the PS4, no faster on the "
              "rest, and some games misbehave with it.",
              [](MenuSettings& s) { s.cpu_unsafe = !s.cpu_unsafe; }},
-            {"Speed-ups", on_off(settings.cpu_speedups),
-             "The PS4's shortcuts in translating a game's code (04.73-04.77): its loops kept in the PS4's "
-             "registers, calls into the system linked straight, memory copies done natively and more, about a "
-             "quarter faster. Off: the translator as in 04.72, slower; to tell whether a game's trouble comes "
-             "from them (if it goes away with them off, say so).",
-             [](MenuSettings& s) { s.cpu_speedups = !s.cpu_speedups; }},
+            {"Speed-ups", kSpeedupModes[settings.speedups % kSpeedupModeCount].label,
+             "The PS4's shortcuts in translating a game's code (04.73-04.78), about a quarter faster. Off: the "
+             "translator as in 04.72, slower. The other choices turn off one group or one of them, to find the one "
+             "behind a game's trouble: 04.75's are the native memory copies and the tiny functions; 04.73's the "
+             "direct calls, the loop registers, the stack checks and the translator shortcuts.",
+             [](MenuSettings& s) { s.speedups = (s.speedups + 1) % kSpeedupModeCount; }},
             {"CPU Cores", settings.seventh_core ? "7 (with the shared one)" : "6",
              "A PS4 app has 6 cores to itself and may use a 7th that the system shares. With 7, New Eden's threads "
              "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "

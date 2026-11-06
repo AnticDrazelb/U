@@ -53,6 +53,16 @@ struct Title
 // The Switch's limit for a user's nickname
 constexpr size_t kNicknameLength = 10;
 
+// (04.78) CPU > Speed-ups' choices (home_menu.cpp): the menu's label, the speed-ups off
+// (EDEN_PS4_JIT_OFF), menu.txt's name
+struct SpeedupMode {
+    const char* label;
+    const char* off;
+    const char* name;
+};
+constexpr int kSpeedupModeCount = 10;
+extern const SpeedupMode kSpeedupModes[kSpeedupModeCount];
+
 struct MenuSettings
 {
     bool white_theme = false;
@@ -65,7 +75,9 @@ struct MenuSettings
     bool jit_cache = true;     // (04.17) the CPU code translated kept on disk, loaded when the game starts again
     bool async_shaders = true; // shaders built in the background (a draw waits for none)
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
-    bool cpu_speedups = true;  // (04.77) the translator's PS4 speed-ups (off: as 04.72, EDEN_PS4_JIT_TEST=extras)
+    // (04.77) the translator's PS4 speed-ups: 0 all on; 1 all off (as 04.72, EDEN_PS4_JIT_TEST=extras);
+    // (04.78) 2-9 one group or one of them off (EDEN_PS4_JIT_OFF, kSpeedupModes in home_menu.cpp)
+    int speedups = 0;
     bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
     bool pin_threads = true;   // the emulated CPU cores and the GPU thread each on a core of their own

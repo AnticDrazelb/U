@@ -89,12 +89,32 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.78:** the native memcpy's copies to and from GPU-cached memory happen (they didn't: flicker).
 - **04.77:** CPU > Speed-ups (off: the translator as in 04.72, for telling whether trouble is theirs).
 - **04.76:** unlocked frame pacing keeps games at their own rate (below).
 - **04.75:** memcpy, memmove and memset run on the host; short leaf calls followed (below).
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.78: the native memcpy's bug (Echoes of Wisdom's flicker and crash)
+
+- **04.76 on the console:** Echoes of Wisdom flickered in play and crashed in one area
+  (`VK_ERROR_OUT_OF_DEVICE_MEMORY` creating an index buffer); the boot watcher's step 2 (the speed-ups
+  off) ran it without the flicker. Little Kitty had crashed once on the normal settings too.
+- **The cause** (patch 0167): `Memory::CopyBlock(dest, src, size)` walked the *destination* and wrote
+  each piece of it onto itself: it never copied anything (inherited; its only callers were the
+  kernel's I/O memory reads and writes, rarely used). 04.75's native memcpy/memmove copied every piece
+  touching a page that isn't plain memory - one the GPU caches: vertex, index and constant buffers -
+  with it, so those copies did nothing and the GPU drew stale data, or read a garbage index count.
+  The differential test missed it: its native calls ran dynarmic's default byte copies, not Eden's.
+- **The fix:** such a piece goes through a page buffer with `ReadBlock` and `WriteBlock` (with the
+  GPU's notifications), and `CopyBlock` walks the source and writes at the same offset in the
+  destination. `tools/native-test` drives Eden's own `Move` and `Fill` with plain and GPU-cached
+  pages against memmove/memset: the 04.75 code got 22% of 200,000 copies wrong, 04.78's none.
+- **CPU > Speed-ups** can now turn off one group (04.75's: native copies and tiny functions; 04.73's:
+  direct calls, loop registers, stack checks, translator shortcuts) or one of them
+  (`EDEN_PS4_JIT_OFF`), to find the one behind a game's trouble in a run or two.
 
 ## 04.77: CPU > Speed-ups
 

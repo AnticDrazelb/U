@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.78: **the native memcpy fixed**: 04.75-04.77's copies to and from memory the GPU uses did nothing
+(Eden's `CopyBlock` copied the destination onto itself), so games could flicker or crash (Echoes of
+Wisdom). Patch 0167; `tools/native-test` checks Eden's copies themselves. CPU > Speed-ups can turn off
+one group or one speed-up.
+
 04.77: **CPU > Speed-ups**: Off runs the translator as in 04.72 (all of 04.73-04.76's CPU speed-ups
 off), to tell whether a game's trouble comes from them.
 
