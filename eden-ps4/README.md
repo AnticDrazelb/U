@@ -379,6 +379,10 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.76: **Frame Pacing: Unlocked keeps games at their proper speed**: each frame is shown as soon as it's
+done but no sooner than the game asks (patch 0166); before, a 30 fps game that could go faster did,
+game time and all (Breath of the Wild).
+
 04.75: **memcpy, memmove and memset run natively** instead of translated (64-bit and 32-bit, patch
 0165): found by name in the games' modules, done on the PS4's own CPU, with memory the GPU caches
 going through Eden's usual notifications. Calls into leaf functions of up to four instructions are

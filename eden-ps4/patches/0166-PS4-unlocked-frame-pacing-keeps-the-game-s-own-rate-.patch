@@ -1,0 +1,176 @@
+From d221b6ad5a1aafe29a6e22c7ac13a08714fe9d76 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 10:31:37 +0000
+Subject: [PATCH] PS4: unlocked frame pacing keeps the game's own rate; native
+ functions logged
+
+- Unlocked pacing (no speed limit) composes ~100 times a vsync, and HardwareComposer counted a
+  frame's swap interval in compositions: a 30 fps game (swap interval 2) ran as fast as it could,
+  its game time too (Breath of the Wild at 57 fps). Now, unlocked, a layer's next buffer is taken
+  no sooner than its last one's swap interval in real 60 Hz vsyncs (on cadence while the game keeps
+  up, from now less a quarter vsync when it's late), and Conductor signals the vsync events games
+  wait on 60 times a second. A frame still isn't held to the next fixed vsync.
+- native_functions.h: the functions found logged as warnings (the PS4 log shows warnings only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/native_functions.h      |  2 +-
+ .../service/nvnflinger/hardware_composer.cpp  | 37 ++++++++++++++++++-
+ .../service/nvnflinger/hardware_composer.h    |  1 +
+ src/core/hle/service/vi/conductor.cpp         | 17 ++++++++-
+ src/core/hle/service/vi/conductor.h           |  1 +
+ 5 files changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/native_functions.h b/src/core/arm/dynarmic/native_functions.h
+index 8374588d33..582ddf1e00 100644
+--- a/src/core/arm/dynarmic/native_functions.h
++++ b/src/core/arm/dynarmic/native_functions.h
+@@ -90,7 +90,7 @@ inline void FindIn(Core::Memory::Memory& memory, u64 base, std::string_view modu
+         if (kind != 0) {
+             const u64 address = base + (u64(symbol.st_value) & (is_64 ? ~u64(0) : ~u64(1)));
+             found.emplace_back(address, kind);
+-            LOG_INFO(Core_ARM, "native {} at {:#x} ({})", name, address, module_name);
++            LOG_WARNING(Core_ARM, "native {} at {:#x} ({})", name, address, module_name);
+         }
+     }
+ }
+diff --git a/src/core/hle/service/nvnflinger/hardware_composer.cpp b/src/core/hle/service/nvnflinger/hardware_composer.cpp
+index cd5dcc135e..7e5decf034 100644
+--- a/src/core/hle/service/nvnflinger/hardware_composer.cpp
++++ b/src/core/hle/service/nvnflinger/hardware_composer.cpp
+@@ -6,6 +6,9 @@
+ 
+ #include "common/cpu_features.h"
+ #include "common/ps4_perf.h"
++#include "common/settings.h"
++#include <algorithm>
++#include <chrono>
+ #include <optional>
+ 
+ #include <boost/container/small_vector.hpp>
+@@ -21,6 +24,23 @@ namespace Service::Nvnflinger {
+ 
+ namespace {
+ 
++// (PS4 04.76) Unlocked frame pacing (no speed limit): compositions come ~100 times a vsync, so a
++// frame's swap interval is counted in real 60 Hz vsyncs, not in compositions: the next frame is
++// taken as soon as it's queued but no sooner than the game asked (a 30 fps game stays at 30, its
++// game time with it, as on the Switch), and one that's late isn't held to the next vsync either.
++// Before, an unlocked game ran as fast as it could, game time and all.
++constexpr u64 VsyncNs = 16'666'667;
++
++bool TimePaced() {
++    return !Settings::values.use_speed_limit.GetValue();
++}
++
++u64 NowNs() {
++    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                std::chrono::steady_clock::now().time_since_epoch())
++                                .count());
++}
++
+ s32 NormalizeSwapInterval(f32* out_speed_scale, s32 swap_interval) {
+     if (swap_interval <= 0) {
+         // As an extension, treat nonpositive swap interval as speed multiplier.
+@@ -78,13 +98,21 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
+     // Determine the number of vsync periods to wait before composing again.
+     std::optional<s32> swap_interval{};
+     bool has_acquired_buffer{};
++    const bool time_paced = TimePaced();
++    const u64 now_ns = time_paced ? NowNs() : 0;
+ 
+     // Acquire all necessary framebuffers.
+     for (auto& layer : display.stack.layers) {
+         auto consumer_id = layer->consumer_id;
+ 
+         bool should_try_acquire = true;
+-        if (!layer->is_overlay) {
++        if (!layer->is_overlay && time_paced) {
++            // (04.76) whether released or still held: not before the last frame's time is up
++            auto fb_it = m_framebuffers.find(consumer_id);
++            if (fb_it != m_framebuffers.end() && now_ns < fb_it->second.next_acquire_ns) {
++                should_try_acquire = false;
++            }
++        } else if (!layer->is_overlay) {
+             auto fb_it = m_framebuffers.find(consumer_id);
+             if (fb_it != m_framebuffers.end() && fb_it->second.is_acquired) {
+                 const u64 frames_since_last_acquire = m_frame_number - fb_it->second.last_acquire_frame;
+@@ -226,6 +254,13 @@ bool HardwareComposer::TryAcquireFramebufferLocked(Layer& layer, Framebuffer& fr
+     framebuffer.release_frame_number = m_frame_number + swap_interval;
+     framebuffer.last_acquire_frame = m_frame_number;
+     framebuffer.is_acquired = true;
++    if (!layer.is_overlay && TimePaced()) {
++        // (04.76) the next frame after this one's swap interval in 60 Hz vsyncs: on cadence while the
++        // game keeps up (no drift), else from now, less a quarter vsync (a late frame's successor
++        // may come a little sooner, catching up)
++        const u64 now = NowNs(), period = u64(swap_interval) * VsyncNs;
++        framebuffer.next_acquire_ns = (std::max)(framebuffer.next_acquire_ns + period, now + period - VsyncNs / 4);
++    }
+ #ifdef __OPENORBIS__
+     if (!layer.is_overlay) {
+         const u64 queued = Common::PS4Perf::frame_queued_ns.exchange(0, std::memory_order_relaxed);
+diff --git a/src/core/hle/service/nvnflinger/hardware_composer.h b/src/core/hle/service/nvnflinger/hardware_composer.h
+index 9702e0584b..606aee6f5f 100644
+--- a/src/core/hle/service/nvnflinger/hardware_composer.h
++++ b/src/core/hle/service/nvnflinger/hardware_composer.h
+@@ -38,6 +38,7 @@ private:
+         android::BufferItem item{};
+         ReleaseFrameNumber release_frame_number{};
+         u64 last_acquire_frame{0};
++        u64 next_acquire_ns{0};  // (unlocked pacing: the next frame no sooner than this)
+         bool is_acquired{false};
+     };
+ 
+diff --git a/src/core/hle/service/vi/conductor.cpp b/src/core/hle/service/vi/conductor.cpp
+index fd7233cf93..a6cc5a0ed8 100644
+--- a/src/core/hle/service/vi/conductor.cpp
++++ b/src/core/hle/service/vi/conductor.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <chrono>
+ 
+ #include "common/adpf.h"
+ #include "common/settings.h"
+@@ -77,9 +78,23 @@ void Conductor::ProcessVsync() {
+     Common::PollThreadPolicies();
+     Common::ADPF::SetTargetWorkDuration(std::chrono::nanoseconds{this->GetFramePeriodNs()});
+ 
++    // (PS4 04.76) Unlocked pacing: compositions ~100 times a vsync (each frame shown as soon as it
++    // may be: hardware_composer.cpp), the vsync events games wait on still 60 a second, on cadence
++    bool signal = true;
++    if (m_system.IsMulticore() && !Settings::values.use_speed_limit.GetValue()) {
++        constexpr u64 vsync_ns = 16'666'667;
++        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                             std::chrono::steady_clock::now().time_since_epoch())
++                                             .count());
++        signal = now >= m_next_vsync_ns;
++        if (signal)
++            m_next_vsync_ns = (std::max)(m_next_vsync_ns + vsync_ns, now + vsync_ns - vsync_ns / 4);
++    }
++
+     for (auto& [display_id, manager] : m_vsync_managers) {
+         m_container.ComposeOnDisplay(&m_swap_interval, &m_compose_speed_scale, display_id);
+-        manager.SignalVsync(m_system.Kernel());
++        if (signal)
++            manager.SignalVsync(m_system.Kernel());
+     }
+ }
+ 
+diff --git a/src/core/hle/service/vi/conductor.h b/src/core/hle/service/vi/conductor.h
+index fdccd48670..a2dcf4c7b1 100644
+--- a/src/core/hle/service/vi/conductor.h
++++ b/src/core/hle/service/vi/conductor.h
+@@ -56,6 +56,7 @@ private:
+ 
+ private:
+     s32 m_swap_interval = 1;
++    u64 m_next_vsync_ns = 0;  // (PS4 04.76: unlocked pacing's next vsync event)
+     f32 m_compose_speed_scale = 1.0f;
+ };
+ 
+-- 
+2.43.0
+

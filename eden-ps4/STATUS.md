@@ -89,10 +89,24 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.76:** unlocked frame pacing keeps games at their own rate (below).
 - **04.75:** memcpy, memmove and memset run on the host; short leaf calls followed (below).
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.76: unlocked frame pacing at the game's own rate
+
+- **04.75 on the console:** Mario Kart 8 much faster; Breath of the Wild 8-12 fps outside but 51-57
+  where it could go above 30, too fast (its game time follows its frames); Little Kitty 6-7 fps;
+  Echoes of Wisdom flashes in play (not in menus). The menu had Frame Pacing: Unlocked.
+- **Unlocked pacing** (patch 0166): Eden's vsyncs come ~100 times as often there, and the composer
+  counted a frame's swap interval in compositions, so a 30 fps game (swap interval 2) had no limit.
+  Now, unlocked, a layer's next frame is taken no sooner than its last one's swap interval in real
+  60 Hz vsyncs (on cadence while the game keeps up; from now, less a quarter vsync, when it's late),
+  and the vsync events games wait on come 60 times a second. A frame still isn't held to the next
+  fixed vsync: a game below its target loses no time waiting, but can't run fast.
+- The native functions found are logged (`native memcpy at ...`, as warnings).
 
 ## 04.75: memcpy, memmove and memset on the host; leaf calls followed
 
