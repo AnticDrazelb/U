@@ -517,6 +517,15 @@ int main(int argc, char** argv) {
         std::_Exit(134);
     });
     std::set_terminate([] {
+        if (std::exception_ptr e = std::current_exception()) {
+            try {
+                std::rethrow_exception(e);
+            } catch (const std::exception& x) {
+                std::fprintf(stderr, "terminate: exception %s\n", x.what());
+            } catch (...) {
+                std::fprintf(stderr, "terminate: an exception of another type\n");
+            }
+        }
         std::fprintf(stderr, "terminated in the block:\n");
         for (const u32 inst : g_current_block)
             std::fprintf(stderr, "  %08x %s\n", inst, Describe(inst).c_str());
@@ -824,12 +833,20 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     const pid_t child = fork();
                     if (child == 0) {
-                        crash_stage = 10;
-                        const Result x = on.Run(code, st);
-                        crash_stage = 11;
-                        const Result y = off.Run(code, st);
-                        crash_stage = 12;
-                        const Result z = bare.Run(code, st);
+                        // (an exception from a runner: its message, then counted as its crash)
+                        const auto guarded = [&](Runner& r, int stage) {
+                            crash_stage = stage;
+                            alarm(std::getenv("DIFFTEST_CHILD_ALARM") ? unsigned(std::atoi(std::getenv("DIFFTEST_CHILD_ALARM"))) : 30u);  // (a loop in real code with a random counter: ends the child)
+                            try {
+                                return r.Run(code, st);
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "runner %d exception: %s\n", stage - 10, e.what());
+                                _exit(stage);
+                            }
+                        };
+                        const Result x = guarded(on, 10);
+                        const Result y = guarded(off, 11);
+                        const Result z = guarded(bare, 12);
                         _exit(x == y && y == z ? 0 : !(x == z) && y == z ? 1 : !(y == z) && x == z ? 2 : 3);
                     }
                     int status = 0;
