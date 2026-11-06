@@ -5,6 +5,42 @@ Where the work stands, what was done, what was tried and ruled out, and what's n
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
 are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see "How to work").
 
+## Update at 04.81 (2026-11-06)
+
+What the console logs say after 04.73-04.81's CPU work (late in each session, 50% resolution,
+Profiler on):
+
+| Game | fps | 04.60-04.78 | Held back by |
+|---|---|---|---|
+| Captain Toad | 55-60 | 39-49 (04.40-04.60) | at the 60 cap most of the time |
+| Mario Kart 8 | ~37 | 37-40 | the main thread (77% running) |
+| Echoes of Wisdom | ~33 | ~33 | - |
+| Silksong | ~30 | ~30 | the main thread (96% running) |
+| Animal Crossing | 15-18 (GPU Accuracy Normal: no stalls) | 11-16, stalls on High | the main thread, GPU thread and GPU each partly idle |
+| Breath of the Wild, outdoors | 8-10 | - | Eden's GPU thread (86% busy, ~21 us a draw, 4,300 draws a frame) |
+| Little Kitty | ~8 | 7.5-8.5 | the main thread (90% running) |
+| Bluey | ~9 | - | the main thread (93% running) |
+
+- **04.80** (thread-local storage on fastmem, native copies in every game, native memcmp) and
+  **04.81** (calls through PLT stubs into tiny functions inlined, GC loops one block) worked as
+  designed (no page walks left, the stubs' callees inlined) but **moved no frame rate**. The
+  sampler's per-core numbers show why: the hot code those targeted ran on the **worker threads**
+  (Bluey's "current thread" calls on cores 1 and 2, its Unity job workers spinning on a lock; Little
+  Kitty's GC loop 0.5% of core 0), not on the **main thread** (core 0) that sets the frame rate.
+  Lesson: profiles are read per core from now on, the main thread's first.
+- **The Unity games' main threads** (Little Kitty, Bluey, Silksong) spend 70-90% of their time in
+  translated code spread over thousands of blocks (none above 0.6%), Eden's own code small (idle
+  7%, clock_gettime 1%). Going further there means the translator's general code quality (the guest
+  registers kept in host registers across blocks, ~21% of the host instructions are their loads and
+  stores): a large change for an estimated 5-10%, not started.
+- **Breath of the Wild outdoors** is held back by Eden's GPU thread, whose time has no hot spot either:
+  [docs/gpu-thread-split.md](docs/gpu-thread-split.md): its work split over two cores (command
+  processing on one, the rasterizer on another); 04.82 keeps every game's profile and measures the
+  split, the split itself follows (04.83-04.84).
+- **04.81's exit freeze fix**: four exits in the next session, none hung (the freeze was about one in
+  ten).
+- **Free**: in Breath of the Wild the PS4's GPU is 90% idle: resolution 100% costs no frame rate.
+
 ## Goal
 
 Mario Kart 8 Deluxe (32-bit ARM, the main test game) racing at 25-30 fps on a base PS4, ideally

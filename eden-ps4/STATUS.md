@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **Next (04.82):** every game's profile kept; the GPU thread's split measured: [docs/gpu-thread-split.md](docs/gpu-thread-split.md).
 - **04.81:** tiny functions behind PLT stubs inlined (Bluey); GC loops one block; the exit freeze (below).
 - **04.80:** thread-local storage on fastmem; native copies found in every game; native memcmp (below).
 - **04.79:** CPU > Speed-ups is a page: each speed-up by name, what it does, a switch (below).
@@ -99,6 +100,23 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.81 on the console, and what's next
+
+- **No frame rate moved** (Bluey 9.0-9.6 against 7-9, Little Kitty 7.8-8.7, Silksong 28-32,
+  Captain Toad 55-58): the stub-call inlining and the GC loop sped up worker threads. Bluey's
+  sampler (04.80) per core: its "current thread" and stub blocks on cores 1 and 2 (0.7-0.9% each
+  there), at most 0.2% on core 0, the main thread, whose time is spread over thousands of blocks;
+  Little Kitty's GC loop 0.5% of core 0. Four exits, none hung.
+- **Breath of the Wild outdoors** (a session of it alone, Profiler on): 8-10 fps; 40,000 draws a
+  second; the GPU thread 86% busy (79% Eden's code), ~21 us a draw; the main thread waiting on the
+  GPU thread's work 45% of the time; the cores half idle; the PS4's GPU 10% busy; the stream buffer
+  never overflowed (staging buffers 0 MiB). The GPU thread's time by part: command processing ~13%,
+  GPU memory reads ~8%, textures and descriptors ~8%, buffers and uniform copies ~7% (5 copies a
+  draw, 63 MB/s), pipelines and state ~4%, the rest unnamed or thin.
+- **Next:** the proposal in [docs/gpu-thread-split.md](docs/gpu-thread-split.md): 04.82 keeps
+  every game's profile and measures the GPU thread's front end against its back end; the split
+  itself (04.83 behind a switch, 04.84 on for testing) is built meanwhile.
 
 ## 04.81: calls through PLT stubs into tiny functions inlined, GC loops one block, the exit freeze
 
