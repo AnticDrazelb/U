@@ -9,7 +9,8 @@
 #include <vector>
 #include <array>
 #include <algorithm>
-using u8 = uint8_t; using u64 = uint64_t; using s64 = int64_t;
+#include <initializer_list>
+using u8 = uint8_t; using u32 = uint32_t; using u64 = uint64_t; using s64 = int64_t;
 namespace Core::Memory { constexpr u64 YUZU_PAGESIZE = 4096, YUZU_PAGEMASK = 4095; }
 struct MockMemory {
     std::vector<u8> bytes;
@@ -47,9 +48,26 @@ int main() {
         for (size_t p = 0; p < pages; p++) m.plain[p] = (rng() % 3) != 0;
         std::vector<u8> ref = m.bytes;
         const u64 n = rng() % 4 == 0 ? rng() % 64 : rng() % (3 * 4096);
-        const u64 dest = rng() % (pages * 4096 - n), kind = rng() % 3;
+        const u64 dest = rng() % (pages * 4096 - n), kind = rng() % 4;
         u64 src = rng() % 2 ? dest + (rng() % 128) - 64 : rng() % (pages * 4096 - n);
         if (src + n > pages * 4096 || s64(src) < 0) src = dest;
+        if (kind == 3) {
+            // (04.80) memcmp: make the two runs mostly equal (a copy, a byte or two changed), then the
+            // first difference's value against the reference's
+            std::memmove(&m.bytes[dest], &m.bytes[src], n);
+            for (int c = int(rng() % 3); c > 0 && n > 0; c--)
+                m.bytes[dest + rng() % n] = u8(rng());
+            ref = m.bytes;
+            unsigned expected = 0;
+            for (u64 i = 0; i < n; i++)
+                if (ref[dest + i] != ref[src + i]) { expected = unsigned(int(ref[dest + i]) - int(ref[src + i])); break; }
+            const unsigned got = Core::NativeFunctions::Compare(m, m.base + dest, m.base + src, n);
+            runs++;
+            if (got != expected || ref != m.bytes) {
+                if (bad++ < 5) std::printf("wrong compare: dest %llu src %llu n %llu: %u, expected %u\n", (unsigned long long)dest, (unsigned long long)src, (unsigned long long)n, got, expected);
+            }
+            continue;
+        }
         if (kind < 2) {
             std::memmove(&ref[dest], &ref[src], n);
             Core::NativeFunctions::Move(m, m.base + dest, m.base + src, n);

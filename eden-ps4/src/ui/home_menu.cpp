@@ -71,8 +71,8 @@ const Speedup kSpeedups[kSpeedupCount] = {
      "Very small functions (four instructions or fewer) are translated into the code that calls them, "
      "saving the jump there and back."},
     {"Native Memory Copies", "native",
-     "Copying and clearing memory (memcpy, memmove, memset) is done by the PS4 directly instead of being "
-     "translated. Memory the GPU uses still goes through the emulator's usual path, so the GPU sees "
+     "Copying, clearing and comparing memory (memcpy, memmove, memset, memcmp) is done by the PS4 directly "
+     "instead of being translated. Memory the GPU uses still goes through the emulator's usual path, so the GPU sees "
      "every change."},
 };
 

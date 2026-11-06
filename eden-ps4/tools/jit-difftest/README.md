@@ -71,7 +71,8 @@ More of the PS4's configuration, and every run checked:
                           failing), a slot holds garbage now and then (guarded links, 04.73)
     DIFFTEST_NO_GUARD=1   the guarded links off
     DIFFTEST_NO_LEAF=1    BLs to short leaf functions not followed (04.74's follow_leaf_calls, on here)
-    DIFFTEST_NATIVE=1     every block: X0-X2 set, BL to a real memcpy/memmove/memset (byte loops), the
+    DIFFTEST_NATIVE=1     every block: X0-X2 set, BL to a real memcpy/memmove/memset/memcmp (byte loops;
+                          memcmp's first differing bytes' difference, as the SDK's; 04.80), the
                           registers the callee may change cleared: run natively (on, off; 04.75's
                           native_functions) against the real code (bare); DIFFTEST_NO_NATIVE=1: not.
                           The last line counts the native calls. (difftest32: the same, ARM.)

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds a Switch homebrew program (.nro) with clang and libnx built from source:
 #   nx-build <out.nro> "<title>" "<author>" "<version>" <sources...> [-- extra compile flags]
+#   NX_LDFLAGS: extra link flags (e.g. "--export-dynamic --hash-style=gnu")
 set -euo pipefail
 D="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$D/devkitA64/bin"
@@ -26,7 +27,7 @@ done
     "$D/libnx-clang/crt_clang.o" "${objs[@]}" \
     -L"$D/libnx/lib" -L"$D/devkitA64/aarch64-none-elf/lib" \
     --start-group -lnx -lc -lm -lsysbase -lclang_rt.builtins-aarch64 --end-group \
-    -o "$work/out.elf"
+    ${NX_LDFLAGS:-} -o "$work/out.elf"
 "$D/tools/bin/nacptool" --create "$title" "$author" "$version" "$work/out.nacp" >/dev/null
 "$D/tools/bin/elf2nro" "$work/out.elf" "$out" --nacp="$work/out.nacp" >/dev/null
 cp "$work/out.elf" "${out%.nro}.elf"

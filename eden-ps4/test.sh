@@ -71,7 +71,8 @@ check "exits on +" code breakout 0
 check "A launches the ball" says breakout "breakout: ball launched"
 check "draws 640x360 frames" drew breakout "640 360"
 check "beeps (audout)" loud breakout 0.2
-# the FPS Counter setting: its yellow digits at the top left of the frame, only when it's on
+# the FPS Counter setting: its yellow digits at the top centre of the frame (since 04.22, as the
+# Vulkan renderer's), only when it's on
 run breakout_fps "$work/breakout.nro" 6 "" EDEN_PS4_FPS=1
 fps_digits() {
     python3 - "$work/$1-frames/last.ppm" "$2" <<'PY'
@@ -80,12 +81,12 @@ data = open(sys.argv[1], 'rb').read()
 header = data.split(b'\n', 3)
 width = int(header[1].split()[0])
 pixels = header[3]
-lit = sum(1 for y in range(40) for x in range(60)
+lit = sum(1 for y in range(40) for x in range(width // 2 - 60, width // 2 + 60)
           if pixels[(y * width + x) * 3:(y * width + x) * 3 + 3] == bytes((255, 255, 77)))
 sys.exit(0 if (lit >= 30) == (sys.argv[2] == "on") else 1)
 PY
 }
-check "FPS Counter: digits at the top left" fps_digits breakout_fps on
+check "FPS Counter: digits at the top centre" fps_digits breakout_fps on
 check "FPS Counter: none when it's off" fps_digits breakout off
 
 echo "blocks.nro: picture, sound, the SD card"
@@ -108,6 +109,14 @@ echo "stacktest.nro: aliased memory (thread stacks), lined up with the PS4's 16 
 run stacktest "$work/stacktest.nro" 60 ""
 check "exits" code stacktest 0
 check "all checks pass" says stacktest "stacktest: all checks passed"
+
+echo "nativetest.nro: memcpy/memmove/memset/memcmp run natively; thread-local storage (04.80)"
+for nt in nativetest nativetest_gnu; do
+    run "$nt" "$work/$nt.nro" 120 ""
+    check "$nt: exits" code "$nt" 0
+    check "$nt: all checks pass" says "$nt" "nativetest: all checks passed"
+    check "$nt: its four functions found (its dynamic symbols)" says "$nt" "native functions: 4 found"
+done
 
 echo "gputest.nro: drawn with the GPU (clears, done in software by the null renderer)"
 run gputest "$work/gputest.nro" 20 "5:Plus,5.5:"

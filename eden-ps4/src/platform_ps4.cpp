@@ -1737,6 +1737,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.80: faster CPU in games that read their thread's own storage often (Unity games: Silksong, Little "
+         "Kitty): it is now read directly instead of looked up each time; native memory copies found in every "
+         "game (Silksong's weren't), and comparing memory (memcmp) runs natively too.\n"
          "04.79: CPU > Speed-ups is a page of its own: each speed-up by name, what it does, and a switch.\n"
          "04.78: fixed flickering and crashes from 04.75's faster memory copies (Echoes of Wisdom): copies to "
          "and from memory the GPU uses did nothing.\n"

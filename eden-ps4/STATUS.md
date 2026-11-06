@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.80:** thread-local storage on fastmem; native copies found in every game; native memcmp (below).
 - **04.79:** CPU > Speed-ups is a page: each speed-up by name, what it does, a switch (below).
 - **04.78:** the native memcpy's copies to and from GPU-cached memory happen (they didn't: flicker).
 - **04.77:** CPU > Speed-ups (off: the translator as in 04.72, for telling whether trouble is theirs).
@@ -97,6 +98,34 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.80: thread-local storage on fastmem, native copies in every game, native memcmp
+
+- **Where Silksong's time went (04.79's profile, `hotblocks.log`):** 14% of the samples in blocks
+  that read thread-local storage (`mrs tpidrro_el0` and a load through it), every such access a page
+  table walk (6.8% of the hot instructions were walks); about 10% in newlib-style memcpy/memset/memcmp
+  loops and the PLT stubs calling them, because 04.75's native functions found none in Silksong.
+- **Thread-local pages in 16 KiB groups** (patch 0168, `KProcess::AllocateGroupedThreadLocalPage`):
+  the PS4's fastmem arena maps 16 KiB at a time, four guest pages back to back and aligned in the
+  DRAM, and a thread-local page was a page on its own - never lined up, so every access through
+  TPIDRRO_EL0 walked (and once one was declined, 03.94's `thread_local_walks` made all of them walk
+  from the start). Now four come from one 16 KiB group of the system pool, mapped as ThreadLocal at a
+  16 KiB boundary: fastmem maps them like any other memory. A group goes (unmapped, freed) with its
+  last page; if one can't be made, a page of its own as before (`thread local pages:` in the log says
+  which).
+- **Native functions found in every game:** each executable code region is tried (Silksong's module
+  didn't have the path after its code that `Core::FindModules` wanted), the symbols counted from
+  DT_HASH or DT_GNU_HASH, a symbol of no type in the code taken, the optimized-routines and ARM EABI
+  names too. The log says `native functions: N found in M code regions`.
+- **memcmp runs natively** (kind 4; CPU > Speed-ups' Native Memory Copies covers it): the first
+  differing bytes' difference, as the SDK's.
+- **Tests:** `game/nativetest.c` (in `test.sh`, built twice: a SysV and a GNU hash table, symbols
+  exported) - 20,000 random copies, overlapping moves, fills and compares against byte loops, then
+  10 rounds of 12 threads checking their thread-local values: all pass, its four functions found;
+  64 KiB memcpy + memset + memcmp 3.6 us natively against 10.0 translated (desktop). `tools/native-test`
+  with `Compare`: 200,000 runs, 0 wrong. The differential tests' native mode with a memcmp: 8,000
+  64-bit and 6,000 32-bit blocks, 0 wrong (47,500 native calls). `test.sh`: 0 failed (its FPS Counter
+  check now looks at the top centre, where the digits have been since 04.22).
 
 ## 04.79: CPU > Speed-ups, a page of its own
 

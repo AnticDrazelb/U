@@ -77,6 +77,7 @@ public:
     u32 NativeMemcpy(u32 d, u32 s, u32 n) override { native_calls++; return UserCallbacks::NativeMemcpy(d, s, n); }
     u32 NativeMemmove(u32 d, u32 s, u32 n) override { native_calls++; return UserCallbacks::NativeMemmove(d, s, n); }
     u32 NativeMemset(u32 d, u32 c, u32 n) override { native_calls++; return UserCallbacks::NativeMemset(d, c, n); }
+    u32 NativeMemcmp(u32 a, u32 b, u32 n) override { native_calls++; return UserCallbacks::NativeMemcmp(a, b, n); }
     // (as the PS4's: memory as it is, no side effects; the guarded links' guess)
     std::optional<u32> PeekCode(u32 vaddr) override { return u32(MemoryRead(vaddr, 4)); }
     std::optional<u32> MemoryReadCode(u32 vaddr) override {
@@ -340,12 +341,14 @@ int main(int argc, char** argv) {
         // SVC: natively (on) against the real code (off, bare)
         g_native = {};
         if (!loops && std::getenv("DIFFTEST_NATIVE")) {
-            const int kind = int(Rand(1, 3));
+            const int kind = int(Rand(1, 4));
             const u32 n = Rand(0, 3) == 0 ? u32(Rand(0, 16)) : u32(Rand(0, 700));
             const u32 dest = kWindow + u32(Rand(0, kWindowSize - 1024));
             u32 src;
             if (kind == 3) {
                 src = u32(rng());
+            } else if (kind == 4 && Rand(0, 1)) {
+                src = dest;  // (memcmp: the same bytes, compared to the end)
             } else if (kind == 2 && Rand(0, 1)) {
                 src = dest + u32(Rand(0, 64)) - 32;
             } else {
@@ -364,13 +367,16 @@ int main(int argc, char** argv) {
             for (const u32 inst : {0xE3A01000u, 0xE3A02000u, 0xE3A03000u, 0xE3A0C000u, 0xE1500000u, kSvc})
                 m.push_back(inst);  // mov r1, r2, r3, r12, #0; cmp r0, r0; svc
             const size_t fn = m.size();
-            static const std::vector<u32> fns[4] = {
+            static const std::vector<u32> fns[5] = {
                 {},
                 {0xE1A03000, 0xE3520000, 0x0A000003, 0xE4D1C001, 0xE4C3C001, 0xE2422001, 0xEAFFFFF9, 0xE12FFF1E},
                 {0xE1A03000, 0xE1500001, 0x8A000005, 0xE3520000, 0x0A00000B, 0xE4D1C001, 0xE4C3C001, 0xE2422001,
                  0xEAFFFFF9, 0xE0811002, 0xE0833002, 0xE3520000, 0x0A000003, 0xE571C001, 0xE563C001, 0xE2422001,
                  0xEAFFFFF9, 0xE12FFF1E},
                 {0xE1A03000, 0xE3520000, 0x0A000002, 0xE4C31001, 0xE2422001, 0xEAFFFFFA, 0xE12FFF1E},
+                // memcmp: the first differing bytes' difference in R0, 0 if none
+                {0xE3520000, 0x0A000005, 0xE4D03001, 0xE4D1C001, 0xE053300C, 0x1A000003, 0xE2522001, 0x1AFFFFF9,
+                 0xE3A00000, 0xE12FFF1E, 0xE1A00003, 0xE12FFF1E},
             };
             m.insert(m.end(), fns[kind].begin(), fns[kind].end());
             m[bl_at] = 0xEB000000u | (u32(s32(fn) - s32(bl_at) - 2) & 0xFFFFFF);

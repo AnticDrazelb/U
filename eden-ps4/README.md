@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.80: **thread-local storage on fastmem; native copies in every game; native memcmp.** Thread-local
+pages come four at a time from a 16 KiB group (patch 0168), which the PS4's fastmem maps, so reads
+through TPIDRRO_EL0 (Unity games: 14% of Silksong's hot samples) no longer walk the page table. The
+native memcpy/memmove/memset are found in every code region (Silksong's weren't) and memcmp runs
+natively too. `game/nativetest.c` tests both in `test.sh`.
+
 04.79: **CPU > Speed-ups is a page of its own**: each of the translator's speed-ups by name, with what it
 does and a switch, and All Speed-ups at the top.
 
@@ -1753,6 +1759,10 @@ more than the declines it saved.
   (`kernel_timer_tasks`); and each of the five busiest services' wait before its thread took the
   call (`request_queue_ns`, set where `KServerSession` takes the request, added to
   `ServiceCall::queue_ns`), to see which service the 80 us waits are in.
+- `game/nativetest.c` (in `test.sh`, 04.80): built with its symbols exported (`NX_LDFLAGS` in
+  `nx-build`), once with a SysV hash table and once with a GNU one; random memcpy/memmove/memset/memcmp
+  calls against byte loops (the native functions), a timed 64 KiB round (`EDEN_PS4_JIT_OFF=native`
+  shows the translated time), then threads checking their thread-local values (the 16 KiB groups).
 - `game/stacktest.c` (in `test.sh`): `svcMapMemory` of 1 to 64 pages at each place in a 16 KiB
   page and two aliases a page apart: the alias reads the source's data, its writes are back in the
   source after `svcUnmapMemory`, the pages beside it stay free to `svcQueryMemory`; then 40 rounds

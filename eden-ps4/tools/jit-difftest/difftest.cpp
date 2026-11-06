@@ -166,6 +166,7 @@ public:
     u64 NativeMemcpy(u64 d, u64 s, u64 n) override { native_calls++; return A64TestEnv::NativeMemcpy(d, s, n); }
     u64 NativeMemmove(u64 d, u64 s, u64 n) override { native_calls++; return A64TestEnv::NativeMemmove(d, s, n); }
     u64 NativeMemset(u64 d, u64 c, u64 n) override { native_calls++; return A64TestEnv::NativeMemset(d, c, n); }
+    u64 NativeMemcmp(u64 a, u64 b, u64 n) override { native_calls++; return A64TestEnv::NativeMemcmp(a, b, n); }
     // (as the PS4's: memory as it is now, no side effects; the guarded links' guess)
     std::optional<std::uint32_t> PeekCode(u64 vaddr) override {
         u32 word = 0;
@@ -1121,11 +1122,13 @@ int main(int argc, char** argv) {
             // the flags) and SVC: run natively (on, off) against the real code (bare)
             g_native = {};
             if (std::getenv("DIFFTEST_NATIVE")) {
-                const int kind = int(Rand(1, 3));
+                const int kind = int(Rand(1, 4));
                 const u64 n = Rand(0, 3) == 0 ? Rand(0, 16) : Rand(0, 700);
                 u64 dest = kWindow + Rand(0, kWindowSize - 1024), src;
                 if (kind == 3) {
                     src = rng();  // (the byte, in X1's low 8 bits)
+                } else if (kind == 4 && Rand(0, 1)) {
+                    src = dest;  // (memcmp: the same bytes, compared to the end)
                 } else if (kind == 2 && Rand(0, 1)) {
                     src = dest + Rand(0, 64) - 32;  // (overlapping)
                 } else {
@@ -1149,12 +1152,15 @@ int main(int argc, char** argv) {
                 for (const u32 inst : {0xD2800001u, 0xD2800002u, 0xD2800003u, 0xD2800004u, 0xEB00001Fu, 0xD4000001u})
                     m.push_back(inst);  // movz x1..x4, #0; cmp x0, x0; svc #0
                 const size_t fn = m.size();
-                static const std::vector<u32> fns[4] = {
+                static const std::vector<u32> fns[5] = {
                     {},
                     {0xAA0003E3, 0xB40000A2, 0x38401424, 0x38001464, 0xD1000442, 0x17FFFFFC, 0xD65F03C0},  // memcpy
                     {0xAA0003E3, 0xEB01001F, 0x540000C8, 0xB4000182, 0x38401424, 0x38001464, 0xD1000442, 0x17FFFFFC,
                      0x8B020021, 0x8B020063, 0xB40000A2, 0x385FFC24, 0x381FFC64, 0xD1000442, 0x17FFFFFC, 0xD65F03C0},
                     {0xAA0003E3, 0xB4000082, 0x38001461, 0xD1000442, 0x17FFFFFD, 0xD65F03C0},  // memset
+                    // memcmp: the first differing bytes' difference in W0 (sub w0 as the SDK's), 0 if none
+                    {0xB40000E2, 0x38401403, 0x38401424, 0x6B040063, 0x540000A1, 0xF1000442, 0x54FFFF61, 0x2A1F03E0,
+                     0xD65F03C0, 0x2A0303E0, 0xD65F03C0},
                 };
                 m.insert(m.end(), fns[kind].begin(), fns[kind].end());
                 m[bl_at] = 0x94000000u | (u32(fn - bl_at) & 0x3ffffff);
