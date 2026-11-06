@@ -113,3 +113,35 @@ the translated code, not the GPU thread.
 - **Less gain than hoped**: if 04.82's measurement shows the front end well under 30%, the split's
   ceiling is lower than estimated; it stays behind the switch, and the back end's biggest parts are
   trimmed too.
+
+## Design notes (04.83, from reading Eden's code)
+
+- **What the renderer side reads of the 3D engine**: only `regs`, `dirty`, `draw_manager`, `state`
+  (constant buffer bindings) and `engine_state` (the Vulkan rasterizer, buffer/texture/query/shader
+  caches, the null renderer). So the back end gets a **shadow Maxwell3D** per channel, which the
+  real rasterizer and caches bind to (`ChannelSetupCaches`' `ChannelInfo`), and the front end's
+  Maxwell3D keeps processing methods and macros as now.
+- **Registers to the shadow**: macro HLE (`macro.cpp`) writes registers and dirty flags directly,
+  around `ProcessDirtyRegisters` and `SinkWriteRun`, so a write log would miss some. Instead, before
+  each queued operation that reads engine state (draws, clears, ...), the front end compares its
+  registers with the copy it last sent (14 KiB, ~0.5 us on the Jaguar) and sends the changed words;
+  its dirty flags (nothing on the front end reads them, it only sets them) are sent and cleared, and
+  `pipeline_key_changed` with them; `state` and the draw manager's draw state copied when they changed.
+- **Who runs what**:
+  - front end (the GPU thread): DmaPusher (fetching and decoding the command lists), the puller's
+    `BindObject` (the subchannels' engines), Maxwell3D's methods and macros (register state, the draw
+    manager);
+  - back end (a new thread on cores 4-6): every rasterizer call, through a `RasterizerProxy` that the
+    front end's engines and DmaPusher are bound to (each call queued in order, with the state it needs;
+    calls returning a value - `HasDrawTransformFeedback`, `AccelerateConditionalRendering`,
+    `MustFlushRegion` - wait for the back end to empty its queue first); the other engines' methods
+    whole (2D, DMA, compute, inline memory: their own rasterizer the real one, their memory copies in
+    order); the puller's other methods (semaphores, syncpoints, fences); Maxwell3D's own memory writes
+    (constant buffer uploads between draws, inline data), deferred with their data copied; the GPU
+    thread's other commands (`TickWork`, which runs the frame composition, and the emulated CPU's
+    flushes and invalidations).
+- **Queue**: batches of tasks (published at most every 64 tasks, at each command list's end and
+  before a wait), bounded, the back end spinning briefly before it sleeps (as the GPU thread does).
+- **Switch**: `EDEN_PS4_GPU_SPLIT=1` (the menu's Graphics > GPU Threads), off by default: off, the
+  GPU thread runs exactly as before (no proxy, no shadow, no queue).
+
