@@ -1407,6 +1407,8 @@ Ui::MenuSettings LoadMenuSettings()
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
             settings.cpu_unsafe = true;
+        else if (line == "speedups=off")
+            settings.cpu_speedups = false;
         else if (line == "gpu=high")
             settings.gpu_high = true;
         else if (line == "cores=6")
@@ -1460,7 +1462,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
                         "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\ndraws=%s\nmotion=%s\n"
-                        "nickname=%s\navatar=%d\navatar_color=%d\n",
+                        "speedups=%s\nnickname=%s\navatar=%d\navatar_color=%d\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1471,8 +1473,8 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
                      settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
                      settings.touchpad_minus ? "minus" : "touch", settings.serial_draws ? "serial" : "parallel",
-                     settings.motion_controls ? "on" : "off", settings.nickname.c_str(), settings.avatar,
-                     settings.avatar_color);
+                     settings.motion_controls ? "on" : "off", settings.cpu_speedups ? "on" : "off",
+                     settings.nickname.c_str(), settings.avatar, settings.avatar_color);
         // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
         std::fflush(f);
         fsync(fileno(f));
@@ -1718,6 +1720,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.77: CPU > Speed-ups: on by default; off runs the translator as before 04.73, to tell whether a "
+         "game's trouble comes from the speed-ups.\n"
          "04.76: Frame Pacing: Unlocked shows each frame as soon as it's done but no sooner than the game asks, "
          "so games keep their proper speed (Breath of the Wild ran too fast where it could go above 30).\n"
          "04.75: copying and clearing memory (memcpy, memmove, memset) runs natively on the PS4 instead of "
@@ -3345,6 +3349,13 @@ void* Run(void*)
         const std::string game_test = GameProfile(program);
         if (!game_test.empty())
             Trace(game_test);
+        // (04.77) Speed-ups off: the translator as 04.72 had it under Auto (the boot watcher's first
+        // safer step, arm_dynarmic_64.cpp/arm_dynarmic_32.cpp), unless a step of its set something safer
+        if (!settings.cpu_speedups && std::getenv("EDEN_PS4_JIT_TEST") == nullptr)
+        {
+            setenv("EDEN_PS4_JIT_TEST", "extras", 1);
+            Trace("CPU speed-ups off (the menu): the translator as in 04.72");
+        }
         NoteRecent(program);
         const std::string setup = fmt::format(
             "renderer: {}; console mode: {}; resolution {}%; shader cache {}, translation cache {}, asynchronous shaders {}, "
@@ -3354,8 +3365,8 @@ void* Run(void*)
             settings.shader_cache ? "on" : "off", settings.jit_cache ? "on" : "off", settings.async_shaders ? "on" : "off",
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
             settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
-            settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
-            settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
+            fmt::format("{}{}", settings.cpu_unsafe ? "unsafe" : "auto", settings.cpu_speedups ? "" : " (speed-ups off)"),
+            settings.seventh_core ? 7 : 6, settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.touchpad_minus ? "the Minus button" : "the touch screen",
             settings.serial_draws ? "one at a time" : "parallel", settings.motion_controls ? "on" : "off",

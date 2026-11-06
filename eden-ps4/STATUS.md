@@ -89,11 +89,21 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.77:** CPU > Speed-ups (off: the translator as in 04.72, for telling whether trouble is theirs).
 - **04.76:** unlocked frame pacing keeps games at their own rate (below).
 - **04.75:** memcpy, memmove and memset run on the host; short leaf calls followed (below).
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.77: CPU > Speed-ups
+
+- The menu's CPU Accuracy is Auto or Unsafe, and both have had the translator's PS4 speed-ups since
+  04.73: no way to tell whether a game's trouble (Echoes of Wisdom's flashes) is theirs. **CPU >
+  Speed-ups: Off** (`speedups=off` in menu.txt) sets `EDEN_PS4_JIT_TEST=extras` for the game, the
+  boot watcher's first safer step: the translator as 04.72 had it under Auto (no extras, loop pins,
+  range-check reuse, guarded links, leaf calls, native functions), unless a step of the watcher's has
+  set something safer. The session line says `CPU auto (speed-ups off)`.
 
 ## 04.76: unlocked frame pacing at the game's own rate
 

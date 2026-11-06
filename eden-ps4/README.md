@@ -379,6 +379,9 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.77: **CPU > Speed-ups**: Off runs the translator as in 04.72 (all of 04.73-04.76's CPU speed-ups
+off), to tell whether a game's trouble comes from them.
+
 04.76: **Frame Pacing: Unlocked keeps games at their proper speed**: each frame is shown as soon as it's
 done but no sooner than the game asks (patch 0166); before, a 30 fps game that could go faster did,
 game time and all (Breath of the Wild).

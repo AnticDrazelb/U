@@ -65,6 +65,7 @@ struct MenuSettings
     bool jit_cache = true;     // (04.17) the CPU code translated kept on disk, loaded when the game starts again
     bool async_shaders = true; // shaders built in the background (a draw waits for none)
     bool cpu_unsafe = false;   // Eden's Unsafe CPU accuracy instead of Auto
+    bool cpu_speedups = true;  // (04.77) the translator's PS4 speed-ups (off: as 04.72, EDEN_PS4_JIT_TEST=extras)
     bool gpu_high = false;     // Eden's High GPU accuracy (and reactive flushing) instead of Normal
     bool seventh_core = true;  // the app's threads may also run on the 7th core (shared with the system)
     bool pin_threads = true;   // the emulated CPU cores and the GPU thread each on a core of their own

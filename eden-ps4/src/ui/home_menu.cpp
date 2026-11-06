@@ -997,6 +997,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "how cores share memory: about 10% faster on vector maths on the PS4, no faster on the "
              "rest, and some games misbehave with it.",
              [](MenuSettings& s) { s.cpu_unsafe = !s.cpu_unsafe; }},
+            {"Speed-ups", on_off(settings.cpu_speedups),
+             "The PS4's shortcuts in translating a game's code (04.73-04.77): its loops kept in the PS4's "
+             "registers, calls into the system linked straight, memory copies done natively and more, about a "
+             "quarter faster. Off: the translator as in 04.72, slower; to tell whether a game's trouble comes "
+             "from them (if it goes away with them off, say so).",
+             [](MenuSettings& s) { s.cpu_speedups = !s.cpu_speedups; }},
             {"CPU Cores", settings.seventh_core ? "7 (with the shared one)" : "6",
              "A PS4 app has 6 cores to itself and may use a 7th that the system shares. With 7, New Eden's threads "
              "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "
