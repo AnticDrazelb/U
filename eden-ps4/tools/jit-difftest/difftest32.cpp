@@ -41,6 +41,7 @@ constexpr u32 kSvc = 0xEF000000;  // svc #0
 // with bit 0 set would otherwise run Thumb through it for ever, never linking back)
 constexpr u32 kSvcBoth = 0xEF00DF00;
 std::vector<std::pair<u32, u32>> g_preset;  // words in the window each run starts with (DIFFTEST_PLT)
+struct { u32 addr = 0; int kind = 0; } g_native;  // (DIFFTEST_NATIVE) the function run natively
 
 class Env final : public A32::UserCallbacks {
 public:
@@ -71,6 +72,11 @@ public:
             std::memcpy(arena + a, &v, sizeof(v));
         raised = false;
     }
+    int NativeFunction(u32 vaddr) override { return vaddr == g_native.addr ? g_native.kind : 0; }
+    static inline u64 native_calls = 0;  // (the native runs, all runners: printed at the end)
+    u32 NativeMemcpy(u32 d, u32 s, u32 n) override { native_calls++; return UserCallbacks::NativeMemcpy(d, s, n); }
+    u32 NativeMemmove(u32 d, u32 s, u32 n) override { native_calls++; return UserCallbacks::NativeMemmove(d, s, n); }
+    u32 NativeMemset(u32 d, u32 c, u32 n) override { native_calls++; return UserCallbacks::NativeMemset(d, c, n); }
     // (as the PS4's: memory as it is, no side effects; the guarded links' guess)
     std::optional<u32> PeekCode(u32 vaddr) override { return u32(MemoryRead(vaddr, 4)); }
     std::optional<u32> MemoryReadCode(u32 vaddr) override {
@@ -176,6 +182,7 @@ struct Runner {
             c.split_cold_code = on("split_cold_code");
             c.loop_register_pins = on("loop_register_pins");
             c.guarded_indirect_links = on("guarded_indirect_links");
+            c.native_functions = on("native_functions");
         }
         if (kind == Kind::Off)
             c.loop_register_pins = false;
@@ -328,6 +335,48 @@ int main(int argc, char** argv) {
         // LDR R11, [IP, #off]!, BLX R11); the slot points at an ARM callee, which may point it at a
         // second one before its random code (the check failing), or at a Thumb one (BX LR), or at
         // garbage now and then. The callees clear R9, R11 and R12 first, their random code names no LR.
+        // (DIFFTEST_NATIVE=1) some random code, R0-R2 set (MOVW/MOVT), BL to a real ARM memcpy,
+        // memmove or memset (byte loops), what the callee may change cleared (R1-R3, R12, the flags),
+        // SVC: natively (on) against the real code (off, bare)
+        g_native = {};
+        if (!loops && std::getenv("DIFFTEST_NATIVE")) {
+            const int kind = int(Rand(1, 3));
+            const u32 n = Rand(0, 3) == 0 ? u32(Rand(0, 16)) : u32(Rand(0, 700));
+            const u32 dest = kWindow + u32(Rand(0, kWindowSize - 1024));
+            u32 src;
+            if (kind == 3) {
+                src = u32(rng());
+            } else if (kind == 2 && Rand(0, 1)) {
+                src = dest + u32(Rand(0, 64)) - 32;
+            } else {
+                do src = kWindow + u32(Rand(0, kWindowSize - 1024)); while (src < dest + n && dest < src + n);
+            }
+            const auto mov32 = [](std::vector<u32>& out, u32 rd, u32 v) {
+                out.push_back(0xE3000000u | ((v & 0xffff) >> 12 << 16) | (rd << 12) | (v & 0xfff));
+                out.push_back(0xE3400000u | ((v >> 16) >> 12 << 16) | (rd << 12) | ((v >> 16) & 0xfff));
+            };
+            std::vector<u32> m(code.begin(), code.begin() + std::min<size_t>(code.size(), 6));
+            mov32(m, 0, dest);
+            mov32(m, 1, src);
+            mov32(m, 2, n);
+            const size_t bl_at = m.size();
+            m.push_back(0u);
+            for (const u32 inst : {0xE3A01000u, 0xE3A02000u, 0xE3A03000u, 0xE3A0C000u, 0xE1500000u, kSvc})
+                m.push_back(inst);  // mov r1, r2, r3, r12, #0; cmp r0, r0; svc
+            const size_t fn = m.size();
+            static const std::vector<u32> fns[4] = {
+                {},
+                {0xE1A03000, 0xE3520000, 0x0A000003, 0xE4D1C001, 0xE4C3C001, 0xE2422001, 0xEAFFFFF9, 0xE12FFF1E},
+                {0xE1A03000, 0xE1500001, 0x8A000005, 0xE3520000, 0x0A00000B, 0xE4D1C001, 0xE4C3C001, 0xE2422001,
+                 0xEAFFFFF9, 0xE0811002, 0xE0833002, 0xE3520000, 0x0A000003, 0xE571C001, 0xE563C001, 0xE2422001,
+                 0xEAFFFFF9, 0xE12FFF1E},
+                {0xE1A03000, 0xE3520000, 0x0A000002, 0xE4C31001, 0xE2422001, 0xEAFFFFFA, 0xE12FFF1E},
+            };
+            m.insert(m.end(), fns[kind].begin(), fns[kind].end());
+            m[bl_at] = 0xEB000000u | (u32(s32(fn) - s32(bl_at) - 2) & 0xFFFFFF);
+            code = m;
+            g_native = {s.start + u32(fn) * 4, kind};
+        }
         g_preset.clear();
         if (!loops && std::getenv("DIFFTEST_PLT") && Rand(0, 1) == 0) {
             const u32 page = kWindow + u32(Rand(1, 3)) * 0x1000, off = u32(Rand(0, 1023)) * 4, slot = page + off;
@@ -480,8 +529,8 @@ int main(int argc, char** argv) {
         }
     }
     alarm(0);
-    std::printf("\n%llu iterations: the extras wrong %llu, without them wrong %llu, unclear %llu (on and off differing %llu)\n",
+    std::printf("\n%llu iterations: the extras wrong %llu, without them wrong %llu, unclear %llu (on and off differing %llu; native calls %llu)\n",
                 (unsigned long long)iterations, (unsigned long long)on_wrong, (unsigned long long)off_wrong,
-                (unsigned long long)unclear, (unsigned long long)on_off_differ);
+                (unsigned long long)unclear, (unsigned long long)on_off_differ, (unsigned long long)Env::native_calls);
     return int(on_wrong != 0);
 }

@@ -1,0 +1,779 @@
+From fb5674a64a78ee27ba48151db802c96922341c9f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 09:35:06 +0000
+Subject: [PATCH] dynarmic + PS4: memcpy, memmove and memset run on the host;
+ leaf calls followed (up to 4 instructions)
+
+- UserConfig::native_functions (A64 and A32): a block at an address UserCallbacks::NativeFunction
+  names (1 memcpy, 2 memmove, 3 memset) is a call into NativeMemcpy/NativeMemmove/NativeMemset with
+  X0-X2 (R0-R2), its result to X0 (R0), then a return to X30 (BX LR). New IR ops A64CallNative and
+  A32CallNative (side effects; HostCall + the devirtualized callback, as the memory callbacks). The
+  function's first 64 bytes are the block's code for the code cache's check.
+- Eden (native_functions.h): the addresses from the modules' dynamic symbol tables (defined
+  functions; 32-bit also __aeabi_memcpy/memmove and their 4/8 forms, Thumb bit off), read once per
+  core at its first translation; plain memory (Memory::GetPlainPointer, new: a page table entry with
+  a host pointer) copied and filled directly a page at a time, anything else (GPU-cached, unmapped)
+  through ReadBlock/WriteBlock/CopyBlock; overlap with memmove's result. Off with a debugger.
+- A64 follow_leaf_calls: the leaf limit five instructions (up to four of the callee's, then RET):
+  unity64 unchanged, game64 -2.3%; X30 as a base or source register refuses a leaf too.
+- Both on with Auto and Unsafe; off with the boot watcher's extras step, Accurate, Paranoid.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  27 +++
+ src/core/arm/dynarmic/arm_dynarmic_32.h       |   9 +
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  31 ++++
+ src/core/arm/dynarmic/arm_dynarmic_64.h       |  10 ++
+ src/core/arm/dynarmic/native_functions.h      | 164 ++++++++++++++++++
+ src/core/memory.cpp                           |  14 ++
+ src/core/memory.h                             |   3 +
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp |  17 ++
+ .../dynarmic/backend/x64/a32_interface.cpp    |  18 ++
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp |  17 ++
+ .../dynarmic/backend/x64/a64_interface.cpp    |  19 +-
+ .../dynarmic/frontend/A32/a32_ir_emitter.h    |   4 +
+ .../dynarmic/frontend/A64/a64_ir_emitter.h    |   5 +
+ .../frontend/A64/translate/a64_translate.h    |   2 +-
+ .../A64/translate/impl/a64_branch.cpp         |   8 +-
+ .../src/dynarmic/interface/A32/config.h       |  24 +++
+ .../src/dynarmic/interface/A64/config.h       |  24 +++
+ src/dynarmic/src/dynarmic/ir/opcodes.h        |   2 +
+ src/dynarmic/src/dynarmic/ir/opcodes.inc      |   2 +
+ 19 files changed, 396 insertions(+), 4 deletions(-)
+ create mode 100644 src/core/arm/dynarmic/native_functions.h
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index acb0b745c5..ff767fa625 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -17,6 +17,7 @@
+ #endif
+ #include "core/arm/dynarmic/arm_dynarmic.h"
+ #include "core/arm/dynarmic/arm_dynarmic_32.h"
++#include "core/arm/dynarmic/native_functions.h"
+ #include "core/arm/dynarmic/dynarmic_cp15.h"
+ #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+ #include "core/core_timing.h"
+@@ -43,6 +44,29 @@ u64 DynarmicCallbacks32::MemoryRead(u32 vaddr, size_t size) {
+     }
+ }
+ 
++int DynarmicCallbacks32::NativeFunction(u32 vaddr) {
++    if (m_debugger_enabled || m_process == nullptr)
++        return 0;
++    if (!native_functions)
++        native_functions = NativeFunctions::Find(m_process, m_memory, false);
++    return NativeFunctions::Kind(*native_functions, vaddr);
++}
++
++u32 DynarmicCallbacks32::NativeMemcpy(u32 dest, u32 src, u32 n) {
++    NativeFunctions::Move(m_memory, dest, src, n);
++    return dest;
++}
++
++u32 DynarmicCallbacks32::NativeMemmove(u32 dest, u32 src, u32 n) {
++    NativeFunctions::Move(m_memory, dest, src, n);
++    return dest;
++}
++
++u32 DynarmicCallbacks32::NativeMemset(u32 dest, u32 c, u32 n) {
++    NativeFunctions::Fill(m_memory, dest, u8(c), n);
++    return dest;
++}
++
+ std::optional<u32> DynarmicCallbacks32::PeekCode(u32 vaddr) {
+     const u8* const pointer = m_memory.GetPointerSilent(vaddr);
+     if (!pointer || (vaddr & Core::Memory::YUZU_PAGEMASK) > Core::Memory::YUZU_PAGEMASK - 3)
+@@ -257,6 +281,8 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     // (04.74) a PLT stub's LDR PC: a link straight to the function its GOT slot held when
+     // translated, while the slot still holds it (as the 64-bit JIT's from 04.73)
+     config.guarded_indirect_links = true;
++    // (04.75) memcpy, memmove and memset (the SDK's) run on the host (native_functions.h)
++    config.native_functions = true;
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+     // (04.73) EDEN_PS4_JIT_TEST=extras: the same as Accurate does here, with Auto's speed
+     // otherwise (the boot watcher's first safer step: the translator as 04.72 had it under Auto)
+@@ -265,6 +291,7 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     if ((accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) || extras_off) {
+         config.loop_register_pins = false;
+         config.guarded_indirect_links = false;
++        config.native_functions = false;
+         config.inline_conditional_instructions = false;
+         config.elide_dead_nzcv = false;
+         config.elide_dead_nzcv_abi = false;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.h b/src/core/arm/dynarmic/arm_dynarmic_32.h
+index ad00628d80..ca4a6e077a 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.h
+@@ -6,6 +6,9 @@
+ 
+ #pragma once
+ 
++#include <optional>
++#include <utility>
++#include <vector>
+ #include <dynarmic/interface/A32/a32.h>
+ #include <dynarmic/interface/code_page.h>
+ 
+@@ -33,6 +36,12 @@ public:
+     u64 MemoryRead(u32 vaddr, size_t size) override;
+     std::optional<u32> MemoryReadCode(u32 vaddr) override;
+     std::optional<u32> PeekCode(u32 vaddr) override;
++    // (04.75) memcpy, memmove and memset run on the host (native_functions.h)
++    int NativeFunction(u32 vaddr) override;
++    u32 NativeMemcpy(u32 dest, u32 src, u32 n) override;
++    u32 NativeMemmove(u32 dest, u32 src, u32 n) override;
++    u32 NativeMemset(u32 dest, u32 c, u32 n) override;
++    std::optional<std::vector<std::pair<u64, int>>> native_functions;
+     void InstructionSynchronizationBarrierRaised() override {
+         last_code_addr = u64(-1); //reset back, force refetch
+     }
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 4e84439532..b9a315ed8f 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -12,6 +12,7 @@
+ #include "common/orbis_memory.h"
+ #endif
+ #include <algorithm>
++#include <array>
+ #include <cstdlib>
+ #include <atomic>
+ #include <string>
+@@ -22,6 +23,7 @@
+ #include "common/ps4_game_state.h"
+ #include "common/settings.h"
+ #include "core/arm/dynarmic/arm_dynarmic.h"
++#include "core/arm/dynarmic/native_functions.h"
+ #include "core/arm/dynarmic/arm_dynarmic_64.h"
+ #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+ #include "core/core_timing.h"
+@@ -114,6 +116,29 @@ bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vect
+             m_memory.WriteExclusive128(vaddr, value, expected);
+ }
+ 
++int DynarmicCallbacks64::NativeFunction(u64 vaddr) {
++    if (m_debugger_enabled || m_process == nullptr)  // (the debugger's watchpoints see every access)
++        return 0;
++    if (!native_functions)
++        native_functions = NativeFunctions::Find(m_process, m_memory, true);
++    return NativeFunctions::Kind(*native_functions, vaddr);
++}
++
++u64 DynarmicCallbacks64::NativeMemcpy(u64 dest, u64 src, u64 n) {
++    NativeFunctions::Move(m_memory, dest, src, n);
++    return dest;
++}
++
++u64 DynarmicCallbacks64::NativeMemmove(u64 dest, u64 src, u64 n) {
++    NativeFunctions::Move(m_memory, dest, src, n);
++    return dest;
++}
++
++u64 DynarmicCallbacks64::NativeMemset(u64 dest, u64 c, u64 n) {
++    NativeFunctions::Fill(m_memory, dest, u8(c), n);
++    return dest;
++}
++
+ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) {
+     last_code_addr = u64(-1); //invalidate cached page
+     switch (op) {
+@@ -402,6 +427,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // (04.73) a PLT stub's (or a call through the GOT's) indirect branch: a link straight to the
+     // function its GOT slot held when translated, while the slot still holds it
+     config.guarded_indirect_links = true;
++    // (04.75) a BL to a leaf function of up to four instructions: translated into the caller's block
++    config.follow_leaf_calls = true;
++    // (04.75) memcpy, memmove and memset (the SDK's) run on the host (DynarmicCallbacks64::Native*)
++    config.native_functions = true;
+ #if defined(__OPENORBIS__)
+     // (04.73) a block's stack accesses range checked once (the arena has no-access room on either
+     // side: common/orbis_memory.cpp)
+@@ -421,6 +450,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     if ((accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) || extras_off) {
+         config.loop_register_pins = false;
+         config.guarded_indirect_links = false;
++        config.follow_leaf_calls = false;
++        config.native_functions = false;
+         config.fastmem_range_check_reuse = false;
+         config.fold_address_offsets = false;
+         config.skip_redundant_extensions = false;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.h b/src/core/arm/dynarmic/arm_dynarmic_64.h
+index 10e8a4b26f..025b8295d5 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.h
+@@ -8,6 +8,9 @@
+ 
+ #include <atomic>
+ #include <memory>
++#include <optional>
++#include <utility>
++#include <vector>
+ #include "common/container/unordered_map.h"
+ 
+ #include <dynarmic/interface/A64/a64.h>
+@@ -57,6 +60,13 @@ public:
+     void AddTicks(u64 ticks) override;
+     u64 GetTicksRemaining() override;
+     u64 GetCNTPCT() override;
++    // (04.75) memcpy, memmove and memset run on the host (UserConfig::native_functions): those the
++    // process's modules define, found the first time it's asked
++    int NativeFunction(u64 vaddr) override;
++    u64 NativeMemcpy(u64 dest, u64 src, u64 n) override;
++    u64 NativeMemmove(u64 dest, u64 src, u64 n) override;
++    u64 NativeMemset(u64 dest, u64 c, u64 n) override;
++    std::optional<std::vector<std::pair<u64, int>>> native_functions;
+     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
+     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
+ 
+diff --git a/src/core/arm/dynarmic/native_functions.h b/src/core/arm/dynarmic/native_functions.h
+new file mode 100644
+index 0000000000..8374588d33
+--- /dev/null
++++ b/src/core/arm/dynarmic/native_functions.h
+@@ -0,0 +1,164 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// (PS4 04.75) memcpy, memmove and memset run on the host instead of translated (dynarmic's
++// UserConfig::native_functions, A64 and A32): where the process's modules define them, and the
++// copies themselves.
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "common/common_funcs.h"
++#include "common/common_types.h"
++#include "common/elf.h"
++#include "common/logging.h"
++#include "core/arm/debug.h"
++#include "core/memory.h"
++
++namespace Core::NativeFunctions {
++
++using Table = std::vector<std::pair<u64, int>>;  // (address, 1 memcpy / 2 memmove / 3 memset)
++
++inline int Kind(const Table& table, u64 vaddr) {
++    for (const auto& [address, kind] : table)
++        if (address == vaddr)
++            return kind;
++    return 0;
++}
++
++// The functions as the process's modules define them (the SDK's, a static libc's): from each
++// module's dynamic symbol table, read in bulk (a game's can be large). Read once, at the first block
++// a core translates: the modules are all loaded by then. 32-bit: also the ARM EABI's
++// __aeabi_memcpy/__aeabi_memmove (and their 4- and 8-aligned forms: the same arguments); a Thumb
++// function's address without its bit 0 (as the JIT's location has it).
++template <typename Sym, typename Dyn>
++inline void FindIn(Core::Memory::Memory& memory, u64 base, std::string_view module_name, bool is_64, Table& found) {
++    using namespace Common::ELF;
++    struct {
++        u32 version, header_offset, version_offset;
++    } loc{};
++    struct {
++        u32 signature, dynamic_offset;
++    } hdr{};
++    if (!memory.ReadBlock(base, &loc, sizeof(loc)) || !memory.ReadBlock(base + loc.header_offset, &hdr, sizeof(hdr)) ||
++        hdr.signature != Common::MakeMagic('M', 'O', 'D', '0'))
++        return;
++    u64 symtab = 0, strtab = 0, strsz = 0, syment = sizeof(Sym);
++    u64 dyn = base + loc.header_offset + hdr.dynamic_offset;
++    for (int i = 0; i < 256; i++, dyn += sizeof(Dyn)) {
++        Dyn d{};
++        if (!memory.ReadBlock(dyn, &d, sizeof(d)) || d.d_tag == ElfDtNull)
++            break;
++        if (d.d_tag == ElfDtSymtab)
++            symtab = d.d_un.d_ptr;
++        else if (d.d_tag == ElfDtStrtab)
++            strtab = d.d_un.d_ptr;
++        else if (d.d_tag == ElfDtStrsz)
++            strsz = d.d_un.d_val;
++        else if (d.d_tag == ElfDtSyment)
++            syment = d.d_un.d_val;
++    }
++    // (the symbols run up to the strings, as Core::Symbols reads them)
++    if (symtab == 0 || strtab <= symtab || strsz == 0 || syment < sizeof(Sym) || strtab - symtab > (u64(64) << 20) ||
++        strsz > (u64(64) << 20))
++        return;
++    std::vector<u8> symbols(strtab - symtab);
++    std::vector<char> strings(strsz + 1, '\0');
++    if (!memory.ReadBlock(base + symtab, symbols.data(), symbols.size()) ||
++        !memory.ReadBlock(base + strtab, strings.data(), strsz))
++        return;
++    for (u64 at = 0; at + sizeof(Sym) <= symbols.size(); at += syment) {
++        Sym symbol;
++        std::memcpy(&symbol, symbols.data() + at, sizeof(symbol));
++        // (defined functions only: an import has no section and no value)
++        if (symbol.st_value == 0 || symbol.st_shndx == 0 || symbol.st_name >= strsz || (symbol.st_info & 0xf) != 2)
++            continue;
++        const std::string_view name{strings.data() + symbol.st_name};
++        int kind = name == "memcpy" ? 1 : name == "memmove" ? 2 : name == "memset" ? 3 : 0;
++        if (!is_64 && kind == 0) {
++            if (name == "__aeabi_memcpy" || name == "__aeabi_memcpy4" || name == "__aeabi_memcpy8")
++                kind = 1;
++            else if (name == "__aeabi_memmove" || name == "__aeabi_memmove4" || name == "__aeabi_memmove8")
++                kind = 2;
++        }
++        if (kind != 0) {
++            const u64 address = base + (u64(symbol.st_value) & (is_64 ? ~u64(0) : ~u64(1)));
++            found.emplace_back(address, kind);
++            LOG_INFO(Core_ARM, "native {} at {:#x} ({})", name, address, module_name);
++        }
++    }
++}
++
++inline Table Find(Kernel::KProcess* process, Core::Memory::Memory& memory, bool is_64) {
++    Table found;
++    for (const auto& [base, module_name] : Core::FindModules(process)) {
++        if (is_64)
++            FindIn<Common::ELF::Elf64_Sym, Common::ELF::Elf64_Dyn>(memory, base, module_name, true, found);
++        else
++            FindIn<Common::ELF::Elf32_Sym, Common::ELF::Elf32_Dyn>(memory, base, module_name, false, found);
++    }
++    return found;
++}
++
++// Plain memory (its page table entry has a host pointer) is read and written directly, a page at a
++// time; anything else (memory the GPU caches, which needs its notifications; unmapped) through
++// ReadBlock, WriteBlock and CopyBlock, as the guest's own loads and stores would be. memmove's result
++// (memcpy's too, whose overlap is undefined).
++inline void Move(Core::Memory::Memory& memory, u64 dest, u64 src, u64 n) {
++    using Core::Memory::YUZU_PAGEMASK;
++    using Core::Memory::YUZU_PAGESIZE;
++    if (n == 0 || dest == src)
++        return;
++    if ((src & YUZU_PAGEMASK) + n <= YUZU_PAGESIZE && (dest & YUZU_PAGEMASK) + n <= YUZU_PAGESIZE) {
++        u8* const to = memory.GetPlainPointer(dest);
++        const u8* const from = memory.GetPlainPointer(src);
++        if (to && from) {
++            std::memmove(to, from, n);
++            return;
++        }
++    }
++    if (dest < src + n && src < dest + n) {
++        // overlapping, across pages: through a copy
++        std::vector<u8> buffer(n);
++        memory.ReadBlock(src, buffer.data(), n);
++        memory.WriteBlock(dest, buffer.data(), n);
++        return;
++    }
++    for (u64 done = 0; done < n;) {
++        const u64 from_addr = src + done, to_addr = dest + done;
++        const u64 chunk =
++            (std::min)({n - done, YUZU_PAGESIZE - (from_addr & YUZU_PAGEMASK), YUZU_PAGESIZE - (to_addr & YUZU_PAGEMASK)});
++        u8* const to = memory.GetPlainPointer(to_addr);
++        const u8* const from = memory.GetPlainPointer(from_addr);
++        if (to && from)
++            std::memcpy(to, from, chunk);
++        else
++            memory.CopyBlock(to_addr, from_addr, chunk);
++        done += chunk;
++    }
++}
++
++inline void Fill(Core::Memory::Memory& memory, u64 dest, u8 c, u64 n) {
++    using Core::Memory::YUZU_PAGEMASK;
++    using Core::Memory::YUZU_PAGESIZE;
++    for (u64 done = 0; done < n;) {
++        const u64 to_addr = dest + done;
++        const u64 chunk = (std::min)(n - done, YUZU_PAGESIZE - (to_addr & YUZU_PAGEMASK));
++        if (u8* const to = memory.GetPlainPointer(to_addr)) {
++            std::memset(to, c, chunk);
++        } else {
++            std::array<u8, YUZU_PAGESIZE> fill;
++            fill.fill(c);
++            memory.WriteBlock(to_addr, fill.data(), chunk);
++        }
++        done += chunk;
++    }
++}
++
++} // namespace Core::NativeFunctions
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index f7d89df521..ded87210b8 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -635,6 +635,16 @@ struct Memory::Impl {
+             []() {});
+     }
+ 
++    [[nodiscard]] u8* GetPlainPointer(u64 vaddr) const {
++        vaddr &= 0xffffffffffffULL;
++        if (!AddressSpaceContains(*current_page_table, vaddr, 1))
++            return nullptr;
++        const auto raw = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Raw();
++        if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer)
++            return reinterpret_cast<u8*>(pointer + vaddr);
++        return nullptr;
++    }
++
+     [[nodiscard]] u8* GetPointerSilent(const Common::ProcessAddress vaddr) const {
+         return GetPointerImpl(
+             GetInteger(vaddr), []() {}, []() {});
+@@ -876,6 +886,10 @@ u8* Memory::GetPointerSilent(Common::ProcessAddress vaddr) {
+     return impl->GetPointerSilent(vaddr);
+ }
+ 
++u8* Memory::GetPlainPointer(Common::ProcessAddress vaddr) {
++    return impl->GetPlainPointer(GetInteger(vaddr));
++}
++
+ const u8* Memory::GetPointer(Common::ProcessAddress vaddr) const {
+     return impl->GetPointer(vaddr);
+ }
+diff --git a/src/core/memory.h b/src/core/memory.h
+index 7167efbb84..d6662e5f4b 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -147,6 +147,9 @@ public:
+      */
+     u8* GetPointer(Common::ProcessAddress vaddr);
+     u8* GetPointerSilent(Common::ProcessAddress vaddr);
++    /// (PS4 04.75) The host pointer to vaddr if its page is plain memory (not cached by the GPU, not
++    /// debug memory, mapped), else nullptr: for direct reads and writes that need no notifications
++    u8* GetPlainPointer(Common::ProcessAddress vaddr);
+ 
+     template <typename T>
+     T* GetPointer(Common::ProcessAddress vaddr) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 3ea0b295bb..f3cf2c881a 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -1097,6 +1097,23 @@ void A32EmitX64::EmitA32CallSupervisor(A32EmitContext& ctx, IR::Inst* inst) {
+     }
+ }
+ 
++void A32EmitX64::EmitA32CallNative(A32EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u8 kind = args[0].GetImmediateU8();
++    ctx.reg_alloc.HostCall(code, inst, {}, args[1], args[2], args[3]);
++    switch (kind) {
++    case 1:
++        Devirtualize<&A32::UserCallbacks::NativeMemcpy>(conf.callbacks).EmitCall(code);
++        break;
++    case 2:
++        Devirtualize<&A32::UserCallbacks::NativeMemmove>(conf.callbacks).EmitCall(code);
++        break;
++    default:
++        Devirtualize<&A32::UserCallbacks::NativeMemset>(conf.callbacks).EmitCall(code);
++        break;
++    }
++}
++
+ void A32EmitX64::EmitA32ExceptionRaised(A32EmitContext& ctx, IR::Inst* inst) {
+     code.SwitchMxcsrOnExit();
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index df1dadef9b..787975281e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -35,6 +35,7 @@
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/common/atomic.h"
+ #include "dynarmic/frontend/A32/a32_ir_emitter.h"
++#include "dynarmic/frontend/A32/a32_types.h"
+ #include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/frontend/A32/translate/a32_translate.h"
+ #include "dynarmic/interface/A32/a32.h"
+@@ -279,6 +280,7 @@ struct Jit::Impl {
+         add(conf.inline_conditional_instructions);
+         add(conf.loop_register_pins);
+         add(conf.guarded_indirect_links);
++        add(conf.native_functions);
+         add(conf.elide_dead_nzcv);
+         add(conf.elide_dead_nzcv_abi);
+         add(conf.plain_acquire_loads);
+@@ -375,6 +377,21 @@ private:
+         ir_block.Reset(arch_descriptor);
+         ::Common::PS4Perf::jit_blocks.fetch_add(1, std::memory_order_relaxed);
+         const auto compile_start = std::chrono::steady_clock::now();
++        const int native = conf.native_functions && !arch_descriptor.SingleStepping() && arch_descriptor.IT().Value() == 0
++                               ? conf.callbacks->NativeFunction(arch_descriptor.PC())
++                               : 0;
++        if (native >= 1 && native <= 3) {
++            // (PS4 04.75) memcpy, memmove, memset: the host does it, then BX LR. The function's first
++            // 64 bytes stand for it (the code cache's check that it's the same code)
++            A32::IREmitter ir{ir_block, arch_descriptor, conf.arch_version};
++            ir.SetRegister(A32::Reg::R0, ir.CallNative(u8(native), ir.GetRegister(A32::Reg::R0), ir.GetRegister(A32::Reg::R1),
++                                                       ir.GetRegister(A32::Reg::R2)));
++            ir.BXWritePC(ir.GetRegister(A32::Reg::LR));
++            ir.SetTerm(IR::Term::PopRSBHint{});
++            ir_block.CycleCount() = 8;
++            ir_block.SetEndLocation(arch_descriptor.AdvancePC(arch_descriptor.TFlag() ? 2 : 4));
++            ir_block.lookahead.emplace_back(arch_descriptor.PC(), arch_descriptor.PC() + 64);
++        } else {
+         A32::Translate(ir_block, arch_descriptor, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions,
+                                                                    conf.page_table_single_walk_multiple && conf.page_table && !conf.fastmem_pointer &&
+                                                                        !conf.check_halt_on_memory_access,
+@@ -382,6 +399,7 @@ private:
+                                                                    conf.elide_dead_nzcv && !conf.enable_cycle_counting &&
+                                                                        !conf.check_halt_on_memory_access,
+                                                                    conf.elide_dead_nzcv_abi});
++        }
+         Optimization::Optimize(ir_block, conf, polyfill_options);
+         if (conf.guarded_indirect_links && !arch_descriptor.SingleStepping())
+             GuardIndirectLink(ir_block, *conf.callbacks);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 9c52b9b664..1869bc9d09 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -1243,6 +1243,23 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
+     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(A64JitState, exclusive_state)], u8(0));
+ }
+ 
++void A64EmitX64::EmitA64CallNative(A64EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    const u8 kind = args[0].GetImmediateU8();
++    ctx.reg_alloc.HostCall(code, inst, {}, args[1], args[2], args[3]);
++    switch (kind) {
++    case 1:
++        Devirtualize<&A64::UserCallbacks::NativeMemcpy>(conf.callbacks).EmitCall(code);
++        break;
++    case 2:
++        Devirtualize<&A64::UserCallbacks::NativeMemmove>(conf.callbacks).EmitCall(code);
++        break;
++    default:
++        Devirtualize<&A64::UserCallbacks::NativeMemset>(conf.callbacks).EmitCall(code);
++        break;
++    }
++}
++
+ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
+     ctx.reg_alloc.HostCall(code, nullptr);
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 7eec8f6405..cbfdddf14c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -332,7 +332,23 @@ private:
+         // (the exits' flags need the look-ahead)
+         options.superblocks_cond = options.superblocks && conf.superblocks_cond && options.nzcv_lookahead;
+         options.bitfield_shifts = conf.bitfield_shifts;
+-        A64::Translate(ir_block, arch_descriptor, get_code, options);
++        const int native = conf.native_functions && !arch_descriptor.SingleStepping()
++                               ? conf.callbacks->NativeFunction(arch_descriptor.PC())
++                               : 0;
++        if (native >= 1 && native <= 3) {
++            // (PS4 04.75) memcpy, memmove, memset: the host does it, then the return. The function's
++            // first 64 bytes stand for it (the code cache's check that it's the same code)
++            A64::IREmitter ir{ir_block, arch_descriptor};
++            ir.SetX(A64::Reg::R0, ir.CallNative(u8(native), ir.GetX(A64::Reg::R0), ir.GetX(A64::Reg::R1),
++                                                ir.GetX(A64::Reg::R2)));
++            ir.SetPC(ir.GetX(A64::Reg::R30));
++            ir.SetTerm(IR::Term::PopRSBHint{});
++            ir_block.CycleCount() = 8;
++            ir_block.SetEndLocation(arch_descriptor.AdvancePC(4));
++            ir_block.lookahead.emplace_back(arch_descriptor.PC(), arch_descriptor.PC() + 64);
++        } else {
++            A64::Translate(ir_block, arch_descriptor, get_code, options);
++        }
+         // (PS4 04.70) the launcher's search: this block's guest code and IR before and after
+         const u64 block_pc = arch_descriptor.PC();
+         const bool dump = block_pc >= conf.dump_pc_lo && block_pc < conf.dump_pc_hi;
+@@ -451,6 +467,7 @@ private:
+         add(conf.follow_direct_branches);
+         add(conf.follow_known_returns);
+         add(conf.follow_leaf_calls);
++        add(conf.native_functions);
+         add(conf.guarded_indirect_links);
+         add(conf.loop_register_pins);
+         add(conf.fastmem_range_check_reuse);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
+index 5aeb2210a9..522ea2d5fe 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
++++ b/src/dynarmic/src/dynarmic/frontend/A32/a32_ir_emitter.h
+@@ -51,6 +51,10 @@ public:
+     void ALUWritePC(const IR::U32& value);
+     void BranchWritePC(const IR::U32& value);
+     void BXWritePC(const IR::U32& value);
++    /// (PS4 04.75) UserCallbacks::NativeMemcpy (kind 1), NativeMemmove (2) or NativeMemset (3)
++    IR::U32 CallNative(u8 kind, const IR::U32& a, const IR::U32& b, const IR::U32& c) {
++        return Inst<IR::U32>(IR::Opcode::A32CallNative, IR::Value{kind}, a, b, c);
++    }
+     void LoadWritePC(const IR::U32& value);
+     void UpdateUpperLocationDescriptor();
+ 
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h b/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
+index 9606274bb1..346be5e139 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h
+@@ -289,6 +289,11 @@ public:
+         Inst(Opcode::A64SetFPSR, value);
+     }
+ 
++    /// (PS4 04.75) UserCallbacks::NativeMemcpy (kind 1), NativeMemmove (2) or NativeMemset (3)
++    IR::U64 CallNative(u8 kind, const IR::U64& a, const IR::U64& b, const IR::U64& c) noexcept {
++        return Inst<IR::U64>(Opcode::A64CallNative, IR::Value{kind}, a, b, c);
++    }
++
+     void SetPC(const IR::U64& value) noexcept {
+         Inst(Opcode::A64SetPC, value);
+     }
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 033cd34581..c7de9bbd82 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -60,7 +60,7 @@ struct TranslationOptions {
+     bool follow_known_returns = false;
+ 
+     /// (PS4 04.74) Without follow_direct_branches: a BL to a short leaf function (a RET within
+-    /// twelve instructions, none of them a branch, a system instruction or a write to X30) is
++    /// five instructions, none of them a branch, a system instruction or a write to X30) is
+     /// followed, and its RET back to the instruction after the BL (as follow_known_returns): the
+     /// callee in the caller's block, no block exit, entry or return stack push and pop for it
+     bool follow_leaf_calls = false;
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index 1934a14056..0d58c02b73 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -67,16 +67,20 @@ bool TranslatorVisitor::BL(Imm<26> imm26) {
+ 
+     const u64 target = ir.PC() + offset;
+     if (options.follow_direct_branches ? Follow(target)
+-                                       : options.follow_leaf_calls && IsShortLeaf(target) && Follow(target, true))
++                                       : options.follow_leaf_calls && IsShortLeaf(target) && Follow(target, true)) {
+         return true;
++    }
+     ir.SetTerm(IR::Term::LinkBlockFast{ir.current_location->SetPC(target)});
+     return false;
+ }
+ 
++// (PS4 04.75: a RET within five instructions: up to four of the callee's; unity64 lost ~1% with
++// six to twelve - longer leaves pushed blocks to their limits - and game64 gains 2.3% with five)
++constexpr u64 kLeafMax = 5;
+ bool TranslatorVisitor::IsShortLeaf(u64 target) const {
+     if (!read_code || (target & 3) != 0)
+         return false;
+-    for (u64 i = 0; i < 12; i++) {
++    for (u64 i = 0; i < kLeafMax; i++) {
+         const auto word = (*read_code)(target + 4 * i);
+         if (!word)
+             return false;
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 77936970ae..c1882499d4 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -72,6 +72,26 @@ struct UserCallbacks : public TranslateCallbacks {
+         return std::uint32_t(MemoryRead(vaddr, sizeof(std::uint32_t)));
+     }
+ 
++    // (PS4 04.75, UserConfig::native_functions) As the A64 JIT's: a function run as a call into these
++    // instead of translated: 1 memcpy, 2 memmove, 3 memset, 0 none (R0, R1, R2 in, R0 out, back to LR)
++    virtual int NativeFunction(VAddr) { return 0; }
++    virtual std::uint32_t NativeMemcpy(VAddr dest, VAddr src, std::uint32_t n) { return NativeMemmove(dest, src, n); }
++    virtual std::uint32_t NativeMemmove(VAddr dest, VAddr src, std::uint32_t n) {
++        if (dest <= src || dest >= src + n) {
++            for (std::uint32_t i = 0; i < n; i++)
++                MemoryWrite(VAddr(dest + i), MemoryRead(VAddr(src + i), 1), 1);
++        } else {
++            for (std::uint32_t i = n; i-- > 0;)
++                MemoryWrite(VAddr(dest + i), MemoryRead(VAddr(src + i), 1), 1);
++        }
++        return dest;
++    }
++    virtual std::uint32_t NativeMemset(VAddr dest, std::uint32_t c, std::uint32_t n) {
++        for (std::uint32_t i = 0; i < n; i++)
++            MemoryWrite(VAddr(dest + i), c & 0xff, 1);
++        return dest;
++    }
++
+     // A code word read from any thread, without side effects (no caches, no halts, no counters),
+     // or nothing: for the PS4 profiler's dump of the hottest blocks
+     virtual std::optional<std::uint32_t> PeekCode(VAddr) {
+@@ -272,6 +292,10 @@ struct UserConfig {
+     /// it was translated (PeekCode) and links straight to that one's block when they match.
+     bool guarded_indirect_links = false;
+ 
++    /// (PS4 04.75) As the A64 JIT's: a block at an address UserCallbacks::NativeFunction names is a
++    /// call into the matching Native* callback with R0-R2, its result to R0, then BX LR.
++    bool native_functions = false;
++
+     /// A block reads the ARM code its successors start with (a few instructions, along their
+     /// branches): when they set the condition flags before reading them, the flags the block ends
+     /// with are dead. It then doesn't store them, and a conditional branch at its end tests the
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index c435cbeed2..26ef052b69 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -95,6 +95,27 @@ struct UserCallbacks {
+         return std::uint32_t(MemoryRead(vaddr, sizeof(std::uint32_t)));
+     }
+ 
++    // (PS4 04.75, UserConfig::native_functions) A function the JIT runs as a call into these instead
++    // of translating it: 1 memcpy, 2 memmove, 3 memset, 0 none (the procedure call standard: X0,
++    // X1, X2 in, X0 out, the caller expects nothing else kept but the callee-saved registers).
++    virtual int NativeFunction(VAddr) { return 0; }
++    virtual std::uint64_t NativeMemcpy(VAddr dest, VAddr src, std::uint64_t n) { return NativeMemmove(dest, src, n); }
++    virtual std::uint64_t NativeMemmove(VAddr dest, VAddr src, std::uint64_t n) {
++        if (dest <= src || dest >= src + n) {
++            for (std::uint64_t i = 0; i < n; i++)
++                MemoryWrite(dest + i, MemoryRead(src + i, 1), 1);
++        } else {
++            for (std::uint64_t i = n; i-- > 0;)
++                MemoryWrite(dest + i, MemoryRead(src + i, 1), 1);
++        }
++        return dest;
++    }
++    virtual std::uint64_t NativeMemset(VAddr dest, std::uint64_t c, std::uint64_t n) {
++        for (std::uint64_t i = 0; i < n; i++)
++            MemoryWrite(dest + i, c & 0xff, 1);
++        return dest;
++    }
++
+     // A code word read from any thread, without side effects (no caches, no halts, no counters),
+     // or nothing: for the PS4 profiler's dump of the hottest blocks
+     virtual std::optional<std::uint32_t> PeekCode(VAddr) {
+@@ -417,6 +438,9 @@ struct UserConfig {
+     bool follow_known_returns = false;
+     /// (PS4 04.74) see TranslationOptions::follow_leaf_calls
+     bool follow_leaf_calls = false;
++    /// (PS4 04.75) A block at an address UserCallbacks::NativeFunction names is a call into the
++    /// matching Native* callback with X0-X2, its result to X0, then a return to X30.
++    bool native_functions = false;
+     /// (PS4 04.73) A block that ends in an indirect branch (BR, BLR) to a value it loaded from a
+     /// constant address (a PLT stub's LDR X17, [X16, #imm]; BR X17, a call through the GOT):
+     /// the value that address holds when the block is translated (PeekCode) is checked against
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.h b/src/dynarmic/src/dynarmic/ir/opcodes.h
+index c8355336bb..bdc7f578e0 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.h
+@@ -644,6 +644,8 @@ constexpr bool MayHaveSideEffects(const Opcode op) noexcept {
+         || op == Opcode::ConditionalSelectHost32
+         || op == Opcode::ConditionalSelectHost64
+         || op == Opcode::CallHostFunction
++        || op == Opcode::A64CallNative  // (PS4 04.75: memcpy, memmove, memset run on the host)
++        || op == Opcode::A32CallNative
+         || op == Opcode::A64DataCacheOperationRaised
+         || op == Opcode::A64InstructionCacheOperationRaised
+         || IsSetCheckBitOperation(op)
+diff --git a/src/dynarmic/src/dynarmic/ir/opcodes.inc b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+index c4706671cc..13d09d9389 100644
+--- a/src/dynarmic/src/dynarmic/ir/opcodes.inc
++++ b/src/dynarmic/src/dynarmic/ir/opcodes.inc
+@@ -709,6 +709,7 @@ A64OPC(SetFPSR,                                             Void,           U32
+ A64OPC(SetPC,                                               Void,           U64                                                             )
+ A64OPC(CallSupervisor,                                      Void,           U32                                                             )
+ A64OPC(ExceptionRaised,                                     Void,           U64,            U64                                             )
++A64OPC(CallNative,                                          U64,            U8,             U64,            U64,            U64             )
+ A64OPC(DataCacheOperationRaised,                            Void,           U64,            U64,            U64                             )
+ A64OPC(InstructionCacheOperationRaised,                     Void,           U64,            U64                                             )
+ A64OPC(DataSynchronizationBarrier,                          Void,                                                                           )
+@@ -786,6 +787,7 @@ A32OPC(BXWritePC,                                           Void,           U32
+ A32OPC(UpdateUpperLocationDescriptor,                       Void,                                                                           )
+ A32OPC(CallSupervisor,                                      Void,           U32                                                             )
+ A32OPC(ExceptionRaised,                                     Void,           U32,            U64                                             )
++A32OPC(CallNative,                                          U32,            U8,             U32,            U32,            U32             )
+ A32OPC(DataSynchronizationBarrier,                          Void,                                                                           )
+ A32OPC(DataMemoryBarrier,                                   Void,                                                                           )
+ A32OPC(InstructionSynchronizationBarrier,                   Void,                                                                           )
+-- 
+2.43.0
+

@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.75: **memcpy, memmove and memset run natively** instead of translated (64-bit and 32-bit, patch
+0165): found by name in the games' modules, done on the PS4's own CPU, with memory the GPU caches
+going through Eden's usual notifications. Calls into leaf functions of up to four instructions are
+translated into their caller (the limit where it only gains).
+
 04.74: **32-bit games' calls into the SDK linked straight** to their targets too (patch 0164, 04.73's
 guarded links for the 32-bit translator), checked by the 32-bit differential test, which now has the
 PS4's page table. Following calls into short leaf functions was measured and left off (STATUS.md).

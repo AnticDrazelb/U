@@ -61,6 +61,7 @@ u64 Rand(u64 lo, u64 hi) {
 constexpr u64 kWindow = 0x1180000000, kWindowSize = 2 << 20, kArenaBits = 37;
 constexpr u64 kPage = 4096;
 std::vector<std::pair<u64, u64>> g_preset;  // 8-byte words in the window each run starts with
+struct { u64 addr = 0; int kind = 0; } g_native;  // (DIFFTEST_NATIVE) the function run natively
 
 class Env final : public A64TestEnv {
 public:
@@ -159,6 +160,12 @@ public:
             return svc_outside ? 0xD4000001u : 0x14000000u;
         return code_mem[(vaddr - code_mem_start_address) / 4];
     }
+    // (DIFFTEST_NATIVE: the generated memcpy/memmove/memset, run by UserCallbacks' Native*)
+    int NativeFunction(u64 vaddr) override { return vaddr == g_native.addr ? g_native.kind : 0; }
+    static inline u64 native_calls = 0;
+    u64 NativeMemcpy(u64 d, u64 s, u64 n) override { native_calls++; return A64TestEnv::NativeMemcpy(d, s, n); }
+    u64 NativeMemmove(u64 d, u64 s, u64 n) override { native_calls++; return A64TestEnv::NativeMemmove(d, s, n); }
+    u64 NativeMemset(u64 d, u64 c, u64 n) override { native_calls++; return A64TestEnv::NativeMemset(d, c, n); }
     // (as the PS4's: memory as it is now, no side effects; the guarded links' guess)
     std::optional<std::uint32_t> PeekCode(u64 vaddr) override {
         u32 word = 0;
@@ -311,6 +318,7 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
     c.guarded_indirect_links = std::getenv("DIFFTEST_NO_GUARD") == nullptr;
     // (04.74) BLs to short leaf functions followed, and their RETs back (DIFFTEST_NO_LEAF=1: not)
     c.follow_leaf_calls = std::getenv("DIFFTEST_NO_LEAF") == nullptr;
+    c.native_functions = std::getenv("DIFFTEST_NO_NATIVE") == nullptr;
     // (DIFFTEST_FOLLOW=1) BL and forward B translated through, and known returns followed
     c.follow_direct_branches = c.follow_known_returns = std::getenv("DIFFTEST_FOLLOW") != nullptr;
     // (04.73) the 64-bit translator's PS4 extras (04.22-04.30), as Eden sets them (on under Auto
@@ -367,6 +375,7 @@ void MakeBare(A64::UserConfig& c) {
     c.fastmem_range_check_reuse = false;
     c.guarded_indirect_links = false;
     c.follow_leaf_calls = false;
+    c.native_functions = false;
     c.link_forward_without_halt_check = c.inline_rsb_pop = c.inline_fast_dispatch = false;
 }
 
@@ -1106,6 +1115,52 @@ int main(int argc, char** argv) {
             // inline (the same with blr x17); the first callee may point the slot at a second one
             // before its random code and RET (the guarded link's check failing); a garbage slot now
             // and then
+            // (DIFFTEST_NATIVE=1, all of the blocks) some random code, X0-X2 set (MOVZ/MOVK), BL to a
+            // real memcpy, memmove or memset (byte loops; the memmove copies backwards when the
+            // destination is above), then what the call standard lets a callee change cleared (X1-X4,
+            // the flags) and SVC: run natively (on, off) against the real code (bare)
+            g_native = {};
+            if (std::getenv("DIFFTEST_NATIVE")) {
+                const int kind = int(Rand(1, 3));
+                const u64 n = Rand(0, 3) == 0 ? Rand(0, 16) : Rand(0, 700);
+                u64 dest = kWindow + Rand(0, kWindowSize - 1024), src;
+                if (kind == 3) {
+                    src = rng();  // (the byte, in X1's low 8 bits)
+                } else if (kind == 2 && Rand(0, 1)) {
+                    src = dest + Rand(0, 64) - 32;  // (overlapping)
+                } else {
+                    do src = kWindow + Rand(0, kWindowSize - 1024); while (src < dest + n && dest < src + n);
+                }
+                const auto mov64 = [](std::vector<u32>& out, u32 rd, u64 v) {
+                    out.push_back(0xD2800000u | (u32(v & 0xffff) << 5) | rd);
+                    for (u32 hw = 1; hw < 4; hw++)
+                        out.push_back(0xF2800000u | (hw << 21) | (u32((v >> (16 * hw)) & 0xffff) << 5) | rd);
+                };
+                std::vector<u32> m(code.begin(), code.begin() + std::min<size_t>(code.size(), 6));
+                for (u32& inst : m)  // (the random forward branches: nops, none may skip the arguments)
+                    if ((inst & 0x7E000000) == 0x34000000 || (inst & 0x7E000000) == 0x36000000 ||
+                        (inst & 0xFF000010) == 0x54000000 || (inst & 0x7C000000) == 0x14000000)
+                        inst = 0xD503201Fu;
+                mov64(m, 0, dest);
+                mov64(m, 1, src);
+                mov64(m, 2, n);
+                const size_t bl_at = m.size();
+                m.push_back(0u);
+                for (const u32 inst : {0xD2800001u, 0xD2800002u, 0xD2800003u, 0xD2800004u, 0xEB00001Fu, 0xD4000001u})
+                    m.push_back(inst);  // movz x1..x4, #0; cmp x0, x0; svc #0
+                const size_t fn = m.size();
+                static const std::vector<u32> fns[4] = {
+                    {},
+                    {0xAA0003E3, 0xB40000A2, 0x38401424, 0x38001464, 0xD1000442, 0x17FFFFFC, 0xD65F03C0},  // memcpy
+                    {0xAA0003E3, 0xEB01001F, 0x540000C8, 0xB4000182, 0x38401424, 0x38001464, 0xD1000442, 0x17FFFFFC,
+                     0x8B020021, 0x8B020063, 0xB40000A2, 0x385FFC24, 0x381FFC64, 0xD1000442, 0x17FFFFFC, 0xD65F03C0},
+                    {0xAA0003E3, 0xB4000082, 0x38001461, 0xD1000442, 0x17FFFFFD, 0xD65F03C0},  // memset
+                };
+                m.insert(m.end(), fns[kind].begin(), fns[kind].end());
+                m[bl_at] = 0x94000000u | (u32(fn - bl_at) & 0x3ffffff);
+                code = m;
+                g_native = {s.start + 4 * fn, kind};
+            }
             g_preset.clear();
             if (std::getenv("DIFFTEST_PLT") && !called && Rand(0, 1) == 0) {
                 const u64 page = kWindow + (Rand(0, 1) ? 1 : 3) * kPage;  // (in the arena or not)
@@ -1320,8 +1375,8 @@ int main(int argc, char** argv) {
     }
     std::printf("window accesses through the callbacks (passes on): first runs %llu, second runs %llu\n",
                 (unsigned long long)on.first_run_callbacks, (unsigned long long)on.second_run_callbacks);
-    std::printf("\n%llu iterations: the passes wrong %llu, without them wrong %llu, unclear %llu; %zu kinds\n",
+    std::printf("\n%llu iterations: the passes wrong %llu, without them wrong %llu, unclear %llu; %zu kinds; native calls %llu\n",
                 (unsigned long long)iterations, (unsigned long long)on_wrong, (unsigned long long)off_wrong,
-                (unsigned long long)other, kinds.size());
+                (unsigned long long)other, kinds.size(), (unsigned long long)Env::native_calls);
     return 0;
 }

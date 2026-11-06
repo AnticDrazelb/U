@@ -89,9 +89,30 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.75:** memcpy, memmove and memset run on the host; short leaf calls followed (below).
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.75: memcpy, memmove and memset on the host; leaf calls followed
+
+- **memcpy, memmove and memset run natively** (patch 0165, 64-bit and 32-bit): in Little Kitty's
+  profile the SDK's memcpy/memset were 27% of the hottest blocks' samples (6-8% of all translated
+  time), and walked the page table at every site a write to GPU-cached memory had recompiled. Now
+  the JIT turns a block at their address (from the modules' dynamic symbol tables: defined
+  functions; 32-bit also `__aeabi_memcpy`/`__aeabi_memmove` and their 4- and 8-byte forms) into a
+  host call with X0-X2 (R0-R2) and a return to X30 (LR). Plain memory (a page table entry with a
+  host pointer: `Memory::GetPlainPointer`) is copied or filled directly a page at a time; memory the
+  GPU caches, and unmapped memory, go through `ReadBlock`/`WriteBlock`/`CopyBlock`, as the guest's
+  own loads and stores would, with their notifications; overlap has memmove's result. Not with a
+  debugger (its watchpoints). Checked (`DIFFTEST_NATIVE=1`): each program calls a real memcpy,
+  memmove or memset (byte loops, the memmove backwards when needed, overlaps), run natively against
+  the real code: 64-bit 26,000 (with and without cycle counting), 32-bit 4,000, none wrong.
+- **Leaf calls followed** (`follow_leaf_calls`, now on): 04.74 measured unity64 losing ~1% with a
+  twelve-instruction limit; by limit, unity64 is unchanged up to five (a RET within five
+  instructions) and loses from six, while game64 gains 2.3% from five: five it is (game64
+  1,814,345 to 1,772,052, unity64 1,354,258 to 1,354,396). 24,000 random blocks with calls, with and
+  without cycle counting: none wrong.
 
 ## 04.74: the 32-bit guarded links; leaf calls measured
 

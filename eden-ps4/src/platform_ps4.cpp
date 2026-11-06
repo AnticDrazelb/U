@@ -1718,6 +1718,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.75: copying and clearing memory (memcpy, memmove, memset) runs natively on the PS4 instead of "
+         "being translated, in every game; tiny functions are translated into their callers.\n"
          "04.74: 32-bit games' calls into the system libraries jump straight to their target too, as "
          "64-bit games' do since 04.73.\n"
          "04.73: faster CPU emulation in every game. The translated game code does about a quarter less work: "
