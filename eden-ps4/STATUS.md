@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.63)
+# New Eden (formerly Eden for PS4): status (after 04.83)
 
-Install **04.63** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0149). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.83** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0174). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -89,7 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
-- **Next (04.83, in progress, paused 2026-11-06):** the GPU thread's front end and back end on two cores, behind a switch: [docs/gpu-thread-split.md](docs/gpu-thread-split.md). The code so far is in [wip/](wip/README.md), outside the build, with where it stands and the steps to finish it (a hang and a crash at exit in split mode still to fix).
+- **04.83:** Graphics > GPU Threads: Two, the GPU thread's work on two cores (experimental, One by default); a fence wait that didn't wait fixed (below).
 - **04.82:** every game's profile kept; the GPU thread's busy time and the renderer's share measured (below).
 - **04.81:** tiny functions behind PLT stubs inlined (Bluey); GC loops one block; the exit freeze (below).
 - **04.80:** thread-local storage on fastmem; native copies found in every game; native memcmp (below).
@@ -101,6 +101,41 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.83: GPU Threads (Two: the GPU thread split), a fence wait that didn't wait
+
+- **Graphics > GPU Threads** (One / Two, `gpu_threads=` in the settings, `EDEN_PS4_GPU_SPLIT`).
+  Two splits the GPU thread's work over two cores (patch 0173, design and findings in
+  [docs/gpu-thread-split.md](docs/gpu-thread-split.md)).
+  - **Front end** (the GPU thread, core 3): the command lists, the 3D engine's methods and macros.
+  - **Back end** ("GPUBackend", cores 4-6): the renderer and everything else, in order.
+  - Off (One, the default), the GPU thread runs as before.
+  - For games held back by Eden's GPU thread: Breath of the Wild outdoors (86% busy in 04.81).
+    Its expected ceiling is about 1.4x there. No gain for games held back by their main thread.
+- **Fence waits** (patch 0174, Eden's nvhost-ctrl, older than the split).
+  - A wait made while its event's last host action was still finishing (signalled, not yet marked
+    so) was refused. libnx's `nvFenceWait` returns that error without waiting, so the program
+    went on as if the GPU had got there.
+  - In the desktop test it was gputest's crash at exit with the split on (it freed its
+    framebuffer while the GPU still drew into it).
+  - Now such a wait waits the action out.
+- **The front end checks for GPU-written macro parameters without the buffer cache's lock** (a
+  lock-free bitmap of GPU-written 64 KiB granules). The back end holds that lock through each
+  draw, so taking it would have stalled the front end on nearly every draw.
+- **The back end gets a private heap arena on the PS4**, like the GPU thread.
+- **Desktop software renderer:** its draw state is locked against the emulated CPU's threads.
+- **Mesa:** this package is the first from this build machine with the RADV patches up to
+  serialize-wait (04.43-04.62's, listed in `patches/BASE.txt`).
+- **Tests:** `test.sh` 0 failed with the split on (4 runs) and off. gputest: 45 runs on one core
+  and 20 on two loaded cores with the split on, none failed.
+- **The 04.83 WIP's hang** (gputest at 0.1 fps in a full suite run) never came back here, even on
+  a build without the fixes, so its cause isn't confirmed (likeliest: the same refused fence
+  wait). Watch for a game crawling from its start with Two and fine with One.
+- **To test on the console:**
+  - Breath of the Wild outdoors with GPU Threads: Two, then One (Profiler on, played last).
+  - Then Animal Crossing, Mario Kart 8 and Captain Toad.
+  - Compare the fps against 04.82, and read the 30 s line's "the GPU back end busy N%" and the GPU
+    thread's busy %.
 
 ## 04.82: every game's profile, and the GPU thread's split measured
 

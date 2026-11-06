@@ -637,12 +637,14 @@ void ps4_heap_usage(size_t* in_use, size_t* size) {
 // 1.51 only DolphinPS4's were listed, so every Cemu thread shared the one locked heap and the
 // recompiler (allocation heavy) took seconds per function.
 void ps4_heap_private_arena(const char* name) {
-    // (and Eden for PS4's: its emulated CPU cores, in multi-core and single-core mode, and its GPU
-    // thread)
+    // (and Eden for PS4's: its emulated CPU cores, in multi-core and single-core mode, its GPU
+    // thread, and with GPU Threads: Two (New Eden 04.83) the GPU thread's back end, which runs the
+    // renderer - the allocations of the busiest thread there are)
     static const char* const busy[] = {"PPCRecompiler", "OSSched[core=0]", "OSSched[core=1]", "OSSched[core=2]",
                                        "LatteThread", "compilePl", "vkShaderComp", "plCacheCompiler",
                                        "vkDriverPlCache", "fileCache", "PS4AudioOut", "H264Decoder",
-                                       "CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3", "CPUThread", "GPU"};
+                                       "CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3", "CPUThread", "GPU",
+                                       "GPUBackend"};
     if (name) {
         strncpy(t_threadName, name, sizeof(t_threadName) - 1);
         t_threadName[sizeof(t_threadName) - 1] = 0;

@@ -1,0 +1,297 @@
+From 107187a5f470484a85db21e42e8c0a7803af7354 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 20:02:02 +0000
+Subject: [PATCH 174/174] nvhost-ctrl: a wait during the last one's signal
+ waits it out; the null renderer locked
+
+A syncpoint's host action signals its event and only then marks it
+Signalled. The guest thread it woke could make its next fence wait on
+the same event in between: libnx takes the lowest free slot each time.
+That wait was refused as BadParameter, and libnx's nvFenceWait returns
+the error without waiting. The program went on as if the GPU had got
+there.
+
+gputest closed its channel and freed its framebuffer while the GPU
+still had two frames of clears for it: a SIGSEGV at exit, about 1 run
+in 8 on one core with the GPU thread split, whose back end signals.
+Traced: the wait for the last fence was never armed. The Signalling
+state lasts moments, so EventWait and FreeEvent wait it out. 45 runs
+on one core after the fix, none crashed.
+
+The null renderer's software draws (queued draws, their textures'
+cache) are now behind a recursive mutex. The emulated CPU's threads
+reach them too: device memory unmapped or written (InvalidateRegion),
+read (FlushRegion). The Vulkan rasterizer locks its caches for the same
+reason. Callbacks (fences, syncpoints) run outside the lock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ .../hle/service/nvdrv/devices/nvhost_ctrl.cpp |  5 +++
+ .../hle/service/nvdrv/devices/nvhost_ctrl.h   | 14 +++++++
+ .../renderer_null/null_rasterizer.cpp         | 40 +++++++++++++++++--
+ .../renderer_null/null_rasterizer.h           |  8 ++++
+ 4 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp b/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+index 6ef32b890..a7036c6fa 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+@@ -176,6 +176,9 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
+         return NvResult::BadParameter;
+     }
+ 
++    // (PS4 04.83) the last wait's host action may still be finishing (below)
++    WaitOutSignalling(event);
++
+     if (event.IsBeingUsed()) {
+         return NvResult::BadParameter;
+     }
+@@ -221,6 +224,8 @@ NvResult nvhost_ctrl::FreeEvent(u32 slot) {
+         return NvResult::Success;
+     }
+ 
++    WaitOutSignalling(event);
++
+     if (event.IsBeingUsed()) {
+         return NvResult::Busy;
+     }
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_ctrl.h b/src/core/hle/service/nvdrv/devices/nvhost_ctrl.h
+index 403f1a746..9adb0e741 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_ctrl.h
++++ b/src/core/hle/service/nvdrv/devices/nvhost_ctrl.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <thread>
+ #include <vector>
+ #include "common/bit_field.h"
+ #include "common/common_types.h"
+@@ -87,6 +88,19 @@ private:
+         }
+     };
+ 
++    /// (PS4 04.83) A host action signals its event and only then marks it Signalled: the guest
++    /// thread it woke can make its next wait on the event in between (libnx takes the same event
++    /// slot each time), and that wait was refused as BadParameter, which libnx's nvFenceWait
++    /// returns as an error without waiting - the program went on as if the GPU had got there
++    /// (gputest freed its framebuffer while the GPU still drew into it: a crash at exit, mostly on
++    /// one core, and with the GPU thread split, whose back end signals). Signalling lasts moments,
++    /// so it is waited out.
++    static void WaitOutSignalling(const InternalEvent& event) {
++        while (event.status.load(std::memory_order_acquire) == EventState::Signalling) {
++            std::this_thread::yield();
++        }
++    }
++
+     std::unique_lock<std::mutex> NvEventsLock();
+ 
+     void CreateNvEvent(u32 event_id);
+diff --git a/src/video_core/renderer_null/null_rasterizer.cpp b/src/video_core/renderer_null/null_rasterizer.cpp
+index 1a7c4d18a..4924d9ffe 100644
+--- a/src/video_core/renderer_null/null_rasterizer.cpp
++++ b/src/video_core/renderer_null/null_rasterizer.cpp
+@@ -33,6 +33,7 @@ RasterizerNull::RasterizerNull(Tegra::GPU& gpu) : m_gpu{gpu} {}
+ RasterizerNull::~RasterizerNull() = default;
+ 
+ void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {
++    std::scoped_lock lock{m_mutex};
+     if (maxwell3d && gpu_memory) {
+         // the writes the memory manager has gathered (constant buffer updates among them) reported,
+         // as the Vulkan rasterizer reports them before a draw: they'd gather without end otherwise
+@@ -43,6 +44,7 @@ void RasterizerNull::Draw(bool is_indexed, u32 instance_count) {
+ // Indirect draws: each draw's parameters read from the indirect buffer (and their count from the
+ // count buffer), then drawn as a direct draw with them
+ void RasterizerNull::DrawIndirect() {
++    std::scoped_lock lock{m_mutex};
+     if (!maxwell3d || !gpu_memory) {
+         return;
+     }
+@@ -86,6 +88,7 @@ void RasterizerNull::DrawIndirect() {
+ }
+ 
+ void RasterizerNull::DrawTexture() {
++    std::scoped_lock lock{m_mutex};
+     if (maxwell3d && gpu_memory) {
+         gpu_memory->FlushCaching();
+         m_software.DrawTexture(*maxwell3d, *gpu_memory);
+@@ -184,6 +187,7 @@ void FillRect(Tegra::MemoryManager& gpu_memory, Common::ScratchBuffer<u8>& scrat
+ // and the software draws) shows in the null renderer's frames. Colour (render target), depth and
+ // stencil (the depth buffer).
+ void RasterizerNull::Clear(u32 layer_count) {
++    std::scoped_lock lock{m_mutex};
+     if (!maxwell3d || !gpu_memory) {
+         return;
+     }
+@@ -297,6 +301,7 @@ void RasterizerNull::Clear(u32 layer_count) {
+     FillRect(*gpu_memory, m_scratch, fill, x0, y0, x1, y1, surface.layer, layers);
+ }
+ void RasterizerNull::DispatchCompute() {
++    std::scoped_lock lock{m_mutex};
+     if (kepler_compute && gpu_memory) {
+         gpu_memory->FlushCaching();
+         m_software.Dispatch(*kepler_compute, *gpu_memory);
+@@ -305,6 +310,7 @@ void RasterizerNull::DispatchCompute() {
+ void RasterizerNull::ResetCounter(VideoCommon::QueryType type) {}
+ void RasterizerNull::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                            VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush(); // a semaphore: the program may read what's been drawn once it sees it
+     if (!gpu_memory) {
+         return;
+@@ -321,9 +327,11 @@ void RasterizerNull::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
+                                                u32 size) {}
+ void RasterizerNull::DisableGraphicsUniformBuffer(size_t stage, u32 index) {}
+ void RasterizerNull::FlushAll() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
++    std::scoped_lock lock{m_mutex};
+     m_software.FlushRegion(addr, size);
+ }
+ bool RasterizerNull::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+@@ -332,6 +340,7 @@ bool RasterizerNull::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheTyp
+ // A write the memory manager reports (by device address): the software draws' textures there are
+ // checked again before they're next sampled.
+ void RasterizerNull::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
++    std::scoped_lock lock{m_mutex};
+     m_software.MarkDeviceWritten(addr, size);
+ }
+ bool RasterizerNull::OnCPUWrite(PAddr addr, u64 size) {
+@@ -350,44 +359,62 @@ void RasterizerNull::InvalidateGPUCache() {}
+ void RasterizerNull::UnmapMemory(DAddr addr, u64 size) {}
+ void RasterizerNull::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {}
+ void RasterizerNull::SignalFence(std::function<void()>&& func) {
+-    m_software.Flush(); // the queued draws done before the fence is
+-    func();
++    {
++        std::scoped_lock lock{m_mutex};
++        m_software.Flush(); // the queued draws done before the fence is
++    }
++    func(); // (outside the lock: it may wake threads that come back here)
+ }
+ void RasterizerNull::SyncOperation(std::function<void()>&& func) {
+-    m_software.Flush();
++    {
++        std::scoped_lock lock{m_mutex};
++        m_software.Flush();
++    }
+     func();
+ }
+ void RasterizerNull::SignalSyncPoint(u32 value) {
+-    m_software.Flush();
++    {
++        std::scoped_lock lock{m_mutex};
++        m_software.Flush();
++    }
+     auto& syncpoint_manager = m_gpu.Host1x().GetSyncpointManager();
+     syncpoint_manager.IncrementGuest(value);
+     syncpoint_manager.IncrementHost(value);
+ }
+ void RasterizerNull::SignalReference() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::ReleaseFences(bool) {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::FlushAndInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::WaitForIdle() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::FragmentBarrier() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::TiledCacheBarrier() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::FlushCommands() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+ }
+ void RasterizerNull::TickFrame() {
++    std::scoped_lock lock{m_mutex};
+     m_software.TickFrame();
+ }
+ Tegra::Engines::AccelerateDMAInterface& RasterizerNull::AccessAccelerateDMA() {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+     m_software.MarkAllWritten(); // the DMA engine is about to copy (texture uploads among them)
+     return m_accelerate_dma;
+@@ -395,6 +422,7 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerNull::AccessAccelerateDMA() {
+ bool RasterizerNull::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
+                                            const Tegra::Engines::Fermi2D::Surface& dst,
+                                            const Tegra::Engines::Fermi2D::Config& copy_config) {
++    std::scoped_lock lock{m_mutex};
+     m_software.Flush();
+     m_software.MarkAllWritten();
+     return false; // the 2D engine's software blitter copies it
+@@ -402,6 +430,7 @@ bool RasterizerNull::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surfac
+ // Inline uploads (the upload engine's linear ones come here) written to emulated memory
+ void RasterizerNull::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
+                                               std::span<const u8> memory) {
++    std::scoped_lock lock{m_mutex};
+     if (!gpu_memory) {
+         return;
+     }
+@@ -412,12 +441,15 @@ void RasterizerNull::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size
+ void RasterizerNull::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                        const VideoCore::DiskResourceLoadCallback& callback) {}
+ void RasterizerNull::InitializeChannel(Tegra::Control::ChannelState& channel) {
++    std::scoped_lock lock{m_mutex};
+     CreateChannel(channel);
+ }
+ void RasterizerNull::BindChannel(Tegra::Control::ChannelState& channel) {
++    std::scoped_lock lock{m_mutex};
+     BindToChannel(channel.bind_id);
+ }
+ void RasterizerNull::ReleaseChannel(s32 channel_id) {
++    std::scoped_lock lock{m_mutex};
+     EraseChannel(channel_id);
+ }
+ 
+diff --git a/src/video_core/renderer_null/null_rasterizer.h b/src/video_core/renderer_null/null_rasterizer.h
+index de781d11b..375f5a5cf 100644
+--- a/src/video_core/renderer_null/null_rasterizer.h
++++ b/src/video_core/renderer_null/null_rasterizer.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <mutex>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -78,6 +79,7 @@ public:
+     void TickFrame() override;
+     /// The software draws still queued, rasterized (before a frame is shown)
+     void FlushSoftwareDraws() {
++        std::scoped_lock lock{m_mutex};
+         m_software.Flush();
+     }
+     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
+@@ -93,6 +95,12 @@ public:
+     void ReleaseChannel(s32 channel_id) override;
+ 
+ private:
++    /// (PS4 04.83) The software draws' state (queued draws, their textures' cache) is reached from
++    /// more than one thread: the GPU thread (or with the GPU thread split, its back end) and the
++    /// emulated CPU's threads (device memory unmapped or written: InvalidateRegion, read: FlushRegion),
++    /// as the Vulkan rasterizer's caches are, which lock theirs. Recursive: a draw's memory reads can
++    /// come back through the memory manager. Callbacks (fences, syncpoints) run outside it.
++    std::recursive_mutex m_mutex;
+     Tegra::GPU& m_gpu;
+     AccelerateDMA m_accelerate_dma;
+     Common::ScratchBuffer<u8> m_scratch;
+-- 
+2.43.0
+

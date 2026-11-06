@@ -379,6 +379,17 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.83: **Graphics > GPU Threads: Two (experimental); a fence wait that didn't wait fixed.**
+- Two splits the GPU thread's work over two cores (patch 0173): the GPU thread reads the game's
+  command lists and runs the 3D engine's methods and macros, and a back end thread on cores 4-6
+  runs the renderer. It is for games held back by Eden's GPU thread (Breath of the Wild
+  outdoors). One, the default, is as before.
+- A fence wait made while the last one's signal was still finishing was refused, and libnx then
+  didn't wait at all (patch 0174). It was the split's crash at exit in the desktop test.
+- The front end checks for GPU-written macro parameters without the buffer cache's lock, which the
+  back end holds through each draw.
+- [docs/gpu-thread-split.md](docs/gpu-thread-split.md) has the design and what testing found.
+
 04.82: **every game's profile kept; the GPU thread's split measured.** `samples.log` and `hotblocks.log`
 are kept per game like the other logs, and the GPU thread's 30 s line says how its busy time divides
 between the renderer and command processing (patch 0172), for the GPU thread split

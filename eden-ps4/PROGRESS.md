@@ -5,6 +5,21 @@ Where the work stands, what was done, what was tried and ruled out, and what's n
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
 are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see "How to work").
 
+## Update at 04.83 (2026-11-06)
+
+- **The GPU thread split is built** (Graphics > GPU Threads: Two; One by default).
+  - Patch 0173. Design and test findings: [docs/gpu-thread-split.md](docs/gpu-thread-split.md).
+  - Its two open bugs from the 04.83 WIP: the crash at exit was Eden's nvhost-ctrl refusing a
+    fence wait made while the last wait's signal was still finishing (patch 0174). libnx then
+    didn't wait at all.
+  - The hang never came back here, even without the fixes; its cause is unconfirmed.
+- **The front end no longer stalls on the buffer cache's lock per macro call.** A lock-free bitmap
+  of GPU-written granules answers whether a macro's parameters are GPU-written.
+- **Next: the console test.** Breath of the Wild outdoors with Two against One: fps, and the 30 s
+  line's back end busy % against the GPU thread's busy %. If the back end is now the limit, trim it
+  (uniform copies, descriptors). If the front end is, look at SyncState's per-draw register
+  compare (14 KiB) and the tasks' allocations.
+
 ## Update at 04.81 (2026-11-06)
 
 What the console logs say after 04.73-04.81's CPU work (late in each session, 50% resolution,

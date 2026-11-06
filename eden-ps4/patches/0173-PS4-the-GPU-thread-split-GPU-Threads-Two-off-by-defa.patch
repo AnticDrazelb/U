@@ -1,5 +1,63 @@
+From 7a466ada0ae65c93ac78f4c460a33a9bfb670e0a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 20:02:02 +0000
+Subject: [PATCH 173/174] PS4: the GPU thread split (GPU Threads: Two), off by
+ default
+
+EDEN_PS4_GPU_SPLIT=1 splits the GPU thread's work over two threads
+(video_core/gpu_split.h, eden-ps4 docs/gpu-thread-split.md):
+
+- The GPU thread is the front end. It runs DmaPusher, the puller's
+  BindObject, and the 3D engine's methods and macros.
+- A back end thread ("GPUBackend") runs everything else, in order:
+  - every rasterizer call, through RasterizerProxy;
+  - the other engines' methods and the puller's other methods;
+  - the 3D engine's own memory writes;
+  - TickWork, the GPU thread's flushes and invalidations, and its fences.
+- The rasterizer and its caches read a shadow of each channel's 3D
+  engine. Before each queued operation that reads it, the front end
+  sends the shadow the registers that changed, the dirty flags and
+  the draw state.
+- A call that returns a value waits for the back end to empty its
+  queue.
+- Off, none of this exists.
+
+The front end asks GpuWrittenGranules whether a macro's parameters may
+be GPU-written (MemoryManager::IsMemoryDirty -> MustFlushRegion). This
+is a lock-free bitmap of 64 KiB device granules the buffer cache has
+ever recorded as GPU-written, never cleared. Asking the buffer cache
+instead took the lock the back end holds through each draw: one stall
+of the front end per macro call. Its answer was also behind: a write
+still queued isn't recorded yet. Kept for good, a buffer written every
+frame stays marked while this frame's writer is still queued.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/video_core/CMakeLists.txt                 |   2 +
+ src/video_core/buffer_cache/buffer_cache.h    |   3 +
+ src/video_core/control/channel_state.cpp      |  18 +
+ src/video_core/control/channel_state.h        |  11 +
+ .../control/channel_state_cache.cpp           |   3 +-
+ src/video_core/dma_pusher.cpp                 |  79 ++-
+ src/video_core/dma_pusher.h                   |   3 +
+ src/video_core/engines/engine_upload.cpp      |  13 +
+ src/video_core/engines/engine_upload.h        |   3 +
+ src/video_core/engines/maxwell_3d.cpp         |  28 +-
+ src/video_core/engines/maxwell_3d.h           |   4 +
+ src/video_core/gpu.cpp                        |  48 +-
+ src/video_core/gpu_split.cpp                  | 496 ++++++++++++++++++
+ src/video_core/gpu_split.h                    | 258 +++++++++
+ src/video_core/gpu_thread.cpp                 |  40 +-
+ .../renderer_opengl/gl_state_tracker.cpp      |   4 +-
+ .../renderer_vulkan/vk_rasterizer.cpp         |  16 +-
+ .../renderer_vulkan/vk_state_tracker.cpp      |   4 +-
+ 18 files changed, 1012 insertions(+), 21 deletions(-)
+ create mode 100644 src/video_core/gpu_split.cpp
+ create mode 100644 src/video_core/gpu_split.h
+
 diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
-index 6883a11c69..8e5f84598b 100644
+index 6883a11c6..8e5f84598 100644
 --- a/src/video_core/CMakeLists.txt
 +++ b/src/video_core/CMakeLists.txt
 @@ -93,6 +93,8 @@ add_library(video_core STATIC
@@ -11,8 +69,36 @@ index 6883a11c69..8e5f84598b 100644
      gpu_thread.cpp
      gpu_thread.h
      guest_memory.h
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 1a04ad626..b7f3a9ad2 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -12,6 +12,7 @@
+ 
+ #include "common/range_sets.inc"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/texture_cache/util.h"
+@@ -254,6 +255,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+     const bool has_new_downloads = tmp_intervals.size() != 0;
+     for (const auto& pair : tmp_intervals) {
+         gpu_modified_ranges.Add(pair.first, pair.second);
++        VideoCommon::MarkGpuWritten(pair.first, pair.second); // (04.83, the GPU thread split)
+     }
+     const auto& copy = copies[0];
+     src_buffer.MarkUsage(copy.src_offset, copy.size);
+@@ -1589,6 +1591,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+     gpu_modified_ranges.Add(device_addr, size);
+     uncommitted_gpu_modified_ranges.Add(device_addr, size);
++    VideoCommon::MarkGpuWritten(device_addr, size); // (04.83, the GPU thread split)
+ }
+ 
+ template <class P>
 diff --git a/src/video_core/control/channel_state.cpp b/src/video_core/control/channel_state.cpp
-index 12a452dfc0..c033b27eee 100644
+index 12a452dfc..c033b27ee 100644
 --- a/src/video_core/control/channel_state.cpp
 +++ b/src/video_core/control/channel_state.cpp
 @@ -5,6 +5,7 @@
@@ -53,7 +139,7 @@ index 12a452dfc0..c033b27eee 100644
 +
  } // namespace Tegra::Control
 diff --git a/src/video_core/control/channel_state.h b/src/video_core/control/channel_state.h
-index d1802ca415..1e1c0a4c09 100644
+index d1802ca41..1e1c0a4c0 100644
 --- a/src/video_core/control/channel_state.h
 +++ b/src/video_core/control/channel_state.h
 @@ -38,6 +38,9 @@ struct ChannelState {
@@ -84,7 +170,7 @@ index d1802ca415..1e1c0a4c09 100644
      /// Keeps memory_manager alive while the channel exists: its address space (nvhost_as_gpu) can
      /// be closed while the GPU thread still runs commands the channel was given, as a program does
 diff --git a/src/video_core/control/channel_state_cache.cpp b/src/video_core/control/channel_state_cache.cpp
-index bd794d939a..a7ded6ce44 100644
+index bd794d939..a7ded6ce4 100644
 --- a/src/video_core/control/channel_state_cache.cpp
 +++ b/src/video_core/control/channel_state_cache.cpp
 @@ -9,7 +9,8 @@
@@ -98,7 +184,7 @@ index bd794d939a..a7ded6ce44 100644
      , gpu_memory{*channel_state.memory_manager}
      , program_id{channel_state.program_id}
 diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
-index f6297fe815..c21a8d15d0 100644
+index f6297fe81..c21a8d15d 100644
 --- a/src/video_core/dma_pusher.cpp
 +++ b/src/video_core/dma_pusher.cpp
 @@ -7,6 +7,7 @@
@@ -235,7 +321,7 @@ index f6297fe815..c21a8d15d0 100644
          subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
          subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
 diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
-index c39f2aa831..2e83f404ad 100644
+index c39f2aa83..2e83f404a 100644
 --- a/src/video_core/dma_pusher.h
 +++ b/src/video_core/dma_pusher.h
 @@ -176,6 +176,9 @@ public:
@@ -249,7 +335,7 @@ index c39f2aa831..2e83f404ad 100644
      Engines::Puller puller;
      std::mutex sync_mutex;
 diff --git a/src/video_core/engines/engine_upload.cpp b/src/video_core/engines/engine_upload.cpp
-index ba21eec4c4..1122b0297c 100644
+index ba21eec4c..1122b0297 100644
 --- a/src/video_core/engines/engine_upload.cpp
 +++ b/src/video_core/engines/engine_upload.cpp
 @@ -8,6 +8,7 @@
@@ -280,7 +366,7 @@ index ba21eec4c4..1122b0297c 100644
      if (is_linear) {
          for (size_t line = 0; line < regs.line_count; ++line) {
 diff --git a/src/video_core/engines/engine_upload.h b/src/video_core/engines/engine_upload.h
-index 21bf8aeb46..a8c817cbc6 100644
+index 21bf8aeb4..a8c817cbc 100644
 --- a/src/video_core/engines/engine_upload.h
 +++ b/src/video_core/engines/engine_upload.h
 @@ -79,6 +79,9 @@ public:
@@ -294,7 +380,7 @@ index 21bf8aeb46..a8c817cbc6 100644
      u32 write_offset = 0;
      u32 copy_size = 0;
 diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
-index 493fd0d518..0f12399dc9 100644
+index 493fd0d51..0f12399dc 100644
 --- a/src/video_core/engines/maxwell_3d.cpp
 +++ b/src/video_core/engines/maxwell_3d.cpp
 @@ -13,6 +13,7 @@
@@ -354,7 +440,7 @@ index 493fd0d518..0f12399dc9 100644
  
  } // namespace Tegra::Engines
 diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
-index c1a162a4a9..3b3d6fc2e0 100644
+index c1a162a4a..3b3d6fc2e 100644
 --- a/src/video_core/engines/maxwell_3d.h
 +++ b/src/video_core/engines/maxwell_3d.h
 @@ -3166,6 +3166,10 @@ public:
@@ -369,7 +455,7 @@ index c1a162a4a9..3b3d6fc2e0 100644
          size_t base = 0;
          for (const auto& [addr, count] : macro_segments) {
 diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
-index acc7107955..38a6a853f7 100644
+index acc710795..38a6a853f 100644
 --- a/src/video_core/gpu.cpp
 +++ b/src/video_core/gpu.cpp
 @@ -12,6 +12,7 @@
@@ -500,10 +586,10 @@ index acc7107955..38a6a853f7 100644
  
 diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
 new file mode 100644
-index 0000000000..2bde2977b3
+index 000000000..8943f9724
 --- /dev/null
 +++ b/src/video_core/gpu_split.cpp
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,496 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -544,6 +630,11 @@ index 0000000000..2bde2977b3
 +
 +void SetActiveGpuSplit(GpuSplit* split) {
 +    g_split.store(split, std::memory_order_release);
++}
++
++GpuWrittenGranules& GpuWritten() {
++    static GpuWrittenGranules granules;
++    return granules;
 +}
 +
 +void RunOnGpuBackend(std::function<void()>&& task) {
@@ -997,10 +1088,10 @@ index 0000000000..2bde2977b3
 +} // namespace VideoCommon
 diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
 new file mode 100644
-index 0000000000..245ec6f699
+index 000000000..a75c8883f
 --- /dev/null
 +++ b/src/video_core/gpu_split.h
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,258 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1016,6 +1107,8 @@ index 0000000000..245ec6f699
 +// operation that reads it. Off (EDEN_PS4_GPU_SPLIT unset or 0): none of this exists, the GPU
 +// thread runs as before.
 +
++#include <algorithm>
++#include <array>
 +#include <atomic>
 +#include <condition_variable>
 +#include <cstdint>
@@ -1189,9 +1282,76 @@ index 0000000000..245ec6f699
 +    return g_gpu_front_thread && ActiveGpuSplit() != nullptr;
 +}
 +
++/// The device memory the GPU has written, in 64 KiB granules, ever: set where the buffer cache
++/// records a GPU write (with the split on), never cleared. The front end asks this, not the buffer
++/// cache, whether a macro's parameters may be GPU-written (DmaPusher -> MemoryManager::IsMemoryDirty
++/// -> the rasterizer's MustFlushRegion): the back end holds the buffer cache's lock through each draw
++/// it prepares, so asking the buffer cache stalled the front end once a macro, and its answer was
++/// behind anyway (a write still queued isn't recorded yet). Kept for good, a buffer the GPU writes
++/// each frame (an indirect draw's arguments) stays marked while this frame's writer is still queued:
++/// only its first write can be missed. Marked when it needn't be costs the slower, still correct
++/// path (the HLE macros' indirect draw, its parameters read on the back end).
++class GpuWrittenGranules {
++public:
++    static constexpr u32 kGranuleBits = 16;
++    static constexpr u32 kAddressBits = 34; // the device address space (gpu_device_memory_manager.h)
++
++    void Mark(u64 addr, u64 size) noexcept {
++        ForEachWord(addr, size, [](std::atomic<u64>& word, u64 mask) {
++            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
++                word.fetch_or(mask, std::memory_order_release);
++            }
++            return false;
++        });
++    }
++
++    bool Any(u64 addr, u64 size) noexcept {
++        return ForEachWord(addr, size, [](std::atomic<u64>& word, u64 mask) {
++            return (word.load(std::memory_order_acquire) & mask) != 0;
++        });
++    }
++
++private:
++    static constexpr u64 kGranules = u64{1} << (kAddressBits - kGranuleBits);
++
++    /// f(word, the range's granules in it as a mask) for each word the range covers, until f says
++    /// true (the range clipped to the address space)
++    template <typename F>
++    bool ForEachWord(u64 addr, u64 size, F&& f) noexcept {
++        if (size == 0 || (addr >> kGranuleBits) >= kGranules) {
++            return false;
++        }
++        const u64 first = addr >> kGranuleBits;
++        const u64 end = addr + (size - 1) < addr ? ~u64{0} : addr + (size - 1);
++        const u64 last = std::min<u64>(end >> kGranuleBits, kGranules - 1);
++        for (u64 w = first / 64; w <= last / 64; ++w) {
++            const u64 lo = w == first / 64 ? first % 64 : 0;
++            const u64 hi = w == last / 64 ? last % 64 : 63;
++            const u64 below_hi = hi == 63 ? ~u64{0} : (u64{1} << (hi + 1)) - 1;
++            const u64 mask = below_hi & ~((u64{1} << lo) - 1);
++            if (f(words[w], mask)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    std::array<std::atomic<u64>, kGranules / 64> words{};
++};
++
++/// The process's (it has one GPU)
++GpuWrittenGranules& GpuWritten();
++
++/// Where the buffer cache records a GPU write: the granules marked, with the split on
++inline void MarkGpuWritten(u64 addr, u64 size) {
++    if (GpuSplitEnabled()) {
++        GpuWritten().Mark(addr, size);
++    }
++}
++
 +} // namespace VideoCommon
 diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
-index 289e18ac8a..59ba884f18 100644
+index 289e18ac8..59ba884f1 100644
 --- a/src/video_core/gpu_thread.cpp
 +++ b/src/video_core/gpu_thread.cpp
 @@ -16,6 +16,7 @@
@@ -1265,7 +1425,7 @@ index 289e18ac8a..59ba884f18 100644
              if (next.block) {
                  // We have to lock the write_lock to ensure that the condition_variable wait not get a
 diff --git a/src/video_core/renderer_opengl/gl_state_tracker.cpp b/src/video_core/renderer_opengl/gl_state_tracker.cpp
-index dc91723300..619f382099 100644
+index dc9172330..619f38209 100644
 --- a/src/video_core/renderer_opengl/gl_state_tracker.cpp
 +++ b/src/video_core/renderer_opengl/gl_state_tracker.cpp
 @@ -207,7 +207,7 @@ void SetupDirtyMisc(Tables& tables) {
@@ -1286,8 +1446,42 @@ index dc91723300..619f382099 100644
  }
  
  void StateTracker::InvalidateState() {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index d533007c2..e8d12a790 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "video_core/gpu_split.h"
+ #include "video_core/renderer_vulkan/renderer_vulkan.h"
+ 
+ #include "common/assert.h"
+@@ -716,9 +717,18 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType
+ 
+ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+     if ((True(which & VideoCommon::CacheType::BufferCache))) {
+-        std::scoped_lock lock{buffer_cache.mutex};
+-        if (buffer_cache.IsRegionGpuModified(addr, size)) {
+-            return true;
++        if (VideoCommon::DeferToGpuBackend()) {
++            // (04.83) the GPU thread split's front end (a macro's parameters, through
++            // MemoryManager::IsMemoryDirty): without the buffer cache's lock, which the back end
++            // holds through each draw (video_core/gpu_split.h, GpuWrittenGranules)
++            if (VideoCommon::GpuWritten().Any(addr, size)) {
++                return true;
++            }
++        } else {
++            std::scoped_lock lock{buffer_cache.mutex};
++            if (buffer_cache.IsRegionGpuModified(addr, size)) {
++                return true;
++            }
+         }
+     }
+     if (!Settings::IsGPULevelHigh()) {
 diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.cpp b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
-index 0b132c97d6..28e0557b85 100644
+index 0b132c97d..28e0557b8 100644
 --- a/src/video_core/renderer_vulkan/vk_state_tracker.cpp
 +++ b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
 @@ -235,7 +235,7 @@ void SetupRasterModes(Maxwell3D::DirtyState::Tables &tables) {
@@ -1308,3 +1502,6 @@ index 0b132c97d6..28e0557b85 100644
  }
  
  void StateTracker::InvalidateState() {
+-- 
+2.43.0
+

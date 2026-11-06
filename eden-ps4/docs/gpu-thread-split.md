@@ -1,6 +1,6 @@
 # Proposal: the GPU thread's work on two cores (04.82 onwards)
 
-Status: **in progress, paused** (2026-11-06): 04.82 shipped; the 04.83 back end is written and kept in `wip/` (see `wip/README.md`), with a hang and a crash at exit still to fix. Goes with the profiler keeping every
+Status: **in testing** (04.83, 2026-11-06): built behind Graphics > GPU Threads (One by default). The desktop tests pass with it on and off, after two fixes (below, "04.83: what testing found"). Next: the console test, Breath of the Wild outdoors with Two and then One. Goes with the profiler keeping every
 game's profile (below), which ships first.
 
 ## Why
@@ -144,4 +144,56 @@ the translated code, not the GPU thread.
   before a wait), bounded, the back end spinning briefly before it sleeps (as the GPU thread does).
 - **Switch**: `EDEN_PS4_GPU_SPLIT=1` (the menu's Graphics > GPU Threads), off by default: off, the
   GPU thread runs exactly as before (no proxy, no shadow, no queue).
+
+## 04.83: what testing found
+
+The split was finished in patch 0173; patch 0174 has the two fixes below. The desktop runs used
+the null renderer, with `EDEN_PS4_GPU_SPLIT=1` and `test.sh`.
+
+- **The crash at exit was a fence wait that didn't wait** (Eden's nvhost-ctrl, older than the
+  split).
+  - A syncpoint's host action signals its event, then marks it Signalled.
+  - The guest thread it wakes can make its next fence wait in between. libnx takes the same
+    event slot each time.
+  - That wait was refused as BadParameter, and libnx's `nvFenceWait` returns the error without
+    waiting.
+  - So gputest took the GPU for idle, closed its channel and freed its framebuffer, while the back
+    end still had two frames of clears for it: a SIGSEGV in `RasterizerNull::Clear` reading
+    unmapped memory.
+  - A trace showed it: the wait for the last fence was never armed.
+  - It showed with the split because the back end now signals, and on one core the woken guest
+    thread runs before the back end finishes the action: about 1 run in 8.
+  - Fix: a wait (or FreeEvent) on an event still Signalling waits that out, since it lasts
+    moments. 45 one-core runs after the fix, none crashed.
+- **The software renderer is locked.** The null renderer's software draws (queued draws, their
+  textures' cache) are also reached from the emulated CPU's threads: device memory unmapped or
+  written (`InvalidateRegion`), read (`FlushRegion`). They are now behind a recursive mutex, as the
+  Vulkan rasterizer's caches are behind theirs. Callbacks run outside it.
+- **The hang (gputest at 0.1 fps in a full suite run) did not come back.** 8 suite runs with the
+  split on (4 of them without the fixes), 45 runs on one core, 40 on two loaded cores (20 without
+  the fixes).
+  It wasn't reproduced here even without the fixes, so its cause isn't confirmed. The likeliest
+  is the same refused fence wait: it lets gputest rewrite a command buffer before the front end
+  has read it, and gputest's state set only in its first frame then ends up wrong for the rest of
+  the run. Watch for it on the console: a game crawling from its start with Two, fine with One.
+- **The front end no longer takes the buffer cache's lock per macro call.**
+  - DmaPusher asks for each macro call whether its parameters are GPU-written
+    (`MemoryManager::IsMemoryDirty`, which reaches the rasterizer's `MustFlushRegion`). The HLE
+    draw macros then read the parameters on the GPU side (indirect draw) instead of as given.
+  - With Vulkan that took `buffer_cache.mutex`, which the back end holds through each draw it
+    prepares (about 21 us in Breath of the Wild): the front end would have waited on nearly every
+    draw.
+  - The answer was also behind: a write still queued on the back end isn't recorded yet.
+  - Now the front end asks `GpuWrittenGranules`: a lock-free bitmap of the 64 KiB device granules
+    the buffer cache has ever recorded as GPU-written, never cleared. A buffer the GPU writes each
+    frame (an indirect draw's arguments) stays marked while this frame's writer is still queued;
+    only its first write can be missed.
+  - A granule marked needlessly costs the slower, still correct indirect path.
+  - The bitmap was checked against a plain bitset: 133,000 random queries, 0 wrong.
+- **On the PS4:** "GPUBackend" goes to module 1 (cores 4-6, `ps4_place_thread`'s default) at
+  boosted priority. It now gets a private heap arena like the GPU thread (`port/ps4_runtime.cpp`),
+  since it does the renderer's allocations.
+- **What to read in the logs:** the 30 s line's "the GPU back end busy N% of the time, T tasks a
+  second, waited for D times a second" (D: the front end draining the queue, for a call that
+  returns a value). The GPU thread's own busy % is then the front end's.
 

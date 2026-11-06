@@ -1060,6 +1060,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "a game running that freezes the GPU otherwise. If a game closes with a GPU error, try the other "
              "one.",
              [](MenuSettings& s) { s.serial_draws = !s.serial_draws; }},
+            {"GPU Threads", settings.gpu_split ? "Two" : "One",
+             "Two: the emulator's GPU work is shared by two of the PS4's cores, one reading the game's GPU "
+             "commands, the other turning its draws into the PS4's. It can speed up a game that draws a lot "
+             "(Breath of the Wild outdoors); it doesn't help a game held back by its own code. Experimental: "
+             "if a game shows glitches or freezes with Two, set One.",
+             [](MenuSettings& s) { s.gpu_split = !s.gpu_split; }},
             {"FPS Counter", on_off(settings.fps_overlay),
              "The frames shown each second, at the top centre of the picture while a game runs (a game's own target is "
              "usually 30 or 60).",

@@ -91,6 +91,7 @@ struct MenuSettings
     int speed = 100;              // game speed in percent of the Switch's: 100, 150 or 200
     bool touchpad_minus = false;  // (04.59) the touchpad's click is the Minus button; off: the touch screen
     bool serial_draws = false;    // (04.60) Draw Order: One at a Time (each draw waits, caches flushed); off: Parallel
+    bool gpu_split = false;       // (04.83) GPU Threads: Two (the GPU thread's work split over two cores); off: One
     bool motion_controls = true;  // (04.64) the controller's motion sensors are the Switch controller's
     // (04.64) the Switch user, as games see it: the nickname (at most kNicknameLength characters) and
     // the icon, a character on a background colour (ui/avatars.h)
