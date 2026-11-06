@@ -297,6 +297,7 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.follow_known_returns = std::getenv("DYN_RET") != nullptr;
     config.fastmem_range_check_reuse = std::getenv("DYN_REUSE") != nullptr;
     config.guarded_indirect_links = std::getenv("DYN_GUARD") != nullptr;
+    config.follow_leaf_calls = std::getenv("DYN_LEAF") != nullptr;
 #endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;

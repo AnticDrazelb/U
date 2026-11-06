@@ -89,8 +89,32 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.74: the 32-bit guarded links; leaf calls measured
+
+- **32-bit games' calls into other modules linked straight** (patch 0164): 04.73's guarded links
+  for the 32-bit translator: an ARM-state block ending in `LDR PC, [IP, #off]!` (a PLT stub) after
+  the slot's address became a constant checks the loaded word against the slot's word at translation
+  (`PeekCode`), and links to the location the BX would make of it (ARM or Thumb, the hash
+  `EmitA32BXWritePC` computes) when equal; the lookup when not. On with Auto and Unsafe.
+- **Checked** (`difftest32`, `DIFFTEST_PLT=1`, `DIFFTEST_FULL=1`): 48,000 random ARM blocks
+  calling through stubs (`LDR PC`) and the GOT (`BLX`), ARM and Thumb callees, slots repointed and
+  garbage, against bare: none wrong, and in the 30,000 counted the optimised run never differed from
+  the one without the extras (the unclear ones are Auto's float shortcuts, on and off alike). The
+  32-bit harness now has the PS4's page table (without it, a walk for an access fastmem was declined
+  for had none: a crash of the harness's, not the PS4's) and random code that never writes the PC
+  (a conditional `LDR PC` got past its straight-line check and ran off for ever); with them the
+  32-bit extras again: 10,000 random blocks and 5,000 loops, none wrong.
+- **Leaf calls followed, measured and left off** (`follow_leaf_calls`, in patch 0164): a BL to a
+  short leaf function (a RET within twelve instructions, no branch, system instruction or X30)
+  translated into the caller's block, and its RET back. Correct (16,000 random blocks with calls,
+  with and without cycle counting), but game64 1,814,345 to 1,770,154 (-2.4%) and unity64
+  1,354,258 to 1,367,900 (+1.0%): the flags the call boundary let the ABI look-ahead drop are kept
+  once the call is inlined (without that look-ahead, unity64 is the same either way). The Unity
+  games are unity64's kind, so off.
 
 ## 04.73: the translated code's speed, every game
 

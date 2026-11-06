@@ -70,6 +70,7 @@ More of the PS4's configuration, and every run checked:
                           the first callee may point the slot at another one (the guarded link's check
                           failing), a slot holds garbage now and then (guarded links, 04.73)
     DIFFTEST_NO_GUARD=1   the guarded links off
+    DIFFTEST_NO_LEAF=1    BLs to short leaf functions not followed (04.74's follow_leaf_calls, on here)
     DIFFTEST_WITHOUT=<extra>   one of the PS4 extras off (fold_address_offsets, elide_dead_nzcv_abi, ...)
     DIFFTEST_PROGRESS=1   each iteration's code (stderr) before it runs, and which run: to find a hang
     DIFFTEST_SKIP=<n>     the first n iterations made but not run, to get to one
@@ -85,6 +86,10 @@ the PS4's configuration, no cycle counting: 5,819 the same, 110 unclear (on and 
 bare alike: Auto's unfused multiply-adds), 5 the optimised translation wrong, and all 5 are the
 calling convention's dead flags (`DIFFTEST_WITHOUT=elide_dead_nzcv_abi`: the same): the block
 calls or returns with flags it set but didn't read, which the callee or caller never reads.
+
+(04.74) `difftest32` has the PS4's page table (absolute offsets over its flat arena: the walks of
+accesses fastmem was declined for), its random code writes no PC, an iteration has 5 seconds, and the
+last line counts the iterations where on and off differed at all.
 
 `difftest32.cpp` (`jit-difftest32 <n> <seed> [loops]`): the same for the 32-bit translator, random
 ARM, VFP and ASIMD blocks with the 32-bit PS4 extras (on), without (off, Auto as in 04.38-04.72) and

@@ -1718,6 +1718,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.74: 32-bit games' calls into the system libraries jump straight to their target too, as "
+         "64-bit games' do since 04.73.\n"
          "04.73: faster CPU emulation in every game. The translated game code does about a quarter less work: "
          "the CPU translation's PS4 shortcuts are on by default again (they were held back while two games' "
          "problems were tracked down; both turned out to be elsewhere), loops keep their values in the PS4's own "

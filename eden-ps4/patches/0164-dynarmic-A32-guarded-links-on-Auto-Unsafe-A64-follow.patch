@@ -1,0 +1,201 @@
+From 02d9435768925315054e71d7fa49aa6eab437a71 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 08:08:41 +0000
+Subject: [PATCH] dynarmic: A32 guarded links on (Auto/Unsafe); A64
+ follow_leaf_calls (off)
+
+- arm_dynarmic_32.cpp: A32::UserConfig::guarded_indirect_links on with Auto and Unsafe (off with
+  the boot watcher's extras step, Accurate, Paranoid): a PLT stub's LDR PC, [IP, #off]! links
+  straight to the function its GOT slot held when translated while the slot still holds it.
+- A64 TranslationOptions/UserConfig::follow_leaf_calls: without follow_direct_branches, a BL to a
+  short leaf function (a RET within twelve instructions, no branch, system instruction or X30 in
+  its first two register fields) is followed, and its RET back. Not turned on: unity64 loses ~1%
+  (the flags the call boundary let the ABI look-ahead drop are kept once it's inlined), game64
+  gains 2.4%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  7 ++--
+ .../dynarmic/backend/x64/a64_interface.cpp    |  2 +
+ .../frontend/A64/translate/a64_translate.cpp  |  1 +
+ .../frontend/A64/translate/a64_translate.h    |  6 +++
+ .../A64/translate/impl/a64_branch.cpp         | 37 ++++++++++++++++---
+ .../frontend/A64/translate/impl/impl.h        |  6 ++-
+ .../src/dynarmic/interface/A64/config.h       |  2 +
+ 7 files changed, 52 insertions(+), 9 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 919b7d9bba..acb0b745c5 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -254,9 +254,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     // watcher's safer steps)
+     // (04.73) a loop's busiest guest registers in host registers from its start to its exits
+     config.loop_register_pins = true;
+-    // (04.73: a PLT stub's LDR PC linked straight to the function its GOT slot held when
+-    // translated, UserConfig::guarded_indirect_links, is implemented but not on yet: its
+-    // differential test hasn't finished; the 64-bit one is on)
++    // (04.74) a PLT stub's LDR PC: a link straight to the function its GOT slot held when
++    // translated, while the slot still holds it (as the 64-bit JIT's from 04.73)
++    config.guarded_indirect_links = true;
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+     // (04.73) EDEN_PS4_JIT_TEST=extras: the same as Accurate does here, with Auto's speed
+     // otherwise (the boot watcher's first safer step: the translator as 04.72 had it under Auto)
+@@ -264,6 +264,7 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     const bool extras_off = jit_test && (std::string_view{jit_test} == "extras" || std::string_view{jit_test} == "ir");
+     if ((accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) || extras_off) {
+         config.loop_register_pins = false;
++        config.guarded_indirect_links = false;
+         config.inline_conditional_instructions = false;
+         config.elide_dead_nzcv = false;
+         config.elide_dead_nzcv_abi = false;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 0b4ad9ba5d..7eec8f6405 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -326,6 +326,7 @@ private:
+         options.nzcv_lookahead_abi = conf.elide_dead_nzcv_abi;
+         options.follow_direct_branches = conf.follow_direct_branches;
+         options.follow_known_returns = conf.follow_known_returns;
++        options.follow_leaf_calls = conf.follow_leaf_calls;
+         options.elide_load_store_only_barriers = conf.elide_load_store_only_barriers;
+         options.superblocks = conf.superblocks && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         // (the exits' flags need the look-ahead)
+@@ -449,6 +450,7 @@ private:
+         add(conf.return_stack_pc_only);
+         add(conf.follow_direct_branches);
+         add(conf.follow_known_returns);
++        add(conf.follow_leaf_calls);
+         add(conf.guarded_indirect_links);
+         add(conf.loop_register_pins);
+         add(conf.fastmem_range_check_reuse);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+index 3b76f0e991..3bc38d4e13 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp
+@@ -262,6 +262,7 @@ void LookAheadForFlags(IR::Block& block, const MemoryReadCodeFuncType& read_code
+ void Translate(IR::Block& block, LocationDescriptor descriptor, MemoryReadCodeFuncType memory_read_code, TranslationOptions options) {
+     const bool single_step = descriptor.SingleStepping();
+     TranslatorVisitor visitor{block, descriptor, options};
++    visitor.read_code = &memory_read_code;
+ 
+     bool should_continue = true;
+     visitor.piece_start = descriptor.PC();
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index e6783f1b17..033cd34581 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -59,6 +59,12 @@ struct TranslationOptions {
+     /// address in the block too, and the BL's return stack entry is dropped (pushed and popped here)
+     bool follow_known_returns = false;
+ 
++    /// (PS4 04.74) Without follow_direct_branches: a BL to a short leaf function (a RET within
++    /// twelve instructions, none of them a branch, a system instruction or a write to X30) is
++    /// followed, and its RET back to the instruction after the BL (as follow_known_returns): the
++    /// callee in the caller's block, no block exit, entry or return stack push and pop for it
++    bool follow_leaf_calls = false;
++
+     /// DMB of the LD or ST type alone: nothing (UserConfig::elide_load_store_only_barriers)
+     bool elide_load_store_only_barriers = false;
+ 
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index c43a25246a..1934a14056 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -38,8 +38,9 @@ bool TranslatorVisitor::B_uncond(Imm<26> imm26) {
+     return false;
+ }
+ 
+-bool TranslatorVisitor::Follow(u64 target) {
+-    if (!options.follow_direct_branches || follows_left <= 0 || instructions >= 64 || ir.current_location->SingleStepping())
++bool TranslatorVisitor::Follow(u64 target, bool leaf_call) {
++    if (!(options.follow_direct_branches || (leaf_call && options.follow_leaf_calls)) || follows_left <= 0 ||
++        instructions >= 64 || ir.current_location->SingleStepping())
+         return false;
+     const u64 pc = ir.PC();
+     if (target >= piece_start && target <= pc)
+@@ -65,12 +66,38 @@ bool TranslatorVisitor::BL(Imm<26> imm26) {
+     ir.PushRSB(ir.current_location->AdvancePC(4));
+ 
+     const u64 target = ir.PC() + offset;
+-    if (Follow(target))
++    if (options.follow_direct_branches ? Follow(target)
++                                       : options.follow_leaf_calls && IsShortLeaf(target) && Follow(target, true))
+         return true;
+     ir.SetTerm(IR::Term::LinkBlockFast{ir.current_location->SetPC(target)});
+     return false;
+ }
+ 
++bool TranslatorVisitor::IsShortLeaf(u64 target) const {
++    if (!read_code || (target & 3) != 0)
++        return false;
++    for (u64 i = 0; i < 12; i++) {
++        const auto word = (*read_code)(target + 4 * i);
++        if (!word)
++            return false;
++        const u32 inst = *word;
++        if (inst == 0xD65F03C0)  // ret
++            return true;
++        if ((inst & 0x7C000000) == 0x14000000 ||  // B, BL
++            (inst & 0xFE000000) == 0xD6000000 ||  // BR, BLR, RET Xn, ERET, ...
++            (inst & 0x7E000000) == 0x34000000 ||  // CBZ, CBNZ
++            (inst & 0x7E000000) == 0x36000000 ||  // TBZ, TBNZ
++            (inst & 0xFF000010) == 0x54000000 ||  // B.cond
++            (inst & 0xFF000000) == 0xD4000000 ||  // SVC, HVC, SMC, BRK, HLT
++            (inst & 0xFFC00000) == 0xD5000000 ||  // system: MSR, MRS, hints, barriers, SYS
++            (inst & 0x1F) == 30 ||                // X30 its first register field (a write, or a store of it)
++            ((inst >> 5) & 0x1F) == 30 ||         // or its second (a base written back, a source)
++            ((inst & 0x3A000000) == 0x28000000 && ((inst >> 10) & 0x1F) == 30))  // LDP/STP's second
++            return false;
++    }
++    return false;
++}
++
+ bool TranslatorVisitor::BLR(Reg Rn) {
+     const auto target = X(64, Rn);
+ 
+@@ -105,8 +132,8 @@ std::optional<u64> TranslatorVisitor::KnownLinkRegister() const {
+ bool TranslatorVisitor::RET(Reg Rn) {
+     // (PS4 04.73) back from a leaf function the block followed a BL into: on in the block, at the
+     // address the BL left in X30; its return stack entry dropped (the pop this was)
+-    if (Rn == Reg::R30 && options.follow_known_returns && options.follow_direct_branches) {
+-        if (const auto ret = KnownLinkRegister(); ret && Follow(*ret)) {
++    if (Rn == Reg::R30 && ((options.follow_known_returns && options.follow_direct_branches) || options.follow_leaf_calls)) {
++        if (const auto ret = KnownLinkRegister(); ret && Follow(*ret, true)) {
+             for (auto it = ir.block.instructions.begin(); it != ir.block.instructions.end(); ++it) {
+                 // (the last push of that address)
+                 if (it->GetOpcode() == IR::Opcode::PushRSB &&
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+index f3b03c8347..9969c3dd9e 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+@@ -40,7 +40,11 @@ struct TranslatorVisitor final {
+     size_t instructions = 0;
+     // Continues the block at target (a BL's, a forward B's) if it may: the current piece ends
+     // after this instruction
+-    bool Follow(u64 target);
++    bool Follow(u64 target, bool leaf_call = false);
++    // (PS4 04.74, follow_leaf_calls) the code the block is translated from, and whether a BL's
++    // target is a short leaf function
++    const MemoryReadCodeFuncType* read_code = nullptr;
++    bool IsShortLeaf(u64 target) const;
+     // (PS4 04.73, follow_known_returns) X30's value if the block set it to a constant last
+     std::optional<u64> KnownLinkRegister() const;
+ 
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 232562a00a..c435cbeed2 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -415,6 +415,8 @@ struct UserConfig {
+     bool follow_direct_branches = false;
+     /// (PS4 04.73) see TranslationOptions::follow_known_returns
+     bool follow_known_returns = false;
++    /// (PS4 04.74) see TranslationOptions::follow_leaf_calls
++    bool follow_leaf_calls = false;
+     /// (PS4 04.73) A block that ends in an indirect branch (BR, BLR) to a value it loaded from a
+     /// constant address (a PLT stub's LDR X17, [X16, #imm]; BR X17, a call through the GOT):
+     /// the value that address holds when the block is translated (PeekCode) is checked against
+-- 
+2.43.0
+

@@ -45,6 +45,9 @@ std::vector<std::pair<u32, u32>> g_preset;  // words in the window each run star
 class Env final : public A32::UserCallbacks {
 public:
     u8* arena = nullptr;  // 4 GiB, the fastmem view and the callbacks' memory both
+    // (04.74) the page table, as the PS4's (absolute offsets: host = entry + address; every entry the
+    // arena, which maps the whole space): the walks of accesses fastmem was declined for use it
+    std::vector<u64> page_table;
     std::vector<u32> code;
     u32 code_start = 0;
     A32::Jit* jit = nullptr;
@@ -58,6 +61,7 @@ public:
         // past 4 GiB: no access, as the PS4's arena past a 32-bit process's space (a folded offset
         // past the top faults there and takes the slow path, which wraps)
         mprotect(arena + (u64(1) << 32), 0x10000, PROT_NONE);
+        page_table.assign(size_t(1) << 20, u64(reinterpret_cast<uintptr_t>(arena)));
     }
     void Reset() {
         madvise(arena, u64(1) << 32, MADV_DONTNEED);  // (all zeros again)
@@ -148,6 +152,12 @@ struct Runner {
                           OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
         c.unsafe_optimizations = true;
         c.fastmem_pointer = reinterpret_cast<uintptr_t>(env.arena);
+        c.page_table = reinterpret_cast<decltype(c.page_table)>(env.page_table.data());
+        c.page_table_pointer_mask = ~u64{0xFFF};
+        c.page_table_marked_bit = u8(0);
+        c.absolute_offset_page_table = true;
+        c.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+        c.only_detect_misalignment_via_page_table_on_page_boundary = true;
         c.recompile_on_fastmem_failure = true;
         c.fastmem_exclusive_access = true;
         c.jit_frame_pointer = false;
@@ -256,6 +266,14 @@ std::vector<InstructionGenerator> MakeGenerators() {
     return g;
 }
 
+// an instruction that may write the PC: PC in its destination field (bits 12-15) or a register list
+// with it. (Testable lets a conditional one through: its translation stops at the condition.)
+bool WritesPC(u32 inst) {
+    if (((inst >> 12) & 15) == 15)
+        return true;
+    return ((inst >> 25) & 7) == 4 && (inst & (1u << 15)) && (inst & (1u << 20));  // (LDM with PC)
+}
+
 u32 RandomValue() {
     if (Rand(0, 1))
         return kWindow + u32(Rand(0, kWindowSize / 8 - 1)) * 8 + (Rand(0, 3) == 0 ? u32(Rand(0, 7)) : 0);
@@ -281,7 +299,7 @@ int main(int argc, char** argv) {
     off.Make(Kind::Off);
     bare.Make(Kind::Bare);
     std::printf("%zu instruction kinds\n", generators.size());
-    u64 on_wrong = 0, off_wrong = 0, unclear = 0;
+    u64 on_wrong = 0, off_wrong = 0, unclear = 0, on_off_differ = 0;
     for (u64 it = 0; it < iterations; it++) {
         State s;
         s.start = u32(Rand(0x1000, 0x3fffff)) * 4;
@@ -292,6 +310,8 @@ int main(int argc, char** argv) {
             const u32 inst = g.Bits() | (u32(rng()) & ~g.Mask());  // (from the seed, not fuzz_util's own generator)
             if ((g.Mask() & 0xF0000000) == 0 && (inst & 0xF0000000) == 0xF0000000)
                 continue;  // (the unconditional space, for an instruction with a condition field)
+            if (WritesPC(inst))
+                continue;  // (a conditional load into the PC passes Testable, and goes anywhere)
             if (loops) {
                 // (r10, the counter, in none of its register fields nor a register list)
                 bool uses10 = false;
@@ -386,7 +406,7 @@ int main(int argc, char** argv) {
                     m[call_index[k]] = 0xEB000000u | (u32(s32(stub_at) - s32(call_index[k]) - 2) & 0xFFFFFF);
             code = m;
             const u32 pick = u32(Rand(0, 15));
-            const u32 first = pick == 0 ? (RandomValue() & ~3u)
+            const u32 first = pick == 0 ? (0x80000000u | (u32(rng()) & 0x7FFFFFFCu))  // (garbage: no code there)
                             : pick < 5 ? (s.start + u32(thumb_at) * 4) | 1
                             : s.start + u32(leaf_a) * 4;
             g_preset.push_back({slot, first});
@@ -417,7 +437,7 @@ int main(int argc, char** argv) {
             std::printf("iteration %llu %s: finished, raised %d, r0 %08x\n", (unsigned long long)it, only, x.raised, x.regs[0]);
             continue;
         }
-        alarm(20);
+        alarm(5);  // (an iteration takes milliseconds; a runaway that writes memory would fill it)
         static const bool trace = std::getenv("DIFFTEST_TRACE") != nullptr;
         if (trace) {
             std::fprintf(stderr, "it %llu:", (unsigned long long)it);
@@ -429,6 +449,8 @@ int main(int argc, char** argv) {
         const Result a = on.Run(code, s);
         if (trace) std::fprintf(stderr, "  off\n");
         const Result b = off.Run(code, s);
+        if (!(a == b))
+            on_off_differ++;
         if (a == b && !full)
             continue;
         if (trace) std::fprintf(stderr, "  bare\n");
@@ -458,8 +480,8 @@ int main(int argc, char** argv) {
         }
     }
     alarm(0);
-    std::printf("\n%llu iterations: the extras wrong %llu, without them wrong %llu, unclear %llu\n",
+    std::printf("\n%llu iterations: the extras wrong %llu, without them wrong %llu, unclear %llu (on and off differing %llu)\n",
                 (unsigned long long)iterations, (unsigned long long)on_wrong, (unsigned long long)off_wrong,
-                (unsigned long long)unclear);
+                (unsigned long long)unclear, (unsigned long long)on_off_differ);
     return int(on_wrong != 0);
 }

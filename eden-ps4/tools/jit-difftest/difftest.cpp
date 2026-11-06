@@ -309,6 +309,8 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
     c.loop_register_pins = std::getenv("DIFFTEST_NO_PINS") == nullptr;
     c.fastmem_range_check_reuse = std::getenv("DIFFTEST_NO_REUSE") == nullptr;
     c.guarded_indirect_links = std::getenv("DIFFTEST_NO_GUARD") == nullptr;
+    // (04.74) BLs to short leaf functions followed, and their RETs back (DIFFTEST_NO_LEAF=1: not)
+    c.follow_leaf_calls = std::getenv("DIFFTEST_NO_LEAF") == nullptr;
     // (DIFFTEST_FOLLOW=1) BL and forward B translated through, and known returns followed
     c.follow_direct_branches = c.follow_known_returns = std::getenv("DIFFTEST_FOLLOW") != nullptr;
     // (04.73) the 64-bit translator's PS4 extras (04.22-04.30), as Eden sets them (on under Auto
@@ -364,6 +366,7 @@ void MakeBare(A64::UserConfig& c) {
     c.follow_known_returns = false;
     c.fastmem_range_check_reuse = false;
     c.guarded_indirect_links = false;
+    c.follow_leaf_calls = false;
     c.link_forward_without_halt_check = c.inline_rsb_pop = c.inline_fast_dispatch = false;
 }
 

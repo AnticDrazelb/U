@@ -379,6 +379,10 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.74: **32-bit games' calls into the SDK linked straight** to their targets too (patch 0164, 04.73's
+guarded links for the 32-bit translator), checked by the 32-bit differential test, which now has the
+PS4's page table. Following calls into short leaf functions was measured and left off (STATUS.md).
+
 04.73: **every game's CPU emulation faster**: the translated code runs ~27-28% fewer instructions in
 the 64-bit benchmarks and ~21% in the 32-bit one. The PS4 translator extras are on with CPU Auto again
 (off since 04.35/04.38 as a diagnostic switch), loops keep their guest registers in host registers

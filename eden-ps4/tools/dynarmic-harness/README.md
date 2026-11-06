@@ -96,7 +96,10 @@ forward B translated through; measure with Eden's `DYN_FWD=1 DYN_RSB=1 DYN_DISP=
 the shared walk's cost with fastmem; 04.28: `-DHAVE_SUPER`, `DYN_SUPER=1` forward CBZ/TBZ as side
 exits; `programs/c/unity.c` (IL2CPP-shaped) as `unity64.bin`; 04.29: `DYN_SUPERCOND=1` forward
 B.cond as side exits too, `DYN_IRDUMP=1` prints each block's IR as it is compiled; 04.30: `-DHAVE_BFS`,
-`DYN_BFS=1` SBFM/UBFM as shifts; `gen18.py` bitfield encodings and W results read as 64 bits) (callgrind `--dump-instr=yes`
+`DYN_BFS=1` SBFM/UBFM as shifts; `gen18.py` bitfield encodings and W results read as 64 bits;
+04.73-04.74, `-DHAVE_PINS`: `DYN_PINS=1` loop register pins, `DYN_REUSE=1` stack range-check reuse,
+`DYN_GUARD=1` guarded links (the harness's `PeekCode`), `DYN_LEAF=1` short leaf calls followed,
+`DYN_RET=1` known returns followed) (callgrind `--dump-instr=yes`
 into `<dir>/cg.out`, with `DUMP_JIT=<dir>/dump PERF_BUILDID_DIR=<dir>/perf`). `EDEN_SRC=<tree>` builds another Eden tree (a git worktree),
 `BUILD=<dir>` into another build directory.
 
