@@ -1,0 +1,332 @@
+From 8fcb549ef3c555d573f50d8636a11d87ff2e4e3a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 18:13:54 +0000
+Subject: [PATCH] PS4: the GPU thread's busy time and the renderer's share of
+ it (TSC ticks)
+
+Common::PS4Perf::gpu_thread.busy_ticks: each command the GPU thread takes from its queue, until
+done; raster_ticks: within that, the outermost of RasterizerVulkan's entry points (draws, clears,
+compute, queries, uniform buffer binds, cache flushes and invalidations, fences, blits, inline
+uploads, DMA: GpuRasterScope, counted on the GPU thread only). The launcher's 30 s line shows the
+GPU thread's busy share and the renderer's against command processing: what a split of the GPU
+thread into a front end and a back end (docs/gpu-thread-split.md) can gain.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/common/ps4_perf.h                         | 37 +++++++++++++++++++
+ src/video_core/gpu_thread.cpp                 |  5 +++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 30 +++++++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 5367801e4a..4e6da30854 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -71,6 +71,9 @@ struct alignas(64) GpuThreadCounters {
+     std::atomic<uint64_t> cb_bytes{0};
+     std::atomic<uint64_t> ubo_copied{0}, ubo_copied_bytes{0}, ubo_cached{0}, ubo_cached_hits{0};
+     std::atomic<uint64_t> ubo_frames{0}, ubo_frames_copying{0};
++    // (04.82, docs/gpu-thread-split.md) the thread's time in TSC ticks: busy (a command from its
++    // queue taken until done), and of that in the renderer's entry points (GpuRasterScope)
++    std::atomic<uint64_t> busy_ticks{0}, raster_ticks{0};
+     // (04.15) graphics pipeline lookups: all of them, those that reused the last one (none of the
+     // key's registers changed), the reuses checked (the key refreshed and compared), and the
+     // checks that found it changed (reuse then off for the session)
+@@ -111,6 +114,40 @@ inline std::atomic<uint64_t> jit_walked_sites[4], jit_walked_stack_sites[4];
+ // false: the buffer cache's and texture cache's locks, their lookups, the shader cache's)
+ inline std::atomic<uint64_t> gpu_cached_writes_same{0}, gpu_cached_writes_collected{0}, gpu_cached_writes_invalidated{0};
+ inline GpuThreadCounters gpu_thread;
++
++// (04.82) TSC ticks (cheap: the GPU thread reads them twice a draw), and the renderer's share of
++// the GPU thread's time: a scope at each of its entry points (draws, clears, compute, queries,
++// uniform buffer binds, cache flushes and invalidations, blits, DMA), the outermost one counted,
++// only on the GPU thread. What's left of its busy time is command processing: the front end a split
++// of the GPU thread would put on a core of its own (docs/gpu-thread-split.md).
++inline uint64_t Ticks() {
++#if defined(__x86_64__)
++    return __builtin_ia32_rdtsc();
++#else
++    return 0;
++#endif
++}
++inline thread_local bool on_gpu_thread = false;
++inline thread_local int gpu_raster_depth = 0;
++struct GpuRasterScope {
++    uint64_t start = 0;
++    bool counted = false;
++    GpuRasterScope() {
++        if (on_gpu_thread && gpu_raster_depth++ == 0) {
++            counted = true;
++            start = Ticks();
++        }
++    }
++    ~GpuRasterScope() {
++        if (!on_gpu_thread)
++            return;
++        gpu_raster_depth--;
++        if (counted)
++            Bump(gpu_thread.raster_ticks, Ticks() - start);
++    }
++    GpuRasterScope(const GpuRasterScope&) = delete;
++    GpuRasterScope& operator=(const GpuRasterScope&) = delete;
++};
+ // (04.09) What's new to it: graphics pipelines not in the cache (the disk shader cache's are, from
+ // the boot), draws skipped while their pipeline builds (asynchronous shaders), images and buffers
+ // created; for what a race's start waits on
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 6a95e9a454..289e18ac8a 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/ps4_perf.h"
+ #include "common/assert.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+@@ -40,6 +41,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+ 
+         auto current_context = context.Acquire();
+         CommandDataContainer next;
++        // (04.82) its time counted: busy (each command until done), the renderer's share of it
++        Common::PS4Perf::on_gpu_thread = true;
+ #ifdef __OPENORBIS__
+         // (PS4) With threads pinned the GPU thread has a core of its own: it spins up to 2 ms for
+         // the game's next batch before it sleeps, and picks it up within microseconds instead of a
+@@ -69,6 +72,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+             if (stop_token.stop_requested()) {
+                 break;
+             }
++            const uint64_t busy_start = Common::PS4Perf::Ticks();
+             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+@@ -80,6 +84,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+             } else {
+                 ASSERT(false);
+             }
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.busy_ticks, Common::PS4Perf::Ticks() - busy_start);
+             state.signaled_fence.store(next.fence);
+             if (next.block) {
+                 // We have to lock the write_lock to ensure that the condition_variable wait not get a
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 05617d274b..d533007c20 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -266,6 +266,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+ }
+ 
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+ #ifdef __OPENORBIS__
+     Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.draws);
+ #endif
+@@ -302,6 +303,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+ }
+ 
+ void RasterizerVulkan::DrawIndirect() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+ #ifdef __OPENORBIS__
+     Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.draws);
+ #endif
+@@ -363,6 +365,7 @@ void RasterizerVulkan::DrawIndirect() {
+ }
+ 
+ void RasterizerVulkan::DrawTexture() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+ 
+     SCOPE_EXIT {
+         gpu.TickWork();
+@@ -410,6 +413,7 @@ void RasterizerVulkan::DrawTexture() {
+ }
+ 
+ void RasterizerVulkan::Clear(u32 layer_count) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+@@ -595,6 +599,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+ }
+ 
+ void RasterizerVulkan::DispatchCompute() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+@@ -658,6 +663,7 @@ void RasterizerVulkan::DispatchCompute() {
+ }
+ 
+ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     switch (type) {
+     case VideoCommon::QueryType::ZPassPixelCount64:
+     case VideoCommon::QueryType::StreamingByteCount:
+@@ -673,21 +679,25 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+ 
+ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
+ }
+ 
+ void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
+                                                  u32 size) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
+ }
+ 
+ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     buffer_cache.DisableGraphicsUniformBuffer(stage, index);
+ }
+ 
+ void RasterizerVulkan::FlushAll() {}
+ 
+ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     if (addr == 0 || size == 0) {
+         return;
+     }
+@@ -738,6 +748,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
+ }
+ 
+ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     if (addr == 0 || size == 0) {
+         return;
+     }
+@@ -795,6 +806,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+ }
+ 
+ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     if (addr == 0 || size == 0) {
+         return;
+     }
+@@ -835,27 +847,33 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+ }
+ 
+ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     fence_manager.SignalFence(std::move(func));
+ }
+ 
+ void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     fence_manager.SyncOperation(std::move(func));
+ }
+ 
+ void RasterizerVulkan::SignalSyncPoint(u32 value) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     fence_manager.SignalSyncPoint(value);
+ }
+ 
+ void RasterizerVulkan::SignalReference() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     fence_manager.SignalReference();
+ }
+ 
+ void RasterizerVulkan::ReleaseFences(bool force) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     fence_manager.WaitPendingFences(force);
+ }
+ 
+ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
+                                                 VideoCommon::CacheType which) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     if (Settings::IsGPULevelHigh()) {
+         FlushRegion(addr, size, which);
+     }
+@@ -863,6 +881,7 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
+ }
+ 
+ void RasterizerVulkan::WaitForIdle() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
+     // fragment shaders can still write storage buffers.
+     VkPipelineStageFlags flags =
+@@ -886,15 +905,18 @@ void RasterizerVulkan::WaitForIdle() {
+ }
+ 
+ void RasterizerVulkan::FragmentBarrier() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     // We already put barriers when a render pass finishes
+     scheduler.RequestOutsideRenderPassOperationContext();
+ }
+ 
+ void RasterizerVulkan::TiledCacheBarrier() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
+ }
+ 
+ void RasterizerVulkan::FlushCommands() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     if (draw_counter == 0) {
+         return;
+     }
+@@ -903,6 +925,7 @@ void RasterizerVulkan::FlushCommands() {
+ }
+ 
+ void RasterizerVulkan::TickFrame() {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     draw_counter = 0;
+     guest_descriptor_queue.TickFrame();
+     compute_pass_descriptor_queue.TickFrame();
+@@ -931,6 +954,7 @@ bool RasterizerVulkan::HasDrawTransformFeedback() {
+ bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
+                                              const Tegra::Engines::Fermi2D::Surface& dst,
+                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     std::scoped_lock lock{texture_cache.mutex};
+     return texture_cache.BlitImage(dst, src, copy_config);
+ }
+@@ -941,6 +965,7 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA()
+ 
+ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
+                                                 std::span<const u8> memory) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
+     if (!cpu_addr) [[unlikely]] {
+         gpu_memory->WriteBlock(address, memory.data(), copy_size);
+@@ -1018,11 +1043,13 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
+     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
+ 
+ bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     std::scoped_lock lock{buffer_cache.mutex};
+     return buffer_cache.DMAClear(src_address, amount, value);
+ }
+ 
+ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     std::scoped_lock lock{buffer_cache.mutex};
+     return buffer_cache.DMACopy(src_address, dest_address, amount);
+ }
+@@ -1031,6 +1058,7 @@ template <bool IS_IMAGE_UPLOAD>
+ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
+                                        const Tegra::DMA::BufferOperand& buffer_operand,
+                                        const Tegra::DMA::ImageOperand& image_operand) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
+     if (image_id == VideoCommon::NULL_IMAGE_ID) {
+@@ -1063,12 +1091,14 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
+ bool AccelerateDMA::ImageToBuffer(const Tegra::DMA::ImageCopy& copy_info,
+                                   const Tegra::DMA::ImageOperand& image_operand,
+                                   const Tegra::DMA::BufferOperand& buffer_operand) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     return DmaBufferImageCopy<false>(copy_info, buffer_operand, image_operand);
+ }
+ 
+ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
+                                   const Tegra::DMA::BufferOperand& buffer_operand,
+                                   const Tegra::DMA::ImageOperand& image_operand) {
++    Common::PS4Perf::GpuRasterScope ps4_raster_scope;  // (04.82) the renderer's share of the GPU thread
+     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+ }
+ 
+-- 
+2.43.0
+

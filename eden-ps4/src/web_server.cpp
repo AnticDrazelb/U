@@ -330,13 +330,15 @@ bool WriteBundle(const fs::path& data, const std::string& version, const Symbols
                            (size > limit ? ", its last " + std::to_string(limit >> 20) + " MiB" : "") + ") =====\n";
         // samples.log stays until the profiler runs again, perhaps on an older build: its addresses
         // are named only with the symbols of the build that recorded it ("[build 03.89]")
-        const bool other_build = name == "samples.log" && text.find("[build " + version + "]") == std::string::npos;
-        if (name == "samples.log")
+        // (04.82: samples-previous*.log too, one a game)
+        const bool is_samples = name.rfind("samples", 0) == 0 && name.size() > 4 && name.ends_with(".log");
+        const bool other_build = is_samples && text.find("[build " + version + "]") == std::string::npos;
+        if (is_samples)
             part += (other_build ? ProfileSummary(text, Symbols{},
                                                   "(recorded by an earlier build, not this one: its app addresses "
                                                   "aren't named, this build's names wouldn't fit them)")
                                  : ProfileSummary(text, symbols)) +
-                    "\n----- samples.log itself -----\n";
+                    "\n----- " + name + " itself -----\n";
         part += symbols.Empty() || other_build ? std::move(text) : SymbolizeLog(text, symbols);
         if (!part.empty() && part.back() != '\n')
             part += '\n';

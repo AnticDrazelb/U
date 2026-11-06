@@ -1737,6 +1737,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.82: the Profiler keeps every game's profile in the logs, not only the last game's; the GPU "
+         "thread measures how its work divides, for the next step (sharing it between two cores).\n"
          "04.81: faster calls to tiny system functions through library jump tables (Unity games such as "
          "Bluey call one to ask which thread they're on constantly); Unity's garbage collector loop translated "
          "as one piece; fixed a freeze when quitting a game (Echoes of Wisdom).\n"
@@ -2229,6 +2231,9 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     KeepPrevious("/data/eden-ps4/log", ".txt");
     KeepPrevious("/data/eden-ps4/crash", ".log");
     KeepPrevious("/data/eden-ps4/hang", ".log");
+    // (04.82) the profiler's too (it starts each game's afresh): every game of a session in the bundle
+    KeepPrevious("/data/eden-ps4/samples", ".log");
+    KeepPrevious("/data/eden-ps4/hotblocks", ".log");
     g_screen.Clear();
     g_screen.SetScale(2.0f);
     return choice;
@@ -2765,6 +2770,21 @@ std::string PerfLine(double seconds)
         last_draws = draws;
         last_words = words;
         last_run_words = run_words;
+        // (04.82, docs/gpu-thread-split.md) its busy time, and how much of that the renderer took
+        // (draws, clears, compute, binds, flushes, blits, DMA) against command processing (the rest)
+        static uint64_t last_tsc = 0, last_busy = 0, last_raster = 0;
+        const uint64_t tsc = Common::PS4Perf::Ticks();
+        const uint64_t busy = P::gpu_thread.busy_ticks.load(std::memory_order_relaxed);
+        const uint64_t raster = P::gpu_thread.raster_ticks.load(std::memory_order_relaxed);
+        if (last_tsc != 0 && tsc > last_tsc && busy > last_busy) {
+            const double d_busy = double(busy - last_busy), d_raster = double(raster - last_raster);
+            line += fmt::format(", busy {:.0f}% of the time: the renderer {:.0f}% of that, command processing {:.0f}%",
+                                100.0 * d_busy / double(tsc - last_tsc), 100.0 * d_raster / d_busy,
+                                100.0 * (d_busy - d_raster) / d_busy);
+        }
+        last_tsc = tsc;
+        last_busy = busy;
+        last_raster = raster;
         // (04.09) what was new to it: what a race's first seconds wait on
         static uint64_t last_new = 0, last_skipped = 0, last_images = 0, last_buffers = 0;
         const uint64_t pipelines = P::gpu_pipelines_new.load(std::memory_order_relaxed);

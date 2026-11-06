@@ -89,7 +89,8 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
-- **Next (04.82):** every game's profile kept; the GPU thread's split measured: [docs/gpu-thread-split.md](docs/gpu-thread-split.md).
+- **Next (04.83):** the GPU thread's front end and back end on two cores, behind a switch: [docs/gpu-thread-split.md](docs/gpu-thread-split.md).
+- **04.82:** every game's profile kept; the GPU thread's busy time and the renderer's share measured (below).
 - **04.81:** tiny functions behind PLT stubs inlined (Bluey); GC loops one block; the exit freeze (below).
 - **04.80:** thread-local storage on fastmem; native copies found in every game; native memcmp (below).
 - **04.79:** CPU > Speed-ups is a page: each speed-up by name, what it does, a switch (below).
@@ -100,6 +101,19 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.82: every game's profile, and the GPU thread's split measured
+
+- **The profiler keeps every game's profile:** `samples.log` and `hotblocks.log` shift to
+  `-previous`, `-previous-2`... at each boot with the other logs (`KeepPrevious`; the app restarts for
+  each game, and the sampler starts its file afresh), and the log bundle sums up every
+  `samples*.log` (`web_server.cpp`). A session of several games now has each game's profile.
+- **The GPU thread measures its split** (patch 0172): TSC ticks for its busy time (each command from
+  its queue until done) and for the time inside the renderer's entry points (draws, clears, compute,
+  queries, uniform binds, cache flushes and invalidations, fences, blits, inline uploads, DMA;
+  `GpuRasterScope`, the outermost counted). The 30 s line: `the GPU thread: ... busy N% of the time:
+  the renderer R% of that, command processing C%`. C is what a front end on its own core would take
+  off the GPU thread (docs/gpu-thread-split.md).
 
 ## 04.81 on the console, and what's next
 

@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.82: **every game's profile kept; the GPU thread's split measured.** `samples.log` and `hotblocks.log`
+are kept per game like the other logs, and the GPU thread's 30 s line says how its busy time divides
+between the renderer and command processing (patch 0172), for the GPU thread split
+([docs/gpu-thread-split.md](docs/gpu-thread-split.md)).
+
 04.81: **tiny functions behind PLT stubs inlined; GC loops one block; the exit freeze fixed.** A call
 through a system library's stub to a function of a few instructions (Bluey's "current thread": 29% of
 its time with the stub) is translated into the caller, checked as it runs (patch 0170); Unity's GC mark
