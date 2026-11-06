@@ -335,6 +335,7 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
         c.elide_load_store_only_barriers = true;
         c.superblocks = true;
         c.superblocks_cond = true;
+        c.superblocks_backward = true;
         c.bitfield_shifts = true;
         // (DIFFTEST_WITHOUT=<name>: that extra left off, to tell which one a difference is)
         if (const char* w = std::getenv("DIFFTEST_WITHOUT")) {
@@ -347,8 +348,9 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
             if (n == "return_stack_pc_only") c.return_stack_pc_only = false;
             if (n == "plain_acquire_loads") c.plain_acquire_loads = false;
             if (n == "elide_load_store_only_barriers") c.elide_load_store_only_barriers = false;
-            if (n == "superblocks") c.superblocks = c.superblocks_cond = false;
+            if (n == "superblocks") c.superblocks = c.superblocks_cond = c.superblocks_backward = false;
             if (n == "superblocks_cond") c.superblocks_cond = false;
+            if (n == "superblocks_backward") c.superblocks_backward = false;
             if (n == "bitfield_shifts") c.bitfield_shifts = false;
         }
         // (DIFFTEST_NO_ABI=1: no reliance on the procedure call standard's dead flags at calls and
@@ -370,7 +372,7 @@ void MakeBare(A64::UserConfig& c) {
     c.fold_address_offsets = c.skip_redundant_extensions = c.split_cold_code = false;
     c.elide_dead_nzcv = c.elide_dead_nzcv_abi = c.return_stack_pc_only = false;
     c.plain_acquire_loads = c.elide_load_store_only_barriers = false;
-    c.superblocks = c.superblocks_cond = c.bitfield_shifts = false;
+    c.superblocks = c.superblocks_cond = c.superblocks_backward = c.bitfield_shifts = false;
     c.loop_register_pins = false;
     c.follow_known_returns = false;
     c.fastmem_range_check_reuse = false;
@@ -711,10 +713,19 @@ int main(int argc, char** argv) {
     // loop's registers pinned (on), without (off), and with no optimisation (bare, the referee)
     if (argc > 3 && std::string(argv[3]) == "loops") {
         const Generators loop_generators = MakeGenerators(!(argc > 4 && std::string(argv[4]) == "all"));
+        const bool back_exits = std::getenv("DIFFTEST_BACK") != nullptr;
         for (Runner* r : {&on, &off, &bare}) {
             A64::UserConfig c = Config(r->env, *r->monitor, OptimizationFlag{});
             c.enable_cycle_counting = false;
             c.loop_register_pins = r == &on;
+            // (DIFFTEST_BACK: on with the backward side exits, off without, both with the loop pins
+            // (DIFFTEST_BACK_PINS=0: neither): a difference is the side exits', bare decides. Pins
+            // on against off differ here in the FPSR alone (IXC, from the harness's callbacks with the
+            // guest's MXCSR: 04.73's pins, without the backward exits too), so that isn't compared)
+            if (back_exits) {
+                c.loop_register_pins = !(std::getenv("DIFFTEST_BACK_PINS") && std::string_view{std::getenv("DIFFTEST_BACK_PINS")} == "0");
+                c.superblocks_backward = r == &on;
+            }
             if (r == &bare)
                 MakeBare(c);
             r->jit.reset();
@@ -727,16 +738,43 @@ int main(int argc, char** argv) {
                     return true;
             return false;
         };
-        u64 wrong = 0, unclear = 0;
+        u64 wrong = 0, unclear = 0, fpsr_only = 0;
+        // (04.81, DIFFTEST_BACK=1) superblocks_backward's loops: B +2, then an SVC (the backward
+        // exits' target, before the loop), then the loop: its body with backward CBZ/CBNZ/TBZ/TBNZ/
+        // B.cond to that SVC (side exits now) and forward ones within it, closed as below. The
+        // block from the B follows into the loop (its way back then a side exit too); the loop's
+        // own block ends at its way back (pinned)
         for (u64 it = 0; it < iterations; it++) {
             State s;
             s.start = Rand(0x1000, 0x7fffffff) * 4;
             const size_t body = Rand(1, 14);
             std::vector<u32> code;
-            while (code.size() < body) {
+            const size_t head = back_exits ? 2 : 0;
+            if (back_exits) {
+                code.push_back(0x14000002u);  // b head
+                code.push_back(0xD4000001u);  // svc #0 (the backward exits')
+            }
+            while (code.size() < head + body) {
                 const u32 inst = RandomInstruction(loop_generators, s.start + code.size() * 4, false);
                 if (!uses28(inst))
                     code.push_back(inst);
+            }
+            if (back_exits) {
+                for (size_t i = head; i < head + body; i++) {
+                    if (Rand(0, 2) != 0)
+                        continue;
+                    // backward to the SVC (index 1), or forward within the body (to its close at most)
+                    const bool backward = Rand(0, 2) != 0;
+                    const s32 k = backward ? -s32(i - 1) : s32(Rand(1, head + body - i));
+                    u32 rt = u32(Rand(0, 30));
+                    if (rt == 28)
+                        rt = 27;
+                    switch (Rand(0, 2)) {
+                    case 0: code[i] = (Rand(0, 1) ? 0xB4000000u : 0x34000000u) | (Rand(0, 1) << 24) | ((u32(k) & 0x7ffff) << 5) | rt; break;
+                    case 1: code[i] = 0x36000000u | (Rand(0, 1) << 24) | (u32(Rand(0, 1)) << 31) | (u32(Rand(0, 31)) << 19) | ((u32(k) & 0x3fff) << 5) | rt; break;
+                    default: code[i] = 0x54000000u | ((u32(k) & 0x7ffff) << 5) | u32(Rand(0, 13)); break;
+                    }
+                }
             }
             const s32 back = -s32(body + 1);
             switch (Rand(0, 2)) {
@@ -761,7 +799,25 @@ int main(int argc, char** argv) {
             s.regs[28] = Rand(1, 4);
             s.sp = (kWindow + kWindowSize / 2 + Rand(0, kWindowSize / 4)) & ~u64(15);
             s.pstate = u32(Rand(0, 15)) << 28;
+            // (DIFFTEST_LOOP_CODE="<hex> <hex>...": that code instead, the iteration's state kept)
+            if (const char* text = std::getenv("DIFFTEST_LOOP_CODE")) {
+                code.clear();
+                for (const char* p = text; *p;) {
+                    char* end = nullptr;
+                    const unsigned long w = std::strtoul(p, &end, 16);
+                    if (end == p)
+                        break;
+                    code.push_back(u32(w));
+                    p = end;
+                }
+            }
             g_current_block = code;
+            // (DIFFTEST_LOOP_ONLY=<iteration>: that loop alone, e.g. with DIFFTEST_DUMP)
+            if (const char* only = std::getenv("DIFFTEST_LOOP_ONLY"); only && std::strtoull(only, nullptr, 0) != it)
+                continue;
+            // (DIFFTEST_LOOP_FROM=<iteration>: from that loop on)
+            if (const char* from = std::getenv("DIFFTEST_LOOP_FROM"); from && it < std::strtoull(from, nullptr, 0))
+                continue;
             alarm(20);  // (a loop that never ends: the process ends, the block on stderr)
             Result a, b, c;
             try {
@@ -774,6 +830,16 @@ int main(int argc, char** argv) {
             if (a == b)
                 continue;
             c = bare.Run(code, s);
+            // (DIFFTEST_BACK: a difference in the FPSR alone counted apart: its IXC comes and goes
+            // with the harness's callbacks run under the guest's MXCSR, as the blocks' shapes change)
+            if (back_exits) {
+                Result a2 = a, b2 = b;
+                a2.fpsr = b2.fpsr = 0;
+                if (a2 == b2) {
+                    fpsr_only++;
+                    continue;
+                }
+            }
             const bool on_bad = !(a == c) && b == c;
             (on_bad ? wrong : unclear)++;
             if (wrong + unclear <= 5) {
@@ -789,11 +855,26 @@ int main(int argc, char** argv) {
                     std::printf("   sp: pinned %#llx, bare %#llx\n", (unsigned long long)a.sp, (unsigned long long)c.sp);
                 if (a.memory != c.memory)
                     std::printf("   memory differs\n");
+                if (a.pc != c.pc || b.pc != c.pc)
+                    std::printf("   pc: on %#llx, off %#llx, bare %#llx\n", (unsigned long long)a.pc, (unsigned long long)b.pc,
+                                (unsigned long long)c.pc);
+                if (a.nzcv != c.nzcv || b.nzcv != c.nzcv)
+                    std::printf("   nzcv: on %#x, off %#x, bare %#x\n", a.nzcv, b.nzcv, c.nzcv);
+                if (a.fpsr != c.fpsr || b.fpsr != c.fpsr)
+                    std::printf("   fpsr: on %#x, off %#x, bare %#x\n", a.fpsr, b.fpsr, c.fpsr);
+                if (a.raised != c.raised || b.raised != c.raised)
+                    std::printf("   raised: on %d, off %d, bare %d\n", a.raised, b.raised, c.raised);
+                for (size_t v = 0; v < 32; v++)
+                    if (a.vecs[v] != c.vecs[v] || b.vecs[v] != c.vecs[v])
+                        std::printf("   q%zu differs\n", v);
             }
         }
         alarm(0);
-        std::printf("%llu loops: pinned wrong %llu, unclear %llu\n", (unsigned long long)iterations,
+        std::printf("%llu loops: pinned wrong %llu, unclear %llu", (unsigned long long)iterations,
                     (unsigned long long)wrong, (unsigned long long)unclear);
+        if (back_exits)
+            std::printf(" (backward exits on against off; in the FPSR alone %llu)", (unsigned long long)fpsr_only);
+        std::printf("\n");
         return int(wrong != 0);
     }
 

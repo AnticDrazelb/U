@@ -299,6 +299,9 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.guarded_indirect_links = std::getenv("DYN_GUARD") != nullptr;
     config.follow_leaf_calls = std::getenv("DYN_LEAF") != nullptr;
 #endif
+#ifdef HAVE_SUPERBACK  // (04.81) backward branches as side exits too, but to the block's own start (DYN_SUPERBACK)
+    config.superblocks_backward = std::getenv("DYN_SUPERBACK") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
@@ -501,6 +504,7 @@ int main(int argc, char** argv) {
         std::printf("%s, %s: %.1f ns an iteration (slow reads %llu, writes %llu)\n", excl ? "inline exclusives" : "monitor exclusives",
                     walk ? "shared walk" : "walk per access",
                     s * 1e9 / double(iterations), (unsigned long long)env.slow_reads, (unsigned long long)env.slow_writes);
+        DumpJit();  // (04.81: DUMP_JIT in bench mode too)
         return 0;
     }
     Setup(jit);

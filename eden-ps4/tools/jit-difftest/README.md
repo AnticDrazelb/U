@@ -63,6 +63,13 @@ More of the PS4's configuration, and every run checked:
     DIFFTEST_SAFE=1       Auto's unsafe float shortcuts off (exact against bare)
     DIFFTEST_NO_EXTRAS / NO_PINS / NO_REUSE=1   the PS4 extras / loop pins / stack range-check reuse off
     jit-difftest <n> <seed> loops [all]          random loop bodies, pins on against off against bare
+        (04.81) DIFFTEST_BACK=1: B +2, an SVC, then the loop with backward CBZ/TBZ/B.cond to that SVC
+        and forward ones in it: superblocks_backward on against off, both with the pins
+        (DIFFTEST_BACK_PINS=0: neither), bare deciding; a difference in the FPSR alone is counted
+        apart (its IXC comes from the harness's callbacks running under the guest's MXCSR: it shows
+        in bare too, for loops with no FP instruction). DIFFTEST_LOOP_ONLY=<i>, DIFFTEST_LOOP_FROM=<i>,
+        DIFFTEST_LOOP_CODE="<hex>...": one loop, from one on, or given code with that loop's state.
+        6,000 loops with pins and 6,000 without: 0 wrong (149 in the FPSR alone).
     jit-difftest 0 0 loopbench                   a few loops timed with pins and without
     DIFFTEST_PLT=1        half of the blocks (those without DIFFTEST_CALLS's call) make two calls
                           through a GOT slot in the window, each through a PLT stub (BL to ADRP-like

@@ -144,3 +144,13 @@ Instruction counts (no hardware counters in a VM): `valgrind --tool=lackey --bas
 --smc-check=all ./dynbench bench <bin> N` at two N, the difference over the iterations (bench mode
 runs N twice). `DUMP_JIT=<dir> PERF_BUILDID_DIR=<dir>` dumps each block's code in `bench`, `image`
 and `test` mode.
+
+## Little Kitty's GC loop (04.81)
+
+`programs/gcmark64.s`: the loop 04.80's profile found taking 25% of Little Kitty's samples (Unity's
+Boehm GC scanning a range for pointers: CMP, CCMP, B.LO; exits that branch backward; its way back
+from the third block to the first), x19 = scans of 4 KiB. Built with `OPTS="... -DHAVE_SUPERBACK"`,
+`DYN_SUPERBACK=1` turns on `superblocks_backward` (backward branches as side exits, but to the
+block's own start: the loop one block, pinned). With the PS4's options (callgrind, Jaguar mask):
+13,416 host instructions a scan without it, 12,284 with (8% fewer); what remains is mostly CCMP's
+flags (lahf/sahf and a store of NZCV). `DUMP_JIT` works in bench mode too.

@@ -1,0 +1,98 @@
+From 94e05102c3054dc29be4fc460a59c692f3096284 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 14:30:26 +0000
+Subject: [PATCH] dynarmic: PS4 superblocks_backward (backward branches as side
+ exits, but to the block's own start)
+
+With superblocks, a backward CBZ/CBNZ/TBZ/TBNZ (and B.cond with superblocks_cond) may be a side
+exit too, unless it goes back to the block's own start (that one still ends the block: a loop's way
+back) or to itself. A loop whose exits are backward branches (Unity's GC mark loop, Little Kitty's
+hottest code) is then one block that branches back to its start, which loop_register_pins keeps in
+host registers, instead of three linked blocks. Off by default (Eden doesn't turn it on yet); in
+the config hash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp  | 2 ++
+ .../src/dynarmic/frontend/A64/translate/a64_translate.h  | 3 +++
+ .../dynarmic/frontend/A64/translate/impl/a64_branch.cpp  | 9 +++++++--
+ src/dynarmic/src/dynarmic/interface/A64/config.h         | 8 ++++++++
+ 4 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index cca4acc144..bc0b1a74f0 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -331,6 +331,7 @@ private:
+         options.superblocks = conf.superblocks && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         // (the exits' flags need the look-ahead)
+         options.superblocks_cond = options.superblocks && conf.superblocks_cond && options.nzcv_lookahead;
++        options.superblocks_backward = options.superblocks && conf.superblocks_backward;
+         options.bitfield_shifts = conf.bitfield_shifts;
+         const int native = conf.native_functions && !arch_descriptor.SingleStepping()
+                                ? conf.callbacks->NativeFunction(arch_descriptor.PC())
+@@ -475,6 +476,7 @@ private:
+         add(conf.elide_load_store_only_barriers);
+         add(conf.superblocks);
+         add(conf.superblocks_cond);
++        add(conf.superblocks_backward);
+         add(conf.bitfield_shifts);
+         add(conf.enable_cycle_counting);
+         add(conf.code_cache_objects.size());
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index c7de9bbd82..241185d77c 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -76,6 +76,9 @@ struct TranslationOptions {
+     /// With superblocks: a forward B.cond too, its target's need for the flags looked ahead
+     bool superblocks_cond = false;
+ 
++    /// With superblocks: a backward one too, unless to the block's own start (UserConfig::superblocks_backward)
++    bool superblocks_backward = false;
++
+     /// SBFM and UBFM (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH by immediate) as shifts and
+     /// extensions, not a rotate and two masks (UserConfig::bitfield_shifts)
+     bool bitfield_shifts = false;
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index 0d58c02b73..2bad58e7e0 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -162,8 +162,13 @@ bool TranslatorVisitor::RET(Reg Rn) {
+ }
+ 
+ bool TranslatorVisitor::MaySideExit(u64 target) {
+-    if (!options.superblocks || target <= ir.PC() || side_exits_left <= 0 || instructions >= 64 ||
+-        ir.current_location->SingleStepping())
++    if (!options.superblocks || side_exits_left <= 0 || instructions >= 64 || ir.current_location->SingleStepping())
++        return false;
++    // (04.81, superblocks_backward) a backward one too, unless it goes back to the block's own
++    // start: that one ends the block (a loop's way back, which loop_register_pins keeps in host
++    // registers), as does a branch to itself
++    if (target <= ir.PC() &&
++        (!options.superblocks_backward || target == ir.PC() || target == A64::LocationDescriptor{ir.block.Location()}.PC()))
+         return false;
+     side_exits_left--;
+     return true;
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index d76ae57d7f..292dca097e 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -483,6 +483,14 @@ struct UserConfig {
+     /// look-ahead's), its condition on the compare's values right before it where it can be
+     bool superblocks_cond = false;
+ 
++    /// (PS4 04.81) With superblocks: a backward CBZ, CBNZ, TBZ, TBNZ (and with superblocks_cond,
++    /// B.cond) is a side exit too, unless it goes back to the block's own start (that one still
++    /// ends it, as a loop's way back). A loop whose exits are backward branches (Unity's GC
++    /// marking: its range scan's exits jump back to the code before it) is then one block that
++    /// branches back to its own start, instead of three linked ones: loop_register_pins applies,
++    /// and the registers it carries from one part to the next stay in host registers.
++    bool superblocks_backward = false;
++
+     /// (PS4 04.30) SBFM and UBFM by immediate (LSL, LSR, UBFX, UBFIZ, SBFX, SBFIZ, UXTB, UXTH) as
+     /// one or two shifts or an extension (SBFIZ #n, #32: movsxd and shl) instead of the
+     /// architecture's rotate and two masks (rorx, and, movabs, and; nine instructions for SBFIZ)
+-- 
+2.43.0
+
