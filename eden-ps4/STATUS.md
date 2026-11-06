@@ -89,7 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
-- **Next (04.83):** the GPU thread's front end and back end on two cores, behind a switch: [docs/gpu-thread-split.md](docs/gpu-thread-split.md).
+- **Next (04.83, in progress, paused 2026-11-06):** the GPU thread's front end and back end on two cores, behind a switch: [docs/gpu-thread-split.md](docs/gpu-thread-split.md). The code so far is in [wip/](wip/README.md), outside the build, with where it stands and the steps to finish it (a hang and a crash at exit in split mode still to fix).
 - **04.82:** every game's profile kept; the GPU thread's busy time and the renderer's share measured (below).
 - **04.81:** tiny functions behind PLT stubs inlined (Bluey); GC loops one block; the exit freeze (below).
 - **04.80:** thread-local storage on fastmem; native copies found in every game; native memcmp (below).

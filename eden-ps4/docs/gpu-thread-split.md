@@ -1,6 +1,6 @@
 # Proposal: the GPU thread's work on two cores (04.82 onwards)
 
-Status: **approved, not started** (2026-11-06, after 04.81). Goes with the profiler keeping every
+Status: **in progress, paused** (2026-11-06): 04.82 shipped; the 04.83 back end is written and kept in `wip/` (see `wip/README.md`), with a hang and a crash at exit still to fix. Goes with the profiler keeping every
 game's profile (below), which ships first.
 
 ## Why

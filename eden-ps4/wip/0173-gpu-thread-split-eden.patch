@@ -1,0 +1,1310 @@
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 6883a11c69..8e5f84598b 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -93,6 +93,8 @@ add_library(video_core STATIC
+     fence_manager.h
+     gpu.cpp
+     gpu.h
++    gpu_split.cpp
++    gpu_split.h
+     gpu_thread.cpp
+     gpu_thread.h
+     guest_memory.h
+diff --git a/src/video_core/control/channel_state.cpp b/src/video_core/control/channel_state.cpp
+index 12a452dfc0..c033b27eee 100644
+--- a/src/video_core/control/channel_state.cpp
++++ b/src/video_core/control/channel_state.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include "common/assert.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dma_pusher.h"
+ #include "video_core/engines/fermi_2d.h"
+@@ -55,6 +56,10 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
+     ASSERT(memory_manager);
+     program_id = program_id_;
+     payload.emplace(system, *memory_manager, *this);
++    if (VideoCommon::GpuSplitEnabled()) {
++        payload->shadow_maxwell_3d = std::make_unique<Engines::Maxwell3D>(*memory_manager);
++        payload->maxwell_3d.split_shadow = payload->shadow_maxwell_3d.get();
++    }
+     BindNvkDefaultSubchannels(*payload);
+     initialized = true;
+ }
+@@ -70,4 +75,17 @@ void ChannelState::BindRasterizer(VideoCore::RasterizerInterface* rasterizer) {
+     //payload->nv01_timer.BindRasterizer(rasterizer);
+ }
+ 
++void ChannelState::BindSplitRasterizers(VideoCore::RasterizerInterface* proxy, VideoCore::RasterizerInterface* real) {
++    payload->dma_pusher.BindRasterizer(proxy);
++    memory_manager->BindRasterizer(real);
++    payload->maxwell_3d.BindRasterizer(proxy);
++    payload->fermi_2d.BindRasterizer(real);
++    payload->kepler_memory.BindRasterizer(real);
++    payload->kepler_compute.BindRasterizer(real);
++    payload->maxwell_dma.BindRasterizer(real);
++    if (payload->shadow_maxwell_3d) {
++        payload->shadow_maxwell_3d->BindRasterizer(real);
++    }
++}
++
+ } // namespace Tegra::Control
+diff --git a/src/video_core/control/channel_state.h b/src/video_core/control/channel_state.h
+index d1802ca415..1e1c0a4c09 100644
+--- a/src/video_core/control/channel_state.h
++++ b/src/video_core/control/channel_state.h
+@@ -38,6 +38,9 @@ struct ChannelState {
+     void Init(Core::System& system, u64 program_id);
+ 
+     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
++    /// (04.83, the split) the front end's engines (the 3D engine, DmaPusher, the puller through it)
++    /// to the proxy, the ones the back end runs and the shadow to the real rasterizer
++    void BindSplitRasterizers(VideoCore::RasterizerInterface* proxy, VideoCore::RasterizerInterface* real);
+ 
+     struct Payload {
+         explicit Payload(Core::System& system, MemoryManager& memory_manager, ChannelState& channel_state);
+@@ -55,8 +58,16 @@ struct ChannelState {
+         /// NV01 Timer
+         Engines::Nv01Timer nv01_timer;
+         DmaPusher dma_pusher;
++        /// (PS4 04.83, the GPU thread split: video_core/gpu_split.h) the 3D engine as the back end
++        /// sees it, which the rasterizer and its caches read; null with the split off
++        std::unique_ptr<Engines::Maxwell3D> shadow_maxwell_3d;
+     };
+     std::optional<Payload> payload;
++
++    /// (04.83) the 3D engine the renderer reads: the shadow with the GPU thread split, else the engine
++    Engines::Maxwell3D& RendererMaxwell3D() {
++        return payload->shadow_maxwell_3d ? *payload->shadow_maxwell_3d : payload->maxwell_3d;
++    }
+     MemoryManager* memory_manager = nullptr;
+     /// Keeps memory_manager alive while the channel exists: its address space (nvhost_as_gpu) can
+     /// be closed while the GPU thread still runs commands the channel was given, as a program does
+diff --git a/src/video_core/control/channel_state_cache.cpp b/src/video_core/control/channel_state_cache.cpp
+index bd794d939a..a7ded6ce44 100644
+--- a/src/video_core/control/channel_state_cache.cpp
++++ b/src/video_core/control/channel_state_cache.cpp
+@@ -9,7 +9,8 @@
+ namespace VideoCommon {
+ 
+ ChannelInfo::ChannelInfo(Tegra::Control::ChannelState& channel_state)
+-    : maxwell3d{channel_state.payload->maxwell_3d}
++    // (04.83, the GPU thread split: the shadow, which the back end keeps up to date)
++    : maxwell3d{channel_state.RendererMaxwell3D()}
+     , kepler_compute{channel_state.payload->kepler_compute}
+     , gpu_memory{*channel_state.memory_manager}
+     , program_id{channel_state.program_id}
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index f6297fe815..c21a8d15d0 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -7,6 +7,7 @@
+ #include "common/ps4_perf.h"
+ #include "common/settings.h"
+ #include "core/core.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/dma_pusher.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu.h"
+@@ -81,7 +82,14 @@ bool DmaPusher::Step() {
+             const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
+             if (kepler_payload || macro_payload) {
+                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
+-                subchannels[dma_state.subchannel]->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
++                const bool dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
++                if (kepler_payload && VideoCommon::DeferToGpuBackend()) {
++                    // (04.83, the split: the compute engine's methods run on the back end, which
++                    // sets this as each runs)
++                    split_dirty[dma_state.subchannel] = dirty;
++                } else {
++                    subchannels[dma_state.subchannel]->current_dirty = dirty;
++                }
+             }
+         }
+         const bool use_safe = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
+@@ -195,9 +203,14 @@ size_t DmaPusher::SinkRun(std::span<const CommandHeader> commands, size_t index)
+     // (04.10) The 3D engine's writes go straight into its registers, the run's words all at once
+     // (Maxwell3D::SinkWriteRun: what its sink's replay does with them, without the sink)
+     const bool direct = subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D;
++    // (04.83, the split: another engine's sink is the back end's, the run's writes sent there at once)
++    const bool to_backend = !direct && VideoCommon::DeferToGpuBackend();
++    std::vector<std::pair<u32, u32>> backend_sink;
+     const u32 first_method = method;
+     while (count != 0 && i < end && !non_incrementing && !engine->execution_mask[method]) {
+-        if (!direct) {
++        if (to_backend) {
++            backend_sink.emplace_back(method, commands[i].argument);
++        } else if (!direct) {
+             engine->method_sink.emplace_back(method, commands[i].argument);
+         }
+         ++i;
+@@ -208,6 +221,11 @@ size_t DmaPusher::SinkRun(std::span<const CommandHeader> commands, size_t index)
+         non_incrementing = dma_increment_once;
+     }
+     const size_t run = i - index;
++    if (!backend_sink.empty()) {
++        VideoCommon::RunOnGpuBackend([engine, sink = std::move(backend_sink)] {
++            engine->method_sink.insert(engine->method_sink.end(), sink.begin(), sink.end());
++        });
++    }
+     if (direct && run != 0) {
+         // (what was sunk before, first: the order of the writes)
+         engine->ConsumeSink(system);
+@@ -237,15 +255,43 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
+ }
+ 
+ void DmaPusher::CallMethod(u32 argument) {
++    const bool defer = VideoCommon::DeferToGpuBackend();
+     if (dma_state.method < non_puller_methods) {
+-        puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
++        const Engines::Puller::MethodCall call{
+             dma_state.method,
+             argument,
+             dma_state.subchannel,
+             dma_state.method_count,
+-        });
++        };
++        // (04.83, the split: the puller's methods on the back end, but BindObject - the
++        // subchannels' engines, which this dispatches by)
++        if (defer && dma_state.method != 0) {
++            VideoCommon::RunOnGpuBackend([this, call] { puller.CallPullerMethod(*this, call); });
++        } else {
++            puller.CallPullerMethod(*this, call);
++        }
+     } else {
+         auto subchannel = subchannels[dma_state.subchannel];
++        if (defer && subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
++            // (04.83, the split: the other engines' methods whole on the back end, their sink too)
++            const u32 method = dma_state.method;
++            if (!subchannel->execution_mask[method]) {
++                VideoCommon::RunOnGpuBackend([subchannel, method, argument] {
++                    subchannel->method_sink.emplace_back(method, argument);
++                });
++            } else {
++                const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
++                const bool last = dma_state.is_last_call;
++                const bool dirty = split_dirty[dma_state.subchannel];
++                VideoCommon::RunOnGpuBackend([this, subchannel, method, argument, segment, last, dirty] {
++                    subchannel->ConsumeSink(system);
++                    subchannel->current_dma_segment = segment;
++                    subchannel->current_dirty = dirty;
++                    subchannel->CallMethod(system, method, argument, last);
++                });
++            }
++            return;
++        }
+         if (!subchannel->execution_mask[dma_state.method]) {
+             subchannel->method_sink.emplace_back(dma_state.method, argument);
+         } else {
+@@ -257,10 +303,33 @@ void DmaPusher::CallMethod(u32 argument) {
+ }
+ 
+ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
++    const bool defer = VideoCommon::DeferToGpuBackend();
+     if (dma_state.method < non_puller_methods) {
+-        puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
++        if (defer && dma_state.method != 0) {
++            // (04.83, the split: as CallMethod's)
++            std::vector<u32> data(base_start, base_start + num_methods);
++            VideoCommon::RunOnGpuBackend([this, method = dma_state.method, sub = dma_state.subchannel,
++                                          pending = dma_state.method_count, data = std::move(data)] {
++                puller.CallMultiMethod(*this, method, sub, data.data(), u32(data.size()), pending);
++            });
++        } else {
++            puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
++        }
+     } else {
+         auto subchannel = subchannels[dma_state.subchannel];
++        if (defer && subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
++            std::vector<u32> data(base_start, base_start + num_methods);
++            const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
++            const bool dirty = split_dirty[dma_state.subchannel];
++            VideoCommon::RunOnGpuBackend([this, subchannel, method = dma_state.method, pending = dma_state.method_count,
++                                          segment, dirty, data = std::move(data)] {
++                subchannel->ConsumeSink(system);
++                subchannel->current_dma_segment = segment;
++                subchannel->current_dirty = dirty;
++                subchannel->CallMultiMethod(system, method, data.data(), u32(data.size()), pending);
++            });
++            return;
++        }
+         subchannel->ConsumeSink(system);
+         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+         subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index c39f2aa831..2e83f404ad 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -176,6 +176,9 @@ public:
+     DmaState dma_state{};
+     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
+     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
++    /// (04.83, the GPU thread split) the compute engine's inline data's dirtiness, as the front end
++    /// found it, for its methods run on the back end
++    std::array<bool, max_subchannels> split_dirty{};
+ 
+     Engines::Puller puller;
+     std::mutex sync_mutex;
+diff --git a/src/video_core/engines/engine_upload.cpp b/src/video_core/engines/engine_upload.cpp
+index ba21eec4c4..1122b0297c 100644
+--- a/src/video_core/engines/engine_upload.cpp
++++ b/src/video_core/engines/engine_upload.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "common/algorithm.h"
+ #include "common/assert.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/engines/engine_upload.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/memory_manager.h"
+@@ -48,6 +49,18 @@ void State::ProcessData(const u32* data, size_t num_data) {
+ }
+ 
+ void State::ProcessData(std::span<const u8> read_buffer) {
++    if (VideoCommon::DeferToGpuBackend()) {
++        // (04.83, the split: in order with the back end's work)
++        std::vector<u8> data(read_buffer.begin(), read_buffer.end());
++        VideoCommon::RunOnGpuBackend([this, r = regs, linear = is_linear, data = std::move(data)] {
++            ProcessDataWith(r, linear, data);
++        });
++        return;
++    }
++    ProcessDataWith(regs, is_linear, read_buffer);
++}
++
++void State::ProcessDataWith(const Registers& regs, bool is_linear, std::span<const u8> read_buffer) {
+     const GPUVAddr address{regs.dest.Address()};
+     if (is_linear) {
+         for (size_t line = 0; line < regs.line_count; ++line) {
+diff --git a/src/video_core/engines/engine_upload.h b/src/video_core/engines/engine_upload.h
+index 21bf8aeb46..a8c817cbc6 100644
+--- a/src/video_core/engines/engine_upload.h
++++ b/src/video_core/engines/engine_upload.h
+@@ -79,6 +79,9 @@ public:
+ 
+ private:
+     void ProcessData(std::span<const u8> read_buffer);
++    /// (04.83) the write itself, with the registers and layout given (the GPU thread split runs it
++    /// on the back end, with the registers as they were)
++    void ProcessDataWith(const Registers& r, bool linear, std::span<const u8> read_buffer);
+ 
+     u32 write_offset = 0;
+     u32 copy_size = 0;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 493fd0d518..0f12399dc9 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -13,6 +13,7 @@
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -486,6 +487,18 @@ void Maxwell3D::ProcessFirmwareCall4() {
+ 
+ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_query) {
+     const GPUVAddr sequence_address{regs.report_semaphore.Address()};
++    if (VideoCommon::DeferToGpuBackend()) {
++        // (04.83, the split: the result in order with the back end's work)
++        VideoCommon::RunOnGpuBackend([mm = &memory_manager, sys = &system, sequence_address, payload, long_query] {
++            if (long_query) {
++                mm->Write<u64>(sequence_address + sizeof(u64), sys->GPU().GetTicks());
++                mm->Write<u64>(sequence_address, payload);
++            } else {
++                mm->Write<u32>(sequence_address, static_cast<u32>(payload));
++            }
++        });
++        return;
++    }
+     if (long_query) {
+         memory_manager.Write<u64>(sequence_address + sizeof(u64), system.GPU().GetTicks());
+         memory_manager.Write<u64>(sequence_address, payload);
+@@ -641,7 +654,16 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+     // small amount, 0.1 MiB a second)
+     Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.cb_bytes, copy_size);
+ #endif
+-    memory_manager.WriteBlockCached(address, start_base, copy_size);
++    if (VideoCommon::DeferToGpuBackend()) {
++        // (04.83, the split: in order with the draws before it, which the back end may not have
++        // read their constant buffers for yet)
++        std::vector<u32> data(start_base, start_base + amount);
++        VideoCommon::RunOnGpuBackend([mm = &memory_manager, address, data = std::move(data), copy_size] {
++            mm->WriteBlockCached(address, data.data(), copy_size);
++        });
++    } else {
++        memory_manager.WriteBlockCached(address, start_base, copy_size);
++    }
+ 
+     // Increment the current buffer position.
+     regs.const_buffer.offset += static_cast<u32>(copy_size);
+@@ -685,6 +707,10 @@ void Maxwell3D::SetHLEReplacementAttributeType(u32 bank, u32 offset,
+                                                HLEReplacementAttributeType name) {
+     const u64 key = (static_cast<u64>(bank) << 32) | offset;
+     replace_table.emplace(key, name);
++    if (split_shadow != nullptr) {
++        // (04.83, the split: the back end's shader environments read the shadow's)
++        VideoCommon::RunOnGpuBackend([shadow = split_shadow, key, name] { shadow->replace_table.emplace(key, name); });
++    }
+ }
+ 
+ } // namespace Tegra::Engines
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index c1a162a4a9..3b3d6fc2e0 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3166,6 +3166,10 @@ public:
+ 
+     DrawManager draw_manager;
+ 
++    /// (PS4 04.83, the GPU thread split: video_core/gpu_split.h) this front end engine's shadow,
++    /// which the back end's rasterizer reads (null with the split off, and on the shadow itself)
++    Maxwell3D* split_shadow = nullptr;
++
+     GPUVAddr GetMacroAddress(size_t index) const {
+         size_t base = 0;
+         for (const auto& [addr, count] : macro_segments) {
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index acc7107955..38a6a853f7 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -12,6 +12,7 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "common/thread.h"
+ #include "common/assert.h"
+ #include "common/settings.h"
+ #include "common/settings_enums.h"
+@@ -21,6 +22,7 @@
+ #include "core/frontend/graphics_context.h"
+ #include "core/hle/service/nvdrv/nvdata.h"
+ #include "core/perf_stats.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/cdma_pusher.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/control/scheduler.h"
+@@ -67,6 +69,11 @@ struct GPU::Impl {
+         // the channel scheduler (below the renderer) went first, freeing the 3D engines whose dirty
+         // flags the Vulkan state tracker points to; the renderer's last submission then wrote to
+         // them (AddressSanitizer: heap-use-after-free in StateTracker::InvalidateCommandBufferState)
++        // (04.83) the split's back end stopped before, as it runs the renderer's work
++        if (split) {
++            split->backend.Stop();
++            VideoCommon::SetActiveGpuSplit(nullptr);
++        }
+         renderer.reset();
+     }
+ 
+@@ -83,7 +90,8 @@ struct GPU::Impl {
+             ASSERT(it != channels.end());
+             bound_channel = channel_id;
+             current_channel = it->second.get();
+-            renderer->ReadRasterizer()->BindChannel(*current_channel);
++            // (04.83, the split: the back end binds it, in order with the work before)
++            (split ? split->proxy.get() : renderer->ReadRasterizer())->BindChannel(*current_channel);
+         }
+     }
+ 
+@@ -93,6 +101,12 @@ struct GPU::Impl {
+ 
+     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
+         to_init.Init(system, program_id);
++        if (split) {
++            // (04.83, the split: the front end's engines to the proxy, the shadow to the real one)
++            to_init.BindSplitRasterizers(split->proxy.get(), renderer->ReadRasterizer());
++            split->proxy->InitializeChannel(to_init);
++            return;
++        }
+         to_init.BindRasterizer(renderer->ReadRasterizer());
+         renderer->ReadRasterizer()->InitializeChannel(to_init);
+     }
+@@ -108,26 +122,37 @@ struct GPU::Impl {
+     /// Binds a renderer to the GPU.
+     void BindRenderer(std::unique_ptr<VideoCore::RendererBase> renderer_) {
+         renderer = std::move(renderer_);
++        if (VideoCommon::GpuSplitEnabled()) {
++            // (04.83) the GPU thread split: its back end and the proxy (started with the GPU)
++            split = std::make_unique<VideoCommon::GpuSplit>();
++            split->proxy = std::make_unique<VideoCommon::RasterizerProxy>(*renderer->ReadRasterizer(), split->backend);
++        }
+         system.Host1x().memory_manager.BindInterface(renderer->ReadRasterizer());
+         system.Host1x().gmmu_manager.BindRasterizer(renderer->ReadRasterizer());
+     }
+ 
++    /// (04.83) the rasterizer for this thread: the split's proxy on its front end (the GPU thread),
++    /// the real one anywhere else or with the split off
++    VideoCore::RasterizerInterface* FrontRasterizer() {
++        return split && VideoCommon::g_gpu_front_thread ? split->proxy.get() : renderer->ReadRasterizer();
++    }
++
+     /// Flush all current written commands into the host GPU for execution.
+     void FlushCommands() {
+-        renderer->ReadRasterizer()->FlushCommands();
++        FrontRasterizer()->FlushCommands();
+     }
+ 
+     /// Synchronizes CPU writes with Host GPU memory.
+     void InvalidateGPUCache() {
+         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
+-            renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
++            FrontRasterizer()->OnCacheInvalidation(address, size);
+         });
+         system.GatherGPUDirtyMemory(callback_writes);
+     }
+ 
+     /// Signal the ending of command list.
+     void OnCommandListEnd() {
+-        renderer->ReadRasterizer()->ReleaseFences(false);
++        FrontRasterizer()->ReleaseFences(false);
+         Settings::UpdateGPUAccuracy();
+     }
+ 
+@@ -184,11 +209,24 @@ struct GPU::Impl {
+     /// core timing events.
+     void Start() {
+         Settings::UpdateGPUAccuracy();
++        if (split) {
++            split->backend.Start([this] {
++                Common::SetCurrentThreadName("GPUBackend");
++                Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
++                system.RegisterHostThread();
++            });
++            VideoCommon::SetActiveGpuSplit(split.get());
++            LOG_WARNING(HW_GPU, "GPU thread split on: the front end on the GPU thread, the back end on GPUBackend");
++        }
+         gpu_thread.StartThread(*renderer, renderer->Context(), scheduler);
+     }
+ 
+     void NotifyShutdown() {
+         gpu_thread.NotifyShutdown();
++        if (split) {
++            // (the front end stopped: the back end's queue dropped, as the GPU thread's is)
++            split->backend.Stop();
++        }
+         std::unique_lock lk{sync_mutex};
+         shutting_down.store(true, std::memory_order::relaxed);
+         sync_cv.notify_all();
+@@ -356,6 +394,8 @@ struct GPU::Impl {
+ 
+     Tegra::Control::Scheduler scheduler;
+     ::Common::unordered_map<s32, std::shared_ptr<Tegra::Control::ChannelState>> channels;
++    /// (04.83) the GPU thread split's back end and proxy, with EDEN_PS4_GPU_SPLIT=1
++    std::unique_ptr<VideoCommon::GpuSplit> split;
+     Tegra::Control::ChannelState* current_channel;
+     s32 bound_channel{-1};
+ 
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+new file mode 100644
+index 0000000000..2bde2977b3
+--- /dev/null
++++ b/src/video_core/gpu_split.cpp
+@@ -0,0 +1,491 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// (PS4 04.83) The GPU thread split: see gpu_split.h and eden-ps4 docs/gpu-thread-split.md
++
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <string_view>
++
++#if defined(__x86_64__)
++#include <immintrin.h>
++#endif
++
++#include "common/assert.h"
++#include "common/ps4_perf.h"
++#include "video_core/control/channel_state.h"
++#include "video_core/engines/maxwell_3d.h"
++#include "video_core/gpu_split.h"
++
++namespace VideoCommon {
++
++bool GpuSplitEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_PS4_GPU_SPLIT");
++        return value != nullptr && std::string_view{value} == "1";
++    }();
++    return enabled;
++}
++
++namespace {
++std::atomic<GpuSplit*> g_split{nullptr};
++} // namespace
++
++GpuSplit* ActiveGpuSplit() {
++    return g_split.load(std::memory_order_acquire);
++}
++
++void SetActiveGpuSplit(GpuSplit* split) {
++    g_split.store(split, std::memory_order_release);
++}
++
++void RunOnGpuBackend(std::function<void()>&& task) {
++    GpuSplit* const split = ActiveGpuSplit();
++    if (split == nullptr || !g_gpu_front_thread) {
++        task();
++        return;
++    }
++    split->backend.Push(std::move(task));
++}
++
++// ---- the back end ----
++
++GpuBackend::GpuBackend() {
++    batch.reserve(kBatch);
++}
++
++GpuBackend::~GpuBackend() {
++    Stop();
++}
++
++void GpuBackend::Start(std::function<void()> on_start) {
++    thread = std::jthread([this, on_start = std::move(on_start)](std::stop_token stop_token) {
++        thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
++        if (on_start) {
++            on_start();
++        }
++        Run(stop_token);
++    });
++}
++
++void GpuBackend::Push(Task&& task) {
++    batch.push_back(std::move(task));
++    if (batch.size() >= kBatch) {
++        Publish();
++    }
++}
++
++void GpuBackend::Publish() {
++    if (batch.empty()) {
++        return;
++    }
++    const size_t count = batch.size();
++    {
++        std::unique_lock lock{mutex};
++        // (bounded: the front end can't run frames ahead of the back end)
++        done_cv.wait(lock, [&] { return queued_tasks + count <= kMaxQueuedTasks || queue.empty() || !thread.joinable(); });
++        queue.push_back(std::move(batch));
++        queued_tasks += count;
++        published.fetch_add(1, std::memory_order_release);
++    }
++    batches.fetch_add(1, std::memory_order_relaxed);
++    work_cv.notify_one();
++    batch = {};
++    batch.reserve(kBatch);
++}
++
++void GpuBackend::Drain() {
++    ASSERT(!OnBackend());
++    Publish();
++    std::unique_lock lock{mutex};
++    done_cv.wait(lock, [&] { return (queue.empty() && !running_task) || !thread.joinable(); });
++    drains.fetch_add(1, std::memory_order_relaxed);
++}
++
++void GpuBackend::Stop() {
++    if (!thread.joinable()) {
++        return;
++    }
++    thread.request_stop();
++    work_cv.notify_all();
++    thread.join();
++    std::scoped_lock lock{mutex};
++    queue.clear();
++    queued_tasks = 0;
++    running_task = false;
++    done_cv.notify_all();
++}
++
++void GpuBackend::Run(std::stop_token stop_token) {
++    while (!stop_token.stop_requested()) {
++        std::vector<Task> tasks;
++        {
++            std::unique_lock lock{mutex};
++            if (queue.empty()) {
++                // (a short spin first, as the GPU thread does for its own queue: the next batch
++                // usually comes within microseconds, a sleeping thread's wake-up takes hundreds)
++                lock.unlock();
++                const u64 seen = taken.load(std::memory_order_relaxed);
++                const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(500);
++                while (published.load(std::memory_order_acquire) == seen && !stop_token.stop_requested() &&
++                       std::chrono::steady_clock::now() < spin_end) {
++#if defined(__x86_64__)
++                    for (int i = 0; i < 16; i++) {
++                        _mm_pause();
++                    }
++#endif
++                }
++                lock.lock();
++                work_cv.wait(lock, stop_token, [&] { return !queue.empty(); });
++                if (stop_token.stop_requested()) {
++                    return;
++                }
++            }
++            tasks = std::move(queue.front());
++            queue.pop_front();
++            taken.fetch_add(1, std::memory_order_relaxed);
++            running_task = true;
++        }
++        const u64 start = Common::PS4Perf::Ticks();
++        for (Task& task : tasks) {
++            task();
++        }
++        busy_ticks.fetch_add(Common::PS4Perf::Ticks() - start, std::memory_order_relaxed);
++        tasks_run.fetch_add(tasks.size(), std::memory_order_relaxed);
++        {
++            std::scoped_lock lock{mutex};
++            queued_tasks -= tasks.size();
++            running_task = false;
++        }
++        done_cv.notify_all();
++    }
++}
++
++// ---- the proxy ----
++
++RasterizerProxy::RasterizerProxy(VideoCore::RasterizerInterface& real_, GpuBackend& backend_)
++    : real{real_}, backend{backend_} {}
++
++RasterizerProxy::~RasterizerProxy() = default;
++
++template <typename F>
++void RasterizerProxy::Forward(F&& f) {
++    if (!g_gpu_front_thread) {
++        f(real);
++        return;
++    }
++    backend.Push([this, f = std::forward<F>(f)]() mutable { f(real); });
++}
++
++void RasterizerProxy::SyncState() {
++    if (!g_gpu_front_thread) {
++        return;
++    }
++    Shadowed* const s = bound;
++    if (s == nullptr || s->front == nullptr || s->shadow == nullptr) {
++        return;
++    }
++    using Maxwell = Tegra::Engines::Maxwell3D;
++    Maxwell& front = *s->front;
++    const u32* const now = front.regs.reg_array.data();
++    u32* const sent = s->sent.get();
++    // the registers that changed: compared eight bytes at a time, the words of a differing pair
++    // looked at alone
++    std::vector<std::pair<u16, u32>> changed;
++    constexpr size_t n = Maxwell::Regs::NUM_REGS;
++    for (size_t i = 0; i + 1 < n; i += 2) {
++        u64 a, b;
++        std::memcpy(&a, now + i, sizeof(a));
++        std::memcpy(&b, sent + i, sizeof(b));
++        if (a == b) {
++            continue;
++        }
++        for (size_t j = i; j < i + 2; j++) {
++            if (now[j] != sent[j]) {
++                changed.emplace_back(static_cast<u16>(j), now[j]);
++                sent[j] = now[j];
++            }
++        }
++    }
++    if constexpr ((n & 1) != 0) {
++        if (now[n - 1] != sent[n - 1]) {
++            changed.emplace_back(static_cast<u16>(n - 1), now[n - 1]);
++            sent[n - 1] = now[n - 1];
++        }
++    }
++    const Maxwell::DirtyState::Flags flags = front.dirty.flags;
++    front.dirty.flags.reset();
++    const bool key_changed = front.dirty.pipeline_key_changed;
++    front.dirty.pipeline_key_changed = false;
++    auto draw_state = front.draw_manager.draw_state;
++    const auto draw_texture_state = front.draw_manager.draw_texture_state;
++    const auto indirect_state = front.draw_manager.indirect_state;
++    const auto engine_state = front.engine_state;
++    Maxwell* const shadow = s->shadow;
++    backend.Push([shadow, changed = std::move(changed), flags, key_changed, draw_state = std::move(draw_state),
++                  draw_texture_state, indirect_state, engine_state]() mutable {
++        auto& dirty = shadow->dirty;
++        for (const auto& [index, value] : changed) {
++            // (as ProcessDirtyRegisters: a register of the pipeline key with a new value)
++            if (dirty.pipeline_key_regs[index] != 0 && shadow->regs.reg_array[index] != value) {
++                dirty.pipeline_key_changed = true;
++            }
++            shadow->regs.reg_array[index] = value;
++        }
++        dirty.flags |= flags;
++        if (key_changed) {
++            dirty.pipeline_key_changed = true;
++        }
++        shadow->draw_manager.draw_state = std::move(draw_state);
++        shadow->draw_manager.draw_texture_state = draw_texture_state;
++        shadow->draw_manager.indirect_state = indirect_state;
++        shadow->engine_state = engine_state;
++    });
++}
++
++void RasterizerProxy::Draw(bool is_indexed, u32 instance_count) {
++    SyncState();
++    Forward([is_indexed, instance_count](VideoCore::RasterizerInterface& r) { r.Draw(is_indexed, instance_count); });
++}
++
++void RasterizerProxy::DrawIndirect() {
++    SyncState();
++    Forward([](VideoCore::RasterizerInterface& r) { r.DrawIndirect(); });
++}
++
++void RasterizerProxy::DrawTexture() {
++    SyncState();
++    Forward([](VideoCore::RasterizerInterface& r) { r.DrawTexture(); });
++}
++
++void RasterizerProxy::Clear(u32 layer_count) {
++    SyncState();
++    Forward([layer_count](VideoCore::RasterizerInterface& r) { r.Clear(layer_count); });
++}
++
++void RasterizerProxy::DispatchCompute() {
++    SyncState();
++    Forward([](VideoCore::RasterizerInterface& r) { r.DispatchCompute(); });
++}
++
++void RasterizerProxy::ResetCounter(VideoCommon::QueryType type) {
++    SyncState();
++    Forward([type](VideoCore::RasterizerInterface& r) { r.ResetCounter(type); });
++}
++
++void RasterizerProxy::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type, VideoCommon::QueryPropertiesFlags flags,
++                            u32 payload, u32 subreport) {
++    SyncState();
++    Forward([=](VideoCore::RasterizerInterface& r) { r.Query(gpu_addr, type, flags, payload, subreport); });
++}
++
++void RasterizerProxy::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) {
++    Shadowed* const s = g_gpu_front_thread ? bound : nullptr;
++    if (s != nullptr && s->front != nullptr && s->shadow != nullptr) {
++        // (the 3D engine's binding table, which ProcessCBBind has just set, to the shadow with it)
++        const auto entry = s->front->state.shader_stages[stage].const_buffers[index];
++        Tegra::Engines::Maxwell3D* const shadow = s->shadow;
++        backend.Push([this, shadow, entry, stage, index, gpu_addr, size] {
++            shadow->state.shader_stages[stage].const_buffers[index] = entry;
++            real.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
++        });
++        return;
++    }
++    Forward([=](VideoCore::RasterizerInterface& r) { r.BindGraphicsUniformBuffer(stage, index, gpu_addr, size); });
++}
++
++void RasterizerProxy::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
++    Shadowed* const s = g_gpu_front_thread ? bound : nullptr;
++    if (s != nullptr && s->front != nullptr && s->shadow != nullptr) {
++        const auto entry = s->front->state.shader_stages[stage].const_buffers[index];
++        Tegra::Engines::Maxwell3D* const shadow = s->shadow;
++        backend.Push([this, shadow, entry, stage, index] {
++            shadow->state.shader_stages[stage].const_buffers[index] = entry;
++            real.DisableGraphicsUniformBuffer(stage, index);
++        });
++        return;
++    }
++    Forward([=](VideoCore::RasterizerInterface& r) { r.DisableGraphicsUniformBuffer(stage, index); });
++}
++
++void RasterizerProxy::SignalFence(std::function<void()>&& func) {
++    Forward([func = std::move(func)](VideoCore::RasterizerInterface& r) mutable { r.SignalFence(std::move(func)); });
++}
++
++void RasterizerProxy::SyncOperation(std::function<void()>&& func) {
++    Forward([func = std::move(func)](VideoCore::RasterizerInterface& r) mutable { r.SyncOperation(std::move(func)); });
++}
++
++void RasterizerProxy::SignalSyncPoint(u32 value) {
++    Forward([value](VideoCore::RasterizerInterface& r) { r.SignalSyncPoint(value); });
++}
++
++void RasterizerProxy::SignalReference() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.SignalReference(); });
++}
++
++void RasterizerProxy::ReleaseFences(bool force) {
++    Forward([force](VideoCore::RasterizerInterface& r) { r.ReleaseFences(force); });
++}
++
++void RasterizerProxy::FlushAll() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.FlushAll(); });
++}
++
++void RasterizerProxy::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    Forward([=](VideoCore::RasterizerInterface& r) { r.FlushRegion(addr, size, which); });
++}
++
++bool RasterizerProxy::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    if (g_gpu_front_thread) {
++        backend.Drain();
++    }
++    return real.MustFlushRegion(addr, size, which);
++}
++
++VideoCore::RasterizerDownloadArea RasterizerProxy::GetFlushArea(DAddr addr, u64 size) {
++    if (g_gpu_front_thread) {
++        backend.Drain();
++    }
++    return real.GetFlushArea(addr, size);
++}
++
++void RasterizerProxy::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    Forward([=](VideoCore::RasterizerInterface& r) { r.InvalidateRegion(addr, size, which); });
++}
++
++void RasterizerProxy::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
++    std::vector<std::pair<DAddr, std::size_t>> copy(sequences.begin(), sequences.end());
++    Forward([copy = std::move(copy)](VideoCore::RasterizerInterface& r) { r.InnerInvalidation(copy); });
++}
++
++void RasterizerProxy::OnCacheInvalidation(PAddr addr, u64 size) {
++    Forward([=](VideoCore::RasterizerInterface& r) { r.OnCacheInvalidation(addr, size); });
++}
++
++bool RasterizerProxy::OnCPUWrite(PAddr addr, u64 size) {
++    if (g_gpu_front_thread) {
++        backend.Drain();
++    }
++    return real.OnCPUWrite(addr, size);
++}
++
++void RasterizerProxy::InvalidateGPUCache() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.InvalidateGPUCache(); });
++}
++
++void RasterizerProxy::UnmapMemory(DAddr addr, u64 size) {
++    Forward([=](VideoCore::RasterizerInterface& r) { r.UnmapMemory(addr, size); });
++}
++
++void RasterizerProxy::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
++    Forward([=](VideoCore::RasterizerInterface& r) { r.ModifyGPUMemory(as_id, addr, size); });
++}
++
++void RasterizerProxy::FlushAndInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
++    Forward([=](VideoCore::RasterizerInterface& r) { r.FlushAndInvalidateRegion(addr, size, which); });
++}
++
++void RasterizerProxy::WaitForIdle() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.WaitForIdle(); });
++}
++
++void RasterizerProxy::FragmentBarrier() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.FragmentBarrier(); });
++}
++
++void RasterizerProxy::TiledCacheBarrier() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.TiledCacheBarrier(); });
++}
++
++void RasterizerProxy::FlushCommands() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.FlushCommands(); });
++}
++
++void RasterizerProxy::TickFrame() {
++    Forward([](VideoCore::RasterizerInterface& r) { r.TickFrame(); });
++}
++
++bool RasterizerProxy::AccelerateConditionalRendering() {
++    if (g_gpu_front_thread) {
++        // (the queries before it done, and the registers it reads with them; the 3D engine reads
++        // the condition from memory after this when it isn't accelerated)
++        SyncState();
++        backend.Drain();
++    }
++    return real.AccelerateConditionalRendering();
++}
++
++bool RasterizerProxy::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
++                                            const Tegra::Engines::Fermi2D::Surface& dst,
++                                            const Tegra::Engines::Fermi2D::Config& copy_config) {
++    if (g_gpu_front_thread) {
++        backend.Drain();
++    }
++    return real.AccelerateSurfaceCopy(src, dst, copy_config);
++}
++
++Tegra::Engines::AccelerateDMAInterface& RasterizerProxy::AccessAccelerateDMA() {
++    if (g_gpu_front_thread) {
++        backend.Drain();
++    }
++    return real.AccessAccelerateDMA();
++}
++
++void RasterizerProxy::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory) {
++    std::vector<u8> copy(memory.begin(), memory.end());
++    Forward([address, copy_size, copy = std::move(copy)](VideoCore::RasterizerInterface& r) {
++        r.AccelerateInlineToMemory(address, copy_size, copy);
++    });
++}
++
++void RasterizerProxy::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
++                                        const VideoCore::DiskResourceLoadCallback& callback) {
++    real.LoadDiskResources(title_id, stop_loading, callback);
++}
++
++void RasterizerProxy::InitializeChannel(Tegra::Control::ChannelState& channel) {
++    // (at the channel's creation, before it runs: as the real rasterizer is called now)
++    real.InitializeChannel(channel);
++    auto& payload = *channel.payload;
++    std::scoped_lock lock{channels_mutex};
++    Shadowed& s = channels[channel.bind_id];
++    s.front = &payload.maxwell_3d;
++    s.shadow = payload.shadow_maxwell_3d.get();
++    if (s.shadow != nullptr) {
++        // the renderer's dirty tables are the shadow's (the caches read it): the front end's
++        // register writes set the same flags
++        s.front->dirty.tables = s.shadow->dirty.tables;
++        s.sent = std::make_unique<u32[]>(Tegra::Engines::Maxwell3D::Regs::NUM_REGS);
++        std::memcpy(s.sent.get(), s.shadow->regs.reg_array.data(),
++                    sizeof(u32) * Tegra::Engines::Maxwell3D::Regs::NUM_REGS);
++    }
++}
++
++void RasterizerProxy::BindChannel(Tegra::Control::ChannelState& channel) {
++    {
++        std::scoped_lock lock{channels_mutex};
++        const auto it = channels.find(channel.bind_id);
++        bound = it == channels.end() ? nullptr : &it->second;
++    }
++    Tegra::Control::ChannelState* const state = &channel;
++    Forward([state](VideoCore::RasterizerInterface& r) { r.BindChannel(*state); });
++}
++
++void RasterizerProxy::ReleaseChannel(s32 channel_id) {
++    Forward([channel_id](VideoCore::RasterizerInterface& r) { r.ReleaseChannel(channel_id); });
++}
++
++void RasterizerProxy::RegisterTransformFeedback(GPUVAddr tfb_object_addr) {
++    Forward([tfb_object_addr](VideoCore::RasterizerInterface& r) { r.RegisterTransformFeedback(tfb_object_addr); });
++}
++
++bool RasterizerProxy::HasDrawTransformFeedback() {
++    if (g_gpu_front_thread) {
++        backend.Drain();
++    }
++    return real.HasDrawTransformFeedback();
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+new file mode 100644
+index 0000000000..245ec6f699
+--- /dev/null
++++ b/src/video_core/gpu_split.h
+@@ -0,0 +1,189 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// (PS4 04.83) The GPU thread's work on two threads (eden-ps4 docs/gpu-thread-split.md): the GPU
++// thread as the front end - DmaPusher fetching and decoding the command lists, the puller's
++// BindObject, the 3D engine's methods and macros - and a back end thread for everything else:
++// every rasterizer call (through RasterizerProxy, in order), the other engines' methods, the
++// puller's other methods, the 3D engine's own memory writes, the GPU thread's other commands. The
++// rasterizer and its caches read a shadow of each channel's 3D engine, which the front end brings up
++// to date (the registers that changed, the dirty flags, the draw state) before each queued
++// operation that reads it. Off (EDEN_PS4_GPU_SPLIT unset or 0): none of this exists, the GPU
++// thread runs as before.
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include "common/common_types.h"
++#include "video_core/rasterizer_interface.h"
++
++namespace Core {
++class System;
++}
++
++namespace Tegra::Engines {
++class Maxwell3D;
++}
++
++namespace VideoCommon {
++
++/// Whether the split is on (read once: EDEN_PS4_GPU_SPLIT=1)
++bool GpuSplitEnabled();
++
++/// The back end: a thread running the front end's tasks in the order they were pushed
++class GpuBackend {
++public:
++    using Task = std::function<void()>;
++
++    GpuBackend();
++    ~GpuBackend();
++
++    /// Starts the thread; `on_start` runs on it first (its name, priority, host thread registration)
++    void Start(std::function<void()> on_start);
++    /// The front end's: a task into its batch (published when the batch is full)
++    void Push(Task&& task);
++    /// The front end's: its batch to the back end
++    void Publish();
++    /// The front end's: publish, and wait until the back end has run every task so far
++    void Drain();
++    /// Stops the thread (the tasks left are dropped)
++    void Stop();
++
++    bool OnBackend() const noexcept {
++        return std::this_thread::get_id() == thread_id.load(std::memory_order_relaxed);
++    }
++
++    /// Tasks run, batches published, drains, and the TSC ticks spent running tasks (the 30 s line)
++    std::atomic<u64> tasks_run{0}, batches{0}, drains{0}, busy_ticks{0};
++
++private:
++    void Run(std::stop_token stop_token);
++
++    static constexpr size_t kBatch = 64;          // tasks a batch, at most
++    static constexpr size_t kMaxQueuedTasks = 16384;  // queued and not yet run: the front end waits
++
++    std::vector<Task> batch;  // the front end's, not yet published
++    std::mutex mutex;
++    std::condition_variable_any work_cv, done_cv;
++    std::deque<std::vector<Task>> queue;
++    size_t queued_tasks = 0;  // in `queue`
++    bool running_task = false;
++    std::atomic<u64> published{0}, taken{0};  // batches: the back end's spin watches these
++    std::atomic<std::thread::id> thread_id{};
++    std::jthread thread;
++};
++
++/// The rasterizer the front end's engines (the 3D engine, DmaPusher, the puller) are bound to: each
++/// call queued for the real one on the back end (run straight away on the back end itself), the 3D
++/// engine's shadow brought up to date first where the call reads it; a call that returns something
++/// waits for the back end to empty its queue
++class RasterizerProxy final : public VideoCore::RasterizerInterface {
++public:
++    RasterizerProxy(VideoCore::RasterizerInterface& real_, GpuBackend& backend_);
++    ~RasterizerProxy() override;
++
++    VideoCore::RasterizerInterface& Real() {
++        return real;
++    }
++
++    /// The 3D engine's state the rasterizer reads, from the bound channel's front end engine to its
++    /// shadow: the registers that changed since the last time, the dirty flags (cleared on the front
++    /// end, which only sets them), the pipeline key's flag, the draw manager's state, the engine hint
++    void SyncState();
++
++    void Draw(bool is_indexed, u32 instance_count) override;
++    void DrawIndirect() override;
++    void DrawTexture() override;
++    void Clear(u32 layer_count) override;
++    void DispatchCompute() override;
++    void ResetCounter(VideoCommon::QueryType type) override;
++    void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type, VideoCommon::QueryPropertiesFlags flags,
++               u32 payload, u32 subreport) override;
++    void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) override;
++    void DisableGraphicsUniformBuffer(size_t stage, u32 index) override;
++    void SignalFence(std::function<void()>&& func) override;
++    void SyncOperation(std::function<void()>&& func) override;
++    void SignalSyncPoint(u32 value) override;
++    void SignalReference() override;
++    void ReleaseFences(bool force = true) override;
++    void FlushAll() override;
++    void FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    bool MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
++    void InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
++    void OnCacheInvalidation(PAddr addr, u64 size) override;
++    bool OnCPUWrite(PAddr addr, u64 size) override;
++    void InvalidateGPUCache() override;
++    void UnmapMemory(DAddr addr, u64 size) override;
++    void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
++    void FlushAndInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
++    void WaitForIdle() override;
++    void FragmentBarrier() override;
++    void TiledCacheBarrier() override;
++    void FlushCommands() override;
++    void TickFrame() override;
++    bool AccelerateConditionalRendering() override;
++    bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
++                               const Tegra::Engines::Fermi2D::Config& copy_config) override;
++    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
++    void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory) override;
++    void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
++                           const VideoCore::DiskResourceLoadCallback& callback) override;
++    void InitializeChannel(Tegra::Control::ChannelState& channel) override;
++    void BindChannel(Tegra::Control::ChannelState& channel) override;
++    void ReleaseChannel(s32 channel_id) override;
++    void RegisterTransformFeedback(GPUVAddr tfb_object_addr) override;
++    bool HasDrawTransformFeedback() override;
++
++private:
++    /// Runs `f` on the real rasterizer: now on the back end, else queued
++    template <typename F>
++    void Forward(F&& f);
++
++    struct Shadowed {
++        Tegra::Engines::Maxwell3D* front = nullptr;
++        Tegra::Engines::Maxwell3D* shadow = nullptr;
++        std::unique_ptr<u32[]> sent;  // the front end's registers as last sent
++    };
++    VideoCore::RasterizerInterface& real;
++    GpuBackend& backend;
++    std::mutex channels_mutex;  // (channels are made on the emulated CPU's threads)
++    std::unordered_map<s32, Shadowed> channels;  // by bind id
++    Shadowed* bound = nullptr;  // the front end's: the bound channel
++};
++
++/// The split's objects while it's on: the back end and the proxy (set by the GPU when it starts)
++struct GpuSplit {
++    GpuBackend backend;
++    std::unique_ptr<RasterizerProxy> proxy;
++};
++/// Set on the front end's thread (the GPU thread): only it puts work on the back end; anything
++/// else (the emulated CPU's threads) calls the real rasterizer as before
++inline thread_local bool g_gpu_front_thread = false;
++
++/// Null with the split off
++GpuSplit* ActiveGpuSplit();
++void SetActiveGpuSplit(GpuSplit* split);
++
++/// The front end's way to put work on the back end, in order (the 3D engine's memory writes, the
++/// other engines' methods): run now if the split is off (or this is the back end)
++void RunOnGpuBackend(std::function<void()>&& task);
++
++/// Whether work of the front end's must go to the back end (the split on, and this isn't it): the
++/// callers copy what the task needs only then, the single thread's path unchanged
++inline bool DeferToGpuBackend() {
++    return g_gpu_front_thread && ActiveGpuSplit() != nullptr;
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 289e18ac8a..59ba884f18 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -16,6 +16,7 @@
+ #endif
+ #include "core/core.h"
+ #include "core/frontend/graphics_context.h"
++#include "video_core/gpu_split.h"
+ #include "video_core/control/scheduler.h"
+ #include "video_core/dma_pusher.h"
+ #include "video_core/gpu.h"
+@@ -43,6 +44,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         CommandDataContainer next;
+         // (04.82) its time counted: busy (each command until done), the renderer's share of it
+         Common::PS4Perf::on_gpu_thread = true;
++        // (04.83) the GPU thread split's front end, if it's on
++        VideoCommon::g_gpu_front_thread = true;
+ #ifdef __OPENORBIS__
+         // (PS4) With threads pinned the GPU thread has a core of its own: it spins up to 2 ms for
+         // the game's next batch before it sleeps, and picks it up within microseconds instead of a
+@@ -73,18 +76,49 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 break;
+             }
+             const uint64_t busy_start = Common::PS4Perf::Ticks();
++            // (04.83, the GPU thread split: video_core/gpu_split.h) this thread the front end:
++            // the command lists here, the other commands and the fence the back end's, in order
++            VideoCommon::GpuSplit* const split = VideoCommon::ActiveGpuSplit();
+             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+-                system.GPU().TickWork();
++                if (split != nullptr) {
++                    VideoCommon::RunOnGpuBackend([gpu = &system.GPU()] { gpu->TickWork(); });
++                } else {
++                    system.GPU().TickWork();
++                }
+             } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
+-                renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
++                if (split != nullptr) {
++                    VideoCommon::RunOnGpuBackend([r = renderer.ReadRasterizer(), addr = flush->addr, size = flush->size] {
++                        r->FlushRegion(addr, size);
++                    });
++                } else {
++                    renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
++                }
+             } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
+-                renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
++                if (split != nullptr) {
++                    VideoCommon::RunOnGpuBackend([r = renderer.ReadRasterizer(), addr = invalidate->addr, size = invalidate->size] {
++                        r->OnCacheInvalidation(addr, size);
++                    });
++                } else {
++                    renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
++                }
+             } else {
+                 ASSERT(false);
+             }
+             Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.busy_ticks, Common::PS4Perf::Ticks() - busy_start);
++            if (split != nullptr) {
++                // (the fence once the back end has done the command's work)
++                VideoCommon::RunOnGpuBackend([st = &state, fence = next.fence, block = next.block] {
++                    st->signaled_fence.store(fence);
++                    if (block) {
++                        std::scoped_lock lk{st->write_lock};
++                        st->cv.notify_all();
++                    }
++                });
++                split->backend.Publish();
++                continue;
++            }
+             state.signaled_fence.store(next.fence);
+             if (next.block) {
+                 // We have to lock the write_lock to ensure that the condition_variable wait not get a
+diff --git a/src/video_core/renderer_opengl/gl_state_tracker.cpp b/src/video_core/renderer_opengl/gl_state_tracker.cpp
+index dc91723300..619f382099 100644
+--- a/src/video_core/renderer_opengl/gl_state_tracker.cpp
++++ b/src/video_core/renderer_opengl/gl_state_tracker.cpp
+@@ -207,7 +207,7 @@ void SetupDirtyMisc(Tables& tables) {
+ } // Anonymous namespace
+ 
+ void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
+-    auto& tables{channel_state.payload->maxwell_3d.dirty.tables};
++    auto& tables{channel_state.RendererMaxwell3D().dirty.tables};
+     SetupDirtyFlags(tables);
+     SetupDirtyColorMasks(tables);
+     SetupDirtyViewports(tables);
+@@ -234,7 +234,7 @@ void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
+ }
+ 
+ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
+-    flags = &channel_state.payload->maxwell_3d.dirty.flags;
++    flags = &channel_state.RendererMaxwell3D().dirty.flags;
+ }
+ 
+ void StateTracker::InvalidateState() {
+diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.cpp b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+index 0b132c97d6..28e0557b85 100644
+--- a/src/video_core/renderer_vulkan/vk_state_tracker.cpp
++++ b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+@@ -235,7 +235,7 @@ void SetupRasterModes(Maxwell3D::DirtyState::Tables &tables) {
+ } // Anonymous namespace
+ 
+ void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
+-    auto& tables{channel_state.payload->maxwell_3d.dirty.tables};
++    auto& tables{channel_state.RendererMaxwell3D().dirty.tables};
+     SetupDirtyFlags(tables);
+     SetupDirtyViewports(tables);
+     SetupDirtyScissors(tables);
+@@ -258,7 +258,7 @@ void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
+ }
+ 
+ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
+-    flags = &channel_state.payload->maxwell_3d.dirty.flags;
++    flags = &channel_state.RendererMaxwell3D().dirty.flags;
+ }
+ 
+ void StateTracker::InvalidateState() {
