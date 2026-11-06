@@ -24,7 +24,7 @@ exist and the GPU thread runs as before.
 - **Bug 1, a hang:** in one full `EDEN_PS4_GPU_SPLIT=1 TEST_KEEP=1 ./test.sh` run, gputest stayed at
   0.1 fps from its first frame. The harness killed it, so "exits on +" and the frame checks failed.
   It didn't come back in 18 runs of gputest alone (on all cores, on 2, and on 1), so it depends on
-  timing. No stacks were caught yet. The full run ended "7 failed", all of them gputest checks after the hang: exits on +; submits GPU work and waits on its fences; its frames have the picture; a texture the CPU rewrites is drawn as rewritten; and with the macro interpreter; exits on +; draws them.
+  timing. No stacks were caught yet. The full run ended "7 failed", in three separate gputest runs (gputest, gputest_interp with the macro interpreter, gputest_vertices), so in the suite it comes back readily, alone it does not: exits on +; submits GPU work and waits on its fences; its frames have the picture; a texture the CPU rewrites is drawn as rewritten; and with the macro interpreter; exits on +; draws them.
 - **Bug 2, a crash at exit:** pinned to one core (`taskset -c 0`), 1 run in 6 crashed with SIGSEGV
   right after "gputest: channel closed" ("Unhandled SIGSEGV" from dynarmic's handler, exit 139). A
   likely cause: `GPU::Impl::ReleaseChannel` is `UNIMPLEMENTED()`, so the channel's ChannelState is
