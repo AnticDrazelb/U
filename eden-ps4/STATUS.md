@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.79:** CPU > Speed-ups is a page: each speed-up by name, what it does, a switch (below).
 - **04.78:** the native memcpy's copies to and from GPU-cached memory happen (they didn't: flicker).
 - **04.77:** CPU > Speed-ups (off: the translator as in 04.72, for telling whether trouble is theirs).
 - **04.76:** unlocked frame pacing keeps games at their own rate (below).
@@ -96,6 +97,16 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.79: CPU > Speed-ups, a page of its own
+
+- CPU > Speed-ups opens a page (a settings category not in the list; Circle or Left goes back to CPU's
+  row): All Speed-ups (on, off, or Some Off), then each speed-up by what it does, with a switch and a
+  description when selected - Translator Shortcuts, Loop Registers, Stack Checks Once, Direct System
+  Calls, Small Functions Inlined, Native Memory Copies (`Ui::kSpeedups`, `EDEN_PS4_JIT_OFF` names
+  extras, pins, reuse, guard, leaf, native). CPU's row says All On, All Off or "5 of 6 On". No version
+  numbers in the menu: what each does. Saved as `speedups_off=<names>` (04.77-04.78's `speedups=`
+  read as the same). Screenshots: `screenshots/settings-cpu-speedups*.png` (`ui-preview.sh`).
 
 ## 04.78: the native memcpy's bug (Echoes of Wisdom's flicker and crash)
 

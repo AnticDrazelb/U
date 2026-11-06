@@ -1407,11 +1407,24 @@ Ui::MenuSettings LoadMenuSettings()
             settings.async_shaders = false;
         else if (line == "cpu=unsafe")
             settings.cpu_unsafe = true;
+        else if (line.rfind("speedups_off=", 0) == 0)
+        {
+            // (04.79) the speed-ups turned off, by name (Ui::kSpeedups)
+            settings.speedups_off = 0;
+            const std::string list = line.substr(13);
+            for (int k = 0; k < Ui::kSpeedupCount; k++)
+                if (("," + list + ",").find(std::string(",") + Ui::kSpeedups[k].name + ",") != std::string::npos)
+                    settings.speedups_off |= 1u << k;
+        }
         else if (line.rfind("speedups=", 0) == 0)
         {
-            for (int m = 0; m < Ui::kSpeedupModeCount; m++)
-                if (line.substr(9) == Ui::kSpeedupModes[m].name)
-                    settings.speedups = m;
+            // (04.77-04.78's single choice) as the speed-ups it turned off
+            static const std::pair<const char*, unsigned> legacy[] = {
+                {"off", 0x3f}, {"no-0475", 0x30}, {"no-native", 0x20}, {"no-leaf", 0x10}, {"no-0473", 0x0f},
+                {"no-guard", 0x08}, {"no-pins", 0x02}, {"no-reuse", 0x04}, {"no-extras", 0x01}};
+            for (const auto& [name, bits] : legacy)
+                if (line.substr(9) == name)
+                    settings.speedups_off = bits;
         }
         else if (line == "gpu=high")
             settings.gpu_high = true;
@@ -1466,7 +1479,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
         std::fprintf(f, "theme=%s\nrenderer=%s\nmode=%s\nresolution=%d\nshader_cache=%s\nasync_shaders=%s\ngpu=%s\n"
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
                         "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\ndraws=%s\nmotion=%s\n"
-                        "speedups=%s\nnickname=%s\navatar=%d\navatar_color=%d\n",
+                        "speedups_off=%s\nnickname=%s\navatar=%d\navatar_color=%d\n",
                      settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
@@ -1477,7 +1490,7 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                      settings.fastmem ? "on" : "off", settings.jit_cache ? "on" : "off",
                      settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
                      settings.touchpad_minus ? "minus" : "touch", settings.serial_draws ? "serial" : "parallel",
-                     settings.motion_controls ? "on" : "off", Ui::kSpeedupModes[settings.speedups % Ui::kSpeedupModeCount].name,
+                     settings.motion_controls ? "on" : "off", Ui::SpeedupsOffList(settings.speedups_off).c_str(),
                      settings.nickname.c_str(), settings.avatar, settings.avatar_color);
         // (04.37) on the disk at once: a crash of the whole PS4 lost a change made just before
         std::fflush(f);
@@ -1724,8 +1737,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.79: CPU > Speed-ups is a page of its own: each speed-up by name, what it does, and a switch.\n"
          "04.78: fixed flickering and crashes from 04.75's faster memory copies (Echoes of Wisdom): copies to "
-         "and from memory the GPU uses did nothing. CPU > Speed-ups can also turn off one group or one of them.\n"
+         "and from memory the GPU uses did nothing.\n"
          "04.77: CPU > Speed-ups: on by default; off runs the translator as before 04.73, to tell whether a "
          "game's trouble comes from the speed-ups.\n"
          "04.76: Frame Pacing: Unlocked shows each frame as soon as it's done but no sooner than the game asks, "
@@ -3358,16 +3372,11 @@ void* Run(void*)
         // (04.77) Speed-ups off: the translator as 04.72 had it under Auto (the boot watcher's first
         // safer step, arm_dynarmic_64.cpp/arm_dynarmic_32.cpp), unless a step of its set something safer
         unsetenv("EDEN_PS4_JIT_OFF");
-        if (settings.speedups == 1 && std::getenv("EDEN_PS4_JIT_TEST") == nullptr)
+        if (const std::string off = Ui::SpeedupsOffList(settings.speedups_off); !off.empty())
         {
-            setenv("EDEN_PS4_JIT_TEST", "extras", 1);
-            Trace("CPU speed-ups off (the menu): the translator as in 04.72");
-        }
-        else if (settings.speedups > 1 && settings.speedups < Ui::kSpeedupModeCount)
-        {
-            // (04.78) one group or one of them off (arm_dynarmic_64.cpp, arm_dynarmic_32.cpp: JitOff)
-            setenv("EDEN_PS4_JIT_OFF", Ui::kSpeedupModes[settings.speedups].off, 1);
-            Trace(fmt::format("CPU speed-ups (the menu): {}", Ui::kSpeedupModes[settings.speedups].label));
+            // (04.79) CPU > Speed-ups: those turned off (arm_dynarmic_64.cpp, arm_dynarmic_32.cpp: JitOff)
+            setenv("EDEN_PS4_JIT_OFF", off.c_str(), 1);
+            Trace(fmt::format("CPU speed-ups (the menu): {}", Ui::SpeedupsSummary(settings.speedups_off)));
         }
         NoteRecent(program);
         const std::string setup = fmt::format(
@@ -3379,8 +3388,8 @@ void* Run(void*)
             settings.gpu_high ? "high" : "normal", settings.unlocked_frames ? "unlocked" : "60 Hz", settings.speed,
             settings.draw_shortcuts ? "on" : "off", settings.compiled_macros ? "compiled" : "interpreted",
             fmt::format("{}{}", settings.cpu_unsafe ? "unsafe" : "auto",
-                        settings.speedups == 0 ? std::string{} :
-                        fmt::format(" (speed-ups: {})", Ui::kSpeedupModes[settings.speedups % Ui::kSpeedupModeCount].label)),
+                        settings.speedups_off == 0 ? std::string{} :
+                        fmt::format(" (speed-ups {})", Ui::SpeedupsSummary(settings.speedups_off))),
             settings.seventh_core ? 7 : 6, settings.pin_threads ? "pinned" : "free", settings.fastmem ? "on" : "off",
             settings.ram_on_demand ? "on demand" : "all up front",
             settings.touchpad_minus ? "the Minus button" : "the touch screen",

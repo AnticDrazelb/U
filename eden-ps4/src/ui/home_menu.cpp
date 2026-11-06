@@ -51,19 +51,53 @@ const char* const kCategories[] = {"Themes", "Graphics", "CPU", "Console", "Abou
 
 }  // namespace
 
-// (04.78) CPU > Speed-ups' choices: label, EDEN_PS4_JIT_OFF (all off: EDEN_PS4_JIT_TEST=extras)
-const SpeedupMode kSpeedupModes[kSpeedupModeCount] = {
-    {"On", "", "on"},
-    {"Off", "", "off"},
-    {"Without 04.75's", "native,leaf", "no-0475"},
-    {"Without native copies", "native", "no-native"},
-    {"Without tiny functions", "leaf", "no-leaf"},
-    {"Without 04.73's", "extras,pins,reuse,guard", "no-0473"},
-    {"Without direct calls", "guard", "no-guard"},
-    {"Without loop registers", "pins", "no-pins"},
-    {"Without stack checks", "reuse", "no-reuse"},
-    {"Without shortcuts", "extras", "no-extras"},
+// (04.79) CPU > Speed-ups: the translator's speed-ups, each of which can be turned off (to find the
+// one behind a game's trouble); their names are EDEN_PS4_JIT_OFF's (arm_dynarmic_64.cpp: JitOff)
+const Speedup kSpeedups[kSpeedupCount] = {
+    {"Translator Shortcuts", "extras",
+     "Shorter, faster translations of common patterns in a game's code: address arithmetic folded into the "
+     "memory access that uses it, condition flags kept only when something reads them, short branches "
+     "joined into one block of code, and more. The biggest gain of these."},
+    {"Loop Registers", "pins",
+     "A loop keeps the values it uses most in the PS4's own registers, instead of storing them to memory "
+     "and loading them back on every pass."},
+    {"Stack Checks Once", "reuse",
+     "The check that a function's local data (its stack) is within the game's memory is made once per "
+     "block of code, instead of before every access to it."},
+    {"Direct System Calls", "guard",
+     "A game's calls into the system's libraries jump straight to the function, instead of looking up "
+     "where it is every time (checked each time, so a call that has moved still goes to the right place)."},
+    {"Small Functions Inlined", "leaf",
+     "Very small functions (four instructions or fewer) are translated into the code that calls them, "
+     "saving the jump there and back."},
+    {"Native Memory Copies", "native",
+     "Copying and clearing memory (memcpy, memmove, memset) is done by the PS4 directly instead of being "
+     "translated. Memory the GPU uses still goes through the emulator's usual path, so the GPU sees "
+     "every change."},
 };
+
+std::string SpeedupsOffList(unsigned off)
+{
+    std::string list;
+    for (int i = 0; i < kSpeedupCount; i++)
+        if (off & (1u << i))
+            list += std::string(list.empty() ? "" : ",") + kSpeedups[i].name;
+    return list;
+}
+
+std::string SpeedupsSummary(unsigned off)
+{
+    off &= (1u << kSpeedupCount) - 1;
+    if (off == 0)
+        return "all on";
+    if (off == (1u << kSpeedupCount) - 1)
+        return "all off";
+    std::string text = "off:";
+    for (int i = 0; i < kSpeedupCount; i++)
+        if (off & (1u << i))
+            text += std::string(text.size() > 4 ? ", " : " ") + kSpeedups[i].label;
+    return text;
+}
 
 namespace {
 
@@ -100,6 +134,24 @@ std::string Trimmed(const std::string& text)
     return text.substr(first, text.find_last_not_of(' ') - first + 1);
 }
 constexpr int kCategoryCount = 5;
+// (04.79) CPU > Speed-ups' page: a category of its own, not in the list (CPU's row opens it)
+constexpr int kCpuCategory = 2;
+constexpr int kSpeedupsPage = 5;
+constexpr int kSpeedupsRow = 1;  // (its row in CPU)
+
+std::string SpeedupsValue(unsigned off)
+{
+    const unsigned all = (1u << kSpeedupCount) - 1;
+    off &= all;
+    if (off == 0)
+        return "All On";
+    if (off == all)
+        return "All Off";
+    int on = 0;
+    for (int i = 0; i < kSpeedupCount; i++)
+        on += !(off & (1u << i));
+    return std::to_string(on) + " of " + std::to_string(kSpeedupCount) + " On";
+}
 
 float Smooth(float current, float target, float dt)
 {
@@ -516,9 +568,19 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
     }
 
     case Screen::Settings: {
+        // (04.79) out of CPU > Speed-ups' page: back to CPU, its Speed-ups row
+        const auto leave_page = [&] {
+            settings_category = kCpuCategory;
+            settings_items = true;
+            settings_item = kSpeedupsRow;
+            settings_first = 0;
+            settings_scroll = settings_scroll_target = 0;
+        };
         if (pressed & kCircle)
         {
-            if (settings_items)
+            if (settings_category == kSpeedupsPage)
+                leave_page();
+            else if (settings_items)
                 settings_items = false;
             else
                 screen = Screen::Home;
@@ -549,7 +611,10 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
         }
         if (moves & kLeft)
         {
-            settings_items = false;
+            if (settings_category == kSpeedupsPage)
+                leave_page();
+            else
+                settings_items = false;
             return {};
         }
         if (moves & kUp)
@@ -558,6 +623,16 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
             settings_item = std::min(items - 1, settings_item + 1);
         if ((pressed & kCross) && settings_item < items)
         {
+            if (list[settings_item].change == nullptr)
+            {
+                // (04.79) CPU > Speed-ups: its page
+                settings_category = kSpeedupsPage;
+                settings_items = true;
+                settings_item = 0;
+                settings_first = 0;
+                settings_scroll = settings_scroll_target = 0;
+                return {};
+            }
             list[settings_item].change(settings);
             return {MenuAction::Kind::SettingsChanged, {}};
         }
@@ -1015,12 +1090,10 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "how cores share memory: about 10% faster on vector maths on the PS4, no faster on the "
              "rest, and some games misbehave with it.",
              [](MenuSettings& s) { s.cpu_unsafe = !s.cpu_unsafe; }},
-            {"Speed-ups", kSpeedupModes[settings.speedups % kSpeedupModeCount].label,
-             "The PS4's shortcuts in translating a game's code (04.73-04.78), about a quarter faster. Off: the "
-             "translator as in 04.72, slower. The other choices turn off one group or one of them, to find the one "
-             "behind a game's trouble: 04.75's are the native memory copies and the tiny functions; 04.73's the "
-             "direct calls, the loop registers, the stack checks and the translator shortcuts.",
-             [](MenuSettings& s) { s.speedups = (s.speedups + 1) % kSpeedupModeCount; }},
+            {"Speed-ups", SpeedupsValue(settings.speedups_off),
+             "Ways the game's code is translated to run faster on the PS4: together, about a quarter faster. "
+             "Press X to see each of them and turn any of them off, to find the cause if a game misbehaves.",
+             nullptr},
             {"CPU Cores", settings.seventh_core ? "7 (with the shared one)" : "6",
              "A PS4 app has 6 cores to itself and may use a 7th that the system shares. With 7, New Eden's threads "
              "(shader compilers, services, the GPU's work) have more room; with 6, none of them is slowed when the "
@@ -1045,6 +1118,28 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "times a second): off for playing.",
              [](MenuSettings& s) { s.profiler = !s.profiler; }},
         };
+    case kSpeedupsPage: {
+        // (04.79) CPU > Speed-ups' page: all of them at once, then each
+        std::vector<SettingItem> items;
+        const unsigned all = (1u << kSpeedupCount) - 1;
+        items.push_back({"All Speed-ups", (settings.speedups_off & all) == 0 ? "On" : (settings.speedups_off & all) == all ? "Off" : "Some Off",
+                         "Turns every speed-up below on or off at once. With all of them off, the game's code is "
+                         "translated at its plainest: slower, but if a problem goes away like that, turning them back "
+                         "on one at a time finds the one that causes it (please report it).",
+                         [](MenuSettings& s) {
+                             const unsigned all = (1u << kSpeedupCount) - 1;
+                             s.speedups_off = (s.speedups_off & all) == 0 ? all : 0;
+                         }});
+        static void (*const toggles[kSpeedupCount])(MenuSettings&) = {
+            [](MenuSettings& s) { s.speedups_off ^= 1u << 0; }, [](MenuSettings& s) { s.speedups_off ^= 1u << 1; },
+            [](MenuSettings& s) { s.speedups_off ^= 1u << 2; }, [](MenuSettings& s) { s.speedups_off ^= 1u << 3; },
+            [](MenuSettings& s) { s.speedups_off ^= 1u << 4; }, [](MenuSettings& s) { s.speedups_off ^= 1u << 5; },
+        };
+        for (int i = 0; i < kSpeedupCount; i++)
+            items.push_back({kSpeedups[i].label, on_off(!(settings.speedups_off & (1u << i))), kSpeedups[i].description,
+                             toggles[i]});
+        return items;
+    }
     case 3:
         return {{"Console Mode", settings.docked ? "Docked (TV, 1920x1080)" : "Handheld (1280x720)",
                  "Games run as on a Switch in handheld mode, at 1280x720, or docked, at 1920x1080. Handheld asks "
@@ -1080,7 +1175,7 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
     for (int i = 0; i < kCategoryCount; i++)
     {
         const float y = 124 + i * 60.0f;
-        const bool current = i == settings_category;
+        const bool current = i == settings_category || (settings_category == kSpeedupsPage && i == kCpuCategory);
         if (current && !settings_items)
             c.RoundRectOutline(36, y - 4, kCategoryWidth - 20, 56, 6, 4.5f, cursor);
         if (current)
@@ -1091,7 +1186,8 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
 
     // the category's items, and what the selected one means
     const std::vector<SettingItem> items = SettingItems(settings_category);
-    c.Text(kItemLeft, 150, kCategories[settings_category], 24, Weight::SemiBold, t.text);
+    c.Text(kItemLeft, 150, settings_category == kSpeedupsPage ? std::string("CPU  >  Speed-ups") : std::string(kCategories[settings_category]),
+           24, Weight::SemiBold, t.text);
     // (04.21) The rows that fit above the longest description of the category (so the layout
     // doesn't move as the selection does), scrolled to keep the selected one in view; before,
     // the rows just went on down, past the bottom bar (Graphics: GPU Accuracy, Game Speed), and
@@ -1154,7 +1250,9 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
         c.Text(kItemLeft + 8, y, line, 17, Weight::Regular, t.dim);
         y += 26;
     }
-    if (settings_items)
+    if (settings_items && !items.empty() && settings_item < int(items.size()) && items[settings_item].change == nullptr)
+        DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "Open"}});
+    else if (settings_items)
         DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "Change"}});
     else
         DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Cross, "OK"}});

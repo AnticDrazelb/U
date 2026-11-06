@@ -174,6 +174,15 @@ int main(int argc, char** argv)
     Press(menu, kRight);
     Press(menu, kDown);
     Shot(menu, "settings-cpu");
+    // (04.79) CPU > Speed-ups' page: open, a speed-up selected and turned off, back to CPU
+    Press(menu, kCross);
+    Shot(menu, "settings-cpu-speedups");
+    for (int i = 0; i < 6; i++)
+        Press(menu, kDown);
+    Press(menu, kCross);
+    Shot(menu, "settings-cpu-speedups-native-off");
+    Press(menu, kCircle);
+    Shot(menu, "settings-cpu-back");
     Press(menu, kCircle);  // the categories
     Press(menu, kDown);    // Console
     Press(menu, kDown);    // About
