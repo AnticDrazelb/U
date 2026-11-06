@@ -1740,6 +1740,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.84: a measuring build: where the time goes for each thing a game draws (the logs say it every 30 "
+         "seconds), to find what to speed up for games that draw a lot. Nothing else changed.\n"
          "04.83: Graphics > GPU Threads: Two shares the emulator's GPU work between two of the PS4's cores, for "
          "games that draw a lot (Breath of the Wild outdoors). Experimental, One by default. Also fixed: a wait "
          "for the GPU that could end before the GPU got there.\n"
@@ -2803,6 +2805,49 @@ std::string PerfLine(double seconds)
             last_tasks = tasks;
             last_drains = drains;
         }
+        // (04.84) a draw's time on the GPU thread by part, in microseconds (common/ps4_perf.h's
+        // DrawLap), and its waits: for all the GPU's work (a fence the game's commands acquire, a
+        // semaphore), for a GPU tick or the Vulkan worker, and its mprotect calls
+        static uint64_t last_phase[P::PhaseCount] = {}, last_phase_draws = 0;
+        static uint64_t last_fw = 0, last_fwt = 0, last_fwa = 0, last_fws = 0, last_sw = 0, last_swt = 0, last_pr = 0,
+                        last_prt = 0;
+        const P::GpuDrawPhases& dp = P::gpu_draw_phases;
+        const uint64_t phase_draws = dp.draws.load(std::memory_order_relaxed);
+        uint64_t phase[P::PhaseCount];
+        for (int i = 0; i < P::PhaseCount; i++)
+            phase[i] = dp.ticks[i].load(std::memory_order_relaxed);
+        const uint64_t fw = dp.fence_waits.load(), fwt = dp.fence_wait_ticks.load(), fwa = dp.fence_waits_acquire.load(),
+                       fws = dp.fence_waits_semaphore.load(), sw = dp.scheduler_waits.load(),
+                       swt = dp.scheduler_wait_ticks.load(), pr = dp.protects.load(), prt = dp.protect_ticks.load();
+        if (last_tsc != 0 && tsc > last_tsc) {
+            const double us_per_tick = seconds * 1e6 / double(tsc - last_tsc);
+            const uint64_t d_draws = phase_draws - last_phase_draws;
+            if (d_draws > 0) {
+                double total = 0.0;
+                std::string parts;
+                for (int i = 0; i < P::PhaseCount; i++) {
+                    const double us = double(phase[i] - last_phase[i]) * us_per_tick / double(d_draws);
+                    total += us;
+                    parts += fmt::format("{}{} {:.1f}", i ? ", " : "", P::kDrawPhaseNames[i], us);
+                }
+                line += fmt::format("; a draw on the GPU thread: {:.1f} us ({})", total, parts);
+            }
+            const auto each_ms = [&](uint64_t ticks, uint64_t count) {
+                return count ? double(ticks) * us_per_tick / 1000.0 / double(count) : 0.0;
+            };
+            line += fmt::format("; the GPU thread waited for all the GPU's work {:.0f} times a second, {:.2f} ms each "
+                                "(asked by a fence acquire {:.0f}, a semaphore acquire {:.0f} a second), for a GPU tick "
+                                "or the Vulkan worker {:.0f} times a second, {:.2f} ms each; its mprotect calls {:.0f} "
+                                "a second, {:.3f} ms each",
+                                double(fw - last_fw) / seconds, each_ms(fwt - last_fwt, fw - last_fw),
+                                double(fwa - last_fwa) / seconds, double(fws - last_fws) / seconds,
+                                double(sw - last_sw) / seconds, each_ms(swt - last_swt, sw - last_sw),
+                                double(pr - last_pr) / seconds, each_ms(prt - last_prt, pr - last_pr));
+        }
+        std::copy(std::begin(phase), std::end(phase), std::begin(last_phase));
+        last_phase_draws = phase_draws;
+        last_fw = fw, last_fwt = fwt, last_fwa = fwa, last_fws = fws, last_sw = sw, last_swt = swt, last_pr = pr,
+        last_prt = prt;
         last_tsc = tsc;
         last_busy = busy;
         last_raster = raster;

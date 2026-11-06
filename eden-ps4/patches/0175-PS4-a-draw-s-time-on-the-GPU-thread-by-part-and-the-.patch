@@ -1,0 +1,384 @@
+From f41e19c87b11dec0945b33b279279de2f4b62ec0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 22:04:32 +0000
+Subject: [PATCH] PS4: a draw's time on the GPU thread by part, and the
+ thread's waits (measuring)
+
+04.83's console test made the GPU thread split slower, and the single GPU
+thread's profile outdoors in Breath of the Wild is flat (no function over
+3.6%). So this times each part of a draw instead (common/ps4_perf.h,
+DrawLap: one TSC read at each boundary, on the GPU thread only):
+
+- RasterizerVulkan::PrepareDraw: flush, pipeline lookup, the cache
+  locks, dynamic state, record, TickWork.
+- GraphicsPipeline::ConfigureImpl: descriptors, image views, texture
+  buffers, vertex/index, uniforms, image descriptors, render targets,
+  descriptor set.
+
+Also counted on the GPU thread:
+
+- Waits for all the GPU's work (FenceManager::WaitPendingFences(true)),
+  by what asked: the puller's fence acquire or a semaphore acquire.
+- Waits for a GPU tick (Scheduler::Wait) or the Vulkan worker
+  (WaitWorker).
+- mprotect calls (HostMemory::Protect's arena invalidation).
+
+The launcher's 30 s line reports them. No behaviour changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/host_memory.cpp                    |  4 +
+ src/common/ps4_perf.h                         | 76 +++++++++++++++++++
+ src/video_core/engines/puller.cpp             | 11 +++
+ src/video_core/fence_manager.h                |  4 +
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  | 12 ++-
+ .../renderer_vulkan/vk_rasterizer.cpp         | 12 ++-
+ .../renderer_vulkan/vk_scheduler.cpp          |  4 +
+ src/video_core/renderer_vulkan/vk_scheduler.h |  9 +++
+ 8 files changed, 130 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index bb07877f3..be198f6aa 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -33,6 +33,7 @@
+ #elif defined(__OPENORBIS__) // before __FreeBSD__, which the PS4's compiler defines too
+ #include "common/literals.h"
+ #include "common/orbis_memory.h"
++#include "common/ps4_perf.h"
+ #elif defined(__FreeBSD__)
+ #include <sys/shm.h>
+ #endif
+@@ -842,6 +843,9 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission
+     // The arena maps ordinary memory read/write (as the page table walk treats it); fewer rights
+     // (a page the GPU caches, a debug page) take its pages back: the page table decides again
+     if (virtual_base && !(True(perm & MemoryPermission::Read) && True(perm & MemoryPermission::Write))) {
++        // (04.84) the GPU thread's share of these (the arena's pages the GPU caches), timed
++        Common::PS4Perf::GpuWaitScope ps4_protect{Common::PS4Perf::gpu_draw_phases.protects,
++                                                  Common::PS4Perf::gpu_draw_phases.protect_ticks};
+         Orbis::InvalidateArena(virtual_offset, length);
+     }
+ #elif !defined(__managarm__)
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 4e6da3085..9269e9db5 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -87,6 +87,45 @@ struct alignas(64) GpuThreadCounters {
+     std::atomic<uint64_t> ubo_checks{0}, ubo_same{0}, ubo_changed{0}, ubo_moved{0};
+ };
+ 
++// (04.84) Where a draw's time goes on the GPU thread: TSC ticks per part of the Vulkan
++// rasterizer's PrepareDraw and the pipeline's ConfigureImpl (DrawLap at each boundary: one TSC
++// read each, ~10 a draw), and what the thread waited on: the PS4's GPU (fences the puller made it
++// wait for, the scheduler's waits), the buffer and texture caches' locks; and its mprotect calls
++// (the arena's pages the GPU caches, protected and released). Counted on the GPU thread only.
++enum DrawPhase : int {
++    PhaseFlush,           // FlushWork, the memory manager's cached writes
++    PhasePipeline,        // the graphics pipeline looked up
++    PhaseLocks,           // the buffer and texture caches' locks taken (waiting for them)
++    PhaseDescriptors,     // texture/sampler descriptors read, storage buffers bound, samplers
++    PhaseImageViews,      // the texture cache's image views (FillImageViews)
++    PhaseTextureBuffers,  // texture and image buffers bound
++    PhaseGeometry,        // vertex and index buffers (UpdateGraphicsBuffers, BindHostGeometryBuffers)
++    PhaseUniforms,        // each stage's uniform and storage buffers (BindHostStageBuffers)
++    PhaseImageDescs,      // each stage's image descriptors (PushImageDescriptors)
++    PhaseRenderTargets,   // render targets, feedback loop check
++    PhaseDescriptorSet,   // the descriptor set written and bound, the pipeline bound (ConfigureDraw)
++    PhaseDynamicState,    // UpdateDynamicStates
++    PhaseRecord,          // queries, transform feedback, the draw recorded
++    PhaseTickWork,        // GPU::TickWork after the draw
++    PhaseCount
++};
++inline constexpr const char* kDrawPhaseNames[PhaseCount] = {
++    "flush", "pipeline", "cache locks", "descriptors", "image views", "texture buffers", "vertex/index",
++    "uniforms", "image descriptors", "render targets", "descriptor set", "dynamic state", "record", "tick"};
++struct alignas(64) GpuDrawPhases {
++    std::atomic<uint64_t> ticks[PhaseCount]{};
++    std::atomic<uint64_t> draws{0};  // PrepareDraw calls that got as far as the pipeline
++    // the GPU thread's waits: fences forced (ReleaseFences(true): all queued GPU work), by what
++    // asked (the puller's fence acquire, a semaphore acquire, anything else); the scheduler's
++    // Wait(tick)/Finish; ticks and counts
++    std::atomic<uint64_t> fence_waits{0}, fence_wait_ticks{0};
++    std::atomic<uint64_t> fence_waits_acquire{0}, fence_waits_semaphore{0};
++    std::atomic<uint64_t> scheduler_waits{0}, scheduler_wait_ticks{0};
++    // mprotect calls on the GPU thread (Common::HostMemory::Protect) and their ticks
++    std::atomic<uint64_t> protects{0}, protect_ticks{0};
++};
++inline GpuDrawPhases gpu_draw_phases;
++
+ // (04.17) Shaders and pipelines (the tester's question: what the first race builds): those built
+ // at boot from the game's shader cache (vulkan.bin) and those built in play. Pipelines; Eden's
+ // translation of their shaders to SPIR-V (us, summed over its threads); the driver's pipeline
+@@ -129,6 +168,43 @@ inline uint64_t Ticks() {
+ }
+ inline thread_local bool on_gpu_thread = false;
+ inline thread_local int gpu_raster_depth = 0;
++// (04.84) The draw laps: DrawLapStart at PrepareDraw's start, DrawLap(phase) at the end of each part
++// (the time since the last mark added to that part's ticks). On the GPU thread only.
++inline thread_local uint64_t draw_lap_last = 0;
++inline void DrawLapStart() {
++    if (on_gpu_thread)
++        draw_lap_last = Ticks();
++}
++inline void DrawLap(DrawPhase phase) {
++    if (!on_gpu_thread || draw_lap_last == 0)
++        return;
++    const uint64_t now = Ticks();
++    Bump(gpu_draw_phases.ticks[phase], now - draw_lap_last);
++    draw_lap_last = now;
++}
++inline void DrawLapEnd(DrawPhase phase) {
++    DrawLap(phase);
++    draw_lap_last = 0;
++}
++/// A wait of the GPU thread's, timed into a count and a tick total (nothing elsewhere)
++struct GpuWaitScope {
++    std::atomic<uint64_t>* count;
++    std::atomic<uint64_t>* ticks;
++    uint64_t start = 0;
++    GpuWaitScope(std::atomic<uint64_t>& count_, std::atomic<uint64_t>& ticks_)
++        : count{on_gpu_thread ? &count_ : nullptr}, ticks{&ticks_} {
++        if (count)
++            start = Ticks();
++    }
++    ~GpuWaitScope() {
++        if (!count)
++            return;
++        Bump(*count);
++        Bump(*ticks, Ticks() - start);
++    }
++    GpuWaitScope(const GpuWaitScope&) = delete;
++    GpuWaitScope& operator=(const GpuWaitScope&) = delete;
++};
+ struct GpuRasterScope {
+     uint64_t start = 0;
+     bool counted = false;
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 0b05d3171..9b25fad9d 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include "common/ps4_perf.h"
+ #include "common/assert.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+@@ -68,6 +69,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+     case Puller::FenceOperation::Acquire:
+         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
+         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
++        if (Common::PS4Perf::on_gpu_thread) // (PS4 04.84) what made the GPU thread wait
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.fence_waits_acquire);
+         dma_pusher.rasterizer->ReleaseFences();
+         break;
+     case Puller::FenceOperation::Increment:
+@@ -95,6 +98,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+                 regs.acquire_active = true;
+                 regs.acquire_mode = false;
+                 if (word != regs.acquire_value) {
++                    if (Common::PS4Perf::on_gpu_thread) // (PS4 04.84)
++                        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.fence_waits_semaphore);
+                     dma_pusher.rasterizer->ReleaseFences();
+                     continue;
+                 }
+@@ -102,11 +107,15 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+                 regs.acquire_active = true;
+                 regs.acquire_mode = true;
+                 if (word < regs.acquire_value) {
++                    if (Common::PS4Perf::on_gpu_thread) // (PS4 04.84)
++                        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.fence_waits_semaphore);
+                     dma_pusher.rasterizer->ReleaseFences();
+                     continue;
+                 }
+             } else if (op == GpuSemaphoreOperation::AcquireMask) {
+                 if (word && regs.semaphore_sequence == 0) {
++                    if (Common::PS4Perf::on_gpu_thread) // (PS4 04.84)
++                        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.fence_waits_semaphore);
+                     dma_pusher.rasterizer->ReleaseFences();
+                     continue;
+                 }
+@@ -129,6 +138,8 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+     while (word != value) {
+         regs.acquire_active = true;
+         regs.acquire_value = value;
++        if (Common::PS4Perf::on_gpu_thread) // (PS4 04.84)
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.fence_waits_semaphore);
+         dma_pusher.rasterizer->ReleaseFences();
+         word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
+         // TODO(kemathe73) figure out how to do the acquire_timeout
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 776c01e3f..ed4275547 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -15,6 +15,7 @@
+ #include <thread>
+ #include <queue>
+ 
++#include "common/ps4_perf.h"
+ #include "common/common_types.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -114,6 +115,9 @@ public:
+             if (!force) {
+                 return;
+             }
++            // (PS4 04.84) the GPU thread waiting for all the GPU work queued so far, timed
++            Common::PS4Perf::GpuWaitScope ps4_wait{Common::PS4Perf::gpu_draw_phases.fence_waits,
++                                                   Common::PS4Perf::gpu_draw_phases.fence_wait_ticks};
+             std::mutex wait_mutex;
+             std::condition_variable wait_cv;
+             std::atomic<bool> wait_finished{};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index f4082e4da..0e5ed9d18 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -472,7 +472,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     }
+     ASSERT(views.size() == num_image_elements);
+     ASSERT(samplers.size() == num_textures);
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseDescriptors);  // (04.84)
+     texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseImageViews);
+ 
+     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+     const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+@@ -532,14 +534,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         bind_stage_info(4);
+     }
+ 
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseTextureBuffers);
+     if (regs.transform_feedback_enabled != 0) {
+         scheduler.RequestOutsideRenderPassOperationContext();
+     }
+ 
+     buffer_cache.UpdateGraphicsBuffers(is_indexed);
+     buffer_cache.BindHostGeometryBuffers(is_indexed);
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseGeometry);
+ 
+     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseDescriptorSet);
+ 
+     RescalingPushConstant rescaling;
+     RenderAreaPushConstant render_area;
+@@ -547,8 +552,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     const VideoCommon::ImageViewInOut* views_it{views.data()};
+     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+         buffer_cache.BindHostStageBuffers(stage);
++        Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseUniforms);
+         PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
+                              samplers_it, views_it);
++        Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseImageDescs);
+         const auto& info{stage_infos[stage]};
+         if (info.uses_render_area) {
+             render_area.uses_render_area = true;
+@@ -578,10 +585,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     texture_cache.UpdateRenderTargets(false);
+     texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
+                                                                                  views.size()});
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseRenderTargets);
+     if (IsBuilt() && !pipeline) {
+         return false;
+     }
+-    return ConfigureDraw(rescaling, render_area);
++    const bool configured = ConfigureDraw(rescaling, render_area);
++    Common::PS4Perf::DrawLap(Common::PS4Perf::PhaseDescriptorSet);
++    return configured;
+ }
+ 
+ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index e8d12a790..4621109e0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -236,21 +236,30 @@ RasterizerVulkan::~RasterizerVulkan() {
+ 
+ template <typename Func>
+ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+-
++    namespace P = Common::PS4Perf;
++    // (04.84) the draw's parts timed on the GPU thread (common/ps4_perf.h, DrawLap)
++    P::DrawLapStart();
+     SCOPE_EXIT {
++        P::DrawLap(P::PhaseRecord);
+         gpu.TickWork();
++        P::DrawLapEnd(P::PhaseTickWork);
+     };
+     FlushWork();
+     gpu_memory->FlushCaching();
++    P::DrawLap(P::PhaseFlush);
+ 
+     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
++    P::DrawLap(P::PhasePipeline);
+     if (!pipeline) {
+ #ifdef __OPENORBIS__
+         Common::PS4Perf::gpu_draws_skipped.fetch_add(1, std::memory_order_relaxed);
+ #endif
+         return;
+     }
++    if (P::on_gpu_thread)
++        P::Bump(P::gpu_draw_phases.draws);
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++    P::DrawLap(P::PhaseLocks);
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+     if (!pipeline->Configure(is_indexed))
+@@ -259,6 +268,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     draw_pipeline = pipeline;
+     UpdateDynamicStates();
+     draw_pipeline = nullptr;
++    P::DrawLap(P::PhaseDynamicState);
+ 
+     query_cache.NotifySegment(true);
+     HandleTransformFeedback();
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index a9a2a4733..130915d23 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -72,6 +72,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
+ }
+ 
+ void Scheduler::WaitWorker() {
++    // (PS4 04.84) the GPU thread waiting for the Vulkan worker to empty its queue, timed with the
++    // waits for the GPU
++    Common::PS4Perf::GpuWaitScope ps4_wait{Common::PS4Perf::gpu_draw_phases.scheduler_waits,
++                                           Common::PS4Perf::gpu_draw_phases.scheduler_wait_ticks};
+     DispatchWork();
+ 
+     // Ensure the queue is drained.
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index ad186696a..ba5409f6f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -14,6 +14,7 @@
+ #include <utility>
+ #include <queue>
+ 
++#include "common/ps4_perf.h"
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+ #include "common/polyfill_thread.h"
+@@ -132,10 +133,18 @@ public:
+     /// Waits for the given GPU tick, optionally pacing frames.
+     void Wait(u64 tick, double target_fps = 0.0) {
+         if (tick > 0) {
++            // (PS4 04.84) the GPU thread's waits for the GPU, timed (common/ps4_perf.h)
++            const bool timed = Common::PS4Perf::on_gpu_thread && !master_semaphore->IsFree(tick);
++            const u64 wait_start = timed ? Common::PS4Perf::Ticks() : 0;
+             if (tick >= master_semaphore->CurrentTick()) {
+                 Flush();
+             }
+             master_semaphore->Wait(tick);
++            if (timed) {
++                Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.scheduler_waits);
++                Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.scheduler_wait_ticks,
++                                      Common::PS4Perf::Ticks() - wait_start);
++            }
+         }
+         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {
+             auto now = std::chrono::steady_clock::now();
+-- 
+2.43.0
+

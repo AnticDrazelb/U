@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.83)
+# New Eden (formerly Eden for PS4): status (after 04.84)
 
-Install **04.83** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0174). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.84** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0175). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.84:** a measuring build: a draw's time on the GPU thread by part, and what the GPU thread waits on (below).
 - **04.83:** Graphics > GPU Threads: Two, the GPU thread's work on two cores (experimental, One by default); a fence wait that didn't wait fixed (below).
 - **04.82:** every game's profile kept; the GPU thread's busy time and the renderer's share measured (below).
 - **04.81:** tiny functions behind PLT stubs inlined (Bluey); GC loops one block; the exit freeze (below).
@@ -101,6 +102,34 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.84: where a draw's time goes on the GPU thread (a measuring build)
+
+- **04.83 on the console** (Breath of the Wild outdoors, five runs, Profiler on):
+  - **Two is slower than One:** 6-10 fps against 8-14.
+  - One (the single GPU thread), 150 s in: 37,000 draws a second, busy 99%. That's about 27 us a
+    draw: ~6 us reading commands, ~21 us in the renderer.
+  - Two: the front end 50% busy and the back end 77% at 27,000 draws a second. Per draw the front
+    end took ~18 us and the back end ~28 us. The handover (the 14 KiB register compare, ~6 tasks a
+    draw, data crossing to the other Jaguar module's cache) cost more than the overlap gained, and
+    the game, waiting on each frame's fence (46% of the main thread's time against 38%), takes the
+    added delay every frame.
+  - One isn't slower than earlier builds (04.81: 8-10 fps outdoors).
+- **The single GPU thread's profile outdoors is flat** (110-150 s, both One runs): no function over
+  3.6%. About 15% of its time is in system calls: a blocking wait (~9%, while counted busy), mutex
+  lock and unlock (~4.7%), `mprotect` (1.8%). Command processing is ~13%; buffer cache, texture
+  cache and descriptor work are 1-3% each.
+- **This build measures each draw by part** (patch 0175, `Common::PS4Perf::DrawLap`, one TSC read
+  at each boundary of `RasterizerVulkan::PrepareDraw` and `GraphicsPipeline::ConfigureImpl`).
+  - The 30 s line's "a draw on the GPU thread: N us (flush, pipeline, cache locks, descriptors,
+    image views, texture buffers, vertex/index, uniforms, image descriptors, render targets,
+    descriptor set, dynamic state, record, tick)".
+  - Its waits: for all the GPU's work (`ReleaseFences(true)`, by what asked: a fence acquire or a
+    semaphore acquire in the game's commands), for a GPU tick or the Vulkan worker; and its
+    `mprotect` calls.
+  - Nothing else changed.
+- **Next:** one Breath of the Wild run outdoors with GPU Threads: One. The biggest part, or the
+  waits, is what 04.85 cuts.
 
 ## 04.83: GPU Threads (Two: the GPU thread split), a fence wait that didn't wait
 

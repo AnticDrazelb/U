@@ -1,6 +1,6 @@
 # Proposal: the GPU thread's work on two cores (04.82 onwards)
 
-Status: **in testing** (04.83, 2026-11-06): built behind Graphics > GPU Threads (One by default). The desktop tests pass with it on and off, after two fixes (below, "04.83: what testing found"). Next: the console test, Breath of the Wild outdoors with Two and then One. Goes with the profiler keeping every
+Status: **measured on the console, slower** (04.83, 2026-11-06): with GPU Threads: Two, Breath of the Wild outdoors ran 6-10 fps against One's 8-14 (below, "04.83 on the console"). Kept behind the switch, One by default. Goes with the profiler keeping every
 game's profile (below), which ships first.
 
 ## Why
@@ -196,4 +196,29 @@ the null renderer, with `EDEN_PS4_GPU_SPLIT=1` and `test.sh`.
 - **What to read in the logs:** the 30 s line's "the GPU back end busy N% of the time, T tasks a
   second, waited for D times a second" (D: the front end draining the queue, for a call that
   returns a value). The GPU thread's own busy % is then the front end's.
+
+## 04.83 on the console
+
+Breath of the Wild outdoors, five runs (One, Two, Two, Two, One), Profiler on:
+
+| | One | Two |
+|---|---|---|
+| fps outdoors | 8-14 | 6-10 |
+| draws a second (150 s) | 37,000 | 27,000 |
+| GPU thread busy | 99% | 50% (front end) |
+| back end busy | - | 77% |
+| front end per draw | ~6 us (command processing) | ~18 us |
+| renderer per draw | ~21 us | ~28 us (back end) |
+| game's main thread waiting on objects | 38% | 46% |
+
+- **The handover costs more than the overlap gains.** Per draw, the front end compares 14 KiB of
+  registers and makes ~6 tasks (each a heap-allocated closure, freed on the other thread). The back
+  end runs on module 1 (cores 4-6), whose L2 cache isn't the front end's (module 0 is full: three
+  emulated cores and the GPU thread), so every handed-over byte crosses modules.
+- **The game is synchronous with the GPU within a frame:** it waits on each frame's fence, so the
+  pipeline's added latency is paid every frame, and neither thread runs flat out.
+- **What it would take:** register writes tracked as they happen instead of a compare per draw,
+  tasks as plain records in a ring instead of closures, and both threads on one module, which the
+  PS4's core layout doesn't allow. Shelved; the single thread's per-draw cost is measured instead
+  (04.84).
 

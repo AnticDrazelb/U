@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.84: **a measuring build: where a draw's time goes on the GPU thread.** 04.83's GPU Threads: Two made
+Breath of the Wild slower (6-10 fps against One's 8-14): handing each draw to the second thread cost
+more than it saved. The single GPU thread's profile is flat, so this build times each part of a draw
+and the thread's waits (patch 0175) and logs them every 30 seconds. Nothing else changed.
+
 04.83: **Graphics > GPU Threads: Two (experimental); a fence wait that didn't wait fixed.**
 - Two splits the GPU thread's work over two cores (patch 0173): the GPU thread reads the game's
   command lists and runs the 3D engine's methods and macros, and a back end thread on cores 4-6
