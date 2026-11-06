@@ -122,6 +122,10 @@ struct Env final : Dynarmic::A64::UserCallbacks {
             return nullptr;
         return host_page[(vaddr - kData) >> 12] + (vaddr & 4095);
     }
+#ifdef HAVE_PINS
+    // (04.73) memory as it is, no side effects: the guarded links' guess (DYN_GUARD)
+    std::optional<std::uint32_t> PeekCode(uint64_t vaddr) override { return MemoryReadCode(vaddr); }
+#endif
     std::optional<std::uint32_t> MemoryReadCode(uint64_t vaddr) override {
         if (uint8_t* p = vaddr >= kData ? Host(vaddr) : nullptr) {
             uint32_t w;
@@ -292,6 +296,7 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
     config.loop_register_pins = std::getenv("DYN_PINS") != nullptr;
     config.follow_known_returns = std::getenv("DYN_RET") != nullptr;
     config.fastmem_range_check_reuse = std::getenv("DYN_REUSE") != nullptr;
+    config.guarded_indirect_links = std::getenv("DYN_GUARD") != nullptr;
 #endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;

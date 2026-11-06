@@ -24,6 +24,7 @@
 #include <random>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -59,6 +60,7 @@ u64 Rand(u64 lo, u64 hi) {
 // all of it, and the callbacks reading and writing the same memory; outside it, A64TestEnv's
 constexpr u64 kWindow = 0x1180000000, kWindowSize = 2 << 20, kArenaBits = 37;
 constexpr u64 kPage = 4096;
+std::vector<std::pair<u64, u64>> g_preset;  // 8-byte words in the window each run starts with
 
 class Env final : public A64TestEnv {
 public:
@@ -97,6 +99,8 @@ public:
     void Reset() {
         for (u64 i = 0; i < kWindowSize; i++)
             backing[i] = u8((kWindow + i) * 7 >> 3);
+        for (const auto& [va, value] : g_preset)  // (DIFFTEST_PLT: the GOT slot)
+            std::memcpy(backing + (va - kWindow), &value, sizeof(value));
         modified_memory.clear();
         raised = false;
     }
@@ -154,6 +158,15 @@ public:
         if (!IsInCodeMem(vaddr))
             return svc_outside ? 0xD4000001u : 0x14000000u;
         return code_mem[(vaddr - code_mem_start_address) / 4];
+    }
+    // (as the PS4's: memory as it is now, no side effects; the guarded links' guess)
+    std::optional<std::uint32_t> PeekCode(u64 vaddr) override {
+        u32 word = 0;
+        for (u64 i = 0; i < 4; i++) {
+            const u64 a = vaddr + i;
+            word |= u32(InWindow(a) ? backing[a - kWindow] : u8(A64TestEnv::MemoryRead(a, 1))) << (8 * i);
+        }
+        return word;
     }
     void CallSVC(std::uint32_t) override {
         raised = true;
@@ -295,6 +308,7 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
     c.code_cache_size = 64 * 1024 * 1024;
     c.loop_register_pins = std::getenv("DIFFTEST_NO_PINS") == nullptr;
     c.fastmem_range_check_reuse = std::getenv("DIFFTEST_NO_REUSE") == nullptr;
+    c.guarded_indirect_links = std::getenv("DIFFTEST_NO_GUARD") == nullptr;
     // (DIFFTEST_FOLLOW=1) BL and forward B translated through, and known returns followed
     c.follow_direct_branches = c.follow_known_returns = std::getenv("DIFFTEST_FOLLOW") != nullptr;
     // (04.73) the 64-bit translator's PS4 extras (04.22-04.30), as Eden sets them (on under Auto
@@ -311,6 +325,21 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
         c.superblocks = true;
         c.superblocks_cond = true;
         c.bitfield_shifts = true;
+        // (DIFFTEST_WITHOUT=<name>: that extra left off, to tell which one a difference is)
+        if (const char* w = std::getenv("DIFFTEST_WITHOUT")) {
+            const std::string_view n{w};
+            if (n == "fold_address_offsets") c.fold_address_offsets = false;
+            if (n == "skip_redundant_extensions") c.skip_redundant_extensions = false;
+            if (n == "split_cold_code") c.split_cold_code = false;
+            if (n == "elide_dead_nzcv") c.elide_dead_nzcv = c.elide_dead_nzcv_abi = false;
+            if (n == "elide_dead_nzcv_abi") c.elide_dead_nzcv_abi = false;
+            if (n == "return_stack_pc_only") c.return_stack_pc_only = false;
+            if (n == "plain_acquire_loads") c.plain_acquire_loads = false;
+            if (n == "elide_load_store_only_barriers") c.elide_load_store_only_barriers = false;
+            if (n == "superblocks") c.superblocks = c.superblocks_cond = false;
+            if (n == "superblocks_cond") c.superblocks_cond = false;
+            if (n == "bitfield_shifts") c.bitfield_shifts = false;
+        }
         // (DIFFTEST_NO_ABI=1: no reliance on the procedure call standard's dead flags at calls and
         // returns, which random code breaks: for checking calls)
         if (std::getenv("DIFFTEST_NO_ABI"))
@@ -334,6 +363,7 @@ void MakeBare(A64::UserConfig& c) {
     c.loop_register_pins = false;
     c.follow_known_returns = false;
     c.fastmem_range_check_reuse = false;
+    c.guarded_indirect_links = false;
     c.link_forward_without_halt_check = c.inline_rsb_pop = c.inline_fast_dispatch = false;
 }
 
@@ -597,6 +627,66 @@ int main(int argc, char** argv) {
                 on.RunOnce(k.code, st);
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 std::printf("%-16s pins %-3s %7.1f ms (%.2f ns a round)\n", k.name, pins ? "on" : "off", ms, ms * 1e6 / 20e6);
+            }
+        }
+        return 0;
+    }
+
+    // (pltbench) jit-difftest 0 0 pltbench: a call through a PLT stub and one through the GOT
+    // inline (BLR), 20 million times each, with the guarded links and without
+    if (argc > 3 && std::string(argv[3]) == "pltbench") {
+        const u64 page = kWindow + kPage, off = 0x10, base = 0x10000;
+        const auto x16 = [&](std::vector<u32>& out) {
+            out.push_back(0xD2800000u | (u32(page & 0xffff) << 5) | 16);
+            out.push_back(0xF2800000u | (1u << 21) | (u32((page >> 16) & 0xffff) << 5) | 16);
+            out.push_back(0xF2800000u | (2u << 21) | (u32((page >> 32) & 0xffff) << 5) | 16);
+            out.push_back(0xF9400000u | u32(off / 8) << 10 | (16 << 5) | 17);
+            out.push_back(0x91000000u | u32(off) << 10 | (16 << 5) | 16);
+        };
+        struct Case { const char* name; std::vector<u32> code; u64 leaf; };
+        std::vector<Case> cases;
+        {
+            std::vector<u32> c = {0x94000005u, 0xF100079Cu, 0x54FFFFC1u, 0xD4000001u, 0xD503201Fu};
+            x16(c);
+            c.push_back(0xD61F0220u);  // br x17
+            const u64 leaf = base + 4 * c.size();
+            c.push_back(0x91000421u);  // add x1, x1, #1
+            c.push_back(0xD65F03C0u);  // ret
+            cases.push_back({"plt stub", c, leaf});
+        }
+        {
+            std::vector<u32> c;
+            x16(c);
+            c.push_back(0xD63F0220u);  // blr x17
+            c.push_back(0xF100079Cu);  // subs x28, x28, #1
+            c.push_back(0x54000001u | (u32(-7 & 0x7ffff) << 5));  // b.ne the start
+            c.push_back(0xD4000001u);
+            const u64 leaf = base + 4 * c.size();
+            c.push_back(0x91000421u);
+            c.push_back(0xD65F03C0u);
+            cases.push_back({"got blr", c, leaf});
+        }
+        const u64 rounds = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 20000000;
+        for (const bool guard : {false, true}) {
+            if (const char* only = std::getenv("PLTBENCH_GUARD"); only && (only[0] == '1') != guard)
+                continue;  // (one of the two: for callgrind)
+            A64::UserConfig c = Config(on.env, *on.monitor, OptimizationFlag{});
+            c.enable_cycle_counting = false;
+            c.guarded_indirect_links = guard;
+            on.jit.reset();
+            on.jit.emplace(c);
+            on.env.halt_jit = &*on.jit;
+            for (const Case& k : cases) {
+                g_preset = {{page + off, k.leaf}};
+                State st;
+                st.start = base;
+                st.regs[28] = rounds;
+                st.sp = kWindow + kWindowSize / 2;
+                const auto t0 = std::chrono::steady_clock::now();
+                const Result r = on.RunOnce(k.code, st);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                std::printf("%-10s guard %-3s %8.1f ms (%.2f ns a call) x1 %llx\n", k.name, guard ? "on" : "off", ms,
+                            ms * 1e6 / double(rounds), (unsigned long long)r.regs[1]);
             }
         }
         return 0;
@@ -994,7 +1084,9 @@ int main(int argc, char** argv) {
             }
             // a call (DIFFTEST_CALLS=1, a third of the blocks): the block, BL leaf, more of it, SVC,
             // then the leaf (random, then RET) after it
+            bool called = false;  // (DIFFTEST_PLT's calls only in blocks without this one's)
             if (std::getenv("DIFFTEST_CALLS") && Rand(0, 2) == 0) {
+                called = true;
                 const size_t at = Rand(0, code.size());  // (the BL goes in here)
                 std::vector<u32> leaf;
                 for (size_t n = Rand(0, 6); leaf.size() < n;)
@@ -1005,6 +1097,92 @@ int main(int argc, char** argv) {
                 code.insert(code.end(), leaf.begin(), leaf.end());
                 code.push_back(0xD65F03C0u);  // ret
                 code[at] = 0x94000000u | (u32(leaf_at - at) & 0x3ffffff);  // bl leaf
+            }
+            // (DIFFTEST_PLT=1, half of the blocks) two calls through a GOT slot in the window, each
+            // through a PLT stub (bl stub: movz/movk x16, ldr x17, [x16, #off], add x16, br x17) or
+            // inline (the same with blr x17); the first callee may point the slot at a second one
+            // before its random code and RET (the guarded link's check failing); a garbage slot now
+            // and then
+            g_preset.clear();
+            if (std::getenv("DIFFTEST_PLT") && !called && Rand(0, 1) == 0) {
+                const u64 page = kWindow + (Rand(0, 1) ? 1 : 3) * kPage;  // (in the arena or not)
+                const u32 off = u32(Rand(0, 511)) * 8;
+                const u64 slot = page + off;
+                const auto x16_sequence = [&](std::vector<u32>& out) {
+                    out.push_back(0xD2800000u | (u32(page & 0xffff) << 5) | 16);
+                    out.push_back(0xF2800000u | (1u << 21) | (u32((page >> 16) & 0xffff) << 5) | 16);
+                    out.push_back(0xF2800000u | (2u << 21) | (u32((page >> 32) & 0xffff) << 5) | 16);
+                    out.push_back(0xF9400000u | ((off / 8) << 10) | (16 << 5) | 17);  // ldr x17, [x16, #off]
+                    out.push_back(0x91000000u | ((off & 0xfff) << 10) | (16 << 5) | 16);  // add x16, x16, #off
+                };
+                const bool stubbed[2] = {Rand(0, 1) == 0, Rand(0, 1) == 0};
+                std::vector<size_t> sites;  // (where each call's first instruction goes)
+                const size_t at1 = Rand(0, code.size()), at2 = Rand(at1, code.size());
+                // build: main with the call sites, svc, stub, leaf A, leaf B
+                std::vector<u32> main_code;
+                size_t call_index[2]{};
+                for (size_t i = 0; i <= code.size(); i++) {
+                    for (int k = 0; k < 2; k++) {
+                        if ((k == 0 ? at1 : at2) != i)
+                            continue;
+                        call_index[k] = main_code.size();
+                        if (stubbed[k]) {
+                            main_code.push_back(0u);  // (bl stub, below)
+                        } else {
+                            x16_sequence(main_code);
+                            main_code.push_back(0xD63F0220u);  // blr x17
+                        }
+                    }
+                    if (i < code.size())
+                        main_code.push_back(code[i]);
+                }
+                // (the forward branches the block had: their targets moved by the calls put in before them)
+                main_code.push_back(0xD4000001u);  // svc #0
+                const size_t stub_at = main_code.size();
+                x16_sequence(main_code);
+                main_code.push_back(0xD61F0220u);  // br x17
+                const size_t leaf_a = main_code.size();
+                const bool rewrite = Rand(0, 1) == 0;
+                std::vector<u32> a_code, b_code;
+                // (the callees' random code names no X30 - one making it a code address, from X17 = its
+                // own, X9 = the other, would RET back into itself for ever - and starts by clearing X9,
+                // X16 and X17)
+                const auto uses30 = [](u32 inst) {
+                    for (const int shift : {0, 5, 10, 16})
+                        if (((inst >> shift) & 31) == 30)
+                            return true;
+                    return false;
+                };
+                const auto leaf_instruction = [&](u64 pc) {
+                    for (;;)
+                        if (const u32 inst = RandomInstruction(generators, pc, false); !uses30(inst))
+                            return inst;
+                };
+                const u32 clear[3] = {0xD2800009u, 0xD2800010u, 0xD2800011u};  // movz x9/x16/x17, #0
+                for (size_t n = Rand(0, 5); a_code.size() < n;)
+                    a_code.push_back(leaf_instruction(s.start + 4 * (leaf_a + 5 + a_code.size())));
+                // (each callee clears x16 first, which a stub leaves at the slot: random stores through it
+                // would make the slot point anywhere, back into the caller too, for ever)
+                const size_t leaf_b = leaf_a + (rewrite ? 2 : 0) + 3 + a_code.size() + 1;
+                if (rewrite) {
+                    const s64 rel = s64(leaf_b - leaf_a) * 4;  // adr x9, leaf B
+                    main_code.push_back(0x10000000u | (u32(rel & 3) << 29) | (u32((rel >> 2) & 0x7ffff) << 5) | 9);
+                    main_code.push_back(0xF9000209u);  // str x9, [x16]
+                }
+                main_code.insert(main_code.end(), clear, clear + 3);
+                main_code.insert(main_code.end(), a_code.begin(), a_code.end());
+                main_code.push_back(0xD65F03C0u);  // ret
+                for (size_t n = Rand(0, 5); b_code.size() < n;)
+                    b_code.push_back(leaf_instruction(s.start + 4 * (leaf_b + 3 + b_code.size())));
+                main_code.insert(main_code.end(), clear, clear + 3);
+                main_code.insert(main_code.end(), b_code.begin(), b_code.end());
+                main_code.push_back(0xD65F03C0u);  // ret
+                for (int k = 0; k < 2; k++)
+                    if (stubbed[k])
+                        main_code[call_index[k]] = 0x94000000u | (u32(stub_at - call_index[k]) & 0x3ffffff);
+                code = main_code;
+                const u64 first = Rand(0, 15) == 0 ? (RandomValue() & ~u64(3)) : s.start + 4 * leaf_a;
+                g_preset.push_back({slot, first});
             }
             alarm(20);
         }
@@ -1017,9 +1195,29 @@ int main(int argc, char** argv) {
 
         g_current_block = code;
         Result a, b;
+        static const u64 skip = std::getenv("DIFFTEST_SKIP") ? std::strtoull(std::getenv("DIFFTEST_SKIP"), nullptr, 10) : 0;
+        if (it < skip)  // (DIFFTEST_SKIP=n: the first n iterations made but not run, to get to one)
+            continue;
+        if (const char* only = std::getenv("DIFFTEST_ONLY")) {  // (on/off/bare: that run alone)
+            Runner& r = std::string_view{only} == "on" ? on : std::string_view{only} == "off" ? off : bare;
+            const Result x = r.Run(code, s);
+            std::printf("iteration %llu %s: finished, raised %d, x0 %llx\n", (unsigned long long)it, only, int(x.raised),
+                        (unsigned long long)x.regs[0]);
+            continue;
+        }
+        static const bool progress = std::getenv("DIFFTEST_PROGRESS") != nullptr;
+        if (progress) {  // (each iteration's code before it runs, and which run: to find a hang)
+            std::fprintf(stderr, "iteration %llu start %#llx:", (unsigned long long)it, (unsigned long long)s.start);
+            for (const u32 inst : code)
+                std::fprintf(stderr, " %08x", inst);
+            std::fprintf(stderr, "\n");
+        }
         try {
+            if (progress) std::fprintf(stderr, "  on\n");
             a = on.Run(code, s);
+            if (progress) std::fprintf(stderr, "  off\n");
             b = off.Run(code, s);
+            if (progress) std::fprintf(stderr, "  done\n");
         } catch (const std::exception& e) {
             // (the emitter refused the block: what, once per first instruction kind; the JITs made
             // again, as one left mid-compile can't be trusted)

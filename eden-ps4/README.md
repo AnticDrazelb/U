@@ -382,9 +382,11 @@ new log over it).
 04.73: **every game's CPU emulation faster**: the translated code runs ~27-28% fewer instructions in
 the 64-bit benchmarks and ~21% in the 32-bit one. The PS4 translator extras are on with CPU Auto again
 (off since 04.35/04.38 as a diagnostic switch), loops keep their guest registers in host registers
-(patches 0158-0159), and a block's stack accesses are range checked once (0160, 0162). A new 32-bit
-differential test and a stricter 64-bit one checked them. The boot watcher's first safer step turns
-them off (0161).
+(patches 0158-0159), a block's stack accesses are range checked once (0160, 0162), and in 64-bit games
+a call into another module (a PLT stub, a call through the GOT: every call from a game into the SDK)
+links straight to the function its slot held when translated, while it still holds it (0163). A new 32-bit
+differential test and a stricter 64-bit one (real NRO code too) checked them. The boot watcher's first
+safer step turns them off (0161).
 
 04.72: **a large-page probe** at the app's start (once a version): where the PS4's 2 MiB pages
 measure faster, the fastmem arena maps games' memory in whole 2 MiB blocks (patch 0157). A crash

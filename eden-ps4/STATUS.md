@@ -120,6 +120,23 @@ Measured with `tools/dynarmic-harness` (callgrind, 20 steady frames, the Jaguar'
   16 MiB of no-access room on either side for a stack at the very top of the address space. Only the
   stack: with any base, a wild pointer used twice in a block, after its first access's check failed,
   would reach the host's memory past that room (the differential test found one), for ~4% more.
+- **Guarded links for calls into other modules** (patch 0163): a block that ends in BR or BLR to
+  a value it loaded from a constant address (a PLT stub, `ADRP X16; LDR X17, [X16, #off]; ADD X16;
+  BR X17`, and a call through the GOT, which every call from a game into the SDK's modules is) reads
+  that slot as it is when the block is translated (`PeekCode`: no side effects), compares the loaded
+  value with it at the block's end and links straight to that block when they're the same; the usual
+  lookup (the fast dispatch table) when not, so a slot that changes later costs one compare. In
+  Little Kitty's profile PLT stubs were 11% of the hottest blocks' samples; each such call now skips
+  the lookup's 12 host instructions (3 of them loads, then a jump through memory) for 5 and a direct
+  jump. The harness programs make no such calls (static), unchanged: unity64 1,354,286 to
+  1,354,165, game64 1,814,306 to 1,814,355. 64-bit only: the 32-bit form (a PLT stub's
+  `LDR PC, [IP, #off]!`) is written but off, its differential test unfinished. Checked with
+  `DIFFTEST_PLT=1` (below): 30,000 random blocks making calls through stubs and the GOT, slots
+  repointed between calls and holding garbage, against bare: none wrong.
+- **Real code**: 5,934 blocks cut from the homebrew NROs, the PS4's configuration: 5,819 the
+  same, 110 unclear (Auto's unfused multiply-adds, as without the extras), 5 the optimised
+  translation's own, all of them the calling convention's dead flags (`elide_dead_nzcv_abi`: a
+  block calls or returns with flags it set and didn't read, which the other side never reads).
 - **Checked**: `tools/jit-difftest` gained a no-cycle-counting mode (the PS4's multicore: superblocks'
   side exits, forward links, runs ending at an SVC), random forward branches and calls, loops, and
   `DIFFTEST_FULL` (every run against no optimisation, so what the optimised builds share is checked

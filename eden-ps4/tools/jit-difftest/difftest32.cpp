@@ -14,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -36,6 +37,10 @@ u64 Rand(u64 lo, u64 hi) { return lo + rng() % (hi - lo + 1); }
 
 constexpr u32 kWindow = 0x40000000, kWindowSize = 1 << 20;
 constexpr u32 kSvc = 0xEF000000;  // svc #0
+// (code nobody wrote: SVC in ARM state and, its first halfword, in Thumb too - a garbage address
+// with bit 0 set would otherwise run Thumb through it for ever, never linking back)
+constexpr u32 kSvcBoth = 0xEF00DF00;
+std::vector<std::pair<u32, u32>> g_preset;  // words in the window each run starts with (DIFFTEST_PLT)
 
 class Env final : public A32::UserCallbacks {
 public:
@@ -58,12 +63,16 @@ public:
         madvise(arena, u64(1) << 32, MADV_DONTNEED);  // (all zeros again)
         for (u32 i = 0; i < kWindowSize; i++)
             arena[kWindow + i] = u8((kWindow + i) * 7 >> 3);
+        for (const auto& [a, v] : g_preset)
+            std::memcpy(arena + a, &v, sizeof(v));
         raised = false;
     }
+    // (as the PS4's: memory as it is, no side effects; the guarded links' guess)
+    std::optional<u32> PeekCode(u32 vaddr) override { return u32(MemoryRead(vaddr, 4)); }
     std::optional<u32> MemoryReadCode(u32 vaddr) override {
         if (vaddr >= code_start && vaddr - code_start < code.size() * 4)
             return code[(vaddr - code_start) / 4];
-        return kSvc;
+        return kSvcBoth;
     }
     u64 MemoryRead(u32 a, size_t size) override {
         u64 v = 0;
@@ -156,6 +165,7 @@ struct Runner {
             c.skip_redundant_extensions = on("skip_redundant_extensions");
             c.split_cold_code = on("split_cold_code");
             c.loop_register_pins = on("loop_register_pins");
+            c.guarded_indirect_links = on("guarded_indirect_links");
         }
         if (kind == Kind::Off)
             c.loop_register_pins = false;
@@ -293,6 +303,94 @@ int main(int argc, char** argv) {
             if (Testable(inst, s.start + u32(code.size()) * 4))
                 code.push_back(inst);
         }
+        // (DIFFTEST_PLT=1, half of the blocks) two calls through a GOT slot in the window, each
+        // through a PLT stub (BL stub: MOVW/MOVT IP, LDR PC, [IP, #off]!) or inline (MOVW/MOVT IP,
+        // LDR R11, [IP, #off]!, BLX R11); the slot points at an ARM callee, which may point it at a
+        // second one before its random code (the check failing), or at a Thumb one (BX LR), or at
+        // garbage now and then. The callees clear R9, R11 and R12 first, their random code names no LR.
+        g_preset.clear();
+        if (!loops && std::getenv("DIFFTEST_PLT") && Rand(0, 1) == 0) {
+            const u32 page = kWindow + u32(Rand(1, 3)) * 0x1000, off = u32(Rand(0, 1023)) * 4, slot = page + off;
+            const auto movw_movt = [&](std::vector<u32>& out) {
+                out.push_back(0xE300C000u | ((page & 0xffff) >> 12 << 16) | (page & 0xfff));
+                out.push_back(0xE340C000u | ((page >> 16) >> 12 << 16) | ((page >> 16) & 0xfff));
+            };
+            // (no LR, which would make a return go anywhere, and no PC: a conditional load into it
+            // passes Testable)
+            const auto uses14 = [](u32 inst) {
+                for (const int shift : {0, 8, 12, 16})
+                    if (((inst >> shift) & 15) >= 14)
+                        return true;
+                return ((inst >> 25) & 7) == 4 && (inst & (3u << 14));  // (a register list with LR or PC)
+            };
+            const auto random_inst = [&](u32 pc, bool no_lr) {
+                for (;;) {
+                    const InstructionGenerator& g = generators[Rand(0, generators.size() - 1)];
+                    const u32 inst = g.Bits() | (u32(rng()) & ~g.Mask());
+                    if ((g.Mask() & 0xF0000000) == 0 && (inst & 0xF0000000) == 0xF0000000)
+                        continue;
+                    if (no_lr && uses14(inst))
+                        continue;
+                    if (Testable(inst, pc))
+                        return inst;
+                }
+            };
+            const bool stubbed[2] = {Rand(0, 1) == 0, Rand(0, 1) == 0};
+            const size_t at1 = Rand(0, code.size()), at2 = Rand(at1, code.size());
+            std::vector<u32> m;
+            size_t call_index[2]{};
+            for (size_t i = 0; i <= code.size(); i++) {
+                for (int k = 0; k < 2; k++) {
+                    if ((k == 0 ? at1 : at2) != i)
+                        continue;
+                    if (stubbed[k]) {
+                        call_index[k] = m.size();
+                        m.push_back(0u);  // (bl stub, below)
+                    } else {
+                        movw_movt(m);
+                        m.push_back(0xE5BCB000u | off);  // ldr r11, [ip, #off]!
+                        m.push_back(0xE12FFF3Bu);        // blx r11
+                    }
+                }
+                if (i < code.size())
+                    m.push_back(code[i]);
+            }
+            m.push_back(kSvc);
+            const size_t stub_at = m.size();
+            movw_movt(m);
+            m.push_back(0xE5BCF000u | off);  // ldr pc, [ip, #off]!
+            const size_t thumb_at = m.size();
+            m.push_back(0x47704770u);  // (Thumb) bx lr; bx lr
+            const size_t leaf_a = m.size();
+            const u32 clear[3] = {0xE3A09000u, 0xE3A0B000u, 0xE3A0C000u};  // mov r9/r11/r12, #0
+            std::vector<u32> a_code, b_code;
+            for (size_t n = Rand(0, 5); a_code.size() < n;)
+                a_code.push_back(random_inst(s.start + u32(leaf_a + 5 + a_code.size()) * 4, true));
+            const bool rewrite = Rand(0, 1) == 0;
+            const size_t leaf_b = leaf_a + (rewrite ? 2 : 0) + 3 + a_code.size() + 1;
+            if (rewrite) {
+                const u32 rel = u32(leaf_b - (leaf_a + 2)) * 4;  // add r9, pc, #rel (pc reads 8 ahead)
+                m.push_back(0xE28F9000u | rel);
+                m.push_back(0xE58C9000u);  // str r9, [ip]
+            }
+            m.insert(m.end(), clear, clear + 3);
+            m.insert(m.end(), a_code.begin(), a_code.end());
+            m.push_back(0xE12FFF1Eu);  // bx lr
+            for (size_t n = Rand(0, 5); b_code.size() < n;)
+                b_code.push_back(random_inst(s.start + u32(leaf_b + 3 + b_code.size()) * 4, true));
+            m.insert(m.end(), clear, clear + 3);
+            m.insert(m.end(), b_code.begin(), b_code.end());
+            m.push_back(0xE12FFF1Eu);  // bx lr
+            for (int k = 0; k < 2; k++)
+                if (stubbed[k])
+                    m[call_index[k]] = 0xEB000000u | (u32(s32(stub_at) - s32(call_index[k]) - 2) & 0xFFFFFF);
+            code = m;
+            const u32 pick = u32(Rand(0, 15));
+            const u32 first = pick == 0 ? (RandomValue() & ~3u)
+                            : pick < 5 ? (s.start + u32(thumb_at) * 4) | 1
+                            : s.start + u32(leaf_a) * 4;
+            g_preset.push_back({slot, first});
+        }
         if (loops) {
             const u32 n = u32(code.size());
             code.push_back(0xE25AA001u);                                // subs r10, r10, #1
@@ -307,6 +405,18 @@ int main(int argc, char** argv) {
         s.fpscr = u32(Rand(0, 3)) << 22;  // (the rounding mode; flush-to-zero and default NaN off)
         if (loops)
             s.regs[10] = u32(Rand(1, 4));
+        // (DIFFTEST_SKIP=n: the first n iterations made but not run; DIFFTEST32_ONLY=on/off/bare:
+        // only that run, no comparison: to tell whether a hang is one run's or the program's)
+        static const u64 skip = std::getenv("DIFFTEST_SKIP") ? std::strtoull(std::getenv("DIFFTEST_SKIP"), nullptr, 10) : 0;
+        if (it < skip)
+            continue;
+        if (const char* only = std::getenv("DIFFTEST32_ONLY")) {
+            alarm(5);
+            Runner& r = std::string_view{only} == "on" ? on : std::string_view{only} == "off" ? off : bare;
+            const Result x = r.Run(code, s);
+            std::printf("iteration %llu %s: finished, raised %d, r0 %08x\n", (unsigned long long)it, only, x.raised, x.regs[0]);
+            continue;
+        }
         alarm(20);
         static const bool trace = std::getenv("DIFFTEST_TRACE") != nullptr;
         if (trace) {

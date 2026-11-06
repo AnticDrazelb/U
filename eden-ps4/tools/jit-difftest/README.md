@@ -64,6 +64,27 @@ More of the PS4's configuration, and every run checked:
     DIFFTEST_NO_EXTRAS / NO_PINS / NO_REUSE=1   the PS4 extras / loop pins / stack range-check reuse off
     jit-difftest <n> <seed> loops [all]          random loop bodies, pins on against off against bare
     jit-difftest 0 0 loopbench                   a few loops timed with pins and without
+    DIFFTEST_PLT=1        half of the blocks (those without DIFFTEST_CALLS's call) make two calls
+                          through a GOT slot in the window, each through a PLT stub (BL to ADRP-like
+                          MOVZ/MOVK X16, LDR X17, [X16, #off], ADD X16, BR X17) or inline (BLR X17);
+                          the first callee may point the slot at another one (the guarded link's check
+                          failing), a slot holds garbage now and then (guarded links, 04.73)
+    DIFFTEST_NO_GUARD=1   the guarded links off
+    DIFFTEST_WITHOUT=<extra>   one of the PS4 extras off (fold_address_offsets, elide_dead_nzcv_abi, ...)
+    DIFFTEST_PROGRESS=1   each iteration's code (stderr) before it runs, and which run: to find a hang
+    DIFFTEST_SKIP=<n>     the first n iterations made but not run, to get to one
+    DIFFTEST_ONLY=on|off|bare   each iteration's one run alone, no comparison (a hang everyone's
+                          is the program's: a callee's random code making X30 its own address)
+                          (difftest32: DIFFTEST32_ONLY; DIFFTEST_PLT there too, LDR PC stubs, BLX
+                          through the GOT, ARM and Thumb callees, for the 32-bit guarded links)
+    jit-difftest 0 0 pltbench [rounds]           a PLT stub call and a GOT call timed, guard on and off
+                                                 (PLTBENCH_GUARD=0/1: one of them, for callgrind)
+
+Real code (04.73's last check): `blocks` over 5,934 32-instruction blocks cut from the homebrew NROs,
+the PS4's configuration, no cycle counting: 5,819 the same, 110 unclear (on and off differing from
+bare alike: Auto's unfused multiply-adds), 5 the optimised translation wrong, and all 5 are the
+calling convention's dead flags (`DIFFTEST_WITHOUT=elide_dead_nzcv_abi`: the same): the block
+calls or returns with flags it set but didn't read, which the callee or caller never reads.
 
 `difftest32.cpp` (`jit-difftest32 <n> <seed> [loops]`): the same for the 32-bit translator, random
 ARM, VFP and ASIMD blocks with the 32-bit PS4 extras (on), without (off, Auto as in 04.38-04.72) and

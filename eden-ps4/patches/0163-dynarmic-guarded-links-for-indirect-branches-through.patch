@@ -1,0 +1,265 @@
+From d8fab95b9311158538de1418cb563037f278f6d7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 07:02:15 +0000
+Subject: [PATCH] dynarmic: guarded links for indirect branches through a GOT
+ slot (A64 on under Auto/Unsafe)
+
+A block that ends in BR or BLR to a value it loaded from a constant address (a PLT stub's
+LDR X17, [X16, #off]; BR X17, a call through the GOT) reads that slot as it is when the block is
+translated (PeekCode, no side effects), compares the loaded value with it at the block's end
+(FuseCheckBit tests the difference in its register) and links straight to that value's block when
+they're equal; the fast dispatch lookup when not. Only canonical, 4-aligned, non-zero values; not
+when the block sets FPCR or single-steps.
+
+The A32 form (an ARM-state block ending in BXWritePC of a load from a constant address, LDR PC,
+[IP, #off]!) is implemented behind A32::UserConfig::guarded_indirect_links but not turned on yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W5pLthrq7391gS4qodPV4u
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  3 +
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  4 ++
+ .../dynarmic/backend/x64/a32_interface.cpp    | 56 +++++++++++++++++++
+ .../dynarmic/backend/x64/a64_interface.cpp    | 46 +++++++++++++++
+ .../src/dynarmic/interface/A32/config.h       |  5 ++
+ .../src/dynarmic/interface/A64/config.h       |  6 ++
+ 6 files changed, 120 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index adeee5d6af..919b7d9bba 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -254,6 +254,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     // watcher's safer steps)
+     // (04.73) a loop's busiest guest registers in host registers from its start to its exits
+     config.loop_register_pins = true;
++    // (04.73: a PLT stub's LDR PC linked straight to the function its GOT slot held when
++    // translated, UserConfig::guarded_indirect_links, is implemented but not on yet: its
++    // differential test hasn't finished; the 64-bit one is on)
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+     // (04.73) EDEN_PS4_JIT_TEST=extras: the same as Accurate does here, with Auto's speed
+     // otherwise (the boot watcher's first safer step: the translator as 04.72 had it under Auto)
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 8c8fd0ca05..4e84439532 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -399,6 +399,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.bitfield_shifts = true;
+     // (04.73) a loop's busiest guest registers in host registers from its start to its exits
+     config.loop_register_pins = true;
++    // (04.73) a PLT stub's (or a call through the GOT's) indirect branch: a link straight to the
++    // function its GOT slot held when translated, while the slot still holds it
++    config.guarded_indirect_links = true;
+ #if defined(__OPENORBIS__)
+     // (04.73) a block's stack accesses range checked once (the arena has no-access room on either
+     // side: common/orbis_memory.cpp)
+@@ -417,6 +420,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     const bool extras_off = jit_test && (std::string_view{jit_test} == "extras" || std::string_view{jit_test} == "ir");
+     if ((accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) || extras_off) {
+         config.loop_register_pins = false;
++        config.guarded_indirect_links = false;
+         config.fastmem_range_check_reuse = false;
+         config.fold_address_offsets = false;
+         config.skip_redundant_extensions = false;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index 0fa37c5693..df1dadef9b 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -34,6 +34,7 @@
+ #include "dynarmic/backend/x64/ps4_block_map.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/common/atomic.h"
++#include "dynarmic/frontend/A32/a32_ir_emitter.h"
+ #include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/frontend/A32/translate/a32_translate.h"
+ #include "dynarmic/interface/A32/a32.h"
+@@ -72,6 +73,58 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
+     };
+ }
+ 
++// (PS4 04.73) UserConfig::guarded_indirect_links: an ARM-state block, unconditional, ending in the
++// lookup after a BXWritePC of a load from a constant address, changing nothing of the upper location
++// descriptor: the word there now compared with the loaded one at the end; equal, a link straight to
++// the location the BXWritePC makes of it (the hash EmitA32BXWritePC computes at run time)
++static void GuardIndirectLink(IR::Block& block, A32::UserCallbacks& callbacks) {
++    const IR::Term::Terminal terminal = block.GetTerminal();
++    const auto* const leaf = std::get_if<IR::Term::LeafTerminal>(&terminal);
++    if (!leaf || !std::holds_alternative<IR::Term::FastDispatchHint>(*leaf) || block.GetCondition() != IR::Cond::AL)
++        return;
++    const A32::LocationDescriptor start{block.Location()};
++    if (start.TFlag())
++        return;
++    IR::Inst* write_pc = nullptr;
++    for (auto& inst : block.instructions) {
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::A32BXWritePC:
++            write_pc = &inst;
++            break;
++        case IR::Opcode::A32SetCpsr:
++        case IR::Opcode::A32SetFpscr:
++        case IR::Opcode::A32UpdateUpperLocationDescriptor:
++            return;
++        default:
++            break;
++        }
++    }
++    if (!write_pc || write_pc->GetArg(0).IsImmediate())
++        return;
++    IR::Inst* const load = write_pc->GetArg(0).GetInst();
++    if (load->GetOpcode() != IR::Opcode::A32ReadMemory32 || !load->GetArg(1).IsImmediate())
++        return;
++    const u32 vaddr = load->GetArg(1).GetU32();
++    if (vaddr & 3)
++        return;
++    const auto word = callbacks.PeekCode(vaddr);
++    if (!word)
++        return;
++    const u32 value = *word;
++    const bool thumb = (value & 1) != 0;
++    const u32 pc = value & (thumb ? 0xFFFFFFFEu : 0xFFFFFFFCu);
++    if (pc == 0 || (!thumb && (value & 2) != 0))
++        return;
++    const u64 upper_without_t =
++        (A32::LocationDescriptor{block.EndLocation()}.SetSingleStepping(false).UniqueHash() >> 32) & 0xFFFFFFFE;
++    const IR::LocationDescriptor next{((upper_without_t | (thumb ? 1 : 0)) << 32) | pc};
++    // (the new instructions after the BXWritePC: it then stores the PC and upper descriptor, the
++    // lookup reads them back)
++    A32::IREmitter ir{block, start, {}};
++    ir.SetCheckBit(ir.IsZero(ir.Sub(IR::U32{IR::Value{load}}, ir.Imm32(value))));
++    block.ReplaceTerminal(IR::Term::CheckBit{IR::Term::LinkBlock{next}, IR::Term::FastDispatchHint{}});
++}
++
+ struct Jit::Impl {
+     Impl(Jit* jit, A32::UserConfig conf) noexcept
+         : block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf))
+@@ -225,6 +278,7 @@ struct Jit::Impl {
+         add(conf.inline_fast_dispatch);
+         add(conf.inline_conditional_instructions);
+         add(conf.loop_register_pins);
++        add(conf.guarded_indirect_links);
+         add(conf.elide_dead_nzcv);
+         add(conf.elide_dead_nzcv_abi);
+         add(conf.plain_acquire_loads);
+@@ -329,6 +383,8 @@ private:
+                                                                        !conf.check_halt_on_memory_access,
+                                                                    conf.elide_dead_nzcv_abi});
+         Optimization::Optimize(ir_block, conf, polyfill_options);
++        if (conf.guarded_indirect_links && !arch_descriptor.SingleStepping())
++            GuardIndirectLink(ir_block, *conf.callbacks);
+         // Accesses fastmem was declined for (pages the PS4 can't map at the game's addresses: a
+         // thread's stack, its local storage) walk the page table: one walk for those through one
+         // base (a PUSH or POP, a function's stack frame), as without fastmem
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index b11075866e..0b4ad9ba5d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -29,6 +29,7 @@
+ #include "dynarmic/backend/x64/jitstate_info.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/common/atomic.h"
++#include "dynarmic/frontend/A64/a64_ir_emitter.h"
+ #include "dynarmic/frontend/A64/translate/a64_translate.h"
+ #include "dynarmic/interface/A64/a64.h"
+ #include "dynarmic/ir/basic_block.h"
+@@ -254,6 +255,48 @@ private:
+         return GetBlock(A64::LocationDescriptor{GetCurrentLocation()}.SetSingleStepping(true));
+     }
+ 
++    // (PS4 04.73) UserConfig::guarded_indirect_links: the block's last SetPC a load from a constant
++    // address, the block ending in the lookup (BR, BLR): the value there now, if it's an address
++    // code can be at, compared with the loaded one at the end; equal, a link straight to its block
++    void GuardIndirectLink(IR::Block& block) {
++        const IR::Term::Terminal terminal = block.GetTerminal();
++        const auto* const leaf = std::get_if<IR::Term::LeafTerminal>(&terminal);
++        if (!leaf || !std::holds_alternative<IR::Term::FastDispatchHint>(*leaf))
++            return;
++        IR::Inst* set_pc = nullptr;
++        for (auto& inst : block.instructions) {
++            switch (inst.GetOpcode()) {
++            case IR::Opcode::A64SetPC:
++                set_pc = &inst;
++                break;
++            case IR::Opcode::A64SetFPCR:  // (the next block's location carries the FPCR)
++                return;
++            default:
++                break;
++            }
++        }
++        if (!set_pc || set_pc->GetArg(0).IsImmediate())
++            return;
++        IR::Inst* const load = set_pc->GetArg(0).GetInst();
++        if (load->GetOpcode() != IR::Opcode::A64ReadMemory64 || !load->GetArg(1).IsImmediate())
++            return;
++        const u64 vaddr = load->GetArg(1).GetU64();
++        if (vaddr & 7)
++            return;
++        const auto lo = conf.callbacks->PeekCode(vaddr), hi = conf.callbacks->PeekCode(vaddr + 4);
++        if (!lo || !hi)
++            return;
++        const u64 target = u64(*lo) | (u64(*hi) << 32);
++        const auto next = A64::LocationDescriptor{block.Location()}.SetPC(target);
++        if (target == 0 || (target & 3) != 0 || next.PC() != target)  // (one a location can hold)
++            return;
++        // (the new instructions at the end, the terminal right after them: FuseCheckBit tests the
++        // difference in its register)
++        A64::IREmitter ir{block};
++        ir.SetCheckBit(ir.IsZero(ir.Sub(IR::U64{IR::Value{load}}, ir.Imm64(target))));
++        block.ReplaceTerminal(IR::Term::CheckBit{IR::Term::LinkBlock{next}, IR::Term::FastDispatchHint{}});
++    }
++
+     CodePtr GetBlock(IR::LocationDescriptor descriptor) {
+         if (auto block = emitter.GetBasicBlock(descriptor))
+             return block->entrypoint;
+@@ -294,6 +337,8 @@ private:
+         const bool dump = block_pc >= conf.dump_pc_lo && block_pc < conf.dump_pc_hi;
+         const std::string ir_before = dump ? IR::DumpBlock(ir_block) : std::string{};
+         Optimization::Optimize(ir_block, conf, polyfill_options);
++        if (conf.guarded_indirect_links && !arch_descriptor.SingleStepping())
++            GuardIndirectLink(ir_block);
+         // (PS4 04.25) With fastmem, the accesses it was declined for (pages the PS4 can't map at
+         // the game's addresses) walk the page table: one walk for those through one base
+         if (conf.fastmem_pointer && conf.page_table && conf.page_table_shared_walk && !conf.check_halt_on_memory_access &&
+@@ -404,6 +449,7 @@ private:
+         add(conf.return_stack_pc_only);
+         add(conf.follow_direct_branches);
+         add(conf.follow_known_returns);
++        add(conf.guarded_indirect_links);
+         add(conf.loop_register_pins);
+         add(conf.fastmem_range_check_reuse);
+         add(conf.plain_acquire_loads);
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 8d371974a9..77936970ae 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -267,6 +267,11 @@ struct UserConfig {
+     /// of the guest registers it uses in host registers from its start to every exit
+     bool loop_register_pins = false;
+ 
++    /// (PS4 04.73) As the A64 JIT's: a block that ends in a load into the PC from a constant
++    /// address (a PLT stub's LDR PC, [IP, #imm]!) checks the loaded value against the one there when
++    /// it was translated (PeekCode) and links straight to that one's block when they match.
++    bool guarded_indirect_links = false;
++
+     /// A block reads the ARM code its successors start with (a few instructions, along their
+     /// branches): when they set the condition flags before reading them, the flags the block ends
+     /// with are dead. It then doesn't store them, and a conditional branch at its end tests the
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 0f9518c324..232562a00a 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -415,6 +415,12 @@ struct UserConfig {
+     bool follow_direct_branches = false;
+     /// (PS4 04.73) see TranslationOptions::follow_known_returns
+     bool follow_known_returns = false;
++    /// (PS4 04.73) A block that ends in an indirect branch (BR, BLR) to a value it loaded from a
++    /// constant address (a PLT stub's LDR X17, [X16, #imm]; BR X17, a call through the GOT):
++    /// the value that address holds when the block is translated (PeekCode) is checked against
++    /// the loaded one at its end, and the block links straight to that one's block when they
++    /// match; the usual lookup (fast dispatch) when they don't.
++    bool guarded_indirect_links = false;
+ 
+     /// (PS4 04.25) A load-acquire (LDAR, LDAPR, LDAXR; A32's LDA, LDAEX) is a plain load (mov),
+     /// as C++'s sequentially consistent load is on x86-64, instead of a locked exchange-add of 0:
+-- 
+2.43.0
+
