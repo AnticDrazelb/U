@@ -1,0 +1,305 @@
+From ae626b29301a8818625d8bf0aaaf866c7163de94 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 02:25:56 +0000
+Subject: [PATCH] dynarmic A32: loops keep their busiest guest registers in
+ host registers (as A64's)
+
+loop_register_pins for the 32-bit JIT: a block linking back to its own start keeps up to three of
+r0-r14 in rbx, rbp and r12 (the condition prelude after the loop head: tested each time round),
+not with writes to the PC, CPSR or FPSCR, supervisor calls, exceptions, coprocessors, exclusives or
+an ISB. On with CPU Auto and Unsafe. Checked with tools/jit-difftest/difftest32 (loops: on and off
+the same in 20,000 random loops; a build that skips the stores fails 33 of 400).
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |   3 +
+ .../src/dynarmic/backend/x64/a32_emit_x64.cpp | 156 ++++++++++++++++++
+ .../src/dynarmic/backend/x64/a32_emit_x64.h   |  14 ++
+ .../dynarmic/backend/x64/a32_interface.cpp    |   1 +
+ .../src/dynarmic/interface/A32/config.h       |   4 +
+ 5 files changed, 178 insertions(+)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index e02ed7b9cf..f7a916cb3f 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -250,8 +250,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     // by the desktop differential test (tools/jit-difftest/difftest32.cpp, random ARM, VFP and
+     // ASIMD blocks, fastmem as the PS4's); off with Accurate, Paranoid and Debugging (the boot
+     // watcher's safer steps)
++    // (04.73) a loop's busiest guest registers in host registers from its start to its exits
++    config.loop_register_pins = true;
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+     if (accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) {
++        config.loop_register_pins = false;
+         config.inline_conditional_instructions = false;
+         config.elide_dead_nzcv = false;
+         config.elide_dead_nzcv_abi = false;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index 14a607d0e5..3ea0b295bb 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -109,12 +109,15 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
+     }
+ 
+     code.EnableWriting();
++    const bool loop = PlanLoopPins(block);
+     new (&this->reg_alloc) RegAlloc([this] {
+         std::bitset<32> gprs{any_gpr};
+         if (conf.fastmem_pointer)
+             gprs.reset(size_t(HostLoc::R13));
+         if (conf.page_table)
+             gprs.reset(size_t(HostLoc::R14));
++        for (size_t i = 0; i < loop_pins.count; i++)
++            gprs.reset(size_t(loop_pins.host[i]));
+         return gprs;
+     }(), any_xmm);
+ 
+@@ -127,6 +130,13 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
+         code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+         code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+     }
++    if (loop) {
++        // (PS4 04.73) the loop's pinned guest registers, loaded once: its way back jumps past them
++        // (the condition prelude after the head: tested each time round)
++        for (size_t i = 0; i < loop_pins.count; i++)
++            code.mov(HostLocToReg64(loop_pins.host[i]).cvt32(), MJitStateReg(A32::Reg(loop_pins.guest[i])));
++        loop_pins.head = code.getCurr();
++    }
+ 
+     nzcv_stored_end = nullptr;
+     host_cond_flags = HostCondFlags::None;
+@@ -205,6 +215,7 @@ finish_this_inst:
+         code.int3();
+     }
+ 
++    loop_pins = LoopPins{};
+     const size_t size = size_t(code.getCurr() - entrypoint);
+ 
+     const A32::LocationDescriptor descriptor{block.Location()};
+@@ -322,6 +333,134 @@ void A32EmitX64::FoldAddressOffsets(A32EmitContext& ctx, IR::Block& block) {
+     }
+ }
+ 
++// (PS4 04.73, loop_register_pins) as A64EmitX64::PlanLoopPins: a block whose terminal links back
++// to its own start, nothing in it reading the guest's registers from its state or leaving it
++// otherwise (supervisor calls, exceptions, coprocessors, writes to the PC, the CPSR or the FPSCR,
++// exclusives, an instruction barrier's callback)
++bool A32EmitX64::PlanLoopPins(IR::Block& block) {
++    loop_pins = LoopPins{};
++    if (!conf.loop_register_pins || conf.enable_cycle_counting || conf.jit_frame_pointer ||
++        conf.check_halt_on_memory_access || !conf.HasOptimization(OptimizationFlag::BlockLinking))
++        return false;
++    const IR::LocationDescriptor self = block.Location();
++    if (A32::LocationDescriptor{self}.SingleStepping())
++        return false;
++    bool back = false;
++    const auto leaf = [&](const IR::Term::LeafTerminal& t) {
++        if (const auto* link = std::get_if<IR::Term::LinkBlock>(&t))
++            back = back || link->next == self;
++        else if (const auto* fast = std::get_if<IR::Term::LinkBlockFast>(&t))
++            back = back || fast->next == self;
++    };
++    const IR::Term::Terminal terminal = block.GetTerminal();
++    if (const auto* x = std::get_if<IR::Term::LeafTerminal>(&terminal)) {
++        leaf(*x);
++    } else if (const auto* x = std::get_if<IR::Term::If>(&terminal)) {
++        leaf(x->then_);
++        leaf(x->else_);
++    } else if (const auto* x = std::get_if<IR::Term::CheckBit>(&terminal)) {
++        leaf(x->then_);
++        leaf(x->else_);
++    } else {
++        return false;
++    }
++    if (!back)
++        return false;
++    std::array<u16, 15> reads{}, writes{};
++    for (const auto& inst : block.instructions) {
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::A32SetCpsr:
++        case IR::Opcode::A32BXWritePC:
++        case IR::Opcode::A32UpdateUpperLocationDescriptor:
++        case IR::Opcode::A32CallSupervisor:
++        case IR::Opcode::A32ExceptionRaised:
++        case IR::Opcode::A32InstructionSynchronizationBarrier:
++        case IR::Opcode::A32SetFpscr:
++        case IR::Opcode::A32ClearExclusive:
++        case IR::Opcode::A32ExclusiveReadMemory8:
++        case IR::Opcode::A32ExclusiveReadMemory16:
++        case IR::Opcode::A32ExclusiveReadMemory32:
++        case IR::Opcode::A32ExclusiveReadMemory64:
++        case IR::Opcode::A32ExclusiveWriteMemory8:
++        case IR::Opcode::A32ExclusiveWriteMemory16:
++        case IR::Opcode::A32ExclusiveWriteMemory32:
++        case IR::Opcode::A32ExclusiveWriteMemory64:
++        case IR::Opcode::A32CoprocInternalOperation:
++        case IR::Opcode::A32CoprocSendOneWord:
++        case IR::Opcode::A32CoprocSendTwoWords:
++        case IR::Opcode::A32CoprocGetOneWord:
++        case IR::Opcode::A32CoprocGetTwoWords:
++        case IR::Opcode::A32CoprocLoadWords:
++        case IR::Opcode::A32CoprocStoreWords:
++            return false;
++        case IR::Opcode::A32GetRegister:
++            if (const size_t r = size_t(inst.GetArg(0).GetA32RegRef()); r < 15)
++                reads[r]++;
++            else
++                return false;
++            break;
++        case IR::Opcode::A32SetRegister:
++            if (const size_t r = size_t(inst.GetArg(0).GetA32RegRef()); r < 15)
++                writes[r]++;
++            else
++                return false;  // (the PC: not a plain loop)
++            break;
++        default:
++            break;
++        }
++    }
++    std::array<u8, 15> order{};
++    for (size_t i = 0; i < order.size(); i++)
++        order[i] = u8(i);
++    const auto score = [&](size_t g) {
++        return (reads[g] && writes[g] ? 1000 : 0) + reads[g] + writes[g];
++    };
++    std::stable_sort(order.begin(), order.end(), [&](u8 a, u8 b) { return score(a) > score(b); });
++    constexpr std::array<HostLoc, 3> hosts{HostLoc::RBX, HostLoc::RBP, HostLoc::R12};
++    for (size_t i = 0; i < order.size() && loop_pins.count < hosts.size(); i++) {
++        const size_t g = order[i];
++        if (score(g) == 0)
++            break;
++        loop_pins.guest[loop_pins.count] = u8(g);
++        loop_pins.host[loop_pins.count] = hosts[loop_pins.count];
++        loop_pins.written[loop_pins.count] = writes[g] != 0;
++        loop_pins.count++;
++    }
++    if (loop_pins.count == 0)
++        return false;
++    loop_pins.active = true;
++    loop_pins.self = self;
++    return true;
++}
++
++std::optional<Xbyak::Reg32> A32EmitX64::PinnedGuestReg(size_t guest_index) const {
++    if (!loop_pins.active)
++        return std::nullopt;
++    for (size_t i = 0; i < loop_pins.count; i++)
++        if (loop_pins.guest[i] == guest_index)
++            return HostLocToReg64(loop_pins.host[i]).cvt32();
++    return std::nullopt;
++}
++
++void A32EmitX64::EmitLoopPinsStore() {
++    for (size_t i = 0; i < loop_pins.count; i++)
++        if (loop_pins.written[i])
++            code.mov(MJitStateReg(A32::Reg(loop_pins.guest[i])), HostLocToReg64(loop_pins.host[i]).cvt32());
++}
++
++void A32EmitX64::EmitLoopPinsLeaf(IR::Term::LeafTerminal const& terminal, bool is_single_step) {
++    bool back = false;
++    if (const auto* link = std::get_if<IR::Term::LinkBlock>(&terminal))
++        back = link->next == loop_pins.self;
++    else if (const auto* fast = std::get_if<IR::Term::LinkBlockFast>(&terminal))
++        back = fast->next == loop_pins.self;
++    if (back && !is_single_step) {
++        code.cmp(dword[code.ABI_JIT_PTR + offsetof(A32JitState, halt_reason)], 0);
++        code.jz(loop_pins.head);
++    }
++    EmitLoopPinsStore();
++}
++
+ void A32EmitX64::EmitCondPrelude(const A32EmitContext& ctx) {
+     if (ctx.block.GetCondition() == IR::Cond::AL) {
+         ASSERT(!ctx.block.HasConditionFailedLocation());
+@@ -420,6 +559,11 @@ void A32EmitX64::EmitA32SetCheckBit(A32EmitContext& ctx, IR::Inst* inst) {
+ void A32EmitX64::EmitA32GetRegister(A32EmitContext& ctx, IR::Inst* inst) {
+     const A32::Reg reg = inst->GetArg(0).GetA32RegRef();
+     const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
++    if (const auto pinned = PinnedGuestReg(size_t(reg))) {
++        code.mov(result, *pinned);  // (PS4 04.73) in its loop's host register
++        ctx.reg_alloc.DefineValue(code, inst, result);
++        return;
++    }
+ 
+     code.mov(result, MJitStateReg(reg));
+     ctx.reg_alloc.DefineValue(code, inst, result);
+@@ -459,6 +603,16 @@ void A32EmitX64::EmitA32GetVector(A32EmitContext& ctx, IR::Inst* inst) {
+ void A32EmitX64::EmitA32SetRegister(A32EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const A32::Reg reg = inst->GetArg(0).GetA32RegRef();
++    if (const auto pinned = PinnedGuestReg(size_t(reg))) {
++        // (PS4 04.73) into its loop's host register
++        if (args[1].IsImmediate())
++            code.mov(*pinned, args[1].GetImmediateU32());
++        else if (args[1].IsInXmm(ctx.reg_alloc))
++            code.movd(*pinned, ctx.reg_alloc.UseXmm(code, args[1]));
++        else
++            code.mov(*pinned, ctx.reg_alloc.UseGpr(code, args[1]).cvt32());
++        return;
++    }
+ 
+     if (args[1].IsImmediate()) {
+         code.mov(MJitStateReg(reg), args[1].GetImmediateU32());
+@@ -1470,6 +1624,8 @@ bool EmitTerminalImpl(A32EmitX64& e, IR::Term::CheckHalt terminal, IR::LocationD
+ }
+ 
+ bool A32EmitX64::EmitLeafTerminal(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept {
++    if (loop_pins.active)
++        EmitLoopPinsLeaf(terminal, is_single_step);
+     if (auto const x = std::get_if<IR::Term::ReturnToDispatch>(&terminal))
+         return EmitTerminalImpl(*this, *x, initial_location, is_single_step);
+     if (auto const x = std::get_if<IR::Term::LinkBlock>(&terminal))
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+index 3409225b92..7f77ddd7cd 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -153,6 +153,20 @@ public:
+     // location descriptor in ebx for its exit (an inline return or fast dispatch), which reads
+     // them from there instead of loading back what it just stored
+     bool exit_descriptor_in_rbx_rcx = false;
++    /// (PS4 04.73, loop_register_pins) as A64EmitX64::LoopPins: guest r0-r14
++    struct LoopPins {
++        bool active = false;
++        size_t count = 0;
++        std::array<u8, 3> guest{};
++        std::array<HostLoc, 3> host{};
++        std::array<bool, 3> written{};
++        const void* head = nullptr;
++        IR::LocationDescriptor self{0};
++    } loop_pins;
++    bool PlanLoopPins(IR::Block& block);
++    std::optional<Xbyak::Reg32> PinnedGuestReg(size_t guest_index) const;
++    void EmitLoopPinsStore();
++    void EmitLoopPinsLeaf(IR::Term::LeafTerminal const& terminal, bool is_single_step);
+     bool ExitReadsWrittenPC(A32EmitContext& ctx, const IR::Inst* inst) const;
+     unsigned stack_declines = 0;
+     static constexpr unsigned StackDeclinesBeforeWalks = 32;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+index c8db3509ac..0fa37c5693 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a32_interface.cpp
+@@ -224,6 +224,7 @@ struct Jit::Impl {
+         add(conf.inline_rsb_pop);
+         add(conf.inline_fast_dispatch);
+         add(conf.inline_conditional_instructions);
++        add(conf.loop_register_pins);
+         add(conf.elide_dead_nzcv);
+         add(conf.elide_dead_nzcv_abi);
+         add(conf.plain_acquire_loads);
+diff --git a/src/dynarmic/src/dynarmic/interface/A32/config.h b/src/dynarmic/src/dynarmic/interface/A32/config.h
+index 830c8127f2..8d371974a9 100644
+--- a/src/dynarmic/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A32/config.h
+@@ -263,6 +263,10 @@ struct UserConfig {
+     /// TranslationOptions::inline_conditionals).
+     bool inline_conditional_instructions = false;
+ 
++    /// (PS4 04.73) As the A64 JIT's: a block that branches back to its own start keeps up to three
++    /// of the guest registers it uses in host registers from its start to every exit
++    bool loop_register_pins = false;
++
+     /// A block reads the ARM code its successors start with (a few instructions, along their
+     /// branches): when they set the condition flags before reading them, the flags the block ends
+     /// with are dead. It then doesn't store them, and a conditional branch at its end tests the
+-- 
+2.43.0
+

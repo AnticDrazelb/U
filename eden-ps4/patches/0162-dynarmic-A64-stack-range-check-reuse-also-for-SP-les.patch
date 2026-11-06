@@ -1,0 +1,33 @@
+From 035807fc7e6a1834b957ca72bb382b028f7c4bfa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 03:21:01 +0000
+Subject: [PATCH] dynarmic A64: stack range-check reuse also for SP less a
+ constant (a prologue's SUB SP / STP pre-index)
+
+unity64 (dynbench64, 20 steady frames, Jaguar features): 1,391,661 -> 1,354,183 instructions (-2.7%;
+the reuse -6.3% in all). Checked: 16,000 random blocks against no optimisation, every instruction
+kind with exact floats, the loop tests.
+---
+ src/dynarmic/src/dynarmic/backend/x64/emit_x64.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 1e6bfa0f73..79b5aad21c 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -129,10 +129,11 @@ public:
+     // never a wild pointer in a working game. (Any base saves ~6% more of IL2CPP-like code, but a
+     // wild pointer used twice in a block, after its first access's check failed, would reach the
+     // host's memory past the arena's no-access room: the desktop test found one.)
++    // (and SP less a constant: the stack pointer a prologue's SUB SP or STP pre-index left)
+     static bool IsStackBase(const IR::Inst* base) {
+         if (base->GetOpcode() == IR::Opcode::A64GetSP)
+             return true;
+-        if (base->GetOpcode() != IR::Opcode::Add64)
++        if (base->GetOpcode() != IR::Opcode::Add64 && base->GetOpcode() != IR::Opcode::Sub64)
+             return false;
+         const IR::Value a = base->GetArg(0), b = base->GetArg(1);
+         return !a.IsImmediate() && a.GetInst()->GetOpcode() == IR::Opcode::A64GetSP && b.IsImmediate() &&
+-- 
+2.43.0
+

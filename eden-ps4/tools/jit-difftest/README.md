@@ -47,3 +47,28 @@ elimination keeps it in a register) happened on that path only (patch 0155). And
 time: 0.35 s of decoder table set-up per process and ~33 us a block, now under 1 ms and ~14 us,
 the same code out (patch 0156).
 
+
+## 04.73
+
+More of the PS4's configuration, and every run checked:
+
+    DIFFTEST_NO_TICKS=1   no cycle counting (the PS4's multicore): superblocks' side exits and links
+                          without the halt check apply; code outside the block reads as SVC #0, which
+                          halts; random forward branches (CBZ/TBZ/B.cond/B) are mixed in
+    DIFFTEST_FULL=1       every run compared with bare, not only those where on and off differ (on
+                          and off share the PS4 extras, loop pins, followed branches: checked too)
+    DIFFTEST_CALLS=1      a third of the blocks call a leaf function (BL there, RET back)
+    DIFFTEST_FOLLOW=1     BL/forward B translated through, known returns followed
+    DIFFTEST_NO_ABI=1     no reliance on the call standard's dead flags (random code breaks it)
+    DIFFTEST_SAFE=1       Auto's unsafe float shortcuts off (exact against bare)
+    DIFFTEST_NO_EXTRAS / NO_PINS / NO_REUSE=1   the PS4 extras / loop pins / stack range-check reuse off
+    jit-difftest <n> <seed> loops [all]          random loop bodies, pins on against off against bare
+    jit-difftest 0 0 loopbench                   a few loops timed with pins and without
+
+`difftest32.cpp` (`jit-difftest32 <n> <seed> [loops]`): the same for the 32-bit translator, random
+ARM, VFP and ASIMD blocks with the 32-bit PS4 extras (on), without (off, Auto as in 04.38-04.72) and
+bare, a 4 GiB fastmem arena with no access past it (as the PS4's), no cycle counting;
+`DIFFTEST32_WITHOUT=<extra>` leaves one extra off (to tell which one a difference is). Build it as
+jit-difftest (another `add_executable` with tests/fuzz_util.cpp).
+
+Instruction generation follows the seed (not fuzz_util's own generator), so a failure reproduces.

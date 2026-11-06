@@ -89,6 +89,50 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
+  stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.73: the translated code's speed, every game
+
+Measured with `tools/dynarmic-harness` (callgrind, 20 steady frames, the Jaguar's host features):
+
+| program | 04.72 (Auto) | extras | + loop pins | + stack range-check reuse |
+|---|---|---|---|---|
+| game64 (game.c, A64) | 2,536,311 | 1,806,310 (-28.8%) | 1,829,976 | 1,814,233 (-28.5% in all) |
+| unity64 (IL2CPP-shaped, A64) | 1,854,339 | 1,443,126 (-22.2%) | 1,445,374 | 1,354,183 (-27.0% in all) |
+| game.bin (game.c, A32) | 2,642,533 | 2,089,383 (-20.9%) | 2,091,279 | (no range check in A32) |
+
+- **The translator extras on with Auto again** (patch 0158 for A64, the A32 gate in the same file):
+  04.35 (A64) and 04.38 (A32) had turned the PS4's 04.04-04.30 extras off unless CPU Unsafe was on,
+  a switch to tell whether Little Kitty's and Captain Toad's problems were theirs. They weren't (two
+  translator bugs, fixed in 04.68 and 04.71; a GPU hang), so every game under Auto ran without them.
+  Now on with Auto and Unsafe, off with Accurate, Paranoid and Debugging.
+- **Loop register pins** (patches 0158, 0159): a block that branches back to its own start keeps up
+  to three of its guest registers (those carried round the loop first) in rbx, rbp and r12 from its
+  start to every exit; the way back jumps past the loads. Neutral in instruction count (a move for a
+  load), but a loop's guest registers no longer go through memory each time round: llvm-mca for the
+  btver2 (Jaguar) with memory dependencies modelled puts Little Kitty's memcpy loop at 5,410 cycles
+  for 200 rounds, from 8,607.
+- **Stack range-check reuse** (patch 0160): fastmem's range check (cmp + jae before each access,
+  ~20% of what unity64's translated code executed) once a block for the stack pointer (and SP plus
+  or less a constant: locals' addresses, the SP a prologue left; patch 0162), checked against the
+  block's largest offset through it; the arena has
+  16 MiB of no-access room on either side for a stack at the very top of the address space. Only the
+  stack: with any base, a wild pointer used twice in a block, after its first access's check failed,
+  would reach the host's memory past that room (the differential test found one), for ~4% more.
+- **Checked**: `tools/jit-difftest` gained a no-cycle-counting mode (the PS4's multicore: superblocks'
+  side exits, forward links, runs ending at an SVC), random forward branches and calls, loops, and
+  `DIFFTEST_FULL` (every run against no optimisation, so what the optimised builds share is checked
+  too: before, only the IR passes were); 16,000+ random blocks per change, the loop tests (60,000),
+  every instruction kind (the differences left are Auto's unfused multiply-adds, gone with
+  `DIFFTEST_SAFE`), real NRO code. New `difftest32` for the 32-bit translator: 90,000 random ARM/VFP/
+  ASIMD blocks with the extras against without against bare, 20,000 loops (it found nothing wrong
+  with the extras once its arena had the PS4's no-access room past 4 GiB).
+- **Not on**: `follow_direct_branches` with `follow_known_returns` (returns of leaf functions followed
+  in the block, checked): +22% code and +46% translation time for a few percent; global register
+  pinning (the stack pointer is ~3% of the guest state's accesses).
+- **The boot watcher's step 2 is now "the CPU translation's PS4 shortcuts off"** (patch 0161:
+  `EDEN_PS4_JIT_TEST=extras`, 04.72's Auto), before the IR passes off, Accurate and Paranoid.
 
 ## 04.72: Little Kitty's profile; large pages
 

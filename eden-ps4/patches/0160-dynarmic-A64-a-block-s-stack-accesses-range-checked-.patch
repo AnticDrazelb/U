@@ -1,0 +1,326 @@
+From 2cf899d611c3a1d90b57f131c3ba010e54c91fec Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 03:03:49 +0000
+Subject: [PATCH] dynarmic A64: a block's stack accesses range checked once;
+ the fastmem arena with no-access room on either side
+
+fastmem_range_check_reuse: a block's first fastmem access through the stack pointer (or the stack
+pointer plus a constant under 64 KiB, a local's address) checks it against the largest offset any of
+the block's fastmem accesses through that value uses; the others skip the range check (base +
+offset is then inside the arena). The arena gets 16 MiB reserved with no access before and after
+it, where an unchecked access of a base that failed its check (a stack at the very top of the
+address space) faults and takes the fallback. Only stack bases: with any base, a wild pointer used
+twice in a block reaches the host's memory past that room (the desktop test found one), for ~6%
+more of IL2CPP-like code. On the PS4 with CPU Auto and Unsafe.
+
+Measured (dynbench64, 20 steady frames, the Jaguar's features): unity64 -3.7% instructions on top of
+the extras and loop pins, game64 -0.4%. Checked: 16,000 random blocks (no cycle counting, forward
+branches, every run against no optimisation), the loop tests, Little Kitty's 31 blocks.
+---
+ src/common/orbis_memory.cpp                   |  9 ++++-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  6 +++
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 38 +++++++++++++++++++
+ .../dynarmic/backend/x64/a64_interface.cpp    |  1 +
+ .../src/dynarmic/backend/x64/emit_x64.h       | 35 +++++++++++++++++
+ .../backend/x64/emit_x64_memory.cpp.inc       | 17 +++++++--
+ .../dynarmic/backend/x64/emit_x64_memory.h    | 15 +++++---
+ .../src/dynarmic/interface/A64/config.h       |  7 ++++
+ 8 files changed, 116 insertions(+), 12 deletions(-)
+
+diff --git a/src/common/orbis_memory.cpp b/src/common/orbis_memory.cpp
+index 5ed0d9f37e..14a2194d6e 100644
+--- a/src/common/orbis_memory.cpp
++++ b/src/common/orbis_memory.cpp
+@@ -219,6 +219,7 @@ std::atomic_flag arena_lock = ATOMIC_FLAG_INIT;
+ constexpr size_t ArenaPage = 16_KiB;   // the PS4's page
+ constexpr size_t GuestPage = 4_KiB;
+ constexpr size_t MaxArenaRun = 512_KiB; // mapped at once when the pages after qualify too
++constexpr size_t ArenaGuard = 16_MiB;   // (04.73) reserved, no access, before and after the arena
+ 
+ // The direct memory behind DRAM offset `offset` (16 KiB aligned), committing its chunk if the
+ // game hasn't touched it yet; -1 if there's none
+@@ -609,7 +610,11 @@ void* ReserveFastmemArena(unsigned max_bits, void* backing, size_t backing_size,
+     if (!EnableAliasing())
+         return nullptr;
+     for (unsigned b = max_bits; b >= 32; b--) {
+-        if (void* range = ReserveAboveGpu(size_t(1) << b)) {
++        // (04.73) with 16 MiB reserved (no access) on either side: an access the recompiler didn't
++        // range check (fastmem_range_check_reuse: the base checked once a block) that lands just
++        // past either end faults there and takes the fallback
++        if (void* reserved = ReserveAboveGpu((size_t(1) << b) + 2 * ArenaGuard)) {
++            void* const range = static_cast<char*>(reserved) + ArenaGuard;
+             arena.size = size_t(1) << b;
+             arena.bits = b;
+             arena.backing = reinterpret_cast<uintptr_t>(backing);
+@@ -627,7 +632,7 @@ void* ReserveFastmemArena(unsigned max_bits, void* backing, size_t backing_size,
+ void ReleaseFastmemArena() {
+     const uintptr_t base = arena.base.exchange(0, std::memory_order_acq_rel);
+     if (base)
+-        sceKernelMunmap(reinterpret_cast<void*>(base), arena.size);
++        sceKernelMunmap(reinterpret_cast<void*>(base - ArenaGuard), arena.size + 2 * ArenaGuard);
+     arena.table.store(nullptr, std::memory_order_release);
+     arena.bits = 0;
+ }
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 5b99dcadd1..5d843dc6b4 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -399,6 +399,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.bitfield_shifts = true;
+     // (04.73) a loop's busiest guest registers in host registers from its start to its exits
+     config.loop_register_pins = true;
++#if defined(__OPENORBIS__)
++    // (04.73) a block's stack accesses range checked once (the arena has no-access room on either
++    // side: common/orbis_memory.cpp)
++    config.fastmem_range_check_reuse = true;
++#endif
+     // (04.35-04.72: off with CPU Unsafe off, a switch to tell whether a game's trouble was theirs;
+     // it never was: Little Kitty's was two translator bugs, fixed in 04.68 and 04.71, Captain
+     // Toad's a GPU hang) (04.73) On with Auto and Unsafe again, now checked by the desktop
+@@ -408,6 +413,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+     if (accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) {
+         config.loop_register_pins = false;
++        config.fastmem_range_check_reuse = false;
+         config.fold_address_offsets = false;
+         config.skip_redundant_extensions = false;
+         config.split_cold_code = false;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index bf552b869d..9c52b9b664 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -122,6 +122,44 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     nzcv_stored_end = nullptr;
+     host_cond_flags = HostCondFlags::None;
+     FoldAddressOffsets(ctx, block);
++    // (PS4 04.73, fastmem_range_check_reuse) each base's largest offset among the block's fastmem
++    // accesses through it: its first access checks for that, the others skip the check
++    range_dmax.clear();
++    range_checked.clear();
++    if (conf.fastmem_range_check_reuse && conf.fastmem_pointer && !conf.silently_mirror_fastmem &&
++        conf.fastmem_address_space_bits < 64) {
++        for (auto& inst : block.instructions) {
++            switch (inst.GetOpcode()) {
++            case IR::Opcode::A64ReadMemory8:
++            case IR::Opcode::A64ReadMemory16:
++            case IR::Opcode::A64ReadMemory32:
++            case IR::Opcode::A64ReadMemory64:
++            case IR::Opcode::A64ReadMemory128:
++            case IR::Opcode::A64WriteMemory8:
++            case IR::Opcode::A64WriteMemory16:
++            case IR::Opcode::A64WriteMemory32:
++            case IR::Opcode::A64WriteMemory64:
++            case IR::Opcode::A64WriteMemory128: {
++                if (inst.GetArg(1).IsImmediate() || !IsStackBase(inst.GetArg(1).GetInst()) || !ShouldFastmem(ctx, &inst))
++                    break;
++                const IR::Inst* const base = inst.GetArg(1).GetInst();
++                const u32 d = FoldedDisp(&inst);
++                bool found = false;
++                for (auto& [b, dmax] : range_dmax) {
++                    if (b == base) {
++                        dmax = std::max(dmax, d);
++                        found = true;
++                    }
++                }
++                if (!found && range_dmax.size() < range_dmax.capacity())
++                    range_dmax.emplace_back(base, d);
++                break;
++            }
++            default:
++                break;
++            }
++        }
++    }
+     FuseCheckBit(block);
+     FuseCondFlags(block);
+     PeepholeQuad(ctx, block);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index 5ecc08e404..b11075866e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -405,6 +405,7 @@ private:
+         add(conf.follow_direct_branches);
+         add(conf.follow_known_returns);
+         add(conf.loop_register_pins);
++        add(conf.fastmem_range_check_reuse);
+         add(conf.plain_acquire_loads);
+         add(conf.elide_load_store_only_barriers);
+         add(conf.superblocks);
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+index 444886bad1..1e6bfa0f73 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64.h
+@@ -120,6 +120,41 @@ public:
+     // constant folded into the access (A32EmitX64::FoldAddressOffsets): [r13 + base + disp] with
+     // fastmem, the address rebuilt where it is needed whole (a fault's fallback, a walk)
+     boost::container::small_vector<std::pair<const IR::Inst*, u32>, 32> folded_disp;
++    // (PS4 04.73, fastmem_range_check_reuse) for a fastmem access through a base value: whether
++    // an earlier access of the block checked that base already (skip its check), and else the
++    // offset to check it against (the largest any of the block's fastmem accesses through it uses)
++    boost::container::small_vector<std::pair<const IR::Inst*, u32>, 16> range_dmax;
++    boost::container::small_vector<const IR::Inst*, 16> range_checked;
++    // Only the stack pointer, or the stack pointer plus a constant under 64 KiB (a local's address):
++    // never a wild pointer in a working game. (Any base saves ~6% more of IL2CPP-like code, but a
++    // wild pointer used twice in a block, after its first access's check failed, would reach the
++    // host's memory past the arena's no-access room: the desktop test found one.)
++    static bool IsStackBase(const IR::Inst* base) {
++        if (base->GetOpcode() == IR::Opcode::A64GetSP)
++            return true;
++        if (base->GetOpcode() != IR::Opcode::Add64)
++            return false;
++        const IR::Value a = base->GetArg(0), b = base->GetArg(1);
++        return !a.IsImmediate() && a.GetInst()->GetOpcode() == IR::Opcode::A64GetSP && b.IsImmediate() &&
++               b.GetU64() < 0x10000;
++    }
++    std::pair<bool, u32> RangeCheckPlan(const IR::Inst* inst, u32 disp) {
++        if (range_dmax.empty() || inst->GetArg(1).IsImmediate())
++            return {false, disp};
++        const IR::Inst* const base = inst->GetArg(1).GetInst();
++        if (!IsStackBase(base))
++            return {false, disp};
++        for (const IR::Inst* checked : range_checked)
++            if (checked == base)
++                return {true, disp};
++        for (const auto& [b, dmax] : range_dmax) {
++            if (b == base) {
++                range_checked.push_back(base);
++                return {false, std::max(dmax, disp)};
++            }
++        }
++        return {false, disp};
++    }
+     u32 FoldedDisp(const IR::Inst* inst) const {
+         for (const auto& [folded, disp] : folded_disp) {
+             if (folded == inst)
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 89c7065221..33d0c00843 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -125,6 +125,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+ 
+     // (an address folded into the displacement: whole again where the access needs it whole)
+     u32 disp = FoldedDisp(inst);
++    const u32 orig_disp = disp;
+     if (disp != 0 && (!fastmem_marker || ordered)) {
+         const Xbyak::Reg64 whole = ctx.reg_alloc.ScratchGpr(code);
+         EmitWholeAddress(code, whole, vaddr, disp);
+@@ -141,7 +142,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         // Use fastmem, the address's constant in the displacement: a fault's fallback takes the
+         // address whole (the 32-bit wrap) in the base's register, put back after
+         bool require_abort_handling = false;
+-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp);
++        const auto [checked, check_disp] = RangeCheckPlan(inst, orig_disp);
++        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp,
++                                              checked, check_disp);
+ 
+         const void* location;
+         if constexpr (bitsize == 32 || bitsize == 64) {
+@@ -189,8 +192,10 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     } else if (fastmem_marker) {
+         // Use fastmem
+         bool require_abort_handling = false;
++        // (PS4 04.73) the address in vaddr is the base plus orig_disp: the base's check, less that
++        const auto [checked, check_disp] = address_in_arena ? std::pair<bool, u32>{false, orig_disp} : RangeCheckPlan(inst, orig_disp);
+         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, 0,
+-                                              address_in_arena);
++                                              address_in_arena || checked, check_disp - orig_disp);
+ 
+         const void* location;
+         if constexpr (bitsize == 32 || bitsize == 64) {
+@@ -305,6 +310,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+     // (an address folded into the displacement: whole again where the access needs it whole,
+     // or where the value is in the base's register, which the fallback would overwrite)
+     u32 disp = FoldedDisp(inst);
++    const u32 orig_disp = disp;
+     if (disp != 0 && (!fastmem_marker || ordered || bitsize == 128 || (!from_xmm && value_idx == vaddr.getIdx()))) {
+         const Xbyak::Reg64 whole = ctx.reg_alloc.ScratchGpr(code);
+         EmitWholeAddress(code, whole, vaddr, disp);
+@@ -320,7 +326,9 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+         // Use fastmem, the address's constant in the displacement: a fault's fallback takes the
+         // address whole (the 32-bit wrap) in the base's register, put back after
+         bool require_abort_handling = false;
+-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp);
++        const auto [checked, check_disp] = RangeCheckPlan(inst, orig_disp);
++        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, disp,
++                                               checked, check_disp);
+ 
+         const void* location;
+         if constexpr (bitsize == 32 || bitsize == 64) {
+@@ -363,8 +371,9 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+     } else if (fastmem_marker) {
+         // Use fastmem
+         bool require_abort_handling = false;
++        const auto [checked, check_disp] = address_in_arena ? std::pair<bool, u32>{false, orig_disp} : RangeCheckPlan(inst, orig_disp);
+         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, 0,
+-                                               address_in_arena);
++                                               address_in_arena || checked, check_disp - orig_disp);
+ 
+         const void* location;
+         if constexpr (bitsize == 32 || bitsize == 64) {
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+index 9a546de97a..dd0dd91d5e 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -215,15 +215,18 @@ template<>
+ // (PS4 04.22) disp: a constant folded into the access's displacement (A64EmitX64::
+ // FoldAddressOffsets): the range check then makes sure vaddr + disp is in the arena
+ template<typename EmitContext>
+-Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 disp = 0, bool known_in_range = false);
++Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 disp = 0, bool known_in_range = false, u64 check_disp = 0);
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64, bool) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64, bool, u64) {
+     return r13 + vaddr;
+ }
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 disp, bool known_in_range) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 disp, bool known_in_range, u64 check_disp) {
++    // (PS4 04.73) check_disp: what the address in vaddr is checked against beyond disp (a base
++    // checked for the block's largest offset through it: fastmem_range_check_reuse)
++    check_disp = std::max(check_disp, disp);
+     auto const unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
+     if (known_in_range && !ctx.conf.silently_mirror_fastmem) {
+         // (PS4 04.23) a constant address (ADRP + offset: globals) in the arena, the access with it
+@@ -232,8 +235,8 @@ template<>
+     if (disp != 0) {
+         // folded (only with a range check, unmirrored, under 64 bits): the base below the
+         // arena's size less the constant, so base + constant (no wrap) is in it
+-        ASSERT(unused_top_bits != 0 && !ctx.conf.silently_mirror_fastmem && disp < (u64(1) << ctx.conf.fastmem_address_space_bits));
+-        code.cmp(vaddr, code.Const(code.qword, (u64(1) << ctx.conf.fastmem_address_space_bits) - disp));
++        ASSERT(unused_top_bits != 0 && !ctx.conf.silently_mirror_fastmem && check_disp < (u64(1) << ctx.conf.fastmem_address_space_bits));
++        code.cmp(vaddr, code.Const(code.qword, (u64(1) << ctx.conf.fastmem_address_space_bits) - check_disp));
+         code.jae(abort, code.T_NEAR);
+         require_abort_handling = true;
+         return r13 + vaddr;
+@@ -263,7 +266,7 @@ template<>
+         } else {
+             // One compare with the limit in the constant pool (RIP-relative), not a copy, a shift
+             // and a scratch register: on every access of a game with a 2^36-2^39 arena (the PS4)
+-            code.cmp(vaddr, code.Const(code.qword, u64(1) << ctx.conf.fastmem_address_space_bits));
++            code.cmp(vaddr, code.Const(code.qword, (u64(1) << ctx.conf.fastmem_address_space_bits) - check_disp));
+             code.jae(abort, code.T_NEAR);
+             require_abort_handling = true;
+         }
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 2de69dd489..0f9518c324 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -337,6 +337,13 @@ struct UserConfig {
+     /// (needs no cycle counting, no frame pointer, no halt on memory access)
+     bool loop_register_pins = false;
+ 
++    /// (PS4 04.73) With fastmem's range check (an arena smaller than the address space): a
++    /// block's first fastmem access through a base value checks it against the largest offset any
++    /// of the block's fastmem accesses through it uses, the others skip the check (base + offset
++    /// is then inside the arena). Needs no-access room before and after the arena for a base
++    /// that failed its check (the others then fault there and take the fallback, as unchecked).
++    bool fastmem_range_check_reuse = false;
++
+     /// (PS4 04.70) GetSetElimination only for the blocks that start in [getset_pc_lo, getset_pc_hi):
+     /// the launcher's search for a block it's mistranslated in
+     std::uint64_t getset_pc_lo = 0, getset_pc_hi = ~std::uint64_t{0};
+-- 
+2.43.0
+

@@ -73,8 +73,11 @@ public:
         if (fd < 0 || ftruncate(fd, kWindowSize) != 0)
             std::abort();
         backing = static_cast<u8*>(mmap(nullptr, kWindowSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-        arena = static_cast<u8*>(mmap(nullptr, u64(1) << kArenaBits, PROT_NONE,
+        // (04.73: 16 MiB of no access before and after it, as the PS4's arena)
+        arena = static_cast<u8*>(mmap(nullptr, (u64(1) << kArenaBits) + (32 << 20), PROT_NONE,
                                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+        if (arena != MAP_FAILED)
+            arena += 16 << 20;
         page_table = static_cast<u64*>(mmap(nullptr, (u64(1) << (kArenaBits - 12)) * sizeof(u64),
                                             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                                             -1, 0));
@@ -145,7 +148,19 @@ public:
         MemoryWrite(a, v, size);
         return true;
     }
-    void CallSVC(std::uint32_t) override { raised = true; ticks_left = 0; }
+    A64::Jit* halt_jit = nullptr;  // (loops: no cycle counting, an SVC halts the run)
+    bool svc_outside = false;      // (DIFFTEST_NO_TICKS: code outside the block reads as SVC #0)
+    std::optional<std::uint32_t> MemoryReadCode(u64 vaddr) override {
+        if (!IsInCodeMem(vaddr))
+            return svc_outside ? 0xD4000001u : 0x14000000u;
+        return code_mem[(vaddr - code_mem_start_address) / 4];
+    }
+    void CallSVC(std::uint32_t) override {
+        raised = true;
+        ticks_left = 0;
+        if (halt_jit)
+            halt_jit->HaltExecution();
+    }
     void ExceptionRaised(u64, Dynarmic::A64::Exception) override { raised = true; ticks_left = 0; }
 };
 
@@ -232,7 +247,8 @@ Generators MakeGenerators(bool integer_only) {
 
 u32 RandomInstruction(const Generators& g, u64 pc, bool last) {
     while (true) {
-        const u32 inst = g.list[Rand(0, g.list.size() - 1)].Generate();
+        const InstructionGenerator& pick = g.list[Rand(0, g.list.size() - 1)];
+        const u32 inst = pick.Bits() | (u32(rng()) & ~pick.Mask());  // (reproducible from the seed)
         if (Testable(inst, pc, last))
             return inst;
     }
@@ -264,6 +280,10 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
                       OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
     c.optimizations &= ~remove;
     c.unsafe_optimizations = true;
+    if (std::getenv("DIFFTEST_SAFE")) {  // (Auto's unsafe float shortcuts off: exact against bare)
+        c.optimizations &= ~(OptimizationFlag::Unsafe_UnfuseFMA | OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+        c.unsafe_optimizations = false;
+    }
     c.define_unpredictable_behaviour = true;
     c.dczid_el0 = 4;
     c.ctr_el0 = 0x8444c004;
@@ -273,11 +293,48 @@ A64::UserConfig Config(Env& env, ExclusiveMonitor& monitor, OptimizationFlag rem
     c.inline_rsb_pop = true;
     c.inline_fast_dispatch = true;
     c.code_cache_size = 64 * 1024 * 1024;
+    c.loop_register_pins = std::getenv("DIFFTEST_NO_PINS") == nullptr;
+    c.fastmem_range_check_reuse = std::getenv("DIFFTEST_NO_REUSE") == nullptr;
+    // (DIFFTEST_FOLLOW=1) BL and forward B translated through, and known returns followed
+    c.follow_direct_branches = c.follow_known_returns = std::getenv("DIFFTEST_FOLLOW") != nullptr;
+    // (04.73) the 64-bit translator's PS4 extras (04.22-04.30), as Eden sets them (on under Auto
+    // again from 04.73): DIFFTEST_NO_EXTRAS=1 leaves them off (Auto as in 04.35-04.72)
+    if (std::getenv("DIFFTEST_NO_EXTRAS") == nullptr) {
+        c.fold_address_offsets = true;
+        c.skip_redundant_extensions = true;
+        c.split_cold_code = true;
+        c.elide_dead_nzcv = true;
+        c.elide_dead_nzcv_abi = true;
+        c.return_stack_pc_only = true;
+        c.plain_acquire_loads = true;
+        c.elide_load_store_only_barriers = true;
+        c.superblocks = true;
+        c.superblocks_cond = true;
+        c.bitfield_shifts = true;
+        // (DIFFTEST_NO_ABI=1: no reliance on the procedure call standard's dead flags at calls and
+        // returns, which random code breaks: for checking calls)
+        if (std::getenv("DIFFTEST_NO_ABI"))
+            c.elide_dead_nzcv_abi = false;
+    }
     if (std::getenv("DIFFTEST_DUMP")) {  // each block's IR, as translated and as emitted (to stderr)
         c.dump_pc_lo = 0;
         c.dump_pc_hi = ~u64{0};
     }
     return c;
+}
+
+// the referee: no optimisation at all, none of the PS4 extras either
+void MakeBare(A64::UserConfig& c) {
+    c.optimizations = no_optimizations;
+    c.unsafe_optimizations = false;
+    c.fold_address_offsets = c.skip_redundant_extensions = c.split_cold_code = false;
+    c.elide_dead_nzcv = c.elide_dead_nzcv_abi = c.return_stack_pc_only = false;
+    c.plain_acquire_loads = c.elide_load_store_only_barriers = false;
+    c.superblocks = c.superblocks_cond = c.bitfield_shifts = false;
+    c.loop_register_pins = false;
+    c.follow_known_returns = false;
+    c.fastmem_range_check_reuse = false;
+    c.link_forward_without_halt_check = c.inline_rsb_pop = c.inline_fast_dispatch = false;
 }
 
 u64 RandomValue() {
@@ -332,13 +389,15 @@ struct Runner {
         return r;
     }
     u64 first_run_callbacks = 0, second_run_callbacks = 0;
+    bool ignore_fpsr = false;
     Result RunOnce(const std::vector<u32>& code, const State& s) {
         env.Reset();
         env.code_mem = code;
-        env.code_mem.push_back(0x14000000); // B .
+        env.code_mem.push_back(env.svc_outside ? 0xD4000001u : 0x14000000u); // SVC #0 (no ticks), else B .
         env.code_mem_start_address = s.start;
         env.ticks_left = code.size();
         jit->ClearExclusiveState();
+        jit->ClearHalt(HaltReason::UserDefined1);  // (an SVC's halt from the run before)
         jit->SetRegisters(s.regs);
         jit->SetVectors(s.vecs);
         jit->SetPC(s.start);
@@ -347,13 +406,19 @@ struct Runner {
         jit->SetFpsr(0);
         jit->SetPstate(s.pstate);
         jit->Run();
+        // (no ticks: a run that stopped before its SVC, for a recompile its fault asked for, goes on)
+        for (int again = 0; env.svc_outside && !env.raised && again < 16; again++)
+            jit->Run();
+        // (no ticks: FPSR's sticky flags left out of the comparison: they carry over from the run
+        // before in some orders of runs, the same in every configuration, 04.72's too)
+        ignore_fpsr = env.svc_outside;
         Result r;
         r.regs = jit->GetRegisters();
         r.vecs = jit->GetVectors();
         r.sp = jit->GetSP();
         r.pc = jit->GetPC();
         r.nzcv = jit->GetPstate() >> 28;
-        r.fpsr = jit->GetFpsr();
+        r.fpsr = ignore_fpsr ? 0 : jit->GetFpsr();
         r.raised = env.raised;
         r.memory.assign(env.modified_memory.begin(), env.modified_memory.end());
         std::sort(r.memory.begin(), r.memory.end());
@@ -468,13 +533,156 @@ int main(int argc, char** argv) {
         r->env.Init();
         r->monitor.emplace(1);
     }
-    on.jit.emplace(Config(on.env, *on.monitor, OptimizationFlag{}));
-    off.jit.emplace(Config(off.env, *off.monitor, remove));
+    // (DIFFTEST_NO_TICKS=1) without cycle counting, as the PS4's multicore: superblocks and links
+    // without the halt check then apply; a run ends at an SVC (any code outside the block)
+    const bool no_ticks = std::getenv("DIFFTEST_NO_TICKS") != nullptr;
     {
-        A64::UserConfig c = Config(bare.env, *bare.monitor, OptimizationFlag{});
-        c.optimizations = no_optimizations;
-        c.unsafe_optimizations = false;
+        A64::UserConfig c = Config(on.env, *on.monitor, OptimizationFlag{});
+        c.enable_cycle_counting = !no_ticks;
+        on.jit.emplace(c);
+        c = Config(off.env, *off.monitor, remove);
+        c.enable_cycle_counting = !no_ticks;
+        off.jit.emplace(c);
+        c = Config(bare.env, *bare.monitor, OptimizationFlag{});
+        MakeBare(c);
+        c.enable_cycle_counting = !no_ticks;
         bare.jit.emplace(c);
+    }
+    for (Runner* r : {&on, &off, &bare}) {
+        r->env.svc_outside = no_ticks;
+        r->env.halt_jit = no_ticks ? &*r->jit : nullptr;
+    }
+
+    // (loopbench) jit-difftest 0 0 loopbench: a few loops run 20 million times, timed with the
+    // loop's registers pinned and without (no cycle counting, as the PS4's multicore)
+    if (argc > 3 && std::string(argv[3]) == "loopbench") {
+        struct Case { const char* name; std::vector<u32> code; };
+        const std::vector<Case> cases = {
+            // add x1, x1, x2; eor x3, x3, x1; subs x28, x28, #1; b.ne -3
+            {"arithmetic", {0x8B020021, 0xCA010063, 0xF100079C, 0x54FFFFA1, 0xD4000001}},
+            // ldr x1, [x9]; add x1, x1, #1; str x1, [x9]; subs x28, x28, #1; b.ne -4
+            {"load add store", {0xF9400121, 0x91000421, 0xF9000121, 0xF100079C, 0x54FFFF81, 0xD4000001}},
+            // memcpy's 32 bytes a round, the same 32 each time (x9 -> x8, then both back):
+            // ldp x10, x11, [x9]; ldp x12, x13, [x9, #16]; stp x10, x11, [x8]; stp x12, x13, [x8, #16];
+            // add x8, x8, #32; add x9, x9, #32; sub x8, x8, #32; sub x9, x9, #32; subs x28.. ; b.ne
+            {"memcpy round", {0xA9402D2A, 0xA941352C, 0xA9002D0A, 0xA901350C, 0x91008108, 0x91008129, 0xD1008108,
+                              0xD1008129, 0xF100079C, 0x54FFFEC1, 0xD4000001}},
+        };
+        for (const bool pins : {false, true}) {
+            for (Runner* r : {&on}) {
+                A64::UserConfig c = Config(r->env, *r->monitor, OptimizationFlag{});
+                c.enable_cycle_counting = false;
+                c.loop_register_pins = pins;
+                r->jit.reset();
+                r->jit.emplace(c);
+                r->env.halt_jit = &*r->jit;
+            }
+            for (const Case& k : cases) {
+                State st;
+                st.start = 0x10000;
+                st.regs[28] = 20000000;
+                st.regs[8] = kWindow + 0x1000;
+                st.regs[9] = kWindow + 0x2000;  // (pages 1 and 2: in the arena)
+                st.sp = kWindow + kWindowSize / 2;
+                const auto t0 = std::chrono::steady_clock::now();
+                on.RunOnce(k.code, st);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                std::printf("%-16s pins %-3s %7.1f ms (%.2f ns a round)\n", k.name, pins ? "on" : "off", ms, ms * 1e6 / 20e6);
+            }
+        }
+        return 0;
+    }
+
+    // (loops) jit-difftest <iterations> <seed> loops [all]: random loop bodies (x28, the counter,
+    // in none of their register fields) closed by SUBS X28/W28 + B.NE or SUB + CBNZ back to the
+    // start, then an SVC that halts: run without cycle counting (the PS4's multicore), with the
+    // loop's registers pinned (on), without (off), and with no optimisation (bare, the referee)
+    if (argc > 3 && std::string(argv[3]) == "loops") {
+        const Generators loop_generators = MakeGenerators(!(argc > 4 && std::string(argv[4]) == "all"));
+        for (Runner* r : {&on, &off, &bare}) {
+            A64::UserConfig c = Config(r->env, *r->monitor, OptimizationFlag{});
+            c.enable_cycle_counting = false;
+            c.loop_register_pins = r == &on;
+            if (r == &bare)
+                MakeBare(c);
+            r->jit.reset();
+            r->jit.emplace(c);
+            r->env.halt_jit = &*r->jit;
+        }
+        const auto uses28 = [](u32 inst) {
+            for (const int shift : {0, 5, 10, 16})
+                if (((inst >> shift) & 31) == 28)
+                    return true;
+            return false;
+        };
+        u64 wrong = 0, unclear = 0;
+        for (u64 it = 0; it < iterations; it++) {
+            State s;
+            s.start = Rand(0x1000, 0x7fffffff) * 4;
+            const size_t body = Rand(1, 14);
+            std::vector<u32> code;
+            while (code.size() < body) {
+                const u32 inst = RandomInstruction(loop_generators, s.start + code.size() * 4, false);
+                if (!uses28(inst))
+                    code.push_back(inst);
+            }
+            const s32 back = -s32(body + 1);
+            switch (Rand(0, 2)) {
+            case 0:  // subs x28, x28, #1; b.ne start
+                code.push_back(0xF100079Cu);
+                code.push_back(0x54000001u | ((u32(back) & 0x7ffff) << 5));
+                break;
+            case 1:  // subs w28, w28, #1; b.ne start
+                code.push_back(0x7100079Cu);
+                code.push_back(0x54000001u | ((u32(back) & 0x7ffff) << 5));
+                break;
+            default:  // sub x28, x28, #1; cbnz x28, start
+                code.push_back(0xD100079Cu);
+                code.push_back(0xB500001Cu | ((u32(back) & 0x7ffff) << 5));
+                break;
+            }
+            code.push_back(0xD4000001u);  // svc #0
+            for (auto& r : s.regs)
+                r = RandomValue();
+            for (auto& v : s.vecs)
+                v = {rng(), rng()};
+            s.regs[28] = Rand(1, 4);
+            s.sp = (kWindow + kWindowSize / 2 + Rand(0, kWindowSize / 4)) & ~u64(15);
+            s.pstate = u32(Rand(0, 15)) << 28;
+            g_current_block = code;
+            alarm(20);  // (a loop that never ends: the process ends, the block on stderr)
+            Result a, b, c;
+            try {
+                a = on.Run(code, s);
+                b = off.Run(code, s);
+            } catch (const std::exception& e) {
+                std::printf("emitter error: %s\n", e.what());
+                continue;
+            }
+            if (a == b)
+                continue;
+            c = bare.Run(code, s);
+            const bool on_bad = !(a == c) && b == c;
+            (on_bad ? wrong : unclear)++;
+            if (wrong + unclear <= 5) {
+                std::printf("\n%s (iteration %llu, x28 %llu):\n", on_bad ? "PINNED WRONG" : "unclear",
+                            (unsigned long long)it, (unsigned long long)s.regs[28]);
+                for (const u32 inst : code)
+                    std::printf("     %08x  %s\n", inst, Describe(inst).c_str());
+                for (size_t r = 0; r < 31; r++)
+                    if (a.regs[r] != c.regs[r] || b.regs[r] != c.regs[r])
+                        std::printf("   x%zu: pinned %#llx, not %#llx, bare %#llx\n", r, (unsigned long long)a.regs[r],
+                                    (unsigned long long)b.regs[r], (unsigned long long)c.regs[r]);
+                if (a.sp != c.sp)
+                    std::printf("   sp: pinned %#llx, bare %#llx\n", (unsigned long long)a.sp, (unsigned long long)c.sp);
+                if (a.memory != c.memory)
+                    std::printf("   memory differs\n");
+            }
+        }
+        alarm(0);
+        std::printf("%llu loops: pinned wrong %llu, unclear %llu\n", (unsigned long long)iterations,
+                    (unsigned long long)wrong, (unsigned long long)unclear);
+        return int(wrong != 0);
     }
 
     // (compile) jit-difftest <blocks> <stride> compile <nro> [passes off: 1]: the translator's
@@ -751,7 +959,38 @@ int main(int argc, char** argv) {
         const size_t count = Rand(1, 24);
         std::vector<u32> code;
         for (size_t i = 0; i < count; i++)
-            code.push_back(RandomInstruction(generators, s.start + i * 4, i + 1 == count));
+            code.push_back(RandomInstruction(generators, s.start + i * 4, !no_ticks && i + 1 == count));
+        if (no_ticks) {
+            // forward branches (superblocks' side exits, links forward) to a later instruction or
+            // the SVC after the block: CBZ/CBNZ, TBZ/TBNZ, B.cond, B
+            for (size_t i = 0; i + 1 < count + 1 && i < count; i++) {
+                if (Rand(0, 4) != 0)
+                    continue;
+                const u32 k = u32(Rand(1, count - i));  // (i + k <= count: the SVC at most)
+                const u32 rt = u32(Rand(0, 30));
+                switch (Rand(0, 3)) {
+                case 0: code[i] = (Rand(0, 1) ? 0xB4000000u : 0x34000000u) | (Rand(0, 1) << 24) | ((k & 0x7ffff) << 5) | rt; break;
+                case 1: code[i] = 0x36000000u | (Rand(0, 1) << 24) | (u32(Rand(0, 1)) << 31) | (u32(Rand(0, 31)) << 19) | ((k & 0x3fff) << 5) | rt; break;
+                case 2: code[i] = 0x54000000u | ((k & 0x7ffff) << 5) | u32(Rand(0, 13)); break;
+                default: code[i] = 0x14000000u | (k & 0x3ffffff); break;
+                }
+            }
+            // a call (DIFFTEST_CALLS=1, a third of the blocks): the block, BL leaf, more of it, SVC,
+            // then the leaf (random, then RET) after it
+            if (std::getenv("DIFFTEST_CALLS") && Rand(0, 2) == 0) {
+                const size_t at = Rand(0, code.size());  // (the BL goes in here)
+                std::vector<u32> leaf;
+                for (size_t n = Rand(0, 6); leaf.size() < n;)
+                    leaf.push_back(RandomInstruction(generators, s.start + 4 * (code.size() + 2 + leaf.size()), false));
+                code.insert(code.begin() + at, 0u);
+                code.push_back(0xD4000001u);  // svc #0 (the end, the RET's way back passed)
+                const size_t leaf_at = code.size();
+                code.insert(code.end(), leaf.begin(), leaf.end());
+                code.push_back(0xD65F03C0u);  // ret
+                code[at] = 0x94000000u | (u32(leaf_at - at) & 0x3ffffff);  // bl leaf
+            }
+            alarm(20);
+        }
         for (auto& r : s.regs)
             r = RandomValue();
         for (auto& v : s.vecs)
@@ -779,12 +1018,36 @@ int main(int argc, char** argv) {
             off.jit.emplace(Config(off.env, *off.monitor, remove));
             continue;
         }
-        if (a == b)
+        // (DIFFTEST_FULL=1: every run checked against bare, so that what on and off share - the PS4
+        // extras, loop pins, followed branches - is checked too, not only the IR passes)
+        static const bool full = std::getenv("DIFFTEST_FULL") != nullptr;
+        if (a == b && !full)
             continue;
         const Result c = bare.Run(code, s);
+        if (a == c && b == c)
+            continue;
         const bool on_bad = !(a == c) && b == c;
         const bool off_bad = !(b == c) && a == c;
         (on_bad ? on_wrong : off_bad ? off_wrong : other)++;
+        if (std::getenv("DIFFTEST_REPEAT") && on_wrong + off_wrong + other <= 40) {
+            std::printf("\n  first comparison, iteration %llu:", (unsigned long long)it);
+            for (const u32 inst : code)
+                std::printf(" %08x", inst);
+            std::printf("\n");
+            for (size_t i = 0; i < 31; i++)
+                if (a.regs[i] != c.regs[i] || b.regs[i] != c.regs[i])
+                    std::printf("    x%zu: on %llx off %llx bare %llx\n", i, (unsigned long long)a.regs[i],
+                                (unsigned long long)b.regs[i], (unsigned long long)c.regs[i]);
+            if (a.nzcv != c.nzcv) std::printf("    nzcv on %x off %x bare %x\n", a.nzcv, b.nzcv, c.nzcv);
+            if (a.pc != c.pc) std::printf("    pc on %llx off %llx bare %llx\n", (unsigned long long)a.pc, (unsigned long long)b.pc, (unsigned long long)c.pc);
+            if (!(a.memory == c.memory)) std::printf("    memory on %zu off %zu bare %zu entries\n", a.memory.size(), b.memory.size(), c.memory.size());
+            if (a.raised != c.raised) std::printf("    raised on %d off %d bare %d\n", a.raised, b.raised, c.raised);
+            if (!(a.vecs == c.vecs)) std::printf("    vectors differ\n");
+            if (a.fpsr != c.fpsr) std::printf("    fpsr on %x off %x bare %x\n", a.fpsr, b.fpsr, c.fpsr);
+            if (a.sp != c.sp) std::printf("    sp on %llx bare %llx\n", (unsigned long long)a.sp, (unsigned long long)c.sp);
+            const Result a2 = on.Run(code, s);
+            std::printf("    on again: %s\n", a2 == a ? "same as its first" : a2 == c ? "now as bare" : "different again");
+        }
         // the fewest instructions that still differ the same way (each dropped in turn)
         const auto still = [&](const std::vector<u32>& candidate) {
             const Result x = on.Run(candidate, s), y = off.Run(candidate, s);
@@ -813,6 +1076,17 @@ int main(int argc, char** argv) {
             continue;
         const Result x = on.Run(small, s), y = off.Run(small, s), z = bare.Run(small, s);
         std::printf("\n%s (iteration %llu)\n", key.c_str(), (unsigned long long)it);
+        if (std::getenv("DIFFTEST_REPEAT")) {
+            std::printf("  words:");
+            for (const u32 inst : small)
+                std::printf(" %08x", inst);
+            std::printf("\n  repeats: on %d%d%d off %d%d%d bare %d%d%d (1 = same as its first run)\n",
+                        on.Run(small, s) == x, on.Run(small, s) == x, on.Run(small, s) == x,
+                        off.Run(small, s) == y, off.Run(small, s) == y, off.Run(small, s) == y,
+                        bare.Run(small, s) == z, bare.Run(small, s) == z, bare.Run(small, s) == z);
+            std::printf("  raised: on %d off %d bare %d; pc on %llx off %llx bare %llx\n", x.raised, y.raised, z.raised,
+                        (unsigned long long)x.pc, (unsigned long long)y.pc, (unsigned long long)z.pc);
+        }
         for (size_t i = 0; i < 31; i++)
             if (x.regs[i] != y.regs[i] || x.regs[i] != z.regs[i])
                 std::printf("  x%-2zu start %016llx: on %016llx off %016llx bare %016llx\n", i,

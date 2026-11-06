@@ -1,0 +1,530 @@
+From 8176d859031eccc787a9e84373cb75000cb6889b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 01:57:07 +0000
+Subject: [PATCH] dynarmic A64: loops keep their busiest guest registers in
+ host registers; the PS4 extras on with Auto again
+
+- loop_register_pins: a block whose terminal links back to its own start keeps up to three of the
+  guest registers it uses (those carried round the loop first) in rbx, rbp and r12 from its start
+  to every exit: GetX/GetW/GetSP read them with moves, SetX/SetW/SetSP write them with moves, the
+  written ones are stored back at each exit (side exits included), and the way back jumps past
+  the loads after its halt check. Not with anything that reads the guest registers from the JIT
+  state, leaves without its terminal (CheckHalt, supervisor calls, exceptions, halts on memory
+  access) or needs rbx (exclusives, ordered 128-bit accesses). Checked: 60,000 random loop bodies
+  (tools/jit-difftest loops) against no optimisation; a build that skips the stores fails 183 of 300.
+- follow_known_returns (off): a RET whose X30 the block set to a followed BL's return address goes
+  on in the block, the BL's return stack entry dropped.
+- arm_dynarmic_64/32: the PS4 translator extras (64-bit 04.22-04.30, 32-bit 04.04-04.22) on with
+  CPU Auto again (04.35/04.38-04.72 only with Unsafe, a diagnostic switch for problems that turned
+  out to be elsewhere), off with Accurate, Paranoid and Debugging; loop pins likewise.
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp     |  11 +-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  15 +-
+ .../src/dynarmic/backend/x64/a64_emit_x64.cpp | 212 ++++++++++++++++++
+ .../src/dynarmic/backend/x64/a64_emit_x64.h   |  18 ++
+ .../dynarmic/backend/x64/a64_interface.cpp    |   3 +
+ .../frontend/A64/translate/a64_translate.h    |   5 +
+ .../A64/translate/impl/a64_branch.cpp         |  32 +++
+ .../frontend/A64/translate/impl/impl.h        |   2 +
+ .../src/dynarmic/interface/A64/config.h       |   8 +
+ 9 files changed, 298 insertions(+), 8 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 48011db99c..e02ed7b9cf 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -245,10 +245,13 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.skip_redundant_extensions = true;
+     // (04.07) each block's rarely run code apart from it: the code that runs packed together
+     config.split_cold_code = true;
+-    // (04.38) With CPU Unsafe off (Auto): none of the 32-bit translator's PS4 extras (04.04-04.22),
+-    // as the 64-bit cores' since 04.35: a switch to tell whether a 32-bit game's trouble is theirs
+-    // (Captain Toad, a 32-bit game, took the whole PS4 down on its level 3)
+-    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Unsafe) {
++    // (04.38-04.72: off with CPU Unsafe off, a switch to tell whether a 32-bit game's trouble was
++    // theirs; Captain Toad's level 3 was a GPU hang) (04.73) On with Auto and Unsafe again, checked
++    // by the desktop differential test (tools/jit-difftest/difftest32.cpp, random ARM, VFP and
++    // ASIMD blocks, fastmem as the PS4's); off with Accurate, Paranoid and Debugging (the boot
++    // watcher's safer steps)
++    const auto accuracy = Settings::values.cpu_accuracy.GetValue();
++    if (accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) {
+         config.inline_conditional_instructions = false;
+         config.elide_dead_nzcv = false;
+         config.elide_dead_nzcv_abi = false;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 9be51ecba8..5b99dcadd1 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -397,10 +397,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.superblocks_cond = true;
+     // (04.30) LSL, LSR, UBFX, SBFIZ, ... by immediate as shifts, not a rotate and two masks
+     config.bitfield_shifts = true;
+-    // (04.35) With CPU Unsafe off (Auto): none of the 64-bit translator's PS4 extras (04.22-04.30):
+-    // a switch in the menu to tell whether a game's trouble is theirs (Little Kitty, Big City's
+-    // allocator trap; Captain Toad's level 3)
+-    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Unsafe) {
++    // (04.73) a loop's busiest guest registers in host registers from its start to its exits
++    config.loop_register_pins = true;
++    // (04.35-04.72: off with CPU Unsafe off, a switch to tell whether a game's trouble was theirs;
++    // it never was: Little Kitty's was two translator bugs, fixed in 04.68 and 04.71, Captain
++    // Toad's a GPU hang) (04.73) On with Auto and Unsafe again, now checked by the desktop
++    // differential test as the PS4 runs (no cycle counting, superblocks' side exits and forward
++    // links, 48,000 random blocks); off with Accurate, Paranoid and Debugging (the boot watcher's
++    // safer steps)
++    const auto accuracy = Settings::values.cpu_accuracy.GetValue();
++    if (accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) {
++        config.loop_register_pins = false;
+         config.fold_address_offsets = false;
+         config.skip_redundant_extensions = false;
+         config.split_cold_code = false;
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 7bc6431dff..bf552b869d 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -87,12 +87,15 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+     }
+ 
+     code.EnableWriting();
++    const bool loop = PlanLoopPins(block);
+     new (&this->reg_alloc) RegAlloc{[this] {
+         std::bitset<32> gprs = any_gpr;
+         if (conf.fastmem_pointer)
+             gprs.reset(size_t(HostLoc::R13));
+         if (conf.page_table)
+             gprs.reset(size_t(HostLoc::R14));
++        for (size_t i = 0; i < loop_pins.count; i++)
++            gprs.reset(size_t(loop_pins.host[i]));
+         return gprs;
+     }(), any_xmm};
+ 
+@@ -105,6 +108,15 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+         code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+         code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+     }
++    if (loop) {
++        // (PS4 04.73) the loop's pinned guest registers, loaded once: its way back jumps past them
++        for (size_t i = 0; i < loop_pins.count; i++) {
++            const size_t g = loop_pins.guest[i];
++            code.mov(HostLocToReg64(loop_pins.host[i]),
++                     qword[code.ABI_JIT_PTR + (g == 32 ? offsetof(A64JitState, sp) : offsetof(A64JitState, reg) + sizeof(u64) * g)]);
++        }
++        loop_pins.head = code.getCurr();
++    }
+ 
+     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
+     nzcv_stored_end = nullptr;
+@@ -188,6 +200,7 @@ finish_this_inst:
+         code.int3();
+     }
+ 
++    loop_pins = LoopPins{};
+     const size_t size = size_t(code.getCurr() - entrypoint);
+ 
+     const A64::LocationDescriptor descriptor{block.Location()};
+@@ -209,6 +222,151 @@ finish_this_inst:
+     return bdesc;
+ }
+ 
++// (PS4 04.73, loop_register_pins) A block whose terminal links back to its own start: the guest
++// registers it uses most (those it reads and writes, carried round the loop, first) in rbx, rbp and
++// r12 for the whole block. Not with anything that reads the guest's registers from its state, or
++// leaves the block without its terminal or a side exit (a supervisor call, an exception, a halt
++// on a memory access), or needs rbx (exclusives, ordered 128-bit accesses: cmpxchg16b)
++bool A64EmitX64::PlanLoopPins(IR::Block& block) {
++    loop_pins = LoopPins{};
++    if (!conf.loop_register_pins || conf.enable_cycle_counting || conf.jit_frame_pointer ||
++        conf.check_halt_on_memory_access || !conf.HasOptimization(OptimizationFlag::BlockLinking))
++        return false;
++    const IR::LocationDescriptor self = block.Location();
++    if (A64::LocationDescriptor{self}.SingleStepping())
++        return false;
++    bool back = false;
++    const auto leaf = [&](const IR::Term::LeafTerminal& t) {
++        if (const auto* link = std::get_if<IR::Term::LinkBlock>(&t))
++            back = back || link->next == self;
++        else if (const auto* fast = std::get_if<IR::Term::LinkBlockFast>(&t))
++            back = back || fast->next == self;
++    };
++    if (const auto* x = std::get_if<IR::Term::LeafTerminal>(&block.terminal)) {
++        leaf(*x);
++    } else if (const auto* x = std::get_if<IR::Term::If>(&block.terminal)) {
++        leaf(x->then_);
++        leaf(x->else_);
++    } else if (const auto* x = std::get_if<IR::Term::CheckBit>(&block.terminal)) {
++        leaf(x->then_);
++        leaf(x->else_);
++    } else {
++        return false;  // (CheckHalt: its way out skips the stores)
++    }
++    if (!back)
++        return false;
++    std::array<u16, 33> reads{}, writes{};
++    for (const auto& inst : block.instructions) {
++        switch (inst.GetOpcode()) {
++        case IR::Opcode::A64CallSupervisor:
++        case IR::Opcode::A64ExceptionRaised:
++        case IR::Opcode::A64DataCacheOperationRaised:
++        case IR::Opcode::A64InstructionCacheOperationRaised:
++        case IR::Opcode::A64InstructionSynchronizationBarrier:
++        case IR::Opcode::A64ClearExclusive:
++        case IR::Opcode::A64SetPC:
++        case IR::Opcode::A64SetFPCR:
++        case IR::Opcode::A64ExclusiveReadMemory8:
++        case IR::Opcode::A64ExclusiveReadMemory16:
++        case IR::Opcode::A64ExclusiveReadMemory32:
++        case IR::Opcode::A64ExclusiveReadMemory64:
++        case IR::Opcode::A64ExclusiveReadMemory128:
++        case IR::Opcode::A64ExclusiveWriteMemory8:
++        case IR::Opcode::A64ExclusiveWriteMemory16:
++        case IR::Opcode::A64ExclusiveWriteMemory32:
++        case IR::Opcode::A64ExclusiveWriteMemory64:
++        case IR::Opcode::A64ExclusiveWriteMemory128:
++            return false;
++        case IR::Opcode::A64ReadMemory128:
++            if (const IR::AccType acc = inst.GetArg(2).GetAccType();
++                acc == IR::AccType::ORDERED || acc == IR::AccType::ORDEREDRW || acc == IR::AccType::LIMITEDORDERED)
++                return false;
++            break;
++        case IR::Opcode::A64WriteMemory128:
++            if (const IR::AccType acc = inst.GetArg(3).GetAccType();
++                acc == IR::AccType::ORDERED || acc == IR::AccType::ORDEREDRW || acc == IR::AccType::LIMITEDORDERED)
++                return false;
++            break;
++        case IR::Opcode::A64GetW:
++        case IR::Opcode::A64GetX:
++            if (const size_t r = size_t(inst.GetArg(0).GetA64RegRef()); r < 31)
++                reads[r]++;
++            break;
++        case IR::Opcode::A64SetW:
++        case IR::Opcode::A64SetX:
++            if (const size_t r = size_t(inst.GetArg(0).GetA64RegRef()); r < 31)
++                writes[r]++;
++            break;
++        case IR::Opcode::A64GetSP:
++            reads[32]++;
++            break;
++        case IR::Opcode::A64SetSP:
++            writes[32]++;
++            break;
++        default:
++            break;
++        }
++    }
++    // the busiest, those carried round the loop (read and written) first
++    std::array<u8, 33> order{};
++    for (size_t i = 0; i < order.size(); i++)
++        order[i] = u8(i);
++    const auto score = [&](size_t g) {
++        return (reads[g] && writes[g] ? 1000 : 0) + reads[g] + writes[g];
++    };
++    std::stable_sort(order.begin(), order.end(), [&](u8 a, u8 b) { return score(a) > score(b); });
++    constexpr std::array<HostLoc, 3> hosts{HostLoc::RBX, HostLoc::RBP, HostLoc::R12};
++    for (size_t i = 0; i < order.size() && loop_pins.count < hosts.size(); i++) {
++        const size_t g = order[i];
++        if (score(g) == 0)
++            break;
++        loop_pins.guest[loop_pins.count] = u8(g);
++        loop_pins.host[loop_pins.count] = hosts[loop_pins.count];
++        loop_pins.written[loop_pins.count] = writes[g] != 0;
++        loop_pins.count++;
++    }
++    if (loop_pins.count == 0)
++        return false;
++    loop_pins.active = true;
++    loop_pins.self = self;
++    return true;
++}
++
++std::optional<Xbyak::Reg64> A64EmitX64::PinnedGuestReg(size_t guest_index) const {
++    if (!loop_pins.active)
++        return std::nullopt;
++    for (size_t i = 0; i < loop_pins.count; i++)
++        if (loop_pins.guest[i] == guest_index)
++            return HostLocToReg64(loop_pins.host[i]);
++    return std::nullopt;
++}
++
++void A64EmitX64::EmitLoopPinsStore() {
++    for (size_t i = 0; i < loop_pins.count; i++) {
++        if (!loop_pins.written[i])
++            continue;
++        const size_t g = loop_pins.guest[i];
++        code.mov(qword[code.ABI_JIT_PTR + (g == 32 ? offsetof(A64JitState, sp) : offsetof(A64JitState, reg) + sizeof(u64) * g)],
++                 HostLocToReg64(loop_pins.host[i]));
++    }
++}
++
++// The way back to the block's start: no halt, straight past the loads; else (and at every other
++// exit) the written registers stored, then the leaf as usual
++bool A64EmitX64::EmitLoopPinsLeaf(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor, bool is_single_step) {
++    bool back = false;
++    if (const auto* link = std::get_if<IR::Term::LinkBlock>(&terminal))
++        back = link->next == loop_pins.self;
++    else if (const auto* fast = std::get_if<IR::Term::LinkBlockFast>(&terminal))
++        back = fast->next == loop_pins.self;
++    if (back && !is_single_step) {
++        code.cmp(dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
++        code.jz(loop_pins.head);
++    }
++    EmitLoopPinsStore();
++    return false;
++}
++
+ void A64EmitX64::FoldAddressOffsets(A64EmitContext& ctx, IR::Block& block) {
+     folded_disp.clear();
+     if (conf.skip_redundant_extensions) {
+@@ -787,6 +945,20 @@ void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
+ 
+ void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
+     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
++    if (const auto pinned = PinnedGuestReg(size_t(reg))) {
++        // (PS4 04.73) in its loop's host register
++        if (SignedLoadBits(inst) == 64) {
++            const Xbyak::Reg64 wide = ctx.reg_alloc.ScratchGpr(code);
++            code.movsxd(wide, pinned->cvt32());
++            ctx.reg_alloc.DefineValue(code, inst, wide);
++            ctx.reg_alloc.WidenValue(inst, 64);
++            return;
++        }
++        const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
++        code.mov(result, pinned->cvt32());
++        ctx.reg_alloc.DefineValue(code, inst, result);
++        return;
++    }
+     if (SignedLoadBits(inst) == 64) {
+         // (PS4 04.26, PeepholeQuad: read for a SignExtendWordToLong alone) sign-extended as read
+         const Xbyak::Reg64 wide = ctx.reg_alloc.ScratchGpr(code);
+@@ -804,6 +976,11 @@ void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
+ void A64EmitX64::EmitA64GetX(A64EmitContext& ctx, IR::Inst* inst) {
+     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
++    if (const auto pinned = PinnedGuestReg(size_t(reg))) {
++        code.mov(result, *pinned);  // (PS4 04.73) in its loop's host register
++        ctx.reg_alloc.DefineValue(code, inst, result);
++        return;
++    }
+ 
+     code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
+     ctx.reg_alloc.DefineValue(code, inst, result);
+@@ -838,6 +1015,11 @@ void A64EmitX64::EmitA64GetQ(A64EmitContext& ctx, IR::Inst* inst) {
+ 
+ void A64EmitX64::EmitA64GetSP(A64EmitContext& ctx, IR::Inst* inst) {
+     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
++    if (const auto pinned = PinnedGuestReg(32)) {
++        code.mov(result, *pinned);  // (PS4 04.73) in its loop's host register
++        ctx.reg_alloc.DefineValue(code, inst, result);
++        return;
++    }
+     code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, sp)]);
+     ctx.reg_alloc.DefineValue(code, inst, result);
+ }
+@@ -862,6 +1044,14 @@ void A64EmitX64::EmitA64GetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
+ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
++    if (const auto pinned = PinnedGuestReg(size_t(reg))) {
++        // (PS4 04.73) into its loop's host register (a 32-bit move clears the upper half)
++        if (args[1].IsImmediate())
++            code.mov(pinned->cvt32(), args[1].GetImmediateU32());
++        else
++            code.mov(pinned->cvt32(), ctx.reg_alloc.UseGpr(code, args[1]).cvt32());
++        return;
++    }
+     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
+     if (args[1].FitsInImmediateS32()) {
+         code.mov(addr, args[1].GetImmediateS32());
+@@ -887,6 +1077,16 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
+ void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
++    if (const auto pinned = PinnedGuestReg(size_t(reg))) {
++        // (PS4 04.73) into its loop's host register
++        if (args[1].IsImmediate())
++            code.mov(*pinned, args[1].GetImmediateU64());
++        else if (args[1].IsInXmm(ctx.reg_alloc))
++            code.movq(*pinned, ctx.reg_alloc.UseXmm(code, args[1]));
++        else
++            code.mov(*pinned, ctx.reg_alloc.UseGpr(code, args[1]));
++        return;
++    }
+     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
+     if (args[1].FitsInImmediateS32()) {
+         code.mov(addr, args[1].GetImmediateS32());
+@@ -933,6 +1133,16 @@ void A64EmitX64::EmitA64SetQ(A64EmitContext& ctx, IR::Inst* inst) {
+ 
+ void A64EmitX64::EmitA64SetSP(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    if (const auto pinned = PinnedGuestReg(32)) {
++        // (PS4 04.73) into its loop's host register
++        if (args[0].IsImmediate())
++            code.mov(*pinned, args[0].GetImmediateU64());
++        else if (args[0].IsInXmm(ctx.reg_alloc))
++            code.movq(*pinned, ctx.reg_alloc.UseXmm(code, args[0]));
++        else
++            code.mov(*pinned, ctx.reg_alloc.UseGpr(code, args[0]));
++        return;
++    }
+     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, sp)];
+     if (args[0].FitsInImmediateS32()) {
+         code.mov(addr, args[0].GetImmediateS32());
+@@ -1304,6 +1514,8 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::CheckHalt terminal, IR::LocationD
+ }
+ 
+ bool A64EmitX64::EmitLeafTerminal(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept {
++    if (loop_pins.active)
++        EmitLoopPinsLeaf(terminal, initial_location, is_single_step);
+     if (auto const x = std::get_if<IR::Term::ReturnToDispatch>(&terminal))
+         return EmitTerminalImpl(*this, *x, initial_location, is_single_step);
+     if (auto const x = std::get_if<IR::Term::LinkBlock>(&terminal))
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+index 7122ec77b3..93d38cb309 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -110,6 +110,24 @@ public:
+     /// word loaded into a vector register comes: ZeroExtendLongToQuad(w) (one movd or insertps)
+     void PeepholeQuad(A64EmitContext& ctx, IR::Block& block);
+     void EmitSideExitLink(A64EmitContext& ctx, Xbyak::Label& taken, IR::LocationDescriptor target);
++    /// (PS4 04.73, loop_register_pins) The loop's pinned guest registers: guest index (0-30 an X
++    /// register, 32 SP), its host register (rbx, rbp, r12: callee-saved, out of the allocator's
++    /// set), whether the block writes it (stored back at each exit); `head`: past the loads, where
++    /// its way back jumps
++    struct LoopPins {
++        bool active = false;
++        size_t count = 0;
++        std::array<u8, 3> guest{};
++        std::array<HostLoc, 3> host{};
++        std::array<bool, 3> written{};
++        const void* head = nullptr;
++        IR::LocationDescriptor self{0};
++    } loop_pins;
++    bool PlanLoopPins(IR::Block& block);
++    std::optional<Xbyak::Reg64> PinnedGuestReg(size_t guest_index) const;
++    void EmitLoopPinsStore();
++    /// The leaf terminal as a pinned loop leaves it (or jumps back): true if it emitted it
++    bool EmitLoopPinsLeaf(IR::Term::LeafTerminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+     u64 RSBEntryFor(IR::LocationDescriptor target) const override;
+     FakeCall FastmemCallback(u64 rip);
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+index f162fc4c52..5ecc08e404 100644
+--- a/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -282,6 +282,7 @@ private:
+         options.nzcv_lookahead = conf.elide_dead_nzcv && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         options.nzcv_lookahead_abi = conf.elide_dead_nzcv_abi;
+         options.follow_direct_branches = conf.follow_direct_branches;
++        options.follow_known_returns = conf.follow_known_returns;
+         options.elide_load_store_only_barriers = conf.elide_load_store_only_barriers;
+         options.superblocks = conf.superblocks && !conf.enable_cycle_counting && !conf.check_halt_on_memory_access;
+         // (the exits' flags need the look-ahead)
+@@ -402,6 +403,8 @@ private:
+         add(conf.elide_dead_nzcv_abi);
+         add(conf.return_stack_pc_only);
+         add(conf.follow_direct_branches);
++        add(conf.follow_known_returns);
++        add(conf.loop_register_pins);
+         add(conf.plain_acquire_loads);
+         add(conf.elide_load_store_only_barriers);
+         add(conf.superblocks);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+index ed91407231..e6783f1b17 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -54,6 +54,11 @@ struct TranslationOptions {
+     /// The block's other pieces of guest code are in IR::Block::lookahead (its ranges).
+     bool follow_direct_branches = false;
+ 
++    /// (PS4 04.73) With follow_direct_branches: a RET whose X30 the block set itself, to the
++    /// address after a BL it followed (a leaf function: nothing wrote X30 since), goes on to that
++    /// address in the block too, and the BL's return stack entry is dropped (pushed and popped here)
++    bool follow_known_returns = false;
++
+     /// DMB of the LD or ST type alone: nothing (UserConfig::elide_load_store_only_barriers)
+     bool elide_load_store_only_barriers = false;
+ 
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+index ffc8e45a86..c43a25246a 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/a64_branch.cpp
+@@ -90,7 +90,39 @@ bool TranslatorVisitor::BR(Reg Rn) {
+     return false;
+ }
+ 
++std::optional<u64> TranslatorVisitor::KnownLinkRegister() const {
++    std::optional<u64> value;
++    for (const auto& inst : ir.block.instructions) {
++        const auto op = inst.GetOpcode();
++        if ((op == IR::Opcode::A64SetX || op == IR::Opcode::A64SetW) && inst.GetArg(0).GetA64RegRef() == Reg::R30) {
++            const IR::Value v = inst.GetArg(1);
++            value = op == IR::Opcode::A64SetX && v.IsImmediate() ? std::optional<u64>{v.GetImmediateAsU64()} : std::nullopt;
++        }
++    }
++    return value;
++}
++
+ bool TranslatorVisitor::RET(Reg Rn) {
++    // (PS4 04.73) back from a leaf function the block followed a BL into: on in the block, at the
++    // address the BL left in X30; its return stack entry dropped (the pop this was)
++    if (Rn == Reg::R30 && options.follow_known_returns && options.follow_direct_branches) {
++        if (const auto ret = KnownLinkRegister(); ret && Follow(*ret)) {
++            for (auto it = ir.block.instructions.begin(); it != ir.block.instructions.end(); ++it) {
++                // (the last push of that address)
++                if (it->GetOpcode() == IR::Opcode::PushRSB &&
++                    A64::LocationDescriptor{IR::LocationDescriptor{it->GetArg(0).GetU64()}}.PC() == *ret) {
++                    auto last = it;
++                    for (auto jt = std::next(it); jt != ir.block.instructions.end(); ++jt)
++                        if (jt->GetOpcode() == IR::Opcode::PushRSB &&
++                            A64::LocationDescriptor{IR::LocationDescriptor{jt->GetArg(0).GetU64()}}.PC() == *ret)
++                            last = jt;
++                    last->Invalidate();
++                    break;
++                }
++            }
++            return true;
++        }
++    }
+     const auto target = X(64, Rn);
+ 
+     ir.SetPC(target);
+diff --git a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+index 732a51b932..f3b03c8347 100644
+--- a/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
++++ b/src/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.h
+@@ -41,6 +41,8 @@ struct TranslatorVisitor final {
+     // Continues the block at target (a BL's, a forward B's) if it may: the current piece ends
+     // after this instruction
+     bool Follow(u64 target);
++    // (PS4 04.73, follow_known_returns) X30's value if the block set it to a constant last
++    std::optional<u64> KnownLinkRegister() const;
+ 
+     bool UnpredictableInstruction();
+     bool DecodeError();
+diff --git a/src/dynarmic/src/dynarmic/interface/A64/config.h b/src/dynarmic/src/dynarmic/interface/A64/config.h
+index 4be4caa468..2de69dd489 100644
+--- a/src/dynarmic/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/src/dynarmic/interface/A64/config.h
+@@ -331,6 +331,12 @@ struct UserConfig {
+     /// a page table and without fastmem.
+     bool page_table_shared_walk = true;
+ 
++    /// (PS4 04.73) A block that branches back to its own start (a loop) keeps up to three of the
++    /// guest registers it uses in host registers from its start to every exit: read and written
++    /// there with moves, stored back only as it leaves, its way back jumping past the loads
++    /// (needs no cycle counting, no frame pointer, no halt on memory access)
++    bool loop_register_pins = false;
++
+     /// (PS4 04.70) GetSetElimination only for the blocks that start in [getset_pc_lo, getset_pc_hi):
+     /// the launcher's search for a block it's mistranslated in
+     std::uint64_t getset_pc_lo = 0, getset_pc_hi = ~std::uint64_t{0};
+@@ -400,6 +406,8 @@ struct UserConfig {
+     /// between two blocks. The block depends on each piece of guest code it has (invalidation,
+     /// the translation cache's hash).
+     bool follow_direct_branches = false;
++    /// (PS4 04.73) see TranslationOptions::follow_known_returns
++    bool follow_known_returns = false;
+ 
+     /// (PS4 04.25) A load-acquire (LDAR, LDAPR, LDAXR; A32's LDA, LDAEX) is a plain load (mov),
+     /// as C++'s sequentially consistent load is on x86-64, instead of a locked exchange-add of 0:
+-- 
+2.43.0
+

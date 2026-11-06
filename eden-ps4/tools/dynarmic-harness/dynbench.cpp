@@ -309,6 +309,9 @@ Dynarmic::A32::UserConfig MakeConfig(Env& env, const Options& o) {
 #endif
 #ifdef HAVE_INLINE_COND
     config.inline_conditional_instructions = std::getenv("DYN_COND") != nullptr;
+#ifdef HAVE_PINS
+    config.loop_register_pins = std::getenv("DYN_PINS") != nullptr;  // (04.73)
+#endif
 #endif
 #ifdef HAVE_DECLINED_WALK
     config.fastmem_declined_shared_walk = std::getenv("DYN_NOSHARE") == nullptr;

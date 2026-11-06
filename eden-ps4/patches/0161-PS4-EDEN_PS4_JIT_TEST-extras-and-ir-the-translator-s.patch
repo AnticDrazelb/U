@@ -1,0 +1,58 @@
+From 25f43f3c8f98ef02735345d5a558b2c6864f56f8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 03:08:34 +0000
+Subject: [PATCH] PS4: EDEN_PS4_JIT_TEST=extras (and ir): the translator's PS4
+ shortcuts, loop pins and stack range check reuse off, as 04.72's Auto (the
+ boot watcher's first safer step)
+
+---
+ src/core/arm/dynarmic/arm_dynarmic_32.cpp | 8 +++++++-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp | 6 +++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index f7a916cb3f..adeee5d6af 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++#include <string_view>
+ #include <cstdio>
+ #include <cstring>
+ #include <string>
+@@ -253,7 +255,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     // (04.73) a loop's busiest guest registers in host registers from its start to its exits
+     config.loop_register_pins = true;
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+-    if (accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) {
++    // (04.73) EDEN_PS4_JIT_TEST=extras: the same as Accurate does here, with Auto's speed
++    // otherwise (the boot watcher's first safer step: the translator as 04.72 had it under Auto)
++    const char* const jit_test = std::getenv("EDEN_PS4_JIT_TEST");
++    const bool extras_off = jit_test && (std::string_view{jit_test} == "extras" || std::string_view{jit_test} == "ir");
++    if ((accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) || extras_off) {
+         config.loop_register_pins = false;
+         config.inline_conditional_instructions = false;
+         config.elide_dead_nzcv = false;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 5d843dc6b4..8c8fd0ca05 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -411,7 +411,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     // links, 48,000 random blocks); off with Accurate, Paranoid and Debugging (the boot watcher's
+     // safer steps)
+     const auto accuracy = Settings::values.cpu_accuracy.GetValue();
+-    if (accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) {
++    // (04.73) EDEN_PS4_JIT_TEST=extras: the same as Accurate does here, with Auto's speed
++    // otherwise (the boot watcher's first safer step: the translator as 04.72 had it under Auto)
++    const char* const jit_test = std::getenv("EDEN_PS4_JIT_TEST");
++    const bool extras_off = jit_test && (std::string_view{jit_test} == "extras" || std::string_view{jit_test} == "ir");
++    if ((accuracy != Settings::CpuAccuracy::Unsafe && accuracy != Settings::CpuAccuracy::Auto) || extras_off) {
+         config.loop_register_pins = false;
+         config.fastmem_range_check_reuse = false;
+         config.fold_address_offsets = false;
+-- 
+2.43.0
+

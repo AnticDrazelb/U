@@ -841,8 +841,8 @@ std::atomic<uint64_t> g_frames_shown{0}; // (for the hang watchdog)
 // minutes past its first frame) the launcher watches for it failing: the game's own error (its
 // abort, an exception it didn't handle: Common::PS4Diagnostics::guest_exceptions/guest_aborts) or
 // the app crashing (ps4_crash_restart below). A failure stops it and starts it again by itself, a
-// fresh process each time, one step safer: the recompiler's IR passes off, then CPU accuracy
-// Accurate, then Paranoid. The step that gets it running is remembered for that game in this
+// fresh process each time, one step safer: (04.73) the translator's PS4 shortcuts off, the
+// recompiler's IR passes off, then CPU accuracy Accurate, then Paranoid. The step that gets it running is remembered for that game in this
 // build (a new build tries the normal settings first again: its fixes may be what it needed).
 // Little Kitty, Big City was the reason (04.66-04.70: one recompiler bug, fixed in 04.71). L3 + R3
 // while it watches stops the game as usual and the steps with it. State: safe-boot.txt.
@@ -866,9 +866,12 @@ struct SafeBootLevel
 };
 constexpr SafeBootLevel kSafeBootLevels[] = {
     {"", "", "the normal settings", ""},
-    {"ir", "", "the recompiler's IR passes off", "Starting it again with safer settings (step 2 of 4)"},
-    {"", "accurate", "CPU accuracy Accurate", "Starting it again with safer settings (step 3 of 4)"},
-    {"", "paranoid", "CPU accuracy Paranoid", "Starting it again with the safest settings (step 4 of 4)"},
+    // (04.73) the translator as 04.72 had it under Auto: its PS4 shortcuts (on again with Auto from
+    // 04.73), loop registers and stack range checks off, at nearly the same speed
+    {"extras", "", "the CPU translation's PS4 shortcuts off", "Starting it again with safer settings (step 2 of 5)"},
+    {"ir", "", "the recompiler's IR passes off", "Starting it again with safer settings (step 3 of 5)"},
+    {"", "accurate", "CPU accuracy Accurate", "Starting it again with safer settings (step 4 of 5)"},
+    {"", "paranoid", "CPU accuracy Paranoid", "Starting it again with the safest settings (step 5 of 5)"},
 };
 constexpr int kSafeBootLevelCount = int(sizeof(kSafeBootLevels) / sizeof(kSafeBootLevels[0]));
 
@@ -1715,6 +1718,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.73: faster CPU emulation in every game. The translated game code does about a quarter less work: "
+         "the CPU translation's PS4 shortcuts are on by default again (they were held back while two games' "
+         "problems were tracked down; both turned out to be elsewhere), loops keep their values in the PS4's own "
+         "registers, and stack accesses are checked once per block instead of each time. 64-bit and 32-bit games "
+         "both gain. If a game has trouble, the boot watcher's first safer step turns these off by itself.\n"
          "04.72: a test of the PS4's large memory pages when the app starts (once a version, a fraction of a "
          "second): where they're faster, games' memory is mapped in 2 MiB blocks. A game closed with L3 + R3 "
          "no longer shows an error when Eden trips while shutting it down.\n"

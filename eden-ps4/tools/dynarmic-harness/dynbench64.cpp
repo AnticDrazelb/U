@@ -288,6 +288,11 @@ Dynarmic::A64::UserConfig MakeConfig(Env& env, bool excl, bool walk) {
 #ifdef HAVE_BFS  // (04.30) SBFM/UBFM as shifts (DYN_BFS)
     config.bitfield_shifts = std::getenv("DYN_BFS") != nullptr;
 #endif
+#ifdef HAVE_PINS  // (04.73) loops' guest registers in host registers (DYN_PINS), known returns followed (DYN_RET)
+    config.loop_register_pins = std::getenv("DYN_PINS") != nullptr;
+    config.follow_known_returns = std::getenv("DYN_RET") != nullptr;
+    config.fastmem_range_check_reuse = std::getenv("DYN_REUSE") != nullptr;
+#endif
     config.code_cache_size = 32u << 20;
     config.unsafe_optimizations = true;
     config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
