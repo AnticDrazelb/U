@@ -1,6 +1,6 @@
 // xbox-core on the PS4: a menu of XBEs (the samples in the package, and /data/xbox-core/games/<name>/
 // default.xbe), then the chosen one running natively, its screen scaled up on VideoOut, the log on
-// top (OPTIONS hides it). The log also goes to /data/xbox-core/log.txt. One program per start of
+// top (L3+R3 together hide it). The log also goes to /data/xbox-core/log.txt. One program per start of
 // the app: to run another, close it (PS button) and open it again.
 #include <algorithm>
 #include <chrono>
@@ -253,15 +253,65 @@ void OpenPad()
     scePadInit();
     g_pad = scePadOpen(user, 0, 0, nullptr);
 }
-uint32_t PadButtons()
+bool ReadPad(OrbisPadData& out)
 {
     union {
         OrbisPadData data;
         unsigned char room[512];
     } state{};
     if (g_pad < 0 || scePadReadState(g_pad, &state.data) != 0 || !state.data.connected)
-        return 0;
-    return state.data.buttons;
+        return false;
+    out = state.data;
+    return true;
+}
+uint32_t PadButtons()
+{
+    OrbisPadData data;
+    return ReadPad(data) ? data.buttons : 0;
+}
+
+// The DualShock 4 as an Xbox controller: Cross/Circle/Square/Triangle are A/B/X/Y, L1/R1 white/black,
+// L2/R2 the triggers, OPTIONS start, the touch pad's click back. Its rumble goes back to the DS4.
+void FeedGuestPad(const OrbisPadData& d)
+{
+    auto axis = [](uint8_t v, bool flip) {
+        int a = (int(v) - 128) * 258;
+        if (flip)
+            a = -a - 1;
+        return s16(std::clamp(a, -32768, 32767));
+    };
+    auto held = [&](uint32_t b) { return u8(d.buttons & b ? 255 : 0); };
+    PadState p;
+    if (d.buttons & ORBIS_PAD_BUTTON_UP) p.buttons |= 0x01;
+    if (d.buttons & ORBIS_PAD_BUTTON_DOWN) p.buttons |= 0x02;
+    if (d.buttons & ORBIS_PAD_BUTTON_LEFT) p.buttons |= 0x04;
+    if (d.buttons & ORBIS_PAD_BUTTON_RIGHT) p.buttons |= 0x08;
+    if (d.buttons & ORBIS_PAD_BUTTON_OPTIONS) p.buttons |= 0x10;
+    if (d.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) p.buttons |= 0x20;
+    if (d.buttons & ORBIS_PAD_BUTTON_L3) p.buttons |= 0x40;
+    if (d.buttons & ORBIS_PAD_BUTTON_R3) p.buttons |= 0x80;
+    p.analog[0] = held(ORBIS_PAD_BUTTON_CROSS);
+    p.analog[1] = held(ORBIS_PAD_BUTTON_CIRCLE);
+    p.analog[2] = held(ORBIS_PAD_BUTTON_SQUARE);
+    p.analog[3] = held(ORBIS_PAD_BUTTON_TRIANGLE);
+    p.analog[4] = held(ORBIS_PAD_BUTTON_R1); // black
+    p.analog[5] = held(ORBIS_PAD_BUTTON_L1); // white
+    p.analog[6] = d.analogButtons.l2;
+    p.analog[7] = d.analogButtons.r2;
+    p.lx = axis(d.leftStick.x, false);
+    p.ly = axis(d.leftStick.y, true); // the DS4's y grows downwards, the Xbox's upwards
+    p.rx = axis(d.rightStick.x, false);
+    p.ry = axis(d.rightStick.y, true);
+    SetPad(p);
+    static u16 last_left = 0, last_right = 0;
+    u16 left, right;
+    GetRumble(left, right);
+    if (left != last_left || right != last_right)
+    {
+        last_left = left, last_right = right;
+        OrbisPadVibeParam v{u8(left >> 8), u8(right >> 8)};
+        scePadSetVibration(g_pad, &v);
+    }
 }
 
 // ---- the menu
@@ -345,12 +395,17 @@ void PresentLoop()
     bool show_log = true;
     uint32_t previous = PadButtons();
     const auto start = std::chrono::steady_clock::now();
+    constexpr uint32_t kLogToggle = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
     for (;;)
     {
-        const uint32_t buttons = PadButtons(), pressed = buttons & ~previous;
-        previous = buttons;
-        if (pressed & ORBIS_PAD_BUTTON_OPTIONS)
+        OrbisPadData pad{};
+        const bool connected = ReadPad(pad);
+        const uint32_t buttons = connected ? pad.buttons : 0;
+        if ((buttons & kLogToggle) == kLogToggle && (previous & kLogToggle) != kLogToggle)
             show_log = !show_log;
+        previous = buttons;
+        if (connected)
+            FeedGuestPad(pad);
         uint32_t* fb = g_screen.Begin();
         if (!fb)
         {

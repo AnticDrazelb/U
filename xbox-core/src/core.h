@@ -178,6 +178,18 @@ struct DisplayInfo
 DisplayInfo GetDisplay();
 u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);
+// Input: the Xbox controller on USB port 1 (usb.cpp). Buttons (digital): 0x01 up, 0x02 down,
+// 0x04 left, 0x08 right, 0x10 start, 0x20 back, 0x40 left stick, 0x80 right stick. Analog buttons
+// (0-255): A, B, X, Y, black, white, left trigger, right trigger.
+struct PadState
+{
+    u16 buttons = 0;
+    u8 analog[8] = {};
+    s16 lx = 0, ly = 0, rx = 0, ry = 0;
+};
+void SetPad(const PadState& pad);
+void GetRumble(u16& left, u16& right);
+
 // Sound: the AC'97's PCM output, 48 kHz 16-bit stereo, as it plays (audio.cpp)
 extern void (*g_audio_sink)(const s16* samples, size_t frames);
 void StartVblank();
