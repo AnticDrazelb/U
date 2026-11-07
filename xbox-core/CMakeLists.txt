@@ -31,7 +31,7 @@ if (PS4)
     endforeach()
     target_sources(xbox-core PRIVATE ${RUNTIME_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../switch-bench/src/ps4_stubs.cpp)
     target_include_directories(xbox-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../port)
-    target_link_libraries(xbox-core PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut ScePad SceNet
+    target_link_libraries(xbox-core PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet
         ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a)
     target_link_options(xbox-core PRIVATE --undefined=gethostbyname)
     ps4_add_eboot(xbox-core)

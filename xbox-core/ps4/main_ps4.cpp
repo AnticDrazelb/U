@@ -4,6 +4,7 @@
 // the app: to run another, close it (PS button) and open it again.
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -16,6 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <orbis/AudioOut.h>
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
 #include <orbis/VideoOut.h>
@@ -184,6 +186,61 @@ void DrawLog(uint32_t* fb, int y0)
     }
 }
 
+// ---- sound: the guest's AC'97 output (48 kHz, 16-bit stereo) through a ring to sceAudioOut, in
+// 256-frame grains as Crema plays it
+
+constexpr size_t kRingFrames = 48000 / 4; // 250 ms
+std::mutex g_audio_mutex;
+std::condition_variable g_audio_cv;
+std::vector<int16_t> g_ring(kRingFrames * 2);
+size_t g_ring_read = 0, g_ring_write = 0; // in frames, ever increasing
+
+void AudioSink(const int16_t* samples, size_t frames)
+{
+    std::lock_guard lock(g_audio_mutex);
+    for (size_t i = 0; i < frames; i++, g_ring_write++)
+    {
+        if (g_ring_write - g_ring_read >= kRingFrames)
+            g_ring_read++; // the oldest is dropped
+        const size_t at = (g_ring_write % kRingFrames) * 2;
+        g_ring[at] = samples[i * 2];
+        g_ring[at + 1] = samples[i * 2 + 1];
+    }
+    g_audio_cv.notify_one();
+}
+
+void StartAudio()
+{
+    sceAudioOutInit();
+    const int32_t port = sceAudioOutOpen(0xFF, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, 256, 48000,
+                                         ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+    Log("audio: port %#x", uint32_t(port));
+    if (port < 0)
+        return;
+    g_audio_sink = AudioSink;
+    std::thread([port] {
+        std::vector<int16_t> grain(256 * 2);
+        for (;;)
+        {
+            {
+                std::unique_lock lock(g_audio_mutex);
+                g_audio_cv.wait_for(lock, std::chrono::milliseconds(20),
+                                    [] { return g_ring_write - g_ring_read >= 256; });
+                for (size_t i = 0; i < 256; i++)
+                {
+                    const bool have = g_ring_read < g_ring_write;
+                    const size_t at = (g_ring_read % kRingFrames) * 2;
+                    grain[i * 2] = have ? g_ring[at] : 0;
+                    grain[i * 2 + 1] = have ? g_ring[at + 1] : 0;
+                    if (have)
+                        g_ring_read++;
+                }
+            }
+            sceAudioOutOutput(port, grain.data()); // blocks for the grain's time
+        }
+    }).detach();
+}
+
 // ---- the pad
 
 int g_pad = -1;
@@ -331,6 +388,7 @@ void LoadSystemModules()
     const std::pair<const char*, uint32_t> modules[] = {{"SystemService", 0x80000010},
                                                         {"UserService", 0x80000011},
                                                         {"VideoOut", 0x80000022},
+                                                        {"AudioOut", 0x80000001},
                                                         {"Pad", 0x80000024},
                                                         {"Net", 0x8000001C}};
     for (const auto& [name, id] : modules)
@@ -355,6 +413,7 @@ int main()
     LoadSystemModules();
     g_screen.Open();
     OpenPad();
+    StartAudio();
     Log("xbox-core %s", XB_VERSION);
     const std::vector<Entry> xbes = FindXbes();
     // /data/xbox-core/autostart.txt: an XBE's path to run without the menu (tests, a favourite game)

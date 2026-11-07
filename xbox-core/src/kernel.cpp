@@ -760,6 +760,8 @@ void InitKernel()
     K(MmAllocateContiguousMemoryEx) { return AllocContiguous(c.Arg(0), c.Arg(3), c.Arg(1), c.Arg(2)); } END;
     K(MmFreeContiguousMemory) { FreeContiguous(c.Arg(0)); return 0; } END;
     K(MmPersistContiguousMemory) { return 0; } END;
+    K(MmLockUnlockBufferPages) { return 0; } END;
+    K(MmLockUnlockPhysicalPage) { return 0; } END;
     K(MmClaimGpuInstanceMemory)
     {
         // NumberOfBytes, NumberOfPaddingBytes*: the end of the GPU's instance memory (the RAM's

@@ -19,6 +19,7 @@ using u8 = std::uint8_t;
 using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
+using s16 = std::int16_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
 
@@ -177,6 +178,8 @@ struct DisplayInfo
 DisplayInfo GetDisplay();
 u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);
+// Sound: the AC'97's PCM output, 48 kHz 16-bit stereo, as it plays (audio.cpp)
+extern void (*g_audio_sink)(const s16* samples, size_t frames);
 void StartVblank();
 
 } // namespace xb
