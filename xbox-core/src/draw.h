@@ -31,4 +31,11 @@ u32 ReadPixel(const Surface& s, u32 x, u32 y);
 // draw.cpp: vertices, the vertex program, rasterization and the combiners
 void DrawMethod(u32 method, u32 parameter);
 
+// pixel.cpp: a pixel's colour from its interpolated inputs (the register combiners and textures)
+struct PixelInputs
+{
+    float v[16][4] = {}; // indexed like the vertex outputs: 3 diffuse, 4 specular, 9-12 texture coordinates
+};
+u32 ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y);
+
 } // namespace xb
