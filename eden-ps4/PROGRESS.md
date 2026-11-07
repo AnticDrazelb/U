@@ -20,6 +20,15 @@ are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see
   (guest registers kept across blocks, guest calls and returns as host `call`/`ret`) targets our
   biggest measured translator overhead: the CPU-bound games' next step, measured in the harness
   first.
+- **04.85 on the console:** the hand-overs fell from ~4,700 to ~590 a second, the "flush" part from
+  3.0 to 2.0 us a draw, and the GPU thread's draws a second at full load rose ~4% (37,500 to 39,000).
+  The rest of "flush" is the memory manager's queued constant-buffer writes, invalidated before every
+  draw. Buffer checks are 1.8 us a draw, 3.5 a draw, 1 in 50 uploading.
+- **The other Switch emulators' per-draw GPU work** ([docs/gpu-per-draw-comparison.md](docs/gpu-per-draw-comparison.md)):
+  Ryujinx and Strato check each buffer and texture binding once per "sequence" (between syncpoints),
+  where Eden checks them every draw, and write constant-buffer updates into the buffer directly.
+  04.86's candidates: buffer checks skipped when their memory region's modification count is
+  unchanged (exact), texture bindings cached per slot, and the flush part's timer split.
 - **Beyond the Switch** ([docs/arm-to-x86-translators.md](docs/arm-to-x86-translators.md)): most
   ARM emulators on x86 (Azahar, Panda3DS, Vita3K) use dynarmic too. Berberis's loop pass (every guest
   register a loop uses kept in host registers) is a smaller first step than a second tier: an
