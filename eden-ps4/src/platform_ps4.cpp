@@ -1741,6 +1741,8 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.89: the Retro theme's HOME menu no longer crashes when moving quickly along the row (a tile "
+         "just past the screen's edge was drawn with a negative width).\n"
          "04.88: a third theme, Retro (System Settings, Themes): a pixel font, a starry night sky with "
          "scan lines, chunky framed tiles with a gold cursor and a name tag, and chunky buttons with "
          "their names. Basic Black and Basic White are as before.\n"

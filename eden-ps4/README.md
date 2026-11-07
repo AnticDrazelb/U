@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.89: **the Retro theme's crash when moving quickly fixed**: `Canvas::DrawImage` copied a negative
+width for an image wholly off screen (a Retro tile just past the row's edge). The preview now moves
+quickly along a 12-title row in each theme; under AddressSanitizer it caught the bug, and runs clean
+with the fix.
+
 04.88: **the Retro theme.** A third HOME menu theme (System Settings, Themes): Pixelify Sans for its
 font, a starry navy sky with scan lines, chunky framed tiles with a gold cursor and a name tag,
 lavender buttons with their names. Its screens are in `ui-preview.sh`'s output (`retro-*.png`).

@@ -376,6 +376,10 @@ void Canvas::DrawImage(float x, float y, float w, float h, const Image& image, f
         return;
     const int x0 = std::max(px0, clip.x0), x1 = std::min(px0 + pw, clip.x1);
     const int y0 = std::max(py0, clip.y0), y1 = std::min(py0 + ph, clip.y1);
+    // (04.89) nothing of it inside the clip: x1 - x0 would be negative, a huge memcpy below (the
+    // Retro theme's tiles, scrolled just past an edge, crashed the HOME menu)
+    if (x0 >= x1 || y0 >= y1)
+        return;
     const bool exact = image.width == pw && image.height == ph;
     const uint32_t alpha_scale = uint32_t(Clamp01(opacity) * 256);
     for (int py = y0; py < y1; py++)

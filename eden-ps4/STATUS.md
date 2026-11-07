@@ -1,6 +1,6 @@
-# New Eden (formerly Eden for PS4): status (after 04.88)
+# New Eden (formerly Eden for PS4): status (after 04.89)
 
-Install **04.88** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+Install **04.89** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
 The patches are in `eden-ps4/patches` (up to 0178). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.89:** the Retro theme's crash when moving quickly fixed (below).
 - **04.88:** the Retro theme (below).
 - **04.87:** 04.86's skip fixed (per 256 KiB, real changes only); rewritten uniform buffers copied, not uploaded; the queued writes' repeats skipped; the web server removed (below).
 - **04.86:** unchanged buffers aren't checked again, texture slots and sampler variants cached; the flush part split (below).
@@ -106,6 +107,19 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.89: the Retro theme's crash when moving quickly
+
+- **On the console (04.88):** the HOME menu crashed (signal 11 in `memcpy`, from
+  `Canvas::DrawImage` in `DrawRetroHome`) when moving quickly along the row.
+- **Why:** `DrawImage` copies an exact-size image a row at a time; for an image wholly outside the
+  clip, the row's width was negative, a huge `memcpy`. Basic Black and White never draw a tile
+  that's wholly off screen; the Retro theme draws a tile 8 units past the edge, and its art is
+  inset 9 inside the frame, so a tile just past an edge drew art entirely outside the screen.
+- **Fix:** `DrawImage` returns when nothing of the image is inside the clip.
+- **Test:** `ui-preview.sh` now moves quickly along a 12-title row in each theme, a frame after
+  every press (780 frames each). Built with AddressSanitizer, without the fix it stops at the same
+  negative `memcpy`; with it, the whole preview runs clean.
 
 ## 04.88: the Retro theme
 

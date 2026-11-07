@@ -264,6 +264,42 @@ int main(int argc, char** argv)
     Press(white, kRight);
     Shot(white, "home-white");
 
+    // (04.89) moving quickly along the row in each theme: a frame after every press, so the tiles are
+    // drawn at every point of their scrolling (the Retro theme's crashed with a tile just past an edge)
+    for (int theme = 0; theme < 3; theme++)
+    {
+        HomeMenu quick = MakeMenu(theme == 1);
+        std::vector<Title> many;
+        for (int copy = 0; copy < 3; copy++)
+            for (Title title : SampleTitles())
+            {
+                title.name += " " + std::to_string(copy + 1);
+                many.push_back(std::move(title));
+            }
+        quick.SetTitles(std::move(many)); // 12: a row that scrolls a long way
+        MenuSettings quick_settings;
+        quick_settings.white_theme = theme == 1;
+        quick_settings.retro_theme = theme == 2;
+        quick.SetSettings(quick_settings);
+        Canvas canvas(1920, 1080, 1.5f);
+        int frames = 0;
+        for (int round = 0; round < 6; round++)
+            for (const uint32_t button : {kRight, kLeft})
+                for (int i = 0; i < 13; i++)
+                {
+                    quick.Update(button, g_now);
+                    for (int f = 0; f < 4; f++, frames++)
+                    {
+                        g_now += 1.0 / 120 + 0.003 * (round % 4);
+                        quick.Draw(canvas, g_now);
+                    }
+                    quick.Update(0, g_now);
+                    quick.Draw(canvas, g_now);
+                    frames++;
+                }
+        std::printf("moving quickly, theme %d: %d frames drawn\n", theme, frames);
+    }
+
     // (04.88) the Retro theme: HOME (a title, All Software, the buttons), settings, a dialog
     {
         HomeMenu retro = MakeMenu(false);
