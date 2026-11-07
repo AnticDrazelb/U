@@ -1,5 +1,8 @@
 # How the Switch emulators translate ARM code, next to ours (2026-11-07)
 
+Follow-up, beyond the Switch: [arm-to-x86-translators.md](arm-to-x86-translators.md) (Berberis,
+melonDS, DeSmuME, MAME, QEMU; Dolphin and Cemu for one technique each).
+
 The question: how does every public Switch emulator run the game's ARM code, what do we do
 differently on the PS4, which is more effective, and what can we take from them.
 

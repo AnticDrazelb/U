@@ -20,6 +20,10 @@ are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see
   (guest registers kept across blocks, guest calls and returns as host `call`/`ret`) targets our
   biggest measured translator overhead: the CPU-bound games' next step, measured in the harness
   first.
+- **Beyond the Switch** ([docs/arm-to-x86-translators.md](docs/arm-to-x86-translators.md)): most
+  ARM emulators on x86 (Azahar, Panda3DS, Vita3K) use dynarmic too. Berberis's loop pass (every guest
+  register a loop uses kept in host registers) is a smaller first step than a second tier: an
+  extension of 04.73's loop pins.
 
 ## Update at 04.83 (2026-11-06)
 
