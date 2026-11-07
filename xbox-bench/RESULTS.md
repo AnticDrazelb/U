@@ -124,3 +124,25 @@ Segments with a base: `sysarch(I386_SET_LDT)` with `LDT_AUTO_ALLOC` returned -1,
 (EINVAL). Either Sony's kernel refuses LDT changes, or something in how it was asked doesn't
 suit it. 01.03 reads the LDT first and tries explicit indexes, and tries JIT shared memory for
 the `0x80000000` alias.
+
+## 01.03, same console, everything
+
+CPU as before (x1.25, all checksums correct, a call in 236 ns, a kernel call 144 ns, three cores
+94% each). The executable now ends at `0x97ffff` (the bench grew).
+
+| | |
+|---|---|
+| `sysarch(I386_GET_LDT)` | -1, errno 22 |
+| `sysarch(I386_SET_LDT)` at index 1, `LDT_AUTO_ALLOC` and index 17 | -1, errno 22 each time |
+| JIT shared memory (every variant) | `sceKernelJitCreateSharedMemory` fails with `0x80020001` (EPERM) |
+
+- **The PS4's kernel doesn't let an app use the LDT at all**: even reading it fails. Segments with
+  a base are out; guest code runs in the system's flat segments (`0x33`/`0x3b`), so the guest's
+  addresses are the app's own.
+- **This app may not create JIT shared memory** (EPERM; probably a matter of its authority ID or
+  capabilities). With direct memory refusing a second mapping too, there is no alias of the
+  Xbox's RAM at `0x80000000`. The emulator's kernel hands games their contiguous memory at its
+  `0x8xxxxxxx` addresses only, and translates addresses for the GPU itself.
+- So the program itself has to leave the Xbox's addresses. 01.04 is built five ways: as before,
+  and linked at `0x40000000` or `0x1000000000`, each as the usual ASLR program (type `0xfe10`) or
+  as a fixed-address one (`0xfe00`). Its first line says where it really runs.

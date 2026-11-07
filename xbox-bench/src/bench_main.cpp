@@ -889,6 +889,13 @@ int Run(Platform::Mode mode)
         scale = std::atof(s);
     Progress progress;
     Platform::Log("Xbox CPU Bench " BENCH_VERSION ": original Xbox code (32-bit x86) run natively, no recompiler");
+#ifdef XB_IMAGE_BASE_TEXT
+    const char* linked_at = XB_IMAGE_BASE_TEXT;
+#else
+    const char* linked_at = "0";
+#endif
+    Platform::Log(fmt::format("this program: code at {:#x}, data at {:#x} (linked at {})",
+                              reinterpret_cast<u64>(&RunCpu), reinterpret_cast<u64>(&g_mmio_regs), linked_at));
     Platform::Trace("segments");
     g_seg = SurveySegments();
     int result = 0;

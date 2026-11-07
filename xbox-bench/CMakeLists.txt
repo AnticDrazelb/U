@@ -88,6 +88,19 @@ if (PS4)
         # the runtime's network file system wraps (port/ps4_netfs.cpp)
         ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a)
     target_link_options(xbox_bench PRIVATE --undefined=gethostbyname)
+    # XB_IMAGE_BASE: link the program at this address instead of 0 (where the system places it is
+    # what the bench's memory map shows): the Xbox's own addresses below 0x980000 are taken by
+    # the program when it loads at 0x400000. A copy of the link script that starts there.
+    # __dso_handle (only an identity for __cxa_atexit) is lld's otherwise, at the ELF header's
+    # address 0, out of reach of code linked above 2 GiB.
+    set(XB_IMAGE_BASE "" CACHE STRING "link address of the program (empty: 0, as every PS4 app here)")
+    if (XB_IMAGE_BASE)
+        file(READ ${PS4_LINK_SCRIPT} xb_script)
+        string(REGEX REPLACE "SECTIONS[ \t\r\n]*{" "SECTIONS\n{\n\t. = ${XB_IMAGE_BASE};\n\tPROVIDE_HIDDEN(__dso_handle = .);" xb_script "${xb_script}")
+        file(WRITE ${CMAKE_BINARY_DIR}/xb-link.x "${xb_script}")
+        string(REPLACE "${PS4_LINK_SCRIPT}" "${CMAKE_BINARY_DIR}/xb-link.x" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+        target_compile_definitions(xbox_bench PRIVATE XB_IMAGE_BASE_TEXT="${XB_IMAGE_BASE}")
+    endif()
     ps4_add_eboot(xbox_bench)
 else()
     find_package(Threads REQUIRED)
