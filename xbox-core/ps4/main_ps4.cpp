@@ -357,7 +357,19 @@ int main()
     OpenPad();
     Log("xbox-core %s", XB_VERSION);
     const std::vector<Entry> xbes = FindXbes();
-    const std::string xbe = Menu(xbes);
+    // /data/xbox-core/autostart.txt: an XBE's path to run without the menu (tests, a favourite game)
+    std::string xbe;
+    if (FILE* f = std::fopen("/data/xbox-core/autostart.txt", "r"))
+    {
+        char line[512] = {};
+        if (std::fgets(line, sizeof(line), f))
+            xbe = line;
+        std::fclose(f);
+        while (!xbe.empty() && (xbe.back() == '\n' || xbe.back() == '\r' || xbe.back() == ' '))
+            xbe.pop_back();
+    }
+    if (xbe.empty())
+        xbe = Menu(xbes);
     Log("starting %s", xbe.c_str());
     std::thread([xbe] {
         InitMemory();

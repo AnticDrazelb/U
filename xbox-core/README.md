@@ -43,6 +43,29 @@ cmake -S xbox-core -B ~/xc-host -G Ninja && ninja -C ~/xc-host
 nxdk's samples are the tests: `NXDK_DIR=~/emu/nxdk tests/run-nxdk-samples.sh hello sdl gamma ...`
 builds and runs them, with a PNG and a log for each in `tests/out/`.
 
+## On the PS4
+
+`build.sh ps4` makes `out/xbox-core.pkg` (title ID XBCR00001) with nxdk's samples inside.
+
+- The app opens on a menu: the samples, and your own programs as
+  `/data/xbox-core/games/<name>/default.xbe` (that folder is D:). UP/DOWN choose, X runs.
+- `/data/xbox-core/autostart.txt` holding an XBE's path skips the menu.
+- The program's screen is scaled up on the TV, with the log over it for the first 15 seconds
+  (OPTIONS toggles it).
+- The log is also in `/data/xbox-core/log.txt`, and crash reports in `/data/xbox-core/crash.log`.
+- To run another program, close the app and open it again.
+
+Its first log lines check the hardware path:
+- `cpu self-test: 32-bit code runs, its fs is its KPCR (...)` means the switch into 32-bit code,
+  the guest's `fs` (through `amd64_set_fsbase`) and the way back all work;
+- `memory: 0x400000-... in the RAM is the system's; left out` is the app's own executable, which the
+  RAM is mapped around. Programs whose image reaches past `0x400000` won't load until the
+  executable moves (xbox-bench 01.04).
+
+**Not run on a PS4 yet.** In shadPS4 the app itself works (menu, autostart, screen, log), but the
+core stops at its first mapping: shadPS4's address space starts at `0x400000`, so it can't give the
+Xbox's addresses below it. The real console could (xbox-bench).
+
 ## Next
 
 1. **PS4.** The platform parts as xbox-bench has them:
