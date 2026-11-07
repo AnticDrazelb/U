@@ -170,9 +170,16 @@ struct HomeMenu::Theme
         good, bad, panel;
 };
 
-// Basic Black and Basic White
+// Basic Black, Basic White and (04.88) Retro
 const HomeMenu::Theme& HomeMenu::CurrentTheme() const
 {
+    // Retro: navy, cream text, gold for the selection; lavender buttons
+    static const Theme retro{Rgb(0x2B2F66), Rgb(0xF6F2E4), Rgb(0xAEB0DA), Rgb(0x565DA8), Rgb(0xFFD447),
+                             Rgb(0xF7C531), Rgb(0xFFF1A6), Rgb(0x474E99), Rgb(0x14163A, 210), Rgb(0x3B4187),
+                             Rgb(0x6068B5), Rgb(0xEE4B42), Rgb(0xF7A72E), Rgb(0xF6F2E4), Rgb(0x6BDB6B),
+                             Rgb(0xEE4B42), Rgb(0x353A7A)};
+    if (settings.retro_theme)
+        return retro;
     static const Theme black{Rgb(0x2D2D2D), Rgb(0xFFFFFF), Rgb(0xB0B0B0), Rgb(0x585858), Rgb(0x00C8F0),
                              Rgb(0x00B8E8), Rgb(0x6CF2FF), Rgb(0x4E4E4E), Rgb(0x000000, 0), Rgb(0x464646),
                              Rgb(0x5E5E5E), Rgb(0xF0483E), Rgb(0xF5A41E), Rgb(0xE8E8E8), Rgb(0x34C759),
@@ -244,7 +251,8 @@ size_t HomeMenu::HomeCount() const
 
 const Image& HomeMenu::Tile(size_t index, int pixels)
 {
-    std::vector<Image>& list = tiles[pixels];
+    // (04.88) by size and font: the Retro theme's covers are written in its pixel font
+    std::vector<Image>& list = tiles[pixels * 2 + (settings.retro_theme ? 1 : 0)];
     if (list.size() != titles.size())
         list.assign(titles.size(), Image{});
     Image& tile = list[index];
@@ -256,7 +264,8 @@ const Image& HomeMenu::Tile(size_t index, int pixels)
         else if (title.art != Art::None)
             tile = MakeTileArt(title.art, pixels);
         else
-            tile = MakeCover(title.name, title.kind, pixels);
+            tile = MakeCover(title.name, title.kind, pixels,
+                             settings.retro_theme ? FontFamily::Pixel : FontFamily::Inter);
     }
     return tile;
 }
@@ -802,11 +811,18 @@ void HomeMenu::Draw(Canvas& c, double now)
     grid_scroll = Smooth(grid_scroll, grid_scroll_target, dt);
     settings_scroll = Smooth(settings_scroll, settings_scroll_target, dt);
     const Theme& t = CurrentTheme();
-    c.Clear(t.bg);
+    c.SetFontFamily(settings.retro_theme ? FontFamily::Pixel : FontFamily::Inter);
+    if (settings.retro_theme)
+        DrawRetroBackground(c, screen == Screen::Home);
+    else
+        c.Clear(t.bg);
     switch (screen)
     {
     case Screen::Home:
-        DrawHome(c, now);
+        if (settings.retro_theme)
+            DrawRetroHome(c, now);
+        else
+            DrawHome(c, now);
         break;
     case Screen::AllSoftware:
         DrawAllSoftware(c, now);
@@ -959,6 +975,228 @@ void HomeMenu::DrawHome(Canvas& c, double now)
         DrawBottomBar(c, {{Glyph::Cross, "OK"}});
 }
 
+namespace {
+
+// (04.88) The Retro theme's colours besides its Theme
+constexpr uint32_t kRetroInk = Rgb(0x15173B);           // outlines and hard shadows
+constexpr uint32_t kRetroCream = Rgb(0xEDEAF8);         // the tiles' inner frame, the name tag's border
+constexpr uint32_t kRetroLavender = Rgb(0xC9C7EE);      // the buttons
+constexpr uint32_t kRetroLavenderLight = Rgb(0xE6E4F9); // their top edge
+constexpr uint32_t kRetroIconInk = Rgb(0x3A3F7E);       // icons on lavender
+constexpr uint32_t kRetroTag = Rgb(0x1C1F4D);           // the name tag
+
+// A pixel star ('#' its outline, 'o' its face, '+' the light on it) and a twinkle
+const char* const kRetroStar[] = {
+    "......#......", ".....#+#.....", ".....#+#.....", "....#+oo#....", "#####+ooo####",
+    "#+++oooooooo#", ".#+ooooooooo#", "..#ooooooo#..", "..#ooooooo#..", ".#ooo#.#ooo#.",
+    ".#oo#...#oo#.", "#o##.....##o#", "##.........##",
+};
+const char* const kRetroTwinkle[] = {"..#..", "..#..", "##.##", "..#..", "..#.."};
+
+void DrawSprite(Canvas& c, const char* const* rows, int count, float x, float y, float pixel, uint32_t outline,
+                uint32_t face, uint32_t light)
+{
+    for (int r = 0; r < count; r++)
+        for (int k = 0; rows[r][k]; k++)
+        {
+            const char p = rows[r][k];
+            if (p == '.')
+                continue;
+            c.Rect(x + k * pixel, y + r * pixel, pixel, pixel, p == '#' ? outline : p == 'o' ? face : light);
+        }
+}
+
+// A chunky button or tile frame: a hard shadow, a dark outline, a lavender face lit along its top
+void RetroButton(Canvas& c, float cx, float cy, float half, float radius)
+{
+    c.RoundRect(cx - half + 4, cy - half + 5, half * 2, half * 2, radius, Fade(kRetroInk, 0.8f));
+    c.RoundRect(cx - half, cy - half, half * 2, half * 2, radius, kRetroInk);
+    c.RoundRect(cx - half + 4, cy - half + 4, half * 2 - 8, half * 2 - 8, radius - 4, kRetroLavender);
+    c.RoundRect(cx - half + 10, cy - half + 8, half * 2 - 20, 5, 2.5f, kRetroLavenderLight);
+}
+
+} // namespace
+
+void HomeMenu::DrawRetroBackground(Canvas& c, bool stars)
+{
+    Image& background = retro_background[stars ? 1 : 0];
+    if (background.width != c.Width() || background.height != c.Height())
+    {
+        Canvas b(c.Width(), c.Height(), c.Scale());
+        // a night sky in navy, a faint quilt of squares over it
+        b.Gradient(0, 0, 1280, 720, Rgb(0x31377C), Rgb(0x222659));
+        for (int row = 0; row < 9; row++)
+            for (int col = 0; col < 16; col++)
+                if ((row + col) % 2 == 0)
+                    b.Rect(col * 80.0f, row * 80.0f, 80, 80, Rgb(0xFFFFFF, 7));
+        if (stars)
+        {
+            // stars where the tiles and buttons leave room, and twinkles (in fixed places: the
+            // background is drawn once)
+            struct Star { float x, y, pixel, opacity; };
+            static constexpr Star kStars[] = {
+                {470, 36, 4, 0.9f}, {760, 40, 3, 0.8f}, {1010, 76, 4, 0.85f}, {40, 412, 4, 0.85f},
+                {320, 452, 3, 0.75f}, {980, 446, 4, 0.85f}, {1186, 420, 3, 0.8f}, {150, 590, 3, 0.7f},
+                {1120, 586, 4, 0.75f},
+            };
+            for (const Star& star : kStars)
+                DrawSprite(b, kRetroStar, 13, star.x, star.y, star.pixel, Fade(Rgb(0xC08A1C), star.opacity),
+                           Fade(Rgb(0xF7CB45), star.opacity), Fade(Rgb(0xFFF0B4), star.opacity));
+            uint32_t seed = 0x2B2F66;
+            const auto next = [&seed] {
+                seed = seed * 1664525u + 1013904223u;
+                return float(seed >> 8) / float(1u << 24);
+            };
+            for (int i = 0; i < 28; i++)
+            {
+                const float x = 20 + next() * 1240, y = 20 + next() * 680, opacity = 0.18f + next() * 0.3f;
+                const uint32_t color = Fade(Rgb(0xDCD9FF), opacity);
+                DrawSprite(b, kRetroTwinkle, 5, x, y, 2, color, color, color);
+            }
+        }
+        // a CRT's scan lines: every third row of pixels a little darker
+        background.width = c.Width();
+        background.height = c.Height();
+        background.pixels.assign(b.Pixels(), b.Pixels() + size_t(c.Width()) * c.Height());
+        for (int y = 2; y < background.height; y += 3)
+        {
+            uint32_t* line = background.pixels.data() + size_t(y) * background.width;
+            for (int x = 0; x < background.width; x++)
+            {
+                const uint32_t p = line[x];
+                const uint32_t r = (p & 0xFF) * 7 / 8, g = (p >> 8 & 0xFF) * 7 / 8, bl = (p >> 16 & 0xFF) * 7 / 8;
+                line[x] = (p & 0xFF000000u) | bl << 16 | g << 8 | r;
+            }
+        }
+    }
+    std::memcpy(c.Pixels(), background.pixels.data(), background.pixels.size() * sizeof(uint32_t));
+}
+
+void HomeMenu::DrawRetroHome(Canvas& c, double now)
+{
+    const Theme& t = CurrentTheme();
+    const uint32_t cursor = Cursor(now);
+    // text with a hard shadow, a pixel down and right
+    const auto shadowed = [&c](float x, float y, std::string_view text, float size, Weight weight, uint32_t color,
+                               Align align = Align::Left, float max_width = 0) {
+        c.Text(x + 2, y + 2, text, size, weight, kRetroInk, align, max_width);
+        return c.Text(x, y, text, size, weight, color, align, max_width);
+    };
+
+    // the user (its icon in a dark ring; its User Page when chosen) and the time
+    c.Circle(kUserX + 3, kUserY + 4, kUserRadius + 4, Fade(kRetroInk, 0.8f));
+    c.Circle(kUserX, kUserY, kUserRadius + 4, kRetroInk);
+    c.DrawImage(kUserX - kUserRadius, kUserY - kUserRadius, kUserRadius * 2, kUserRadius * 2,
+                Avatar(settings.avatar, settings.avatar_color, kUserRadius * 2, c.Scale()));
+    c.Ring(kUserX, kUserY, kUserRadius, 2, kRetroCream);
+    if (home_row < 0)
+    {
+        c.Ring(kUserX, kUserY, kUserRadius + 12, 5, cursor);
+        shadowed(112, 61, settings.nickname + "'s User Page", 22, Weight::SemiBold, t.accent);
+    }
+    shadowed(1186, 64, clock, 28, Weight::SemiBold, t.text, Align::Right);
+    DrawIcon(c, Icon::WiFi, 1221, 54, 26, kRetroInk);
+    DrawIcon(c, Icon::WiFi, 1219, 52, 26, t.text);
+
+    // the row: titles in chunky frames, then All Software; scrolled to keep the selection in view
+    const size_t count = HomeCount();
+    const auto slot_x = [&](size_t i) { return float(i) * (kTileSize + kTileGap); };
+    const float sel_x = slot_x(home_tile), sel_w = home_tile == count ? kAllSoftwareSlot : kTileSize;
+    if (sel_x - scroll_target < 0)
+        scroll_target = sel_x;
+    if (sel_x + sel_w - scroll_target > kRowRight - kRowLeft)
+        scroll_target = sel_x + sel_w - (kRowRight - kRowLeft);
+    constexpr float kInset = 9; // the frame: 4 of outline, then the cream
+    const int tile_pixels = int(std::lround((kTileSize - 2 * kInset) * c.Scale()));
+    for (size_t i = 0; i < count; i++)
+    {
+        const float x = kRowLeft + slot_x(i) - scroll;
+        if (x > 1280 || x + kTileSize + 8 < 0)
+            continue;
+        c.RoundRect(x + 6, kTileTop + 7, kTileSize, kTileSize, 18, Fade(kRetroInk, 0.8f));
+        c.RoundRect(x, kTileTop, kTileSize, kTileSize, 18, kRetroInk);
+        c.DrawImage(x + kInset, kTileTop + kInset, kTileSize - 2 * kInset, kTileSize - 2 * kInset,
+                    Tile(i, tile_pixels));
+        // the cream frame also rounds the art's corners
+        c.RoundRectOutline(x + 4, kTileTop + 4, kTileSize - 8, kTileSize - 8, 14, 6, kRetroCream);
+    }
+    const float all_cx = kRowLeft + slot_x(count) - scroll + kAllSoftwareSlot / 2;
+    const float all_cy = kTileTop + kTileSize / 2;
+    RetroButton(c, all_cx, all_cy, kAllSoftwareRadius, 18);
+    DrawIcon(c, Icon::AllSoftware, all_cx, all_cy, 40, kRetroIconInk);
+
+    // the selection: a gold frame, and the name in a tag below, pointing at it
+    const auto name_tag = [&](float cx, float top, const std::string& name, uint32_t color, bool pointer) {
+        const float text_width = std::min(c.TextWidth(name, 21, Weight::SemiBold), 560.0f);
+        const float w = text_width + 40, h = 42;
+        const float x = std::clamp(cx - w / 2, 16.0f, 1264.0f - w);
+        c.RoundRect(x + 3, top + 4, w, h, 10, Fade(kRetroInk, 0.8f));
+        c.RoundRect(x, top, w, h, 10, kRetroCream);
+        if (pointer)
+        {
+            c.Triangle(cx, top - 12, cx - 12, top + 1, cx + 12, top + 1, kRetroCream);
+            c.Triangle(cx, top - 5, cx - 7, top + 4, cx + 7, top + 4, kRetroTag);
+        }
+        c.RoundRect(x + 3, top + 3, w - 6, h - 6, 8, kRetroTag);
+        c.Text(x + w / 2, top + 29, name, 21, Weight::SemiBold, color, Align::Center, 560);
+    };
+    if (home_row == 0)
+    {
+        if (home_tile < count)
+        {
+            const float x = kRowLeft + slot_x(home_tile) - scroll;
+            c.RoundRectOutline(x - 13, kTileTop - 13, kTileSize + 26, kTileSize + 26, 29, 3, kRetroInk);
+            c.RoundRectOutline(x - 10, kTileTop - 10, kTileSize + 20, kTileSize + 20, 26, 7, cursor);
+            name_tag(x + kTileSize / 2, kTileTop + kTileSize + 22, titles[home_tile].name, t.text, true);
+        }
+        else
+        {
+            const float half = kAllSoftwareRadius + 10;
+            c.RoundRectOutline(all_cx - half - 3, all_cy - half - 3, half * 2 + 6, half * 2 + 6, 29, 3, kRetroInk);
+            c.RoundRectOutline(all_cx - half, all_cy - half, half * 2, half * 2, 26, 7, cursor);
+            name_tag(all_cx, all_cy + half + 20, "All Software", t.text, true);
+        }
+    }
+    else if (count > 0 && home_tile < count)
+    {
+        // the selected title keeps its tag, dimmed, while the buttons have the cursor
+        name_tag(kRowLeft + slot_x(home_tile) - scroll + kTileSize / 2, kTileTop + kTileSize + 22,
+                 titles[home_tile].name, t.dim, false);
+    }
+    if (count == 0)
+        shadowed(kRowLeft, kTitleBaseline, "No software: put games (.nsp, .xci) or homebrew (.nro) in "
+                 "/data/eden-ps4 or on a USB drive", 19, Weight::Regular, t.dim);
+
+    // the buttons: chunky lavender squares, each with its name below
+    constexpr float kHalf = 37, kGap = 50;
+    const float total = kButtonCount * kHalf * 2 + (kButtonCount - 1) * kGap;
+    for (int i = 0; i < kButtonCount; i++)
+    {
+        const float cx = 640 - total / 2 + kHalf + i * (kHalf * 2 + kGap);
+        const bool selected = home_row == 1 && home_button == i;
+        RetroButton(c, cx, kButtonY, kHalf, 16);
+        const uint32_t color = i == 0 ? t.red : i == 1 ? t.orange : kRetroIconInk;
+        DrawIcon(c, kButtons[i].icon, cx, kButtonY + 1, 36, color);
+        if (selected)
+        {
+            c.RoundRectOutline(cx - kHalf - 12, kButtonY - kHalf - 12, kHalf * 2 + 24, kHalf * 2 + 24, 26, 3,
+                               kRetroInk);
+            c.RoundRectOutline(cx - kHalf - 9, kButtonY - kHalf - 9, kHalf * 2 + 18, kHalf * 2 + 18, 23, 6, cursor);
+        }
+        float baseline = kButtonY + kHalf + 31;
+        for (const std::string& line : c.Wrap(kButtons[i].label, 17, Weight::SemiBold, kHalf * 2 + kGap - 6))
+        {
+            shadowed(cx, baseline, line, 17, Weight::SemiBold, selected ? t.accent : t.text, Align::Center);
+            baseline += 19;
+        }
+    }
+
+    if (home_row == 0 && home_tile < count)
+        DrawBottomBar(c, {{Glyph::Options, "Options"}, {Glyph::Cross, "Start"}});
+    else
+        DrawBottomBar(c, {{Glyph::Cross, "OK"}});
+}
+
 void HomeMenu::DrawAllSoftware(Canvas& c, double now)
 {
     const Theme& t = CurrentTheme();
@@ -1004,9 +1242,18 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
     switch (category)
     {
     case 0:
-        return {{"Theme", settings.white_theme ? "Basic White" : "Basic Black",
-                 "The HOME menu's colours, as the Switch's two themes.",
-                 [](MenuSettings& s) { s.white_theme = !s.white_theme; }}};
+        return {{"Theme", settings.retro_theme ? "Retro" : settings.white_theme ? "Basic White" : "Basic Black",
+                 "The HOME menu's look: the Switch's two themes, or Retro (a pixel font, a starry night, "
+                 "chunky tiles and buttons).",
+                 [](MenuSettings& s) {
+                     // Basic Black, Basic White, Retro, and round again
+                     if (s.retro_theme)
+                         s.retro_theme = false, s.white_theme = false;
+                     else if (s.white_theme)
+                         s.retro_theme = true, s.white_theme = false;
+                     else
+                         s.white_theme = true;
+                 }}};
     case 1: {
         const int width = (settings.docked ? 1920 : 1280) * settings.resolution / 100;
         const int height = (settings.docked ? 1080 : 720) * settings.resolution / 100;
@@ -1242,8 +1489,9 @@ void HomeMenu::DrawSettings(Canvas& c, double now)
     std::string description;
     if (items.empty())
         description = "New Eden " + version + "\nA Nintendo Switch emulator for the PS4, based on Eden (eden-emu.dev).\n\n"
-                      "Renderer: " + renderer + "\nData folder: /data/eden-ps4\n\nGPL-3.0-or-later. The font is "
-                      "Inter (rsms.me/inter), under the SIL Open Font License.";
+                      "Renderer: " + renderer + "\nData folder: /data/eden-ps4\n\nGPL-3.0-or-later. The fonts are "
+                      "Inter (rsms.me/inter) and, for the Retro theme, Pixelify Sans (github.com/eifetx/Pixelify-Sans), "
+                      "both under the SIL Open Font License.";
     else
         description = items[std::min(size_t(settings_items ? settings_item : 0), items.size() - 1)].description;
     y += items.empty() ? 0 : 36;
@@ -1470,6 +1718,13 @@ void HomeMenu::DrawDialog(Canvas& c, double now)
     const float h = 56 + title_lines.size() * 32.0f + (title_lines.empty() || lines.empty() ? 0 : 14) +
                     lines.size() * 28.0f + 40 + buttons_h;
     const float x = 640 - w / 2, y = 360 - h / 2 + (1 - appear) * 12;
+    if (settings.retro_theme)
+    {
+        // (04.88) the Retro theme's chunky frame: a hard shadow, a dark outline, a cream border
+        c.RoundRect(x - 2, y + 4, w + 12, h + 10, 20, Fade(kRetroInk, 0.85f));
+        c.RoundRect(x - 8, y - 8, w + 16, h + 16, 22, kRetroInk);
+        c.RoundRect(x - 4, y - 4, w + 8, h + 8, 18, kRetroCream);
+    }
     c.RoundRect(x, y, w, h, 14, t.dialog);
     float ty = y + 56;
     for (const std::string& line : title_lines)

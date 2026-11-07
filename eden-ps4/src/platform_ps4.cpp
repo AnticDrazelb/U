@@ -1388,6 +1388,8 @@ Ui::MenuSettings LoadMenuSettings()
     {
         if (line == "theme=white")
             settings.white_theme = true;
+        else if (line == "theme=retro")
+            settings.retro_theme = true;
         else if (line == "renderer=software")
             settings.software_renderer = true;
         else if (line == "mode=docked")
@@ -1483,7 +1485,8 @@ void SaveMenuSettings(const Ui::MenuSettings& settings)
                         "cpu=%s\ncores=%d\nprofiler=%s\nram=%s\ngames_folder=%s\nfps=%s\nthreads=%s\npacing=%s\nspeed=%d\nfastmem=%s\n"
                         "jit_cache=%s\ndraw_shortcuts=%s\nmacros=%s\ntouchpad=%s\ndraws=%s\ngpu_threads=%d\nmotion=%s\n"
                         "speedups_off=%s\nnickname=%s\navatar=%d\navatar_color=%d\n",
-                     settings.white_theme ? "white" : "black", settings.software_renderer ? "software" : "vulkan",
+                     settings.retro_theme ? "retro" : settings.white_theme ? "white" : "black",
+                     settings.software_renderer ? "software" : "vulkan",
                      settings.docked ? "docked" : "handheld", settings.resolution, settings.shader_cache ? "on" : "off",
                      settings.async_shaders ? "on" : "off", settings.gpu_high ? "high" : "normal",
                      settings.cpu_unsafe ? "unsafe" : "auto", settings.seventh_core ? 7 : 6,
@@ -1738,6 +1741,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.88: a third theme, Retro (System Settings, Themes): a pixel font, a starry night sky with "
+         "scan lines, chunky framed tiles with a gold cursor and a name tag, and chunky buttons with "
+         "their names. Basic Black and Basic White are as before.\n"
          "04.87: 04.86's skipping fixed (it worked 17% of the time in Breath of the Wild, as each draw's "
          "constant data marked a whole 4 MiB block changed); uniform buffers the game keeps rewriting copied "
          "instead of uploaded, which also stops them ending the GPU's render pass; the per-draw clean-up after "
@@ -2165,7 +2171,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
             Trace(fmt::format("start page: settings: theme {}, renderer {}, {}, resolution {}%, shader cache {}, "
                               "asynchronous shaders {}, GPU accuracy {}, frame pacing {}, speed {}%, CPU {}, {} cores, "
                               "profiler {}",
-                              choice.settings.white_theme ? "white" : "black",
+                              choice.settings.retro_theme ? "retro" : choice.settings.white_theme ? "white" : "black",
                               choice.settings.software_renderer ? "software" : "vulkan",
                               choice.settings.docked ? "docked" : "handheld", choice.settings.resolution,
                               choice.settings.shader_cache ? "on" : "off", choice.settings.async_shaders ? "on" : "off",
@@ -2198,6 +2204,7 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     KeepPrevious("/data/eden-ps4/hotblocks", ".log");
     g_screen.Clear();
     g_screen.SetScale(2.0f);
+    menu.ReleaseBackgrounds(); // (04.88) the Retro theme's two screen-sized images, 16 MiB, not kept for the game
     return choice;
 }
 
@@ -2326,10 +2333,11 @@ void DrawLoadingInto(uint32_t* pixels, uint32_t width, uint32_t height, uint32_t
 
 // What the loading screen shows for `program`: what its last boot left (name, publisher, icon), else
 // its file's name
-Ui::LoadingScreen LoadingScreenFor(const std::string& program, bool white_theme)
+Ui::LoadingScreen LoadingScreenFor(const std::string& program, bool white_theme, bool retro_theme)
 {
     Ui::LoadingScreen screen;
     screen.white_theme = white_theme;
+    screen.retro_theme = retro_theme;
     const std::vector<std::string> cached = ReadLines(Launcher::TitleCachePath(kDataDir, program, "txt").c_str());
     if (!cached.empty() && !cached[0].empty())
     {
@@ -3522,7 +3530,7 @@ void* Run(void*)
             // display takes the screen (what it prints still goes to log.txt)
             {
                 std::lock_guard lock{g_loading_mutex};
-                g_loading = LoadingScreenFor(program, settings.white_theme);
+                g_loading = LoadingScreenFor(program, settings.white_theme, settings.retro_theme);
                 // (04.71) the boot watcher's line, when it's taking a safer step
                 if (const size_t at = game_test.find('['); at != std::string::npos)
                     g_loading.publisher = game_test.substr(at + 1, game_test.find(']') - at - 1);

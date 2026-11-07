@@ -69,6 +69,7 @@ std::string SpeedupsSummary(unsigned off);
 struct MenuSettings
 {
     bool white_theme = false;
+    bool retro_theme = false;  // (04.88) Retro: pixel font, a starry navy background (white_theme off)
     bool software_renderer = false;
     bool docked = false;
     int resolution = 100;      // what games render at, in percent of the console mode's: 100, 75 or 50
@@ -158,6 +159,12 @@ public:
     // The buttons held now; returns what the launcher should do
     MenuAction Update(uint32_t held, double now);
     void Draw(Canvas& canvas, double now);
+    // (04.88) the Retro theme's backgrounds freed (drawn again when next needed): before a game
+    void ReleaseBackgrounds()
+    {
+        for (Image& image : retro_background)
+            image = Image{};
+    }
 
 private:
     enum class Screen { Home, AllSoftware, Settings, News, Games, Controllers, Report, Folder, User, Icon, Keyboard };
@@ -204,6 +211,10 @@ private:
     MenuAction ChooseDialog(int button);
 
     void DrawHome(Canvas& c, double now);
+    // (04.88) the Retro theme: its background (with the stars on the HOME screen, plain on the others,
+    // drawn once a size and kept) and its HOME screen
+    void DrawRetroBackground(Canvas& c, bool stars);
+    void DrawRetroHome(Canvas& c, double now);
     void DrawAllSoftware(Canvas& c, double now);
     void DrawSettings(Canvas& c, double now);
     void DrawNews(Canvas& c);
@@ -225,6 +236,7 @@ private:
 
     std::vector<Title> titles;
     std::map<int, std::vector<Image>> tiles; // by size in pixels: each title's tile, made when first drawn
+    Image retro_background[2];               // (04.88) plain, starry: the size of the last canvas
     MenuSettings settings;
     std::string version, renderer, clock = "0:00", controller_test, games_help;
     bool radv_linked = false, controller = true, keys_present = false;

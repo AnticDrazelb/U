@@ -35,7 +35,7 @@ if (PS4)
     set(EDEN_PS4_UI_FONTS ${CMAKE_CURRENT_LIST_DIR}/../ui-fonts)
     set_source_files_properties(ui/fonts.cpp PROPERTIES
         COMPILE_DEFINITIONS EDEN_PS4_UI_FONTS="${EDEN_PS4_UI_FONTS}"
-        OBJECT_DEPENDS "${EDEN_PS4_UI_FONTS}/Inter-Regular.otf;${EDEN_PS4_UI_FONTS}/Inter-SemiBold.otf")
+        OBJECT_DEPENDS "${EDEN_PS4_UI_FONTS}/Inter-Regular.otf;${EDEN_PS4_UI_FONTS}/Inter-SemiBold.otf;${EDEN_PS4_UI_FONTS}/PixelifySans-Regular.ttf;${EDEN_PS4_UI_FONTS}/PixelifySans-SemiBold.ttf")
     # (04.64) the user icons' art (../ui-art, made by ../tools/avatars), included whole; stb's JPEG writer
     set(EDEN_PS4_UI_ART ${CMAKE_CURRENT_LIST_DIR}/../ui-art)
     set_source_files_properties(ui/avatars.cpp PROPERTIES

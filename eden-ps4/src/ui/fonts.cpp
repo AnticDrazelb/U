@@ -16,14 +16,25 @@
 
 EDEN_PS4_INCLUDE_FONT(eden_ps4_font_regular, "Inter-Regular.otf");
 EDEN_PS4_INCLUDE_FONT(eden_ps4_font_semibold, "Inter-SemiBold.otf");
+EDEN_PS4_INCLUDE_FONT(eden_ps4_font_pixel_regular, "PixelifySans-Regular.ttf");
+EDEN_PS4_INCLUDE_FONT(eden_ps4_font_pixel_semibold, "PixelifySans-SemiBold.ttf");
 
 extern "C" const unsigned char eden_ps4_font_regular[], eden_ps4_font_regular_end[];
 extern "C" const unsigned char eden_ps4_font_semibold[], eden_ps4_font_semibold_end[];
+extern "C" const unsigned char eden_ps4_font_pixel_regular[], eden_ps4_font_pixel_regular_end[];
+extern "C" const unsigned char eden_ps4_font_pixel_semibold[], eden_ps4_font_pixel_semibold_end[];
 
 namespace Ui {
 
-FontData UiFont(Weight weight)
+FontData UiFont(Weight weight, FontFamily family)
 {
+    if (family == FontFamily::Pixel)
+    {
+        if (weight == Weight::SemiBold)
+            return {eden_ps4_font_pixel_semibold,
+                    size_t(eden_ps4_font_pixel_semibold_end - eden_ps4_font_pixel_semibold)};
+        return {eden_ps4_font_pixel_regular, size_t(eden_ps4_font_pixel_regular_end - eden_ps4_font_pixel_regular)};
+    }
     if (weight == Weight::SemiBold)
         return {eden_ps4_font_semibold, size_t(eden_ps4_font_semibold_end - eden_ps4_font_semibold)};
     return {eden_ps4_font_regular, size_t(eden_ps4_font_regular_end - eden_ps4_font_regular)};

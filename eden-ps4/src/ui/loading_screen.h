@@ -14,6 +14,7 @@ struct LoadingScreen
     std::string name, publisher;
     Image icon;              // the game's, when its last boot left one (else a plain tile)
     bool white_theme = false; // the HOME menu's theme
+    bool retro_theme = false; // (04.88) its Retro theme
 };
 
 // One frame of it, `now` seconds into the loading (its bar moves with it). Stage 1: loading the

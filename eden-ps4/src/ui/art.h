@@ -16,7 +16,7 @@ enum class Art { None, Breakout, Blocks, Controller, Gpu, Terminal };
 // A title's tile, size x size pixels: the built-in art, or a cover made from its name (its
 // colours from the name, so each title keeps its own)
 Image MakeTileArt(Art art, int size);
-Image MakeCover(std::string_view name, std::string_view kind, int size);
+Image MakeCover(std::string_view name, std::string_view kind, int size, FontFamily family = FontFamily::Inter);
 
 // The round buttons' icons, centred at (cx, cy), about `size` units across
 enum class Icon { News, Games, Controllers, Settings, Power, AllSoftware, User, WiFi, Check, Cross };

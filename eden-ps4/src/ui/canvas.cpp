@@ -118,7 +118,8 @@ Image ResizeImage(const Image& image, int width, int height)
     return out;
 }
 
-// The two weights of Inter, and every glyph drawn so far (by weight, pixel size and code point)
+// The two weights of Inter and of Pixelify Sans, and every glyph drawn so far (by font, pixel size and
+// code point)
 struct Canvas::Fonts
 {
     struct Glyph
@@ -127,34 +128,38 @@ struct Canvas::Fonts
         float advance = 0;
         std::vector<uint8_t> coverage;
     };
-    stbtt_fontinfo info[2];
-    bool ok[2] = {};
+    // (04.88) by family and weight: Inter's two, then Pixelify Sans's two
+    static int Index(FontFamily family, Weight weight) { return int(family) * 2 + int(weight); }
+    stbtt_fontinfo info[4];
+    bool ok[4] = {};
     std::unordered_map<uint64_t, Glyph> glyphs;
 
     Fonts()
     {
-        for (int w = 0; w < 2; w++)
-        {
-            const FontData data = UiFont(Weight(w));
-            ok[w] = data.data && stbtt_InitFont(&info[w], data.data, stbtt_GetFontOffsetForIndex(data.data, 0));
-        }
+        for (int f = 0; f < 2; f++)
+            for (int w = 0; w < 2; w++)
+            {
+                const int i = Index(FontFamily(f), Weight(w));
+                const FontData data = UiFont(Weight(w), FontFamily(f));
+                ok[i] = data.data && stbtt_InitFont(&info[i], data.data, stbtt_GetFontOffsetForIndex(data.data, 0));
+            }
     }
-    float ScaleFor(Weight weight, float pixels)
+    float ScaleFor(FontFamily family, Weight weight, float pixels)
     {
-        return stbtt_ScaleForMappingEmToPixels(&info[int(weight)], pixels);
+        return stbtt_ScaleForMappingEmToPixels(&info[Index(family, weight)], pixels);
     }
-    const Glyph& Get(Weight weight, float pixels, uint32_t cp)
+    const Glyph& Get(FontFamily family, Weight weight, float pixels, uint32_t cp)
     {
         const uint32_t size_key = uint32_t(pixels * 4 + 0.5f);
-        const uint64_t key = uint64_t(weight) << 56 | uint64_t(size_key) << 32 | cp;
+        const int w = Index(family, weight);
+        const uint64_t key = uint64_t(w) << 56 | uint64_t(size_key) << 32 | cp;
         auto it = glyphs.find(key);
         if (it != glyphs.end())
             return it->second;
         Glyph glyph;
-        const int w = int(weight);
         if (ok[w])
         {
-            const float scale = ScaleFor(weight, size_key / 4.0f);
+            const float scale = ScaleFor(family, weight, size_key / 4.0f);
             int advance = 0, bearing = 0;
             stbtt_GetCodepointHMetrics(&info[w], int(cp), &advance, &bearing);
             glyph.advance = advance * scale;
@@ -415,15 +420,15 @@ void Canvas::DrawImage(float x, float y, float w, float h, const Image& image, f
 float Canvas::Ascent(float size, Weight weight)
 {
     int ascent = 0, descent = 0, gap = 0;
-    stbtt_GetFontVMetrics(&fonts->info[int(weight)], &ascent, &descent, &gap);
-    return ascent * fonts->ScaleFor(weight, size * scale) / scale;
+    stbtt_GetFontVMetrics(&fonts->info[Fonts::Index(family, weight)], &ascent, &descent, &gap);
+    return ascent * fonts->ScaleFor(family, weight, size * scale) / scale;
 }
 
 float Canvas::Descent(float size, Weight weight)
 {
     int ascent = 0, descent = 0, gap = 0;
-    stbtt_GetFontVMetrics(&fonts->info[int(weight)], &ascent, &descent, &gap);
-    return -descent * fonts->ScaleFor(weight, size * scale) / scale;
+    stbtt_GetFontVMetrics(&fonts->info[Fonts::Index(family, weight)], &ascent, &descent, &gap);
+    return -descent * fonts->ScaleFor(family, weight, size * scale) / scale;
 }
 
 float Canvas::TextWidth(std::string_view text, float size, Weight weight)
@@ -431,7 +436,7 @@ float Canvas::TextWidth(std::string_view text, float size, Weight weight)
     const float pixels_size = size * scale;
     float pen = 0;
     for (size_t i = 0; i < text.size();)
-        pen += fonts->Get(weight, pixels_size, NextCodePoint(text, i)).advance;
+        pen += fonts->Get(family, weight, pixels_size, NextCodePoint(text, i)).advance;
     return pen / scale;
 }
 
@@ -446,7 +451,7 @@ std::string Canvas::Fit(std::string_view text, float size, Weight weight, float 
     for (size_t i = 0; i < text.size();)
     {
         const uint32_t cp = NextCodePoint(text, i);
-        pen += fonts->Get(weight, size * scale, cp).advance / scale;
+        pen += fonts->Get(family, weight, size * scale, cp).advance / scale;
         if (pen > room)
             break;
         cut = i;
@@ -471,7 +476,7 @@ float Canvas::Text(float x, float y, std::string_view text_in, float size, Weigh
     const int baseline = int(std::lround(y * scale));
     for (size_t i = 0; i < text.size();)
     {
-        const Fonts::Glyph& glyph = fonts->Get(weight, pixels_size, NextCodePoint(text, i));
+        const Fonts::Glyph& glyph = fonts->Get(family, weight, pixels_size, NextCodePoint(text, i));
         const int gx = int(std::lround(pen)) + glyph.left, gy = baseline + glyph.top;
         for (int row = 0; row < glyph.height; row++)
         {

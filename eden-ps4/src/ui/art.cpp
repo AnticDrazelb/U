@@ -136,9 +136,10 @@ Image MakeTileArt(Art art, int size)
     return Finish(c);
 }
 
-Image MakeCover(std::string_view name, std::string_view kind, int size)
+Image MakeCover(std::string_view name, std::string_view kind, int size, FontFamily family)
 {
     Canvas c(size, size, size / 256.0f);
+    c.SetFontFamily(family);  // (04.88) the Retro theme's pixel font
     const uint64_t h = Hash(name);
     const float hue = float(h % 360);
     c.Gradient(0, 0, 256, 256, Hsv(hue, 0.55f, 0.62f), Hsv(hue + 35, 0.65f, 0.30f));

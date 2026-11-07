@@ -379,6 +379,12 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.88: **the Retro theme.** A third HOME menu theme (System Settings, Themes): Pixelify Sans for its
+font, a starry navy sky with scan lines, chunky framed tiles with a gold cursor and a name tag,
+lavender buttons with their names. Its screens are in `ui-preview.sh`'s output (`retro-*.png`).
+
+![The HOME menu's Retro theme](screenshots/home-retro.png)
+
 04.87: **04.86's skip fixed, rewritten uniform buffers copied, the web server removed** (patch 0178).
 - 04.86 skipped only 17% of buffer checks in Breath of the Wild outdoors: its per-4 MiB generation
   was renewed by the game's per-draw constant updates. Now per 256 KiB, and only on real changes.

@@ -36,6 +36,8 @@ Image DecodeImage(const void* data, size_t size);
 Image ResizeImage(const Image& image, int width, int height);
 
 enum class Weight { Regular, SemiBold };
+// (04.88) Inter, or Pixelify Sans (the Retro theme)
+enum class FontFamily { Inter, Pixel };
 enum class Align { Left, Center, Right };
 
 class Canvas
@@ -47,6 +49,9 @@ public:
     int Width() const { return width; }
     int Height() const { return height; }
     float Scale() const { return scale; }
+    // (04.88) the font every Text call after this uses (Inter until set)
+    void SetFontFamily(FontFamily family_) { family = family_; }
+    FontFamily Family() const { return family; }
     const uint32_t* Pixels() const { return pixels.data(); }
     uint32_t* Pixels() { return pixels.data(); }
 
@@ -99,6 +104,7 @@ private:
     float scale;
     std::vector<uint32_t> pixels;
     Box clip;
+    FontFamily family = FontFamily::Inter;
     Fonts* fonts; // shared by every canvas (with their glyphs)
 };
 

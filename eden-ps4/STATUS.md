@@ -1,6 +1,6 @@
-# New Eden (formerly Eden for PS4): status (after 04.87)
+# New Eden (formerly Eden for PS4): status (after 04.88)
 
-Install **04.87** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+Install **04.88** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
 The patches are in `eden-ps4/patches` (up to 0178). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.88:** the Retro theme (below).
 - **04.87:** 04.86's skip fixed (per 256 KiB, real changes only); rewritten uniform buffers copied, not uploaded; the queued writes' repeats skipped; the web server removed (below).
 - **04.86:** unchanged buffers aren't checked again, texture slots and sampler variants cached; the flush part split (below).
 - **04.85:** the Vulkan worker gets the GPU thread's commands every 64 draws, not 8 (below).
@@ -105,6 +106,24 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.88: the Retro theme
+
+- A third HOME menu theme beside Basic Black and Basic White (System Settings, Themes; menu.txt
+  `theme=retro`), after a retro HOME screen the tester sent, drawn from scratch: no art taken from it.
+  - The font: Pixelify Sans (`ui-fonts/`, SIL Open Font License), everywhere in the menu, the tiles'
+    covers and the loading screen. `Canvas::SetFontFamily`.
+  - The background: a navy night sky, a faint quilt of squares, pixel stars and twinkles, and a CRT's
+    scan lines (every third row of pixels darker). Drawn once a size and copied in each frame; freed
+    before a game boots.
+  - Tiles in chunky frames (a hard shadow, a dark outline, a cream border that also rounds the art's
+    corners); the cursor a pulsing gold frame; the name in a tag below it, pointing up.
+  - The round buttons as lavender squares with their names below them; All Software the same.
+  - Dialogs in the same frame; the other screens in its navy, cream and gold.
+- `ui-preview.sh` draws its screens (`retro-*.png`);
+  [screenshots/home-retro.png](screenshots/home-retro.png).
+
+![The HOME menu's Retro theme](screenshots/home-retro.png)
 
 ## 04.87: 04.86's skip fixed; rewritten uniform buffers copied; the web server removed
 

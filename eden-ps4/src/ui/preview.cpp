@@ -136,6 +136,17 @@ int main(int argc, char** argv)
             stbi_write_png(retry_path.c_str(), retry.Width(), retry.Height(), 4, retry.Pixels(), retry.Width() * 4);
             std::printf("%s\n", retry_path.c_str());
         }
+        {
+            // (04.88) the Retro theme's
+            LoadingScreen retro_loading = loading;
+            retro_loading.white_theme = false;
+            retro_loading.retro_theme = true;
+            Canvas retro(1920, 1080, 1.5f);
+            DrawLoadingScreen(retro, retro_loading, 2, 1234, 3249, 3.0);
+            const std::string retro_path = g_out + "/retro-loading.png";
+            stbi_write_png(retro_path.c_str(), retro.Width(), retro.Height(), 4, retro.Pixels(), retro.Width() * 4);
+            std::printf("%s\n", retro_path.c_str());
+        }
         Canvas small(1280, 720, 1.0f);
         DrawLoadingScreen(small, loading, 1, 0, 0, 0.7);
         path = g_out + "/loading-game.png";
@@ -252,6 +263,34 @@ int main(int argc, char** argv)
     HomeMenu white = MakeMenu(true);
     Press(white, kRight);
     Shot(white, "home-white");
+
+    // (04.88) the Retro theme: HOME (a title, All Software, the buttons), settings, a dialog
+    {
+        HomeMenu retro = MakeMenu(false);
+        MenuSettings retro_settings;
+        retro_settings.retro_theme = true;
+        retro.SetSettings(retro_settings);
+        Press(retro, kRight);
+        Shot(retro, "retro-home");
+        for (int i = 0; i < 4; i++)
+            Press(retro, kRight);
+        Shot(retro, "retro-home-all-software");
+        Press(retro, kDown);
+        Press(retro, kRight);
+        Press(retro, kRight);
+        Press(retro, kRight);
+        Shot(retro, "retro-home-buttons");
+        Press(retro, kCross);
+        Shot(retro, "retro-settings");
+        Press(retro, kCircle);
+        Press(retro, kUp);
+        Press(retro, kLeft);
+        Press(retro, kLeft);
+        Press(retro, kLeft);
+        Press(retro, kLeft);
+        Press(retro, kOptions);
+        Shot(retro, "retro-dialog-info");
+    }
 
     // (04.64) the user's icon, its User Page, the icon's choice and the keyboard
     HomeMenu user = MakeMenu(false);
