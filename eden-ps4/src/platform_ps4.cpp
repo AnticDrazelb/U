@@ -1740,6 +1740,9 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.85: the emulator hands its drawing to the PS4's graphics driver in batches 8 times bigger. In "
+         "04.84's measurement the handing-over took about a tenth of the emulator's GPU work in Breath of the "
+         "Wild.\n"
          "04.84: a measuring build: where the time goes for each thing a game draws (the logs say it every 30 "
          "seconds), to find what to speed up for games that draw a lot. Nothing else changed.\n"
          "04.83: Graphics > GPU Threads: Two shares the emulator's GPU work between two of the PS4's cores, for "
@@ -2811,6 +2814,7 @@ std::string PerfLine(double seconds)
         static uint64_t last_phase[P::PhaseCount] = {}, last_phase_draws = 0;
         static uint64_t last_fw = 0, last_fwt = 0, last_fwa = 0, last_fws = 0, last_sw = 0, last_swt = 0, last_pr = 0,
                         last_prt = 0;
+        static uint64_t last_bs = 0, last_bst = 0, last_bu = 0, last_bub = 0, last_wd = 0;
         const P::GpuDrawPhases& dp = P::gpu_draw_phases;
         const uint64_t phase_draws = dp.draws.load(std::memory_order_relaxed);
         uint64_t phase[P::PhaseCount];
@@ -2819,6 +2823,8 @@ std::string PerfLine(double seconds)
         const uint64_t fw = dp.fence_waits.load(), fwt = dp.fence_wait_ticks.load(), fwa = dp.fence_waits_acquire.load(),
                        fws = dp.fence_waits_semaphore.load(), sw = dp.scheduler_waits.load(),
                        swt = dp.scheduler_wait_ticks.load(), pr = dp.protects.load(), prt = dp.protect_ticks.load();
+        const uint64_t bs = dp.buffer_syncs.load(), bst = dp.buffer_sync_ticks.load(), bu = dp.buffer_uploads.load(),
+                       bub = dp.buffer_upload_bytes.load(), wd = dp.worker_dispatches.load();
         if (last_tsc != 0 && tsc > last_tsc) {
             const double us_per_tick = seconds * 1e6 / double(tsc - last_tsc);
             const uint64_t d_draws = phase_draws - last_phase_draws;
@@ -2831,6 +2837,14 @@ std::string PerfLine(double seconds)
                     parts += fmt::format("{}{} {:.1f}", i ? ", " : "", P::kDrawPhaseNames[i], us);
                 }
                 line += fmt::format("; a draw on the GPU thread: {:.1f} us ({})", total, parts);
+                // (04.85) of those parts, the buffer cache's look for the CPU's writes and their
+                // uploads (SynchronizeBuffer), a draw; the hand-overs to the Vulkan worker
+                line += fmt::format("; of that, buffers checked for the CPU's writes {:.1f} us ({:.1f} a draw, {:.2f} "
+                                    "of them uploading, {:.0f} bytes a draw); work handed to the Vulkan worker {:.0f} "
+                                    "times a second",
+                                    double(bst - last_bst) * us_per_tick / double(d_draws),
+                                    double(bs - last_bs) / double(d_draws), double(bu - last_bu) / double(d_draws),
+                                    double(bub - last_bub) / double(d_draws), double(wd - last_wd) / seconds);
             }
             const auto each_ms = [&](uint64_t ticks, uint64_t count) {
                 return count ? double(ticks) * us_per_tick / 1000.0 / double(count) : 0.0;
@@ -2848,6 +2862,7 @@ std::string PerfLine(double seconds)
         last_phase_draws = phase_draws;
         last_fw = fw, last_fwt = fwt, last_fwa = fwa, last_fws = fws, last_sw = sw, last_swt = swt, last_pr = pr,
         last_prt = prt;
+        last_bs = bs, last_bst = bst, last_bu = bu, last_bub = bub, last_wd = wd;
         last_tsc = tsc;
         last_busy = busy;
         last_raster = raster;

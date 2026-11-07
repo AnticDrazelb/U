@@ -1,0 +1,112 @@
+From dd034911f8334ec7174843952e9eda8a7282ed3f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 22:37:01 +0000
+Subject: [PATCH] PS4: commands to the Vulkan worker every 64 draws, not 8;
+ buffer syncs timed
+
+04.84 measured Breath of the Wild outdoors: 37,500 draws a second on
+the GPU thread at 99% busy, about 27 us a draw. Of each draw, 3.0 us
+went to FlushWork, which handed the recorded commands to the Vulkan
+worker every 8 draws (4,700 times a second). Each hand-over takes the
+queue's and the chunk reserve's locks, which the worker takes too, and
+wakes the worker: a system call, to a thread on the other Jaguar module
+that is asleep most of the time (86% idle).
+
+On the PS4 the hand-over is now every 64 draws. The GPU gets the work
+at the flush every 4,096 draws or at a sync point either way, and each
+of those hands everything over first. A chunk (32 KiB) that fills
+before then hands itself over, as before.
+
+Also timed on the GPU thread: BufferCache::SynchronizeBuffer (calls,
+ticks, those that uploaded and their bytes, inside the vertex/index
+and uniform parts of 04.84's draw laps), and the hand-overs counted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/ps4_perf.h                            |  5 +++++
+ src/video_core/buffer_cache/buffer_cache.h       |  8 ++++++++
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 11 +++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 9269e9db5..8a3bd467b 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -123,6 +123,11 @@ struct alignas(64) GpuDrawPhases {
+     std::atomic<uint64_t> scheduler_waits{0}, scheduler_wait_ticks{0};
+     // mprotect calls on the GPU thread (Common::HostMemory::Protect) and their ticks
+     std::atomic<uint64_t> protects{0}, protect_ticks{0};
++    // (04.85) the buffer cache's SynchronizeBuffer on the GPU thread (within the parts above: the
++    // CPU's writes looked for and uploaded to a buffer before it's used): calls and their ticks,
++    // those that uploaded and the bytes; and the scheduler's hand-overs to the Vulkan worker
++    std::atomic<uint64_t> buffer_syncs{0}, buffer_sync_ticks{0}, buffer_uploads{0}, buffer_upload_bytes{0};
++    std::atomic<uint64_t> worker_dispatches{0};
+ };
+ inline GpuDrawPhases gpu_draw_phases;
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index b7f3a9ad2..e273b4be5 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -10,6 +10,7 @@
+ #include <memory>
+ #include <numeric>
+ 
++#include "common/ps4_perf.h"
+ #include "common/range_sets.inc"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/gpu_split.h"
+@@ -1803,6 +1804,9 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
+ 
+ template <class P>
+ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
++    // (PS4 04.85) timed on the GPU thread (common/ps4_perf.h)
++    Common::PS4Perf::GpuWaitScope ps4_sync{Common::PS4Perf::gpu_draw_phases.buffer_syncs,
++                                           Common::PS4Perf::gpu_draw_phases.buffer_sync_ticks};
+     upload_copies.clear();
+     u64 total_size_bytes = 0;
+     u64 largest_copy = 0;
+@@ -1829,6 +1833,10 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     if (total_size_bytes == 0) {
+         return true;
+     }
++    if (Common::PS4Perf::on_gpu_thread) {
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.buffer_uploads);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.buffer_upload_bytes, total_size_bytes);
++    }
+     const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
+     UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
+     any_buffer_uploaded = true;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 4621109e0..aa0eddc4f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1041,6 +1041,15 @@ void RasterizerVulkan::FlushWork() {
+ #ifdef __ANDROID__
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+     static constexpr u32 CHECK_MASK = 3;
++#elif defined(__OPENORBIS__)
++    // (PS4 04.85) The recorded commands to the Vulkan worker every 64 draws, not 8: each hand-over
++    // wakes the worker (a system call; it's on the other Jaguar module and asleep most of the time)
++    // and takes two locks the worker takes too. 04.84 measured it in Breath of the Wild outdoors:
++    // 3.0 us of each draw's ~27 on the GPU thread (37,500 draws a second, 4,700 hand-overs), most of
++    // the ~9% the profiler found it in a system call. The GPU gets the work at the flush below or a
++    // sync point either way (each hands everything over first), and a full chunk hands itself over.
++    static constexpr u32 DRAWS_TO_DISPATCH = 4096;
++    static constexpr u32 CHECK_MASK = 63;
+ #else
+     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+     static constexpr u32 CHECK_MASK = 7;
+@@ -1050,6 +1059,8 @@ void RasterizerVulkan::FlushWork() {
+     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
+         return;
+     }
++    if (Common::PS4Perf::on_gpu_thread)
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.worker_dispatches);
+     if (draw_counter < DRAWS_TO_DISPATCH) {
+         scheduler.DispatchWork();
+         return;
+-- 
+2.43.0
+

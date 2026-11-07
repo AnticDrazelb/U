@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.84)
+# New Eden (formerly Eden for PS4): status (after 04.85)
 
-Install **04.84** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0175). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.85** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0176). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.85:** the Vulkan worker gets the GPU thread's commands every 64 draws, not 8 (below).
 - **04.84:** a measuring build: a draw's time on the GPU thread by part, and what the GPU thread waits on (below).
 - **04.83:** Graphics > GPU Threads: Two, the GPU thread's work on two cores (experimental, One by default); a fence wait that didn't wait fixed (below).
 - **04.82:** every game's profile kept; the GPU thread's busy time and the renderer's share measured (below).
@@ -102,6 +103,38 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.85: the GPU thread's commands to the Vulkan worker in bigger batches
+
+- **04.84 on the console** (Breath of the Wild outdoors, One, 180-570 s):
+  - 35,000-38,700 draws a second at 99-100% busy: about 26.7 us of GPU thread time a draw.
+  - The draw path (PrepareDraw) is 18.2 us of that, steady across the run (us a draw):
+
+    | part | us | part | us |
+    |---|---|---|---|
+    | uniforms | 3.3 | render targets | 1.0 |
+    | vertex/index | 3.1 | record | 0.8 |
+    | flush (hand-overs to the Vulkan worker) | 3.0 | pipeline | 0.8 |
+    | dynamic state | 1.5 | image descriptors | 0.7 |
+    | image views | 1.5 | descriptor set | 0.5 |
+    | descriptors | 1.4 | cache locks | 0.4 |
+    | tick | 0.2 | texture buffers | 0.1 |
+
+  - The rest of the renderer's ~20.5 us is its other entry points (uniform buffer binds, clears),
+    and command processing is ~6 us.
+  - Waits: no forced fence waits at all; the GPU or the Vulkan worker 12-14 times a second, ~0.9 ms
+    each (~1.2%); `mprotect` 2,000-3,500 times a second, ~6 us each (~1.5-2%).
+- **The flush part** was `FlushWork` handing the recorded commands to the Vulkan worker every 8 draws:
+  4,700 times a second. Each hand-over takes two locks the worker also takes, and wakes the worker,
+  which sleeps most of the time on the other Jaguar module: a system call, about 24 us a hand-over.
+  That is most of the ~9% of the GPU thread the profiler found in a system call.
+- **Now every 64 draws on the PS4** (patch 0176). The GPU gets the work at the flush every 4,096
+  draws or at a sync point either way (each hands everything over first), and a full 32 KiB chunk
+  hands itself over. Expected: the flush part from ~3 us to well under 1 us a draw, about 10% more
+  draws a second when the GPU thread is the limit. Not yet measured on the console.
+- **Also measured now:** the buffer cache's checks for the CPU's writes and their uploads
+  (`SynchronizeBuffer`, inside the vertex/index and uniform parts), and the hand-overs a second: for
+  what to cut next in those two parts.
 
 ## 04.84: where a draw's time goes on the GPU thread (a measuring build)
 

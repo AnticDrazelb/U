@@ -5,6 +5,16 @@ Where the work stands, what was done, what was tried and ruled out, and what's n
 newest first) and in the launcher's News page (`News()` in `src/platform_ps4.cpp`); the Eden changes
 are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see "How to work").
 
+## Update at 04.85 (2026-11-07)
+
+- **04.83's GPU split was slower on the console** (Breath of the Wild 6-10 fps with Two, 8-14 with
+  One): shelved, kept behind the switch. Details in docs/gpu-thread-split.md.
+- **04.84 measured each draw on the single GPU thread:** ~26.7 us of GPU thread time a draw outdoors,
+  18.2 us of it the draw path. The biggest parts: uniforms 3.3, vertex/index 3.1, the hand-over to
+  the Vulkan worker 3.0 (STATUS.md has the table).
+- **04.85 hands over every 64 draws instead of 8.** Next: its console run, then the uniform and
+  vertex/index parts (04.85 times the buffer cache's checks for the CPU's writes inside them).
+
 ## Update at 04.83 (2026-11-06)
 
 - **The GPU thread split is built** (Graphics > GPU Threads: Two; One by default).

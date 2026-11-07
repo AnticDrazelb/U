@@ -379,6 +379,11 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.85: **the GPU thread's commands go to the Vulkan worker every 64 draws, not 8** (patch 0176). 04.84
+measured the hand-over at 3 of each draw's ~27 us on the GPU thread in Breath of the Wild outdoors
+(4,700 hand-overs a second, each waking the worker on the other core module). The buffer cache's
+checks for the CPU's writes are timed too, for the next step.
+
 04.84: **a measuring build: where a draw's time goes on the GPU thread.** 04.83's GPU Threads: Two made
 Breath of the Wild slower (6-10 fps against One's 8-14): handing each draw to the second thread cost
 more than it saved. The single GPU thread's profile is flat, so this build times each part of a draw
