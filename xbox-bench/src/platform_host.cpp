@@ -1,4 +1,4 @@
-// Desktop host (Linux x86-64): stdout, mmap, Linux's signal context, modify_ldt and arch_prctl.
+// Desktop host (Linux x86-64): stdout, mmap and Linux's signal context.
 // The 32-bit code segment is Linux's __USER32_CS, which the bench finds by itself.
 #include <cerrno>
 #include <csignal>
@@ -7,8 +7,6 @@
 #include <cstring>
 #include <string>
 
-#include <asm/ldt.h>
-#include <asm/prctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
@@ -163,30 +161,4 @@ void RemoveFaultHandler()
     g_handler = nullptr;
 }
 
-// ---- fs
-
-uint16_t SetLdtEntry(int index, uint32_t base, uint32_t limit, std::string& error)
-{
-    user_desc d{};
-    d.entry_number = static_cast<unsigned>(index);
-    d.base_addr = base;
-    d.limit = limit >> 12;
-    d.seg_32bit = 1;
-    d.contents = 0; // data
-    d.limit_in_pages = 1;
-    d.useable = 1;
-    if (syscall(SYS_modify_ldt, 1, &d, sizeof(d)) != 0)
-    {
-        error = Errno("modify_ldt");
-        return 0;
-    }
-    return static_cast<uint16_t>((index << 3) | 4 | 3);
-}
-void FsBaseRestoreCall(uint64_t base, uint64_t* slot, uint64_t out[3])
-{
-    *slot = base;
-    out[0] = SYS_arch_prctl;
-    out[1] = ARCH_SET_FS;
-    out[2] = base;
-}
 } // namespace Platform

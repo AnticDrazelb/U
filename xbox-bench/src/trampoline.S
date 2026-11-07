@@ -25,11 +25,6 @@ slot_guest_ds:  .quad 0     // 32  data selector for ds/es in the guest (the emu
 slot_saved_ds:  .word 0     // 40  the emulator's ds
 slot_saved_es:  .word 0     // 42  the emulator's es
                 .long 0
-slot_guest_fs:  .quad 0     // 48  fs selector for the guest (0: fs untouched)
-slot_fs_nr:     .quad 0     // 56  system call that puts the emulator's fs base back
-slot_fs_a0:     .quad 0     // 64    its first argument
-slot_fs_a1:     .quad 0     // 72    its second argument
-slot_fs_base:   .quad 0     // 80    the emulator's fs base (for a1 to point at)
     .p2align 7
 
     .code64
@@ -55,13 +50,7 @@ xbt_enter64:                // uint64_t enter64(uint32_t fn /* edi */, uint32_t 
 
     .code32
 stub32:
-    call 1f
-1:  pop %ecx
-    mov (slot_guest_fs - 1b)(%ecx), %edx
-    test %edx, %edx
-    jz 2f
-    mov %edx, %fs
-2:  call *%eax              // the guest function
+    call *%eax              // the guest function
     call 3f
 3:  pop %ecx
     push (slot_sel64 - 3b)(%ecx)
@@ -75,17 +64,8 @@ xbt_back64:
     shl $32, %rdx
     mov %eax, %eax
     or %rdx, %rax
-    mov %rax, %rbx
     mov slot_saved_ds(%rip), %ds
     mov slot_saved_es(%rip), %es
-    cmpq $0, slot_guest_fs(%rip)
-    je 4f
-    // fs was the guest's: give the emulator its thread pointer back before any C code runs
-    mov slot_fs_nr(%rip), %rax
-    mov slot_fs_a0(%rip), %rdi
-    mov slot_fs_a1(%rip), %rsi
-    syscall
-4:  mov %rbx, %rax
     pop %r15
     pop %r14
     pop %r13

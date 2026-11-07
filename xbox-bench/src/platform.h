@@ -1,6 +1,5 @@
 // What differs between the PS4 and a desktop host (Linux): where results go and how they are
-// shown, how memory is mapped at fixed addresses below 4 GiB, the signal context layout, and the
-// system calls behind an LDT entry and the fs base.
+// shown, how memory is mapped at fixed addresses below 4 GiB, and the signal context layout.
 #pragma once
 
 #include <cstddef>
@@ -57,13 +56,4 @@ using FaultHandler = bool (*)(FaultContext& context);
 void InstallFaultHandler(FaultHandler handler);
 void RemoveFaultHandler();
 
-// ---- the guest's fs segment
-
-// Sets LDT entry `index` to a 32-bit data segment (base, limit in bytes - 1). Returns its selector,
-// or 0 with `error` set.
-uint16_t SetLdtEntry(int index, uint32_t base, uint32_t limit, std::string& error);
-// The system call that sets this thread's fs base (number and two arguments), for the
-// trampoline to restore the emulator's thread pointer after guest code had its own fs. `slot`
-// is a word the trampoline fills with the base; some systems want a pointer to it.
-void FsBaseRestoreCall(uint64_t base, uint64_t* slot, uint64_t out[3]);
 } // namespace Platform

@@ -320,19 +320,10 @@ uint32_t xb_thunk(uint32_t n, KernelExport export_fn)
     return acc;
 }
 
-// The thread's FS segment: Xbox code reads its KPCR through fs (fs:[0x28] is the current thread,
-// fs:[0x20] the PRCB). Returns fs:[offset].
-uint32_t xb_fs_read(uint32_t offset)
-{
-    uint32_t v;
-    __asm__ volatile("movl %%fs:(%1), %0" : "=r"(v) : "r"(offset));
-    return v;
-}
-
 // The table the emulator finds at the image's load address.
 __attribute__((section(".bench_table"), used)) const uint32_t xb_table[] = {
     (uint32_t)xb_int,  (uint32_t)xb_branchy, (uint32_t)xb_calls, (uint32_t)xb_memory,
     (uint32_t)xb_copy, (uint32_t)xb_sse,     (uint32_t)xb_x87,   (uint32_t)xb_empty,
-    (uint32_t)xb_mmio, (uint32_t)xb_thunk,   (uint32_t)xb_fs_read,
+    (uint32_t)xb_mmio, (uint32_t)xb_thunk,
 };
 #endif
