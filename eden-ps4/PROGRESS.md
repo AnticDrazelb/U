@@ -32,6 +32,11 @@ are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see
 - **04.86 has all three** (patch 0177; STATUS.md). The desktop can now run Eden's Vulkan renderer on
   lavapipe (`EDEN_PS4_RENDERER=vulkan`, `VK_ICD_FILENAMES=.../lvp_icd.json`), which tests the buffer
   and texture caches, which the null renderer doesn't use.
+- **04.86 on the console: no difference** (STATUS.md). Breath of the Wild outdoors draws at the
+  same rate (38,600 a second). Only 17% of its buffer checks were skipped outdoors: its
+  constant-buffer updates, invalidated about once a draw, give their whole 4 MiB tracker region a
+  new generation, and the other buffers in that region can't be skipped. A region-wide count is
+  too coarse; a fix needs the buffer's own range (Ryujinx marks the one buffer dirty).
 - **Beyond the Switch** ([docs/arm-to-x86-translators.md](docs/arm-to-x86-translators.md)): most
   ARM emulators on x86 (Azahar, Panda3DS, Vita3K) use dynarmic too. Berberis's loop pass (every guest
   register a loop uses kept in host registers) is a smaller first step than a second tier: an

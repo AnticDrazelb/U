@@ -79,6 +79,14 @@ map, the sampler variant cached per view; descriptors are still read every draw,
 the pool's memory); the flush split for item 3. Frames identical with and without them on Eden's
 Vulkan renderer (lavapipe, gputest's five modes).
 
-Items 1 and 2 together are 04.86's candidates, with the timer split for item 3. Combined, items 1-3
+**04.86 on the console: no difference.** Breath of the Wild outdoors drew 38,600 a second, as on
+04.85. Buffer checks were skipped only 17% of the time outdoors, and still cost 2.0 us a draw. The
+game's constant-buffer updates are invalidated about once a draw. Each marks a page CPU-modified,
+which gives its whole 4 MiB region a new generation, and the other buffers in that region can't
+be skipped. Item 1 as built is too coarse: it needs to know whether the buffer's own range changed,
+as Ryujinx's per-buffer dirty flag does. Item 2's exact part changed neither image views nor
+descriptors (1.4 and 1.3 us).
+
+Items 1 and 2 together were 04.86's candidates, with the timer split for item 3. Combined, items 1-3
 are perhaps 15-20% of the GPU thread: Breath of the Wild outdoors from ~10 towards ~12 fps. That
 helps every game the GPU thread holds back, not only Breath of the Wild.

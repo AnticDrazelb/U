@@ -140,6 +140,20 @@ programs, 0 failures.
 - **Expected:** most of the 1.8 us of buffer checks and their `mprotect` calls, part of the texture
   slots' ~3 us. The console run tells how much: the 30 s line's "buffer checks skipped N%" and the
   draw parts against 04.85's.
+- **On the console (2026-11-07): no difference.**
+  - Breath of the Wild outdoors: 38,600 draws a second (04.85: 37,400-39,000), the same fps.
+  - The draw path 17.8 us (04.85: 17.3); buffer checks 2.0 us at 3.6 a draw (04.85: 1.8 at 3.5);
+    image views 1.4 and descriptors 1.3, both as before.
+  - Buffer checks skipped: 49%, 36% and 39% in the first minutes, **17% outdoors**. Link's
+    Awakening 21-65%, Mario Kart 37%.
+  - Why: the game's constant-buffer updates are invalidated ~once a draw (0.7-1.0 times, 1.5-2.2
+    ranges each). Each marks its page CPU-modified, which gives its whole 4 MiB region a new
+    generation. The game's other buffers share that region, so their checks can't be skipped.
+  - The queued writes' invalidation, by side: texture cache 0.4-0.6 us, buffer cache 0.7-3.6, query
+    and shader caches 0.4-0.8. Sampler variants from their cache 27-59%.
+  - Also seen: Mario Kart's GPU thread is 84-92% busy in races (the main thread 75% running), so
+    the GPU thread limits it too. Link's Awakening's slow parts (21-26 fps) are its main thread (74%
+    running), the GPU thread at 39-49%.
 
 ## 04.85: the GPU thread's commands to the Vulkan worker in bigger batches
 
