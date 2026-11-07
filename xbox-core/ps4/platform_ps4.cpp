@@ -60,7 +60,9 @@ constexpr int kSignals[3] = {kSigSegv, kSigBus, kSigIll};
 constexpr uint16_t kUserFs32 = 0x13; // GUFS32: the fs selector whose base is the thread's fs base
 
 using SetFsBase = int (*)(void*);
+using GetFsBase = int (*)(void**);
 SetFsBase g_set_fsbase = nullptr;
+GetFsBase g_get_fsbase = nullptr;
 bool g_load_fs_selector = false;
 FaultHandler g_handler = nullptr;
 struct sigaction g_old[3];
@@ -121,8 +123,15 @@ void FsHostImpl(uint64_t base)
 void OnSignal(int sig, siginfo_t*, void* context)
 {
     auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
-    // the interrupted fs base: a KPCR when guest code (or the switch) ran; the emulator's own first
-    const uint64_t fs = regs[kFsBase];
+    // the interrupted fs base: a KPCR when guest code (or the switch) ran; the emulator's own first.
+    // Asked of the kernel (the handler runs with the interrupted fs base); else the context's copy.
+    uint64_t fs = regs[kFsBase];
+    if (g_get_fsbase)
+    {
+        void* base = nullptr;
+        if (g_get_fsbase(&base) == 0)
+            fs = reinterpret_cast<uint64_t>(base);
+    }
     const bool guest_fs = fs && fs < 0x100000000ull;
     if (guest_fs)
         g_set_fsbase(reinterpret_cast<void*>(*reinterpret_cast<const uint64_t*>(fs + 0x300)));
@@ -153,6 +162,7 @@ void OnSignal(int sig, siginfo_t*, void* context)
 std::string Init()
 {
     g_set_fsbase = reinterpret_cast<SetFsBase>(Lookup("amd64_set_fsbase"));
+    g_get_fsbase = reinterpret_cast<GetFsBase>(Lookup("amd64_get_fsbase"));
     if (!g_set_fsbase)
         return "amd64_set_fsbase isn't exported by a loaded module";
     uint16_t fs;

@@ -366,6 +366,16 @@ void InitCpu()
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);
+    // Self-test: a guest function that returns fs:[0x18] (the thread's NT_TIB.Self, its KPCR).
+    // Right, it shows the switch into 32-bit code, the guest's fs and the way back all work.
+    const u32 code = AllocKernel(16, 16);
+    const u8 test[] = {0x64, 0xa1, 0x18, 0x00, 0x00, 0x00, 0xc3}; // mov eax, fs:[0x18]; ret
+    std::memcpy(Ptr(code), test, sizeof(test));
+    GuestThread* t = NewGuestThread(0x4000, 0, "self-test");
+    const u32 got = u32(CallGuest(t, code, {}));
+    if (got != t->kpcr)
+        Fatal("cpu self-test: guest code read fs:[0x18] = %#x, expected the KPCR %#x", got, t->kpcr);
+    Log("cpu self-test: 32-bit code runs, its fs is its KPCR (%#x)", got);
 }
 
 u32 ExportStub(u32 ordinal)
