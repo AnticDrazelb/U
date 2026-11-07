@@ -69,7 +69,7 @@ constexpr int kMaxCores = 3;
 // to 4 GiB. Kept inaccessible, so every access there faults.
 constexpr u64 kMmioBase = 0xFD000000, kMmioSize = 0x03000000;
 // Trampoline slots (src/trampoline.S)
-constexpr int kSlotSel32 = 8, kSlotSel64 = 16, kSlotHandler = 24, kSlotGuestDs = 32;
+constexpr int kSlotSel32 = 8, kSlotSel64 = 16, kSlotHandler = 24, kSlotGuestDs = 32, kSlotBase = 48;
 
 // The bench_table at the image's start (guest/kernels.c xb_table)
 enum GuestFn { kInt, kBranchy, kCalls, kMemory, kCopy, kSse, kX87, kEmpty, kMmio, kThunk, kFnCount };
@@ -199,6 +199,24 @@ Core* g_cores[kMaxCores] = {};
 Segments g_seg;
 u64 g_layout = 0;
 
+// The guest's address space: its code and data selectors, and their base (guest address a is
+// linear address base + a, mod 4 GiB). Base 0 with the system's own 32-bit segments is the flat
+// space; an LDT entry can give it another base.
+struct GuestSpace
+{
+    u64 base = 0;
+    u16 cs32 = 0, ds32 = 0;
+};
+GuestSpace g_space;
+u64 Linear(u64 guest)
+{
+    return (g_space.base + guest) & 0xFFFFFFFFu;
+}
+u32 Guest(u64 linear)
+{
+    return u32(linear - g_space.base);
+}
+
 // The NV2A stand-in: registers that keep what is written to them.
 u32 g_mmio_regs[4096];
 std::atomic<u64> g_mmio_accesses{0};
@@ -209,18 +227,19 @@ size_t TrampSize()
 }
 
 // One emulated CPU: its own trampoline (the switch keeps the emulator's stack pointer in it), its
-// own stack and data, inside the shared Xbox address space.
+// own stack and data, inside the shared Xbox address space. Addresses here are linear.
 struct Core
 {
     int index = 0;
     u64 tramp = 0, stack = 0, data = 0;
+    u32 GuestData() const { return Guest(data); }
     std::string error;
     std::vector<std::pair<u64, size_t>> mapped;
 
     u64& Slot(int offset) const { return *reinterpret_cast<u64*>(tramp + u64(offset)); }
     u64 Entry(const u8* symbol) const { return tramp + u64(symbol - xbt_begin); }
     bool InTrampoline(u64 rip) const { return rip >= tramp && rip < tramp + u64(xbt_end - xbt_begin); }
-    bool InStack(u64 esp) const { return esp >= stack && esp < stack + kStackSize; }
+    bool InStack(u32 guest_esp) const { return Linear(guest_esp) >= stack && Linear(guest_esp) < stack + kStackSize; }
 
     bool Map(u64 addr, size_t size, int access, const char* what)
     {
@@ -236,17 +255,18 @@ struct Core
 
     explicit Core(int i) : index(i)
     {
-        tramp = g_layout + kTrampOffset + u64(i) * kTrampStride;
-        stack = g_layout + kStackOffset + u64(i) * kStackSize;
-        data = g_layout + kDataOffset + u64(i) * kDataSize;
+        tramp = Linear(g_layout + kTrampOffset + u64(i) * kTrampStride);
+        stack = Linear(g_layout + kStackOffset + u64(i) * kStackSize);
+        data = Linear(g_layout + kDataOffset + u64(i) * kDataSize);
         if (!Map(tramp, TrampSize(), Platform::Read | Platform::Write | Platform::Exec, "trampoline") ||
             !Map(stack, kStackSize, Platform::Read | Platform::Write, "stack") ||
             !Map(data, kDataSize, Platform::Read | Platform::Write, "data"))
             return;
         std::memcpy(reinterpret_cast<void*>(tramp), xbt_begin, size_t(xbt_end - xbt_begin));
-        Slot(kSlotSel32) = g_seg.sel32;
+        Slot(kSlotSel32) = g_space.cs32;
         Slot(kSlotSel64) = g_seg.cs;
-        Slot(kSlotGuestDs) = g_seg.ss;
+        Slot(kSlotGuestDs) = g_space.ds32;
+        Slot(kSlotBase) = g_space.base;
         g_cores[i] = this;
     }
     ~Core()
@@ -260,18 +280,19 @@ struct Core
     Core& operator=(const Core&) = delete;
 
     void SetGate(u32 (*handler)(const u32*)) { Slot(kSlotHandler) = reinterpret_cast<u64>(handler); }
-    u32 Gate() const { return u32(Entry(xbt_gate32)); }
+    u32 Gate() const { return Guest(Entry(xbt_gate32)); }
 
     // Calls guest function `fn` (cdecl) with 32-bit arguments; returns its eax.
     u32 Call(u32 fn, std::initializer_list<u32> args)
     {
+        Platform::PrepareThread();
         const u64 esp = (stack + kStackSize - 4096) & ~u64(15);
         u32* a = reinterpret_cast<u32*>(esp);
         for (u32 v : args)
             *a++ = v;
         using Enter = u64 (*)(u32, u32);
         const auto enter = reinterpret_cast<Enter>(Entry(xbt_enter64));
-        return u32(enter(fn, u32(esp)));
+        return u32(enter(fn, Guest(esp)));
     }
 };
 
@@ -285,7 +306,7 @@ struct Image
 
     bool Load(const u8* elf, size_t len)
     {
-        base = g_layout + kImageOffset;
+        base = Linear(g_layout + kImageOffset);
         const std::string e =
             Platform::MapFixed(base, kImageSize, Platform::Read | Platform::Write | Platform::Exec);
         if (!e.empty())
@@ -316,12 +337,13 @@ struct Image
             std::memcpy(&memsz, ph + 20, 4);
             if (type != 1)
                 continue;
-            if (vaddr < base || u64(vaddr) + memsz > base + kImageSize || u64(offset) + filesz > len)
+            const u64 guest_base = g_layout + kImageOffset;
+            if (vaddr < guest_base || u64(vaddr) + memsz > guest_base + kImageSize || u64(offset) + filesz > len)
             {
                 error = "guest segment outside the image region";
                 return false;
             }
-            std::memcpy(reinterpret_cast<void*>(u64(vaddr)), elf + offset, filesz);
+            std::memcpy(reinterpret_cast<void*>(Linear(vaddr)), elf + offset, filesz);
         }
         std::memcpy(fn, reinterpret_cast<const void*>(base), sizeof(fn)); // xb_table
         return true;
@@ -343,22 +365,23 @@ bool OnFault(Platform::FaultContext& c)
     const u64 rip = *c.rip;
     Core* core = nullptr;
     for (Core* k : g_cores)
-        if (k && ((c.cs == g_seg.sel32 && k->InStack(*c.gpr[4] & 0xFFFFFFFFu)) || k->InTrampoline(rip)))
+        if (k && ((c.cs == g_space.cs32 && k->InStack(u32(*c.gpr[4]))) || k->InTrampoline(rip)))
             core = k;
     if (!core)
         return false;
     // a fault in back64 itself can't be recovered from here: let the crash log have it
     if (rip >= core->Entry(xbt_back64) && rip < core->Entry(xbt_gate32))
         return false;
-    if (c.cs == g_seg.sel32 && c.address >= kMmioBase && c.address < kMmioBase + kMmioSize)
+    const u64 guest_address = Guest(c.address);
+    if (c.cs == g_space.cs32 && guest_address >= kMmioBase && guest_address < kMmioBase + kMmioSize)
     {
-        const u8* code = reinterpret_cast<const u8*>(rip & 0xFFFFFFFFu);
+        const u8* code = reinterpret_cast<const u8*>(Linear(u32(rip)));
         const u8 op = code[0], modrm = code[1];
         const int mod = modrm >> 6, reg = (modrm >> 3) & 7, rm = modrm & 7;
         if ((op == 0x89 || op == 0x8B) && mod != 3)
         {
             size_t length = 2 + (rm == 4 ? 1 : 0) + (mod == 1 ? 1 : mod == 2 ? 4 : 0) + (mod == 0 && rm == 5 ? 4 : 0);
-            u32& r = g_mmio_regs[((c.address - kMmioBase) >> 2) % 4096];
+            u32& r = g_mmio_regs[((guest_address - kMmioBase) >> 2) % 4096];
             if (op == 0x89)
                 r = u32(*c.gpr[reg]);
             else
@@ -404,17 +427,17 @@ std::vector<Kernel> MakeKernels(double scale)
         {"int", "integer math", [=](u8*) { return native_xb_int(n_int); },
          [=](Core& c, const Image& im) { return c.Call(im.fn[kInt], {n_int}); }},
         {"branchy", "game logic (state machines)", [=](u8* buf) { return native_xb_branchy(n_br, buf, kEntities); },
-         [=](Core& c, const Image& im) { return c.Call(im.fn[kBranchy], {n_br, u32(c.data), kEntities}); }},
+         [=](Core& c, const Image& im) { return c.Call(im.fn[kBranchy], {n_br, c.GuestData(), kEntities}); }},
         {"calls", "calls and indirect calls", [=](u8*) { return native_xb_calls(n_calls); },
          [=](Core& c, const Image& im) { return c.Call(im.fn[kCalls], {n_calls}); }},
         {"memory", "random and sequential memory", [=](u8* buf) { return native_xb_memory(n_mem, buf, kWords); },
-         [=](Core& c, const Image& im) { return c.Call(im.fn[kMemory], {n_mem, u32(c.data), kWords}); }},
+         [=](Core& c, const Image& im) { return c.Call(im.fn[kMemory], {n_mem, c.GuestData(), kWords}); }},
         {"copy", "64-byte block copies", [=](u8* buf) { return native_xb_copy(n_copy, buf, kBlocks); },
-         [=](Core& c, const Image& im) { return c.Call(im.fn[kCopy], {n_copy, u32(c.data), kBlocks}); }},
+         [=](Core& c, const Image& im) { return c.Call(im.fn[kCopy], {n_copy, c.GuestData(), kBlocks}); }},
         {"sse", "4-wide float math (SSE)",
          [=](u8* buf) { return native_xb_sse(n_sse, buf, buf + kFloats * 4, kFloats); },
          [=](Core& c, const Image& im) {
-             return c.Call(im.fn[kSse], {n_sse, u32(c.data), u32(c.data + kFloats * 4), kFloats});
+             return c.Call(im.fn[kSse], {n_sse, c.GuestData(), c.GuestData() + kFloats * 4, kFloats});
          }},
         {"x87", "double math (x87 in the guest)", [=](u8*) { return native_xb_x87(n_x87); },
          [=](Core& c, const Image& im) { return c.Call(im.fn[kX87], {n_x87}); }},
@@ -439,7 +462,9 @@ bool ChooseLayout(std::unique_ptr<Image>& image, std::vector<std::unique_ptr<Cor
 {
     const u8* images[] = {guest_image, guest_image_high};
     const size_t lengths[] = {guest_image_len, guest_image_high_len};
-    for (size_t l = 0; l < std::size(kLayouts); l++)
+    // with a segment base, guest addresses can be anywhere: only the Xbox's own
+    const size_t layouts = g_space.base ? 1 : std::size(kLayouts);
+    for (size_t l = 0; l < layouts; l++)
     {
         g_layout = kLayouts[l];
         Platform::Trace(fmt::format("layout {:#x}: image", g_layout));
@@ -457,9 +482,10 @@ bool ChooseLayout(std::unique_ptr<Image>& image, std::vector<std::unique_ptr<Cor
         }
         if (error.empty())
         {
-            Platform::Log(fmt::format("guest memory: image at {:#x}, data, stacks and trampolines from {:#x}{}",
-                                      image->base, g_layout + kDataOffset,
-                                      g_layout ? " (not the Xbox's own addresses: those weren't free)" : " (the Xbox's own addresses)"));
+            Platform::Log(fmt::format("guest memory: image at {:#x}, data, stacks and trampolines from {:#x}{}{}",
+                                      g_layout + kImageOffset, g_layout + kDataOffset,
+                                      g_layout ? " (not the Xbox's own addresses: those weren't free)" : " (the Xbox's own addresses)",
+                                      g_space.base ? fmt::format(", at linear {:#x} and up", image->base) : ""));
             return true;
         }
         Platform::Log(fmt::format("guest memory at {:#x}: {}", g_layout, error));
@@ -469,10 +495,10 @@ bool ChooseLayout(std::unique_ptr<Image>& image, std::vector<std::unique_ptr<Cor
     return false;
 }
 
-int RunCpu(double scale, Progress& progress)
+int RunCpu(double scale, Progress& progress, const std::string& title)
 {
     Platform::Log("");
-    Platform::Log("cpu: Xbox code (Pentium III build) run by this CPU in 32-bit mode, no recompiler");
+    Platform::Log(title);
     std::unique_ptr<Image> image;
     std::vector<std::unique_ptr<Core>> cores;
     if (!ChooseLayout(image, cores))
@@ -480,7 +506,7 @@ int RunCpu(double scale, Progress& progress)
         Platform::Log("  not run: no layout of guest memory mapped");
         return 1;
     }
-    const std::string reserve = Platform::ReserveFixed(kMmioBase, kMmioSize);
+    const std::string reserve = Platform::ReserveFixed(Linear(kMmioBase), kMmioSize);
     Platform::Log(reserve.empty() ? fmt::format("  hardware registers {:#x}-{:#x} kept unmapped (they fault)", kMmioBase,
                                                 kMmioBase + kMmioSize - 1)
                                   : fmt::format("  hardware register range not reserved ({}): MMIO test skipped", reserve));
@@ -624,7 +650,7 @@ int RunCpu(double scale, Progress& progress)
     }
     Platform::RemoveFaultHandler();
     if (reserve.empty())
-        Platform::Unmap(kMmioBase, kMmioSize);
+        Platform::Unmap(Linear(kMmioBase), kMmioSize);
 
     Platform::Log("");
     Platform::Log(fmt::format("Xbox code runs at x{:.2f} the time of native code (1.00 = the same speed), 3 cores "
@@ -741,6 +767,60 @@ void RunMemory(Progress& progress)
     });
 }
 
+// ---- segments with a base: the Xbox's addresses anywhere free
+
+// What the system exports that an emulator could use here, looked up at run time.
+void ReportSystemFunctions()
+{
+    Platform::Log("");
+    Platform::Log("system functions (looked up, not imported):");
+    for (const char* name : {"i386_set_ldt", "i386_get_ldt", "sysarch", "amd64_set_fsbase",
+                             "sceKernelJitCreateSharedMemory", "sceKernelJitCreateAliasOfSharedMemory",
+                             "sceKernelJitMapSharedMemory"})
+    {
+        Platform::Trace(fmt::format("system function {}", name));
+        std::string where;
+        const void* p = Platform::SystemFunction(name, where);
+        Platform::Log(fmt::format("  {:<38} {}", name, p ? fmt::format("yes, in {}", where) : "no"));
+    }
+}
+
+// On the PS4 the Xbox's low addresses hold the app's own executable (0x400000-0x977fff in 01.01).
+// A code and a data segment with base B put guest address a at linear B + a: the whole 4 GiB guest
+// space moves past it. Their LDT entries also give the guest an fs of its own later.
+constexpr u64 kSegmentBase = 0x10000000;
+
+int RunBased(double scale, Progress& progress)
+{
+    ReportSystemFunctions();
+    Platform::Log("");
+    Platform::Log(fmt::format("segments with a base: guest address 0 at linear {:#x} (LDT entries)", kSegmentBase));
+    Platform::Trace("LDT: code segment");
+    std::string error;
+    const u16 code = Platform::SetLdtEntry(1, u32(kSegmentBase), true, error);
+    if (!code)
+    {
+        Platform::Log("  code segment: NO (" + error + ")");
+        return 0;
+    }
+    Platform::Trace("LDT: data segment");
+    const u16 data = Platform::SetLdtEntry(2, u32(kSegmentBase), false, error);
+    if (!data)
+    {
+        Platform::Log(fmt::format("  code segment {:#x}; data segment: NO ({})", code, error));
+        return 0;
+    }
+    const Descriptor dc = Lar(code), dd = Lar(data);
+    Platform::Log(fmt::format("  code segment {:#x}: {}", code, dc.valid ? Describe(dc) : "NOT VISIBLE (lar)"));
+    Platform::Log(fmt::format("  data segment {:#x}: {}", data, dd.valid ? Describe(dd) : "NOT VISIBLE (lar)"));
+    if (!dc.valid || !dd.valid)
+        return 0;
+    g_space = {kSegmentBase, code, data};
+    const int result = RunCpu(scale, progress, "cpu, through the based segments:");
+    g_space = {0, g_seg.sel32, g_seg.ss};
+    return result;
+}
+
 int Run(Platform::Mode mode)
 {
     double scale = 1.0;
@@ -754,9 +834,15 @@ int Run(Platform::Mode mode)
     if (mode != Platform::Mode::MemoryOnly)
     {
         if (g_seg.ok)
-            result = RunCpu(scale, progress);
+        {
+            g_space = {0, g_seg.sel32, g_seg.ss};
+            result = RunCpu(scale, progress,
+                            "cpu: Xbox code (Pentium III build) run by this CPU in 32-bit mode, no recompiler");
+        }
         else
             Platform::Log("cpu: not run (no 32-bit code segment)"), result = 1;
+        if (g_seg.ok)
+            result = std::max(result, RunBased(scale, progress));
     }
     if (mode != Platform::Mode::CpuOnly)
         RunMemory(progress);

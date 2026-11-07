@@ -52,6 +52,25 @@ struct VirtualQueryInfo
     char name[32];
 };
 int32_t sceKernelVirtualQuery(const void* addr, int32_t flags, VirtualQueryInfo* info, size_t infoSize);
+// the loaded modules, as port/ps4_sampler.cpp lists them
+struct ModuleSegment
+{
+    void* address;
+    uint32_t size;
+    int32_t prot;
+};
+struct ModuleInfo
+{
+    size_t size;
+    char name[256];
+    ModuleSegment segments[4];
+    uint32_t segment_count;
+    uint8_t fingerprint[20];
+};
+int32_t sceKernelGetModuleList(int32_t* handles, size_t count, size_t* available);
+int32_t sceKernelGetModuleInfo(int32_t handle, ModuleInfo* info);
+int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
+int* __error(void);
 int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
 int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 // port/ps4_runtime.cpp: the app heap behind malloc
@@ -557,6 +576,7 @@ std::vector<AliasRecord> g_aliases;
 // port/ps4_crashlog.cpp)
 
 constexpr int kSigIllFreeBsd = 4, kSigBusFreeBsd = 10, kSigSegvFreeBsd = 11, kSaSiginfoFreeBsd = 0x40;
+constexpr int kSaOnstackFreeBsd = 0x1;
 constexpr int kMcontextOffset = 0x40;
 constexpr int kGprIndex[8] = {7, 4, 3, 8, 23, 9, 2, 1}; // rax rcx rdx rbx rsp rbp rsi rdi
 constexpr int kRipIndex = 20, kCsIndex = 21, kAddrIndex = 17;
@@ -766,7 +786,7 @@ void InstallFaultHandler(FaultHandler handler)
     std::memset(&action, 0, sizeof(action));
     void (*function)(int, siginfo_t*, void*) = OnFault;
     std::memcpy(&action, &function, sizeof(function)); // the handler union is the first member
-    action.sa_flags = kSaSiginfoFreeBsd;
+    action.sa_flags = kSaSiginfoFreeBsd | kSaOnstackFreeBsd;
     sigemptyset(&action.sa_mask);
     for (int i = 0; i < 3; i++)
         sigaction(kSignals[i], &action, &g_old[i]);
@@ -777,6 +797,72 @@ void RemoveFaultHandler()
     for (int i = 0; i < 3; i++)
         sigaction(kSignals[i], &g_old[i], nullptr);
     g_handler = nullptr;
+}
+
+// Crema's runtime gives every thread a signal stack already (ps4_install_signal_stack).
+void PrepareThread() {}
+
+// ---- system functions and segments
+
+void* SystemFunction(const char* name, std::string& where)
+{
+    where.clear();
+    int32_t handles[256];
+    size_t count = 0;
+    if (sceKernelGetModuleList(handles, 256, &count) != 0)
+        return nullptr;
+    for (size_t m = 0; m < count && m < 256; m++)
+    {
+        void* address = nullptr;
+        if (sceKernelDlsym(handles[m], name, &address) != 0 || !address)
+            continue;
+        ModuleInfo info;
+        std::memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        where = sceKernelGetModuleInfo(handles[m], &info) == 0 ? info.name : fmt::format("module {}", handles[m]);
+        return address;
+    }
+    return nullptr;
+}
+
+// FreeBSD's LDT calls: i386_set_ldt(start, descriptors, count), or sysarch(I386_SET_LDT, args).
+// A raw 8-byte descriptor is FreeBSD's union descriptor.
+uint16_t SetLdtEntry(int, uint32_t base, bool code, std::string& error)
+{
+    const uint32_t type = code ? 0xB : 0x3; // execute/read or read/write, accessed
+    const uint32_t limit = 0xFFFFF;          // in 4 KiB units: 4 GiB
+    uint32_t descriptor[2];
+    descriptor[0] = (limit & 0xFFFF) | ((base & 0xFFFF) << 16);
+    descriptor[1] = ((base >> 16) & 0xFF) | (type << 8) | (1u << 12) /* code/data */ | (3u << 13) /* dpl 3 */ |
+                    (1u << 15) /* present */ | (((limit >> 16) & 0xF) << 16) | (1u << 22) /* 32-bit */ |
+                    (1u << 23) /* 4 KiB granularity */ | ((base >> 24) << 24);
+    constexpr unsigned kAutoAlloc = 0xFFFFFFFFu; // LDT_AUTO_ALLOC
+    std::string where;
+    int index = -1;
+    if (auto set_ldt = reinterpret_cast<int (*)(int, void*, int)>(SystemFunction("i386_set_ldt", where)))
+    {
+        index = set_ldt(int(kAutoAlloc), descriptor, 1);
+        if (index < 0)
+            error = fmt::format("i386_set_ldt ({}): {} (errno {})", where, index, *__error());
+    }
+    else if (auto sysarch = reinterpret_cast<int (*)(int, void*)>(SystemFunction("sysarch", where)))
+    {
+        struct
+        {
+            unsigned start;
+            void* descriptors;
+            unsigned count;
+        } args = {kAutoAlloc, descriptor, 1};
+        index = sysarch(1 /* I386_SET_LDT */, &args);
+        if (index < 0)
+            error = fmt::format("sysarch ({}): {} (errno {})", where, index, *__error());
+    }
+    else
+        error = "neither i386_set_ldt nor sysarch is exported by a loaded module";
+    if (index < 0)
+        return 0;
+    error.clear();
+    return static_cast<uint16_t>((index << 3) | 4 | 3);
 }
 
 } // namespace Platform

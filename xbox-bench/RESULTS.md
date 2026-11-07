@@ -72,3 +72,36 @@ average).
   - give the guest its own code and data segments with a base (in compatibility mode segment bases
     still apply), so guest address 0 can be anywhere free. That needs LDT entries, which the PS4
     may not allow an app to set.
+
+## 01.01, same console, memory checks only
+
+Mapped below 4 GiB: the app's own executable and nothing else.
+
+| range | size | what |
+|---|---|---|
+| `0x00400000-0x005b3fff` | 1744 KiB | r-x flexible "executable" (code) |
+| `0x005b4000-0x005c3fff` | 64 KiB | r-- flexible "executable" (read-only data) |
+| `0x005c4000-0x00977fff` | 3792 KiB | rw- flexible "executable" (data, bss) |
+
+| check | result |
+|---|---|
+| the Xbox's RAM at its own addresses (`0x10000-0x3ffffff`) | no: the executable is in it |
+| 64 MiB at `0x04000000` | yes |
+| the same, executable (system flexible memory, RWX) | yes |
+| executable memory at `0x04000000`, 16 MiB at a time | **208 MiB** |
+| 64 MiB at `0x04000000` again at `0x84000000` (alias) | no: the second `sceKernelMapDirectMemory` fails with `0x80020010` (EBUSY) |
+| the same alias, executable | no: `0x80020016` (EINVAL) on the first view; direct memory never maps executable |
+| an alias of one 16 KiB page | no: `0x80020010` (EBUSY) |
+| an alias of one 4 KiB page | no: direct memory maps in 16 KiB pages only |
+| the hardware range kept unmapped | yes |
+
+So:
+
+- Executable memory is plentiful below 4 GiB (208 MiB beside the bench's own heap): the Xbox's
+  64 MiB can be RWX, as Xbox code needs (self-modifying code, code loaded at run time).
+- **The PS4 won't map the same direct memory twice** (EBUSY), so the contiguous-memory alias at
+  `0x80000000` can't be made with mappings. An emulator's kernel gives games their contiguous
+  memory at `0x8xxxxxxx` without a low alias. The GPU's physical addresses are then translated
+  through the kernel's own table, not by masking.
+- The only obstacle at the Xbox's own addresses is the app's executable at `0x400000`. 01.02 tries
+  32-bit segments with a base (LDT entries), which move the whole guest address space past it.

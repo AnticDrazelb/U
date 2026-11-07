@@ -7,6 +7,8 @@
 #include <cstring>
 #include <string>
 
+#include <asm/ldt.h>
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
@@ -169,16 +171,58 @@ void InstallFaultHandler(FaultHandler handler)
     g_handler = handler;
     struct sigaction action{};
     action.sa_sigaction = OnFault;
-    action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     for (int i = 0; i < 3; i++)
         sigaction(kSignals[i], &action, &g_old[i]);
+}
+void PrepareThread()
+{
+    thread_local bool done = false;
+    if (done)
+        return;
+    done = true;
+    static constexpr size_t kSize = 256 * 1024;
+    stack_t st{};
+    st.ss_sp = std::malloc(kSize);
+    st.ss_size = kSize;
+    if (st.ss_sp && sigaltstack(&st, nullptr) != 0)
+        std::free(st.ss_sp);
 }
 void RemoveFaultHandler()
 {
     for (int i = 0; i < 3; i++)
         sigaction(kSignals[i], &g_old[i], nullptr);
     g_handler = nullptr;
+}
+
+// ---- system functions and segments
+
+void* SystemFunction(const char* name, std::string& where)
+{
+    void* p = dlsym(RTLD_DEFAULT, name);
+    where = p ? "libc" : "";
+    return p;
+}
+
+uint16_t SetLdtEntry(int index, uint32_t base, bool code, std::string& error)
+{
+    user_desc d{};
+    d.entry_number = static_cast<unsigned>(index);
+    d.base_addr = base;
+    d.limit = 0xFFFFF;
+    d.seg_32bit = 1;
+    d.contents = code ? 2 : 0; // MODIFY_LDT_CONTENTS_CODE / _DATA
+    d.read_exec_only = 0;
+    d.limit_in_pages = 1;
+    d.seg_not_present = 0;
+    d.useable = 1;
+    if (syscall(SYS_modify_ldt, 1, &d, sizeof(d)) != 0)
+    {
+        error = Errno("modify_ldt");
+        return 0;
+    }
+    return static_cast<uint16_t>((index << 3) | 4 | 3);
 }
 
 } // namespace Platform

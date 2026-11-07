@@ -61,7 +61,21 @@ void SetCs(FaultContext& context, uint16_t cs);
 // Called for every fault; returns true when handled (execution resumes from the context). Faults
 // it doesn't handle go to the handlers that were there before (the crash log).
 using FaultHandler = bool (*)(FaultContext& context);
+// Faults are handled on a signal stack of their own (SA_ONSTACK): while guest code runs with a
+// based stack segment, its esp isn't a linear address the system could put a signal frame at.
 void InstallFaultHandler(FaultHandler handler);
+// Gives the calling thread its signal stack, if the platform doesn't already (once per thread).
+void PrepareThread();
 void RemoveFaultHandler();
+
+// ---- system functions and segments
+
+// The address of a function the system's libraries export (looked up at run time, so it adds no
+// import), or nullptr; `where` names the library it came from.
+void* SystemFunction(const char* name, std::string& where);
+// Sets an LDT entry: a 32-bit segment with base `base`, 4 GiB long, privilege level 3, code
+// (execute/read) or data (read/write). Returns its selector, or 0 with `error` set. `index` is a
+// hint; the system may choose another.
+uint16_t SetLdtEntry(int index, uint32_t base, bool code, std::string& error);
 
 } // namespace Platform
