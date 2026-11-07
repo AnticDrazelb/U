@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.86)
+# New Eden (formerly Eden for PS4): status (after 04.87)
 
-Install **04.86** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0177). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.87** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0178). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.87:** 04.86's skip fixed (per 256 KiB, real changes only); rewritten uniform buffers copied, not uploaded; the queued writes' repeats skipped; the web server removed (below).
 - **04.86:** unchanged buffers aren't checked again, texture slots and sampler variants cached; the flush part split (below).
 - **04.85:** the Vulkan worker gets the GPU thread's commands every 64 draws, not 8 (below).
 - **04.84:** a measuring build: a draw's time on the GPU thread by part, and what the GPU thread waits on (below).
@@ -104,6 +105,48 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.87: 04.86's skip fixed; rewritten uniform buffers copied; the web server removed
+
+- **Why 04.86 made no difference** (its console run, above under 04.86):
+  - Its generation was per 4 MiB region, renewed by every marking. Breath of the Wild's
+    constant-buffer updates (about one a draw) renewed the region its other buffers share.
+  - The buffer checks' 2 us a draw are mostly the few that upload. From 04.86's runs (Breath of
+    the Wild and Mario Kart solved together): a check that finds nothing ~0.3 us, an upload ~11 us.
+  - Breath of the Wild's cached uniform buffers (over 4 KiB: 1,690 binds a second) uploaded 93% of
+    the time: the game's constant updates rewrite them between binds. Each upload into a buffer
+    earlier draws use is recorded in order, ending the render pass.
+- **This build (patch 0178), all exact:**
+  - **The skip per 256 KiB word** (64 pages): a word's generation is renewed only when one of its
+    pages goes from clean to CPU-modified or untracked. A page marked again while already marked
+    changes nothing. The buffer remembers the counter's value at its check; a range whose words'
+    generations are all below it is skipped.
+  - **Rewritten uniform buffers copied, not uploaded.** A cached uniform buffer (up to 16 KiB)
+    found changed on consecutive binds is copied from the game's memory to the stream buffer, as
+    those up to 4 KiB always are. Its pages stay marked, so every 8th bind in such a run uploads
+    and clears them: a buffer written once and bound many times copies at most 7 times.
+  - **The queued writes' repeats skipped.** The texture, query and shader caches' sides of each
+    draw's constant-update invalidation are skipped for a range they already ran on with nothing
+    new registered since (an image registered or refreshed, a query or a shader added).
+  - The tracker's range lists on the stack instead of the heap.
+  - `EDEN_PS4_DRAW_SKIPS=0` turns all of them off, with 04.86's.
+- **Measured too** (the 30 s line): the uploads' own time and each one's; uniform buffers copied
+  instead of uploaded; render passes ended for a copy or barrier (and those for uploads); the
+  queued writes' ranges skipped by each cache.
+- **The web server removed.** The logs go to `eden-ps4-logs.txt` in the Game Folder as before
+  (`src/log_bundle.cpp`, split out of `web_server.cpp`). The HOME menu no longer shows an address.
+- **Tested on the desktop with Eden's Vulkan renderer** (lavapipe):
+  - gputest has a new mode, Y: the constant update test, Breath of the Wild's pattern. 64 pieces of
+    the mesh, each placed by a matrix the GPU writes into one 8 KiB uniform buffer with a constant
+    update just before its draw; the program reads past 4 KiB, so it takes the cached path. On the
+    software renderer each piece is in its own place.
+  - Skips on against off, every 30th frame: identical in all six modes (apart from gputest's
+    frame-rate bar).
+  - In the constant update test: 81% of buffer checks skipped, uploads 72% fewer (18,032 copies
+    instead), the texture, query and shader sides skipped for 98-100% of the ranges, 22% more
+    draws in the same time.
+- **Expected on the console:** most of the buffer checks' 2 us a draw, most of the queued writes'
+  1.5-1.9 us, fewer render pass ends. The 30 s line tells.
 
 ## 04.86: unchanged buffers and texture slots not checked again
 

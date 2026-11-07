@@ -46,7 +46,7 @@ if (PS4)
     set_source_files_properties(ui/canvas.cpp PROPERTIES COMPILE_OPTIONS
         "-Wno-unused-function;-Wno-conversion;-Wno-sign-conversion;-Wno-implicit-fallthrough;-Wno-missing-field-initializers")
 
-    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp usb_import.cpp web_server.cpp log_tools.cpp
+    add_executable(eden-ps4 main.cpp platform_ps4.cpp ps4_stubs.cpp usb_import.cpp log_bundle.cpp log_tools.cpp
                             firmware_zip.cpp
                             ${EDEN_PS4_UI_SOURCES}
                             ${EDEN_PS4_RUNTIME_SOURCES})

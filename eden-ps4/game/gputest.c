@@ -83,6 +83,8 @@ size_t __nx_heap_size = 64 * 1024 * 1024;
 #define M_TEX_SAMPLER_POOL 0x557   // address (2), last index
 #define M_TEX_HEADER_POOL 0x55D    // address (2), last index
 #define M_CONST_BUFFER 0x8E0       // size, address (2): the buffer the next bind binds
+#define M_CB_OFFSET 0x8E3          // where in it the next constant update writes
+#define M_CB_DATA 0x8E4            // 16 words: the constant update (a game's per-draw constants)
 #define M_BIND_FRAGMENT_CBUF 0x924 // valid | slot << 4, for the fragment stage (bind group 4)
 #define M_BIND_VERTEX_CBUF 0x904   // the same, for the vertex stage (bind group 0)
 #define M_INDEX_BUFFER 0x5F2       // address (2), limit (2), format (2: 32-bit), first, count
@@ -310,6 +312,9 @@ static u64 ffma_cbuf(u32 dest, u32 a, u32 bank, u32 offset, u32 c) {
 #define FS_MSAA_OFFSET 0x7610 // sample 3 of each pixel of the storage image as a 2x2 multisampled texture
 #define VS_MESH_OFFSET 0x7A10 // the vertex stress test's: position times a matrix (constant buffer 1)
 #define MESH_CBUF(i, d) (0x8000 + ((i) * 16 + (d)) * 64) // each mesh draw's matrix, by command buffer
+#define VS_CB_OFFSET 0x8C10   // the constant update test's: the mesh program, reading constant buffer 1 to 0x1FF0
+#define CB_BIG 0x9000         // its constant buffer: 8 KiB, the matrix written before each draw by the GPU
+#define CB_BIG_SIZE 0x2000
 #define STORAGE_OFFSET 0x3000 // a storage buffer: a colour
 #define TIC_POOL 0x2000 // texture headers (32 bytes each)
 #define TSC_POOL 0x2100 // samplers (32 bytes each)
@@ -509,6 +514,24 @@ static void write_programs(u8* heap) {
     u64* vm = (u64*)(heap + VS_MESH_OFFSET + 0x50);
     for (size_t i = 0, k = 0; i < sizeof(mesh_code) / sizeof(mesh_code[0]); k++) {
         vm[k] = k % 4 == 0 ? SCHED : mesh_code[i++];
+    }
+    // the constant update test's: the same, also reading c[1][0x1FF0] (0, added as 0 * 0) so that
+    // the buffer it uses is 8 KiB: above the 4 KiB Eden copies each draw, so it goes through Eden's
+    // buffer cache (a game's large uniform buffer it updates each draw)
+    memcpy(heap + VS_CB_OFFSET, vs_sph, 0x50);
+    const u64 cb_code[] = {
+        ald128(0, 0x80), ald128(4, 0x90), fmul_cbuf(8, 0, 1, 0x00),
+        ffma_cbuf(8, 1, 1, 0x04, 8), ffma_cbuf(8, 2, 1, 0x08, 8), ffma_cbuf(8, 3, 1, 0x0C, 8),
+        fmul_cbuf(9, 0, 1, 0x10), ffma_cbuf(9, 1, 1, 0x14, 9), ffma_cbuf(9, 2, 1, 0x18, 9),
+        ffma_cbuf(9, 3, 1, 0x1C, 9), fmul_cbuf(10, 0, 1, 0x20), ffma_cbuf(10, 1, 1, 0x24, 10),
+        ffma_cbuf(10, 2, 1, 0x28, 10), ffma_cbuf(10, 3, 1, 0x2C, 10), fmul_cbuf(11, 0, 1, 0x30),
+        ffma_cbuf(11, 1, 1, 0x34, 11), ffma_cbuf(11, 2, 1, 0x38, 11), ffma_cbuf(11, 3, 1, 0x3C, 11),
+        mov_cbuf(12, 1, 0x1FF0), ffma(8, 12, 12, 8),
+        ast128(0x70, 8), ast128(0x80, 4), exit_(),
+    };
+    u64* vc = (u64*)(heap + VS_CB_OFFSET + 0x50);
+    for (size_t i = 0, k = 0; i < sizeof(cb_code) / sizeof(cb_code[0]); k++) {
+        vc[k] = k % 4 == 0 ? SCHED : cb_code[i++];
     }
 
     // the storage image's: workgroups of 8x8, each invocation at x, y of a 32x32 image; its colour
@@ -1027,6 +1050,7 @@ int main(int argc, char* argv[]) {
     bool stress = false;
     bool stress_3d = false; // B: 12 large lit, textured, depth-tested quads
     bool stress_vertices = false; // X: 16 meshes of 4225 vertices
+    bool cb_updates = false; // Y: 64 meshes placed by constant updates (one before each draw)
     int stress_sprites = 400;
     {   // the storage buffer (a cyan), its address and size in the constant buffer
         const float colour[4] = {0.1f, 0.9f, 0.95f, 1.0f};
@@ -1085,6 +1109,10 @@ int main(int argc, char* argv[]) {
         if (down & HidNpadButton_X) {
             stress_vertices = !stress_vertices;
             fprintf(stderr, "gputest: vertex stress test %s\n", stress_vertices ? "on" : "off");
+        }
+        if (down & HidNpadButton_Y) {
+            cb_updates = !cb_updates;
+            fprintf(stderr, "gputest: constant update test %s\n", cb_updates ? "on" : "off");
         }
         if (down & (HidNpadButton_Up | HidNpadButton_Down)) {
             stress_sprites += (down & HidNpadButton_Up) ? 100 : -100;
@@ -1802,6 +1830,43 @@ int main(int argc, char* argv[]) {
             }
             method1(M_PIPELINE + 1 * 0x10 + 1, VS_OFFSET);
         }
+        // the constant update test: 64 small pieces of the mesh in an 8x8 grid at the right, each
+        // turning, placed by its matrix, which the GPU writes into one 8 KiB constant buffer with a
+        // constant update just before the piece's draw (as games pass their per-draw constants).
+        // Each draw must see its own matrix: a stale one draws a piece over another's place.
+        if (cb_updates) {
+            const u32 scissor[3] = {1, (u32)W << 16, (u32)H << 16};
+            method(M_SCISSOR, 3, scissor);
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_CB_OFFSET);
+            const u32 stream[4] = {32 | 1 << 12, (u32)(mesh_iova >> 32), (u32)mesh_iova, 0};
+            method(M_VERTEX_STREAM, 4, stream);
+            const iova_t last = mesh_iova + MESH_VERTICES * 32 - 1;
+            const u32 limit[2] = {(u32)(last >> 32), (u32)last};
+            method(M_VERTEX_STREAM_LIMIT, 2, limit);
+            const iova_t big = heap_iova + CB_BIG;
+            const u32 bind[3] = {CB_BIG_SIZE, (u32)(big >> 32), (u32)big};
+            method(M_CONST_BUFFER, 3, bind);
+            method1(M_BIND_VERTEX_CBUF, 1 | 1 << 4);
+            const iova_t mesh_indices = mesh_iova + MESH_VERTICES * 32;
+            const iova_t indices_last = mesh_indices + MESH_INDICES * 4 - 1;
+            const u32 ib[7] = {(u32)(mesh_indices >> 32), (u32)mesh_indices, (u32)(indices_last >> 32),
+                               (u32)indices_last, 2 /* 32-bit */, 0, MESH_SIDE * 6 * 8};
+            for (int d = 0; d < 64; d++) {
+                const float angle = (float)frame * 0.03f + (float)d * 0.7f, c = cosf(angle), sn = sinf(angle);
+                const float sx = 14.0f / (W / 2.0f), sy = 14.0f / (H / 2.0f);
+                const float tx = 0.25f + (float)(d % 8) * 2.6f * sx, ty = -0.85f + (float)(d / 8) * 2.6f * sy;
+                const float rows[16] = {c * sx, -sn * sx, 0.0f, tx, sn * sy, c * sy, 0.0f, ty,
+                                        0.0f, 0.0f, 1.0f, 0.5f, 0.0f, 0.0f, 0.0f, 1.0f};
+                u32 words[16];
+                memcpy(words, rows, sizeof(words));
+                method1(M_CB_OFFSET, 0);
+                method(M_CB_DATA, 16, words);
+                method(M_INDEX_BUFFER, 7, ib); // (its count written makes the draw indexed)
+                method1(M_DRAW_BEGIN, TOPOLOGY_TRIANGLES);
+                method1(M_DRAW_END, 0);
+            }
+            method1(M_PIPELINE + 1 * 0x10 + 1, VS_OFFSET);
+        }
         // a bar showing the frame rate: 6 pixels per frame a second
         rect(10, H - 16, fps * 6, 6, 0.4f, 1.0f, 0.5f);
 
@@ -1833,10 +1898,11 @@ int main(int argc, char* argv[]) {
             fps = (int)fps_frames;
             fps_frames = 0;
             fps_tick = now;
-            if (frame < 200 || frame % 600 < 60 || stress || stress_3d || stress_vertices)
-                fprintf(stderr, "gputest: %d fps, %u command words a frame%s%s%s\n", fps, g_cmd->used,
+            if (frame < 200 || frame % 600 < 60 || stress || stress_3d || stress_vertices || cb_updates)
+                fprintf(stderr, "gputest: %d fps, %u command words a frame%s%s%s%s\n", fps, g_cmd->used,
                         stress ? " (stress test)" : "", stress_3d ? " (3D stress test)" : "",
-                        stress_vertices ? " (vertex stress test)" : "");
+                        stress_vertices ? " (vertex stress test)" : "",
+                        cb_updates ? " (constant update test)" : "");
         }
     }
 

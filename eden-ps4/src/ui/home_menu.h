@@ -140,7 +140,6 @@ public:
     void SetNews(std::vector<std::pair<std::string, std::string>> sections) { news = std::move(sections); }
     void SetGamesStatus(std::vector<StatusRow> rows, std::string help);
     // Where a browser reaches the app's web server ("http://...:8080", or empty without a network)
-    void SetWebAddress(std::string url) { web_address = std::move(url); }
     // Controllers' "Test Input Devices" boots this (none: no such button)
     void SetControllerTest(std::string path) { controller_test = std::move(path); }
     // Shown first, until dismissed
@@ -227,7 +226,7 @@ private:
     std::vector<Title> titles;
     std::map<int, std::vector<Image>> tiles; // by size in pixels: each title's tile, made when first drawn
     MenuSettings settings;
-    std::string version, renderer, clock = "0:00", controller_test, games_help, web_address;
+    std::string version, renderer, clock = "0:00", controller_test, games_help;
     bool radv_linked = false, controller = true, keys_present = false;
     std::vector<std::pair<std::string, std::string>> news;
     std::vector<StatusRow> games_status;

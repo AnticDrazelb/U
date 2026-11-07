@@ -74,7 +74,6 @@ HomeMenu MakeMenu(bool white)
     menu.SetSettings(settings);
     menu.SetInfo("03.20", "Vulkan on the PS4's GPU (Mesa's RADV)", true);
     menu.SetClock("9:27");
-    menu.SetWebAddress("http://192.168.1.23:8080");
     menu.SetKeysPresent(false);
     menu.SetControllerTest("/app0/padtest.nro");
     menu.SetFolderPlaces({"/data/eden-ps4", "/mnt/usb0", "/mnt/usb1", "/mnt/ext0", "/mnt/ext1", "/mnt"});

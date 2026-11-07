@@ -1,0 +1,732 @@
+From 33d27229bf0a8e580cc77889c6d8159aab6a5ddc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 05:08:29 +0000
+Subject: [PATCH] PS4: buffer checks skipped per 256 KiB word; changed uniform
+ buffers copied, not uploaded; queued writes' repeats skipped
+
+The skip gate's generation is kept per 256 KiB word and renewed only when a page in it goes
+from clean to CPU-modified or untracked (04.86's per-4 MiB one was renewed by Breath of the
+Wild's per-draw constant-buffer updates: 17% skipped). A cached uniform buffer found changed
+by the CPU on consecutive binds is copied to the stream buffer for up to 7 binds, then uploaded
+(an upload ends the render pass when the buffer is in use). The texture, query and shader
+caches' sides of the queued writes' invalidation are skipped for a range they already ran on
+with nothing new registered since. Uploads timed, render pass ends counted.
+---
+ src/common/ps4_perf.h                         | 10 +++
+ src/video_core/buffer_cache/buffer_base.h     | 11 ++-
+ src/video_core/buffer_cache/buffer_cache.h    | 88 +++++++++++++++----
+ .../buffer_cache/memory_tracker_base.h        | 27 +++---
+ src/video_core/buffer_cache/word_manager.h    | 84 ++++++++++++++----
+ src/video_core/gpu_thread.cpp                 | 11 ++-
+ src/video_core/query_cache/query_cache.h      |  1 +
+ src/video_core/query_cache/query_cache_base.h |  8 ++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 33 ++++++-
+ .../renderer_vulkan/vk_rasterizer.h           | 34 +++++++
+ .../renderer_vulkan/vk_scheduler.cpp          |  6 ++
+ src/video_core/shader_cache.cpp               |  1 +
+ src/video_core/shader_cache.h                 |  8 ++
+ src/video_core/texture_cache/texture_cache.h  |  2 +
+ .../texture_cache/texture_cache_base.h        |  6 ++
+ 15 files changed, 276 insertions(+), 54 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 171bb58f2..b9dede272 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -138,6 +138,16 @@ struct alignas(64) GpuDrawPhases {
+     std::atomic<uint64_t> inner_calls{0}, inner_ranges{0}, inner_texture_ticks{0}, inner_buffer_ticks{0},
+         inner_other_ticks{0};
+     std::atomic<uint64_t> sampler_variant_lookups{0}, sampler_variant_hits{0};
++    // (04.87) cached uniform buffers found changed again and copied to the stream buffer instead
++    // (the count and bytes); uploads' ticks (within the buffer checks); render passes ended for a
++    // copy or barrier outside one (Scheduler::RequestOutsideRenderPassOperationContext with one
++    // open), all of them and those for buffer uploads
++    std::atomic<uint64_t> ubo_dirty_streams{0}, ubo_dirty_stream_bytes{0};
++    std::atomic<uint64_t> buffer_uploads_timed{0}, upload_ticks{0};
++    std::atomic<uint64_t> renderpass_breaks{0}, renderpass_breaks_upload{0};
++    // (04.87) the queued writes' ranges whose texture, query or shader cache side was skipped
++    // (already run there with nothing new since)
++    std::atomic<uint64_t> inner_texture_skips{0}, inner_query_skips{0}, inner_shader_skips{0};
+ };
+ inline GpuDrawPhases gpu_draw_phases;
+ /// (04.86) The draw skips (unchanged buffers' checks, the texture slots' flat ids, the samplers'
+diff --git a/src/video_core/buffer_cache/buffer_base.h b/src/video_core/buffer_cache/buffer_base.h
+index 5bbbcd842..141aa0096 100644
+--- a/src/video_core/buffer_cache/buffer_base.h
++++ b/src/video_core/buffer_cache/buffer_base.h
+@@ -130,12 +130,15 @@ public:
+         write_tick = write_tick_;
+     }
+ 
+-    /// (PS4 04.86) the range last checked for the CPU's writes (SynchronizeBuffer) and the
+-    /// generations of its memory regions then: a check of a range within it, the generations the
+-    /// same, would find nothing
++    /// (PS4 04.86-04.87) the range last checked for the CPU's writes (SynchronizeBuffer), clean
++    /// then, and the tracker's generation counter before that check: a range within it whose words'
++    /// generations are all still below it would find nothing
+     DAddr sync_begin = 0;
+     DAddr sync_end = 0;
+-    std::array<u64, 2> sync_generations{};
++    u64 sync_generation = 0;
++    /// (PS4 04.87) the binds as a uniform buffer in a row that found its range changed by the CPU
++    /// (BufferCache::BindHostGraphicsUniformBuffer: copied to the stream buffer while it repeats)
++    u8 ubo_dirty_streak = 0;
+ 
+ private:
+     VAddr cpu_addr = 0;
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 6903bf1f5..d52210940 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -963,9 +963,34 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             return alignment > 1 && (offset % alignment) != 0;
+         }
+     }();
+-    const bool use_fast_buffer = needs_alignment_stream
++    bool use_fast_buffer = needs_alignment_stream
+         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+             && !memory_tracker.IsRegionGpuModified(device_addr, size));
++    // (PS4 04.87) A cached uniform buffer the CPU changes between binds (Breath of the Wild: 93% of
++    // its cached binds uploaded, the game's constant-buffer updates rewriting them each time) is
++    // copied to the stream buffer, as the small ones always are, instead of uploaded. An upload
++    // costs ~11 us on the GPU thread and mostly ends the render pass (the buffer is in use by
++    // earlier draws). Exact: the copy reads the game's memory, which the upload would have read
++    // too (never where the GPU wrote). Its pages stay marked, so each 8th bind in such a run is
++    // uploaded and clears them: a buffer written once and bound many times copies at most 7 times.
++    bool dirty_stream = false;
++    if (!use_fast_buffer && has_host_buffer && Common::PS4Perf::DrawSkipsEnabled()) {
++        if (buffer.ubo_dirty_streak == 0) {
++            // the cached path below tells whether this bind found the range changed
++        } else if (buffer.ubo_dirty_streak < 8 && size <= 16_KiB &&
++                   memory_tracker.IsRegionCpuModified(device_addr, size) &&
++                   !memory_tracker.IsRegionGpuModified(device_addr, size)) {
++            use_fast_buffer = true;
++            dirty_stream = true;
++            ++buffer.ubo_dirty_streak;
++        } else if (buffer.ubo_dirty_streak >= 8) {
++            buffer.ubo_dirty_streak = 0;  // uploaded below; a changed range starts the next run
++        }
++    }
++    if (dirty_stream) {
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.ubo_dirty_streams);
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.ubo_dirty_stream_bytes, size);
++    }
+     if (use_fast_buffer) {
+         if constexpr (IS_OPENGL) {
+             if (runtime.HasFastBufferSubData()) {
+@@ -1029,6 +1054,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+ #ifdef __OPENORBIS__
+         Common::PS4Perf::Bump(Common::PS4Perf::gpu_thread.ubo_cached_hits);
+ #endif
++        buffer.ubo_dirty_streak = 0;
++    } else if (buffer.ubo_dirty_streak == 0) {
++        buffer.ubo_dirty_streak = 1;  // (PS4 04.87) changed: the next bind may copy instead
+     }
+     // Skip binding if it's not needed and if the bound buffer is not the fast version
+     // This exists to avoid instances where the fast buffer is bound and a GPU write happens
+@@ -1807,37 +1835,46 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     // (PS4 04.85) timed on the GPU thread (common/ps4_perf.h)
+     Common::PS4Perf::GpuWaitScope ps4_sync{Common::PS4Perf::gpu_draw_phases.buffer_syncs,
+                                            Common::PS4Perf::gpu_draw_phases.buffer_sync_ticks};
+-    // (PS4 04.86) Skipped when nothing can have changed: the range lies within the one this buffer
+-    // was last checked over, and no page in its memory regions has been marked CPU-modified or
+-    // untracked since (their generations are the same). The check would find nothing to upload and
+-    // no page to protect again. 04.85: 3.5 checks a draw in Breath of the Wild, 1 in 50 uploading.
+-    // Under the buffer cache's lock, as every marking is (the generations are read before the check
+-    // so that a marking during it is seen by the next one).
+-    std::array<u64, 2> generations{};
+-    const bool gated = Common::PS4Perf::DrawSkipsEnabled() &&
+-                       memory_tracker.RangeGenerations(device_addr, size, generations);
+-    if (gated && generations == buffer.sync_generations && device_addr >= buffer.sync_begin &&
+-        device_addr + size <= buffer.sync_end) {
++    // (PS4 04.86; 04.87: per 256 KiB word) Skipped when nothing can have changed: the range lies
++    // within the one this buffer was last checked over, clean then, and no page in the words it
++    // touches has gone from clean to CPU-modified or untracked since (each such word's generation
++    // would be at least the counter's value at that check). The check would find nothing to upload
++    // and no page to protect again. 04.86's whole-region generations were renewed by Breath of the
++    // Wild's constant-buffer updates about once a draw: 17% skipped outdoors.
++    // Under the buffer cache's lock, as every marking is.
++    const bool skips = Common::PS4Perf::DrawSkipsEnabled();
++    u64 newest = 0;
++    const bool gated = skips && memory_tracker.NewestGeneration(device_addr, size, newest);
++    if (gated && buffer.sync_end != 0 && device_addr >= buffer.sync_begin &&
++        device_addr + size <= buffer.sync_end && newest < buffer.sync_generation) {
+         if (Common::PS4Perf::on_gpu_thread) {
+             Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.buffer_sync_skips);
+         }
+         return true;
+     }
++    // The last range still clean and next to or overlapping this one: both are clean after the
++    // check (decided before it, which only clears)
++    u64 last_newest = 0;
++    const bool extend = gated && buffer.sync_end != 0 && device_addr <= buffer.sync_end &&
++                        device_addr + size >= buffer.sync_begin &&
++                        memory_tracker.NewestGeneration(buffer.sync_begin,
++                                                        buffer.sync_end - buffer.sync_begin,
++                                                        last_newest) &&
++                        last_newest < buffer.sync_generation;
++    const u64 checked_at = gated ? CurrentTrackerGeneration() : 0;
+     const auto remember_check = [&] {
+         if (!gated) {
+             buffer.sync_begin = buffer.sync_end = 0;
+             return;
+         }
+-        // (a range next to or overlapping the last one, with nothing marked since: both clean)
+-        if (generations == buffer.sync_generations && device_addr <= buffer.sync_end &&
+-            device_addr + size >= buffer.sync_begin && buffer.sync_end != 0) {
++        if (extend) {
+             buffer.sync_begin = (std::min)(buffer.sync_begin, device_addr);
+             buffer.sync_end = (std::max)(buffer.sync_end, device_addr + size);
+         } else {
+             buffer.sync_begin = device_addr;
+             buffer.sync_end = device_addr + size;
+         }
+-        buffer.sync_generations = generations;
++        buffer.sync_generation = checked_at;
+     };
+     upload_copies.clear();
+     u64 total_size_bytes = 0;
+@@ -1872,7 +1909,12 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+         Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.buffer_upload_bytes, total_size_bytes);
+     }
+     const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
+-    UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
++    {
++        // (PS4 04.87) the upload's own time (within the check's)
++        Common::PS4Perf::GpuWaitScope ps4_upload{Common::PS4Perf::gpu_draw_phases.buffer_uploads_timed,
++                                                 Common::PS4Perf::gpu_draw_phases.upload_ticks};
++        UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
++    }
+     any_buffer_uploaded = true;
+     return false;
+ }
+@@ -1928,6 +1970,12 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
+             copy.src_offset += upload_staging.offset;
+         }
+         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
++#ifdef __OPENORBIS__
++        if (!can_reorder && Common::PS4Perf::on_gpu_thread) {
++            // (PS4 04.87) recorded in the draws' command buffer: ends the render pass if one is open
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.renderpass_breaks_upload);
++        }
++#endif
+         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+     }
+ }
+@@ -1970,6 +2018,12 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
+         u8* const src_pointer = upload_staging.mapped_span.data();
+         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
+         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
++#ifdef __OPENORBIS__
++        if (!can_reorder && Common::PS4Perf::on_gpu_thread) {
++            // (PS4 04.87) recorded in the draws' command buffer: ends the render pass if one is open
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.renderpass_breaks_upload);
++        }
++#endif
+         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+     } else {
+         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+index 00653a99a..bcd717a35 100644
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -136,23 +136,30 @@ public:
+         cached_pages.clear();
+     }
+ 
+-    /// (PS4 04.86) The generations of the regions (at most two) a range lies in, for
+-    /// BufferCache::SynchronizeBuffer's skip; false when it spans more, or a region doesn't exist yet
+-    [[nodiscard]] bool RangeGenerations(VAddr cpu_address, u64 size, std::array<u64, 2>& out) const noexcept {
++    /// (PS4 04.86; per 256 KiB word since 04.87) The newest generation among the words a range
++    /// touches, for BufferCache::SynchronizeBuffer's skip; false when it spans more than four
++    /// regions, or a region doesn't exist yet
++    [[nodiscard]] bool NewestGeneration(VAddr cpu_address, u64 size, u64& out) const noexcept {
+         if (size == 0) {
+             return false;
+         }
+         const size_t first = cpu_address >> HIGHER_PAGE_BITS;
+         const size_t last = (cpu_address + size - 1) >> HIGHER_PAGE_BITS;
+-        if (last - first > 1 || last >= NUM_HIGH_PAGES) {
++        if (last - first > 3 || last >= NUM_HIGH_PAGES) {
+             return false;
+         }
+-        const Manager* const a = top_tier[first];
+-        const Manager* const b = last != first ? top_tier[last] : nullptr;
+-        if (a == nullptr || (last != first && b == nullptr)) {
+-            return false;
++        u64 newest = 0;
++        for (size_t index = first; index <= last; ++index) {
++            const Manager* const manager = top_tier[index];
++            if (manager == nullptr) {
++                return false;
++            }
++            const VAddr region_start = VAddr(index) << HIGHER_PAGE_BITS;
++            const VAddr begin = (std::max)(cpu_address, region_start);
++            const VAddr end = (std::min)(cpu_address + size, region_start + HIGHER_PAGE_SIZE);
++            newest = (std::max)(newest, manager->NewestGeneration(begin - region_start, end - begin));
+         }
+-        out = {a->generation, b != nullptr ? b->generation : 0};
++        out = newest;
+         return true;
+     }
+ 
+@@ -270,7 +277,7 @@ private:
+         }
+         Manager* new_manager = free_managers.front();
+         new_manager->cpu_addr = base_cpu_address;
+-        new_manager->generation = NextTrackerGeneration();  // (PS4 04.86) a region of its own now
++        new_manager->RenewGenerations();  // (PS4 04.86-04.87) a region of its own now
+         free_managers.pop_front();
+         return new_manager;
+     }
+diff --git a/src/video_core/buffer_cache/word_manager.h b/src/video_core/buffer_cache/word_manager.h
+index 5d5011534..2614e62a1 100644
+--- a/src/video_core/buffer_cache/word_manager.h
++++ b/src/video_core/buffer_cache/word_manager.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <bit>
+ #include <limits>
+@@ -14,6 +15,8 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <boost/container/small_vector.hpp>
++
+ #include "common/alignment.h"
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
+@@ -35,12 +38,24 @@ enum class Type {
+     Max
+ };
+ 
+-/// (PS4 04.86) A region's generation: a new value, unique across every region, each time a page in
+-/// it is marked CPU-modified or untracked (WordManager::generation)
+-inline u64 NextTrackerGeneration() noexcept {
++/// (PS4 04.86, per 256 KiB word since 04.87) A word's generation: a new value, larger than every
++/// one before it, each time a page in the word goes from clean to CPU-modified or untracked
++/// (WordManager::word_generations). A buffer's check that saw the counter at G knows a word whose
++/// generation is still below G hasn't changed since (BufferCache::SynchronizeBuffer).
++inline std::atomic<u64>& TrackerGenerationCounter() noexcept {
+     static std::atomic<u64> next{1};
+-    return next.fetch_add(1, std::memory_order_relaxed);
++    return next;
++}
++inline u64 NextTrackerGeneration() noexcept {
++    return TrackerGenerationCounter().fetch_add(1, std::memory_order_relaxed);
+ }
++/// The value the next generation will have: every generation given out so far is below it
++inline u64 CurrentTrackerGeneration() noexcept {
++    return TrackerGenerationCounter().load(std::memory_order_relaxed);
++}
++
++/// (PS4 04.87) the page ranges a state change collects for the tracker: on the stack, not the heap
++using TrackerRanges = boost::container::small_vector<std::pair<VAddr, u64>, 16>;
+ 
+ template <class DeviceTracker, size_t stack_words, size_t size_bytes>
+ struct WordManager {
+@@ -56,9 +71,30 @@ struct WordManager {
+         u64 const last_word = (~u64{0} << shift) >> shift;
+         heap[num_words * size_t(Type::CPU) + num_words - 1] = last_word;
+         heap[num_words * size_t(Type::Untracked) + num_words - 1] = last_word;
++        RenewGenerations();
+     }
+     explicit WordManager() = default;
+ 
++    /// (PS4 04.87) every word new to every buffer's check (a fresh region)
++    void RenewGenerations() noexcept {
++        word_generations.fill(NextTrackerGeneration());
++    }
++
++    /// (PS4 04.87) The newest generation among the words a range (offset, size: within this region)
++    /// touches
++    [[nodiscard]] u64 NewestGeneration(u64 offset, u64 size) const noexcept {
++        if (size == 0 || offset >= size_bytes) {
++            return 0;
++        }
++        const size_t first = size_t(offset / BYTES_PER_WORD);
++        const size_t last = (std::min)(size_t((offset + size - 1) / BYTES_PER_WORD), num_words - 1);
++        u64 newest = 0;
++        for (size_t index = first; index <= last; ++index) {
++            newest = (std::max)(newest, word_generations[index]);
++        }
++        return newest;
++    }
++
+     static u64 ExtractBits(u64 word, size_t page_start, size_t page_end) {
+         constexpr size_t number_bits = sizeof(u64) * 8;
+         const size_t limit_page_end = number_bits - (std::min)(page_end, number_bits);
+@@ -127,14 +163,18 @@ struct WordManager {
+         std::span<u64> state_words = Span(type);
+         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
+         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
+-        std::vector<std::pair<VAddr, u64>> ranges;
++        TrackerRanges ranges;
+         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+             if (type == Type::CPU || type == Type::CachedCPU) {
+                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
+             }
+             if (enable) {
+-                if (type == Type::CPU || type == Type::CachedCPU) {
+-                    generation = NextTrackerGeneration();  // (PS4 04.86)
++                // (PS4 04.86; 04.87: per word, and only when a page in it was clean) A page already
++                // marked and untracked changes no check's outcome: Breath of the Wild's constant
++                // buffer updates mark the same pages about once a draw.
++                if ((type == Type::CPU || type == Type::CachedCPU) &&
++                    (mask & ~(state_words[index] & untracked_words[index])) != 0) {
++                    word_generations[index] = NextTrackerGeneration();
+                 }
+                 state_words[index] |= mask;
+                 if (type == Type::CPU || type == Type::CachedCPU)
+@@ -175,7 +215,7 @@ struct WordManager {
+             func(cpu_addr + pending_offset * BYTES_PER_PAGE,
+                  (pending_pointer - pending_offset) * BYTES_PER_PAGE);
+         };
+-        std::vector<std::pair<VAddr, u64>> ranges;
++        TrackerRanges ranges;
+         IterateWords(offset, size, [&](size_t index, u64 mask) {
+             if (type == Type::GPU)
+                 mask &= ~untracked_words[index];
+@@ -255,13 +295,17 @@ struct WordManager {
+     }
+ 
+     void FlushCachedWrites() noexcept {
+-        generation = NextTrackerGeneration();  // (PS4 04.86) cached writes become CPU-modified pages
+         auto const cached_words = Span(Type::CachedCPU);
+         auto const untracked_words = Span(Type::Untracked);
+         auto const cpu_words = Span(Type::CPU);
+-        std::vector<std::pair<VAddr, u64>> ranges;
++        TrackerRanges ranges;
+         for (u64 word_index = 0; word_index < num_words; ++word_index) {
+             const u64 cached_bits = cached_words[word_index];
++            if (cached_bits == 0) {
++                continue;
++            }
++            // (PS4 04.86; per word since 04.87) cached writes become CPU-modified pages
++            word_generations[word_index] = NextTrackerGeneration();
+             CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
+             untracked_words[word_index] |= cached_bits;
+             cpu_words[word_index] |= cached_bits;
+@@ -278,7 +322,7 @@ struct WordManager {
+     /// @param current_bits   Current state of the word
+     /// @param new_bits       New state of the word
+     /// @tparam add_to_tracker True when the tracker should start tracking the new pages
+-    void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, std::vector<std::pair<VAddr, u64>>& out_ranges) const {
++    void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, TrackerRanges& out_ranges) const {
+         u64 changed_bits = (add_to_tracker ? current_bits : ~current_bits) & new_bits;
+         VAddr addr = cpu_addr + word_index * BYTES_PER_WORD;
+         IteratePages(changed_bits, [&](size_t offset, size_t size) {
+@@ -286,13 +330,16 @@ struct WordManager {
+         });
+     }
+ 
+-    void ApplyCollectedRanges(std::vector<std::pair<VAddr, u64>>& ranges, int delta) const {
++    void ApplyCollectedRanges(TrackerRanges& ranges, int delta) const {
+         if (ranges.empty())
+             return;
+-        std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++        // (PS4 04.87) collected in address order already (words, then pages, ascending)
++        if (!std::is_sorted(ranges.begin(), ranges.end(),
++                            [](const auto& a, const auto& b) { return a.first < b.first; })) {
++            std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++        }
+         // Coalesce adjacent/contiguous ranges
+-        std::vector<std::pair<VAddr, size_t>> coalesced;
+-        coalesced.reserve(ranges.size());
++        boost::container::small_vector<std::pair<VAddr, size_t>, 16> coalesced;
+         VAddr cur_addr = ranges[0].first;
+         size_t cur_size = static_cast<size_t>(ranges[0].second);
+         for (size_t i = 1; i < ranges.size(); ++i) {
+@@ -334,10 +381,9 @@ struct WordManager {
+     std::array<u64, size_t(Type::Max) * num_words> heap = {};
+     DeviceTracker* tracker = nullptr;
+     VAddr cpu_addr = 0;
+-    /// (PS4 04.86) changed (to a value unique across every region) whenever a page here is marked
+-    /// CPU-modified or untracked; unchanged since a buffer's last check over a range here means the
+-    /// check would find nothing to upload or protect again (BufferCache::SynchronizeBuffer)
+-    u64 generation = NextTrackerGeneration();
++    /// (PS4 04.86; per 256 KiB word since 04.87) a word's generation, renewed whenever a clean page
++    /// in it is marked CPU-modified or untracked (TrackerGenerationCounter)
++    std::array<u64, num_words> word_generations{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index c0bde4600..26324f484 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -133,12 +133,19 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+             const auto& d = Common::PS4Perf::gpu_draw_phases;
+             std::fprintf(stderr,
+                          "draw stats: draws %llu, buffer checks %llu, skipped %llu, uploading %llu; sampler variants "
+-                         "%llu, from the cache %llu; queued-write invalidations %llu (%llu ranges)\n",
++                         "%llu, from the cache %llu; queued-write invalidations %llu (%llu ranges; skipped: texture "
++                         "%llu, query %llu, shader %llu); uniform buffers copied instead of uploaded %llu; render "
++                         "passes ended %llu (uploads %llu)\n",
+                          (unsigned long long)d.draws.load(), (unsigned long long)d.buffer_syncs.load(),
+                          (unsigned long long)d.buffer_sync_skips.load(), (unsigned long long)d.buffer_uploads.load(),
+                          (unsigned long long)d.sampler_variant_lookups.load(),
+                          (unsigned long long)d.sampler_variant_hits.load(), (unsigned long long)d.inner_calls.load(),
+-                         (unsigned long long)d.inner_ranges.load());
++                         (unsigned long long)d.inner_ranges.load(), (unsigned long long)d.inner_texture_skips.load(),
++                         (unsigned long long)d.inner_query_skips.load(),
++                         (unsigned long long)d.inner_shader_skips.load(),
++                         (unsigned long long)d.ubo_dirty_streams.load(),
++                         (unsigned long long)d.renderpass_breaks.load(),
++                         (unsigned long long)d.renderpass_breaks_upload.load());
+         }
+     });
+ }
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+index b8c1bc4f4..78457f001 100644
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -315,6 +315,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
+     {
+         std::scoped_lock lock(cache_mutex);
++        insert_epoch.fetch_add(1, std::memory_order_acq_rel);  // (PS4 04.87)
+         auto it1 = cached_queries.try_emplace(cont_addr);
+         auto& sub_container = it1.first->second;
+         auto it_current = sub_container.find(base);
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index d73e9039f..d31009b4c 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <functional>
+ #include <mutex>
+ #include <optional>
+@@ -57,6 +58,12 @@ public:
+ 
+     ~QueryCacheBase();
+ 
++    /// (PS4 04.87) Changed whenever a query is cached: InvalidateRegion over a range it has
++    /// already run on, at the same value, does nothing (RasterizerVulkan::InnerInvalidation)
++    [[nodiscard]] u64 InsertEpoch() const noexcept {
++        return insert_epoch.load(std::memory_order_acquire);
++    }
++
+     void InvalidateRegion(VAddr addr, std::size_t size) {
+         IterateCache<true>(addr, size,
+                            [this](QueryLocation location) { InvalidateQuery(location); });
+@@ -170,6 +177,7 @@ protected:
+ 
+     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
+     std::mutex cache_mutex;
++    std::atomic<u64> insert_epoch{0};
+ 
+     struct QueryCacheBaseImpl;
+     friend struct QueryCacheBaseImpl;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 802d6d8fd..073eeca0e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -793,11 +793,22 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+     // (PS4 04.86) its three sides timed on the GPU thread (the queued writes of each draw)
+     namespace P = Common::PS4Perf;
+     const bool timed = P::on_gpu_thread;
++    // (PS4 04.87) These are the game's constant-buffer updates (the only queued writes), about
++    // once a draw in Breath of the Wild, mostly to the same few ranges. The texture, query and
++    // shader caches' sides are skipped for a range one of them already ran on with nothing new
++    // since (InvalidationMemo): exact, as running it again would find nothing to do there.
++    const bool skips = P::DrawSkipsEnabled();
+     u64 t0 = timed ? P::Ticks() : 0;
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+         for (const auto& [addr, size] : sequences) {
++            const u64 epoch = texture_cache.write_epoch;
++            if (skips && texture_write_memo.Covers(addr, size, epoch)) {
++                if (timed) P::Bump(P::gpu_draw_phases.inner_texture_skips);
++                continue;
++            }
+             texture_cache.WriteMemory(addr, size);
++            texture_write_memo.Note(addr, size, epoch);
+         }
+     }
+     u64 t1 = timed ? P::Ticks() : 0;
+@@ -809,9 +820,27 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+     }
+     u64 t2 = timed ? P::Ticks() : 0;
+     {
++        bool shader_skipped = false;
+         for (const auto& [addr, size] : sequences) {
+-            query_cache.InvalidateRegion(addr, size);
+-            pipeline_cache.InvalidateRegion(addr, size);
++            const u64 query_epoch = query_cache.InsertEpoch();
++            if (skips && query_memo.Covers(addr, size, query_epoch)) {
++                if (timed) P::Bump(P::gpu_draw_phases.inner_query_skips);
++            } else {
++                query_cache.InvalidateRegion(addr, size);
++                query_memo.Note(addr, size, query_epoch);
++            }
++            const u64 shader_epoch = pipeline_cache.RegisterEpoch();
++            if (skips && shader_memo.Covers(addr, size, shader_epoch)) {
++                if (timed) P::Bump(P::gpu_draw_phases.inner_shader_skips);
++                shader_skipped = true;
++            } else {
++                pipeline_cache.InvalidateRegion(addr, size);
++                shader_memo.Note(addr, size, shader_epoch);
++            }
++        }
++        if (shader_skipped) {
++            // what InvalidateRegion does besides: shaders marked by the CPU's writes removed
++            pipeline_cache.SyncGuestHost();
+         }
+     }
+     if (timed) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 4b082df03..06d258f36 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -242,6 +242,40 @@ private:
+     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
+ 
+     u32 draw_counter = 0;
++
++    /// (PS4 04.87) The ranges each cache's side of InnerInvalidation last ran on, at its epoch (the
++    /// texture cache's write epoch, the query cache's and the shader cache's insert epochs): a
++    /// queued write within one of them, the epoch unchanged, would do nothing there
++    struct InvalidationMemo {
++        static constexpr size_t SIZE = 4;
++        struct Range {
++            DAddr begin = 0, end = 0;
++            u64 epoch = ~u64{0};
++        };
++        std::array<Range, SIZE> ranges{};
++        size_t next = 0;
++        [[nodiscard]] bool Covers(DAddr addr, size_t size, u64 epoch) const noexcept {
++            for (const Range& r : ranges) {
++                if (r.epoch == epoch && addr >= r.begin && addr + size <= r.end) {
++                    return true;
++                }
++            }
++            return false;
++        }
++        /// After the side ran over the range: the epoch read before it ran
++        void Note(DAddr addr, size_t size, u64 epoch) noexcept {
++            for (Range& r : ranges) {
++                if (r.epoch == epoch && r.end != 0 && addr <= r.end && addr + size >= r.begin) {
++                    r.begin = (std::min)(r.begin, addr);
++                    r.end = (std::max)(r.end, DAddr(addr + size));
++                    return;
++                }
++            }
++            ranges[next] = Range{addr, DAddr(addr + size), epoch};
++            next = (next + 1) % SIZE;
++        }
++    };
++    InvalidationMemo texture_write_memo, query_memo, shader_memo;
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 130915d23..09328500f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -235,6 +235,12 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
+ }
+ 
+ void Scheduler::RequestOutsideRenderPassOperationContext() {
++#ifdef __OPENORBIS__
++    if (state.renderpass && Common::PS4Perf::on_gpu_thread) {
++        // (PS4 04.87) a render pass ended for a copy or barrier: counted
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.renderpass_breaks);
++    }
++#endif
+     EndRenderPass();
+ }
+ 
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+index f1aff2810..25e90f8fe 100644
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -128,6 +128,7 @@ ShaderInfo* ShaderCache::TryGet(VAddr addr) const {
+ 
+ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t size) {
+     std::scoped_lock lock{invalidation_mutex, lookup_mutex};
++    register_epoch.fetch_add(1, std::memory_order_acq_rel);  // (PS4 04.87)
+ 
+     const VAddr addr_end = addr + size;
+     Entry* const entry = NewEntry(addr, addr_end, data.get());
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+index 997f2b037..f3e633cb0 100644
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -8,6 +8,7 @@
+ 
+ #include <array>
+ #include <memory>
++#include <atomic>
+ #include <mutex>
+ #include <span>
+ #include "common/container/unordered_map.h"
+@@ -71,6 +72,12 @@ public:
+     /// @brief Flushes delayed removal operations
+     void SyncGuestHost();
+ 
++    /// (PS4 04.87) Changed whenever a shader is registered: InvalidateRegion over a range it has
++    /// already run on, at the same value, does nothing (RasterizerVulkan::InnerInvalidation)
++    [[nodiscard]] u64 RegisterEpoch() const noexcept {
++        return register_epoch.load(std::memory_order_acquire);
++    }
++
+ protected:
+     struct GraphicsEnvironments {
+         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
+@@ -147,6 +154,7 @@ private:
+ 
+     mutable std::mutex lookup_mutex;
+     std::mutex invalidation_mutex;
++    std::atomic<u64> register_epoch{0};
+ 
+     ::Common::unordered_map<u64, std::unique_ptr<Entry>> lookup_cache;
+     ::Common::unordered_map<u64, std::vector<Entry*>> invalidation_cache;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 30fa1b9d2..528b60741 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1153,6 +1153,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     }
+ 
+     image.flags &= ~ImageFlagBits::CpuModified;
++    ++write_epoch;  // (PS4 04.87)
+ 
+     TrackImage(image, image_id);
+ 
+@@ -2184,6 +2185,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
+     image.flags |= ImageFlagBits::Registered;
++    ++write_epoch;  // (PS4 04.87)
+     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+     if ((IsPixelFormatASTC(image.info.format) &&
+          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 58a506d9f..c85d2d3b3 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -261,6 +261,12 @@ public:
+ 
+     std::recursive_mutex mutex;
+ 
++    /// (PS4 04.87) Changed whenever WriteMemory's work in a range could differ from doing nothing
++    /// once it has run there: an image registered, or one's CPU-modified flag cleared (its
++    /// contents refreshed). RasterizerVulkan::InnerInvalidation skips a range already written at
++    /// the same value.
++    u64 write_epoch = 0;
++
+ private:
+     /// Iterate over all page indices in a range
+     template <typename Func>
+-- 
+2.43.0
+

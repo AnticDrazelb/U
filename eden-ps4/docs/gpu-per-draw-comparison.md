@@ -87,6 +87,17 @@ be skipped. Item 1 as built is too coarse: it needs to know whether the buffer's
 as Ryujinx's per-buffer dirty flag does. Item 2's exact part changed neither image views nor
 descriptors (1.4 and 1.3 us).
 
+**04.87 (patch 0178)** fixes item 1 and takes the useful part of item 3 without moving the
+writes:
+- The generation per 256 KiB word, renewed only when a page in it goes from clean to changed.
+- A cached uniform buffer the game rewrites between binds is copied to the stream buffer instead
+  of uploaded. 04.86's runs put an upload at ~11 us, a check that finds nothing at ~0.3 us.
+- The texture, query and shader caches skip a queued write's range they already handled, with
+  nothing new registered since (Ryujinx skips those caches for constant updates altogether).
+
+On lavapipe, gputest's new constant update test (Breath of the Wild's pattern) gives identical
+frames, 81% of checks skipped and 72% fewer uploads.
+
 Items 1 and 2 together were 04.86's candidates, with the timer split for item 3. Combined, items 1-3
 are perhaps 15-20% of the GPU thread: Breath of the Wild outdoors from ~10 towards ~12 fps. That
 helps every game the GPU thread holds back, not only Breath of the Wild.

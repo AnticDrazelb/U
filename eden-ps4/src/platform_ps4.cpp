@@ -63,7 +63,7 @@
 #include "ui/nro.h"
 #include "usb_import.h"
 #include "log_tools.h"
-#include "web_server.h"
+#include "log_bundle.h"
 
 // Declared by hand: the toolchain headers give these the wrong (or no) prototypes
 // (as in port/ps4_runtime.cpp).
@@ -1578,7 +1578,7 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
                                           : ". Square copies it to the PS4, then the drive isn't needed")
                     : keys ? fmt::format("On the PS4: {}", kKeysFile)
                            : fmt::format("Not found: put it on a USB drive (at its top, or in a folder there such as "
-                                         "switch; Square then copies it to the PS4), or send it from a browser"),
+                                         "switch; Square then copies it to the PS4)"),
                     keys});
     const bool title_keys = on_usb.title_keys || (on_usb.keys_folder.empty() && std::filesystem::exists(kTitleKeysFile, ec));
     rows.push_back({"Title keys (title.keys)",
@@ -1600,8 +1600,7 @@ std::vector<Ui::StatusRow> KeysAndFirmwareStatus()
                                                              "needed"))
                     : firmware ? fmt::format("On the PS4: {} files in {}", firmware, kFirmwareDir)
                                : fmt::format("None in {}: put your Switch's firmware (its folder of .nca files) on a "
-                                             "USB drive, or its .zip (Square copies either to the PS4), or send "
-                                             "it from a browser",
+                                             "USB drive, or its .zip (Square copies either to the PS4)",
                                              kFirmwareDir),
                     !on_usb.firmware_folder.empty() || firmware > 0});
     if (!g_games_folder.empty())
@@ -1659,8 +1658,7 @@ constexpr const char* kGamesHelp =
     "firmware (its folder of .nca files) on a USB drive are used from there: the keys at the drive's top or in a "
     "folder there (switch), the firmware in a folder. Square copies them (or the firmware's .zip, unpacked) from "
     "the drive to the PS4, after which the drive isn't needed; it also takes them from /data/eden-ps4/import, "
-    "where a file manager such as PS4-Xplorer can put them. Or send all of them from a browser: the address is at "
-    "the top of the HOME menu. OPTIONS on a game on the PS4 deletes it.";
+    "where a file manager such as PS4-Xplorer can put them. OPTIONS on a game on the PS4 deletes it.";
 
 constexpr const char* kCopyKeysTitle = "Copy keys and firmware to the PS4";
 
@@ -1740,6 +1738,11 @@ std::vector<std::pair<std::string, std::string>> News()
 {
     return {
         {"New Eden " EDEN_PS4_VERSION,
+         "04.87: 04.86's skipping fixed (it worked 17% of the time in Breath of the Wild, as each draw's "
+         "constant data marked a whole 4 MiB block changed); uniform buffers the game keeps rewriting copied "
+         "instead of uploaded, which also stops them ending the GPU's render pass; the per-draw clean-up after "
+         "the game's constant writes skipped where nothing new is there. The web server is gone: the logs go to "
+         "the USB drive as before.\n"
          "04.86: less work for each thing a game draws: buffers and textures that haven't changed aren't checked "
          "again, as other Switch emulators do. For games that draw a lot (Breath of the Wild).\n"
          "04.85: the emulator hands its drawing to the PS4's graphics driver in batches 8 times bigger. In "
@@ -1821,11 +1824,10 @@ std::vector<std::pair<std::string, std::string>> News()
          "Before 03.70: games, keys, firmware and logs through a web browser, the Profiler, sound, and one game "
          "after another without restarting."},
         {"Games",
-         "Put games (.nsp, .xci) in /data/eden-ps4, or send them from a browser (the address at the top of the "
-         "HOME menu). They need the keys and firmware of the Switch they were dumped from: send them from the "
-         "browser too, or copy prod.keys, title.keys and the firmware (its .zip, or its folder of .nca files) from "
-         "a USB drive into /data/eden-ps4/import with a file manager such as PS4-Xplorer, then Import in Games and "
-         "Keys. A game's icon and name appear once it has booted once."},
+         "Put games (.nsp, .xci) in /data/eden-ps4, or on a USB drive (Game Folder). They need the keys and firmware "
+         "of the Switch they were dumped from: put prod.keys, title.keys and the firmware (its .zip, or its folder "
+         "of .nca files) on a USB drive, or copy them into /data/eden-ps4/import with a file manager such as "
+         "PS4-Xplorer, then Import in Games and Keys. A game's icon and name appear once it has booted once."},
         {"The HOME menu",
          "Your software is in the row, the most recently played first, and All Software at its end has everything. "
          "Below: News, Games and Keys (what's found, and where things go), Controllers, System Settings (theme, "
@@ -1887,49 +1889,12 @@ std::string ClockText()
     return fmt::format("{}:{:02}", local.tm_hour, local.tm_min);
 }
 
-// The web server (web_server.h): started once, its port; set when a browser added or removed files
-bool g_web_started = false;
-uint16_t g_web_port = 8080;
+// Set when the games or keys may have changed (a USB drive plugged in, a copy or import done)
 std::atomic<bool> g_files_changed{false};
 
-// Where a browser reaches the web server ("" without a network, or if it didn't start)
-std::string WebUrl()
-{
-    if (!g_web_started)
-        return {};
-    const std::string address = Launcher::LocalAddress();
-    return address.empty() ? std::string() : fmt::format("http://{}:{}", address, g_web_port);
-}
-
-void StartWebServer()
-{
-    Launcher::WebServerConfig web;
-    web.data_dir = kDataDir;
-    if (const char* port = std::getenv("EDEN_PS4_WEB_PORT"); port && std::atoi(port) > 0)
-        g_web_port = uint16_t(std::atoi(port));
-    web.port = g_web_port;
-    web.version = EDEN_PS4_VERSION;
-    web.status = [] {
-        std::string label;
-        {
-            std::lock_guard lock{g_mutex};
-            label = g_renderer_label;
-        }
-        std::erase_if(label, [](char c) { return c == '"' || c == '\\' || uint8_t(c) < 0x20; });
-        return "\"renderer\":\"" + label + "\"";
-    };
-    web.changed = [] { g_files_changed = true; };
-    web.log = [](const std::string& line) { Trace(line); };
-    web.symbols_path = kSymbolsFile;
-    web.program_running = [] { return g_running.load(); };
-    g_web_started = Launcher::StartWebServer(std::move(web));
-    if (!g_web_started)
-        Trace(fmt::format("web: port {} can't be opened", g_web_port));
-}
-
-// The logs as one file in the Game Folder, eden-ps4-logs.txt (what the web page's "Download all logs"
-// gives, code addresses named): taken away on its USB drive, without a network. As the app starts
-// (the last session's, a crash's included) and when a program has ended.
+// The logs as one file in the Game Folder, eden-ps4-logs.txt (code addresses named): taken away on
+// its USB drive. As the app starts (the last session's, a crash's included) and when a program has
+// ended.
 void ExportLogs(const char* when)
 {
     struct stat status{};
@@ -1994,8 +1959,6 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
         g_menu_message_title.clear();
     }
     Ui::StatusRow software_status = SoftwareStatus(titles);
-    std::string web_url = WebUrl();
-    menu.SetWebAddress(web_url);
     const auto set_games_status = [&] {
         std::vector<Ui::StatusRow> rows = KeysAndFirmwareStatus();
         rows.push_back(software_status);
@@ -2006,16 +1969,9 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
             updates += it->path().extension() == ".nsp";
         rows.push_back({"Updates and DLC",
                         updates ? fmt::format("{} in /data/eden-ps4/updates, applied as their game starts", updates)
-                                : std::string("None: .nsp files in /data/eden-ps4/updates (or sent from a browser) "
-                                              "are applied as their game starts"),
+                                : std::string("None: .nsp files in /data/eden-ps4/updates are applied as their "
+                                              "game starts"),
                         updates > 0});
-        rows.push_back({"From a PC or phone",
-                        web_url.empty() ? std::string("No network: connected, the PS4 takes keys, firmware and games "
-                                                      "from a browser, and gives it every log")
-                                        : fmt::format("Open {} in a browser on the same network: keys, firmware, "
-                                                      "games, and every log in one file",
-                                                      web_url),
-                        !web_url.empty()});
         menu.SetGamesStatus(std::move(rows), kGamesHelp);
         menu.SetKeysPresent(std::filesystem::exists(kKeysFile, ec) || !KeysAndFirmwareOnUsb().keys_folder.empty());
     };
@@ -2052,34 +2008,27 @@ MenuChoice ShowHomeMenu(bool first, bool radv, const Ui::MenuSettings& settings)
     const double start = Seconds();
     const int countdown = 60;
     MenuChoice choice{kTestProgram, settings};
-    double web_checked = start;
+    double usb_checked = start;
     std::string usb_signature = UsbSignature();
     for (;;)
     {
         const double now = Seconds();
         const uint32_t pad = MenuPad();
         menu.SetClock(ClockText());
-        if (now - web_checked >= 3)
+        if (now - usb_checked >= 3)
         {
-            // (the network may come up after the app; a new address shows; a USB drive may be
-            // plugged in, or mounted after the app started: its games show)
-            web_checked = now;
+            // (a USB drive may be plugged in, or mounted after the app started: its games show)
+            usb_checked = now;
             if (std::string usb = UsbSignature(); usb != usb_signature)
             {
                 usb_signature = std::move(usb);
                 Trace("usb: " + UsbReport());
                 g_files_changed = true;
             }
-            if (std::string url = WebUrl(); url != web_url)
-            {
-                web_url = std::move(url);
-                menu.SetWebAddress(web_url);
-                set_games_status();
-            }
         }
         if (g_files_changed.exchange(false))
         {
-            // a browser added or removed keys, firmware or games
+            // keys, firmware or games added or removed
             std::vector<Ui::Title> fresh = LoadTitles();
             software_status = SoftwareStatus(fresh);
             menu.SetTitles(std::move(fresh));
@@ -2819,6 +2768,8 @@ std::string PerfLine(double seconds)
         static uint64_t last_bs = 0, last_bst = 0, last_bu = 0, last_bub = 0, last_wd = 0;
         static uint64_t last_bsk = 0, last_ic = 0, last_ir = 0, last_itx = 0, last_ibu = 0, last_iot = 0, last_svl = 0,
                         last_svh = 0;
+        static uint64_t last_uds = 0, last_udb = 0, last_upt = 0, last_rpb = 0, last_rpu = 0, last_its = 0, last_iqs = 0,
+                        last_iss = 0;
         const P::GpuDrawPhases& dp = P::gpu_draw_phases;
         const uint64_t phase_draws = dp.draws.load(std::memory_order_relaxed);
         uint64_t phase[P::PhaseCount];
@@ -2833,6 +2784,10 @@ std::string PerfLine(double seconds)
                        itx = dp.inner_texture_ticks.load(), ibu = dp.inner_buffer_ticks.load(),
                        iot = dp.inner_other_ticks.load(), svl = dp.sampler_variant_lookups.load(),
                        svh = dp.sampler_variant_hits.load();
+        const uint64_t uds = dp.ubo_dirty_streams.load(), udb = dp.ubo_dirty_stream_bytes.load(),
+                       upt = dp.upload_ticks.load(), rpb = dp.renderpass_breaks.load(),
+                       rpu = dp.renderpass_breaks_upload.load(), its = dp.inner_texture_skips.load(),
+                       iqs = dp.inner_query_skips.load(), iss = dp.inner_shader_skips.load();
         if (last_tsc != 0 && tsc > last_tsc) {
             const double us_per_tick = seconds * 1e6 / double(tsc - last_tsc);
             const uint64_t d_draws = phase_draws - last_phase_draws;
@@ -2866,6 +2821,22 @@ std::string PerfLine(double seconds)
                                     double(ibu - last_ibu) * us_per_tick / double(d_draws),
                                     double(iot - last_iot) * us_per_tick / double(d_draws),
                                     svl > last_svl ? 100.0 * double(svh - last_svh) / double(svl - last_svl) : 0.0);
+                // (04.87) the uploads' own time; cached uniform buffers copied instead (changed again);
+                // render passes ended for copies or barriers; the queued writes' ranges whose texture,
+                // query or shader side was skipped (nothing new there since it last ran)
+                const double d_ranges = double(ir - last_ir);
+                line += fmt::format("; uploads {:.1f} us a draw ({:.1f} us each); uniform buffers changed again and "
+                                    "copied instead of uploaded {:.0f} a second ({:.0f} KiB); render passes ended for a "
+                                    "copy or barrier {:.0f} a second ({:.0f} of them uploads); of the queued writes' "
+                                    "ranges, skipped by the texture cache {:.0f}%, the query cache {:.0f}%, the shader "
+                                    "cache {:.0f}%",
+                                    double(upt - last_upt) * us_per_tick / double(d_draws),
+                                    bu > last_bu ? double(upt - last_upt) * us_per_tick / double(bu - last_bu) : 0.0,
+                                    double(uds - last_uds) / seconds, double(udb - last_udb) / 1024.0 / seconds,
+                                    double(rpb - last_rpb) / seconds, double(rpu - last_rpu) / seconds,
+                                    d_ranges > 0 ? 100.0 * double(its - last_its) / d_ranges : 0.0,
+                                    d_ranges > 0 ? 100.0 * double(iqs - last_iqs) / d_ranges : 0.0,
+                                    d_ranges > 0 ? 100.0 * double(iss - last_iss) / d_ranges : 0.0);
             }
             const auto each_ms = [&](uint64_t ticks, uint64_t count) {
                 return count ? double(ticks) * us_per_tick / 1000.0 / double(count) : 0.0;
@@ -2886,6 +2857,8 @@ std::string PerfLine(double seconds)
         last_bs = bs, last_bst = bst, last_bu = bu, last_bub = bub, last_wd = wd;
         last_bsk = bsk, last_ic = ic, last_ir = ir, last_itx = itx, last_ibu = ibu, last_iot = iot, last_svl = svl,
         last_svh = svh;
+        last_uds = uds, last_udb = udb, last_upt = upt, last_rpb = rpb, last_rpu = rpu, last_its = its, last_iqs = iqs,
+        last_iss = iss;
         last_tsc = tsc;
         last_busy = busy;
         last_raster = raster;
@@ -3388,7 +3361,6 @@ void* Run(void*)
     // where Import (Games and Keys) looks first: filled from a USB drive with a file manager
     std::error_code import_ec;
     std::filesystem::create_directories(std::string(kDataDir) + "/import", import_ec);
-    StartWebServer();
     // the threads the profiler samples (System Settings, CPU, Profiler): the emulated CPU cores, the
     // GPU thread (Maxwell commands) and the Vulkan thread (recording and submitting)
     ps4_sampler_sample_threads("CPUCore_,CPUThread,GPU,VulkanWorker");
@@ -3948,7 +3920,7 @@ int main()
         Trace(large ? "fastmem: 2 MiB blocks (large pages) where the game's memory allows"
                     : "fastmem: 16 KiB pages only (no large-page gain measured)");
     }
-    // a browser that goes away mid-transfer would otherwise end the app (the web server)
+    // a write to a closed pipe or socket would otherwise end the app
     std::signal(SIGPIPE, SIG_IGN);
     LoadSystemModules();
     Trace(g_screen.Open() ? "screen open" : "no screen (video out failed)");

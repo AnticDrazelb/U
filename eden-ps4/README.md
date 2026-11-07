@@ -379,6 +379,15 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.87: **04.86's skip fixed, rewritten uniform buffers copied, the web server removed** (patch 0178).
+- 04.86 skipped only 17% of buffer checks in Breath of the Wild outdoors: its per-4 MiB generation
+  was renewed by the game's per-draw constant updates. Now per 256 KiB, and only on real changes.
+- A uniform buffer the game rewrites between binds is copied to the stream buffer instead of
+  uploaded (an upload costs ~11 us and ends the render pass).
+- The texture, query and shader caches skip a queued write's range they already handled.
+- The web server is gone; the logs still go to the Game Folder's USB drive.
+- gputest's new constant update test (Y); frames identical with and without on lavapipe.
+
 04.86: **unchanged buffers and texture slots not checked again** (patch 0177).
 - A buffer check is skipped when no page in its memory regions has been marked changed since its
   last check over that range. The check would have found nothing, so the result is the same.
@@ -2555,11 +2564,10 @@ Since 03.60 the logs name the code they point at themselves (the package's `symb
 build's ELF (kept next to the package in `out/` when it's sent, and in `~/eden-ps4-elves`) is still
 what `llvm-symbolizer` takes for line numbers.
 
-The easiest way to move files: open the address shown at the top of the HOME menu
-(`http://<the PS4's address>:8080`) in a browser on a PC or phone on the same network. It takes
-keys, firmware and games, and **Download all logs** gives every log above in one file, code
-addresses named, to send instead of photos. **Profile summary** shows where a game's time went
-when System Settings, CPU, Profiler is on.
+Every log above goes into one file, `eden-ps4-logs.txt` in the Game Folder (on its USB drive),
+code addresses named and the profile summed up, as the app starts and after each program: the file
+to send. Keys, firmware and games come from a USB drive (Games and Keys). (03.60-04.86 also had a
+web page on the network for this; 04.87 removed it.)
 
 ## Testing in shadPS4
 

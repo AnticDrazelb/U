@@ -37,6 +37,11 @@ are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see
   constant-buffer updates, invalidated about once a draw, give their whole 4 MiB tracker region a
   new generation, and the other buffers in that region can't be skipped. A region-wide count is
   too coarse; a fix needs the buffer's own range (Ryujinx marks the one buffer dirty).
+- **04.87** (patch 0178; STATUS.md): the generation per 256 KiB word and renewed only on a real
+  change; uniform buffers the game rewrites between binds copied, not uploaded; the queued writes'
+  repeats skipped in the texture, query and shader caches. The web server removed. gputest's
+  constant update test (Y) exercises all of it: identical frames, 81% of checks skipped, 72%
+  fewer uploads.
 - **Beyond the Switch** ([docs/arm-to-x86-translators.md](docs/arm-to-x86-translators.md)): most
   ARM emulators on x86 (Azahar, Panda3DS, Vita3K) use dynarmic too. Berberis's loop pass (every guest
   register a loop uses kept in host registers) is a smaller first step than a second tier: an

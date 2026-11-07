@@ -276,14 +276,11 @@ MenuAction HomeMenu::Start(size_t index)
         Dialog dialog;
         dialog.kind = DialogKind::NoKeys;
         dialog.title = "The keys of your Switch are needed.";
-        dialog.text = web_address.empty()
-            ? "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
-              "that Switch's firmware. Put them on a USB drive, where they're used from (the keys at its top "
-              "or in a folder there such as switch, the firmware's .nca files in a folder); Square in Games "
-              "and Keys copies them to the PS4, after which the drive isn't needed."
-            : "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
-              "that Switch's firmware. Open " + web_address + " in a browser on a PC or phone on the same "
-              "network to send them, or put them on a USB drive, where they're used from.";
+        dialog.text =
+            "A game (.nsp, .xci) needs prod.keys (and title.keys) from the Switch it was dumped from, and "
+            "that Switch's firmware. Put them on a USB drive, where they're used from (the keys at its top "
+            "or in a folder there such as switch, the firmware's .nca files in a folder); Square in Games "
+            "and Keys copies them to the PS4, after which the drive isn't needed.";
         dialog.buttons = {"OK"};
         OpenDialog(std::move(dialog));
         return {};
@@ -890,9 +887,6 @@ void HomeMenu::DrawHome(Canvas& c, double now)
         c.Ring(kUserX, kUserY, kUserRadius + 9, 5, cursor);
         c.Text(108, 60, settings.nickname + "'s User Page", 21, Weight::SemiBold, t.accent);
     }
-    // where a browser on the network reaches the app's web page (keys, firmware, games, logs)
-    else if (!web_address.empty())
-        c.Text(108, 60, "From a PC or phone: " + web_address, 19, Weight::Regular, t.dim);
     c.Text(1188, 62, clock, 22, Weight::SemiBold, t.text, Align::Right);
     DrawIcon(c, Icon::WiFi, 1219, 52, 26, t.text);
 
@@ -1427,11 +1421,8 @@ void HomeMenu::DrawReport(Canvas& c)
     c.Text(100, 72, "The software was closed because an error occurred.", 25, Weight::SemiBold, t.text);
     c.Line(30, kHeaderLine, 1250, kHeaderLine, 1.2f, t.line);
     c.Text(60, 136,
-           web_address.empty()
-               ? std::string("Take a photo of this screen to report it: the end of its output, its crash report and "
-                             "its last steps.")
-               : "Every log, to send: open " + web_address + " in a browser on the same network and choose "
-                 "Download all logs. Or take a photo of this screen.",
+           "Every log is copied to eden-ps4-logs.txt in the Game Folder (on its USB drive) to send. Or take a "
+           "photo of this screen: the end of its output, its crash report and its last steps.",
            17, Weight::Regular, t.dim, Align::Left, 1160);
     const auto column = [&](float x, float y, float bottom, const std::string& heading,
                             const std::vector<std::string>& lines, uint32_t color) {
