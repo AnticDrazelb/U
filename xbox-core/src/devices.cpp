@@ -1,6 +1,6 @@
-// Devices: the NV2A's registers as plain memory with the few that must answer (the card's ID, the
-// memory size, vblank status and interrupts), the vblank interrupt (service routines and DPCs run on
-// an "interrupt" guest thread), KeTickCount, and the displayed picture saved as a PNG.
+// Devices: the table of memory-mapped devices (an access faults and the fault handler calls them),
+// level-triggered interrupt lines whose connected service routines run on an "interrupt" guest
+// thread, DPCs, the vblank tick, KeTickCount, and the displayed picture (PNG on the desktop).
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -8,35 +8,21 @@
 #include <vector>
 
 #include "core.h"
+#include "devices.h"
 #include "kernel.h"
 
 namespace xb {
 
 namespace {
 
-constexpr u32 kNv2aSize = 0x01000000;
-std::vector<u8> g_nv2a(kNv2aSize);
-std::mutex g_dev;
+std::mutex g_table_mutex;
+std::vector<Device> g_devices;
 
-// NV2A registers (offsets from 0xfd000000)
-constexpr u32 NV_PMC_BOOT_0 = 0x000000, NV_PMC_INTR_0 = 0x000100, NV_PMC_INTR_EN_0 = 0x000140,
-              NV_PFB_CFG0 = 0x100200, NV_PCRTC_INTR = 0x600100, NV_PCRTC_INTR_EN = 0x600140,
-              NV_PCRTC_START = 0x600800, NV_PCIO_CRTC_STATUS = 0x6013da;
-
-u32 Reg(u32 offset)
-{
-    u32 v;
-    std::memcpy(&v, &g_nv2a[offset], 4);
-    return v;
-}
-void SetReg(u32 offset, u32 v)
-{
-    std::memcpy(&g_nv2a[offset], &v, 4);
-}
-
+std::mutex g_irq_mutex;
+std::condition_variable g_irq_cv;
+u32 g_lines = 0;               // asserted interrupt lines
 std::vector<u32> g_interrupts; // connected KINTERRUPTs
 std::deque<u32> g_dpcs;
-std::condition_variable g_dpc_cv;
 std::atomic<u32> g_tick_count_variable{0};
 std::atomic<u64> g_vblanks{0};
 
@@ -108,13 +94,22 @@ bool WritePng(const std::string& path, int w, int h, const std::vector<u8>& rgb)
     return true;
 }
 
+const Device* Find(u32 address)
+{
+    std::lock_guard lock(g_table_mutex);
+    for (const Device& d : g_devices)
+        if (address - d.base < d.size)
+            return &d;
+    return nullptr;
+}
+
 void RunDpcs(GuestThread* t)
 {
     for (;;)
     {
         u32 dpc;
         {
-            std::lock_guard lock(g_dev);
+            std::lock_guard lock(g_irq_mutex);
             if (g_dpcs.empty())
                 return;
             dpc = g_dpcs.front();
@@ -126,74 +121,112 @@ void RunDpcs(GuestThread* t)
     }
 }
 
+// The service routines of every asserted line, until the lines drop (level-triggered); a routine
+// that leaves its line up is called again on the next pass, at most a few times per pass.
+void RunInterrupts(GuestThread* t)
+{
+    for (int pass = 0; pass < 16; pass++)
+    {
+        std::vector<u32> isrs;
+        {
+            std::lock_guard lock(g_irq_mutex);
+            for (u32 i : g_interrupts)
+                if (g_lines & (1u << (Read<u32>(i + 8) & 31)))
+                    isrs.push_back(i);
+        }
+        if (isrs.empty())
+            return;
+        for (u32 i : isrs)
+            CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)}); // ServiceRoutine(Interrupt, ServiceContext)
+        RunDpcs(t);
+    }
+}
+
 } // namespace
+
+void AddDevice(const Device& d)
+{
+    std::lock_guard lock(g_table_mutex);
+    g_devices.push_back(d);
+}
+
+void SetIrq(int line, bool level)
+{
+    {
+        std::lock_guard lock(g_irq_mutex);
+        if (level)
+            g_lines |= 1u << line;
+        else
+            g_lines &= ~(1u << line);
+    }
+    if (level)
+        g_irq_cv.notify_all();
+}
+
+u32 PhysToGuest(u32 phys)
+{
+    phys &= 0x0fffffff;
+    if (phys < kContiguousSize)
+        return kContiguousBase + phys;
+    if (phys >= kRamPhysical && phys - kRamPhysical < kRamEnd)
+        return phys - kRamPhysical;
+    return 0;
+}
 
 void InitDevices()
 {
-    SetReg(NV_PMC_BOOT_0, 0x02A000A2); // NV2A A2
-    SetReg(NV_PFB_CFG0, 0x03070103);   // 64 MiB
+    InitNv2a();
+    InitUsb();
+    InitAudio();
 }
 
 bool DeviceRead(u32 address, u32 size, u32& value)
 {
     value = 0;
-    if (address < kDeviceBase || address - kDeviceBase + size > kNv2aSize)
-        return true; // the other devices read as 0
-    const u32 offset = address - kDeviceBase;
-    std::lock_guard lock(g_dev);
-    if (offset == NV_PCIO_CRTC_STATUS)
-    {
-        // bit 3: in vertical retrace; toggles so that polling loops finish
-        static u32 n = 0;
-        value = (++n & 8) ? 0x08 : 0x00;
-        return true;
-    }
-    std::memcpy(&value, &g_nv2a[offset], size);
-    return true;
+    if (const Device* d = Find(address))
+        value = d->read(address - d->base, size);
+    if (g_verbose >= 3)
+        Log("dev read  %#010x/%u = %#x", address, size, value);
+    return true; // what nothing answers reads as 0
 }
 
 bool DeviceWrite(u32 address, u32 size, u32 value)
 {
-    if (address < kDeviceBase || address - kDeviceBase + size > kNv2aSize)
-        return true;
-    const u32 offset = address - kDeviceBase;
-    std::lock_guard lock(g_dev);
-    if (offset == NV_PCRTC_INTR || offset == NV_PMC_INTR_0)
-    {
-        SetReg(offset, Reg(offset) & ~value); // write 1 to clear
-        return true;
-    }
-    std::memcpy(&g_nv2a[offset], &value, size);
-    if (offset == NV_PCRTC_START && g_verbose >= 1)
-        Log("nv2a: display start %#x", value);
+    if (g_verbose >= 3)
+        Log("dev write %#010x/%u = %#x", address, size, value);
+    if (const Device* d = Find(address))
+        d->write(address - d->base, size, value);
     return true;
 }
 
 void ConnectInterrupt(u32 vector, u32 kinterrupt)
 {
-    std::lock_guard lock(g_dev);
-    g_interrupts.push_back(kinterrupt);
+    {
+        std::lock_guard lock(g_irq_mutex);
+        g_interrupts.push_back(kinterrupt);
+    }
     Log("devices: interrupt %u connected (service routine %#x)", vector, Read<u32>(kinterrupt));
+    g_irq_cv.notify_all();
 }
 
 void DisconnectInterrupt(u32 kinterrupt)
 {
-    std::lock_guard lock(g_dev);
+    std::lock_guard lock(g_irq_mutex);
     std::erase(g_interrupts, kinterrupt);
 }
 
 void QueueDpc(u32 kdpc)
 {
     {
-        std::lock_guard lock(g_dev);
+        std::lock_guard lock(g_irq_mutex);
         g_dpcs.push_back(kdpc);
     }
-    g_dpc_cv.notify_all();
+    g_irq_cv.notify_all();
 }
 
 void SetDisplayMode(u32 mode, u32 format, u32 pitch, u32 framebuffer)
 {
-    std::lock_guard lock(g_dev);
+    std::lock_guard lock(g_irq_mutex);
     g_display = {mode, format, pitch, framebuffer};
     Log("devices: display mode %#x, format %#x, pitch %u, framebuffer %#x", mode, format, pitch, framebuffer);
 }
@@ -216,36 +249,30 @@ void StartVblank()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }).detach();
-    // vblank at 60 Hz: the interrupt (VBL_IRQ 3) when enabled, then the DPCs; DPCs queued between
-    // vblanks run as they come
+    // the interrupt thread: vblank at 60 Hz, service routines of asserted lines, DPCs
     GuestThread* t = NewGuestThread(0x10000, 0, "interrupts");
     StartHostThread(t, [t] {
         auto next = std::chrono::steady_clock::now();
         while (!g_quit)
         {
             {
-                std::unique_lock lock(g_dev);
-                g_dpc_cv.wait_until(lock, next, [] { return !g_dpcs.empty() || g_quit.load(); });
+                std::unique_lock lock(g_irq_mutex);
+                g_irq_cv.wait_until(lock, next, [] {
+                    if (!g_dpcs.empty() || g_quit)
+                        return true;
+                    for (u32 i : g_interrupts)
+                        if (g_lines & (1u << (Read<u32>(i + 8) & 31)))
+                            return true;
+                    return false;
+                });
             }
-            RunDpcs(t);
-            if (std::chrono::steady_clock::now() < next)
-                continue;
-            next += std::chrono::microseconds(16683);
-            g_vblanks++;
-            std::vector<u32> isrs;
+            if (std::chrono::steady_clock::now() >= next)
             {
-                std::lock_guard lock(g_dev);
-                const bool enabled = (Reg(NV_PCRTC_INTR_EN) & 1) && (Reg(NV_PMC_INTR_EN_0) & 1);
-                if (!enabled)
-                    continue;
-                SetReg(NV_PCRTC_INTR, Reg(NV_PCRTC_INTR) | 1);
-                SetReg(NV_PMC_INTR_0, Reg(NV_PMC_INTR_0) | (1u << 24));
-                for (u32 i : g_interrupts)
-                    if (Read<u32>(i + 8) == 3)
-                        isrs.push_back(i);
+                next += std::chrono::microseconds(16683);
+                g_vblanks++;
+                Nv2aVblank();
             }
-            for (u32 i : isrs)
-                CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)}); // ServiceRoutine(Interrupt, ServiceContext)
+            RunInterrupts(t);
             RunDpcs(t);
         }
     });
@@ -254,21 +281,19 @@ void StartVblank()
 DisplayInfo GetDisplay()
 {
     Display d;
-    u32 start;
     {
-        std::lock_guard lock(g_dev);
+        std::lock_guard lock(g_irq_mutex);
         d = g_display;
-        start = Reg(NV_PCRTC_START);
     }
+    const u32 start = Nv2aDisplayStart();
     DisplayInfo info;
     info.format = d.format;
     info.bpp = d.format == 0x12 ? 4 : d.format == 0x11 || d.format == 0x10 ? 2 : 4;
     info.pitch = d.pitch ? d.pitch : 640 * 4;
     info.width = int(info.pitch / info.bpp);
     info.height = info.width >= 1920 ? 1080 : info.width >= 1280 ? 720 : 480;
-    const u32 phys = start ? start : d.framebuffer & 0x0fffffff;
-    info.address = phys < kContiguousSize ? kContiguousBase + phys : phys;
-    info.valid = d.pitch != 0;
+    info.address = PhysToGuest(start ? start : d.framebuffer);
+    info.valid = d.pitch != 0 && info.address != 0;
     return info;
 }
 
@@ -286,6 +311,11 @@ u32 DisplayPixel(const DisplayInfo& d, int x, int y)
 bool SaveFramebuffer(const std::string& path)
 {
     const DisplayInfo d = GetDisplay();
+    if (!d.valid)
+    {
+        Log("devices: no picture to save (no display mode set)");
+        return false;
+    }
     std::vector<u8> rgb(size_t(d.width) * d.height * 3);
     for (int y = 0; y < d.height; y++)
         for (int x = 0; x < d.width; x++)

@@ -210,6 +210,7 @@ void InitMemory()
     for (auto [start, size] : taken)
         if (start >= kRamBase && start < kRamEnd)
             g_virtual.AllocAt(start, size);
+    g_contiguous.AllocAt(kGpuInstanceMemory, 0x100000);
 }
 
 u32 AllocVirtual(u32 size, u32 at)
@@ -272,7 +273,9 @@ u32 PhysicalAddress(u32 guest)
 {
     if (guest >= kContiguousBase && guest < kContiguousBase + kContiguousSize)
         return guest - kContiguousBase;
-    return guest; // RAM: its "physical" address is its address (the GPU translates back)
+    if (guest >= kRamBase && guest < kRamEnd)
+        return kRamPhysical + guest;
+    return guest;
 }
 
 bool QueryAllocation(u32 at, u32& start, u32& size)

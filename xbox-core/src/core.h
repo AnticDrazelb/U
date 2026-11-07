@@ -67,6 +67,12 @@ constexpr u32 kContiguousBase = 0x80000000, kContiguousSize = 0x04000000;
 constexpr u32 kKernelBase = 0x8c000000, kKernelSize = 0x01000000;
 constexpr u32 kStackBase = 0xd0000000, kStackAreaSize = 0x04000000;
 constexpr u32 kDeviceBase = 0xfd000000;
+// The RAM's "physical" addresses (what MmGetPhysicalAddress gives and the GPU uses): above the
+// contiguous memory's 64 MiB, so that a physical address names one place.
+constexpr u32 kRamPhysical = 0x04000000;
+// The GPU's instance memory (RAMIN): the last 1 MiB of the contiguous memory, as the last 1 MiB of
+// the Xbox's RAM. Never handed out.
+constexpr u32 kGpuInstanceMemory = kContiguousBase + kContiguousSize - 0x100000;
 
 bool MapGuest(u32 base, u32 size, bool exec, std::string& error);
 void InitMemory();

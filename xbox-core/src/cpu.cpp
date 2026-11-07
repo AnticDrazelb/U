@@ -312,6 +312,23 @@ bool OnFault(platform::Fault& f)
         "ecx %#x edx %#x ebx %#x esp %#x ebp %#x esi %#x edi %#x",
         t ? t->id : 0, f.signal, u32(rip), f.address, code[0], code[1], code[2], code[3], code[4], code[5], r.Get(0),
         r.Get(1), r.Get(2), r.Get(3), r.Get(4), r.Get(5), r.Get(6), r.Get(7));
+    // the calls that led there: the guest's frame pointer chain
+    std::string chain;
+    for (u32 ebp = r.Get(5), n = 0; n < 12 && ebp >= 0x10000 && (ebp & 3) == 0; n++)
+    {
+        u32 start, size;
+        const bool mapped = (ebp >= kStackBase && ebp < kStackBase + kStackAreaSize) || QueryAllocation(ebp, start, size);
+        if (!mapped)
+            break;
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), " %#x", Read<u32>(ebp + 4));
+        chain += buf;
+        const u32 next = Read<u32>(ebp);
+        if (next <= ebp)
+            break;
+        ebp = next;
+    }
+    Log("  called from:%s", chain.c_str());
     *f.rip = SwitchEntry(xcs_bail64);
     platform::SetCs(f, g_sel64);
     return true;

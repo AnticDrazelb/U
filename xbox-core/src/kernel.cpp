@@ -760,6 +760,61 @@ void InitKernel()
     K(MmAllocateContiguousMemoryEx) { return AllocContiguous(c.Arg(0), c.Arg(3), c.Arg(1), c.Arg(2)); } END;
     K(MmFreeContiguousMemory) { FreeContiguous(c.Arg(0)); return 0; } END;
     K(MmPersistContiguousMemory) { return 0; } END;
+    K(MmClaimGpuInstanceMemory)
+    {
+        // NumberOfBytes, NumberOfPaddingBytes*: the end of the GPU's instance memory (the RAM's
+        // last 64 KiB stay the kernel's)
+        if (c.Arg(1))
+            Write<u32>(c.Arg(1), 0x10000);
+        return kContiguousBase + kContiguousSize - 0x10000;
+    } END;
+    K(HalRegisterShutdownNotification) { return 0; } END;
+    K(RtlTimeToTimeFields)
+    {
+        // Time (100 ns since 1601), TIME_FIELDS: Year, Month, Day, Hour, Minute, Second, Milliseconds, Weekday
+        const s64 t = Read<s64>(c.Arg(0));
+        const s64 ms = t / 10000;
+        s64 days = ms / 86400000;
+        const s64 rest = ms % 86400000;
+        const u32 out = c.Arg(1);
+        Write<u16>(out + 14, u16((days + 1) % 7)); // 1601-01-01 was a Monday
+        // civil date from days since 1601-01-01
+        s64 y = 1601;
+        auto leap = [](s64 yy) { return (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0; };
+        while (days >= (leap(y) ? 366 : 365))
+            days -= leap(y) ? 366 : 365, y++;
+        const int mdays[12] = {31, leap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        int m = 0;
+        while (days >= mdays[m])
+            days -= mdays[m++];
+        Write<u16>(out + 0, u16(y));
+        Write<u16>(out + 2, u16(m + 1));
+        Write<u16>(out + 4, u16(days + 1));
+        Write<u16>(out + 6, u16(rest / 3600000));
+        Write<u16>(out + 8, u16(rest / 60000 % 60));
+        Write<u16>(out + 10, u16(rest / 1000 % 60));
+        Write<u16>(out + 12, u16(rest % 1000));
+        return 0;
+    } END;
+    K(RtlTimeFieldsToTime)
+    {
+        const u32 in = c.Arg(0);
+        const s64 y = Read<u16>(in), mo = Read<u16>(in + 2), d = Read<u16>(in + 4);
+        auto leap = [](s64 yy) { return (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0; };
+        if (y < 1601 || mo < 1 || mo > 12 || d < 1)
+            return 0;
+        s64 days = 0;
+        for (s64 yy = 1601; yy < y; yy++)
+            days += leap(yy) ? 366 : 365;
+        const int mdays[12] = {31, leap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        for (int m = 0; m < mo - 1; m++)
+            days += mdays[m];
+        days += d - 1;
+        const s64 ms = ((days * 24 + Read<u16>(in + 6)) * 60 + Read<u16>(in + 8)) * 60000 + Read<u16>(in + 10) * 1000 +
+                       Read<u16>(in + 12);
+        Write<s64>(c.Arg(1), ms * 10000);
+        return 1;
+    } END;
     K(MmGetPhysicalAddress) { return PhysicalAddress(c.Arg(0)); } END;
     K(MmQueryAllocationSize)
     {
