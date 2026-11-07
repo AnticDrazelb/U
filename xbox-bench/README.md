@@ -72,11 +72,10 @@ for a Pentium III costs next to code built for the host. The copy is `rep movsd`
 vector moves; the doubles go to the x87, as there is no SSE2. An emulator can't make them faster
 without rewriting the game's code.
 
-**Not yet run on a PS4.** The PS4 build has only been checked to compile against stand-ins for
-the system headers; it hasn't been built with Crema's toolchain. What decides everything is the
-first line after `segments:`. FreeBSD, which the PS4's kernel comes from, puts a 32-bit user
-code segment at `0x33` (its 64-bit one is `0x43`). Whether Sony's kernel kept it is what this run
-shows.
+**On a PS4 (01.00): the 32-bit code segment is there (`0x33`), Xbox code runs at x1.28 of
+native with every checksum correct, and the Xbox's low addresses collide with the app's own
+executable.** Details in [RESULTS.md](RESULTS.md). 01.01 lists what is mapped below 4 GiB and
+repeats the memory checks at a free address.
 
 ## Research: how the original Xbox is emulated elsewhere
 

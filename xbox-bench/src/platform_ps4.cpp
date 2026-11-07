@@ -41,6 +41,17 @@ int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t
 int32_t sceKernelMapDirectMemory(void** addr, size_t len, int32_t prot, int32_t flags, off_t phys,
                                  size_t align);
 int32_t sceKernelReleaseDirectMemory(off_t start, size_t len);
+// as Crema's MemMapperPS4.cpp declares it
+struct VirtualQueryInfo
+{
+    void* start;
+    void* end;
+    off_t offset;
+    int32_t protection, memoryType;
+    uint32_t isFlexible : 1, isDirect : 1, isStack : 1, isPooled : 1, isCommitted : 1;
+    char name[32];
+};
+int32_t sceKernelVirtualQuery(const void* addr, int32_t flags, VirtualQueryInfo* info, size_t infoSize);
 int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
 int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 // port/ps4_runtime.cpp: the app heap behind malloc
@@ -507,6 +518,7 @@ Platform::Mode StartPage()
 
 constexpr int32_t kProtCpuRead = 0x1, kProtCpuWrite = 0x2, kProtCpuExec = 0x4;
 constexpr size_t kPage = 16 * 1024; // the PS4 maps in 16 KiB pages
+constexpr int32_t kVirtualQueryFindNext = 1; // the mapping at or after the address
 
 int32_t Prot(int access)
 {
@@ -709,6 +721,36 @@ size_t PageSize()
 std::string PoolName(int access)
 {
     return (access & Exec) ? "system flexible memory, RWX" : "flexible memory";
+}
+
+std::vector<Mapping> Mappings(uint64_t limit)
+{
+    std::vector<Mapping> out;
+    uint64_t at = 0x10000;
+    while (at < limit && out.size() < 4096)
+    {
+        VirtualQueryInfo info{};
+        if (sceKernelVirtualQuery(reinterpret_cast<const void*>(at), kVirtualQueryFindNext, &info, sizeof(info)) != 0)
+            break;
+        const uint64_t start = reinterpret_cast<uint64_t>(info.start), end = reinterpret_cast<uint64_t>(info.end);
+        if (start >= limit || end <= start)
+            break;
+        char name[33] = {};
+        std::memcpy(name, info.name, 32);
+        const int32_t p = info.protection;
+        std::string what = fmt::format("{}{}{}{}", (p & kProtCpuRead) ? "r" : "-", (p & kProtCpuWrite) ? "w" : "-",
+                                       (p & kProtCpuExec) ? "x" : "-", (p & 0x30) ? " gpu" : "");
+        what += info.isFlexible ? " flexible" : info.isDirect ? " direct" : "";
+        if (info.isStack)
+            what += " stack";
+        if (!info.isCommitted)
+            what += " reserved";
+        if (name[0])
+            what += fmt::format(" \"{}\"", name);
+        out.push_back({start, end, what});
+        at = end;
+    }
+    return out;
 }
 
 void SetCs(FaultContext& context, uint16_t cs)

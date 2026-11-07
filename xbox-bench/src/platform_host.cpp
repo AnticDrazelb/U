@@ -108,6 +108,26 @@ std::string PoolName(int access)
 {
     return (access & Exec) ? "anonymous RWX" : "anonymous";
 }
+std::vector<Mapping> Mappings(uint64_t limit)
+{
+    std::vector<Mapping> out;
+    FILE* f = std::fopen("/proc/self/maps", "r");
+    if (!f)
+        return out;
+    char line[512];
+    while (std::fgets(line, sizeof(line), f))
+    {
+        unsigned long long start = 0, end = 0;
+        char perms[8] = {}, path[256] = {};
+        if (std::sscanf(line, "%llx-%llx %7s %*s %*s %*s %255[^\n]", &start, &end, perms, path) < 3)
+            continue;
+        if (start >= limit)
+            break;
+        out.push_back({start, end, std::string(perms) + (path[0] ? " " + std::string(path) : "")});
+    }
+    std::fclose(f);
+    return out;
+}
 
 // ---- faults
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace Platform {
 enum class Mode { All, CpuOnly, MemoryOnly };
@@ -35,6 +36,13 @@ std::string MapAlias(uint64_t a, uint64_t b, size_t size, int access);
 size_t PageSize();
 // Name of the memory pool MapFixed uses for each kind (for the log).
 std::string PoolName(int access);
+// Everything mapped below `limit`, in address order, with what the system says it is.
+struct Mapping
+{
+    uint64_t start, end;
+    std::string what;
+};
+std::vector<Mapping> Mappings(uint64_t limit);
 
 // ---- faults (SIGSEGV, SIGBUS, SIGILL)
 

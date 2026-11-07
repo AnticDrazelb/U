@@ -670,26 +670,50 @@ void RunMemory(Progress& progress)
     }
     Platform::Log(fmt::format("  free below 4 GiB: {} in all:{}", Mib(free_total), ranges.empty() ? " none" : ranges));
 
-    auto check = [&](const char* name, const std::function<std::string()>& f) {
+    // what is mapped below 4 GiB, and what it is (01.00 found something in the Xbox's RAM range)
+    progress.Step("memory: mappings below 4 GiB");
+    Platform::Trace("memory: mappings below 4 GiB");
+    const std::vector<Platform::Mapping> mappings = Platform::Mappings(0x100000000ull);
+    Platform::Log(fmt::format("  mapped below 4 GiB: {} ranges", mappings.size()));
+    for (size_t i = 0; i < mappings.size() && i < 24; i++)
+        Platform::Log(fmt::format("    {:#010x}-{:#010x} {:>9} {}", mappings[i].start, mappings[i].end - 1,
+                                  Mib(mappings[i].end - mappings[i].start), mappings[i].what));
+    if (mappings.size() > 24)
+        Platform::Log(fmt::format("    ... {} more", mappings.size() - 24));
+
+    auto check = [&](const std::string& name, const std::function<std::string()>& f) {
         progress.Step(fmt::format("memory: {}", name));
         Platform::Trace(fmt::format("memory: {}", name));
         const std::string e = f();
         Platform::Log(fmt::format("  {}: {}", name, e.empty() ? "yes" : "NO (" + e + ")"));
         return e.empty();
     };
+    auto map_and_free = [&](u64 at, u64 size, int access) {
+        std::string e = Platform::MapFixed(at, size, access);
+        if (e.empty())
+            Platform::Unmap(at, size);
+        return e;
+    };
     constexpr u64 kRam = 64 * MB - 64 * KB; // the Xbox's 64 MiB above its first 64 KiB
-    check("the Xbox's RAM at its own addresses (0x10000-0x3ffffff)", [&] {
-        std::string e = Platform::MapFixed(0x10000, kRam, Platform::Read | Platform::Write);
-        if (e.empty())
-            Platform::Unmap(0x10000, kRam);
-        return e;
-    });
-    check(("the same, executable (" + Platform::PoolName(Platform::Exec) + ")").c_str(), [&] {
-        std::string e = Platform::MapFixed(0x10000, kRam, Platform::Read | Platform::Write | Platform::Exec);
-        if (e.empty())
-            Platform::Unmap(0x10000, kRam);
-        return e;
-    });
+    const int rw = Platform::Read | Platform::Write, rwx = rw | Platform::Exec;
+    check("the Xbox's RAM at its own addresses (0x10000-0x3ffffff)", [&] { return map_and_free(0x10000, kRam, rw); });
+    // The same questions at an address that is free, so the answers are about the memory, not the
+    // address: 64 MiB at 0x04000000, its alias at 0x84000000.
+    constexpr u64 kFreeBase = 0x04000000;
+    check(fmt::format("64 MiB at {:#x}", kFreeBase), [&] { return map_and_free(kFreeBase, 64 * MB, rw); });
+    check(fmt::format("the same, executable ({})", Platform::PoolName(Platform::Exec)),
+          [&] { return map_and_free(kFreeBase, 64 * MB, rwx); });
+    // how much executable memory there is at low addresses, 16 MiB at a time (up to 256 MiB)
+    {
+        progress.Step("memory: executable memory below 4 GiB");
+        Platform::Trace("memory: executable memory below 4 GiB");
+        u64 got = 0;
+        while (got < 256 * MB && Platform::MapFixed(kFreeBase + got, 16 * MB, rwx).empty())
+            got += 16 * MB;
+        if (got)
+            Platform::Unmap(kFreeBase, got);
+        Platform::Log(fmt::format("  executable memory at {:#x}, 16 MiB at a time: {}", kFreeBase, Mib(got)));
+    }
     auto alias = [&](u64 a, u64 b, u64 size, int access) {
         std::string e = Platform::MapAlias(a, b, size, access);
         if (!e.empty())
@@ -702,12 +726,13 @@ void RunMemory(Progress& progress)
         Platform::Unmap(b, size);
         return ok ? std::string() : std::string("maps, but the views don't share memory");
     };
-    check("the RAM again at 0x80010000 (contiguous memory, an alias)",
-          [&] { return alias(0x10000, 0x80010000, kRam, Platform::Read | Platform::Write); });
-    check("the same alias, executable",
-          [&] { return alias(0x10000, 0x80010000, kRam, Platform::Read | Platform::Write | Platform::Exec); });
-    check("an alias of a single 4 KiB page (the Xbox's page size)",
-          [&] { return alias(0x00100000, 0x80100000, 4 * KB, Platform::Read | Platform::Write); });
+    check(fmt::format("64 MiB at {:#x} again at {:#x} (contiguous memory, an alias)", kFreeBase, kFreeBase + 0x80000000),
+          [&] { return alias(kFreeBase, kFreeBase + 0x80000000, 64 * MB, rw); });
+    check("the same alias, executable", [&] { return alias(kFreeBase, kFreeBase + 0x80000000, 64 * MB, rwx); });
+    check(fmt::format("an alias of one {} page", Mib(Platform::PageSize())),
+          [&] { return alias(kFreeBase, kFreeBase + 0x80000000, Platform::PageSize(), rw); });
+    check("an alias of one 4 KiB page (the Xbox's page size)",
+          [&] { return alias(kFreeBase, kFreeBase + 0x80000000, 4 * KB, rw); });
     check("the hardware range 0xfd000000-0xffffffff kept unmapped", [&] {
         std::string e = Platform::ReserveFixed(kMmioBase, kMmioSize);
         if (e.empty())
