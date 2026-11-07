@@ -14,6 +14,12 @@ are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see
   the Vulkan worker 3.0 (STATUS.md has the table).
 - **04.85 hands over every 64 draws instead of 8.** Next: its console run, then the uniform and
   vertex/index parts (04.85 times the buffer cache's checks for the CPU's writes inside them).
+- **The other Switch emulators' CPU translators** compared with ours:
+  [docs/arm-translation-comparison.md](docs/arm-translation-comparison.md). Ours is ahead of every
+  other dynarmic, and nothing upstream is worth porting. Ryujinx's function-level second tier
+  (guest registers kept across blocks, guest calls and returns as host `call`/`ret`) targets our
+  biggest measured translator overhead: the CPU-bound games' next step, measured in the harness
+  first.
 
 ## Update at 04.83 (2026-11-06)
 
