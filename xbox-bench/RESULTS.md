@@ -105,3 +105,22 @@ So:
   through the kernel's own table, not by masking.
 - The only obstacle at the Xbox's own addresses is the app's executable at `0x400000`. 01.02 tries
   32-bit segments with a base (LDT entries), which move the whole guest address space past it.
+
+## 01.02, same console, CPU tests only
+
+The flat run repeats 01.00 within noise (x1.26, all checksums correct; a call into Xbox code
+233 ns, a kernel call 144 ns, a register access 7.43 µs, three cores 94% each).
+
+System functions found with `sceKernelDlsym` (not imported):
+
+| function | |
+|---|---|
+| `i386_set_ldt`, `i386_get_ldt` | no |
+| `sysarch` | yes, in `libkernel_sys.sprx` |
+| `amd64_set_fsbase` | yes, in `libkernel_sys.sprx` |
+| `sceKernelJitCreateSharedMemory`, `...CreateAliasOfSharedMemory`, `...MapSharedMemory` | yes, in `libkernel_sys.sprx` |
+
+Segments with a base: `sysarch(I386_SET_LDT)` with `LDT_AUTO_ALLOC` returned -1, errno 22
+(EINVAL). Either Sony's kernel refuses LDT changes, or something in how it was asked doesn't
+suit it. 01.03 reads the LDT first and tries explicit indexes, and tries JIT shared memory for
+the `0x80000000` alias.

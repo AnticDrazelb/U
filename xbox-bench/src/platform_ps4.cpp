@@ -825,9 +825,42 @@ void* SystemFunction(const char* name, std::string& where)
     return nullptr;
 }
 
-// FreeBSD's LDT calls: i386_set_ldt(start, descriptors, count), or sysarch(I386_SET_LDT, args).
-// A raw 8-byte descriptor is FreeBSD's union descriptor.
-uint16_t SetLdtEntry(int, uint32_t base, bool code, std::string& error)
+// FreeBSD's LDT calls: sysarch(I386_GET_LDT / I386_SET_LDT, args) (i386_set_ldt is libc's wrapper
+// of it). A raw 8-byte descriptor is FreeBSD's union descriptor.
+namespace {
+struct LdtArgs
+{
+    unsigned start;
+    void* descriptors;
+    unsigned count;
+};
+using Sysarch = int (*)(int, void*);
+Sysarch FindSysarch(std::string& where)
+{
+    return reinterpret_cast<Sysarch>(SystemFunction("sysarch", where));
+}
+} // namespace
+
+std::string LdtRead()
+{
+    std::string where;
+    const Sysarch sysarch = FindSysarch(where);
+    if (!sysarch)
+        return "no sysarch";
+    uint32_t descriptors[16][2] = {};
+    LdtArgs args = {0, descriptors, 16};
+    const int n = sysarch(0 /* I386_GET_LDT */, &args);
+    if (n < 0)
+        return fmt::format("I386_GET_LDT: -1 (errno {})", *__error());
+    std::string text = fmt::format("I386_GET_LDT: {} entries", n);
+    for (int i = 0; i < n && i < 4; i++)
+        text += fmt::format(" [{}] {:08x}{:08x}", i, descriptors[i][1], descriptors[i][0]);
+    return text;
+}
+
+// Tries the hinted index, then the system's choice (LDT_AUTO_ALLOC), then the hint + 16; the error
+// lists every attempt.
+uint16_t SetLdtEntry(int hint, uint32_t base, bool code, std::string& error)
 {
     const uint32_t type = code ? 0xB : 0x3; // execute/read or read/write, accessed
     const uint32_t limit = 0xFFFFF;          // in 4 KiB units: 4 GiB
@@ -836,33 +869,80 @@ uint16_t SetLdtEntry(int, uint32_t base, bool code, std::string& error)
     descriptor[1] = ((base >> 16) & 0xFF) | (type << 8) | (1u << 12) /* code/data */ | (3u << 13) /* dpl 3 */ |
                     (1u << 15) /* present */ | (((limit >> 16) & 0xF) << 16) | (1u << 22) /* 32-bit */ |
                     (1u << 23) /* 4 KiB granularity */ | ((base >> 24) << 24);
-    constexpr unsigned kAutoAlloc = 0xFFFFFFFFu; // LDT_AUTO_ALLOC
     std::string where;
-    int index = -1;
-    if (auto set_ldt = reinterpret_cast<int (*)(int, void*, int)>(SystemFunction("i386_set_ldt", where)))
+    const Sysarch sysarch = FindSysarch(where);
+    if (!sysarch)
     {
-        index = set_ldt(int(kAutoAlloc), descriptor, 1);
-        if (index < 0)
-            error = fmt::format("i386_set_ldt ({}): {} (errno {})", where, index, *__error());
-    }
-    else if (auto sysarch = reinterpret_cast<int (*)(int, void*)>(SystemFunction("sysarch", where)))
-    {
-        struct
-        {
-            unsigned start;
-            void* descriptors;
-            unsigned count;
-        } args = {kAutoAlloc, descriptor, 1};
-        index = sysarch(1 /* I386_SET_LDT */, &args);
-        if (index < 0)
-            error = fmt::format("sysarch ({}): {} (errno {})", where, index, *__error());
-    }
-    else
-        error = "neither i386_set_ldt nor sysarch is exported by a loaded module";
-    if (index < 0)
+        error = "no sysarch exported by a loaded module";
         return 0;
+    }
     error.clear();
-    return static_cast<uint16_t>((index << 3) | 4 | 3);
+    for (unsigned start : {unsigned(hint), 0xFFFFFFFFu /* LDT_AUTO_ALLOC */, unsigned(hint + 16)})
+    {
+        LdtArgs args = {start, descriptor, 1};
+        const int index = sysarch(1 /* I386_SET_LDT */, &args);
+        if (index >= 0)
+        {
+            error.clear();
+            return static_cast<uint16_t>((index << 3) | 4 | 3);
+        }
+        error += fmt::format("{}start {}: errno {}", error.empty() ? "" : ", ",
+                             start == 0xFFFFFFFFu ? std::string("auto") : std::to_string(start), *__error());
+    }
+    error = fmt::format("sysarch (I386_SET_LDT): {}", error);
+    return 0;
+}
+
+// JIT shared memory: one block of memory, mapped twice through the file descriptors the JIT calls
+// give (the descriptor itself and an alias of it), at fixed addresses with mmap.
+std::string JitAlias(uint64_t a, uint64_t b, size_t size, int access_a, int access_b, bool alias_for_b)
+{
+    std::string where;
+    using Create = int32_t (*)(const char*, size_t, int32_t, int32_t*);
+    using CreateAlias = int32_t (*)(int32_t, int32_t, int32_t*);
+    const auto create = reinterpret_cast<Create>(SystemFunction("sceKernelJitCreateSharedMemory", where));
+    const auto create_alias = reinterpret_cast<CreateAlias>(SystemFunction("sceKernelJitCreateAliasOfSharedMemory", where));
+    if (!create || !create_alias)
+        return "no JIT shared memory calls";
+    int32_t fd = -1, alias = -1;
+    int32_t r = create("xbox-bench ram", size, kProtCpuRead | kProtCpuWrite | kProtCpuExec, &fd);
+    if (r != 0)
+        return fmt::format("sceKernelJitCreateSharedMemory {:#x}", uint32_t(r));
+    std::string e;
+    if (alias_for_b)
+    {
+        r = create_alias(fd, Prot(access_b), &alias);
+        if (r != 0)
+            e = fmt::format("sceKernelJitCreateAliasOfSharedMemory {:#x}", uint32_t(r));
+    }
+    constexpr int kMapShared = 0x1, kMapFixedFlag = 0x10;
+    bool a_mapped = false;
+    if (e.empty())
+        for (int view = 0; view < 2 && e.empty(); view++)
+        {
+            const uint64_t at = view == 0 ? a : b;
+            const int view_fd = view == 1 && alias_for_b ? alias : fd;
+            e = ReserveAt(at, size);
+            if (!e.empty())
+                break;
+            void* p = mmap(reinterpret_cast<void*>(at), size, Prot(view == 0 ? access_a : access_b),
+                           kMapShared | kMapFixedFlag, view_fd, 0);
+            if (p == reinterpret_cast<void*>(-1) || reinterpret_cast<uint64_t>(p) != at)
+            {
+                e = fmt::format("mmap of the {} view (errno {})", view == 0 ? "first" : "second", *__error());
+                sceKernelMunmap(reinterpret_cast<void*>(at), size);
+                if (p != reinterpret_cast<void*>(-1))
+                    munmap(p, size);
+            }
+            else if (view == 0)
+                a_mapped = true;
+        }
+    if (!e.empty() && a_mapped)
+        sceKernelMunmap(reinterpret_cast<void*>(a), size);
+    if (alias >= 0)
+        close(alias);
+    close(fd);
+    return e;
 }
 
 } // namespace Platform

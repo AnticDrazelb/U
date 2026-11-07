@@ -77,5 +77,11 @@ void* SystemFunction(const char* name, std::string& where);
 // (execute/read) or data (read/write). Returns its selector, or 0 with `error` set. `index` is a
 // hint; the system may choose another.
 uint16_t SetLdtEntry(int index, uint32_t base, bool code, std::string& error);
+// What reading the LDT gives (for the log).
+std::string LdtRead();
+// Maps one block of memory at `a` and at `b` with JIT shared memory (the PS4's way to have code
+// written through one mapping and run through another): `access_a` / `access_b` (Access bits),
+// the second view through an alias descriptor if `alias_for_b`. Returns an error text, or "".
+std::string JitAlias(uint64_t a, uint64_t b, size_t size, int access_a, int access_b, bool alias_for_b);
 
 } // namespace Platform

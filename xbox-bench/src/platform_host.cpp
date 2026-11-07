@@ -205,6 +205,39 @@ void* SystemFunction(const char* name, std::string& where)
     return p;
 }
 
+std::string LdtRead()
+{
+    uint8_t buffer[16 * 8] = {};
+    const long n = syscall(SYS_modify_ldt, 0, buffer, sizeof(buffer));
+    return n < 0 ? Errno("modify_ldt (read)") : "modify_ldt (read): " + std::to_string(n / 8) + " entries";
+}
+
+// The desktop has no JIT calls; a memfd mapped twice stands in for them.
+std::string JitAlias(uint64_t a, uint64_t b, size_t size, int access_a, int access_b, bool)
+{
+    const int fd = static_cast<int>(syscall(SYS_memfd_create, "xbox-bench jit", 0));
+    if (fd < 0)
+        return Errno("memfd_create");
+    std::string error;
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0)
+        error = Errno("ftruncate");
+    auto prot = [](int access) {
+        return ((access & Read) ? PROT_READ : 0) | ((access & Write) ? PROT_WRITE : 0) | ((access & Exec) ? PROT_EXEC : 0);
+    };
+    void* pa = MAP_FAILED;
+    if (error.empty() &&
+        (pa = mmap(reinterpret_cast<void*>(a), size, prot(access_a), MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0)) == MAP_FAILED)
+        error = Errno("mmap (first view)");
+    if (error.empty() &&
+        mmap(reinterpret_cast<void*>(b), size, prot(access_b), MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0) == MAP_FAILED)
+    {
+        error = Errno("mmap (second view)");
+        munmap(pa, size);
+    }
+    close(fd);
+    return error;
+}
+
 uint16_t SetLdtEntry(int index, uint32_t base, bool code, std::string& error)
 {
     user_desc d{};

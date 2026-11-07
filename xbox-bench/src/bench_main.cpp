@@ -663,6 +663,33 @@ int RunCpu(double scale, Progress& progress, const std::string& title)
 
 // ---- memory: what an Xbox emulator needs below 4 GiB
 
+// Whether code written through `write_view` runs at `code`: a "ret" is written and called. A fault
+// on it is caught and treated as if the ret ran (as switch-bench and Crema's runtime check RWX).
+volatile u64 g_probe_code = 0;
+volatile bool g_probe_faulted = false;
+bool OnProbeFault(Platform::FaultContext& c)
+{
+    if (!g_probe_code || *c.rip != g_probe_code)
+        return false;
+    const u64 rsp = *c.gpr[4];
+    *c.rip = *reinterpret_cast<const u64*>(rsp);
+    *c.gpr[4] = rsp + 8;
+    g_probe_faulted = true;
+    return true;
+}
+bool RunsCode(u64 code, u64 write_view)
+{
+    *reinterpret_cast<volatile u8*>(write_view) = 0xC3; // ret
+    g_probe_faulted = false;
+    g_probe_code = code;
+    Platform::InstallFaultHandler(OnProbeFault);
+    void (*volatile function)() = reinterpret_cast<void (*)()>(code);
+    function();
+    Platform::RemoveFaultHandler();
+    g_probe_code = 0;
+    return !g_probe_faulted;
+}
+
 void RunMemory(Progress& progress)
 {
     Platform::Log("");
@@ -759,6 +786,31 @@ void RunMemory(Progress& progress)
           [&] { return alias(kFreeBase, kFreeBase + 0x80000000, Platform::PageSize(), rw); });
     check("an alias of one 4 KiB page (the Xbox's page size)",
           [&] { return alias(kFreeBase, kFreeBase + 0x80000000, 4 * KB, rw); });
+    // JIT shared memory: the PS4's own way to see one block of memory at two addresses (01.01:
+    // direct memory can't be mapped twice). The Xbox's RAM needs a low view that is writable and
+    // runs code, and a second, writable one at 0x8xxxxxxx.
+    const u64 low = kFreeBase, high = kFreeBase + 0x80000000;
+    auto jit = [&](int access_a, int access_b, bool alias_fd, bool run_code) -> std::string {
+        std::string e = Platform::JitAlias(low, high, 64 * MB, access_a, access_b, alias_fd);
+        if (!e.empty())
+            return e;
+        if ((access_b & Platform::Write) && (access_a & Platform::Read))
+        {
+            *reinterpret_cast<volatile u32*>(high + 64 * MB - 4) = 0xC0FFEE02u;
+            if (*reinterpret_cast<volatile u32*>(low + 64 * MB - 4) != 0xC0FFEE02u)
+                e = "maps, but the views don't share memory";
+        }
+        if (e.empty() && run_code && !RunsCode(low, high))
+            e = "maps and shares, but code written through the second view DOESN'T RUN in the first";
+        Platform::Unmap(low, 64 * MB);
+        Platform::Unmap(high, 64 * MB);
+        return e;
+    };
+    check("JIT shared memory twice, both read/write (the contiguous-memory alias)",
+          [&] { return jit(rw, rw, false, false); });
+    check("JIT shared memory: RWX low, read/write high", [&] { return jit(rwx, rw, false, true); });
+    check("JIT shared memory: r-x low, read/write high through an alias",
+          [&] { return jit(Platform::Read | Platform::Exec, rw, true, true); });
     check("the hardware range 0xfd000000-0xffffffff kept unmapped", [&] {
         std::string e = Platform::ReserveFixed(kMmioBase, kMmioSize);
         if (e.empty())
@@ -789,18 +841,22 @@ void ReportSystemFunctions()
 // A code and a data segment with base B put guest address a at linear B + a: the whole 4 GiB guest
 // space moves past it. Their LDT entries also give the guest an fs of its own later.
 constexpr u64 kSegmentBase = 0x10000000;
+std::string g_ldt_summary = "segments with a base: not tried (CPU tests not run)";
 
 int RunBased(double scale, Progress& progress)
 {
     ReportSystemFunctions();
     Platform::Log("");
     Platform::Log(fmt::format("segments with a base: guest address 0 at linear {:#x} (LDT entries)", kSegmentBase));
+    Platform::Trace("LDT: read");
+    Platform::Log("  " + Platform::LdtRead());
     Platform::Trace("LDT: code segment");
     std::string error;
     const u16 code = Platform::SetLdtEntry(1, u32(kSegmentBase), true, error);
     if (!code)
     {
         Platform::Log("  code segment: NO (" + error + ")");
+        g_ldt_summary = "segments with a base: NO (" + error + ")";
         return 0;
     }
     Platform::Trace("LDT: data segment");
@@ -808,13 +864,18 @@ int RunBased(double scale, Progress& progress)
     if (!data)
     {
         Platform::Log(fmt::format("  code segment {:#x}; data segment: NO ({})", code, error));
+        g_ldt_summary = "segments with a base: data segment NO (" + error + ")";
         return 0;
     }
     const Descriptor dc = Lar(code), dd = Lar(data);
     Platform::Log(fmt::format("  code segment {:#x}: {}", code, dc.valid ? Describe(dc) : "NOT VISIBLE (lar)"));
     Platform::Log(fmt::format("  data segment {:#x}: {}", data, dd.valid ? Describe(dd) : "NOT VISIBLE (lar)"));
     if (!dc.valid || !dd.valid)
+    {
+        g_ldt_summary = "segments with a base: set, but not visible to lar";
         return 0;
+    }
+    g_ldt_summary = fmt::format("segments with a base: yes ({:#x}, {:#x}); the CPU tests ran through them above", code, data);
     g_space = {kSegmentBase, code, data};
     const int result = RunCpu(scale, progress, "cpu, through the based segments:");
     g_space = {0, g_seg.sel32, g_seg.ss};
@@ -846,6 +907,8 @@ int Run(Platform::Mode mode)
     }
     if (mode != Platform::Mode::CpuOnly)
         RunMemory(progress);
+    Platform::Log("");
+    Platform::Log(g_ldt_summary);
     Platform::Finish("Xbox CPU Bench done");
     return result;
 }
