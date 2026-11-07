@@ -68,15 +68,14 @@ Xbox's addresses below it. The real console could (xbox-bench).
 
 ## Next
 
-1. **PS4.** The platform parts as xbox-bench has them:
-   - `amd64_set_fsbase` for `fs` (found with `sceKernelDlsym`);
-   - FreeBSD's signal context;
-   - the PS4's memory calls;
-   - the framebuffer on VideoOut.
-
-   The XBE must stay below the app's own executable at `0x400000`
-   (`xbox-bench/RESULTS.md`), or the executable moves (xbox-bench 01.04's variants).
-2. **The NV2A.** xemu's NV2A emulation and its Vulkan renderer, already ported to the PS4's RADV in
-   xemu-ps4. Push-buffer writes would be caught on the register page.
-3. More of the kernel as programs need it: directory listing (`NtQueryDirectoryFile`), the `\??`
-   object directory, timers, APCs, the XISO file system.
+1. **A console run** of `out/xbox-core-00.01.pkg`: the self-test line, then `sample: hello` and
+   `sample: sdl`.
+2. **The app's executable out of the Xbox's addresses**, for games whose image is bigger than the
+   ~4 MiB below `0x400000`. xbox-bench 01.04's variants (linked at `0x40000000` or `0x1000000000`,
+   ASLR or fixed) show which way the system allows.
+3. **The NV2A.** xemu's NV2A emulation and its Vulkan renderer, already ported to the PS4's RADV in
+   xemu-ps4, which renders through the same RADV/GNM stack as Crema. Push-buffer writes would be
+   caught on the register page; on the PS4 a register access through the fault handler costs about
+   7 µs.
+4. Input (the USB host controller and the gamepad, as xemu emulates them), audio (the MCPX APU),
+   and more of the kernel as programs need it: timers, APCs, the XISO file system.
