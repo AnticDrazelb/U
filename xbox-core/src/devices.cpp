@@ -251,7 +251,7 @@ void StartVblank()
     });
 }
 
-bool SaveFramebuffer(const std::string& path)
+DisplayInfo GetDisplay()
 {
     Display d;
     u32 start;
@@ -260,35 +260,43 @@ bool SaveFramebuffer(const std::string& path)
         d = g_display;
         start = Reg(NV_PCRTC_START);
     }
-    const u32 bpp = d.format == 0x12 ? 4 : d.format == 0x11 || d.format == 0x10 ? 2 : 4;
-    const u32 pitch = d.pitch ? d.pitch : 640 * 4;
-    const int w = int(pitch / bpp);
-    const int h = w >= 1920 ? 1080 : w >= 1280 ? 720 : 480;
+    DisplayInfo info;
+    info.format = d.format;
+    info.bpp = d.format == 0x12 ? 4 : d.format == 0x11 || d.format == 0x10 ? 2 : 4;
+    info.pitch = d.pitch ? d.pitch : 640 * 4;
+    info.width = int(info.pitch / info.bpp);
+    info.height = info.width >= 1920 ? 1080 : info.width >= 1280 ? 720 : 480;
     const u32 phys = start ? start : d.framebuffer & 0x0fffffff;
-    const u32 at = phys < kContiguousSize ? kContiguousBase + phys : phys;
-    std::vector<u8> rgb(size_t(w) * h * 3);
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
+    info.address = phys < kContiguousSize ? kContiguousBase + phys : phys;
+    info.valid = d.pitch != 0;
+    return info;
+}
+
+u32 DisplayPixel(const DisplayInfo& d, int x, int y)
+{
+    const u32 p = d.address + u32(y) * d.pitch + u32(x) * d.bpp;
+    if (d.bpp == 4)
+        return Read<u32>(p) & 0xffffff;
+    const u16 v = Read<u16>(p);
+    if (d.format == 0x11)
+        return u32((v >> 11) << 3) << 16 | u32(((v >> 5) & 63) << 2) << 8 | u32((v & 31) << 3);
+    return u32(((v >> 10) & 31) << 3) << 16 | u32(((v >> 5) & 31) << 3) << 8 | u32((v & 31) << 3);
+}
+
+bool SaveFramebuffer(const std::string& path)
+{
+    const DisplayInfo d = GetDisplay();
+    std::vector<u8> rgb(size_t(d.width) * d.height * 3);
+    for (int y = 0; y < d.height; y++)
+        for (int x = 0; x < d.width; x++)
         {
-            const u32 p = at + u32(y) * pitch + u32(x) * bpp;
-            u8* o = &rgb[(size_t(y) * w + x) * 3];
-            if (bpp == 4)
-            {
-                const u32 v = Read<u32>(p);
-                o[0] = u8(v >> 16), o[1] = u8(v >> 8), o[2] = u8(v);
-            }
-            else
-            {
-                const u16 v = Read<u16>(p);
-                if (d.format == 0x11)
-                    o[0] = u8((v >> 11) << 3), o[1] = u8(((v >> 5) & 63) << 2), o[2] = u8((v & 31) << 3);
-                else
-                    o[0] = u8(((v >> 10) & 31) << 3), o[1] = u8(((v >> 5) & 31) << 3), o[2] = u8((v & 31) << 3);
-            }
+            const u32 v = DisplayPixel(d, x, y);
+            u8* o = &rgb[(size_t(y) * d.width + x) * 3];
+            o[0] = u8(v >> 16), o[1] = u8(v >> 8), o[2] = u8(v);
         }
-    Log("devices: framebuffer at %#x (%dx%d, format %#x) -> %s; %llu vblanks", at, w, h, d.format, path.c_str(),
-        (unsigned long long)g_vblanks.load());
-    return WritePng(path, w, h, rgb);
+    Log("devices: framebuffer at %#x (%dx%d, format %#x) -> %s; %llu vblanks", d.address, d.width, d.height, d.format,
+        path.c_str(), (unsigned long long)g_vblanks.load());
+    return WritePng(path, d.width, d.height, rgb);
 }
 
 } // namespace xb

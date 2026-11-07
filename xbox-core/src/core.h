@@ -25,6 +25,8 @@ using s64 = std::int64_t;
 // ---- log
 
 void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+extern void (*g_log_sink)(const char* line); // also gets every log line (the PS4's screen and log file)
+extern void (*g_fatal_hook)(); // runs before Fatal ends the process
 [[noreturn]] void Fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 extern int g_verbose; // 0 quiet, 1 kernel calls not yet seen, 2 every kernel call
 
@@ -57,13 +59,13 @@ inline void Write(u32 guest, T v)
 //   0x80000000-0x83ffffff  contiguous memory (MmAllocateContiguousMemory): what the GPU reads; its
 //                          "physical" address is the offset from 0x80000000. Not an alias of the RAM
 //                          above (the PS4 can't map memory twice).
-//   0x8c000000-0x8fffffff  the core's kernel area: KPCRs, threads, objects, export stubs, data exports
-//   0xd0000000-0xdfffffff  thread stacks
+//   0x8c000000-0x8cffffff  the core's kernel area: KPCRs, threads, objects, export stubs, data exports
+//   0xd0000000-0xd3ffffff  thread stacks
 //   0xfd000000-0xffffffff  devices (NV2A at 0xfd000000), kept unmapped: accesses fault and are emulated
 constexpr u32 kRamBase = 0x00010000, kRamEnd = 0x04000000;
 constexpr u32 kContiguousBase = 0x80000000, kContiguousSize = 0x04000000;
-constexpr u32 kKernelBase = 0x8c000000, kKernelSize = 0x04000000;
-constexpr u32 kStackBase = 0xd0000000, kStackAreaSize = 0x10000000;
+constexpr u32 kKernelBase = 0x8c000000, kKernelSize = 0x01000000;
+constexpr u32 kStackBase = 0xd0000000, kStackAreaSize = 0x04000000;
 constexpr u32 kDeviceBase = 0xfd000000;
 
 bool MapGuest(u32 base, u32 size, bool exec, std::string& error);
@@ -159,6 +161,15 @@ bool DeviceWrite(u32 address, u32 size, u32 value);
 // Interrupts: the vblank thread calls the connected service routines.
 void ConnectInterrupt(u32 vector, u32 kinterrupt);
 void DisconnectInterrupt(u32 kinterrupt);
+// The picture the guest shows: where it is and how to read it.
+struct DisplayInfo
+{
+    bool valid = false; // a mode has been set
+    u32 address = 0, format = 0, pitch = 0, bpp = 4;
+    int width = 640, height = 480;
+};
+DisplayInfo GetDisplay();
+u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);
 void StartVblank();
 

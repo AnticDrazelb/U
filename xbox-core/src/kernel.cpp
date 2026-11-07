@@ -385,6 +385,13 @@ void* HostOf(u32 handle, int kind)
     return it == g_handles.end() || it->second.kind != kind ? nullptr : it->second.host;
 }
 
+bool IsHandleKind(u32 handle, int kind)
+{
+    std::lock_guard lock(g_handles_mutex);
+    auto it = g_handles.find(handle);
+    return it != g_handles.end() && it->second.kind == kind;
+}
+
 s64 SystemTime()
 {
     // 100 ns units since 1601-01-01

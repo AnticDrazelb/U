@@ -41,6 +41,7 @@ int main(int argc, char** argv)
         Fatal("%s: %s", xbe.c_str(), error.c_str());
     const size_t slash = xbe.find_last_of('/');
     SetGameDirectory(slash == std::string::npos ? "." : xbe.substr(0, slash));
+    SetDataDirectory("xbox-data");
     ResolveThunks();
     StartVblank();
     RunXbe();

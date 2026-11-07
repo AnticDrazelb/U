@@ -1,22 +1,17 @@
 // CPU: Xbox code runs on the host CPU in 32-bit compatibility mode (switch.S). Guest threads (KPCR,
 // ETHREAD, stack, TLS), the kernel export stubs, and the fault handler: device registers are
 // emulated instruction by instruction, privileged instructions skipped, anything else reported.
-// Host side: Linux x86-64 with FSGSBASE.
+// The host's side of it (memory, fs, signals) is in platform_*.cpp.
 #include <cctype>
-#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
 
-#include <sys/auxv.h>
-#include <ucontext.h>
-
 #include "core.h"
+#include "platform.h"
 
 extern "C" {
 extern const unsigned char xcs_begin[], xcs_end[], xcs_enter64[], xcs_gate32[], xcs_bail64[], xcs_back64[];
-void xcs_linux_fs_guest(uint64_t kpcr);
-void xcs_linux_fs_host(uint64_t base);
 }
 
 namespace xb {
@@ -47,20 +42,7 @@ bool Lar(u16 selector, u32& rights)
 
 u64 HostFsBase()
 {
-    u64 v;
-    __asm__ volatile("mov %%fs:0, %0" : "=r"(v)); // the thread control block's self pointer
-    return v;
-}
-
-u64 RdFsBase()
-{
-    u64 v;
-    __asm__ volatile("rdfsbase %0" : "=r"(v));
-    return v;
-}
-void WrFsBase(u64 v)
-{
-    __asm__ volatile("wrfsbase %0" : : "r"(v));
+    return platform::HostFsBase();
 }
 
 extern "C" void GateEntry(u32* frame, u64 kpcr)
@@ -73,9 +55,9 @@ extern "C" void GateEntry(u32* frame, u64 kpcr)
 
 struct Regs
 {
-    greg_t* g;
-    u32 Get(int r) const { return u32(g[Order(r)]); }
-    void Set(int r, u32 v) { g[Order(r)] = (g[Order(r)] & ~greg_t(0xffffffff)) | v; }
+    platform::Fault& f;
+    u32 Get(int r) const { return u32(*f.gpr[r]); }
+    void Set(int r, u32 v) { *f.gpr[r] = (*f.gpr[r] & ~u64(0xffffffff)) | v; }
     u32 Get8(int r) const { return r < 4 ? Get(r) & 0xff : (Get(r - 4) >> 8) & 0xff; }
     void Set8(int r, u32 v)
     {
@@ -84,23 +66,18 @@ struct Regs
         else
             Set(r - 4, (Get(r - 4) & ~0xff00u) | ((v & 0xff) << 8));
     }
-    static int Order(int r)
-    {
-        static const int order[8] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI};
-        return order[r];
-    }
     void Flags(u32 result, u32 size, bool carry = false)
     {
         const u32 mask = size == 4 ? 0xffffffff : size == 2 ? 0xffff : 0xff;
         result &= mask;
-        greg_t f = g[REG_EFL] & ~greg_t(0x8d5); // CF PF AF ZF SF OF
+        u64 fl = *f.eflags & ~u64(0x8d5); // CF PF AF ZF SF OF
         if (!result)
-            f |= 0x40;
+            fl |= 0x40;
         if (result & ((mask >> 1) + 1))
-            f |= 0x80;
+            fl |= 0x80;
         if (carry)
-            f |= 1;
-        g[REG_EFL] = f;
+            fl |= 1;
+        *f.eflags = fl;
     }
 };
 
@@ -291,81 +268,53 @@ size_t SkipPrivileged(const u8* p, Regs& r)
     return 0;
 }
 
-struct sigaction g_old[3];
-constexpr int kSignals[3] = {SIGSEGV, SIGBUS, SIGILL};
-
-void OnFault(int sig, siginfo_t* info, void* raw)
+bool OnFault(platform::Fault& f)
 {
-    // The guest's fs may be current: the emulator's first (C++ thread-locals live there).
-    const u64 fs = RdFsBase();
-    const bool guest_fs = fs && fs < 0x100000000ull;
-    if (guest_fs)
-        WrFsBase(Read<u64>(u32(fs) + kpcr::HostFsBase));
-    auto* uc = static_cast<ucontext_t*>(raw);
-    greg_t* g = uc->uc_mcontext.gregs;
-    const u16 cs = u16(g[REG_CSGSFS] & 0xffff);
-    const u64 rip = u64(g[REG_RIP]);
-    Regs r{g};
-    if (cs == g_sel32)
+    const u64 rip = *f.rip;
+    const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
+    Regs r{f};
+    if (f.cs != g_sel32)
     {
-        const u8* code = Ptr<u8>(u32(rip));
-        const u32 address = u32(reinterpret_cast<uintptr_t>(info->si_addr));
-        size_t length = 0;
-        if (sig == SIGSEGV && address >= kDeviceBase)
-            length = EmulateDeviceAccess(code, address, r);
-        if (!length)
-            length = SkipPrivileged(code, r);
-        if (length)
-        {
-            g[REG_RIP] = greg_t(rip + length);
-            WrFsBase(fs);
-            return;
-        }
-        GuestThread* t = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(fs) + kpcr::HostThread)) : nullptr;
-        if (code[0] == 0xf4) // hlt: the program stopped (an assertion, a fatal error): its message
-        {
-            const u32 ebp = r.Get(5);
-            std::string args;
-            for (int i = 0; i < 5; i++)
-            {
-                const u32 v = Read<u32>(ebp + 8 + i * 4);
-                const bool text = v >= kRamBase && v < kRamEnd && std::isprint(Read<u8>(v));
-                char buf[160];
-                if (text)
-                    std::snprintf(buf, sizeof(buf), " \"%.120s\"", Ptr<const char>(v));
-                else
-                    std::snprintf(buf, sizeof(buf), " %#x", v);
-                args += buf;
-            }
-            Log("guest halted (hlt at %#x) in thread %u; its caller's arguments:%s", u32(rip), t ? t->id : 0,
-                args.c_str());
-        }
-        Log("guest fault in thread %u: signal %d at %#x, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
-            "ecx %#x edx %#x ebx %#x esp %#x ebp %#x esi %#x edi %#x",
-            t ? t->id : 0, sig, u32(rip), address, code[0], code[1], code[2], code[3], code[4], code[5], r.Get(0),
-            r.Get(1), r.Get(2), r.Get(3), r.Get(4), r.Get(5), r.Get(6), r.Get(7));
-        g[REG_RIP] = greg_t(SwitchEntry(xcs_bail64));
-        g[REG_CSGSFS] = (g[REG_CSGSFS] & ~greg_t(0xffff)) | g_sel64;
-        WrFsBase(fs);
-        return;
+        Log("host fault: signal %d at rip %#llx, address %#x%s", f.signal, (unsigned long long)rip, f.address,
+            guest_fs ? " (with the guest's fs)" : "");
+        return false;
     }
-    Log("host fault: signal %d at rip %#llx, address %p%s", sig, (unsigned long long)rip, info->si_addr,
-        guest_fs ? " (with the guest's fs)" : "");
-    for (int i = 0; i < 3; i++)
-        if (kSignals[i] == sig)
-            sigaction(sig, &g_old[i], nullptr);
-}
-
-void PrepareSignalStack()
-{
-    thread_local bool done = false;
-    if (done)
-        return;
-    done = true;
-    stack_t st{};
-    st.ss_size = 256 * 1024;
-    st.ss_sp = std::malloc(st.ss_size);
-    sigaltstack(&st, nullptr);
+    const u8* code = Ptr<u8>(u32(rip));
+    size_t length = 0;
+    if (f.signal == 11 && f.address >= kDeviceBase)
+        length = EmulateDeviceAccess(code, f.address, r);
+    if (!length)
+        length = SkipPrivileged(code, r);
+    if (length)
+    {
+        *f.rip = rip + length;
+        return true;
+    }
+    GuestThread* t = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+    if (code[0] == 0xf4) // hlt: the program stopped (an assertion, a fatal error): its message
+    {
+        const u32 ebp = r.Get(5);
+        std::string args;
+        for (int i = 0; i < 5; i++)
+        {
+            const u32 v = Read<u32>(ebp + 8 + i * 4);
+            const bool text = v >= kRamBase && v < kRamEnd && std::isprint(Read<u8>(v));
+            char buf[160];
+            if (text)
+                std::snprintf(buf, sizeof(buf), " \"%.120s\"", Ptr<const char>(v));
+            else
+                std::snprintf(buf, sizeof(buf), " %#x", v);
+            args += buf;
+        }
+        Log("guest halted (hlt at %#x) in thread %u; its caller's arguments:%s", u32(rip), t ? t->id : 0, args.c_str());
+    }
+    Log("guest fault in thread %u: signal %d at %#x, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
+        "ecx %#x edx %#x ebx %#x esp %#x ebp %#x esi %#x edi %#x",
+        t ? t->id : 0, f.signal, u32(rip), f.address, code[0], code[1], code[2], code[3], code[4], code[5], r.Get(0),
+        r.Get(1), r.Get(2), r.Get(3), r.Get(4), r.Get(5), r.Get(6), r.Get(7));
+    *f.rip = SwitchEntry(xcs_bail64);
+    platform::SetCs(f, g_sel64);
+    return true;
 }
 
 } // namespace
@@ -377,8 +326,9 @@ GuestThread* CurrentThread()
 
 void InitCpu()
 {
-    if (!(getauxval(AT_HWCAP2) & 2))
-        Fatal("this host's kernel doesn't enable FSGSBASE (needed to switch fs without system calls)");
+    const std::string problem = platform::Init();
+    if (!problem.empty())
+        Fatal("%s", problem.c_str());
     __asm__("mov %%cs, %0" : "=r"(g_sel64));
     __asm__("mov %%ss, %0" : "=r"(g_ds));
     for (u16 index = 1; index < 32 && !g_sel32; index++)
@@ -398,8 +348,8 @@ void InitCpu()
     Write<u64>(g_switch + kSlotSel64, g_sel64);
     Write<u64>(g_switch + kSlotGuestDs, g_ds);
     Write<u64>(g_switch + kSlotHandler, reinterpret_cast<u64>(&GateEntry));
-    Write<u64>(g_switch + kSlotFsGuest, reinterpret_cast<u64>(&xcs_linux_fs_guest));
-    Write<u64>(g_switch + kSlotFsHost, reinterpret_cast<u64>(&xcs_linux_fs_host));
+    Write<u64>(g_switch + kSlotFsGuest, reinterpret_cast<u64>(platform::FsGuest()));
+    Write<u64>(g_switch + kSlotFsHost, reinterpret_cast<u64>(platform::FsHost()));
     // export stubs: mov eax, ordinal; jmp xcs_gate32
     g_stubs = AllocKernel(kExportCount * kStubSize, 16);
     const u32 gate = u32(SwitchEntry(xcs_gate32));
@@ -413,13 +363,8 @@ void InitCpu()
         std::memcpy(s + 6, &rel, 4);
         s[10] = 0xcc;
     }
-    struct sigaction action{};
-    action.sa_sigaction = OnFault;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    sigemptyset(&action.sa_mask);
-    for (int i = 0; i < 3; i++)
-        sigaction(kSignals[i], &action, &g_old[i]);
-    PrepareSignalStack();
+    platform::InstallFaultHandler(OnFault);
+    platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);
 }
 
@@ -475,7 +420,7 @@ GuestThread* NewGuestThread(u32 stack_size, u32 tls_size, const char* name)
 
 u64 CallGuest(GuestThread* t, u32 fn, std::initializer_list<u32> args)
 {
-    PrepareSignalStack();
+    platform::PrepareThread();
     tl_thread = t;
     Write<u64>(t->kpcr + kpcr::HostFsBase, HostFsBase());
     u32 esp = ((t->tls_area ? t->tls_area : t->stack_top) - 64) & ~15u;
@@ -508,7 +453,7 @@ u64 CallGuestNested(u32 fn, std::initializer_list<u32> args)
 void StartHostThread(GuestThread* t, std::function<void()> body)
 {
     std::thread([t, body = std::move(body)] {
-        PrepareSignalStack();
+        platform::PrepareThread();
         tl_thread = t;
         body();
     }).detach();

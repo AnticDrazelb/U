@@ -6,50 +6,49 @@
 #include <map>
 #include <mutex>
 
-#include <sys/mman.h>
-
 #include "core.h"
+#include "platform.h"
 
 namespace xb {
 
 int g_verbose = 1;
+void (*g_log_sink)(const char* line) = nullptr;
 
 void Log(const char* fmt, ...)
 {
     static std::mutex m;
-    std::lock_guard lock(m);
+    char line[2048];
     va_list ap;
     va_start(ap, fmt);
-    std::vfprintf(stdout, fmt, ap);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
+    std::lock_guard lock(m);
+    std::fputs(line, stdout);
     std::fputc('\n', stdout);
     std::fflush(stdout);
+    if (g_log_sink)
+        g_log_sink(line);
 }
+
+void (*g_fatal_hook)() = nullptr;
 
 void Fatal(const char* fmt, ...)
 {
+    char line[2048];
     va_list ap;
     va_start(ap, fmt);
-    std::fprintf(stdout, "FATAL: ");
-    std::vfprintf(stdout, fmt, ap);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    std::fputc('\n', stdout);
-    std::fflush(stdout);
+    Log("FATAL: %s", line);
+    if (g_fatal_hook)
+        g_fatal_hook(); // the PS4: keeps the message on screen
     std::_Exit(2);
 }
 
 bool MapGuest(u32 base, u32 size, bool exec, std::string& error)
 {
-    const int prot = PROT_READ | PROT_WRITE | (exec ? PROT_EXEC : 0);
-    void* p = mmap(Ptr(base), size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (p == MAP_FAILED || Guest(p) != base)
-    {
-        error = std::string("mmap: ") + std::strerror(errno);
-        if (p != MAP_FAILED)
-            munmap(p, size);
-        return false;
-    }
-    return true;
+    error = platform::Map(base, size, platform::Read | platform::Write | (exec ? platform::Exec : 0));
+    return error.empty();
 }
 
 namespace {
@@ -170,23 +169,47 @@ void InitMemory()
         const char* what;
     } regions[] = {
         {kRamBase, kRamEnd - kRamBase, true, "RAM"},
-        {kContiguousBase, kContiguousSize, true, "contiguous memory"},
+        {kContiguousBase, kContiguousSize, false, "contiguous memory"},
         {kKernelBase, kKernelSize, true, "kernel area"},
         {kStackBase, kStackAreaSize, false, "stacks"},
     };
+    // Whatever the system already has in a region (on the PS4 the app's own executable, at 0x400000)
+    // stays where it is: the region is mapped around it, and the allocators never hand it out.
+    std::vector<std::pair<u32, u32>> taken;
+    const u32 page = std::max<u32>(platform::PageSize(), kPage);
     for (const Region& r : regions)
     {
-        std::string e;
-        if (!MapGuest(r.base, r.size, r.exec, e))
-            Fatal("%s at %#x: %s", r.what, r.base, e.c_str());
+        auto occupied = platform::Occupied(r.base, r.base + r.size);
+        u32 at = r.base;
+        occupied.push_back({r.base + r.size, r.base + r.size});
+        for (auto [start, end] : occupied)
+        {
+            start &= ~(page - 1);
+            end = (end + page - 1) & ~(page - 1);
+            if (start > at)
+            {
+                std::string e;
+                if (!MapGuest(at, start - at, r.exec, e))
+                    Fatal("%s at %#x (%#x bytes): %s", r.what, at, start - at, e.c_str());
+            }
+            if (end > start)
+            {
+                Log("memory: %#x-%#x in the %s is the system's; left out", start, end - 1, r.what);
+                taken.push_back({start, end - start});
+            }
+            at = std::max(at, end);
+        }
     }
     // the devices: reserved, inaccessible
-    void* p = mmap(Ptr(kDeviceBase), 0x03000000, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (p != Ptr(kDeviceBase))
-        Fatal("device range at %#x not reserved", kDeviceBase);
+    const std::string e = platform::Reserve(kDeviceBase, 0x03000000);
+    if (!e.empty())
+        Fatal("device range at %#x not reserved: %s", kDeviceBase, e.c_str());
     g_virtual.Init(kRamBase, kRamEnd);
     g_contiguous.Init(kContiguousBase, kContiguousBase + kContiguousSize);
     g_stacks.Init(kStackBase, kStackBase + kStackAreaSize);
+    for (auto [start, size] : taken)
+        if (start >= kRamBase && start < kRamEnd)
+            g_virtual.AllocAt(start, size);
 }
 
 u32 AllocVirtual(u32 size, u32 at)
@@ -241,7 +264,7 @@ u32 AllocStack(u32 size)
     const u32 p = g_stacks.Alloc(size + kPage, 0x10000);
     if (!p)
         Fatal("out of stack space");
-    mprotect(Ptr(p), kPage, PROT_NONE);
+    platform::Protect(p, kPage, 0);
     return p + kPage + size;
 }
 

@@ -25,10 +25,12 @@ std::string GuestString(u32 ansi_string);
 void RegisterFileExports(RegisterFn reg);
 void CloseHostHandle(int kind, void* host);
 void SetGameDirectory(const std::string& dir);
+void SetDataDirectory(const std::string& dir); // the hard disk's partitions (E:, T:, ...) live under it
 
 // handles (kernel.cpp): kind 1 = file, 2 = directory
 u32 NewHostHandle(int kind, void* host);
 void* HostOf(u32 handle, int kind);
+bool IsHandleKind(u32 handle, int kind); // kind 3 = the \?? object directory
 
 // devices.cpp
 void QueueDpc(u32 kdpc);

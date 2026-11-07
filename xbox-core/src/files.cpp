@@ -34,7 +34,25 @@ struct HostFile
     int fd = -1;
     std::string path;
     bool directory = false;
+    std::vector<std::string> listing; // NtQueryDirectoryFile: the names, read at the first query
+    size_t next = 0;
+    std::string pattern;
 };
+
+constexpr u32 kDosDevicesDirectory = 0xfffffffd; // ObDosDevicesDirectory()
+
+// "*" and "?" as the Xbox's file system matches them, case-insensitive.
+bool Matches(const char* pattern, const char* name)
+{
+    if (!*pattern)
+        return !*name;
+    if (*pattern == '*')
+        return Matches(pattern + 1, name) || (*name && Matches(pattern, name + 1));
+    if (!*name)
+        return false;
+    return (*pattern == '?' || std::tolower((unsigned char)*pattern) == std::tolower((unsigned char)*name)) &&
+           Matches(pattern + 1, name + 1);
+}
 
 std::string Lower(std::string s)
 {
@@ -274,6 +292,14 @@ void SetGameDirectory(const std::string& dir)
     g_game_dir = dir;
 }
 
+void SetDataDirectory(const std::string& dir)
+{
+    g_data_dir = dir;
+    // the hard disk's partitions, so that listing them works before a program writes there
+    for (const char* p : {"", "/c", "/e", "/t", "/u", "/x", "/y", "/z"})
+        mkdir((dir + p).c_str(), 0755);
+}
+
 void CloseHostHandle(int kind, void* host)
 {
     if (kind == 1 || kind == 2)
@@ -438,10 +464,107 @@ void RegisterFileExports(RegisterFn reg)
         SetIo(c.Arg(1), 0, 0);
         return STATUS_SUCCESS;
     });
-    // object directories (\Device, \??): nothing to list
-    reg("NtOpenDirectoryObject", [](Call&) -> u64 { return STATUS_OBJECT_NAME_NOT_FOUND; });
+    // object directories: \?? (the drive letters: D: and the program's links); others are empty
+    reg("NtOpenDirectoryObject", [](Call& c) -> u64 {
+        u32 root;
+        const std::string name = Lower(ObjectPath(c.Arg(1), root));
+        if (root == kDosDevicesDirectory || name == "\\??" || name == "\\?" "?\\")
+        {
+            const u32 h = NewHostHandle(3, nullptr);
+            Write<u32>(c.Arg(0), h);
+            return STATUS_SUCCESS;
+        }
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    });
     reg("NtOpenSymbolicLinkObject", [](Call&) -> u64 { return STATUS_OBJECT_NAME_NOT_FOUND; });
-    reg("NtQueryDirectoryObject", [](Call&) -> u64 { return 0x8000001A; /* STATUS_NO_MORE_ENTRIES */ });
+    reg("NtQueryDirectoryObject", [](Call& c) -> u64 {
+        // DirectoryHandle, Buffer, Length, RestartScan, Context*, ReturnLength*
+        if (!HostOf(c.Arg(0), 3) && !IsHandleKind(c.Arg(0), 3))
+            return 0x8000001A; // STATUS_NO_MORE_ENTRIES
+        std::vector<std::string> names = {"D:"};
+        {
+            std::lock_guard lock(g_links_mutex);
+            for (auto& [key, device] : g_links)
+                if (key.size() == 2 && key[1] == ':' && key != "d:")
+                    names.push_back(std::string(1, char(std::toupper(key[0]))) + ":");
+        }
+        const u32 index = (c.Arg(3) & 0xff) ? 0 : Read<u32>(c.Arg(4));
+        if (index >= names.size())
+            return 0x8000001A;
+        Write<u32>(c.Arg(4), index + 1);
+        const std::string& n = names[index];
+        if (c.Arg(2) < 12 + n.size())
+            return 0xC0000023; // STATUS_BUFFER_TOO_SMALL
+        // OBJECT_DIRECTORY_INFORMATION: Name (OBJECT_STRING), Type; the name's characters after it
+        const u32 out = c.Arg(1);
+        Write<u16>(out, u16(n.size()));
+        Write<u16>(out + 2, u16(n.size()));
+        Write<u32>(out + 4, out + 12);
+        Write<u32>(out + 8, 0);
+        std::memcpy(Ptr(out + 12), n.data(), n.size());
+        if (c.Arg(5))
+            Write<u32>(c.Arg(5), u32(12 + n.size()));
+        return STATUS_SUCCESS;
+    });
+    reg("NtQueryDirectoryFile", [](Call& c) -> u64 {
+        // FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length,
+        // FileInformationClass, FileName (a pattern), RestartScan
+        auto* dir = static_cast<HostFile*>(HostOf(c.Arg(0), 2));
+        if (!dir)
+            return STATUS_INVALID_HANDLE;
+        if (c.Arg(7) != 1) // FileDirectoryInformation
+        {
+            Log("files: NtQueryDirectoryFile class %u not implemented", c.Arg(7));
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ((c.Arg(9) & 0xff) || dir->listing.empty())
+        {
+            dir->listing.clear();
+            dir->next = 0;
+            dir->pattern = c.Arg(8) ? GuestString(c.Arg(8)) : "*";
+            if (dir->pattern.empty())
+                dir->pattern = "*";
+            if (DIR* d = opendir(dir->path.c_str()))
+            {
+                while (dirent* e = readdir(d))
+                    if (std::strcmp(e->d_name, ".") && std::strcmp(e->d_name, "..") &&
+                        Matches(dir->pattern.c_str(), e->d_name))
+                        dir->listing.push_back(e->d_name);
+                closedir(d);
+            }
+            if (dir->listing.empty())
+            {
+                SetIo(c.Arg(4), 0xC000000F, 0);
+                return 0xC000000F; // STATUS_NO_SUCH_FILE
+            }
+        }
+        if (dir->next >= dir->listing.size())
+        {
+            SetIo(c.Arg(4), 0x80000006, 0);
+            return 0x80000006; // STATUS_NO_MORE_FILES
+        }
+        const std::string& name = dir->listing[dir->next];
+        struct stat st{};
+        stat((dir->path + "/" + name).c_str(), &st);
+        const u32 out = c.Arg(5);
+        if (c.Arg(6) < 64 + name.size())
+            return 0x80000005; // STATUS_BUFFER_OVERFLOW
+        dir->next++;
+        // FILE_DIRECTORY_INFORMATION (the name in 8-bit characters, as on the Xbox)
+        Write<u32>(out + 0, 0);
+        Write<u32>(out + 4, u32(dir->next));
+        Write<s64>(out + 8, FileTime(st.st_ctim));
+        Write<s64>(out + 16, FileTime(st.st_atim));
+        Write<s64>(out + 24, FileTime(st.st_mtim));
+        Write<s64>(out + 32, FileTime(st.st_mtim));
+        Write<s64>(out + 40, st.st_size);
+        Write<s64>(out + 48, (st.st_size + 4095) & ~4095LL);
+        Write<u32>(out + 56, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
+        Write<u32>(out + 60, u32(name.size()));
+        std::memcpy(Ptr(out + 64), name.data(), name.size());
+        SetIo(c.Arg(4), STATUS_SUCCESS, u32(64 + name.size()));
+        return STATUS_SUCCESS;
+    });
 
     reg("XcSHAInit", [](Call& c) -> u64 {
         Sha1 s;
