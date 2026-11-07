@@ -1,7 +1,7 @@
-# New Eden (formerly Eden for PS4): status (after 04.85)
+# New Eden (formerly Eden for PS4): status (after 04.86)
 
-Install **04.85** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
-The patches are in `eden-ps4/patches` (up to 0176). The Eden tree is `~/eden`, branch `ps4`. The
+Install **04.86** (newest). Packages are built to `out/NewEden.pkg` (copies: `out/NewEden-<version>.pkg`; up to 04.60 `out/EdenPS4-<version>.pkg`). They are not in git.
+The patches are in `eden-ps4/patches` (up to 0177). The Eden tree is `~/eden`, branch `ps4`. The
 harness worktree is `~/eden-pptc`, branch `pptc64`; it is behind `ps4` from 0139 on.
 
 ## Done since 04.22
@@ -89,6 +89,7 @@ programs, 0 failures.
 - **04.70:** Little Kitty runs without get/set elimination; its first boot searches for the block (below).
 - **04.71:** the bug found and fixed; the translator ~6x faster; the boot watcher; crash restarts (below).
 - **04.72:** where Little Kitty's time goes; the large-page probe and 2 MiB arena blocks (below).
+- **04.86:** unchanged buffers aren't checked again, texture slots and sampler variants cached; the flush part split (below).
 - **04.85:** the Vulkan worker gets the GPU thread's commands every 64 draws, not 8 (below).
 - **04.84:** a measuring build: a draw's time on the GPU thread by part, and what the GPU thread waits on (below).
 - **04.83:** Graphics > GPU Threads: Two, the GPU thread's work on two cores (experimental, One by default); a fence wait that didn't wait fixed (below).
@@ -103,6 +104,42 @@ programs, 0 failures.
 - **04.74:** the guarded links for 32-bit games too; leaf-call following measured, off (below).
 - **04.73:** CPU speed for every game: the translator extras on with Auto again, loop register pins,
   stack range-check reuse; a 32-bit differential test; the boot watcher's extras-off step (below).
+
+## 04.86: unchanged buffers and texture slots not checked again
+
+- **04.85 on the console** (Breath of the Wild outdoors):
+  - The hand-overs fell from ~4,700 to ~590 a second, the flush part from 3.0 to 2.0 us a draw.
+  - Draws a second at full load rose ~4% (37,500 to 39,000).
+  - Buffer checks: 3.5 a draw, 1.8 us, 1 in 50 uploading.
+  - Mario Kart on 04.83: 35-41 fps in races.
+- **The other Switch emulators** check a buffer or texture binding at most once per sequence,
+  between syncpoints; Eden checks every bound one on every draw
+  ([docs/gpu-per-draw-comparison.md](docs/gpu-per-draw-comparison.md)). This build takes the
+  exact part of that (patch 0177):
+  - **Buffer checks skipped when nothing can have changed.** Each 4 MiB memory tracker region gets
+    a new, globally unique generation whenever a page in it is marked CPU-modified or unprotected.
+    A buffer checked over a range remembers it and its regions' generations; a check within it with
+    the generations unchanged would find nothing, and is skipped. It also stops the check from
+    protecting pages again.
+  - **Texture slots:** the view and sampler ids in a flat array per descriptor table instead of a
+    hash map lookup for every texture of every draw, used exactly when the map would give the same
+    id.
+  - **Sampler variants:** Vulkan's `Sampler::HandleFor` keeps the variant it last found for an
+    image view (a new unique serial per view).
+  - `EDEN_PS4_DRAW_SKIPS=0` turns the three off.
+- **Measured too:**
+  - The draw laps' flush part split into "hand-over" and "queued writes".
+  - The queued writes' invalidation by side (texture cache, buffer cache, query and shader caches).
+  - The skips a second and the sampler cache's hit rate.
+- **Tested on the desktop with Eden's Vulkan renderer** on lavapipe (Mesa's software Vulkan, newly
+  usable here with `EDEN_PS4_RENDERER=vulkan`).
+  - gputest's five modes, skips on against off, every 30th frame compared (the new
+    `EDEN_PS4_FRAMES_EVERY`): identical apart from gputest's fps bar.
+  - Checks skipped 2-64% by mode, sampler variants from the cache 25-98%.
+  - `test.sh`: 0 failed.
+- **Expected:** most of the 1.8 us of buffer checks and their `mprotect` calls, part of the texture
+  slots' ~3 us. The console run tells how much: the 30 s line's "buffer checks skipped N%" and the
+  draw parts against 04.85's.
 
 ## 04.85: the GPU thread's commands to the Vulkan worker in bigger batches
 

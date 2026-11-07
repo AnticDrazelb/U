@@ -74,6 +74,11 @@ Ranked by gain against risk. Gains are shares of the GPU thread's ~25.6 us a dra
    beyond items 1-2, but it changes behaviour: a CPU write that lands between syncpoints would be
    seen one sequence later. Only if items 1-2 leave the checks expensive.
 
+**04.86 (patch 0177):** item 1 as described; item 2's exact part (flat slot ids instead of the
+map, the sampler variant cached per view; descriptors are still read every draw, as nothing tracks
+the pool's memory); the flush split for item 3. Frames identical with and without them on Eden's
+Vulkan renderer (lavapipe, gputest's five modes).
+
 Items 1 and 2 together are 04.86's candidates, with the timer split for item 3. Combined, items 1-3
 are perhaps 15-20% of the GPU thread: Breath of the Wild outdoors from ~10 towards ~12 fps. That
 helps every game the GPU thread holds back, not only Breath of the Wild.

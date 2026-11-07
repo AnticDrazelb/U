@@ -379,6 +379,13 @@ use, flexible memory free, the largest free block of direct memory), and the las
 `gpu/radv-ps4.log` is kept as `radv-ps4-previous.log` (a crash restarts the app, which started a
 new log over it).
 
+04.86: **unchanged buffers and texture slots not checked again** (patch 0177).
+- A buffer check is skipped when no page in its memory regions has been marked changed since its
+  last check over that range. The check would have found nothing, so the result is the same.
+- Texture slots and sampler variants are cached.
+- From the other Switch emulators' design ([docs/gpu-per-draw-comparison.md](docs/gpu-per-draw-comparison.md)).
+- Tested with Eden's Vulkan renderer on the desktop (lavapipe): frames identical with and without.
+
 04.85: **the GPU thread's commands go to the Vulkan worker every 64 draws, not 8** (patch 0176). 04.84
 measured the hand-over at 3 of each draw's ~27 us on the GPU thread in Breath of the Wild outdoors
 (4,700 hand-overs a second, each waking the worker on the other core module). The buffer cache's

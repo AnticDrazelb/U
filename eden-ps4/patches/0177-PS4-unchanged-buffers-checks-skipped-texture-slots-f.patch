@@ -1,0 +1,554 @@
+From 4a417b1d390827cbf7202ca404ddb48bb67323a9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 01:26:23 +0000
+Subject: [PATCH] PS4: unchanged buffers' checks skipped, texture slots' flat
+ ids, sampler variants cached; flush split
+
+04.85 measured, in Breath of the Wild outdoors:
+
+- 3.5 buffer checks a draw (SynchronizeBuffer), 1.8 us in all, 1 in 50
+  uploading. Each walked the page bitmap and protected unprotected
+  pages again: the GPU thread's ~2,900 mprotect calls a second.
+- About 3 us a draw on texture slots, which Ryujinx and Strato skip
+  for slots already checked (docs/gpu-per-draw-comparison.md).
+
+All three skips change no result: they only skip work whose outcome
+is known.
+
+- Buffer checks skipped when nothing can have changed.
+  - Each memory tracker region (WordManager, 4 MiB) has a generation,
+    a new globally unique value whenever a page in it is marked
+    CPU-modified or untracked (ChangeRegionState enabling CPU or
+    CachedCPU, FlushCachedWrites, a region reassigned).
+  - A buffer remembers the range it was last checked over and its
+    regions' generations then. A check within that range, generations
+    the same, would find nothing to upload or protect, so it's skipped.
+  - Under the buffer cache's lock, as every marking is; the
+    generations are read before the check.
+- Texture slots' view and sampler ids in a flat array per descriptor
+  table, set with their map entries when a slot reads as new. They're
+  used only when it reads as unchanged, which is exactly when the map
+  holds the same id.
+- Vulkan's Sampler::HandleFor keeps the variant it last found (keyed by
+  the image view's new unique serial, whether depth, whether the
+  variants were full). A view's key doesn't change and variants are
+  only added; only found variants are kept, since a new one's creation
+  can fail and is tried again.
+- EDEN_PS4_DRAW_SKIPS=0 turns all three off.
+
+Measured too:
+
+- The draw laps' "flush" split into the hand-overs and the queued
+  writes (FlushCaching).
+- InnerInvalidation's texture, buffer and query/shader sides timed on
+  the GPU thread.
+- The skips and the sampler cache's hits counted.
+- EDEN_PS4_DRAW_STATS=1 prints the counters when the GPU thread ends
+  (desktop comparisons).
+
+Desktop, Eden's Vulkan renderer on lavapipe: gputest's five modes with
+the skips on and off, every 30th frame compared, identical apart from
+its fps bar. The CPU-rewritten texture and the moving squares were
+drawn the same. Checks skipped: 33%, 2%, 50% and 64% by mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VdsH7Cki1YqWbFL1ncEV7C
+---
+ src/common/ps4_perf.h                         | 23 +++++++++++--
+ src/video_core/buffer_cache/buffer_base.h     |  8 +++++
+ src/video_core/buffer_cache/buffer_cache.h    | 34 +++++++++++++++++++
+ .../buffer_cache/memory_tracker_base.h        | 21 ++++++++++++
+ src/video_core/buffer_cache/word_manager.h    | 16 +++++++++
+ src/video_core/gpu_thread.cpp                 | 13 +++++++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 17 +++++++++-
+ .../renderer_vulkan/vk_texture_cache.cpp      | 18 +++++++++-
+ .../renderer_vulkan/vk_texture_cache.h        |  9 +++++
+ .../texture_cache/descriptor_table.h          | 13 +++++++
+ .../texture_cache/image_view_base.h           | 11 ++++++
+ src/video_core/texture_cache/texture_cache.h  | 17 +++++++---
+ 12 files changed, 191 insertions(+), 9 deletions(-)
+
+diff --git a/src/common/ps4_perf.h b/src/common/ps4_perf.h
+index 8a3bd467b..171bb58f2 100644
+--- a/src/common/ps4_perf.h
++++ b/src/common/ps4_perf.h
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstdlib>
+ #include <cstring>
+ #include <cstdint>
+ #include <mutex>
+@@ -93,7 +94,8 @@ struct alignas(64) GpuThreadCounters {
+ // wait for, the scheduler's waits), the buffer and texture caches' locks; and its mprotect calls
+ // (the arena's pages the GPU caches, protected and released). Counted on the GPU thread only.
+ enum DrawPhase : int {
+-    PhaseFlush,           // FlushWork, the memory manager's cached writes
++    PhaseFlush,           // FlushWork (the recorded commands to the Vulkan worker)
++    PhaseFlushWrites,     // (04.86) the memory manager's queued writes invalidated (FlushCaching)
+     PhasePipeline,        // the graphics pipeline looked up
+     PhaseLocks,           // the buffer and texture caches' locks taken (waiting for them)
+     PhaseDescriptors,     // texture/sampler descriptors read, storage buffers bound, samplers
+@@ -110,7 +112,7 @@ enum DrawPhase : int {
+     PhaseCount
+ };
+ inline constexpr const char* kDrawPhaseNames[PhaseCount] = {
+-    "flush", "pipeline", "cache locks", "descriptors", "image views", "texture buffers", "vertex/index",
++    "hand-over", "queued writes", "pipeline", "cache locks", "descriptors", "image views", "texture buffers", "vertex/index",
+     "uniforms", "image descriptors", "render targets", "descriptor set", "dynamic state", "record", "tick"};
+ struct alignas(64) GpuDrawPhases {
+     std::atomic<uint64_t> ticks[PhaseCount]{};
+@@ -128,8 +130,25 @@ struct alignas(64) GpuDrawPhases {
+     // those that uploaded and the bytes; and the scheduler's hand-overs to the Vulkan worker
+     std::atomic<uint64_t> buffer_syncs{0}, buffer_sync_ticks{0}, buffer_uploads{0}, buffer_upload_bytes{0};
+     std::atomic<uint64_t> worker_dispatches{0};
++    // (04.86) buffer checks skipped (their memory regions unchanged since the buffer's last check);
++    // the queued writes' invalidation (RasterizerVulkan::InnerInvalidation) on the GPU thread: calls,
++    // ranges, ticks in the texture cache, the buffer cache and the query and shader caches; the
++    // sampler variants found in their one-entry cache
++    std::atomic<uint64_t> buffer_sync_skips{0};
++    std::atomic<uint64_t> inner_calls{0}, inner_ranges{0}, inner_texture_ticks{0}, inner_buffer_ticks{0},
++        inner_other_ticks{0};
++    std::atomic<uint64_t> sampler_variant_lookups{0}, sampler_variant_hits{0};
+ };
+ inline GpuDrawPhases gpu_draw_phases;
++/// (04.86) The draw skips (unchanged buffers' checks, the texture slots' flat ids, the samplers'
++/// variant cache): on unless EDEN_PS4_DRAW_SKIPS=0 (a comparison and a way back)
++inline bool DrawSkipsEnabled() noexcept {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_PS4_DRAW_SKIPS");
++        return !(value != nullptr && value[0] == '0');
++    }();
++    return enabled;
++}
+ 
+ // (04.17) Shaders and pipelines (the tester's question: what the first race builds): those built
+ // at boot from the game's shader cache (vulkan.bin) and those built in play. Pipelines; Eden's
+diff --git a/src/video_core/buffer_cache/buffer_base.h b/src/video_core/buffer_cache/buffer_base.h
+index d7eb21612..5bbbcd842 100644
+--- a/src/video_core/buffer_cache/buffer_base.h
++++ b/src/video_core/buffer_cache/buffer_base.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
+ #include <bit>
+ #include <limits>
+ #include <utility>
+@@ -129,6 +130,13 @@ public:
+         write_tick = write_tick_;
+     }
+ 
++    /// (PS4 04.86) the range last checked for the CPU's writes (SynchronizeBuffer) and the
++    /// generations of its memory regions then: a check of a range within it, the generations the
++    /// same, would find nothing
++    DAddr sync_begin = 0;
++    DAddr sync_end = 0;
++    std::array<u64, 2> sync_generations{};
++
+ private:
+     VAddr cpu_addr = 0;
+     BufferFlagBits flags{};
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index e273b4be5..6903bf1f5 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1807,6 +1807,38 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     // (PS4 04.85) timed on the GPU thread (common/ps4_perf.h)
+     Common::PS4Perf::GpuWaitScope ps4_sync{Common::PS4Perf::gpu_draw_phases.buffer_syncs,
+                                            Common::PS4Perf::gpu_draw_phases.buffer_sync_ticks};
++    // (PS4 04.86) Skipped when nothing can have changed: the range lies within the one this buffer
++    // was last checked over, and no page in its memory regions has been marked CPU-modified or
++    // untracked since (their generations are the same). The check would find nothing to upload and
++    // no page to protect again. 04.85: 3.5 checks a draw in Breath of the Wild, 1 in 50 uploading.
++    // Under the buffer cache's lock, as every marking is (the generations are read before the check
++    // so that a marking during it is seen by the next one).
++    std::array<u64, 2> generations{};
++    const bool gated = Common::PS4Perf::DrawSkipsEnabled() &&
++                       memory_tracker.RangeGenerations(device_addr, size, generations);
++    if (gated && generations == buffer.sync_generations && device_addr >= buffer.sync_begin &&
++        device_addr + size <= buffer.sync_end) {
++        if (Common::PS4Perf::on_gpu_thread) {
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.buffer_sync_skips);
++        }
++        return true;
++    }
++    const auto remember_check = [&] {
++        if (!gated) {
++            buffer.sync_begin = buffer.sync_end = 0;
++            return;
++        }
++        // (a range next to or overlapping the last one, with nothing marked since: both clean)
++        if (generations == buffer.sync_generations && device_addr <= buffer.sync_end &&
++            device_addr + size >= buffer.sync_begin && buffer.sync_end != 0) {
++            buffer.sync_begin = (std::min)(buffer.sync_begin, device_addr);
++            buffer.sync_end = (std::max)(buffer.sync_end, device_addr + size);
++        } else {
++            buffer.sync_begin = device_addr;
++            buffer.sync_end = device_addr + size;
++        }
++        buffer.sync_generations = generations;
++    };
+     upload_copies.clear();
+     u64 total_size_bytes = 0;
+     u64 largest_copy = 0;
+@@ -1830,6 +1862,8 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+         });
+         add_upload(upload_start, device_addr_out + range_size);
+     });
++    // (PS4 04.86) the range's pages are clean now (their CPU-modified and untracked bits cleared)
++    remember_check();
+     if (total_size_bytes == 0) {
+         return true;
+     }
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+index b8547f314..00653a99a 100644
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -136,6 +136,26 @@ public:
+         cached_pages.clear();
+     }
+ 
++    /// (PS4 04.86) The generations of the regions (at most two) a range lies in, for
++    /// BufferCache::SynchronizeBuffer's skip; false when it spans more, or a region doesn't exist yet
++    [[nodiscard]] bool RangeGenerations(VAddr cpu_address, u64 size, std::array<u64, 2>& out) const noexcept {
++        if (size == 0) {
++            return false;
++        }
++        const size_t first = cpu_address >> HIGHER_PAGE_BITS;
++        const size_t last = (cpu_address + size - 1) >> HIGHER_PAGE_BITS;
++        if (last - first > 1 || last >= NUM_HIGH_PAGES) {
++            return false;
++        }
++        const Manager* const a = top_tier[first];
++        const Manager* const b = last != first ? top_tier[last] : nullptr;
++        if (a == nullptr || (last != first && b == nullptr)) {
++            return false;
++        }
++        out = {a->generation, b != nullptr ? b->generation : 0};
++        return true;
++    }
++
+     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
+     template <typename Func>
+     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+@@ -250,6 +270,7 @@ private:
+         }
+         Manager* new_manager = free_managers.front();
+         new_manager->cpu_addr = base_cpu_address;
++        new_manager->generation = NextTrackerGeneration();  // (PS4 04.86) a region of its own now
+         free_managers.pop_front();
+         return new_manager;
+     }
+diff --git a/src/video_core/buffer_cache/word_manager.h b/src/video_core/buffer_cache/word_manager.h
+index 76d608bbe..5d5011534 100644
+--- a/src/video_core/buffer_cache/word_manager.h
++++ b/src/video_core/buffer_cache/word_manager.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <bit>
+ #include <limits>
+ #include <span>
+@@ -34,6 +35,13 @@ enum class Type {
+     Max
+ };
+ 
++/// (PS4 04.86) A region's generation: a new value, unique across every region, each time a page in
++/// it is marked CPU-modified or untracked (WordManager::generation)
++inline u64 NextTrackerGeneration() noexcept {
++    static std::atomic<u64> next{1};
++    return next.fetch_add(1, std::memory_order_relaxed);
++}
++
+ template <class DeviceTracker, size_t stack_words, size_t size_bytes>
+ struct WordManager {
+     static constexpr size_t num_words = Common::DivCeil(size_bytes, BYTES_PER_WORD);
+@@ -125,6 +133,9 @@ struct WordManager {
+                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
+             }
+             if (enable) {
++                if (type == Type::CPU || type == Type::CachedCPU) {
++                    generation = NextTrackerGeneration();  // (PS4 04.86)
++                }
+                 state_words[index] |= mask;
+                 if (type == Type::CPU || type == Type::CachedCPU)
+                     untracked_words[index] |= mask;
+@@ -244,6 +255,7 @@ struct WordManager {
+     }
+ 
+     void FlushCachedWrites() noexcept {
++        generation = NextTrackerGeneration();  // (PS4 04.86) cached writes become CPU-modified pages
+         auto const cached_words = Span(Type::CachedCPU);
+         auto const untracked_words = Span(Type::Untracked);
+         auto const cpu_words = Span(Type::CPU);
+@@ -322,6 +334,10 @@ struct WordManager {
+     std::array<u64, size_t(Type::Max) * num_words> heap = {};
+     DeviceTracker* tracker = nullptr;
+     VAddr cpu_addr = 0;
++    /// (PS4 04.86) changed (to a value unique across every region) whenever a page here is marked
++    /// CPU-modified or untracked; unchanged since a buffer's last check over a range here means the
++    /// check would find nothing to upload or protect again (BufferCache::SynchronizeBuffer)
++    u64 generation = NextTrackerGeneration();
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 59ba884f1..c0bde4600 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -14,6 +14,7 @@
+ #include <immintrin.h>
+ #include "common/cpu_features.h"
+ #endif
++#include <cstdio>
+ #include "core/core.h"
+ #include "core/frontend/graphics_context.h"
+ #include "video_core/gpu_split.h"
+@@ -127,6 +128,18 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 state.cv.notify_all();
+             }
+         }
++        // (04.86) the draw counters, for desktop comparisons (EDEN_PS4_DRAW_STATS=1)
++        if (const char* stats = std::getenv("EDEN_PS4_DRAW_STATS"); stats != nullptr && stats[0] == '1') {
++            const auto& d = Common::PS4Perf::gpu_draw_phases;
++            std::fprintf(stderr,
++                         "draw stats: draws %llu, buffer checks %llu, skipped %llu, uploading %llu; sampler variants "
++                         "%llu, from the cache %llu; queued-write invalidations %llu (%llu ranges)\n",
++                         (unsigned long long)d.draws.load(), (unsigned long long)d.buffer_syncs.load(),
++                         (unsigned long long)d.buffer_sync_skips.load(), (unsigned long long)d.buffer_uploads.load(),
++                         (unsigned long long)d.sampler_variant_lookups.load(),
++                         (unsigned long long)d.sampler_variant_hits.load(), (unsigned long long)d.inner_calls.load(),
++                         (unsigned long long)d.inner_ranges.load());
++        }
+     });
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index aa0eddc4f..802d6d8fd 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -245,8 +245,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         P::DrawLapEnd(P::PhaseTickWork);
+     };
+     FlushWork();
+-    gpu_memory->FlushCaching();
+     P::DrawLap(P::PhaseFlush);
++    gpu_memory->FlushCaching();
++    P::DrawLap(P::PhaseFlushWrites);  // (04.86) split from the hand-overs
+ 
+     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+     P::DrawLap(P::PhasePipeline);
+@@ -789,24 +790,38 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
+ }
+ 
+ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
++    // (PS4 04.86) its three sides timed on the GPU thread (the queued writes of each draw)
++    namespace P = Common::PS4Perf;
++    const bool timed = P::on_gpu_thread;
++    u64 t0 = timed ? P::Ticks() : 0;
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+         for (const auto& [addr, size] : sequences) {
+             texture_cache.WriteMemory(addr, size);
+         }
+     }
++    u64 t1 = timed ? P::Ticks() : 0;
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
+         for (const auto& [addr, size] : sequences) {
+             buffer_cache.WriteMemory(addr, size);
+         }
+     }
++    u64 t2 = timed ? P::Ticks() : 0;
+     {
+         for (const auto& [addr, size] : sequences) {
+             query_cache.InvalidateRegion(addr, size);
+             pipeline_cache.InvalidateRegion(addr, size);
+         }
+     }
++    if (timed) {
++        const u64 t3 = P::Ticks();
++        P::Bump(P::gpu_draw_phases.inner_calls);
++        P::Bump(P::gpu_draw_phases.inner_ranges, sequences.size());
++        P::Bump(P::gpu_draw_phases.inner_texture_ticks, t1 - t0);
++        P::Bump(P::gpu_draw_phases.inner_buffer_ticks, t2 - t1);
++        P::Bump(P::gpu_draw_phases.inner_other_ticks, t3 - t2);
++    }
+ }
+ 
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 583cb6eda..9a51386e1 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -15,6 +15,7 @@
+ #include <boost/container/small_vector.hpp>
+ #include <bit>
+ #include <numeric>
++#include "common/ps4_perf.h"
+ #include "common/bit_util.h"
+ #include "common/settings.h"
+ 
+@@ -2938,12 +2939,27 @@ VkSampler Sampler::Emplace(VariantKey key) {
+ }
+ 
+ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
++    const bool full = variants.size() >= MAX_VARIANTS;
++    if (Common::PS4Perf::on_gpu_thread)
++        Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.sampler_variant_lookups);
++    // (PS4 04.86) the variant found for this view last time (its key would be the same)
++    if (image_view.serial == last_view_serial && is_depth == last_is_depth && full == last_full &&
++        last_variant != VK_NULL_HANDLE && Common::PS4Perf::DrawSkipsEnabled()) {
++        if (Common::PS4Perf::on_gpu_thread)
++            Common::PS4Perf::Bump(Common::PS4Perf::gpu_draw_phases.sampler_variant_hits);
++        return last_variant;
++    }
+     VariantKey key = MakeKey(image_view, is_depth);
+-    if (variants.size() >= MAX_VARIANTS) {
++    if (full) {
+         key.srgb_border = false;
+         key.swizzle = {};
+     }
+     if (const VkSampler existing = Find(key); existing != VK_NULL_HANDLE) {
++        // (only a found one: a new one's creation can fail, and is tried again next time)
++        last_view_serial = image_view.serial;
++        last_is_depth = is_depth;
++        last_full = full;
++        last_variant = existing;
+         return existing;
+     }
+     return Emplace(key);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 2e9736f70..ccc835c80 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -562,6 +562,15 @@ private:
+     CustomBorderColorBudget custom_border_color_budget;
+     std::vector<Variant> variants;
+ 
++    /// (PS4 04.86) The last image view this sampler's variant was found for (its serial, whether
++    /// depth, whether the variants were full then) and that variant: the same view gets the same
++    /// key, and a found variant stays (variants are only added). 04.84: MakeKey and Find for every
++    /// texture of every draw.
++    u64 last_view_serial{0};
++    bool last_is_depth{};
++    bool last_full{};
++    VkSampler last_variant{VK_NULL_HANDLE};
++
+     const Device* device_ptr{nullptr};
+     VkSamplerCreateInfo base_ci{};
+     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index c60685f95..f73ddd706 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -88,10 +88,23 @@ public:
+         std::fill(read_descriptors.begin(), read_descriptors.begin() + old_size, 0);
+         //
+         descriptors.resize(num_descriptors);
++        slot_ids.resize(num_descriptors);  // (PS4 04.86)
++    }
++
++    /// (PS4 04.86) The texture cache's id for a slot (an image view's or a sampler's), set together
++    /// with its map entry when the slot's descriptor is read as new; valid while the slot reads as
++    /// unchanged (Read's second false), which is the only time it is used: a flat array instead of
++    /// the per-channel map's lookup for every texture of every draw
++    [[nodiscard]] u32 SlotId(u32 index) const noexcept {
++        return slot_ids[index];
++    }
++    void SetSlotId(u32 index, u32 id) noexcept {
++        slot_ids[index] = id;
+     }
+ 
+     std::vector<u64> read_descriptors;
+     std::vector<T> descriptors;
++    std::vector<u32> slot_ids;  // (PS4 04.86) see SlotId
+     GPUVAddr current_gpu_addr{};
+     u32 current_limit{};
+     const u8* host_pool{};                  // (PS4 04.16) the pool in host memory, or nullptr
+diff --git a/src/video_core/texture_cache/image_view_base.h b/src/video_core/texture_cache/image_view_base.h
+index 87549ffff..8204e6b7d 100644
+--- a/src/video_core/texture_cache/image_view_base.h
++++ b/src/video_core/texture_cache/image_view_base.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #include "common/common_funcs.h"
+ #include "video_core/surface.h"
+ #include "video_core/texture_cache/types.h"
+@@ -23,6 +25,12 @@ enum class ImageViewFlagBits : u16 {
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(ImageViewFlagBits)
+ 
++/// (PS4 04.86) A number no other image view has had (ImageViewBase::serial)
++inline u64 NextImageViewSerial() noexcept {
++    static std::atomic<u64> next{1};
++    return next.fetch_add(1, std::memory_order_relaxed);
++}
++
+ struct ImageViewBase {
+     explicit ImageViewBase(const ImageViewInfo& info, const ImageInfo& image_info, ImageId image_id,
+                            GPUVAddr addr);
+@@ -36,6 +44,9 @@ struct ImageViewBase {
+     [[nodiscard]] bool SupportsAnisotropy() const noexcept;
+ 
+     ImageId image_id{};
++    /// (PS4 04.86) unique to this view: a cache keyed by it can't mistake a later view in the same
++    /// slot for this one (Vulkan's Sampler::HandleFor)
++    u64 serial = NextImageViewSerial();
+     GPUVAddr gpu_addr = 0;
+     PixelFormat format{};
+     ImageViewType type{};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index dfb417a32..30fa1b9d2 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -328,9 +328,12 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
+     if (is_new) {
+         auto const id = FindSampler(descriptor, compute);
+         channel_state->sampler_ids.insert_or_assign(map_index, id);
++        table.SetSlotId(index, id.index);  // (PS4 04.86) the same id, in a flat array
+         return id;
+     }
+-    return channel_state->sampler_ids.find(map_index)->second;
++    if (!Common::PS4Perf::DrawSkipsEnabled())
++        return channel_state->sampler_ids.find(map_index)->second;
++    return SamplerId{table.SlotId(index)};  // (PS4 04.86) what sampler_ids holds for it
+ }
+ 
+ template <class P>
+@@ -580,15 +583,19 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+                 pair->second = CreateImageView(descriptor);
+             PrepareImageView(pair->second, false, false);
+             channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
++            table.SetSlotId(index, pair->second.index);  // (PS4 04.86) the same id, in a flat array
+             return pair->second;
+         }
+         channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
++        table.SetSlotId(index, NULL_IMAGE_VIEW_ID.index);
+         return NULL_IMAGE_VIEW_ID;
+     }
+-    auto const it = channel_state->image_view_ids.find(map_index);
+-    if (it->second != NULL_IMAGE_VIEW_ID)
+-        PrepareImageView(it->second, false, false);
+-    return it->second;
++    // (PS4 04.86) what image_view_ids holds for this slot, without the map's lookup
++    const ImageViewId view_id = Common::PS4Perf::DrawSkipsEnabled() ? ImageViewId{table.SlotId(index)}
++                                                                     : channel_state->image_view_ids.find(map_index)->second;
++    if (view_id != NULL_IMAGE_VIEW_ID)
++        PrepareImageView(view_id, false, false);
++    return view_id;
+ }
+ 
+ template <class P>
+-- 
+2.43.0
+

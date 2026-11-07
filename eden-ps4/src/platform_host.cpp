@@ -6,6 +6,8 @@
 // For testing programs that draw and read the controller, without a screen or a controller:
 //   EDEN_PS4_FRAMES=<dir>   saves frames there as PPM images: frame-0001.ppm (the first), then
 //                           one every second, and last.ppm (the last one, at exit)
+//   EDEN_PS4_FRAMES_EVERY=<n> (04.86) every n-th frame instead of one a second: the same frame
+//                           numbers in every run, for comparing two runs' frames
 //   EDEN_PS4_LOG=<filter>   Eden's log filter, e.g. "*:Info Service.VI:Debug" (default: warnings)
 //   EDEN_PS4_INPUT=<script> player 1's buttons over time: "<seconds>:<buttons>,..." with the
 //                           buttons joined by '+' (A B X Y L R ZL ZR Plus Minus Left Up Right
@@ -89,7 +91,12 @@ void SaveFrame(std::span<const uint32_t> pixels, uint32_t width, uint32_t height
     g_last_width = width;
     g_last_height = height;
     const auto now = std::chrono::steady_clock::now();
-    if (++g_frame_count == 1 || now >= g_next_save) {
+    static const unsigned every = [] {
+        const char* env = std::getenv("EDEN_PS4_FRAMES_EVERY");
+        return env ? unsigned(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    ++g_frame_count;
+    if (g_frame_count == 1 || (every != 0 ? g_frame_count % every == 0 : now >= g_next_save)) {
         char name[64];
         std::snprintf(name, sizeof(name), "/frame-%04u.ppm", g_frame_count);
         WritePpm(g_frames_dir + name, pixels, width, height);

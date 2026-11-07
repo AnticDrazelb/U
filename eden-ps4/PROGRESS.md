@@ -29,6 +29,9 @@ are the patches in [patches/](patches) (0001-0092, applied in order to Eden; see
   where Eden checks them every draw, and write constant-buffer updates into the buffer directly.
   04.86's candidates: buffer checks skipped when their memory region's modification count is
   unchanged (exact), texture bindings cached per slot, and the flush part's timer split.
+- **04.86 has all three** (patch 0177; STATUS.md). The desktop can now run Eden's Vulkan renderer on
+  lavapipe (`EDEN_PS4_RENDERER=vulkan`, `VK_ICD_FILENAMES=.../lvp_icd.json`), which tests the buffer
+  and texture caches, which the null renderer doesn't use.
 - **Beyond the Switch** ([docs/arm-to-x86-translators.md](docs/arm-to-x86-translators.md)): most
   ARM emulators on x86 (Azahar, Panda3DS, Vita3K) use dynarmic too. Berberis's loop pass (every guest
   register a loop uses kept in host registers) is a smaller first step than a second tier: an
