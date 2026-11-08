@@ -76,7 +76,7 @@ export NXDK_DIR=~/emu/nxdk PATH="$HOME/emu/nxdk/bin:/opt/llvm21/bin:$PATH"
 ```
 Run it from a scratch folder, because it creates `xbox-data/` there.
 
-**Regression set** (must stay at 0 failures):
+**Regression set** (must stay at 0 failures): `tests/regression.sh` runs all of it on the desktop.
 - `tests/kernel-test/bin/default.xbe`
 - `tests/seh-test/bin/default.xbe`
 - `tests/disc-test/disc-test.iso`
@@ -93,6 +93,24 @@ cd ~/emu/run && DISPLAY=:99 timeout 25 ~/emu/shadPS4/build/shadps4 ~/emu/run/gam
 Its files land in `~/emu/run/user/data/xbox-core/`. Its USB drive is `~/emu/run/user/mnt/usb0`.
 They only go there if `~/emu/run/user` exists (otherwise `~/.local/share/shadPS4`). The first run
 spends most of 25 s setting shadPS4 up: if nothing was written, run it again.
+
+**The PS4's system in a VM** (`tests/freebsd-vm/run.sh`): the console's kernel and libkernel come
+from FreeBSD, so a FreeBSD 14.3 VM under QEMU (no KVM needed: its software CPU, set to the Jaguar's
+instruction set) runs a FreeBSD build of the core (`src/platform_freebsd.cpp`: the kernel's own
+sigaction, `amd64_set_fsbase`, 16 KiB pages, the executable at 0x400000, as on the PS4). It
+reproduces the console's crash: `XB_SIGNAL_ROUTE=libthr` (libthr's sigaction and its wrapper) dies
+silently at the first guest fault, exit 139, as the PS4 did. `run.sh boot`, `run.sh sync` (copy and
+build, ~10 min), `run.sh test` (kernel, SEH, disc, triangle). Use it for anything touching signals,
+`fs`, threads or memory mapping before sending a package.
+
+**Games to play here** (`tests/games/`): open-source nxdk games, legal to build and ship.
+ClassiCube (github.com/ClassiCube/ClassiCube, `make xbox` with nxdk; the package carries it as
+`sample: classicube`) is a 3D block game drawn on the NV2A. It needs a texture pack it would
+download: `classicube-pack.py` draws one from nothing, and the package puts it on E: at launch
+(`/app0/hdd-seed` copied into `/data/xbox-core/hdd` where missing). Desktop:
+`mkdir -p xbox-data/e/ClassiCube/texpacks`, the pack there as `default.zip` and `classicube.zip`;
+then `--pad "down@17,down@19,down@21,down@23,down@25,down@27,a@29"` walks the launcher to
+Singleplayer, and `--shots s` saves the screen every second.
 
 ## 3. What the console logs give you
 
@@ -223,7 +241,11 @@ again. So a step that kills the app costs one launch.
    - XAPI formatting the cache partition: raw writes to partition 3–5, `IOCTL`s (`files: device control …` lines), `NtFsControlFile`
    - Halo's D3D start-up on the NV2A: GPU methods, register faults at `0xfd…`
    - DirectSound and the APU
-   - the 6 kernel imports not implemented yet: `IoInvalidDeviceRequest`, `NtUserIoApcDispatcher`, `IoStartPacket`, `IofCompleteRequest`, `IoStartNextPacket`, `IoMarkIrpMustComplete`
+   - Halo's 6 imports that were missing are done (`NtUserIoApcDispatcher` for real; the IRP ones as
+     NT does them, each logged as `kernel: IRP …`/`IoStartPacket …`: a line there means Halo's own
+     driver code ran, and the driver model may need more)
+   - overlapped I/O now ends as NT's does (event set, APC queued, completion port posted): before,
+     a game waiting on an overlapped read's event or a `ReadFileEx` routine waited forever
 
 4. **Performance on the console:** every hardware-register access now costs a signal, two context
    switches and two `amd64_set_fsbase` calls. xbox-bench measured 7.3 µs per access before this
@@ -235,6 +257,12 @@ again. So a step that kills the app costs one launch.
 
 6. **Optional leftovers:** NV2A gaps (W-buffering, bump maps, signed blends, line widths), and the
    APU's DSPs.
+
+7. **Drawing speed.** The renderer is software. ClassiCube's world draws at ~11 frames/s on the
+   desktop (3 raster threads); the time is spread over the pixel pipeline (combiners, texture
+   stages, swizzling), with no single hot spot. Before the w/z clipping fix (8409972) it was 1
+   frame/s. For Halo at speed on the PS4 the NV2A must eventually draw on the PS4's GPU: the repo
+   already has Mesa for the PS4 (Crema's), which is the way there.
 
 ## 6. Things to know
 

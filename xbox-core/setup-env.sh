@@ -169,6 +169,12 @@ if [ ! -f "$NX/NevolutionX.iso" ]; then
     make -C "$NX" -j"$(nproc)" > "$LOG/nevolutionx.log" 2>&1 || echo "NevolutionX failed: $LOG/nevolutionx.log"
 fi
 
+CC="$HOME/emu/games/ClassiCube"
+if [ ! -f "$CC/ClassiCube-xbox.iso" ]; then
+    [ -d "$CC/.git" ] || git clone -q --depth 1 https://github.com/ClassiCube/ClassiCube "$CC"
+    make -C "$CC" xbox -j"$(nproc)" > "$LOG/classicube.log" 2>&1 || echo "ClassiCube failed: $LOG/classicube.log"
+fi
+
 if [ "${1:-}" = shadps4 ]; then
     step "shadPS4 (~/emu/shadPS4/build/shadps4)"
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libx11-dev libxext-dev libxrandr-dev \

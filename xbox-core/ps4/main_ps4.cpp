@@ -373,6 +373,50 @@ struct Entry
     std::string name, path;
 };
 
+// Files the package carries for the hard disk (/app0/hdd-seed/<partition>/...: a game's data that
+// would otherwise be downloaded, such as ClassiCube's texture pack) copied into its folders when
+// they aren't there yet; what a game has written itself is never replaced.
+void SeedHardDisk(const std::string& from, const std::string& to)
+{
+    DIR* d = opendir(from.c_str());
+    if (!d)
+        return;
+    mkdir(to.c_str(), 0777);
+    while (dirent* e = readdir(d))
+    {
+        const std::string name = e->d_name;
+        if (name == "." || name == "..")
+            continue;
+        const std::string src = from + "/" + name, dst = to + "/" + name;
+        struct stat st;
+        if (stat(src.c_str(), &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode))
+        {
+            SeedHardDisk(src, dst);
+            continue;
+        }
+        struct stat have;
+        if (stat(dst.c_str(), &have) == 0)
+            continue;
+        FILE* in = std::fopen(src.c_str(), "rb");
+        FILE* out = in ? std::fopen(dst.c_str(), "wb") : nullptr;
+        if (in && out)
+        {
+            char buf[65536];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0)
+                std::fwrite(buf, 1, n, out);
+            Log("launch: %s put on the hard disk (%s)", name.c_str(), dst.c_str());
+        }
+        if (in)
+            std::fclose(in);
+        if (out)
+            std::fclose(out);
+    }
+    closedir(d);
+}
+
 // The samples in the package are /app0/samples/<name>.xbe; the player's own games are
 // /data/xbox-core/games/<name>/default.xbe (with their files beside them: that folder is D:) or disc
 // images, /data/xbox-core/games/<name>.iso (or an .iso inside a game's folder).
@@ -808,6 +852,7 @@ int main()
         std::string error;
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
+        SeedHardDisk("/app0/hdd-seed", "/data/xbox-core/hdd");
         SetDataDirectory("/data/xbox-core/hdd");
         diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks, [] { WriteLogBundle({}); });
         // the logs onto the USB drives every 15 s while it runs: a console that freezes hard

@@ -59,6 +59,15 @@ for p in lines:
             cp "$HERE/tests/$t-test/bin/default.xbe" "$stage/samples/test-$t.xbe"
         fi
     done
+    # open-source games built with nxdk (tests/games/README.md): ClassiCube, with a texture pack drawn
+    # by tests/games/classicube-pack.py put on E: at launch (hdd-seed)
+    GAMES_DIR="${XB_GAMES_DIR:-$HOME/emu/games}"
+    if [ -f "$GAMES_DIR/ClassiCube/ClassiCube-xbox.iso" ]; then
+        cp "$GAMES_DIR/ClassiCube/ClassiCube-xbox.iso" "$stage/samples/classicube.iso"
+        mkdir -p "$stage/hdd-seed/e/ClassiCube/texpacks"
+        python3 "$HERE/tests/games/classicube-pack.py" "$stage/hdd-seed/e/ClassiCube/texpacks/default.zip" >/dev/null
+        cp "$stage/hdd-seed/e/ClassiCube/texpacks/default.zip" "$stage/hdd-seed/e/ClassiCube/texpacks/classicube.zip"
+    fi
     if [ -f "$HERE/tests/disc-test/disc-test.iso" ]; then
         cp "$HERE/tests/disc-test/disc-test.iso" "$stage/samples/test-disc.iso"
     fi
