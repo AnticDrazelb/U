@@ -23,6 +23,7 @@
 #include "kernel.h"
 
 namespace xb {
+void LogLaunchData();
 
 std::atomic<bool> g_quit{false};
 double g_time_limit = 0;
@@ -1038,7 +1039,9 @@ void InitKernel()
     } END;
     K(HalReturnToFirmware)
     {
+        // 0 halt, 1 reboot, 2 quick reboot (XLaunchNewImage: to another XBE, or the dashboard), 3, 4 fatal
         Log("kernel: HalReturnToFirmware(%u): the program ended", c.Arg(0));
+        LogLaunchData();
         g_quit = true;
         WakeAll();
         ExitThread();
@@ -2295,8 +2298,38 @@ void KernelCall(GateFrame* frame, GuestThread* thread)
         StopWhileSuspended(thread);
 }
 
+// What a program leaving through XLaunchNewImage left for the next one (LaunchDataPage): an XBE to
+// start, or the dashboard and why (XAPI's fatal errors go there: a bad hard disk, ...).
+void LogLaunchData()
+{
+    const u32 variable = g_data[164]; // LaunchDataPage
+    const u32 page = variable ? Read<u32>(variable) : 0;
+    if (!page)
+    {
+        Log("kernel: no launch data (LaunchDataPage is null)");
+        return;
+    }
+    const u32 type = Read<u32>(page), title = Read<u32>(page + 4), flags = Read<u32>(page + 0x210);
+    std::string path;
+    for (u32 i = 0; i < 520; i++)
+    {
+        const char ch = char(Read<u8>(page + 8 + i));
+        if (!ch)
+            break;
+        path += ch;
+    }
+    const char* kind = type == 0 ? "start this title" : type == 1 ? "the dashboard" : type == 2 ? "from the dashboard" : "?";
+    Log("kernel: launch data at %#x: type %u (%s), title %08X, path \"%s\", flags %#x; data %08x %08x %08x %08x %08x %08x", page,
+        type, kind, title, path.c_str(), flags, Read<u32>(page + 0x400), Read<u32>(page + 0x404), Read<u32>(page + 0x408),
+        Read<u32>(page + 0x40c), Read<u32>(page + 0x410), Read<u32>(page + 0x414));
+    if (type == 1)
+        Log("kernel: (to the dashboard: reason %u, parameters %#x %#x; reason 2 is an error, XAPI's fatal ones)",
+            Read<u32>(page + 0x400), Read<u32>(page + 0x408), Read<u32>(page + 0x40c));
+}
+
 int RunXbe()
 {
+    diag::SetRunning(true);
     // the start-up thread: the XBE's entry point, with the XBE's TLS
     const u32 tls = g_xbe.tls_directory
                         ? ((g_xbe.tls_raw_end - g_xbe.tls_raw_start + g_xbe.tls_zero_fill + 15) & ~15u) + 4
@@ -2321,6 +2354,10 @@ int RunXbe()
     }
     g_quit = true;
     WakeAll();
+    // every thread's last kernel calls, into the log (and so the log bundle): how it ended
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    diag::LogState("the program's end");
+    diag::SetRunning(false);
     return 0;
 }
 

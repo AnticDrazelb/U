@@ -677,6 +677,22 @@ int main()
     // drives first thing, before anything that could fail; this session's log also goes to a drive
     // line by line, so a crash leaves it there
     std::rename(kLogFile, "/data/xbox-core/log-previous.txt");
+    // crash.log gets every crash appended: each start marked, so a report says which build and run it
+    // came from (an older build's addresses name the wrong functions); kept from growing too big
+    {
+        struct stat st;
+        if (stat("/data/xbox-core/crash.log", &st) == 0 && st.st_size > 256 * 1024)
+            std::rename("/data/xbox-core/crash.log", "/data/xbox-core/crash-previous.log");
+        if (FILE* f = std::fopen("/data/xbox-core/crash.log", "a"))
+        {
+            const time_t now = time(nullptr);
+            char when[32];
+            std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+            std::fprintf(f, "\n--- xbox-core %s (built %s %s) started %s: what follows is from this run\n", XB_VERSION,
+                         __DATE__, __TIME__, when);
+            std::fclose(f);
+        }
+    }
     g_log_file = std::fopen(kLogFile, "w");
     g_system = {std::string("xbox-core ") + XB_VERSION + " (written as the app started)"};
     WriteLogBundle({});

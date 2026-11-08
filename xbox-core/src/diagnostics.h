@@ -42,6 +42,9 @@ void LogState(const char* title);
 // with the host's thread stacks if `host_stacks` is given (the PS4's crash log can).
 void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char* file, const char* title));
 
+// A program running (RunXbe) or not: the watchdog watches only while one is, from its start.
+void SetRunning(bool running);
+
 double Seconds(); // since the process started
 
 } // namespace xb::diag

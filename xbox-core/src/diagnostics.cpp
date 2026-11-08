@@ -40,17 +40,32 @@ constexpr u32 kMethodRing = 256;
 MethodRecord g_method_ring[kMethodRing];
 std::atomic<u32> g_method_next{0};
 
-void Put(int fd, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-void Put(int fd, const char* fmt, ...)
+// to a file with write() (a crash report's: no locks, no allocation), or into a string
+struct Out
+{
+    int fd = -1;
+    std::string* text = nullptr;
+};
+void Put(Out out, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+void Put(Out out, const char* fmt, ...)
 {
     char line[512];
     va_list ap;
     va_start(ap, fmt);
     const int n = std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    if (n > 0)
-        (void)!write(fd, line, size_t(std::min(n, int(sizeof(line)) - 1)));
+    if (n <= 0)
+        return;
+    const size_t length = size_t(std::min(n, int(sizeof(line)) - 1));
+    if (out.text)
+        out.text->append(line, length);
+    else
+        (void)!write(out.fd, line, length);
 }
+
+std::atomic<bool> g_run{false};
+std::atomic<u32> g_run_number{0};
+std::atomic<u32> g_failures_logged{0};
 
 const char* Name(u32 ordinal)
 {
@@ -111,7 +126,14 @@ void CallEnded(GuestThread* t, u32 result)
         return;
     const u32 n = t->calls_next.load();
     if (n)
-        t->calls[(n - 1) % GuestThread::kCallRecords].result = result;
+    {
+        CallRecord& r = t->calls[(n - 1) % GuestThread::kCallRecords];
+        r.result = result;
+        // an NTSTATUS error (nothing of the guest's is at 0xc0000000: no pointer looks like one)
+        if (result >= 0xC0000000u && result < 0xC0010000u && g_failures_logged++ < 3000)
+            Log("kernel: %s(%#x, %#x, %#x, %#x) from %#x failed: %#x", Name(r.ordinal), r.a0, r.a1, r.a2, r.a3, r.eip,
+                result);
+    }
     t->in_call = 0;
 }
 
@@ -131,7 +153,7 @@ void RegisterThread(GuestThread* t)
     }
 }
 
-void WriteStateLockFree(int fd)
+void WriteState(Out fd)
 {
     const float now = float(Seconds());
     Put(fd, "guest state at %.3f s: %llu kernel calls, %llu frames, %llu draws, %llu GPU methods, %llu exceptions\n", now,
@@ -167,24 +189,13 @@ void WriteStateLockFree(int fd)
     }
 }
 
+void WriteStateLockFree(int fd) { WriteState(Out{fd, nullptr}); }
+
 void LogState(const char* title)
 {
     Log("==== %s: the guest's state", title);
-    // the lock-free text, through a pipe-less temporary file, into the log line by line
-    char path[] = "/tmp/xbox-core-state-XXXXXX";
-    int fd = mkstemp(path);
     std::string text;
-    if (fd >= 0)
-    {
-        WriteStateLockFree(fd);
-        lseek(fd, 0, SEEK_SET);
-        char buf[4096];
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof(buf))) > 0)
-            text.append(buf, size_t(n));
-        close(fd);
-        unlink(path);
-    }
+    WriteState(Out{-1, &text});
     size_t at = 0;
     while (at < text.size())
     {
@@ -205,6 +216,13 @@ void LogState(const char* title)
     }
 }
 
+void SetRunning(bool running)
+{
+    if (running)
+        g_run_number++;
+    g_run = running;
+}
+
 void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*, const char*))
 {
     std::thread([hang_file, host_stacks] {
@@ -213,10 +231,20 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
         u32 screen_changes = 0;
         double last_activity = Seconds(), last_stats = Seconds();
         bool any_activity = false, hung = false;
+        u32 run_number = 0;
+        double run_start = Seconds();
         for (;;)
         {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             const double now = Seconds();
+            if (!g_run) // no program running (not yet, or it ended): nothing to watch
+                continue;
+            if (run_number != g_run_number)
+            {
+                run_number = g_run_number;
+                run_start = last_activity = last_stats = now;
+                any_activity = hung = false;
+            }
             const u64 frames = g_frames, draws = g_draws;
             static u64 seen_frames = 0, seen_draws = 0;
             // the picture itself, sampled (a program drawing into one framebuffer flips nothing)
@@ -270,16 +298,16 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
             }
             // the watchdog
             const double quiet = now - last_activity;
-            if (!hung && ((any_activity && quiet >= 20) || (!any_activity && now >= 90)))
+            if (!hung && ((any_activity && quiet >= 20) || (!any_activity && now - run_start >= 90)))
             {
                 hung = true;
                 const char* reason = any_activity ? "no frames, draws or picture changes for 20 s after they had started"
-                                                  : "no frame, draw or picture 90 s after the start";
+                                                  : "no frame, draw or picture 90 s after the program started";
                 Log("hang watchdog: %s: every thread's state in %s and below", reason, hang_file.c_str());
                 const int fd = open(hang_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd >= 0)
                 {
-                    Put(fd, "hang watchdog at %.1f s: %s\n\n", now, reason);
+                    Put(Out{fd}, "hang watchdog at %.1f s: %s\n\n", now, reason);
                     WriteStateLockFree(fd);
                     close(fd);
                 }

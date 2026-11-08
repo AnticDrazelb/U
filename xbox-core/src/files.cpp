@@ -2,9 +2,12 @@
 // \Device\CdRom0 are the game's folder, or its disc image (read-only, through xiso.cpp); the hard
 // disk's partitions (E:, T:, U:, Z: and \Device\Harddisk0\PartitionN) are folders under a data
 // folder. Also the XcSHA* exports.
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 
@@ -56,7 +59,39 @@ struct HostFile
     std::vector<std::string> listing; // NtQueryDirectoryFile: the names, read at the first query
     size_t next = 0;
     std::string pattern;
+    int raw = -1;      // the raw disk (0) or one of its partitions opened as a volume (1-5)
+    u64 raw_size = 0;  // its size: reads past what was ever written there give zeros, as a disk does
 };
+
+// The retail hard disk's layout (partition 1 E:, 2 C:, 3-5 the X:, Y:, Z: cache partitions; 0 the
+// whole disk, its first 512 KiB the config sectors: the cache table XAPI reads, the refurb info).
+struct RawPartition
+{
+    u64 start, size;
+};
+constexpr RawPartition kPartitions[6] = {{0, 8ull << 30},          {0xABE80000, 0x131F00000}, {0x8CA80000, 0x1F400000},
+                                         {0x00080000, 0x2EE00000}, {0x2EE80000, 0x2EE00000},  {0x5DC80000, 0x2EE00000}};
+
+// "\Device\Harddisk0\PartitionN" itself (no trailing backslash): the volume, not its root folder
+int RawPartitionOf(const std::string& xbox_path)
+{
+    std::string lower;
+    for (char ch : xbox_path)
+        lower += ch == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(ch)));
+    const std::string prefix = "/device/harddisk0/partition";
+    if (lower.size() != prefix.size() + 1 || lower.compare(0, prefix.size(), prefix) != 0)
+        return -1;
+    const char n = lower.back();
+    return n >= '0' && n <= '5' ? n - '0' : -1;
+}
+
+// The raw disk's reads and writes, logged (they're few: the config sectors, a cache partition's format)
+void LogRaw(const HostFile* f, const char* what, u64 at, u32 length, u32 status)
+{
+    static std::atomic<u32> logged{0};
+    if (logged++ < 300)
+        Log("disk: %s partition %d at %#llx, %#x bytes: %#x", what, f->raw, (unsigned long long)at, length, status);
+}
 
 constexpr u32 kDosDevicesDirectory = 0xfffffffd; // ObDosDevicesDirectory()
 
@@ -274,6 +309,30 @@ void NetworkOpenInfo(const Info& info, u32 out)
     Write<u32>(out + 0x30, Attributes(info));
 }
 
+// Everything in a folder (not the folder itself).
+void RemoveContents(const std::string& dir)
+{
+    DIR* d = opendir(dir.c_str());
+    if (!d)
+        return;
+    while (dirent* e = readdir(d))
+    {
+        const std::string name = e->d_name;
+        if (name == "." || name == "..")
+            continue;
+        const std::string path = dir + "/" + name;
+        struct stat st;
+        if (lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        {
+            RemoveContents(path);
+            rmdir(path.c_str());
+        }
+        else
+            unlink(path.c_str());
+    }
+    closedir(d);
+}
+
 void MakeDirs(const std::string& path)
 {
     for (size_t i = 1; i < path.size(); i++)
@@ -339,6 +398,25 @@ u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 dispositi
         SetIo(io_status, STATUS_SUCCESS, 1);
         if (g_verbose >= 1)
             Log("files: %s -> disc image /%s", xbox.c_str(), in_image.c_str());
+        return STATUS_SUCCESS;
+    }
+    const int raw = RawPartitionOf(xbox);
+    if (raw >= 0 && !(options & 1))
+    {
+        // the disk or a partition as a volume: an image file, sparse, that's always "there"
+        auto* f = new HostFile;
+        f->raw = raw;
+        f->raw_size = kPartitions[raw].size;
+        f->path = raw == 0 ? host : g_data_dir + "/partition" + char('0' + raw) + ".img";
+        f->fd = open(f->path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (f->fd < 0)
+        {
+            delete f;
+            SetIo(io_status, STATUS_ACCESS_DENIED, 0);
+            return STATUS_ACCESS_DENIED;
+        }
+        Write<u32>(handle_ptr, NewHostHandle(1, f));
+        SetIo(io_status, STATUS_SUCCESS, 1);
         return STATUS_SUCCESS;
     }
     struct stat st;
@@ -537,6 +615,24 @@ void RegisterFileExports(RegisterFn reg)
         if (!f || (f->fd < 0 && !(f->iso && !f->directory)))
             return STATUS_INVALID_HANDLE;
         ssize_t n;
+        if (f->raw >= 0)
+        {
+            // the disk: every sector there is something (zeros where nothing was ever written)
+            const u64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? u64(Read<s64>(c.Arg(7))) : u64(lseek(f->fd, 0, SEEK_CUR));
+            const u32 length = at >= f->raw_size ? 0 : u32(std::min<u64>(c.Arg(6), f->raw_size - at));
+            u8* out = static_cast<u8*>(Ptr(c.Arg(5)));
+            ssize_t got = length ? pread(f->fd, out, length, off_t(at)) : 0;
+            if (got < 0)
+                got = 0;
+            std::memset(out + got, 0, length - size_t(got));
+            lseek(f->fd, off_t(at + length), SEEK_SET);
+            const u32 status = length == 0 && c.Arg(6) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
+            LogRaw(f, "read", at, c.Arg(6), status);
+            SetIo(c.Arg(4), status, length);
+            if (c.Arg(1))
+                WakeAll();
+            return status;
+        }
         if (f->iso)
         {
             const s64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? Read<s64>(c.Arg(7)) : f->position;
@@ -562,6 +658,26 @@ void RegisterFileExports(RegisterFn reg)
         if (!f || f->fd < 0)
             return STATUS_INVALID_HANDLE;
         ssize_t n;
+        if (f->raw >= 0)
+        {
+            const u64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? u64(Read<s64>(c.Arg(7))) : u64(lseek(f->fd, 0, SEEK_CUR));
+            const u32 length = at >= f->raw_size ? 0 : u32(std::min<u64>(c.Arg(6), f->raw_size - at));
+            const ssize_t put = length ? pwrite(f->fd, Ptr(c.Arg(5)), length, off_t(at)) : 0;
+            const u32 status = put == ssize_t(length) && length == c.Arg(6) ? STATUS_SUCCESS : 0xC0000185; // IO_DEVICE_ERROR
+            LogRaw(f, "write", at, c.Arg(6), status);
+            // a cache partition (X:, Y:, Z:) given a new file system: what was in it is gone
+            if (status == STATUS_SUCCESS && at == 0 && f->raw >= 3 && length >= 4 && !std::memcmp(Ptr(c.Arg(5)), "FATX", 4))
+            {
+                const std::string dir = g_data_dir + "/" + "xyz"[f->raw - 3];
+                Log("disk: partition %d (%s) formatted: emptied", f->raw, dir.c_str());
+                RemoveContents(dir);
+            }
+            lseek(f->fd, off_t(at + length), SEEK_SET);
+            SetIo(c.Arg(4), status, put < 0 ? 0 : u32(put));
+            if (c.Arg(1))
+                WakeAll();
+            return status;
+        }
         if (c.Arg(7) && Read<s64>(c.Arg(7)) >= 0)
             n = pwrite(f->fd, Ptr(c.Arg(5)), c.Arg(6), off_t(Read<s64>(c.Arg(7))));
         else
@@ -781,7 +897,8 @@ void RegisterFileExports(RegisterFn reg)
     reg("NtReadFileScatter", [scatter](Call& c) -> u64 { return scatter(c, false); });
     reg("NtWriteFileGather", [scatter](Call& c) -> u64 { return scatter(c, true); });
     // device controls: the disk's geometry and partitions, as XAPI asks when it mounts drives
-    auto ioctl = [](u32 code, u32 out, u32 out_length) -> u32 { // returns bytes written
+    // `partition`: the handle's (the disk 0, a partition 1-5; -1 not known: the 750 MiB of a cache one)
+    auto ioctl = [](u32 code, u32 out, u32 out_length, int partition) -> u32 { // returns bytes written
         if (out && out_length)
             std::memset(Ptr(out), 0, out_length);
         switch (code)
@@ -796,21 +913,40 @@ void RegisterFileExports(RegisterFn reg)
             Write<u32>(out + 16, 1);
             Write<u32>(out + 20, code == 0x70000 ? 512 : 2048);
             return 24;
-        case 0x74004: // IOCTL_DISK_GET_PARTITION_INFO: a 750 MiB partition, recognized
+        case 0x74004: // IOCTL_DISK_GET_PARTITION_INFO: where it is on the disk, recognized
+        {
             if (out_length < 32)
                 return 0;
-            Write<s64>(out, 0x80000);
-            Write<s64>(out + 8, 750ll * 1024 * 1024);
-            Write<u32>(out + 20, 1);
-            Write<u8>(out + 24, 0x0b); // FAT32
-            Write<u8>(out + 26, 1);
+            const RawPartition p = partition >= 0 && partition <= 5 ? kPartitions[partition] : RawPartition{0x00080000, 0x2EE00000};
+            Write<s64>(out, s64(p.start));
+            Write<s64>(out + 8, s64(p.size));
+            Write<u32>(out + 16, 0);                             // hidden sectors
+            Write<u32>(out + 20, partition > 0 ? u32(partition) : 1); // partition number
+            Write<u8>(out + 24, 0x0b);                           // type
+            Write<u8>(out + 25, 0);                              // boot indicator
+            Write<u8>(out + 26, 1);                              // recognized
             return 32;
         }
+        case 0x74800: // IOCTL_DISK_VERIFY: every sector reads
+        case 0x4d014: // IOCTL_SCSI_PASS_THROUGH_DIRECT (the DVD drive's commands): nothing back
+            return 0;
+        }
+        char name[16];
+        std::snprintf(name, sizeof(name), "%#x", code);
+        diag::Note("device control", name);
         return 0;
     };
-    reg("NtDeviceIoControlFile", [ioctl](Call& c) -> u64 {
+    auto partition_of = [](u32 handle) {
+        const HostFile* f = FileOf(handle);
+        return f ? f->raw : -1;
+    };
+    reg("NtDeviceIoControlFile", [ioctl, partition_of](Call& c) -> u64 {
         // handle, event, apc, context, io status, code, in, in length, out, out length
-        const u32 n = ioctl(c.Arg(5), c.Arg(8), c.Arg(9));
+        const u32 n = ioctl(c.Arg(5), c.Arg(8), c.Arg(9), partition_of(c.Arg(0)));
+        static std::atomic<u32> logged{0};
+        if (logged++ < 200)
+            Log("files: device control %#x on handle %#x (partition %d): %u bytes back", c.Arg(5), c.Arg(0),
+                partition_of(c.Arg(0)), n);
         SetIo(c.Arg(4), STATUS_SUCCESS, n);
         if (c.Arg(1))
             WakeAll();
@@ -818,12 +954,16 @@ void RegisterFileExports(RegisterFn reg)
     });
     reg("IoSynchronousDeviceIoControlRequest", [ioctl](Call& c) -> u64 {
         // code, device, in, in length, out, out length, returned length*, internal
-        const u32 n = ioctl(c.Arg(0), c.Arg(4), c.Arg(5));
+        const u32 n = ioctl(c.Arg(0), c.Arg(4), c.Arg(5), -1);
         if (c.Arg(6))
             Write<u32>(c.Arg(6), n);
         return STATUS_SUCCESS;
     });
-    reg("NtFsControlFile", [](Call& c) -> u64 { SetIo(c.Arg(4), STATUS_SUCCESS, 0); return STATUS_SUCCESS; });
+    reg("NtFsControlFile", [](Call& c) -> u64 {
+        Log("files: file system control %#x on handle %#x", c.Arg(5), c.Arg(0));
+        SetIo(c.Arg(4), STATUS_SUCCESS, 0);
+        return STATUS_SUCCESS;
+    });
     reg("IoDismountVolume", [](Call&) -> u64 { return STATUS_SUCCESS; });
     reg("IoDismountVolumeByName", [](Call&) -> u64 { return STATUS_SUCCESS; });
     reg("NtQueryDirectoryObject", [](Call& c) -> u64 {

@@ -117,6 +117,43 @@ int main(void)
                                                                  &geometry, sizeof(geometry)) == 0 && geometry.BytesPerSector == 512);
     NtClose(raw);
 
+    // the raw disk, as XAPI's cache drive set-up uses it (XMountUtilityDrive): partition 0's config
+    // sectors read even on a fresh disk (zeros), written and read back; a cache partition opened as
+    // a volume, its geometry and place, given a FATX header (formatted: its files go)
+    RtlInitAnsiString(&name, "\\Device\\Harddisk0\\Partition0");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    check("open the raw disk", NtOpenFile(&raw, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &oa, &io, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          FILE_SYNCHRONOUS_IO_ALERT) == 0);
+    offset.QuadPart = 0x600000; // well past anything written (the image grows only as it's written)
+    memset(pages, 0xcc, 512);
+    check("a sector never written reads as zeros", NtReadFile(raw, NULL, NULL, NULL, &io, pages, 512, &offset) == 0 &&
+                                                   io.Information == 512 && pages[0] == 0 && pages[511] == 0);
+    offset.QuadPart = 4 * 512;
+    memset(pages, 0x5a, 512);
+    check("write a config sector", NtWriteFile(raw, NULL, NULL, NULL, &io, pages, 512, &offset) == 0 && io.Information == 512);
+    memset(pages, 0, 512);
+    check("and read it back", NtReadFile(raw, NULL, NULL, NULL, &io, pages, 512, &offset) == 0 && pages[0] == 0x5a && pages[511] == 0x5a);
+    memset(pages, 0, 512); // left as a fresh disk's
+    NtWriteFile(raw, NULL, NULL, NULL, &io, pages, 512, &offset);
+    NtClose(raw);
+
+    f = CreateFileA("Z:\\cache-file.tmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    CloseHandle(f);
+    RtlInitAnsiString(&name, "\\Device\\Harddisk0\\Partition5");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    check("open partition 5 (Z:) as a volume", NtOpenFile(&raw, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &oa, &io, 0,
+                                                          FILE_SYNCHRONOUS_IO_ALERT) == 0);
+    PARTITION_INFORMATION partition;
+    check("its place on the disk", NtDeviceIoControlFile(raw, NULL, NULL, NULL, &io, IOCTL_DISK_GET_PARTITION_INFO, NULL, 0, &partition,
+                                                        sizeof(partition)) == 0 &&
+                                       partition.StartingOffset.QuadPart == 0x5DC80000 && partition.PartitionLength.QuadPart == 0x2EE00000);
+    memset(pages, 0, 4096);
+    memcpy(pages, "FATX", 4);
+    offset.QuadPart = 0;
+    check("format it", NtWriteFile(raw, NULL, NULL, NULL, &io, pages, 4096, &offset) == 0);
+    NtClose(raw);
+    check("what was on it is gone", GetFileAttributesA("Z:\\cache-file.tmp") == INVALID_FILE_ATTRIBUTES);
+
     DbgPrint("disc test: %d failures\n", failures);
     debugPrint("disc test: %d failures\n", failures);
     for (;;)
