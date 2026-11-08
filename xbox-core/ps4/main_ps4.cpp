@@ -477,7 +477,7 @@ std::string Library(const std::vector<std::string>& system)
                          paths,
                          UsbDrives(),
                          system,
-                         {{"/data/xbox-core/log-previous.txt", 400}, {"/data/xbox-core/crash.log", 200},
+                         {{"/data/xbox-core/log-1.txt", 400}, {"/data/xbox-core/crash.log", 200},
                           {"/data/xbox-core/boot-trace.log", 60}, {kLogFile, 60}},
                          "/data/xbox-core/diagnostics.txt",
                          kDataDir};
@@ -690,7 +690,13 @@ int main()
     // the last session's log kept (it ran the game being asked about), and every log onto the USB
     // drives first thing, before anything that could fail; this session's log also goes to a drive
     // line by line, so a crash leaves it there
-    std::rename(kLogFile, "/data/xbox-core/log-previous.txt");
+    // the last 10 sessions' logs kept: log.txt this one, log-1.txt the one before, ... log-9.txt;
+    // the log bundle has them all
+    std::remove("/data/xbox-core/log-previous.txt"); // the old name
+    for (int i = 8; i >= 1; i--)
+        std::rename(("/data/xbox-core/log-" + std::to_string(i) + ".txt").c_str(),
+                    ("/data/xbox-core/log-" + std::to_string(i + 1) + ".txt").c_str());
+    std::rename(kLogFile, "/data/xbox-core/log-1.txt");
     // crash.log gets every crash appended: each start marked, so a report says which build and run it
     // came from (an older build's addresses name the wrong functions); kept from growing too big
     {

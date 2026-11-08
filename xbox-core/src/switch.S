@@ -24,6 +24,12 @@
 //                               registers as they were. Saves them as a CONTEXT, calls the handlers
 //                               of the fs:[0] chain until one takes it (an __except jumps away from
 //                               here) or continues (the CONTEXT is resumed); none: KeBugCheckEx.
+//   xcs_fault64                 the fault handler resumes a guest thread here (64-bit, the guest's fs)
+//                               after saving the fault in its KPCR (0x348..0x377): the fault is
+//                               handled by slot_fault on the emulator's stack, outside the signal
+//                               handler (where the PS4's C library can't be used), and the guest
+//                               resumes with the registers and eip it left there (0: resume;
+//                               otherwise the call bails as xcs_bail64).
 //   xcs_fault32                 the same for a fault: the fault handler has pushed the interrupted
 //                               code's esp, edx, ecx, eax (eax on top) and set eax, edx as above.
 // Gate frame (on the guest stack, linear): rdi, rsi (8 each), then eax = ordinal, ecx, edx, the return
@@ -31,7 +37,7 @@
 // to pop above the return address.
     .section .rodata.xcs, "a"
     .p2align 7
-    .globl xcs_begin, xcs_end, xcs_enter64, xcs_gate32, xcs_bail64, xcs_back64, xcs_raise32, xcs_fault32
+    .globl xcs_begin, xcs_end, xcs_enter64, xcs_gate32, xcs_bail64, xcs_back64, xcs_raise32, xcs_fault32, xcs_fault64
 xcs_begin:
 slot_sel32:     .quad 0     // 0   32-bit user code selector
 slot_sel64:     .quad 0     // 8   64-bit user code selector
@@ -40,6 +46,7 @@ slot_handler:   .quad 0     // 24  void (*)(uint32_t* frame, uint64_t kpcr)
 slot_fs_guest:  .quad 0     // 32  void (*)(uint64_t kpcr): fs base = the KPCR
 slot_fs_host:   .quad 0     // 40  void (*)(uint64_t base): fs base = the emulator's
 slot_bugcheck:  .quad 0     // 48  the guest address of KeBugCheckEx's export stub
+slot_fault:     .quad 0     // 56  uint32_t (*)(uint64_t kpcr): a saved fault handled (0 resume)
     .p2align 7
 
     .code64
@@ -110,6 +117,44 @@ leave64:
     pop %rbp
     pop %rbx
     ret
+
+xcs_fault64:
+    mov %esp, %esp
+    mov %fs:0x320, %r12     // fs is the guest's: its base is the KPCR
+    and $-16, %rsp
+    mov 0x300(%r12), %rdi
+    call *slot_fs_host(%rip) // on the guest's stack, below its esp: a few bytes
+    mov 0x310(%r12), %rsp   // the emulator's stack
+    and $-16, %rsp
+    mov %r12, %rdi
+    call *slot_fault(%rip)
+    mov %eax, %r13d
+    mov %r12, %rdi
+    call *slot_fs_guest(%rip)
+    test %r13d, %r13d
+    jnz 8f
+    // back into the guest: eflags, eip and its code selector below its esp, the registers from the
+    // KPCR, then popfq and a far return to 32-bit code
+    mov %fs:0x360, %eax     // its esp
+    lea -24(%rax), %rsp
+    mov %fs:0x34c, %ecx
+    mov %rcx, (%rsp)
+    mov %fs:0x348, %ecx
+    mov %rcx, 8(%rsp)
+    mov slot_sel32(%rip), %rcx
+    mov %rcx, 16(%rsp)
+    mov %fs:0x350, %eax
+    mov %fs:0x354, %ecx
+    mov %fs:0x358, %edx
+    mov %fs:0x35c, %ebx
+    mov %fs:0x364, %ebp
+    mov %fs:0x368, %esi
+    mov %fs:0x36c, %edi
+    popfq
+    lretq
+8:  mov $0xffffffff, %r13d   // not to be resumed: the call ends as xcs_bail64's
+    mov $0xbad0bad0, %r14d
+    jmp leave64
 
     .code32
 xcs_gate32:

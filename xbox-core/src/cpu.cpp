@@ -16,7 +16,7 @@
 
 extern "C" {
 extern const unsigned char xcs_begin[], xcs_end[], xcs_enter64[], xcs_gate32[], xcs_bail64[], xcs_back64[],
-    xcs_raise32[], xcs_fault32[];
+    xcs_raise32[], xcs_fault32[], xcs_fault64[];
 }
 
 namespace xb {
@@ -24,7 +24,7 @@ namespace xb {
 namespace {
 
 constexpr int kSlotSel32 = 0, kSlotSel64 = 8, kSlotGuestDs = 16, kSlotHandler = 24, kSlotFsGuest = 32,
-              kSlotFsHost = 40, kSlotBugCheck = 48;
+              kSlotFsHost = 40, kSlotBugCheck = 48, kSlotFault = 56;
 constexpr u32 kExportCount = 400, kStubSize = 16;
 
 u32 g_switch = 0; // the switch's copy below 4 GiB
@@ -340,18 +340,20 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
 
 std::atomic<bool> g_fault_log{false}; // the first faults logged and synced from the handler (the self-test's step)
 
-bool OnFault(platform::Fault& f)
+// A fault in guest code, handled: 0 when the guest resumes (*f.rip and the registers updated), 1
+// when it can't (the call into it bails). Outside the signal handler (FaultResumed), except for the
+// rare fault OnFault can't send there.
+int HandleGuestFault(platform::Fault& f)
 {
     const u64 rip = *f.rip;
     const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
     Regs r{f};
-    if (f.cs != g_sel32)
-    {
-        Log("host fault: signal %d at rip %#llx, address %#x%s", f.signal, (unsigned long long)rip, f.address,
-            guest_fs ? " (with the guest's fs)" : "");
-        return false;
-    }
     const u8* code = Ptr<u8>(u32(rip));
+    GuestThread* const fault_thread =
+        guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+    u32 regs[8];
+    for (int i = 0; i < 8; i++)
+        regs[i] = r.Get(i);
     // the first faults, each on the disk before it's handled: if handling one kills the app, the
     // log ends with it
     static std::atomic<u32> s_faults{0};
@@ -362,6 +364,10 @@ bool OnFault(platform::Fault& f)
                 "ecx %#x edx %#x esp %#x", n + 1, ft ? ft->id : 0, f.signal, u32(rip), f.address, code[0], code[1], code[2],
                 code[3], code[4], code[5], r.Get(0), r.Get(1), r.Get(2), r.Get(4));
     }
+    // every fault into the ring the reports show (the last ones, all their registers and code)
+    auto record = [&](const char* outcome) {
+        diag::RecordFault(fault_thread ? fault_thread->id : 0, f.signal, u32(rip), f.address, code, regs, outcome);
+    };
     size_t length = 0;
     if (f.signal == 11 && (f.address >= kDeviceBase || (f.address >= kAliasBase && f.address - kAliasBase < kAliasSize)))
         length = EmulateDeviceAccess(code, f.address, r);
@@ -369,12 +375,17 @@ bool OnFault(platform::Fault& f)
         length = SkipPrivileged(code, r);
     if (length)
     {
+        record(f.signal == 11 && f.address >= kDeviceBase ? "a hardware register, emulated" : "emulated or skipped");
         *f.rip = rip + length;
-        return true;
+        return 0;
     }
-    GuestThread* t = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+    GuestThread* t = fault_thread;
     if (code[0] != 0xf4 && DeliverException(f, r, t))
-        return true;
+    {
+        record("to the program's exception handlers");
+        return 0;
+    }
+    record(code[0] == 0xf4 ? "hlt: the program stopped" : "not handled: the thread stops");
     if (code[0] == 0xf4) // hlt: the program stopped (an assertion, a fatal error): its message
     {
         const u32 ebp = r.Get(5);
@@ -414,9 +425,64 @@ bool OnFault(platform::Fault& f)
     }
     Log("  called from:%s", chain.c_str());
     diag::LogState("guest fault");
-    *f.rip = SwitchEntry(xcs_bail64);
+    return 1;
+}
+
+// The signal handler: no C library in here (on the PS4 it can't be used where the kernel enters the
+// handler directly). A fault in guest code is saved in the thread's KPCR and the thread sent on to
+// xcs_fault64, which has it handled (FaultResumed) on the emulator's stack and resumes the guest.
+// What can't go there (no KPCR, a fault in the switch's own code) is handled here as before.
+bool OnFault(platform::Fault& f)
+{
+    if (f.cs != g_sel32)
+        return false; // the emulator's own: the crash log's
+    const u32 eip = u32(*f.rip);
+    const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
+    const bool in_switch = eip >= g_switch && eip < g_switch + u32(xcs_end - xcs_begin);
+    if (!guest_fs || in_switch)
+    {
+        if (HandleGuestFault(f) != 0)
+        {
+            *f.rip = SwitchEntry(xcs_bail64);
+            platform::SetCs(f, g_sel64);
+        }
+        return true;
+    }
+    const u32 k = u32(f.fs_base);
+    for (int i = 0; i < 8; i++)
+        Write<u32>(k + kpcr::FaultRegs + u32(i) * 4, u32(*f.gpr[i]));
+    Write<u32>(k + kpcr::FaultEip, eip);
+    Write<u32>(k + kpcr::FaultEflags, u32(*f.eflags));
+    Write<u32>(k + kpcr::FaultSignal, u32(f.signal));
+    Write<u32>(k + kpcr::FaultAddress, f.address);
+    *f.rip = SwitchEntry(xcs_fault64);
     platform::SetCs(f, g_sel64);
     return true;
+}
+
+// xcs_fault64's: the saved fault handled with the whole C library at hand; 0 resume, 1 bail.
+extern "C" u32 FaultResumed(u64 kpcr_address)
+{
+    const u32 k = u32(kpcr_address);
+    u64 gpr[8], rip = Read<u32>(k + kpcr::FaultEip), eflags = Read<u32>(k + kpcr::FaultEflags);
+    for (int i = 0; i < 8; i++)
+        gpr[i] = Read<u32>(k + kpcr::FaultRegs + u32(i) * 4);
+    platform::Fault f{};
+    for (int i = 0; i < 8; i++)
+        f.gpr[i] = &gpr[i];
+    f.rip = &rip;
+    f.eflags = &eflags;
+    f.cs = g_sel32;
+    f.signal = int(Read<u32>(k + kpcr::FaultSignal));
+    f.address = Read<u32>(k + kpcr::FaultAddress);
+    f.fs_base = k;
+    f.raw = nullptr;
+    const int result = HandleGuestFault(f);
+    for (int i = 0; i < 8; i++)
+        Write<u32>(k + kpcr::FaultRegs + u32(i) * 4, u32(gpr[i]));
+    Write<u32>(k + kpcr::FaultEip, u32(rip));
+    Write<u32>(k + kpcr::FaultEflags, u32(eflags));
+    return u32(result);
 }
 
 } // namespace
@@ -469,6 +535,7 @@ void InitCpu()
         std::memcpy(s + 12, &rel, 4);
     }
     Write<u64>(g_switch + kSlotBugCheck, ExportStub(96)); // KeBugCheckEx, for unhandled exceptions
+    Write<u64>(g_switch + kSlotFault, reinterpret_cast<u64>(&FaultResumed));
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);

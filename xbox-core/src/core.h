@@ -128,7 +128,11 @@ constexpr u32 NtTibStackBase = 0x04, NtTibStackLimit = 0x08, NtTibSelf = 0x18, S
               Irql = 0x24, CurrentThread = 0x28, Size = 0x300;
 constexpr u32 HostFsBase = 0x300, HostThread = 0x308, HostRsp = 0x310, HostSegs = 0x318, Self = 0x320,
               GuestEsp = 0x328, GuestEax = 0x330, GuestEbx = 0x334, GuestEbp = 0x338, GuestEsi = 0x33c,
-              GuestEdi = 0x340, GuestEflags = 0x344, BlockSize = 0x360;
+              GuestEdi = 0x340, GuestEflags = 0x344,
+              // a fault in guest code, saved by the signal handler for its handling outside it
+              // (xcs_fault64): eip, eflags, eax ecx edx ebx esp ebp esi edi, the signal, the address
+              FaultEip = 0x348, FaultEflags = 0x34c, FaultRegs = 0x350, FaultSignal = 0x370, FaultAddress = 0x374,
+              BlockSize = 0x380;
 // the PRCB's DPC fields, in the KPCR
 constexpr u32 DpcInterruptRequested = 0x4c, DpcRoutineActive = 0x58;
 } // namespace kpcr

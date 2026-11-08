@@ -31,6 +31,20 @@ constexpr u32 kMaxThreads = 512;
 GuestThread* g_threads[kMaxThreads];
 std::atomic<u32> g_thread_count{0};
 
+// the latest faults in guest code
+struct FaultRecord
+{
+    float at;
+    u32 thread, eip, address, regs[8];
+    int signal;
+    u8 code[16];
+    const char* outcome;
+};
+constexpr u32 kFaultRing = 128;
+FaultRecord g_fault_ring[kFaultRing];
+std::atomic<u32> g_fault_next{0};
+std::atomic<u64> g_faults{0};
+
 // the GPU's latest methods
 struct MethodRecord
 {
@@ -145,6 +159,16 @@ void CallEnded(GuestThread* t, u32 result)
     t->in_call = 0;
 }
 
+void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, const u32 regs[8], const char* outcome)
+{
+    g_faults++;
+    FaultRecord& r = g_fault_ring[g_fault_next.fetch_add(1) % kFaultRing];
+    r.at = float(Seconds());
+    r.thread = thread, r.eip = eip, r.address = address, r.signal = signal, r.outcome = outcome;
+    std::memcpy(r.regs, regs, sizeof(r.regs));
+    std::memcpy(r.code, code, sizeof(r.code));
+}
+
 void Method(u32 cls, u32 method, u32 parameter)
 {
     g_methods++;
@@ -178,6 +202,29 @@ void WriteState(Out fd)
             in ? "in the kernel call " : "running guest code (or not started)\n");
         if (in)
             Put(fd, "%s for %.1f s\n", Name(in - 1), double(now - t->call_started));
+        // its last kernel call's stack, and its last fault's registers and stack (the guest's stacks
+        // are always mapped: read without risk)
+        auto dump_stack = [&](const char* what, u32 esp) {
+            if (esp < kStackBase || esp + 64 * 4 > kStackBase + kStackAreaSize)
+                return;
+            Put(fd, "    %s, esp %#x:", what, esp);
+            for (u32 w = 0; w < 64; w++)
+                Put(fd, "%s%08x", w % 8 ? " " : "\n      ", Read<u32>(esp + w * 4));
+            Put(fd, "\n");
+        };
+        dump_stack("the stack at its last kernel call", u32(Read<u64>(t->kpcr + kpcr::GuestEsp)));
+        if (const u32 feip = Read<u32>(t->kpcr + kpcr::FaultEip))
+        {
+            Put(fd, "    its last fault: signal %u at %#x, address %#x; eax %#x ecx %#x edx %#x ebx %#x esp %#x ebp %#x "
+                    "esi %#x edi %#x eflags %#x\n",
+                Read<u32>(t->kpcr + kpcr::FaultSignal), feip, Read<u32>(t->kpcr + kpcr::FaultAddress),
+                Read<u32>(t->kpcr + kpcr::FaultRegs), Read<u32>(t->kpcr + kpcr::FaultRegs + 4),
+                Read<u32>(t->kpcr + kpcr::FaultRegs + 8), Read<u32>(t->kpcr + kpcr::FaultRegs + 12),
+                Read<u32>(t->kpcr + kpcr::FaultRegs + 16), Read<u32>(t->kpcr + kpcr::FaultRegs + 20),
+                Read<u32>(t->kpcr + kpcr::FaultRegs + 24), Read<u32>(t->kpcr + kpcr::FaultRegs + 28),
+                Read<u32>(t->kpcr + kpcr::FaultEflags));
+            dump_stack("the stack at its last fault", Read<u32>(t->kpcr + kpcr::FaultRegs + 16));
+        }
         const u32 n = t->calls_next.load();
         const u32 shown = std::min<u32>(n, GuestThread::kCallRecords);
         for (u32 k = 0; k < shown; k++)
@@ -186,6 +233,20 @@ void WriteState(Out fd)
             Put(fd, "    %9.3f %s(%#x, %#x, %#x, %#x) from %#x = %#x\n", double(c.at), Name(c.ordinal), c.a0, c.a1, c.a2, c.a3,
                 c.eip, c.result);
         }
+    }
+    const u32 fn = g_fault_next.load();
+    const u32 fshown = std::min(fn, kFaultRing);
+    Put(fd, "faults in guest code: %llu; the latest %u (time, thread, signal, eip, address, what became of it, "
+            "registers eax..edi, code at eip):\n", (unsigned long long)g_faults.load(), fshown);
+    for (u32 k = 0; k < fshown; k++)
+    {
+        const FaultRecord& r = g_fault_ring[(fn - fshown + k) % kFaultRing];
+        Put(fd, "    %9.3f t%u sig %d eip %#x addr %#x %s\n      regs %x %x %x %x %x %x %x %x\n      code", double(r.at),
+            r.thread, r.signal, r.eip, r.address, r.outcome ? r.outcome : "?", r.regs[0], r.regs[1], r.regs[2], r.regs[3],
+            r.regs[4], r.regs[5], r.regs[6], r.regs[7]);
+        for (u8 b : r.code)
+            Put(fd, " %02x", b);
+        Put(fd, "\n");
     }
     const u32 m = g_method_next.load();
     const u32 shown = std::min(m, kMethodRing);

@@ -26,6 +26,9 @@ std::string NotesSummary();
 // a kernel call starting and ending on the calling guest thread (KernelCall)
 void CallStarted(GuestThread* t, u32 ordinal, u32 a0, u32 a1, u32 a2, u32 a3, u32 return_eip);
 void CallEnded(GuestThread* t, u32 result);
+// a fault in guest code and what became of it (into a ring of the last 128, with the registers and
+// the code at eip: every report shows them)
+void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, const u32 regs[8], const char* outcome);
 // a GPU method (its class, method, parameter)
 void Method(u32 cls, u32 method, u32 parameter);
 // a guest thread, kept for the reports (never freed, so a crash report can read them)
