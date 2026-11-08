@@ -1,11 +1,18 @@
 // Drawing for the software NV2A: vertices from the vertex arrays (or inline), the vertex program
 // (the NV2A's own microcode, interpreted), primitives assembled and rasterized into the colour and
-// depth surfaces. The pixel stage (combiners, textures) is pixel.cpp; until it is complete a pixel
-// is its interpolated diffuse colour (oD0).
+// depth surfaces; the pixel stage (textures, combiners, blending) is pixel.cpp. Rasterization is
+// shared by a pool of threads, each drawing every triangle of a draw into its own bands of rows, in
+// order, so the result is the same as one thread's.
 //
 // The vertex program's encoding is the NV2A's (xemu documents it in pgraph/glsl/vsh-prog.c).
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "core.h"
@@ -290,7 +297,11 @@ bool DepthTest(u32 func, float z, float stored)
     }
 }
 
-void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c)
+// rows are dealt to the threads in bands of this many
+constexpr int kBand = 16;
+
+// Draws the part of the triangle in bands `part`, `part + parts`, ...
+void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, int part = 0, int parts = 1)
 {
     const KelvinState& k = g_kelvin;
     const Surface cs = ColorSurface(), zs = ZetaSurface();
@@ -298,7 +309,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         return;
     const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     static int logged = 0;
-    if (g_verbose >= 2 && logged < 3)
+    if (g_verbose >= 2 && logged < 3 && part == 0)
     {
         logged++;
         Log("nv2a: triangle area %g; surface %#x %ux%u swizzled %d; cull %u/%#x front %#x; depth test %u func %#x "
@@ -330,6 +341,12 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const u32 write_mask = k.Get(0x358) ? ((k.Get(0x358) & 0x01000000 ? 0xff000000u : 0) | (k.Get(0x358) & 0x00010000 ? 0x00ff0000u : 0) |
                                            (k.Get(0x358) & 0x00000100 ? 0x0000ff00u : 0) | (k.Get(0x358) & 0x00000001 ? 0x000000ffu : 0))
                                         : 0xffffffffu;
+    // the outputs the pixel stage reads
+    const u32 inputs = PixelInputMask();
+    int used[16], used_count = 0;
+    for (int o = 0; o < 16; o++)
+        if (inputs & (1u << o))
+            used[used_count++] = o;
     // edge functions, stepped per pixel: e(x+1) = e(x) + dx, e(y+1) = e(y) + dy
     const float sign = area < 0 ? -1.f : 1.f, inv_area = 1.f / std::fabs(area);
     auto edge = [&](const ScreenVertex& p, const ScreenVertex& q, float px, float py) {
@@ -338,6 +355,11 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const float dax = -sign * (c.y - b.y), dbx = -sign * (a.y - c.y), dcx = -sign * (b.y - a.y);
     for (int y = y0; y <= y1; y++)
     {
+        if ((y / kBand) % parts != part)
+        {
+            y = (y / kBand + 1) * kBand - 1; // to the end of this band
+            continue;
+        }
         const float py = y + 0.5f, px0 = x0 + 0.5f;
         float ea = edge(b, c, px0, py), eb = edge(c, a, px0, py), ec = edge(a, b, px0, py);
         for (int x = x0; x <= x1; x++, ea += dax, eb += dbx, ec += dcx)
@@ -357,11 +379,15 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
                     continue;
             }
             // perspective-correct interpolation of the outputs
-            const float pa = wa * a.inv_w, pb = wb * b.inv_w, pc = wc * c.inv_w, sum = pa + pb + pc;
+            const float pa0 = wa * a.inv_w, pb0 = wb * b.inv_w, pc0 = wc * c.inv_w;
+            const float norm = 1.f / (pa0 + pb0 + pc0), pa = pa0 * norm, pb = pb0 * norm, pc = pc0 * norm;
             PixelInputs in;
-            for (int o : {3, 4, 9, 10, 11, 12})
+            for (int n = 0; n < used_count; n++)
+            {
+                const int o = used[n];
                 for (int i = 0; i < 4; i++)
-                    in.v[o][i] = (a.o[o][i] * pa + b.o[o][i] * pb + c.o[o][i] * pc) / sum;
+                    in.v[o][i] = a.o[o][i] * pa + b.o[o][i] * pb + c.o[o][i] * pc;
+            }
             u32 color;
             if (!ShadePixel(in, cs, u32(x), u32(y), color))
                 continue;
@@ -376,6 +402,88 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         }
     }
 }
+
+} // namespace
+
+// ---- the rasterizer's threads
+
+namespace {
+
+std::mutex g_pool_mutex;
+std::condition_variable g_pool_wake, g_pool_done;
+const std::function<void(int)>* g_pool_job = nullptr;
+int g_pool_parts = 0, g_pool_next = 0, g_pool_pending = 0;
+u64 g_pool_generation = 0;
+
+} // namespace
+
+int RasterThreads()
+{
+    static const int n = [] {
+        if (const char* forced = std::getenv("XB_RASTER_THREADS"))
+            return std::clamp(std::atoi(forced), 1, 16);
+        const int hw = int(std::thread::hardware_concurrency());
+        return std::clamp(hw > 1 ? hw - 1 : 4, 1, 6);
+    }();
+    return n;
+}
+
+namespace {
+
+void PoolWorker()
+{
+    u64 seen = 0;
+    for (;;)
+    {
+        std::unique_lock lock(g_pool_mutex);
+        g_pool_wake.wait(lock, [&] { return g_pool_generation != seen && g_pool_next < g_pool_parts; });
+        seen = g_pool_generation;
+        while (g_pool_next < g_pool_parts)
+        {
+            const int part = g_pool_next++;
+            const auto* job = g_pool_job;
+            lock.unlock();
+            (*job)(part);
+            lock.lock();
+            if (--g_pool_pending == 0)
+                g_pool_done.notify_all();
+        }
+    }
+}
+
+} // namespace
+
+// Runs fn(0) .. fn(parts - 1), this thread taking a share; returns when all are done.
+void RunParts(int parts, const std::function<void(int)>& fn)
+{
+    if (parts <= 1)
+    {
+        fn(0);
+        return;
+    }
+    static std::once_flag started;
+    std::call_once(started, [] {
+        for (int i = 1; i < RasterThreads(); i++)
+            std::thread(PoolWorker).detach();
+    });
+    std::unique_lock lock(g_pool_mutex);
+    g_pool_job = &fn;
+    g_pool_parts = parts, g_pool_next = 0, g_pool_pending = parts;
+    g_pool_generation++;
+    g_pool_wake.notify_all();
+    while (g_pool_next < g_pool_parts)
+    {
+        const int part = g_pool_next++;
+        lock.unlock();
+        fn(part);
+        lock.lock();
+        --g_pool_pending;
+    }
+    g_pool_done.wait(lock, [] { return g_pool_pending == 0; });
+    g_pool_job = nullptr;
+}
+
+namespace {
 
 void Flush()
 {
@@ -393,34 +501,69 @@ void Flush()
             Log("  vertex %zu: pos %g %g %g %g  diffuse %g %g %g %g", i, s[i].o[0][0], s[i].o[0][1], s[i].o[0][2],
                 s[i].o[0][3], s[i].o[3][0], s[i].o[3][1], s[i].o[3][2], s[i].o[3][3]);
     }
+    // the primitive as triangles (indices into s)
+    std::vector<std::array<u32, 3>> tris;
+    auto add = [&](size_t i, size_t j, size_t k) { tris.push_back({u32(i), u32(j), u32(k)}); };
     switch (g_primitive)
     {
     case 5: // triangles
         for (size_t i = 0; i + 2 < n; i += 3)
-            Triangle(s[i], s[i + 1], s[i + 2]);
+            add(i, i + 1, i + 2);
         break;
     case 6: // triangle strip
         for (size_t i = 0; i + 2 < n; i++)
             if (i & 1)
-                Triangle(s[i + 1], s[i], s[i + 2]);
+                add(i + 1, i, i + 2);
             else
-                Triangle(s[i], s[i + 1], s[i + 2]);
+                add(i, i + 1, i + 2);
         break;
     case 7: // triangle fan
     case 10: // polygon
         for (size_t i = 1; i + 1 < n; i++)
-            Triangle(s[0], s[i], s[i + 1]);
+            add(0, i, i + 1);
         break;
     case 8: // quads
         for (size_t i = 0; i + 3 < n; i += 4)
-            Triangle(s[i], s[i + 1], s[i + 2]), Triangle(s[i], s[i + 2], s[i + 3]);
+            add(i, i + 1, i + 2), add(i, i + 2, i + 3);
         break;
     case 9: // quad strip
         for (size_t i = 0; i + 3 < n; i += 2)
-            Triangle(s[i], s[i + 1], s[i + 3]), Triangle(s[i], s[i + 3], s[i + 2]);
+            add(i, i + 1, i + 3), add(i, i + 3, i + 2);
         break;
     default: // points and lines aren't drawn yet
         break;
+    }
+    // how much there is to draw: small draws stay on this thread
+    float pixels = 0;
+    for (const auto& t : tris)
+    {
+        const ScreenVertex &a = s[t[0]], &b = s[t[1]], &c = s[t[2]];
+        pixels += std::fabs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5f;
+    }
+    if (tris.empty())
+    {
+        g_vertices.clear();
+        return;
+    }
+    PreparePixels();
+    const int parts = pixels < 4096 ? 1 : RasterThreads();
+    const auto start = std::chrono::steady_clock::now();
+    RunParts(parts, [&](int part) {
+        for (const auto& t : tris)
+            Triangle(s[t[0]], s[t[1]], s[t[2]], part, parts);
+    });
+    // -v 1: how long drawing takes, every 2 seconds
+    static double busy = 0, area = 0;
+    static auto report = start;
+    const auto end = std::chrono::steady_clock::now();
+    busy += std::chrono::duration<double>(end - start).count();
+    area += pixels;
+    if (g_verbose >= 1 && end - report > std::chrono::seconds(2))
+    {
+        const double span = std::chrono::duration<double>(end - report).count();
+        Log("nv2a: rasterizing took %.0f%% of the last %.1f s (%.1f Mpixels/s drawn, %d threads)", 100 * busy / span, span,
+            area / busy / 1e6, RasterThreads());
+        busy = area = 0, report = end;
     }
     g_vertices.clear();
 }

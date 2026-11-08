@@ -2,6 +2,7 @@
 // general stages and the final combiner), the alpha test and blending. The register layouts are
 // nxdk's nv_regs.h; the combiners' arithmetic is NV_register_combiners'.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #include "core.h"
@@ -99,6 +100,30 @@ Texture StageTexture(int stage)
     t.border = k.Get(base + 0x24);
     return t;
 }
+
+// What the pixel stage needs from the registers, decoded once per draw (PreparePixels)
+struct Stage
+{
+    u32 icw, ocw, aicw, aocw;
+    V4 c0, c1;
+    bool rgb, alpha; // whether the RGB and alpha portions write anything
+};
+struct PixelState
+{
+    bool combiners = false;
+    u32 stages = 0;
+    Stage stage[8];
+    u32 cw0 = 0, cw1 = 0;
+    bool uses_ef = false, uses_sum = false;
+    V4 final_c0{}, final_c1{};
+    u32 program[4] = {};
+    bool enabled[4] = {};
+    Texture texture[4];
+    bool alpha_test = false, blend = false;
+    u32 alpha_func = 0, alpha_ref = 0, blend_sfactor = 0, blend_dfactor = 0, blend_equation = 0;
+    V4 blend_color{};
+};
+PixelState g_ps;
 
 V4 Expand565(u16 v)
 {
@@ -261,7 +286,7 @@ float MapInput(float x, u32 map)
 
 struct Registers
 {
-    V4 r[16] = {};
+    V4 r[16]; // set by Combine: what isn't an input starts at zero
 };
 
 // one input of a general stage, as RGB (`alpha_portion` false) or as the alpha portion's scalar
@@ -296,36 +321,10 @@ float ApplyOp(float v, u32 op)
     return std::clamp(v, -1.f, 1.f);
 }
 
-void GeneralStage(Registers& regs, int stage, const V4& c0, const V4& c1)
+void GeneralStage(Registers& regs, const Stage& st)
 {
-    const KelvinState& k = g_kelvin;
-    regs.r[1] = c0, regs.r[2] = c1;
-    const u32 control = k.Get(0x1e60);
-    const bool mux_msb = (control >> 8) & 1;
+    regs.r[1] = st.c0, regs.r[2] = st.c1;
     const bool mux = regs.r[12][3] >= 0.5f; // the MUX: r0's alpha (its MSB; the LSB isn't kept)
-    (void)mux_msb;
-    // RGB
-    const u32 icw = k.Get(0xac0 + u32(stage) * 4), ocw = k.Get(0x1e40 + u32(stage) * 4);
-    const V4 a = ColorInput(regs, icw >> 24), b = ColorInput(regs, (icw >> 16) & 0xff);
-    const V4 c = ColorInput(regs, (icw >> 8) & 0xff), d = ColorInput(regs, icw & 0xff);
-    V4 ab, cd, sum;
-    const float ab_dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2], cd_dot = c[0] * d[0] + c[1] * d[1] + c[2] * d[2];
-    const u32 op = (ocw >> 15) & 7;
-    for (int i = 0; i < 3; i++)
-    {
-        ab[i] = ocw & (1u << 13) ? ab_dot : a[i] * b[i];
-        cd[i] = ocw & (1u << 12) ? cd_dot : c[i] * d[i];
-        sum[i] = ocw & (1u << 14) ? (mux ? cd[i] : ab[i]) : ab[i] + cd[i];
-        ab[i] = ApplyOp(ab[i], op), cd[i] = ApplyOp(cd[i], op), sum[i] = ApplyOp(sum[i], op);
-    }
-    // alpha
-    const u32 aicw = k.Get(0x260 + u32(stage) * 4), aocw = k.Get(0xaa0 + u32(stage) * 4);
-    const float aa = AlphaInput(regs, aicw >> 24), ab_ = AlphaInput(regs, (aicw >> 16) & 0xff);
-    const float ac = AlphaInput(regs, (aicw >> 8) & 0xff), ad = AlphaInput(regs, aicw & 0xff);
-    const u32 aop = (aocw >> 15) & 7;
-    const float alpha_ab = ApplyOp(aa * ab_, aop), alpha_cd = ApplyOp(ac * ad, aop);
-    const float alpha_sum = ApplyOp(aocw & (1u << 14) ? (mux ? ac * ad : aa * ab_) : aa * ab_ + ac * ad, aop);
-    // the results, RGB then alpha (a stage reads its inputs before any of its writes)
     auto write_rgb = [&](u32 dst, const V4& v) {
         if (dst)
             for (int i = 0; i < 3; i++)
@@ -335,9 +334,41 @@ void GeneralStage(Registers& regs, int stage, const V4& c0, const V4& c1)
         if (dst)
             regs.r[dst][3] = v;
     };
+    // a stage reads all its inputs before any of its writes
+    V4 ab, cd, sum;
+    float alpha_ab = 0, alpha_cd = 0, alpha_sum = 0;
+    const u32 icw = st.icw, ocw = st.ocw;
+    if (st.rgb || (ocw & (3u << 18)))
+    {
+    const V4 a = ColorInput(regs, icw >> 24), b = ColorInput(regs, (icw >> 16) & 0xff);
+    const V4 c = ColorInput(regs, (icw >> 8) & 0xff), d = ColorInput(regs, icw & 0xff);
+    const float ab_dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2], cd_dot = c[0] * d[0] + c[1] * d[1] + c[2] * d[2];
+    const u32 op = (ocw >> 15) & 7;
+    for (int i = 0; i < 3; i++)
+    {
+        ab[i] = ocw & (1u << 13) ? ab_dot : a[i] * b[i];
+        cd[i] = ocw & (1u << 12) ? cd_dot : c[i] * d[i];
+        sum[i] = ocw & (1u << 14) ? (mux ? cd[i] : ab[i]) : ab[i] + cd[i];
+        ab[i] = ApplyOp(ab[i], op), cd[i] = ApplyOp(cd[i], op), sum[i] = ApplyOp(sum[i], op);
+    }
+    }
+    const u32 aicw = st.aicw, aocw = st.aocw;
+    if (st.alpha)
+    {
+    const float aa = AlphaInput(regs, aicw >> 24), ab_ = AlphaInput(regs, (aicw >> 16) & 0xff);
+    const float ac = AlphaInput(regs, (aicw >> 8) & 0xff), ad = AlphaInput(regs, aicw & 0xff);
+    const u32 aop = (aocw >> 15) & 7;
+    alpha_ab = ApplyOp(aa * ab_, aop), alpha_cd = ApplyOp(ac * ad, aop);
+    alpha_sum = ApplyOp(aocw & (1u << 14) ? (mux ? ac * ad : aa * ab_) : aa * ab_ + ac * ad, aop);
+    }
+    if (st.rgb)
+    {
     write_rgb((ocw >> 4) & 0xf, ab);
     write_rgb(ocw & 0xf, cd);
     write_rgb((ocw >> 8) & 0xf, sum);
+    }
+    if (st.alpha)
+    {
     write_alpha((aocw >> 4) & 0xf, alpha_ab);
     write_alpha(aocw & 0xf, alpha_cd);
     write_alpha((aocw >> 8) & 0xf, alpha_sum);
@@ -345,12 +376,18 @@ void GeneralStage(Registers& regs, int stage, const V4& c0, const V4& c1)
         write_alpha((ocw >> 4) & 0xf, ab[2]);
     if (ocw & (1u << 18))
         write_alpha(ocw & 0xf, cd[2]);
+    }
 }
 
 // a final combiner input: unsigned, maybe inverted; `blue_or_alpha` picks a component for G
 V4 FinalInput(const Registers& regs, u32 byte, const V4& sum, const V4& ef)
 {
     const u32 source = byte & 0xf;
+    if (source == 0)
+    {
+        const float z = byte & 0xe0 ? 1.f : 0.f;
+        return {z, z, z, z};
+    }
     const V4& s = source == 14 ? sum : source == 15 ? ef : regs.r[source];
     V4 v;
     for (int i = 0; i < 4; i++)
@@ -363,33 +400,36 @@ V4 FinalInput(const Registers& regs, u32 byte, const V4& sum, const V4& ef)
 
 V4 Combine(const PixelInputs& in, const V4 tex[4])
 {
-    const KelvinState& k = g_kelvin;
     Registers regs;
+    for (int i : {0, 1, 2, 3, 6, 7, 12, 13, 14, 15})
+        regs.r[i] = {0, 0, 0, 0};
     regs.r[4] = {in.v[3][0], in.v[3][1], in.v[3][2], in.v[3][3]}; // v0: diffuse
     regs.r[5] = {in.v[4][0], in.v[4][1], in.v[4][2], in.v[4][3]}; // v1: specular
     for (int i = 0; i < 4; i++)
         regs.r[8 + i] = tex[i];
     regs.r[12][3] = tex[0][3]; // r0's alpha starts as t0's
-    const u32 control = k.Get(0x1e60);
-    const u32 stages = std::min<u32>(control & 0xff, 8);
-    const bool factor0_each = (control >> 12) & 1, factor1_each = (control >> 16) & 1;
-    for (u32 s = 0; s < stages; s++)
-        GeneralStage(regs, int(s), Unpack(k.Get(0xa60 + (factor0_each ? s * 4 : 0))),
-                     Unpack(k.Get(0xa80 + (factor1_each ? s * 4 : 0))));
+    for (u32 s = 0; s < g_ps.stages; s++)
+        GeneralStage(regs, g_ps.stage[s]);
     // the final combiner: rgb = A*B + (1-A)*C + D, alpha = G; E*F and spec + r0 as extra sources
-    regs.r[1] = Unpack(k.Get(0x1e20)), regs.r[2] = Unpack(k.Get(0x1e24));
-    const u32 cw0 = k.Get(0x288), cw1 = k.Get(0x28c);
-    V4 sum, ef;
-    for (int i = 0; i < 3; i++)
+    regs.r[1] = g_ps.final_c0, regs.r[2] = g_ps.final_c1;
+    const u32 cw0 = g_ps.cw0, cw1 = g_ps.cw1;
+    V4 sum{}, ef{};
+    if (g_ps.uses_sum)
     {
-        sum[i] = regs.r[12][i] + regs.r[5][i];
-        if (cw1 & 0x80)
-            sum[i] = Clamp01(sum[i]);
+        for (int i = 0; i < 3; i++)
+        {
+            sum[i] = regs.r[12][i] + regs.r[5][i];
+            if (cw1 & 0x80)
+                sum[i] = Clamp01(sum[i]);
+        }
+        sum[3] = 1;
     }
-    sum[3] = 1;
-    const V4 e = FinalInput(regs, cw1 >> 24, sum, ef), f = FinalInput(regs, (cw1 >> 16) & 0xff, sum, ef);
-    for (int i = 0; i < 4; i++)
-        ef[i] = e[i] * f[i];
+    if (g_ps.uses_ef)
+    {
+        const V4 e = FinalInput(regs, cw1 >> 24, sum, ef), f = FinalInput(regs, (cw1 >> 16) & 0xff, sum, ef);
+        for (int i = 0; i < 4; i++)
+            ef[i] = e[i] * f[i];
+    }
     const V4 a = FinalInput(regs, cw0 >> 24, sum, ef), b = FinalInput(regs, (cw0 >> 16) & 0xff, sum, ef);
     const V4 c = FinalInput(regs, (cw0 >> 8) & 0xff, sum, ef), d = FinalInput(regs, cw0 & 0xff, sum, ef);
     // G: the alpha bit picks alpha, else blue
@@ -409,13 +449,11 @@ V4 Combine(const PixelInputs& in, const V4 tex[4])
 
 void TextureStages(const PixelInputs& in, V4 tex[4])
 {
-    const KelvinState& k = g_kelvin;
-    const u32 programs = k.Get(0x1e70);
     for (int s = 0; s < 4; s++)
     {
         tex[s] = {0, 0, 0, 0};
-        const u32 program = (programs >> (5 * s)) & 0x1f;
-        const bool enabled = k.Get(0x1b0c + u32(s) * 64) & (1u << 30);
+        const u32 program = g_ps.program[s];
+        const bool enabled = g_ps.enabled[s];
         const float* tc = in.v[9 + s];
         switch (program)
         {
@@ -427,7 +465,7 @@ void TextureStages(const PixelInputs& in, V4 tex[4])
             if (!enabled)
                 break;
             const float q = program == 1 && tc[3] != 0 ? tc[3] : 1.f;
-            tex[s] = Sample(StageTexture(s), tc[0] / q, tc[1] / q);
+            tex[s] = Sample(g_ps.texture[s], tc[0] / q, tc[1] / q);
             break;
         }
         case 4: // pass-through: the coordinates as a colour
@@ -435,10 +473,9 @@ void TextureStages(const PixelInputs& in, V4 tex[4])
             break;
         default:
         {
-            static u32 reported = 0;
-            if (!(reported & (1u << program)))
+            static std::atomic<u32> reported{0};
+            if (!(reported.fetch_or(1u << program) & (1u << program)))
             {
-                reported |= 1u << program;
                 Log("nv2a: texture stage program %u isn't done yet", program);
             }
         }
@@ -492,11 +529,63 @@ V4 BlendFactor(u32 f, const V4& src, const V4& dst, const V4& constant)
 
 } // namespace
 
-bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out)
+void PreparePixels()
 {
     const KelvinState& k = g_kelvin;
+    PixelState& ps = g_ps;
+    const u32 control = k.Get(0x1e60);
+    ps.stages = std::min<u32>(control & 0xff, 8);
+    ps.combiners = ps.stages != 0;
+    const bool factor0_each = (control >> 12) & 1, factor1_each = (control >> 16) & 1;
+    for (u32 s = 0; s < ps.stages; s++)
+    {
+        Stage& st = ps.stage[s];
+        st.icw = k.Get(0xac0 + s * 4), st.ocw = k.Get(0x1e40 + s * 4);
+        st.aicw = k.Get(0x260 + s * 4), st.aocw = k.Get(0xaa0 + s * 4);
+        st.c0 = Unpack(k.Get(0xa60 + (factor0_each ? s * 4 : 0)));
+        st.c1 = Unpack(k.Get(0xa80 + (factor1_each ? s * 4 : 0)));
+        st.rgb = (st.ocw & 0xfff) != 0;
+        st.alpha = (st.aocw & 0xfff) != 0 || (st.ocw & (3u << 18));
+    }
+    ps.cw0 = k.Get(0x288), ps.cw1 = k.Get(0x28c);
+    ps.uses_ef = ps.uses_sum = false;
+    for (u32 byte : {ps.cw0 >> 24, (ps.cw0 >> 16) & 0xff, (ps.cw0 >> 8) & 0xff, ps.cw0 & 0xff, (ps.cw1 >> 8) & 0xff})
+    {
+        ps.uses_ef |= (byte & 0xf) == 15;
+        ps.uses_sum |= (byte & 0xf) == 14;
+    }
+    for (u32 byte : {ps.cw1 >> 24, (ps.cw1 >> 16) & 0xff})
+        ps.uses_sum |= (byte & 0xf) == 14;
+    ps.final_c0 = Unpack(k.Get(0x1e20)), ps.final_c1 = Unpack(k.Get(0x1e24));
+    const u32 programs = k.Get(0x1e70);
+    for (int s = 0; s < 4; s++)
+    {
+        ps.program[s] = (programs >> (5 * s)) & 0x1f;
+        ps.enabled[s] = k.Get(0x1b0c + u32(s) * 64) & (1u << 30);
+        if (ps.combiners && ps.enabled[s] && ps.program[s])
+            ps.texture[s] = StageTexture(s);
+    }
+    ps.alpha_test = k.Get(0x300), ps.alpha_func = k.Get(0x33c), ps.alpha_ref = k.Get(0x340) & 0xff;
+    ps.blend = k.Get(0x304), ps.blend_sfactor = k.Get(0x344), ps.blend_dfactor = k.Get(0x348);
+    ps.blend_equation = k.Get(0x350), ps.blend_color = Unpack(k.Get(0x34c));
+}
+
+u32 PixelInputMask()
+{
+    if (!g_ps.combiners)
+        return 1u << 3;
+    u32 mask = 1u << 3 | 1u << 4;
+    for (int s = 0; s < 4; s++)
+        if (g_ps.program[s])
+            mask |= 1u << (9 + s);
+    return mask;
+}
+
+bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out)
+{
+    const PixelState& ps = g_ps;
     V4 color;
-    if ((k.Get(0x1e60) & 0xff) == 0) // no combiners set up: the diffuse colour
+    if (!ps.combiners) // no combiners set up: the diffuse colour
         color = {in.v[3][0], in.v[3][1], in.v[3][2], in.v[3][3]};
     else
     {
@@ -504,20 +593,19 @@ bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32&
         TextureStages(in, tex);
         color = Combine(in, tex);
     }
-    // the alpha test (SET_ALPHA_TEST_ENABLE, SET_ALPHA_FUNC, SET_ALPHA_REF)
-    if (k.Get(0x300) && !Compare(k.Get(0x33c), u32(Clamp01(color[3]) * 255.f + 0.5f), k.Get(0x340) & 0xff))
+    // the alpha test
+    if (ps.alpha_test && !Compare(ps.alpha_func, u32(Clamp01(color[3]) * 255.f + 0.5f), ps.alpha_ref))
         return false;
-    // blending (SET_BLEND_ENABLE, the factors, SET_BLEND_COLOR, SET_BLEND_EQUATION)
-    if (k.Get(0x304))
+    // blending
+    if (ps.blend)
     {
-        const V4 dst = Unpack(ReadPixel(target, x, y)), constant = Unpack(k.Get(0x34c));
-        const V4 sf = BlendFactor(k.Get(0x344), color, dst, constant);
-        const V4 df = BlendFactor(k.Get(0x348), color, dst, constant);
-        const u32 equation = k.Get(0x350);
+        const V4 dst = Unpack(ReadPixel(target, x, y));
+        const V4 sf = BlendFactor(ps.blend_sfactor, color, dst, ps.blend_color);
+        const V4 df = BlendFactor(ps.blend_dfactor, color, dst, ps.blend_color);
         for (int i = 0; i < 4; i++)
         {
             const float s = color[i] * sf[i], d = dst[i] * df[i];
-            switch (equation)
+            switch (ps.blend_equation)
             {
             case 0x800a: color[i] = s - d; break;
             case 0x800b: color[i] = d - s; break;

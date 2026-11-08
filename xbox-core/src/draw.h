@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 
 #include "core.h"
 
@@ -30,6 +31,10 @@ Surface ZetaSurface();
 void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask = 0xffffffff);
 u32 ReadPixel(const Surface& s, u32 x, u32 y);
 
+// draw.cpp: runs fn(0) .. fn(parts - 1) on the rasterizer's threads; how many it has
+void RunParts(int parts, const std::function<void(int)>& fn);
+int RasterThreads();
+
 // draw.cpp: vertices, the vertex program, rasterization and the combiners
 void DrawMethod(u32 method, u32 parameter);
 
@@ -37,8 +42,10 @@ void DrawMethod(u32 method, u32 parameter);
 // alpha test and blending with what `target` holds); false when the alpha test discards it
 struct PixelInputs
 {
-    float v[16][4] = {}; // indexed like the vertex outputs: 3 diffuse, 4 specular, 9-12 texture coordinates
+    float v[16][4]; // only what PixelInputMask names is set; indexed like the vertex outputs: 3 diffuse, 4 specular, 9-12 texture coordinates
 };
+void PreparePixels(); // the registers ShadePixel reads, decoded for a draw
+u32 PixelInputMask();  // which of PixelInputs' v[] the prepared state reads (bit per output)
 bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out);
 
 } // namespace xb

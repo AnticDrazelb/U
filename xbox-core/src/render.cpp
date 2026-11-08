@@ -1,5 +1,6 @@
 // The NV2A's 3D engine (Kelvin, class 0x97), drawn in software into guest memory: the surfaces the
 // driver set up, clears, and (draw.cpp) primitives through the vertex program and the combiners.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -117,9 +118,13 @@ void Clear(u32 flags)
             if (flags & 0x40) mask |= 0x000000ff; // B
             if (flags & 0x80) mask |= 0xff000000; // A
             const u32 color = k.Get(0x1d90);
-            for (u32 y = y0; y <= y1 && y < s.height; y++)
-                for (u32 x = x0; x <= x1 && x < s.width; x++)
-                    WritePixel(s, x, y, color, mask);
+            const u32 rows = y1 < y0 ? 0 : std::min(y1, s.height - 1) - y0 + 1;
+            const int parts = rows * (x1 - x0 + 1) > 16384 ? RasterThreads() : 1;
+            RunParts(parts, [&](int part) {
+                for (u32 y = y0 + u32(part); y <= y1 && y < s.height; y += u32(parts))
+                    for (u32 x = x0; x <= x1 && x < s.width; x++)
+                        WritePixel(s, x, y, color, mask);
+            });
         }
     }
     if (flags & 0x3)
@@ -128,7 +133,9 @@ void Clear(u32 flags)
         if (z.address && z.pitch)
         {
             const u32 value = k.Get(0x1d8c);
-            for (u32 y = y0; y <= y1 && y < z.height; y++)
+            const int parts = (y1 - y0 + 1) * (x1 - x0 + 1) > 16384 ? RasterThreads() : 1;
+            RunParts(parts, [&](int part) {
+            for (u32 y = y0 + u32(part); y <= y1 && y < z.height; y += u32(parts))
                 for (u32 x = x0; x <= x1 && x < z.width; x++)
                 {
                     const u32 p = z.address + y * z.pitch + x * z.bytes;
@@ -142,6 +149,7 @@ void Clear(u32 flags)
                         Write<u32>(p, (Read<u32>(p) & ~mask) | (value & mask));
                     }
                 }
+            });
         }
     }
 }
