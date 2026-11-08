@@ -45,6 +45,7 @@ bool LoadXbe(const std::string& path, XbeInfo& info, std::string& error)
         error = "not an XBE";
         return false;
     }
+    info.path = path;
     info.base = Get32(d, 0x104);
     const u32 headers_size = Get32(d, 0x108);
     info.image_size = Get32(d, 0x10c);

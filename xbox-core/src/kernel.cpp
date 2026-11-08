@@ -7,6 +7,11 @@
 #include <csetjmp>
 #include <cstdarg>
 #include <cstdio>
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -154,7 +159,14 @@ bool Deadline(u32 timeout_ptr, Clock::time_point& deadline)
 }
 
 // Waits for objects; returns the NTSTATUS (STATUS_WAIT_0 + index, or STATUS_TIMEOUT).
-u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr)
+struct ThreadState;
+bool HasApcs(ThreadState* s, bool alertable);
+bool RunApcs(bool alertable); // runs the current thread's deliverable APCs; whether a user one ran
+ThreadState* CurrentState();  // under g_sched
+
+constexpr u32 STATUS_USER_APC = 0xC0;
+
+u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr, bool alertable = false)
 {
     const u32 me = CurrentThread() ? CurrentThread()->ethread : 0;
     Clock::time_point deadline;
@@ -163,9 +175,19 @@ u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr)
     std::vector<u64> pulses(objects.size());
     for (size_t i = 0; i < objects.size(); i++)
         pulses[i] = g_pulses[objects[i]];
+    ThreadState* self = CurrentState();
     for (;;)
     {
-        if (all)
+        if (self && HasApcs(self, alertable))
+        {
+            lock.unlock();
+            const bool user = RunApcs(alertable);
+            lock.lock();
+            if (user)
+                return STATUS_USER_APC;
+            continue;
+        }
+        if (all && !objects.empty())
         {
             bool ok = true;
             for (size_t i = 0; i < objects.size(); i++)
@@ -177,7 +199,7 @@ u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr)
                 return STATUS_SUCCESS;
             }
         }
-        else
+        else if (!all)
             for (size_t i = 0; i < objects.size(); i++)
                 if (IsSignaled(objects[i], me) || g_pulses[objects[i]] != pulses[i])
                 {
@@ -229,13 +251,26 @@ std::string GuestFormat(u32 fmt, u32 args)
         }
         std::string spec = "%";
         f++;
-        while (*f && std::strchr("-+ #0123456789.", *f))
-            spec += *f++;
-        bool longlong = false;
-        while (*f == 'l' || *f == 'h' || *f == 'z' || *f == 'I')
+        while (*f && std::strchr("-+ #0123456789.*", *f))
+        {
+            if (*f == '*') // a width or precision from the arguments
+            {
+                spec += std::to_string(s32(Read<u32>(args)));
+                args += 4;
+                f++;
+            }
+            else
+                spec += *f++;
+        }
+        bool longlong = false, wide = false;
+        while (*f == 'l' || *f == 'h' || *f == 'z' || *f == 'I' || *f == 'w')
         {
             if (*f == 'l' && f[1] == 'l')
                 longlong = true, f++;
+            else if (*f == 'I' && f[1] == '6' && f[2] == '4')
+                longlong = true, f += 2;
+            else if (*f == 'w' || *f == 'l')
+                wide = true;
             f++;
         }
         char buf[512];
@@ -245,10 +280,37 @@ std::string GuestFormat(u32 fmt, u32 args)
         switch (conv)
         {
         case 's':
+        case 'S':
+        case 'Z': // ANSI_STRING* (UNICODE_STRING* with w)
         {
             const u32 p = Read<u32>(args);
             args += 4;
-            std::snprintf(buf, sizeof(buf), (spec + "s").c_str(), p ? Ptr<const char>(p) : "(null)");
+            std::string text;
+            if (!p)
+                text = "(null)";
+            else if (conv == 'Z')
+            {
+                const u16 length = Read<u16>(p);
+                const u32 buffer = Read<u32>(p + 4);
+                for (u32 i = 0; buffer && i < (wide ? length / 2u : length); i++)
+                {
+                    const u16 ch = wide ? Read<u16>(buffer + i * 2) : Read<u8>(buffer + i);
+                    text += ch < 0x80 ? char(ch) : '?';
+                }
+            }
+            else if (conv == 'S' || wide)
+                for (u32 q = p; Read<u16>(q); q += 2)
+                    text += Read<u16>(q) < 0x80 ? char(Read<u16>(q)) : '?';
+            else
+                text = Ptr<const char>(p);
+            std::snprintf(buf, sizeof(buf), (spec + "s").c_str(), text.c_str());
+            break;
+        }
+        case 'C':
+        {
+            const u32 v = Read<u32>(args) & 0xffff;
+            args += 4;
+            std::snprintf(buf, sizeof(buf), (spec + "c").c_str(), v < 0x80 ? int(v) : '?');
             break;
         }
         case 'c': case 'd': case 'i': case 'u': case 'x': case 'X': case 'o':
@@ -292,8 +354,193 @@ struct ThreadState
     std::jmp_buf exit;
     int suspend = 0;
     bool done = false;
+    // queued APCs: a KAPC (kapc != 0: its kernel routine first) or NtQueueApcThread's routine
+    struct Apc
+    {
+        u32 kapc, kernel_routine, normal_routine, context, arg1, arg2;
+        bool user;
+    };
+    std::deque<Apc> apcs;
 };
 std::unordered_map<GuestThread*, ThreadState*> g_threads;
+
+ThreadState* CurrentState()
+{
+    auto it = g_threads.find(CurrentThread());
+    return it == g_threads.end() ? nullptr : it->second;
+}
+
+ThreadState* StateOf(u32 ethread) // under g_sched
+{
+    for (auto& [t, s] : g_threads)
+        if (t->ethread == ethread)
+            return s;
+    return nullptr;
+}
+
+bool HasApcs(ThreadState* s, bool alertable)
+{
+    for (const auto& a : s->apcs)
+        if (!a.user || alertable)
+            return true;
+    return false;
+}
+
+bool RunApcs(bool alertable)
+{
+    bool user_ran = false;
+    for (;;)
+    {
+        ThreadState::Apc a;
+        {
+            std::lock_guard lock(g_sched);
+            ThreadState* s = CurrentState();
+            if (!s)
+                return user_ran;
+            auto it = std::find_if(s->apcs.begin(), s->apcs.end(), [&](const auto& x) { return !x.user || alertable; });
+            if (it == s->apcs.end())
+                return user_ran;
+            a = *it;
+            s->apcs.erase(it);
+        }
+        u32 normal = a.normal_routine, context = a.context, arg1 = a.arg1, arg2 = a.arg2;
+        if (a.kapc)
+        {
+            Write<u8>(a.kapc + 3, 0); // no longer inserted
+            if (a.kernel_routine) // KernelRoutine(Apc, &NormalRoutine, &NormalContext, &Arg1, &Arg2)
+            {
+                CallGuestNested(a.kernel_routine, {a.kapc, a.kapc + 0x18, a.kapc + 0x1c, a.kapc + 0x20, a.kapc + 0x24});
+                normal = Read<u32>(a.kapc + 0x18), context = Read<u32>(a.kapc + 0x1c);
+                arg1 = Read<u32>(a.kapc + 0x20), arg2 = Read<u32>(a.kapc + 0x24);
+            }
+        }
+        if (normal)
+            CallGuestNested(normal, {context, arg1, arg2});
+        user_ran |= a.user;
+    }
+}
+
+void QueueApc(ThreadState* s, const ThreadState::Apc& a) // under g_sched
+{
+    s->apcs.push_back(a);
+    g_cv.notify_all();
+}
+
+// ---- timers (KTIMER: header 0x10, DueTime 0x10, TimerListEntry 0x18, Dpc 0x20, Period 0x24),
+// fired by their own thread
+
+struct TimerInfo
+{
+    Clock::time_point due;
+    u32 period_ms = 0, dpc = 0, apc_routine = 0, apc_context = 0;
+    ThreadState* apc_thread = nullptr;
+};
+std::mutex g_timer_mutex;
+std::condition_variable g_timer_cv;
+std::map<u32, TimerInfo> g_timers;
+
+Clock::time_point DueTime(s64 t)
+{
+    if (t < 0)
+        return Clock::now() + std::chrono::nanoseconds(-t * 100);
+    return Clock::now() + std::chrono::nanoseconds(std::max<s64>(0, t - SystemTime()) * 100);
+}
+
+void TimerThread()
+{
+    std::unique_lock lock(g_timer_mutex);
+    while (!g_quit)
+    {
+        auto next = g_timers.end();
+        for (auto it = g_timers.begin(); it != g_timers.end(); ++it)
+            if (next == g_timers.end() || it->second.due < next->second.due)
+                next = it;
+        if (next == g_timers.end())
+        {
+            g_timer_cv.wait_for(lock, std::chrono::milliseconds(100));
+            continue;
+        }
+        if (Clock::now() < next->second.due)
+        {
+            g_timer_cv.wait_until(lock, std::min(next->second.due, Clock::now() + std::chrono::milliseconds(100)));
+            continue;
+        }
+        const u32 timer = next->first;
+        const TimerInfo info = next->second;
+        if (info.period_ms)
+            next->second.due += std::chrono::milliseconds(info.period_ms);
+        else
+            g_timers.erase(next);
+        lock.unlock();
+        {
+            std::lock_guard sched(g_sched);
+            SetSignal(timer, 1);
+            if (!info.period_ms)
+                Write<u8>(timer + 3, 0); // no longer inserted
+            if (info.apc_routine && info.apc_thread && !info.apc_thread->done)
+            {
+                const u64 now = u64(SystemTime());
+                QueueApc(info.apc_thread, {0, 0, info.apc_routine, info.apc_context, u32(now), u32(now >> 32), true});
+            }
+            g_cv.notify_all();
+        }
+        if (info.dpc)
+            QueueDpc(info.dpc);
+        lock.lock();
+    }
+}
+
+// Sets a timer: returns whether it was already set.
+bool SetTimer(u32 timer, s64 due, u32 period_ms, u32 dpc, u32 apc_routine = 0, u32 apc_context = 0)
+{
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(TimerThread).detach(); });
+    ThreadState* me;
+    {
+        std::lock_guard sched(g_sched);
+        SetSignal(timer, 0);
+        Write<u8>(timer + 3, 1);
+        Write<s64>(timer + 0x10, due);
+        Write<u32>(timer + 0x20, dpc);
+        Write<u32>(timer + 0x24, period_ms);
+        me = CurrentState();
+    }
+    std::lock_guard lock(g_timer_mutex);
+    const bool was = g_timers.count(timer) != 0;
+    g_timers[timer] = {DueTime(due), period_ms, dpc, apc_routine, apc_context, apc_routine ? me : nullptr};
+    g_timer_cv.notify_all();
+    return was;
+}
+
+bool CancelTimer(u32 timer)
+{
+    std::lock_guard lock(g_timer_mutex);
+    Write<u8>(timer + 3, 0);
+    return g_timers.erase(timer) != 0;
+}
+
+// ---- read/write locks (ERWLOCK; the core keeps its own fields: +0x04 the writer, +0x0c readers)
+
+void AcquireRwLock(u32 lock_object, bool exclusive)
+{
+    const u32 me = CurrentThread()->ethread;
+    std::unique_lock lock(g_sched);
+    for (;;)
+    {
+        const u32 writer = Read<u32>(lock_object + 4);
+        const s32 readers = Read<s32>(lock_object + 0xc);
+        if (exclusive ? (!writer && readers == 0) : !writer)
+        {
+            if (exclusive)
+                Write<u32>(lock_object + 4, me);
+            else
+                Write<s32>(lock_object + 0xc, readers + 1);
+            Write<s32>(lock_object, Read<s32>(lock_object) + 1);
+            return;
+        }
+        g_cv.wait_for(lock, std::chrono::milliseconds(50));
+    }
+}
 std::atomic<int> g_running{0};
 
 void ThreadDone(ThreadState* s)
@@ -313,7 +560,7 @@ u32 CreateThread(u32 stack, u32 tls, u32 start, u32 context, bool suspended, u32
 {
     GuestThread* t = NewGuestThread(stack, tls, name);
     Write<u32>(t->ethread + kthread::EthreadStartAddress, start);
-    auto* s = new ThreadState{t, {}, suspended ? 1 : 0, false};
+    auto* s = new ThreadState{t, {}, suspended ? 1 : 0, false, {}};
     {
         std::lock_guard lock(g_sched);
         g_threads[t] = s;
@@ -418,6 +665,11 @@ std::string GuestString(u32 ansi_string)
     return buffer ? std::string(Ptr<const char>(buffer), length) : "";
 }
 
+std::string FormatGuest(u32 fmt, u32 args)
+{
+    return GuestFormat(fmt, args);
+}
+
 u32 Call::Arg(int i) const
 {
     if (fastcall)
@@ -440,6 +692,7 @@ void InitKernel()
             g_ordinal_by_name[e.name] = e.ordinal;
         }
     RegisterFileExports(Register);
+    RegisterRtlExports(Register);
 
     // ---- debugging, firmware
     K(DbgPrint)
@@ -510,12 +763,10 @@ void InitKernel()
             Write<u32>(c.Arg(1), 0);
         return STATUS_SUCCESS; // threads that already run aren't stopped
     } END;
-    K(KeDelayExecutionThread)
+    K(KeDelayExecutionThread) // mode, alertable, interval: a wait for nothing
     {
-        Clock::time_point deadline;
-        if (Deadline(c.Arg(2), deadline))
-            std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(60)));
-        return STATUS_SUCCESS;
+        const u32 status = WaitObjects({}, false, c.Arg(2), c.Arg(1) & 0xff);
+        return status == STATUS_USER_APC ? STATUS_USER_APC : STATUS_SUCCESS;
     } END;
 
     // ---- time
@@ -655,7 +906,7 @@ void InitKernel()
 
     // ---- waits
     K(NtWaitForSingleObject) { const u32 o = ObjectOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(2)) : STATUS_INVALID_HANDLE; } END;
-    K(NtWaitForSingleObjectEx) { const u32 o = ObjectOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(3)) : STATUS_INVALID_HANDLE; } END;
+    K(NtWaitForSingleObjectEx) { const u32 o = ObjectOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(3), c.Arg(2) & 0xff) : STATUS_INVALID_HANDLE; } END;
     K(NtWaitForMultipleObjectsEx)
     {
         std::vector<u32> objects;
@@ -666,15 +917,15 @@ void InitKernel()
                 return STATUS_INVALID_HANDLE;
             objects.push_back(o);
         }
-        return WaitObjects(objects, c.Arg(2) == 0, c.Arg(5));
+        return WaitObjects(objects, c.Arg(2) == 0, c.Arg(5), c.Arg(4) & 0xff);
     } END;
-    K(KeWaitForSingleObject) { return WaitObjects({c.Arg(0)}, false, c.Arg(4)); } END;
+    K(KeWaitForSingleObject) { return WaitObjects({c.Arg(0)}, false, c.Arg(4), c.Arg(3) & 0xff); } END;
     K(KeWaitForMultipleObjects)
     {
         std::vector<u32> objects;
         for (u32 i = 0; i < c.Arg(0); i++)
             objects.push_back(Read<u32>(c.Arg(1) + i * 4));
-        return WaitObjects(objects, c.Arg(2) == 0, c.Arg(6));
+        return WaitObjects(objects, c.Arg(2) == 0, c.Arg(6), c.Arg(5) & 0xff);
     } END;
 
     // ---- handles and objects
@@ -702,6 +953,317 @@ void InitKernel()
     } END;
     K(ObfDereferenceObject) { return 0; } END;
     K(ObfReferenceObject) { return 0; } END;
+
+    // ---- kernel mutants (KMUTANT: header, list entry 0x10, OwnerThread 0x18, Abandoned 0x1c)
+    K(KeInitializeMutant)
+    {
+        const bool owned = c.Arg(1) & 0xff;
+        InitHeader(c.Arg(0), kMutant, 8, owned ? 0 : 1);
+        Write<u32>(c.Arg(0) + 0x18, owned ? CurrentThread()->ethread : 0);
+        Write<u8>(c.Arg(0) + 0x1c, 0);
+        return 0;
+    } END;
+    K(KeReleaseMutant) // mutant, increment, abandoned, wait: the previous state
+    {
+        const u32 m = c.Arg(0);
+        std::lock_guard lock(g_sched);
+        const s32 old = Signal(m);
+        SetSignal(m, (c.Arg(2) & 0xff) ? 1 : old + 1);
+        if (Signal(m) > 0)
+            Write<u32>(m + 0x18, 0);
+        g_cv.notify_all();
+        return u32(old);
+    } END;
+    K(KeSetEventBoostPriority) // event, thread*
+    {
+        std::lock_guard lock(g_sched);
+        SetSignal(c.Arg(0), 1);
+        if (c.Arg(1))
+            Write<u32>(c.Arg(1), 0);
+        g_cv.notify_all();
+        return 0;
+    } END;
+
+    // ---- object queries
+    K(NtQueryEvent) // handle, EVENT_BASIC_INFORMATION { EventType, EventState }
+    {
+        const u32 o = ObjectOf(c.Arg(0));
+        if (!o)
+            return STATUS_INVALID_HANDLE;
+        Write<u32>(c.Arg(1), Type(o) == kSynchronizationEvent ? 1 : 0);
+        Write<s32>(c.Arg(1) + 4, Signal(o));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtQueryMutant) // handle, { CurrentCount, OwnedByCaller, AbandonedState }
+    {
+        const u32 o = ObjectOf(c.Arg(0));
+        if (!o)
+            return STATUS_INVALID_HANDLE;
+        Write<s32>(c.Arg(1), Signal(o));
+        Write<u8>(c.Arg(1) + 4, Read<u32>(o + 0x18) == CurrentThread()->ethread);
+        Write<u8>(c.Arg(1) + 5, Read<u8>(o + 0x1c));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtQuerySemaphore) // handle, { CurrentCount, MaximumCount }
+    {
+        const u32 o = ObjectOf(c.Arg(0));
+        if (!o)
+            return STATUS_INVALID_HANDLE;
+        Write<s32>(c.Arg(1), Signal(o));
+        Write<s32>(c.Arg(1) + 4, Read<s32>(o + 0x10));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtDuplicateObject) // source, target*, options (1: close the source)
+    {
+        HandleEntry e;
+        {
+            std::lock_guard lock(g_handles_mutex);
+            auto it = g_handles.find(c.Arg(0));
+            if (it == g_handles.end())
+            {
+                if (c.Arg(0) != 0xfffffffe)
+                    return STATUS_INVALID_HANDLE;
+                e = {CurrentThread()->ethread, 0, nullptr};
+            }
+            else
+                e = it->second;
+            if (e.kind != 0 && !(c.Arg(2) & 1))
+                return 0xC00000BB; // STATUS_NOT_SUPPORTED: a file handle has one owner here
+            if (c.Arg(2) & 1)
+                g_handles.erase(c.Arg(0));
+        }
+        Write<u32>(c.Arg(1), NewHandle(e.object, e.kind, e.host));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtSignalAndWaitForSingleObjectEx) // signal handle, wait handle, mode, alertable, timeout*
+    {
+        const u32 signal = ObjectOf(c.Arg(0)), wait = ObjectOf(c.Arg(1));
+        if (!signal || !wait)
+            return STATUS_INVALID_HANDLE;
+        {
+            std::lock_guard lock(g_sched);
+            switch (Type(signal))
+            {
+            case kSemaphore: SetSignal(signal, Signal(signal) + 1); break;
+            case kMutant:
+                SetSignal(signal, Signal(signal) + 1);
+                if (Signal(signal) > 0)
+                    Write<u32>(signal + 0x18, 0);
+                break;
+            default: SetSignal(signal, 1);
+            }
+            g_cv.notify_all();
+        }
+        return WaitObjects({wait}, false, c.Arg(4), c.Arg(3) & 0xff);
+    } END;
+    K(ObOpenObjectByPointer) // object, type, handle*
+    {
+        Write<u32>(c.Arg(2), NewHandle(c.Arg(0)));
+        return STATUS_SUCCESS;
+    } END;
+    K(ObReferenceObjectByPointer) { return STATUS_SUCCESS; } END;
+    K(ObMakeTemporaryObject) { return 0; } END;
+
+    // ---- threads by their KTHREAD
+    K(PsCreateSystemThread) // handle*, thread id*, start, context, debugger thread
+    {
+        u32 handle = 0;
+        const u32 id = CreateThread(0x10000, 0, c.Arg(2), c.Arg(3), false, 0, "system", &handle);
+        if (c.Arg(0))
+            Write<u32>(c.Arg(0), handle);
+        if (c.Arg(1))
+            Write<u32>(c.Arg(1), id);
+        return STATUS_SUCCESS;
+    } END;
+    K(KeSuspendThread) { return 0; } END;
+    K(KeResumeThread)
+    {
+        std::lock_guard lock(g_sched);
+        ThreadState* s = StateOf(c.Arg(0));
+        if (!s)
+            return 0;
+        const int old = s->suspend;
+        if (s->suspend > 0)
+            s->suspend--;
+        g_cv.notify_all();
+        return u32(old);
+    } END;
+    K(KeAlertThread) { return 0; } END;
+    K(KeAlertResumeThread) { return 0; } END;
+    K(KeTestAlertThread) { return 0; } END;
+
+    // ---- APCs (KAPC: Type 0, ApcMode 2, Inserted 3, Thread 4, list 8, KernelRoutine 0x10,
+    // RundownRoutine 0x14, NormalRoutine 0x18, NormalContext 0x1c, SystemArgument1 0x20, 2 0x24)
+    K(KeInitializeApc) // apc, thread, kernel routine, rundown routine, normal routine, mode, context
+    {
+        const u32 apc = c.Arg(0);
+        std::memset(Ptr(apc), 0, 0x28);
+        Write<u16>(apc, 0x12);
+        Write<u8>(apc + 2, u8(c.Arg(5)));
+        Write<u32>(apc + 4, c.Arg(1));
+        Write<u32>(apc + 0x10, c.Arg(2));
+        Write<u32>(apc + 0x14, c.Arg(3));
+        Write<u32>(apc + 0x18, c.Arg(4));
+        Write<u32>(apc + 0x1c, c.Arg(6));
+        return 0;
+    } END;
+    K(KeInsertQueueApc) // apc, argument 1, argument 2, increment
+    {
+        const u32 apc = c.Arg(0);
+        std::lock_guard lock(g_sched);
+        ThreadState* s = StateOf(Read<u32>(apc + 4));
+        if (!s || s->done || Read<u8>(apc + 3))
+            return 0;
+        Write<u32>(apc + 0x20, c.Arg(1));
+        Write<u32>(apc + 0x24, c.Arg(2));
+        Write<u8>(apc + 3, 1);
+        // user-mode APCs (mode 1) wait for an alertable wait; kernel ones run at the next wait
+        QueueApc(s, {apc, Read<u32>(apc + 0x10), Read<u32>(apc + 0x18), Read<u32>(apc + 0x1c), c.Arg(1), c.Arg(2),
+                     Read<u8>(apc + 2) == 1});
+        return 1;
+    } END;
+    K(NtQueueApcThread) // thread, routine, context, status block, reserved
+    {
+        const u32 thread = ObjectOf(c.Arg(0));
+        std::lock_guard lock(g_sched);
+        ThreadState* s = StateOf(thread);
+        if (!s || s->done)
+            return STATUS_INVALID_HANDLE;
+        QueueApc(s, {0, 0, c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4), true});
+        return STATUS_SUCCESS;
+    } END;
+
+    // ---- timers
+    K(KeInitializeTimerEx) // timer, type (0 notification, 1 synchronization)
+    {
+        InitHeader(c.Arg(0), c.Arg(1) ? kSynchronizationTimer : kNotificationTimer, 10, 0);
+        Write<s64>(c.Arg(0) + 0x10, 0);
+        Write<u32>(c.Arg(0) + 0x20, 0);
+        Write<u32>(c.Arg(0) + 0x24, 0);
+        return 0;
+    } END;
+    K(KeSetTimer) // timer, due time (2 slots), dpc
+    {
+        return SetTimer(c.Arg(0), s64(u64(c.Arg(1)) | u64(c.Arg(2)) << 32), 0, c.Arg(3));
+    } END;
+    K(KeSetTimerEx) // timer, due time (2 slots), period (ms), dpc
+    {
+        return SetTimer(c.Arg(0), s64(u64(c.Arg(1)) | u64(c.Arg(2)) << 32), c.Arg(3), c.Arg(4));
+    } END;
+    K(KeCancelTimer) { return CancelTimer(c.Arg(0)); } END;
+    K(NtCreateTimer) // handle*, attributes, type
+    {
+        const u32 t = AllocKernel(0x28, 16);
+        InitHeader(t, c.Arg(2) ? kSynchronizationTimer : kNotificationTimer, 10, 0);
+        Write<u32>(c.Arg(0), NewHandle(t));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtSetTimerEx) // handle, due time*, apc routine, apc mode, apc context, resume, period, previous state*
+    {
+        const u32 t = ObjectOf(c.Arg(0));
+        if (!t)
+            return STATUS_INVALID_HANDLE;
+        if (c.Arg(7))
+            Write<u8>(c.Arg(7), Signal(t) > 0);
+        SetTimer(t, Read<s64>(c.Arg(1)), c.Arg(6), 0, c.Arg(2), c.Arg(4));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtCancelTimer) // handle, current state*
+    {
+        const u32 t = ObjectOf(c.Arg(0));
+        if (!t)
+            return STATUS_INVALID_HANDLE;
+        CancelTimer(t);
+        if (c.Arg(1))
+            Write<u8>(c.Arg(1), Signal(t) > 0);
+        return STATUS_SUCCESS;
+    } END;
+    K(NtQueryTimer) // handle, class, TIMER_BASIC_INFORMATION { RemainingTime, TimerState }
+    {
+        const u32 t = ObjectOf(c.Arg(0));
+        if (!t)
+            return STATUS_INVALID_HANDLE;
+        s64 remaining = 0;
+        {
+            std::lock_guard lock(g_timer_mutex);
+            auto it = g_timers.find(t);
+            if (it != g_timers.end())
+                remaining = std::max<s64>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(it->second.due - Clock::now()).count() / 100);
+        }
+        Write<s64>(c.Arg(2), remaining);
+        Write<u8>(c.Arg(2) + 8, Signal(t) > 0);
+        return STATUS_SUCCESS;
+    } END;
+
+    // ---- read/write locks
+    K(ExInitializeReadWriteLock)
+    {
+        std::memset(Ptr(c.Arg(0)), 0, 0x38);
+        Write<s32>(c.Arg(0), -1);
+        return 0;
+    } END;
+    K(ExAcquireReadWriteLockExclusive) { AcquireRwLock(c.Arg(0), true); return 0; } END;
+    K(ExAcquireReadWriteLockShared) { AcquireRwLock(c.Arg(0), false); return 0; } END;
+    K(ExReleaseReadWriteLock)
+    {
+        const u32 l = c.Arg(0);
+        std::lock_guard lock(g_sched);
+        if (Read<u32>(l + 4))
+            Write<u32>(l + 4, 0);
+        else if (Read<s32>(l + 0xc) > 0)
+            Write<s32>(l + 0xc, Read<s32>(l + 0xc) - 1);
+        Write<s32>(l, Read<s32>(l) - 1);
+        g_cv.notify_all();
+        return 0;
+    } END;
+
+    // ---- exceptions: structured exception handling isn't emulated yet; a raised exception ends
+    // the program with a report, and an unwind just drops the frames above the target
+    auto raise = [](u32 code) {
+        Log("kernel: an exception was raised: code %#x (structured exception handling isn't emulated yet)", code);
+        g_quit = true;
+        WakeAll();
+        ExitThread();
+    };
+    Register("ExRaiseStatus", [raise](Call& c) -> u64 { raise(c.Arg(0)); return 0; });
+    Register("RtlRaiseStatus", [raise](Call& c) -> u64 { raise(c.Arg(0)); return 0; });
+    Register("ExRaiseException", [raise](Call& c) -> u64 { raise(Read<u32>(c.Arg(0))); return 0; });
+    K(RtlUnwind) // target frame, target ip, exception record, return value
+    {
+        if (c.Arg(0))
+            Write<u32>(CurrentThread()->kpcr, c.Arg(0)); // NtTib.ExceptionList
+        return c.Arg(3);
+    } END;
+
+    // ---- XBE sections loaded and unloaded on demand (XBE_SECTION_HEADER: VirtualAddress 4,
+    // VirtualSize 8, FileAddress 12, FileSize 16, SectionReferenceCount 24). Every section is in
+    // memory from the start; a section loaded again after its last unload gets its data back.
+    K(XeLoadSection)
+    {
+        const u32 h = c.Arg(0);
+        const u32 count = Read<u32>(h + 24);
+        if (count == 0 && Read<u32>(h + 4))
+        {
+            const u32 va = Read<u32>(h + 4), vsize = Read<u32>(h + 8), raw = Read<u32>(h + 12), rsize = Read<u32>(h + 16);
+            if (FILE* f = std::fopen(g_xbe.path.c_str(), "rb"))
+            {
+                const u32 n = std::min(rsize, vsize);
+                if (std::fseek(f, long(raw), SEEK_SET) == 0 && std::fread(Ptr(va), 1, n, f) == n && vsize > n)
+                    std::memset(Ptr(va + n), 0, vsize - n);
+                std::fclose(f);
+            }
+        }
+        Write<u32>(h + 24, count + 1);
+        return STATUS_SUCCESS;
+    } END;
+    K(XeUnloadSection)
+    {
+        const u32 count = Read<u32>(c.Arg(0) + 24);
+        if (count == 0)
+            return STATUS_INVALID_PARAMETER;
+        Write<u32>(c.Arg(0) + 24, count - 1);
+        return STATUS_SUCCESS;
+    } END;
 
     // ---- interlocked (fastcall)
     K(InterlockedExchange) { return __atomic_exchange_n(Ptr<u32>(c.Arg(0)), c.Arg(1), __ATOMIC_SEQ_CST); } END;

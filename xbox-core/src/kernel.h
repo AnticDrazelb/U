@@ -20,6 +20,12 @@ using RegisterFn = void (*)(const char* name, std::function<u64(Call&)> handler)
 
 s64 SystemTime(); // 100 ns units since 1601
 std::string GuestString(u32 ansi_string);
+std::string FormatGuest(u32 fmt, u32 args); // printf over the guest's arguments at `args`
+
+// kernel_rtl.cpp: strings, memory, integers, printf, the pool, lists, crypto, debug and HAL stubs
+void RegisterRtlExports(RegisterFn reg);
+u32 PoolAlloc(u32 size);
+void PoolFree(u32 p);
 
 // files.cpp
 void RegisterFileExports(RegisterFn reg);

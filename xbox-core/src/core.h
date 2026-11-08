@@ -98,6 +98,7 @@ struct XbeInfo
     u32 tls_directory = 0, tls_raw_start = 0, tls_raw_end = 0, tls_index_address = 0, tls_zero_fill = 0;
     u32 init_flags = 0;
     std::string title;
+    std::string path; // the file it was loaded from (XeLoadSection reads sections again from it)
 };
 bool LoadXbe(const std::string& path, XbeInfo& info, std::string& error);
 extern XbeInfo g_xbe;
