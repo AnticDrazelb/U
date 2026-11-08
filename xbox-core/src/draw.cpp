@@ -717,6 +717,27 @@ struct DepthStencil
     u32 depth_func = 0, stencil_func = 0, stencil_ref = 0, stencil_mask = 0, stencil_write = 0;
     u32 op_fail = 0, op_zfail = 0, op_zpass = 0;
     float z_max = 0;
+    bool z_float = false; // SET_CONTROL0's Z_FORMAT: depth stored as floats
+
+    // a depth as stored: fixed point, or the float formats (24 bits: a float without its sign and
+    // last 7 mantissa bits; 16 bits: 4 exponent bits with a bias of 7, 12 mantissa), which order
+    // as integers do
+    u32 Encode(float z) const
+    {
+        z = std::clamp(z, 0.f, z_max);
+        if (!z_float)
+            return u32(z + 0.5f);
+        u32 bits;
+        std::memcpy(&bits, &z, 4);
+        if (zs.bytes == 4)
+            return bits >> 7;
+        const int e = int((bits >> 23) & 0xff) - 120;
+        if (e <= 0)
+            return std::min(4095u, u32(z * 262144.f)); // below 2^-6: m / 4096 * 2^-6
+        if (e >= 16)
+            return 0xffff;
+        return u32(e) << 12 | ((bits >> 11) & 0xfff);
+    }
 
     DepthStencil()
     {
@@ -731,7 +752,8 @@ struct DepthStencil
         stencil_func = k.Get(0x364), stencil_ref = k.Get(0x368) & 0xff, stencil_mask = k.Get(0x36c) & 0xff;
         stencil_write = k.Get(0x360) & 0xff;
         op_fail = k.Get(0x370), op_zfail = k.Get(0x374), op_zpass = k.Get(0x378);
-        z_max = zs.bytes == 2 ? 65535.f : 16777215.f;
+        z_float = k.Get(0x290) & (1u << 12);
+        z_max = z_float ? (zs.bytes == 2 ? 511.9375f : 3.4028235e38f) : zs.bytes == 2 ? 65535.f : 16777215.f;
         active = depth_test || depth_write || stencil;
     }
 
@@ -760,7 +782,7 @@ struct DepthStencil
         const u32 word = zs.bytes == 2 ? Read<u16>(p) : Read<u32>(p);
         const u32 stored = zs.bytes == 2 ? word : word >> 8;
         const u8 old_stencil = zs.bytes == 2 ? 0 : u8(word);
-        const u32 zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
+        const u32 zi = Encode(z);
         u8 s = old_stencil;
         bool pass = true;
         if (stencil && !DepthTest(stencil_func, float(stencil_ref & stencil_mask), float(old_stencil & stencil_mask)))
