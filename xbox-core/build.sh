@@ -7,7 +7,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NXDK_DIR="${NXDK_DIR:-$HOME/emu/nxdk}"
-SAMPLES=(hello hello++ sdl gamma winapi_filefind winapi_drivelist triangle xaudio usb sdl_gamecontroller)
+SAMPLES=(hello hello++ sdl gamma winapi_filefind winapi_drivelist triangle xaudio usb sdl_gamecontroller mesh)
 case "${1:-}" in
 host)
     cmake -S "$HERE" -B "$HOME/xc-host" -G Ninja -DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}"

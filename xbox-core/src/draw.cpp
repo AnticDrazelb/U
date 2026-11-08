@@ -346,21 +346,15 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
                 continue;
             const float wa = ea * inv_area, wb = eb * inv_area, wc = ec * inv_area;
             const float z = a.z * wa + b.z * wb + c.z * wc;
+            u32 zp = 0, zi = 0;
             if (depth_test || depth_write)
             {
                 // compared as the integer the buffer holds
-                const u32 zp = zs.address + u32(y) * zs.pitch + u32(x) * zs.bytes;
+                zp = zs.address + u32(y) * zs.pitch + u32(x) * zs.bytes;
                 const u32 stored = zs.bytes == 2 ? Read<u16>(zp) : Read<u32>(zp) >> 8;
-                const u32 zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
+                zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
                 if (depth_test && !DepthTest(k.Get(0x354), float(zi), float(stored)))
                     continue;
-                if (depth_write)
-                {
-                    if (zs.bytes == 2)
-                        Write<u16>(zp, u16(zi));
-                    else
-                        Write<u32>(zp, (Read<u32>(zp) & 0xff) | (zi << 8));
-                }
             }
             // perspective-correct interpolation of the outputs
             const float pa = wa * a.inv_w, pb = wb * b.inv_w, pc = wc * c.inv_w, sum = pa + pb + pc;
@@ -368,7 +362,16 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
             for (int o : {3, 4, 9, 10, 11, 12})
                 for (int i = 0; i < 4; i++)
                     in.v[o][i] = (a.o[o][i] * pa + b.o[o][i] * pb + c.o[o][i] * pc) / sum;
-            const u32 color = ShadePixel(in, cs, u32(x), u32(y));
+            u32 color;
+            if (!ShadePixel(in, cs, u32(x), u32(y), color))
+                continue;
+            if (depth_write)
+            {
+                if (zs.bytes == 2)
+                    Write<u16>(zp, u16(zi));
+                else
+                    Write<u32>(zp, (Read<u32>(zp) & 0xff) | (zi << 8));
+            }
             WritePixel(cs, u32(x), u32(y), color, write_mask);
         }
     }
