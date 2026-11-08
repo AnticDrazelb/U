@@ -55,10 +55,25 @@ u32 Wcslen(u32 p)
     return n;
 }
 
-char Upper(char c) { return c >= 'a' && c <= 'z' ? char(c - 32) : c; }
-char Lower(char c) { return c >= 'A' && c <= 'Z' ? char(c + 32) : c; }
-u16 UpperW(u16 c) { return c >= 'a' && c <= 'z' ? u16(c - 32) : c; }
-u16 LowerW(u16 c) { return c >= 'A' && c <= 'Z' ? u16(c + 32) : c; }
+// Latin-1 case, as the Xbox's kernel maps it (its tables, measured on hardware): the accented
+// letters too, but not the multiplication and division signs; ÿ has no uppercase in 8 bits ('?')
+u8 Upper(u8 c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 0xe0 && c <= 0xfe && c != 0xf7))
+        return u8(c - 32);
+    return c == 0xff ? '?' : c;
+}
+u8 Lower(u8 c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 0xc0 && c <= 0xde && c != 0xd7) ? u8(c + 32) : c;
+}
+u16 UpperW(u16 c)
+{
+    if ((c >= 'a' && c <= 'z') || (c >= 0xe0 && c <= 0xfe && c != 0xf7))
+        return u16(c - 32);
+    return c == 0xff ? 0x178 : c;
+}
+u16 LowerW(u16 c) { return (c >= 'A' && c <= 'Z') || (c >= 0xc0 && c <= 0xde && c != 0xd7) ? u16(c + 32) : c; }
 
 // characters of a string as u16 (ANSI widened)
 std::vector<u16> Chars(u32 s, bool wide)
@@ -70,7 +85,8 @@ std::vector<u16> Chars(u32 s, bool wide)
     return out;
 }
 
-s32 CompareChars(const std::vector<u16>& a, const std::vector<u16>& b, bool insensitive)
+// the first differing characters' difference, else the lengths' (in bytes: `unit` a character)
+s32 CompareChars(const std::vector<u16>& a, const std::vector<u16>& b, bool insensitive, int unit = 1)
 {
     const size_t n = std::min(a.size(), b.size());
     for (size_t i = 0; i < n; i++)
@@ -79,7 +95,7 @@ s32 CompareChars(const std::vector<u16>& a, const std::vector<u16>& b, bool inse
         if (x != y)
             return s32(x) - s32(y);
     }
-    return s32(a.size()) - s32(b.size());
+    return (s32(a.size()) - s32(b.size())) * unit;
 }
 
 // Fills a string with `chars` (ANSI or wide); allocates its buffer from the pool when `allocate`.
@@ -279,11 +295,29 @@ void RegisterRtlExports(RegisterFn reg)
             chars[i] = Read<u16>(src + i * 2);
         return StoreString(c.Arg(0), chars, true, true) == STATUS_SUCCESS;
     });
+    // conversions: the result needs its terminator's room too. Unicode: more than 64 KiB is an
+    // invalid parameter; a buffer too small is an overflow, nothing written. ANSI: a buffer too small
+    // is an overflow, as much as fits written.
     reg("RtlAnsiStringToUnicodeString", [](Call& c) -> u64 {
-        return StoreString(c.Arg(0), Chars(c.Arg(1), false), true, c.Arg(2) & 0xff);
+        const auto chars = Chars(c.Arg(1), false);
+        const u32 needed = u32(chars.size()) * 2 + 2;
+        if (needed > 0xffff)
+            return 0xC00000F0; // STATUS_INVALID_PARAMETER_2
+        if (!(c.Arg(2) & 0xff) && needed > MaxLength(c.Arg(0)))
+            return STATUS_BUFFER_OVERFLOW;
+        return StoreString(c.Arg(0), chars, true, c.Arg(2) & 0xff);
     });
     reg("RtlUnicodeStringToAnsiString", [](Call& c) -> u64 {
-        return StoreString(c.Arg(0), Chars(c.Arg(1), true), false, c.Arg(2) & 0xff);
+        auto chars = Chars(c.Arg(1), true);
+        const u32 needed = u32(chars.size()) + 1;
+        u32 status = STATUS_SUCCESS;
+        if (!(c.Arg(2) & 0xff) && needed > MaxLength(c.Arg(0)))
+        {
+            chars.resize(MaxLength(c.Arg(0)) ? MaxLength(c.Arg(0)) - 1u : 0u);
+            status = STATUS_BUFFER_OVERFLOW;
+        }
+        const u32 stored = StoreString(c.Arg(0), chars, false, c.Arg(2) & 0xff);
+        return stored != STATUS_SUCCESS ? stored : status;
     });
     reg("RtlFreeAnsiString", [](Call& c) -> u64 { PoolFree(Buffer(c.Arg(0))); SetString(c.Arg(0), 0, 0, 0); return 0; });
     reg("RtlFreeUnicodeString", [](Call& c) -> u64 { PoolFree(Buffer(c.Arg(0))); SetString(c.Arg(0), 0, 0, 0); return 0; });
@@ -332,7 +366,7 @@ void RegisterRtlExports(RegisterFn reg)
         return u32(CompareChars(Chars(c.Arg(0), false), Chars(c.Arg(1), false), c.Arg(2) & 0xff));
     });
     reg("RtlCompareUnicodeString", [](Call& c) -> u64 {
-        return u32(CompareChars(Chars(c.Arg(0), true), Chars(c.Arg(1), true), c.Arg(2) & 0xff));
+        return u32(CompareChars(Chars(c.Arg(0), true), Chars(c.Arg(1), true), c.Arg(2) & 0xff, 2));
     });
     reg("RtlEqualString", [](Call& c) -> u64 {
         return CompareChars(Chars(c.Arg(0), false), Chars(c.Arg(1), false), c.Arg(2) & 0xff) == 0;
@@ -343,7 +377,7 @@ void RegisterRtlExports(RegisterFn reg)
     reg("RtlUpperString", [](Call& c) -> u64 {
         auto chars = Chars(c.Arg(1), false);
         for (auto& ch : chars)
-            ch = u8(Upper(char(ch)));
+            ch = Upper(u8(ch));
         chars.resize(std::min<size_t>(chars.size(), MaxLength(c.Arg(0))));
         StoreString(c.Arg(0), chars, false, false);
         return 0;
@@ -362,8 +396,8 @@ void RegisterRtlExports(RegisterFn reg)
     });
     reg("RtlUpcaseUnicodeChar", [](Call& c) -> u64 { return UpperW(u16(c.Arg(0))); });
     reg("RtlDowncaseUnicodeChar", [](Call& c) -> u64 { return LowerW(u16(c.Arg(0))); });
-    reg("RtlUpperChar", [](Call& c) -> u64 { return u8(Upper(char(c.Arg(0)))); });
-    reg("RtlLowerChar", [](Call& c) -> u64 { return u8(Lower(char(c.Arg(0)))); });
+    reg("RtlUpperChar", [](Call& c) -> u64 { return Upper(u8(c.Arg(0))); });
+    reg("RtlLowerChar", [](Call& c) -> u64 { return Lower(u8(c.Arg(0))); });
     reg("RtlCharToInteger", [](Call& c) -> u64 {
         std::vector<u16> s;
         for (u32 p = c.Arg(0); Read<u8>(p); p++)

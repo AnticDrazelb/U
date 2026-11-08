@@ -1008,7 +1008,10 @@ void InitKernel()
     {
         const u32 o = ObjectOf(c.Arg(0));
         if (!o)
+        {
+            Write<u32>(c.Arg(2), 0);
             return STATUS_INVALID_HANDLE;
+        }
         Write<u32>(c.Arg(2), o);
         return STATUS_SUCCESS;
     } END;
@@ -1560,29 +1563,39 @@ void InitKernel()
     K(HalRegisterShutdownNotification) { return 0; } END;
     K(RtlTimeToTimeFields)
     {
-        // Time (100 ns since 1601), TIME_FIELDS: Year, Month, Day, Hour, Minute, Second, Milliseconds, Weekday
+        // Time (100 ns since 1601), TIME_FIELDS: Year, Month, Day, Hour, Minute, Second, Milliseconds,
+        // Weekday. The kernel's arithmetic: milliseconds and days by signed division, then 32-bit
+        // unsigned days and milliseconds, the years counted in 32 bits (negative times give what the
+        // console gives, overflows included).
         const s64 t = Read<s64>(c.Arg(0));
-        const s64 ms = t / 10000;
-        s64 days = ms / 86400000;
-        const s64 rest = ms % 86400000;
+        const s64 total_ms = t / 10000, signed_days = total_ms / 86400000;
+        const u32 days = u32(signed_days), ms = u32(total_ms - signed_days * 86400000);
+        const u32 n400 = days / 146097;
+        u32 d = days - n400 * 146097;
+        const u32 n100 = (d * 100 + 75) / 3652425;
+        d -= n100 * 36524;
+        const u32 n4 = d / 1461;
+        d -= n4 * 1461;
+        const u32 years = n400 * 400 + n100 * 100 + n4 * 4 + (d * 100 + 75) / 36525;
+        u32 rest = days - (years * 365 + years / 4 - years / 100 + years / 400);
+        const u32 y1 = years + 1;
+        const bool leap = (y1 % 4 == 0 && y1 % 100 != 0) || y1 % 400 == 0;
+        static const u32 kNormal[13] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365};
+        static const u32 kLeap[13] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366};
+        const u32* table = leap ? kLeap : kNormal;
+        u32 m = 0;
+        while (m < 12 && table[m + 1] <= rest)
+            m++;
+        rest -= table[m];
         const u32 out = c.Arg(1);
-        Write<u16>(out + 14, u16((days + 1) % 7)); // 1601-01-01 was a Monday
-        // civil date from days since 1601-01-01
-        s64 y = 1601;
-        auto leap = [](s64 yy) { return (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0; };
-        while (days >= (leap(y) ? 366 : 365))
-            days -= leap(y) ? 366 : 365, y++;
-        const int mdays[12] = {31, leap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-        int m = 0;
-        while (days >= mdays[m])
-            days -= mdays[m++];
-        Write<u16>(out + 0, u16(y));
+        Write<u16>(out + 0, u16(1601 + years));
         Write<u16>(out + 2, u16(m + 1));
-        Write<u16>(out + 4, u16(days + 1));
-        Write<u16>(out + 6, u16(rest / 3600000));
-        Write<u16>(out + 8, u16(rest / 60000 % 60));
-        Write<u16>(out + 10, u16(rest / 1000 % 60));
-        Write<u16>(out + 12, u16(rest % 1000));
+        Write<u16>(out + 4, u16(rest + 1));
+        Write<u16>(out + 6, u16(ms / 3600000));
+        Write<u16>(out + 8, u16(ms % 3600000 / 60000));
+        Write<u16>(out + 10, u16(ms % 60000 / 1000));
+        Write<u16>(out + 12, u16(ms % 1000));
+        Write<u16>(out + 14, u16((days + 1) % 7)); // 1601-01-01 was a Monday
         return 0;
     } END;
     K(RtlTimeFieldsToTime)
@@ -1590,18 +1603,21 @@ void InitKernel()
         const u32 in = c.Arg(0);
         const s64 y = Read<u16>(in), mo = Read<u16>(in + 2), d = Read<u16>(in + 4);
         auto leap = [](s64 yy) { return (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0; };
-        if (y < 1601 || mo < 1 || mo > 12 || d < 1)
+        const u32 hour = Read<u16>(in + 6), minute = Read<u16>(in + 8), second = Read<u16>(in + 10), msec = Read<u16>(in + 12);
+        if (y < 1601 || mo < 1 || mo > 12 || d < 1 || hour > 23 || minute > 59 || second > 59 || msec > 999)
+            return 0; // FALSE, the time left alone
+        const int mdays[12] = {31, leap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        if (d > mdays[mo - 1])
             return 0;
-        s64 days = 0;
+        u64 days = 0;
         for (s64 yy = 1601; yy < y; yy++)
             days += leap(yy) ? 366 : 365;
-        const int mdays[12] = {31, leap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
         for (int m = 0; m < mo - 1; m++)
-            days += mdays[m];
-        days += d - 1;
-        const s64 ms = ((days * 24 + Read<u16>(in + 6)) * 60 + Read<u16>(in + 8)) * 60000 + Read<u16>(in + 10) * 1000 +
-                       Read<u16>(in + 12);
-        Write<s64>(c.Arg(1), ms * 10000);
+            days += u64(mdays[m]);
+        days += u64(d - 1);
+        // in 64-bit unsigned arithmetic: the latest dates wrap as the kernel's do
+        const u64 ms = ((days * 24 + hour) * 60 + minute) * 60000 + second * 1000ull + msec;
+        Write<u64>(c.Arg(1), ms * 10000);
         return 1;
     } END;
     K(MmGetPhysicalAddress) { return PhysicalAddress(c.Arg(0)); } END;
