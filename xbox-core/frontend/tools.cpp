@@ -27,7 +27,7 @@ bool IsFile(const std::string& p)
     return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-bool IsIso(const std::string& n) { return n.size() > 4 && strcasecmp(n.c_str() + n.size() - 4, ".iso") == 0; }
+bool IsIso(const std::string& n) { return IsDiscImageName(n); }
 
 uint64_t TreeSize(const std::string& path)
 {

@@ -19,6 +19,7 @@ struct Game
     uint64_t size = 0;     // bytes (the image, or the folder's XBE)
     std::string cover;     // a picture's path, or ""
     bool sample = false;
+    std::string usb;       // the USB drive it's on ("" on the hard drive)
     // history
     int plays = 0;
     int64_t last_played = 0; // seconds since 1970
@@ -29,11 +30,17 @@ struct LibraryPaths
 {
     std::vector<std::string> sample_dirs; // folders of bundled .xbe/.iso samples
     std::string games;                    // the player's games
+    std::vector<std::string> usb_drives;  // USB drives' tops, their games listed too
     std::string covers;                   // pictures by title ID or name
     std::string history;                  // a file
 };
 
 std::vector<Game> ScanLibrary(const LibraryPaths& paths);
+// a disc image's name: .iso or .xiso
+bool IsDiscImageName(const std::string& name);
+// USB drive i (0-7) where the app sees it: /mnt/usbN, or /usbN where a console shows an app its
+// drives instead (as New Eden found); "" when neither is there
+std::string UsbDrive(int i);
 void SaveHistory(const std::string& file, const std::vector<Game>& games);
 // a run starting (counted) or its end ("" leaves the result as it was)
 void RecordRun(const std::string& file, const std::string& path, const std::string& result);

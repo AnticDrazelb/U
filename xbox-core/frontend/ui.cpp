@@ -292,7 +292,7 @@ Image LibraryUi::GeneratedCover(const Game& g, int w, int h)
     const int band = int(40 * k);
     c.Fill(0, 0, w, band, Rgb(0x111417, 235));
     c.Fill(0, band, w, std::max(1, int(3 * k)), kAccent);
-    const std::string tag = g.sample ? "SAMPLE" : g.kind == "Disc image" ? "DISC" : "GAME";
+    const std::string tag = g.sample ? "SAMPLE" : !g.usb.empty() ? "USB" : g.kind == "Disc image" ? "DISC" : "GAME";
     semibold.Draw(c, int(12 * k), int(11 * k), tag, 17 * k, kAccent);
     // the title, centred in the middle
     const float size = 30 * k;
@@ -498,7 +498,7 @@ void LibraryUi::DrawDetails(Canvas& c, const Game& g)
         y += 48;
     }
     y += 6;
-    regular.Draw(c, tx, y, regular.Fit(g.kind + "  \xC2\xB7  " + g.file_name, 22, tw), 22, kDim);
+    regular.Draw(c, tx, y, regular.Fit(g.kind + (g.usb.empty() ? "" : " on USB (" + g.usb + ")") + "  \xC2\xB7  " + g.file_name, 22, tw), 22, kDim);
     y += 46;
     c.Fill(tx, y, tw, 2, kPanelEdge);
     y += 20;

@@ -22,7 +22,7 @@ int main(int argc, char** argv)
         return 1;
     }
     const std::string assets = argv[1], games = argv[2], prefix = argv[3];
-    fe::LibraryPaths paths{{games + "/samples"}, games, games + "/covers", games + "/history.txt"};
+    fe::LibraryPaths paths{{games + "/samples"}, games, {games + "-usb"}, games + "/covers", games + "/history.txt"};
     fe::Settings settings;
     settings.Load(games + "/settings.txt");
     fe::UiPaths ui_paths{assets, games + "/settings.txt", games + "/autostart.txt",

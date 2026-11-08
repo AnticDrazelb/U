@@ -393,7 +393,14 @@ void SetGameDirectory(const std::string& dir)
 
 bool LoadGame(const std::string& path, std::string& error)
 {
-    const bool image = path.size() > 4 && Lower(path.substr(path.size() - 4)) == ".iso";
+    // an XBE starts "XBEH"; anything else is taken for a disc image (.iso, .xiso, whatever its name)
+    bool image = true;
+    if (FILE* f = std::fopen(path.c_str(), "rb"))
+    {
+        char magic[4] = {};
+        image = std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "XBEH", 4) != 0;
+        std::fclose(f);
+    }
     if (!image)
     {
         if (!LoadXbe(path, g_xbe, error))

@@ -160,14 +160,15 @@ Game Describe(const std::string& path, const std::string& file_name, const std::
     Game g;
     g.path = path, g.file_name = file_name, g.title = file_name, g.kind = kind;
     g.size = FileSize(path);
-    if (EndsWith(path, ".iso"))
+    if (IsDiscImageName(path))
         ParseXbe(IsoXbeHead(path), g);
     else if (FILE* f = std::fopen(path.c_str(), "rb"))
     {
         ParseXbe(ReadHead(f, 0, 0x10000), g);
         std::fclose(f);
     }
-    const std::string stem = EndsWith(path, ".iso") || EndsWith(path, ".xbe") ? path.substr(0, path.size() - 4) : path;
+    const std::string stem = EndsWith(path, ".xiso") ? path.substr(0, path.size() - 5)
+                             : EndsWith(path, ".iso") || EndsWith(path, ".xbe") ? path.substr(0, path.size() - 4) : path;
     g.cover = FindCover(g, folder, stem, covers);
     return g;
 }
@@ -222,6 +223,19 @@ void WriteHistory(const std::string& file, const std::map<std::string, HistoryEn
 
 } // namespace
 
+bool IsDiscImageName(const std::string& name) { return EndsWith(name, ".iso") || EndsWith(name, ".xiso"); }
+
+std::string UsbDrive(int i)
+{
+    const std::string mnt = "/mnt/usb" + std::to_string(i), root = "/usb" + std::to_string(i);
+    struct stat st;
+    if (stat(mnt.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        return mnt;
+    if (stat(root.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        return root;
+    return "";
+}
+
 std::vector<Game> ScanLibrary(const LibraryPaths& paths)
 {
     std::vector<Game> out;
@@ -231,45 +245,53 @@ std::vector<Game> ScanLibrary(const LibraryPaths& paths)
             while (dirent* e = readdir(d))
             {
                 const std::string name = e->d_name;
-                if (EndsWith(name, ".xbe") || EndsWith(name, ".iso"))
+                if (EndsWith(name, ".xbe") || IsDiscImageName(name))
                 {
-                    Game g = Describe(dir + "/" + name, name.substr(0, name.size() - 4), "", "Sample", paths.covers);
+                    Game g = Describe(dir + "/" + name, name.substr(0, name.find_last_of('.')), "", "Sample", paths.covers);
                     g.sample = true;
                     out.push_back(g);
                 }
             }
             closedir(d);
         }
-    if (DIR* d = opendir(paths.games.c_str()))
-    {
+    // the games folder, then the USB drives (their tops, and their games, xbox and xbox-core/games
+    // folders): disc images, folders with a default.xbe, folders holding a disc image
+    auto scan = [&](const std::string& dir, const std::string& usb) {
+        DIR* d = opendir(dir.c_str());
+        if (!d)
+            return;
         while (dirent* e = readdir(d))
         {
-            const std::string name = e->d_name, full = paths.games + "/" + name;
+            const std::string name = e->d_name, full = dir + "/" + name;
             if (name[0] == '.')
                 continue;
-            if (EndsWith(name, ".iso"))
-            {
-                out.push_back(Describe(full, name.substr(0, name.size() - 4), "", "Disc image", paths.covers));
-                continue;
-            }
-            if (Exists(full + "/default.xbe"))
-            {
-                out.push_back(Describe(full + "/default.xbe", name, full, "Game folder", paths.covers));
-                continue;
-            }
-            if (DIR* inner = opendir(full.c_str())) // a folder holding a disc image
+            Game g;
+            if (IsDiscImageName(name))
+                g = Describe(full, name.substr(0, name.find_last_of('.')), "", "Disc image", paths.covers);
+            else if (Exists(full + "/default.xbe"))
+                g = Describe(full + "/default.xbe", name, full, "Game folder", paths.covers);
+            else if (DIR* inner = opendir(full.c_str()))
             {
                 while (dirent* f = readdir(inner))
-                    if (EndsWith(f->d_name, ".iso"))
+                    if (IsDiscImageName(f->d_name))
                     {
-                        out.push_back(Describe(full + "/" + f->d_name, name, full, "Disc image", paths.covers));
+                        g = Describe(full + "/" + f->d_name, name, full, "Disc image", paths.covers);
                         break;
                     }
                 closedir(inner);
             }
+            if (g.path.empty())
+                continue;
+            g.usb = usb;
+            if (std::none_of(out.begin(), out.end(), [&](const Game& o) { return o.path == g.path; }))
+                out.push_back(g);
         }
         closedir(d);
-    }
+    };
+    scan(paths.games, "");
+    for (const std::string& drive : paths.usb_drives)
+        for (const char* sub : {"", "/games", "/xbox", "/Xbox", "/xbox-core/games"})
+            scan(drive + sub, drive);
     const auto history = LoadHistory(paths.history);
     for (Game& g : out)
         if (auto it = history.find(g.path); it != history.end())
