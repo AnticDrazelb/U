@@ -123,7 +123,7 @@ struct PixelState
     V4 fog_color{};
     V4 final_c0{}, final_c1{};
     u32 program[4] = {};
-    u32 dot_map[4] = {}, input[4] = {}, clip_mode = 0;
+    u32 dot_map[4] = {}, input[4] = {}, clip_mode = 0, shadow_func = 0;
     float bump[4][4] = {}, bump_scale[4] = {}, bump_offset[4] = {};
     bool enabled[4] = {};
     Texture texture[4];
@@ -328,6 +328,62 @@ V4 SampleLevel(const Texture& t, float u, float v, bool linear)
     for (int i = 0; i < 4; i++)
         c[i] = (c00[i] * (1 - ax) + c10[i] * ax) * (1 - ay) + (c01[i] * (1 - ax) + c11[i] * ax) * ay;
     return c;
+}
+
+// ---- depth textures: shadow comparisons
+
+bool IsDepthFormat(u32 f) { return f >= 0x2a && f <= 0x31; }
+
+// a depth texel's value: the fixed formats as integers, the float ones (24 bits: 8 exponent, 16
+// mantissa; 16 bits: 4 exponent with a bias of 7, 12 mantissa) as their values
+float DepthTexel(const Texture& t, u32 x, u32 y)
+{
+    const u32 bpt = BytesPerTexel(t.format);
+    const u32 p = t.address + (t.swizzled ? Swizzle(x, y, t.width, t.height) * bpt : y * t.pitch + x * bpt);
+    switch (t.format)
+    {
+    case 0x2a: case 0x2e: return float(Read<u32>(p) >> 8);
+    case 0x2b: case 0x2f:
+    {
+        const u32 bits = (Read<u32>(p) >> 8) << 7;
+        float f;
+        std::memcpy(&f, &bits, 4);
+        return f;
+    }
+    case 0x2c: case 0x30: return float(Read<u16>(p));
+    default: // 0x2d, 0x31
+    {
+        const u32 v = Read<u16>(p), e = v >> 12, m = v & 0xfff;
+        return e ? std::ldexp(1.f + float(m) / 4096.f, int(e) - 7) : std::ldexp(float(m) / 4096.f, -6);
+    }
+    }
+}
+
+// SET_SHADOW_COMPARE_FUNC (0 never, 1 greater, 2 equal, 3 greater or equal, 4 less, 5 not equal,
+// 6 less or equal, 7 always) between the reference and the texel's depth: all ones or all zeros
+V4 ShadowSample(const Texture& t, float u, float v, float reference)
+{
+    if (t.swizzled)
+        u *= float(t.width), v *= float(t.height);
+    const int ax = Address(int(std::floor(u)), t.width, t.wrap & 0xf);
+    const int ay = Address(int(std::floor(v)), t.height, (t.wrap >> 8) & 0xf);
+    if (ax < 0 || ay < 0)
+        return Unpack(t.border);
+    const float depth = DepthTexel(t, u32(ax), u32(ay));
+    bool pass;
+    switch (g_ps.shadow_func)
+    {
+    case 0: pass = false; break;
+    case 1: pass = reference > depth; break;
+    case 2: pass = reference == depth; break;
+    case 3: pass = reference >= depth; break;
+    case 4: pass = reference < depth; break;
+    case 5: pass = reference != depth; break;
+    case 6: pass = reference <= depth; break;
+    default: pass = true;
+    }
+    const float r = pass ? 1.f : 0.f;
+    return {r, r, r, r};
 }
 
 // ---- the combiners
@@ -580,7 +636,10 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             if (!enabled)
                 break;
             const float q = program == 1 && tc[3] != 0 ? tc[3] : 1.f;
-            tex[s] = SampleLod(t, tc[0] / q, tc[1] / q, in.lod[s]);
+            if (IsDepthFormat(t.format)) // a shadow map: the depth reference is r (over q)
+                tex[s] = ShadowSample(t, tc[0] / q, tc[1] / q, tc[2] / q);
+            else
+                tex[s] = SampleLod(t, tc[0] / q, tc[1] / q, in.lod[s]);
             break;
         }
         case 3: // cube map
@@ -757,6 +816,7 @@ void PreparePixels()
         ps.dot_map[i] = (k.Get(0x1e74) >> (4 * (i - 1))) & 0xf;
     ps.input[1] = 0, ps.input[2] = (k.Get(0x1e78) >> 16) & 0xf, ps.input[3] = (k.Get(0x1e78) >> 20) & 0xf;
     ps.clip_mode = k.Get(0x17f8);
+    ps.shadow_func = k.Get(0x1e6c) & 7; // SET_SHADOW_COMPARE_FUNC
     for (int i = 0; i < 4; i++)
     {
         for (int j = 0; j < 4; j++)
