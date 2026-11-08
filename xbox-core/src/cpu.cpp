@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "core.h"
@@ -347,6 +349,16 @@ bool OnFault(platform::Fault& f)
         return false;
     }
     const u8* code = Ptr<u8>(u32(rip));
+    // the first faults, each on the disk before it's handled: if handling one kills the app, the
+    // log ends with it
+    static std::atomic<u32> s_faults{0};
+    if (const u32 n = s_faults++; n < 300)
+    {
+        GuestThread* ft = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+        LogSync("cpu: fault %u in thread %u: signal %d at %#x, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
+                "ecx %#x edx %#x esp %#x", n + 1, ft ? ft->id : 0, f.signal, u32(rip), f.address, code[0], code[1], code[2],
+                code[3], code[4], code[5], r.Get(0), r.Get(1), r.Get(2), r.Get(4));
+    }
     size_t length = 0;
     if (f.signal == 11 && (f.address >= kDeviceBase || (f.address >= kAliasBase && f.address - kAliasBase < kAliasSize)))
         length = EmulateDeviceAccess(code, f.address, r);
@@ -482,6 +494,17 @@ void InitCpu()
     if (after != t->kpcr)
         Fatal("cpu self-test: after the faults guest code read fs:[0x18] = %#x, expected the KPCR %#x", after, t->kpcr);
     Log("cpu self-test: faults in 32-bit code are handled, and the guest's fs is intact after them");
+    // again on a thread of its own, as the program's threads run (their own signal stacks)
+    GuestThread* t2 = NewGuestThread(0x4000, 0, "self-test 2");
+    std::atomic<u32> other{0};
+    LogSync("cpu self-test: the same on a new thread (if the app dies here, faults on the program's threads don't "
+            "reach the emulator)");
+    StartHostThread(t2, [&] { other = u32(CallGuest(t2, code, {})) | 1u; });
+    for (int i = 0; i < 5000 && !other; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if ((other & ~1u) != (t2->kpcr & ~1u))
+        Fatal("cpu self-test: on a new thread, guest code read fs:[0x18] = %#x, expected the KPCR %#x", other.load(), t2->kpcr);
+    Log("cpu self-test: faults on a new thread are handled too");
 }
 
 u16 GuestCodeSelector() { return g_sel32; }

@@ -3,6 +3,7 @@
 // on consoles: the 32-bit code segment is 0x33, the LDT is off, direct memory maps once, the app's
 // executable is at 0x400000.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -466,7 +467,30 @@ std::string WrapSignal(int sig)
     return "";
 }
 
-// Crema's runtime gives every thread a signal stack (ps4_install_signal_stack).
-void PrepareThread() {}
+// Crema's runtime gives every thread a 64 KiB signal stack (ps4_install_signal_stack): too little for
+// the fault handler, which emulates the hardware a register access reaches (the GPU's command
+// processing, a draw) on it. A thread that runs guest code gets 1 MiB instead.
+struct BsdSignalStack
+{
+    void* sp;
+    size_t size;
+    int32_t flags;
+};
+extern "C" int ps4_sigaltstack_xb(const BsdSignalStack* stack, BsdSignalStack* old) __asm__("sigaltstack");
+
+void PrepareThread()
+{
+    thread_local bool done = false;
+    if (done)
+        return;
+    done = true;
+    constexpr size_t kSize = 1024 * 1024;
+    if (void* stack = std::malloc(kSize))
+    {
+        const BsdSignalStack s{stack, kSize, 0};
+        if (ps4_sigaltstack_xb(&s, nullptr) != 0)
+            std::free(stack);
+    }
+}
 
 } // namespace xb::platform
