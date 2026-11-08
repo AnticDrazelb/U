@@ -59,6 +59,7 @@ struct HostFile
     std::vector<std::string> listing; // NtQueryDirectoryFile: the names, read at the first query
     size_t next = 0;
     std::string pattern;
+    u32 port = 0, key = 0; // the I/O completion object it is bound to (FileCompletionInformation)
     int raw = -1;      // the raw disk (0) or one of its partitions opened as a volume (1-5)
     u64 raw_size = 0;  // its size: reads past what was ever written there give zeros, as a disk does
 };
@@ -557,6 +558,20 @@ void CloseHostHandle(int kind, void* host)
 
 void RegisterFileExports(RegisterFn reg)
 {
+    // the I/O calls (handle, event, APC routine, APC context, I/O status block, ...): each ends as NT's
+    // I/O manager ends a request (CompleteIo): overlapped I/O, ReadFileEx and completion ports rely on it
+    const auto reg_io = [reg](const char* name, std::function<u64(Call&)> handler) {
+        reg(name, [handler](Call& c) -> u64 {
+            const u64 status = handler(c);
+            if (u32(status) != STATUS_INVALID_HANDLE)
+            {
+                const HostFile* f = FileOf(c.Arg(0));
+                CompleteFileIo(c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4), u32(status), c.Arg(4) ? Read<u32>(c.Arg(4) + 4) : 0,
+                           f ? f->port : 0, f ? f->key : 0);
+            }
+            return status;
+        });
+    };
     reg("IoCreateSymbolicLink", [](Call& c) -> u64 { // link name, device name (OBJECT_STRING*)
         if (!c.Arg(0))
             return STATUS_SUCCESS; // an unnamed link: nothing anyone can find
@@ -609,7 +624,7 @@ void RegisterFileExports(RegisterFn reg)
         // FileHandle*, DesiredAccess, ObjectAttributes, IoStatusBlock, ShareAccess, OpenOptions
         return Open(c.Arg(0), c.Arg(2), c.Arg(3), 1, c.Arg(5), c.Arg(1));
     });
-    reg("NtReadFile", [](Call& c) -> u64 {
+    reg_io("NtReadFile", [](Call& c) -> u64 {
         // FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset*
         HostFile* f = FileOf(c.Arg(0));
         if (!f || (f->fd < 0 && !(f->iso && !f->directory)))
@@ -651,7 +666,7 @@ void RegisterFileExports(RegisterFn reg)
             WakeAll();
         return status;
     });
-    reg("NtWriteFile", [](Call& c) -> u64 {
+    reg_io("NtWriteFile", [](Call& c) -> u64 {
         HostFile* f = FileOf(c.Arg(0));
         if (f && f->iso)
             return STATUS_ACCESS_DENIED;
@@ -755,6 +770,30 @@ void RegisterFileExports(RegisterFn reg)
                 (f->directory ? rmdir : unlink)(f->path.c_str());
             SetIo(c.Arg(1), 0, 0);
             return STATUS_SUCCESS;
+        case 30: // FileCompletionInformation: port handle, key
+            f->port = KernelObjectOf(Read<u32>(in));
+            f->key = Read<u32>(in + 4);
+            SetIo(c.Arg(1), 0, 0);
+            return f->port ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
+        case 10: // FileRenameInformation: ReplaceIfExists, RootDirectory, FileName (OBJECT_STRING): MoveFile
+        {
+            const std::string to = HostPath(GuestString(in + 8), Read<u32>(in + 4));
+            if (to.empty() || f->path.empty())
+                return STATUS_INVALID_PARAMETER;
+            struct stat st;
+            if (!Read<u8>(in) && stat(to.c_str(), &st) == 0)
+                return STATUS_OBJECT_NAME_COLLISION;
+            if (std::rename(f->path.c_str(), to.c_str()) != 0)
+                return STATUS_ACCESS_DENIED;
+            Log("files: renamed %s to %s", f->path.c_str(), to.c_str());
+            f->path = to;
+            SetIo(c.Arg(1), 0, 0);
+            return STATUS_SUCCESS;
+        }
+        case 4:  // FileBasicInformation (times, attributes): kept as the host has them
+        case 16: // FileModeInformation
+            SetIo(c.Arg(1), 0, 0);
+            return STATUS_SUCCESS;
         }
         Log("files: NtSetInformationFile class %u not implemented", c.Arg(4));
         return STATUS_INVALID_PARAMETER;
@@ -778,6 +817,43 @@ void RegisterFileExports(RegisterFn reg)
             Write<u32>(out + 16, 32);
             Write<u32>(out + 20, 512);
             SetIo(c.Arg(1), 0, 24);
+            return STATUS_SUCCESS;
+        }
+        const u32 length = c.Arg(3);
+        switch (c.Arg(4))
+        {
+        case 1: // FileFsVolumeInformation: creation time, serial number, label length, objects, label
+            if (length < 18)
+                return 0xC0000004; // STATUS_INFO_LENGTH_MISMATCH
+            std::memset(Ptr(out), 0, 18);
+            Write<u32>(out + 8, 0x58424f58); // the serial number
+            SetIo(c.Arg(1), 0, 18);
+            return STATUS_SUCCESS;
+        case 4: // FileFsDeviceInformation: type, characteristics
+            if (length < 8)
+                return 0xC0000004;
+            Write<u32>(out, 7); // FILE_DEVICE_DISK
+            Write<u32>(out + 4, 0);
+            SetIo(c.Arg(1), 0, 8);
+            return STATUS_SUCCESS;
+        case 5: // FileFsAttributeInformation: attributes, longest name, name length, name ("FATX")
+            if (length < 16)
+                return 0xC0000004;
+            Write<u32>(out, 0x2);    // FILE_CASE_PRESERVED_NAMES
+            Write<u32>(out + 4, 42); // FATX names
+            Write<u32>(out + 8, 4);
+            std::memcpy(Ptr(out + 12), "FATX", 4);
+            SetIo(c.Arg(1), 0, 16);
+            return STATUS_SUCCESS;
+        case 7: // FileFsFullSizeInformation: total, caller's free, free; sectors per cluster, sector size
+            if (length < 32)
+                return 0xC0000004;
+            Write<s64>(out, 8ll * 1024 * 1024 * 1024 / 16384);
+            Write<s64>(out + 8, 4ll * 1024 * 1024 * 1024 / 16384);
+            Write<s64>(out + 16, 4ll * 1024 * 1024 * 1024 / 16384);
+            Write<u32>(out + 24, 32);
+            Write<u32>(out + 28, 512);
+            SetIo(c.Arg(1), 0, 32);
             return STATUS_SUCCESS;
         }
         Log("files: NtQueryVolumeInformationFile class %u not implemented", c.Arg(4));
@@ -894,8 +970,8 @@ void RegisterFileExports(RegisterFn reg)
             WakeAll();
         return status;
     };
-    reg("NtReadFileScatter", [scatter](Call& c) -> u64 { return scatter(c, false); });
-    reg("NtWriteFileGather", [scatter](Call& c) -> u64 { return scatter(c, true); });
+    reg_io("NtReadFileScatter", [scatter](Call& c) -> u64 { return scatter(c, false); });
+    reg_io("NtWriteFileGather", [scatter](Call& c) -> u64 { return scatter(c, true); });
     // device controls: the disk's geometry and partitions, as XAPI asks when it mounts drives
     // `partition`: the handle's (the disk 0, a partition 1-5; -1 not known: the 750 MiB of a cache one)
     auto ioctl = [](u32 code, u32 out, u32 out_length, int partition) -> u32 { // returns bytes written
@@ -940,7 +1016,7 @@ void RegisterFileExports(RegisterFn reg)
         const HostFile* f = FileOf(handle);
         return f ? f->raw : -1;
     };
-    reg("NtDeviceIoControlFile", [ioctl, partition_of](Call& c) -> u64 {
+    reg_io("NtDeviceIoControlFile", [ioctl, partition_of](Call& c) -> u64 {
         // handle, event, apc, context, io status, code, in, in length, out, out length
         const u32 n = ioctl(c.Arg(5), c.Arg(8), c.Arg(9), partition_of(c.Arg(0)));
         static std::atomic<u32> logged{0};
@@ -959,7 +1035,7 @@ void RegisterFileExports(RegisterFn reg)
             Write<u32>(c.Arg(6), n);
         return STATUS_SUCCESS;
     });
-    reg("NtFsControlFile", [](Call& c) -> u64 {
+    reg_io("NtFsControlFile", [](Call& c) -> u64 {
         Log("files: file system control %#x on handle %#x", c.Arg(5), c.Arg(0));
         SetIo(c.Arg(4), STATUS_SUCCESS, 0);
         return STATUS_SUCCESS;
@@ -995,7 +1071,7 @@ void RegisterFileExports(RegisterFn reg)
             Write<u32>(c.Arg(5), u32(12 + n.size()));
         return STATUS_SUCCESS;
     });
-    reg("NtQueryDirectoryFile", [](Call& c) -> u64 {
+    reg_io("NtQueryDirectoryFile", [](Call& c) -> u64 {
         // FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FileInformation, Length,
         // FileInformationClass, FileName (a pattern), RestartScan
         auto* dir = static_cast<HostFile*>(HostOf(c.Arg(0), 2));

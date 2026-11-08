@@ -15,6 +15,29 @@ static void check(const char *what, int ok)
         failures++;
 }
 
+static int apc_calls;
+static DWORD apc_error, apc_bytes;
+static VOID WINAPI on_read_done(DWORD error, DWORD bytes, LPOVERLAPPED overlapped)
+{
+    apc_calls++;
+    apc_error = error;
+    apc_bytes = bytes;
+}
+
+static HANDLE open_path(const char *path, ACCESS_MASK access, ULONG disposition)
+{
+    ANSI_STRING name;
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h = NULL;
+    RtlInitAnsiString(&name, path);
+    InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    if (NtCreateFile(&h, access | SYNCHRONIZE, &attributes, &iosb, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+                     disposition, FILE_SYNCHRONOUS_IO_NONALERT) != 0)
+        return NULL;
+    return h;
+}
+
 static volatile LONG dpc_count = 0, apc_count = 0, timer_apc_count = 0;
 static ULONG apc_seen_context = 0;
 
@@ -170,6 +193,72 @@ int main(void)
     NtClearEvent(ev1);
     check("NtSignalAndWaitForSingleObjectEx", NtSignalAndWaitForSingleObjectEx(ev1, ev2, KernelMode, FALSE, NULL) == 0 &&
                                                   NtQueryEvent(ev1, &info) == 0 && info.EventState == 1);
+
+
+    // file I/O ends as NT's I/O manager ends it: the event set, the APC queued, the completion port told
+    {
+        HANDLE f = open_path("\\Device\\CdRom0\\default.xbe", GENERIC_READ, FILE_OPEN);
+        if (!f)
+            f = CreateFileA("D:\\default.xbe", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        char buf[64];
+        IO_STATUS_BLOCK iosb;
+        LARGE_INTEGER at, zero;
+        at.QuadPart = 0;
+        zero.QuadPart = 0;
+        HANDLE ev;
+        NtCreateEvent(&ev, NULL, NotificationEvent, FALSE);
+        NTSTATUS st = NtReadFile(f, ev, NULL, NULL, &iosb, buf, 64, &at);
+        check("a read's event is set when it ends", (st == 0 || st == STATUS_PENDING) &&
+                                                       NtWaitForSingleObject(ev, FALSE, &zero) == 0 &&
+                                                       iosb.Information == 64 && buf[0] == 'X' && buf[1] == 'B');
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof(ov));
+        st = NtReadFile(f, NULL, (PIO_APC_ROUTINE)NtUserIoApcDispatcher, (PVOID)on_read_done, (PIO_STATUS_BLOCK)&ov, buf,
+                        16, &at);
+        check("a read's APC waits for an alertable wait", apc_calls == 0);
+        LARGE_INTEGER shortly;
+        shortly.QuadPart = -10000; // 1 ms
+        st = KeDelayExecutionThread(UserMode, TRUE, &shortly);
+        check("ReadFileEx's completion routine runs (NtUserIoApcDispatcher)",
+              st == STATUS_USER_APC && apc_calls == 1 && apc_error == 0 && apc_bytes == 16);
+        HANDLE port;
+        FILE_COMPLETION_INFORMATION bind;
+        check("NtCreateIoCompletion", NtCreateIoCompletion(&port, 0, NULL, 0) == 0);
+        bind.Port = port;
+        bind.Key = (PVOID)0x1234;
+        check("a file bound to a completion port",
+              NtSetInformationFile(f, &iosb, &bind, sizeof(bind), FileCompletionInformation) == 0);
+        NtReadFile(f, NULL, NULL, (PVOID)0x5678, &iosb, buf, 8, &at);
+        PVOID key = NULL, context = NULL;
+        IO_STATUS_BLOCK got;
+        st = NtRemoveIoCompletion(port, &key, &context, &got, &zero);
+        check("a read's packet on the completion port",
+              st == 0 && key == (PVOID)0x1234 && context == (PVOID)0x5678 && got.Information == 8);
+        FILE_FS_FULL_SIZE_INFORMATION full;
+        check("FileFsFullSizeInformation", NtQueryVolumeInformationFile(f, &iosb, &full, sizeof(full),
+                                                                        FileFsFullSizeInformation) == 0 &&
+                                               full.BytesPerSector == 512 && full.TotalAllocationUnits.QuadPart > 0);
+        NtClose(port);
+        NtClose(ev);
+        NtClose(f);
+    }
+    {
+        HANDLE f = open_path("\\Device\\Harddisk0\\Partition1\\xc-rename-a.txt", GENERIC_WRITE | DELETE, FILE_OVERWRITE_IF);
+        IO_STATUS_BLOCK iosb;
+        char rename_buf[sizeof(FILE_RENAME_INFORMATION) + 64];
+        FILE_RENAME_INFORMATION *r = (FILE_RENAME_INFORMATION *)rename_buf;
+        memset(rename_buf, 0, sizeof(rename_buf));
+        r->ReplaceIfExists = TRUE;
+        RtlInitAnsiString(&r->FileName, "\\Device\\Harddisk0\\Partition1\\xc-rename-b.txt");
+        NTSTATUS st = f ? NtSetInformationFile(f, &iosb, r, sizeof(rename_buf), FileRenameInformation) : -1;
+        if (f)
+            NtClose(f);
+        HANDLE g = open_path("\\Device\\Harddisk0\\Partition1\\xc-rename-b.txt", GENERIC_READ, FILE_OPEN);
+        HANDLE old = open_path("\\Device\\Harddisk0\\Partition1\\xc-rename-a.txt", GENERIC_READ, FILE_OPEN);
+        check("FileRenameInformation (MoveFile)", f && st == 0 && g && !old);
+        if (g)
+            NtClose(g);
+    }
 
     DbgPrint("kernel test: %d failures\n", failures);
     debugPrint("kernel test: %d failures\n", failures);

@@ -687,6 +687,25 @@ void QueueApc(ThreadState* s, const ThreadState::Apc& a) // under g_sched
     g_cv.notify_all();
 }
 
+void CompleteIo(u32 event, u32 apc_routine, u32 apc_context, u32 io_status_block, u32 status, u32 information,
+                u32 port, u32 key)
+{
+    // as NT's I/O manager ends a request: its event set; on success (or a warning) the caller's APC
+    // queued (ReadFileEx's completion routine, through NtUserIoApcDispatcher: it runs in an alertable
+    // wait) or, for a file bound to a completion port, a packet posted there
+    const u32 object = event ? ObjectOf(event) : 0;
+    const bool ok = status < 0xC0000000u;
+    if (ok && !apc_routine && port && apc_context)
+        PostCompletion(port, key, apc_context, status, information);
+    std::lock_guard lock(g_sched);
+    if (object)
+        SetSignal(object, 1);
+    if (ok && apc_routine)
+        if (ThreadState* s = CurrentState())
+            QueueApc(s, {0, 0, apc_routine, apc_context, io_status_block, 0, true});
+    g_cv.notify_all();
+}
+
 // ---- timers (KTIMER: header 0x10, DueTime 0x10, TimerListEntry 0x18, Dpc 0x20, Period 0x24),
 // fired by their own thread
 
@@ -2148,9 +2167,8 @@ void InitKernel()
         Write<u32>(dest + 4, src);
         return 0;
     } END;
-    K(RtlNtStatusToDosError)
-    {
-        switch (c.Arg(0))
+    static const auto dos_error = [](u32 status) -> u32 {
+        switch (status)
         {
         case 0: return 0;
         case STATUS_TIMEOUT: return 1460;
@@ -2166,6 +2184,69 @@ void InitKernel()
         case STATUS_NO_MORE_ENTRIES: return 259;
         default: return 317;
         }
+    };
+    K(RtlNtStatusToDosError) { return dos_error(c.Arg(0)); } END;
+    // ReadFileEx/WriteFileEx's APC routine: the program's completion routine (ApcContext) called with
+    // the error, the bytes moved and the OVERLAPPED (whose first fields are the I/O status block)
+    K(NtUserIoApcDispatcher) // ApcContext, IoStatusBlock, Reserved
+    {
+        const u32 iosb = c.Arg(1), status = Read<u32>(iosb);
+        const bool ok = status < 0x80000000u;
+        CallGuestNested(c.Arg(0), {ok ? 0u : dos_error(status), ok ? Read<u32>(iosb + 4) : 0u, iosb});
+        return 0;
+    } END;
+
+    // ---- the driver model's IRPs, which only a driver linked into the program would use (nothing in
+    // this kernel sends IRPs to it): done as NT does them, each call logged so a run shows if one
+    // is ever reached. IRP: IoStatus 0x10, UserIosb 0x1c, UserEvent 0x20; DEVICE_OBJECT: DriverObject
+    // 0x08, CurrentIrp 0x10; DRIVER_OBJECT: DriverStartIo 0x00.
+    static const auto complete_irp = [](u32 irp) {
+        const u32 iosb = Read<u32>(irp + 0x1c), event = Read<u32>(irp + 0x20);
+        Log("kernel: IRP %#x completed: status %#x, information %#x (I/O status block %#x, event %#x)", irp,
+            Read<u32>(irp + 0x10), Read<u32>(irp + 0x14), iosb, event);
+        if (iosb)
+        {
+            Write<u32>(iosb, Read<u32>(irp + 0x10));
+            Write<u32>(iosb + 4, Read<u32>(irp + 0x14));
+        }
+        if (event)
+        {
+            std::lock_guard lock(g_sched);
+            SetSignal(event, 1);
+            g_cv.notify_all();
+        }
+    };
+    K(IofCompleteRequest) // fastcall: Irp, PriorityBoost
+    {
+        complete_irp(c.Arg(0));
+        return 0;
+    } END;
+    K(IoInvalidDeviceRequest) // DeviceObject, Irp
+    {
+        Write<u32>(c.Arg(1) + 0x10, 0xC0000010); // STATUS_INVALID_DEVICE_REQUEST
+        Write<u32>(c.Arg(1) + 0x14, 0);
+        complete_irp(c.Arg(1));
+        return 0xC0000010;
+    } END;
+    K(IoMarkIrpMustComplete) // Irp
+    {
+        Log("kernel: IoMarkIrpMustComplete(%#x)", c.Arg(0));
+        return 0;
+    } END;
+    K(IoStartPacket) // DeviceObject, Irp, Key*, CancelFunction: straight to the driver's StartIo
+    {
+        const u32 device = c.Arg(0), irp = c.Arg(1), start_io = Read<u32>(Read<u32>(device + 8));
+        Log("kernel: IoStartPacket(device %#x, IRP %#x): its driver's StartIo %#x", device, irp, start_io);
+        Write<u32>(device + 0x10, irp);
+        if (start_io)
+            CallGuestNested(start_io, {device, irp});
+        return 0;
+    } END;
+    K(IoStartNextPacket) // DeviceObject, Cancelable: no queue here (IoStartPacket starts each at once)
+    {
+        Log("kernel: IoStartNextPacket(device %#x)", c.Arg(0));
+        Write<u32>(c.Arg(0) + 0x10, 0);
+        return 0;
     } END;
 
     // ---- audio/video, hardware
@@ -2237,6 +2318,17 @@ void InitKernel()
         return STATUS_SUCCESS;
     } END;
     K(ExSaveNonVolatileSetting) { return STATUS_SUCCESS; } END;
+}
+
+u32 KernelObjectOf(u32 handle)
+{
+    return ObjectOf(handle);
+}
+
+void CompleteFileIo(u32 event, u32 apc_routine, u32 apc_context, u32 io_status_block, u32 status, u32 information,
+                    u32 port, u32 key)
+{
+    CompleteIo(event, apc_routine, apc_context, io_status_block, status, information, port, key);
 }
 
 void ResolveThunks()

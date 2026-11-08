@@ -42,6 +42,11 @@ void SetDataDirectory(const std::string& dir); // the hard disk's partitions (E:
 u32 NewHostHandle(int kind, void* host);
 void* HostOf(u32 handle, int kind);
 bool IsHandleKind(u32 handle, int kind); // kind 3 = the \?? object directory
+u32 KernelObjectOf(u32 handle);          // a kernel object's handle: its object (0 if not one)
+// An I/O request done (all of ours finish at once): its event set, its APC queued to the calling
+// thread or a packet posted to the file's completion port (port: the I/O completion object, or 0).
+void CompleteFileIo(u32 event, u32 apc_routine, u32 apc_context, u32 io_status_block, u32 status, u32 information,
+                u32 port, u32 key);
 
 // devices.cpp
 void QueueDpc(u32 kdpc);
