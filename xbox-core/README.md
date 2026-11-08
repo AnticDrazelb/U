@@ -104,6 +104,14 @@ Each shows its own title, title ID and region (read from its XBE), its size, and
 and how that ended. Cover art is yours to add: `cover.jpg`/`cover.png` in a game's folder,
 `<name>.jpg` beside an image, or `/data/xbox-core/covers/<title ID>.jpg`; without one a cover is
 drawn from the title. L1/R1 switch to Settings (the log while a game starts, the picture's scaling,
-the library's order) and About. Triangle on a game can make it start with the app; hold L1 while the
+the library's order), Tools and About. Triangle on a game can make it start with the app; hold L1 while the
 app opens to get back to the library. The screen is drawn in software (`frontend/`, fonts: Inter,
 SIL OFL); `ui-preview` (desktop build) renders it to PNG files.
+
+**Tools.** *Copy games from USB to the hard drive* lists the disc images and game folders on USB
+drives (at a drive's top, or in `games/`, `xbox/` or `xbox-core/games/`) and copies the ones you pick
+into `/data/xbox-core/games`, one after another in the background, checking the free space first
+(Square cancels). *Write a diagnostics report* writes `/data/xbox-core/diagnostics.txt`, and
+`xbox-core-diagnostics.txt` on each USB drive: the app and console, the settings, every game's
+facts and last result, and the ends of the last session's log (`log-previous.txt`: the game you
+just ran) and the crash logs.

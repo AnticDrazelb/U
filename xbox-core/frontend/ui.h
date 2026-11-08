@@ -9,6 +9,7 @@
 
 #include "canvas.h"
 #include "library.h"
+#include "tools.h"
 
 namespace fe {
 
@@ -25,6 +26,14 @@ struct UiPaths
     std::string settings;    // a file
     std::string autostart;   // a file: the game to run without the library
     std::vector<std::string> help; // lines for the About tab: where games and covers go
+    LibraryPaths library;          // to scan again after a copy
+    std::vector<std::string> usb;  // where USB drives may be mounted
+    // the diagnostics report: the app's own lines, the logs to quote (file, last lines), where to
+    // write it (each USB drive gets a copy too, as <drive>/xbox-core-diagnostics.txt)
+    std::vector<std::string> system;
+    std::vector<std::pair<std::string, size_t>> logs;
+    std::string report;
+    std::string data_dir;
 };
 
 class LibraryUi
@@ -41,7 +50,7 @@ public:
     void Draw(Canvas& c, double seconds, const std::string& clock, const std::string& user);
 
 private:
-    enum Tab { kLibrary, kSettings, kAbout, kTabs };
+    enum Tab { kLibrary, kSettings, kTools, kAbout, kTabs };
     struct Covers
     {
         Image card, large;
@@ -56,6 +65,10 @@ private:
     void DrawDetails(Canvas& c, const Game& g);
     void DrawSettings(Canvas& c);
     void DrawAbout(Canvas& c);
+    void DrawTools(Canvas& c);
+    void DrawCopyProgress(Canvas& c, int x, int y, int w);
+    void UpdateTools(const Input& in);
+    void Rescan();
     void DrawOptions(Canvas& c);
     void DrawHints(Canvas& c, const std::string& user);
     void Glyph(Canvas& c, int cx, int cy, char button, int radius = 20);
@@ -79,6 +92,15 @@ private:
     std::map<std::string, Covers> covers;
     std::vector<uint32_t> background;
     std::string autostart_game; // the autostart file's game, or ""
+    // tools
+    int tool = 0;
+    bool usb_view = false;
+    size_t usb_selected = 0;
+    std::vector<std::string> usb_roots;
+    std::vector<UsbGame> usb_games;
+    Copier copier;
+    Copier::Status copy;
+    std::vector<std::string> report_written;
 };
 
 } // namespace fe

@@ -1,8 +1,11 @@
 // Renders the PS4 front end's screen to PNG files on the desktop, to look at it without a console.
 //   ui-preview <assets dir> <games dir> <out prefix> [presses...]
-// Each press (up down left right x o s t l1 r1) is applied in turn and a picture written after it:
-// <prefix>0.png before any, <prefix>1.png after the first, ...
+// Each press (up down left right x o s t l1 r1, or "wait": a second passes) is applied in turn and a
+// picture written after it: <prefix>0.png before any, <prefix>1.png after the first, ... <games>-usb
+// stands in for a USB drive.
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -24,7 +27,13 @@ int main(int argc, char** argv)
     settings.Load(games + "/settings.txt");
     fe::UiPaths ui_paths{assets, games + "/settings.txt", games + "/autostart.txt",
                          {"Games: /data/xbox-core/games/<name>/default.xbe, or <name>.iso",
-                          "Covers: cover.jpg beside a game, or /data/xbox-core/covers/<title ID>.jpg"}};
+                          "Covers: cover.jpg beside a game, or /data/xbox-core/covers/<title ID>.jpg"},
+                         paths,
+                         {games + "-usb"},
+                         {"xbox-core 0.1 (desktop preview)"},
+                         {{games + "/log.txt", 50}},
+                         games + "/diagnostics.txt",
+                         games};
     fe::LibraryUi ui(fe::ScanLibrary(paths), settings, ui_paths, "0.1");
     if (!ui.Ready())
     {
@@ -46,6 +55,8 @@ int main(int argc, char** argv)
         in.up = p == "up", in.down = p == "down", in.left = p == "left", in.right = p == "right";
         in.cross = p == "x", in.circle = p == "o", in.square = p == "s", in.triangle = p == "t";
         in.l1 = p == "l1", in.r1 = p == "r1";
+        if (p == "wait")
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         if (const fe::Game* g = ui.Update(in))
             std::printf("play: %s\n", g->path.c_str());
         write(i - 3);

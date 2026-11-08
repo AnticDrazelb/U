@@ -39,6 +39,13 @@ int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
 int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 int32_t sceSysmoduleLoadModuleInternal(uint32_t id);
 void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
+struct SwVersion
+{
+    uint64_t size;
+    char text[0x1c];
+    uint32_t version;
+};
+int32_t sceKernelGetSystemSwVersion(SwVersion* version);
 }
 
 namespace {
@@ -438,13 +445,20 @@ std::string Menu(const std::vector<Entry>& xbes)
 
 // The library: the front end's screen, the pad's presses (held directions repeat; the left stick
 // steers too), until a game is chosen. "" when the screen can't be drawn that way (fonts missing).
-std::string Library()
+std::string Library(const std::vector<std::string>& system)
 {
     fe::LibraryPaths paths{{"/app0/samples"}, "/data/xbox-core/games", "/data/xbox-core/covers", kHistoryFile};
     fe::UiPaths ui_paths{"/app0/ui", kSettingsFile, kAutostartFile,
                          {"Games: /data/xbox-core/games/<name>/default.xbe (with its files), or <name>.iso",
-                          "Covers: cover.jpg or cover.png beside a game (or <name>.jpg beside an .iso),",
-                          "or /data/xbox-core/covers/<title ID>.jpg, the title ID as the details show it."}};
+                          "(Tools copies them there from a USB drive.) Covers: cover.jpg or cover.png beside a game",
+                          "(or <name>.jpg beside an .iso), or /data/xbox-core/covers/<title ID>.jpg."},
+                         paths,
+                         {"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4", "/mnt/usb5", "/mnt/usb6", "/mnt/usb7"},
+                         system,
+                         {{"/data/xbox-core/log-previous.txt", 400}, {"/data/xbox-core/crash.log", 200},
+                          {"/data/xbox-core/boot-trace.log", 60}, {kLogFile, 60}},
+                         "/data/xbox-core/diagnostics.txt",
+                         kDataDir};
     fe::LibraryUi ui(fe::ScanLibrary(paths), g_settings, ui_paths, XB_VERSION);
     if (!ui.Ready())
         return "";
@@ -602,6 +616,8 @@ int main()
 {
     mkdir(kDataDir, 0777);
     mkdir("/data/xbox-core/games", 0777);
+    // the last session's log stays for the diagnostics report (it ran the game being asked about)
+    std::rename(kLogFile, "/data/xbox-core/log-previous.txt");
     g_log_file = std::fopen(kLogFile, "w");
     g_log_sink = LogSink;
     g_fatal_hook = [] {
@@ -633,8 +649,23 @@ int main()
     if (PadButtons() & ORBIS_PAD_BUTTON_L1)
         xbe.clear();
     g_settings.Load(kSettingsFile);
+    std::vector<std::string> system;
+    {
+        char line[256];
+        std::snprintf(line, sizeof(line), "xbox-core %s, built %s %s", XB_VERSION, __DATE__, __TIME__);
+        system.push_back(line);
+        std::snprintf(line, sizeof(line), "app code at %#llx (%s)", (unsigned long long)code,
+                      code < 0x4000000 ? "inside the Xbox's RAM addresses: the normal package" : "clear of them: the high package");
+        system.push_back(line);
+        SwVersion v{sizeof(SwVersion), {}, 0};
+        if (sceKernelGetSystemSwVersion(&v) == 0)
+            system.push_back(std::string("PS4 firmware ") + v.text);
+        std::snprintf(line, sizeof(line), "direct memory %zu MB", sceKernelGetDirectMemorySize() / MB);
+        system.push_back(line);
+        system.push_back(std::string("autostart: ") + (xbe.empty() ? "none" : xbe));
+    }
     if (xbe.empty())
-        xbe = Library();
+        xbe = Library(system);
     if (xbe.empty())
         xbe = Menu(xbes);
     Log("starting %s", xbe.c_str());

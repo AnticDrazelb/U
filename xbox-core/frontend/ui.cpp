@@ -109,8 +109,86 @@ void LibraryUi::Toast(const std::string& text)
 
 bool LibraryUi::IsAutostart(const Game& g) const { return !autostart_game.empty() && autostart_game == g.path; }
 
+void LibraryUi::Rescan()
+{
+    if (paths.library.games.empty())
+        return;
+    games = ScanLibrary(paths.library);
+    Sort();
+    usb_games = FindUsbGames(usb_roots, paths.library.games);
+}
+
+void LibraryUi::UpdateTools(const Input& in)
+{
+    if (!usb_view)
+    {
+        if (in.up || in.down)
+            tool ^= 1;
+        if (in.cross && tool == 0)
+        {
+            usb_roots = UsbRoots(paths.usb);
+            usb_games = FindUsbGames(usb_roots, paths.library.games);
+            usb_selected = 0;
+            usb_view = true;
+        }
+        else if (in.cross && tool == 1)
+        {
+            DiagnosticsInput d;
+            d.system = paths.system;
+            d.settings = &settings;
+            d.games = games;
+            d.usb_roots = UsbRoots(paths.usb);
+            d.data_dir = paths.data_dir;
+            d.logs = paths.logs;
+            std::vector<std::string> outputs{paths.report};
+            for (const std::string& u : d.usb_roots)
+                outputs.push_back(u + "/xbox-core-diagnostics.txt");
+            report_written = WriteDiagnostics(d, outputs);
+            Toast(report_written.empty() ? "The report couldn't be written" : "Report written: " + report_written.back());
+        }
+        return;
+    }
+    if (in.circle)
+        usb_view = false;
+    if (in.triangle)
+    {
+        usb_roots = UsbRoots(paths.usb);
+        usb_games = FindUsbGames(usb_roots, paths.library.games);
+        usb_selected = std::min(usb_selected, usb_games.empty() ? 0 : usb_games.size() - 1);
+    }
+    if (in.square && copy.busy)
+    {
+        copier.Cancel();
+        Toast("Copying cancelled");
+    }
+    if (usb_games.empty())
+        return;
+    if (in.up && usb_selected > 0) usb_selected--;
+    if (in.down && usb_selected + 1 < usb_games.size()) usb_selected++;
+    if (in.cross)
+    {
+        UsbGame& g = usb_games[usb_selected];
+        if (g.on_hdd)
+            Toast(g.name + " is on the hard drive already");
+        else
+        {
+            copier.Queue(g, paths.library.games);
+            g.on_hdd = true; // queued: not twice
+            Toast("Copying " + g.name);
+        }
+    }
+}
+
 const Game* LibraryUi::Update(const Input& in)
 {
+    // copies finishing: the library learns of them
+    copy = copier.Poll();
+    if (!copy.finished.empty())
+    {
+        Rescan();
+        const std::string& last = copy.finished.back();
+        Toast(last.find(": ") == std::string::npos ? "Copied " + last + " to the hard drive" : "Not copied: " + last);
+    }
     if (in.l1 || in.r1)
     {
         tab = Tab((tab + (in.r1 ? 1 : kTabs - 1)) % kTabs);
@@ -187,6 +265,9 @@ const Game* LibraryUi::Update(const Input& in)
         }
         return nullptr;
     }
+    case kTools:
+        UpdateTools(in);
+        return nullptr;
     default:
         return nullptr;
     }
@@ -286,7 +367,7 @@ void LibraryUi::DrawHeader(Canvas& c, const std::string& clock)
     const std::string v = "v" + version;
     regular.Draw(c, kWidth - 60 - cw - 40 - regular.Measure(v, 22), 42, v, 22, kFaint);
 
-    static const char* kNames[kTabs] = {"LIBRARY", "SETTINGS", "ABOUT"};
+    static const char* kNames[kTabs] = {"LIBRARY", "SETTINGS", "TOOLS", "ABOUT"};
     for (int i = 0; i < kTabs; i++)
     {
         const int x = 60 + i * 200, w = 190, cx = x + w / 2;
@@ -312,6 +393,12 @@ void LibraryUi::DrawHeader(Canvas& c, const std::string& clock)
                 c.Line(cx + std::cos(a) * 10, iy + 15 + std::sin(a) * 10, cx + std::cos(a) * 17, iy + 15 + std::sin(a) * 17, 6, ic);
             }
             c.Circle(float(cx), float(iy + 15), 12, ic, 5);
+        }
+        else if (i == kTools) // a wrench
+        {
+            c.Line(float(cx - 13), float(iy + 28), float(cx + 6), float(iy + 9), 7, ic);
+            c.Circle(float(cx + 9), float(iy + 6), 9, ic, 4);
+            c.Fill(cx + 9, iy - 4, 9, 9, on ? kRaised : Rgb(0x15181B));
         }
         else // a circled i
         {
@@ -362,6 +449,10 @@ void LibraryUi::DrawHints(Canvas& c, const std::string& user)
         hints = {{'x', "PLAY"}, {'t', "OPTIONS"}, {'s', "SORT"}, {'L', ""}, {'R', "TABS"}};
     else if (tab == kSettings)
         hints = {{'x', "CHANGE"}, {'L', ""}, {'R', "TABS"}};
+    else if (tab == kTools && usb_view)
+        hints = {{'x', "COPY"}, {'s', "CANCEL COPY"}, {'t', "LOOK AGAIN"}, {'o', "BACK"}};
+    else if (tab == kTools)
+        hints = {{'x', "SELECT"}, {'L', ""}, {'R', "TABS"}};
     else
         hints = {{'L', ""}, {'R', "TABS"}};
     int x = 62;
@@ -584,6 +675,91 @@ void LibraryUi::DrawAbout(Canvas& c)
     regular.Draw(c, 100, y, "Inter typeface (SIL Open Font License 1.1); stb libraries (public domain). Not affiliated with Microsoft or Sony.", 22, kDim);
 }
 
+void LibraryUi::DrawCopyProgress(Canvas& c, int x, int y, int w)
+{
+    c.RoundRect(x, y, w, 120, 14, kPanel);
+    c.RoundRect(x, y, w, 120, 14, kAccent, 2);
+    const float f = copy.total ? float(double(copy.done) / double(copy.total)) : 0.f;
+    char line[160];
+    std::snprintf(line, sizeof(line), "%s / %s   %.0f%%   %.1f MB/s%s", FormatSize(copy.done).c_str(),
+                  FormatSize(copy.total).c_str(), f * 100, copy.rate / 1048576.0,
+                  copy.queued ? ("   (" + std::to_string(copy.queued) + " more queued)").c_str() : "");
+    semibold.Draw(c, x + 28, y + 18, semibold.Fit("Copying " + copy.current, 28, w - 56), 28, kText);
+    regular.Draw(c, x + 28, y + 56, line, 22, kDim);
+    c.RoundRect(x + 28, y + 92, w - 56, 12, 6, Rgb(0x2A2F34));
+    if (f > 0)
+        c.RoundRect(x + 28, y + 92, std::max(12, int(float(w - 56) * f)), 12, 6, kAccent);
+}
+
+void LibraryUi::DrawTools(Canvas& c)
+{
+    if (usb_view)
+    {
+        const uint64_t free = FreeSpace(paths.library.games);
+        std::string drives;
+        for (const std::string& u : usb_roots)
+            drives += (drives.empty() ? "" : ", ") + u;
+        bold.Draw(c, 62, 236, "Copy from USB to the hard drive", 36, kText);
+        regular.Draw(c, 62, 286, "USB: " + (drives.empty() ? std::string("no drive found") : drives) + "     Hard drive free: " +
+                                     (free ? FormatSize(free) : "unknown"), 22, kDim);
+        const int list_y = 330, row_h = 64, visible = copy.busy ? 8 : 9;
+        if (usb_games.empty())
+        {
+            regular.Draw(c, 62, list_y + 20, "No games found. Put .iso files or game folders (with default.xbe) at the top of the", 26, kDim);
+            regular.Draw(c, 62, list_y + 60, "drive or in a games, xbox or xbox-core/games folder, then press Triangle.", 26, kDim);
+        }
+        const size_t first = usb_selected >= size_t(visible) ? usb_selected - size_t(visible) + 1 : 0;
+        for (size_t i = first; i < usb_games.size() && i < first + size_t(visible); i++)
+        {
+            const UsbGame& g = usb_games[i];
+            const int y = list_y + int(i - first) * (row_h + 8);
+            const bool on = i == usb_selected;
+            c.RoundRect(62, y, 1796, row_h, 12, on ? kRaised : kPanel);
+            c.RoundRect(62, y, 1796, row_h, 12, on ? kAccent : kPanelEdge, on ? 3 : 2);
+            semibold.Draw(c, 92, y + 16, semibold.Fit(g.name, 28, 1100), 28, kText);
+            regular.Draw(c, 1260, y + 20, g.folder ? "Game folder" : "Disc image", 22, kDim);
+            regular.Draw(c, 1460, y + 20, FormatSize(g.size), 22, kDim);
+            const bool now_copying = copy.busy && copy.current == g.name;
+            if (g.on_hdd || now_copying)
+            {
+                const char* tag = now_copying ? "COPYING" : "ON HDD";
+                const int tw = semibold.Measure(tag, 18) + 24;
+                c.RoundRect(1830 - tw, y + 17, tw, 30, 15, now_copying ? kAccent : kAccentDark);
+                semibold.Draw(c, 1830 - tw + 12, y + 21, tag, 18, now_copying ? Rgb(0x111316) : kAccent);
+            }
+        }
+        if (copy.busy)
+            DrawCopyProgress(c, 62, kHintsY - 214, 1796);
+        return;
+    }
+    const std::pair<const char*, const char*> rows[2] = {
+        {"Copy games from USB to the hard drive", "Disc images and game folders from a USB drive into /data/xbox-core/games."},
+        {"Write a diagnostics report", "A text file about the app, your library and the last run's log, to show when asking for help."}};
+    int y = 250;
+    for (int i = 0; i < 2; i++)
+    {
+        const bool on = tool == i;
+        c.RoundRect(62, y, 1796, 104, 14, on ? kRaised : kPanel);
+        c.RoundRect(62, y, 1796, 104, 14, on ? kAccent : kPanelEdge, on ? 3 : 2);
+        semibold.Draw(c, 96, y + 18, rows[i].first, 30, kText);
+        regular.Draw(c, 96, y + 60, rows[i].second, 21, kDim);
+        Glyph(c, 1858 - 50, y + 52, 'x', 22);
+        y += 124;
+    }
+    if (copy.busy)
+        DrawCopyProgress(c, 62, y + 10, 1796), y += 150;
+    if (!report_written.empty())
+    {
+        semibold.Draw(c, 62, y + 10, "LAST REPORT", 20, kAccent);
+        y += 44;
+        for (const std::string& f : report_written)
+        {
+            regular.Draw(c, 62, y, f, 24, kText);
+            y += 34;
+        }
+    }
+}
+
 void LibraryUi::Draw(Canvas& c, double seconds, const std::string& clock, const std::string& user)
 {
     now = seconds;
@@ -593,6 +769,8 @@ void LibraryUi::Draw(Canvas& c, double seconds, const std::string& clock, const 
         DrawLibrary(c, seconds);
     else if (tab == kSettings)
         DrawSettings(c);
+    else if (tab == kTools)
+        DrawTools(c);
     else
         DrawAbout(c);
     DrawHints(c, user);
