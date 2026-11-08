@@ -39,6 +39,12 @@ Surface ColorSurface()
     s.width = (k.Get(0x200) >> 16) + (k.Get(0x200) & 0xffff);
     s.height = (k.Get(0x204) >> 16) + (k.Get(0x204) & 0xffff);
     s.swizzled = ((format >> 8) & 0xf) == 2;
+    if (s.swizzled) // SET_SURFACE_FORMAT's log2 width and height
+    {
+        s.width = 1u << ((format >> 16) & 0xff);
+        s.height = 1u << ((format >> 24) & 0xff);
+        s.pitch = s.width * s.bytes;
+    }
     const u32 base = Nv2aDmaAddress(k.Get(0x194));
     s.address = base ? base + k.Get(0x210) : 0;
     return s;
@@ -54,6 +60,14 @@ Surface ZetaSurface()
     s.pitch = k.Get(0x20c) >> 16;
     s.width = (k.Get(0x200) >> 16) + (k.Get(0x200) & 0xffff);
     s.height = (k.Get(0x204) >> 16) + (k.Get(0x204) & 0xffff);
+    const u32 format = k.Get(0x208);
+    s.swizzled = ((format >> 8) & 0xf) == 2;
+    if (s.swizzled)
+    {
+        s.width = 1u << ((format >> 16) & 0xff);
+        s.height = 1u << ((format >> 24) & 0xff);
+        s.pitch = s.width * s.bytes;
+    }
     const u32 base = Nv2aDmaAddress(k.Get(0x198));
     s.address = base && zformat ? base + k.Get(0x214) : 0;
     return s;
@@ -62,7 +76,7 @@ Surface ZetaSurface()
 // a color as 0xAARRGGBB, written in the surface's format
 void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask)
 {
-    const u32 p = s.address + y * s.pitch + x * s.bytes;
+    const u32 p = PixelAddress(s, x, y);
     if (s.bytes == 4)
     {
         const u32 old = Read<u32>(p);
@@ -78,7 +92,7 @@ void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask)
 
 u32 ReadPixel(const Surface& s, u32 x, u32 y)
 {
-    const u32 p = s.address + y * s.pitch + x * s.bytes;
+    const u32 p = PixelAddress(s, x, y);
     if (s.bytes == 4)
         return Read<u32>(p);
     if (s.format == 0x3)
@@ -138,7 +152,7 @@ void Clear(u32 flags)
             for (u32 y = y0 + u32(part); y <= y1 && y < z.height; y += u32(parts))
                 for (u32 x = x0; x <= x1 && x < z.width; x++)
                 {
-                    const u32 p = z.address + y * z.pitch + x * z.bytes;
+                    const u32 p = PixelAddress(z, x, y);
                     if (z.bytes == 2)
                         Write<u16>(p, u16(value));
                     else

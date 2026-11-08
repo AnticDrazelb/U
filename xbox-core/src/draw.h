@@ -24,8 +24,25 @@ extern KelvinState g_kelvin;
 struct Surface
 {
     u32 address = 0, pitch = 0, width = 0, height = 0, bytes = 4, format = 0;
-    bool swizzled = false;
+    bool swizzled = false; // then width and height are powers of two, pixels in the NV2A's swizzle order
 };
+// the NV2A's swizzle: the bits of x and y interleaved (x first) while both have them
+inline u32 Swizzle(u32 x, u32 y, u32 width, u32 height)
+{
+    u32 offset = 0, bit = 0;
+    for (u32 i = 1; i < width || i < height; i <<= 1)
+    {
+        if (i < width)
+            offset |= (x & i ? 1u : 0u) << bit++;
+        if (i < height)
+            offset |= (y & i ? 1u : 0u) << bit++;
+    }
+    return offset;
+}
+inline u32 PixelAddress(const Surface& s, u32 x, u32 y)
+{
+    return s.swizzled ? s.address + Swizzle(x, y, s.width, s.height) * s.bytes : s.address + y * s.pitch + x * s.bytes;
+}
 Surface ColorSurface();
 Surface ZetaSurface();
 void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask = 0xffffffff);

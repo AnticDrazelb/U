@@ -682,6 +682,86 @@ bool DepthTest(u32 func, float z, float stored)
     }
 }
 
+// ---- depth and stencil: the tests and their writes, for a pixel at a time
+
+struct DepthStencil
+{
+    Surface zs;
+    bool depth_test = false, depth_write = false, stencil = false, active = false;
+    u32 depth_func = 0, stencil_func = 0, stencil_ref = 0, stencil_mask = 0, stencil_write = 0;
+    u32 op_fail = 0, op_zfail = 0, op_zpass = 0;
+    float z_max = 0;
+
+    DepthStencil()
+    {
+        const KelvinState& k = g_kelvin;
+        zs = ZetaSurface();
+        if (!zs.address)
+            return;
+        depth_test = k.Get(0x30c), depth_write = k.Get(0x35c), depth_func = k.Get(0x354);
+        // SET_STENCIL_TEST_ENABLE, its function, reference, read and write masks and operations; the
+        // stencil is the low byte of a Z24S8 buffer
+        stencil = k.Get(0x32c) && zs.bytes == 4;
+        stencil_func = k.Get(0x364), stencil_ref = k.Get(0x368) & 0xff, stencil_mask = k.Get(0x36c) & 0xff;
+        stencil_write = k.Get(0x360) & 0xff;
+        op_fail = k.Get(0x370), op_zfail = k.Get(0x374), op_zpass = k.Get(0x378);
+        z_max = zs.bytes == 2 ? 65535.f : 16777215.f;
+        active = depth_test || depth_write || stencil;
+    }
+
+    static u8 Op(u32 op, u8 s, u8 ref)
+    {
+        switch (op)
+        {
+        case 0x1e00: return s;                              // keep
+        case 0x0000: return 0;                              // zero
+        case 0x1e01: return ref;                            // replace
+        case 0x1e02: return u8(s == 255 ? 255 : s + 1);     // increment, saturated
+        case 0x1e03: return u8(s == 0 ? 0 : s - 1);         // decrement, saturated
+        case 0x150a: return u8(~s);                         // invert
+        case 0x8507: return u8(s + 1);                      // increment, wrapping
+        case 0x8508: return u8(s - 1);                      // decrement, wrapping
+        default: return s;
+        }
+    }
+
+    // Whether the pixel at (x, y) with depth z survives; the depth and stencil written as it decides.
+    bool Test(u32 x, u32 y, float z) const
+    {
+        if (!active || x >= zs.width || y >= zs.height)
+            return true;
+        const u32 p = PixelAddress(zs, x, y);
+        const u32 word = zs.bytes == 2 ? Read<u16>(p) : Read<u32>(p);
+        const u32 stored = zs.bytes == 2 ? word : word >> 8;
+        const u8 old_stencil = zs.bytes == 2 ? 0 : u8(word);
+        const u32 zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
+        u8 s = old_stencil;
+        bool pass = true;
+        if (stencil && !DepthTest(stencil_func, float(stencil_ref & stencil_mask), float(old_stencil & stencil_mask)))
+        {
+            s = Op(op_fail, s, u8(stencil_ref));
+            pass = false;
+        }
+        else
+        {
+            const bool depth_ok = !depth_test || DepthTest(depth_func, float(zi), float(stored));
+            if (stencil)
+                s = Op(depth_ok ? op_zpass : op_zfail, s, u8(stencil_ref));
+            pass = depth_ok;
+        }
+        u32 new_z = pass && depth_write ? zi : stored;
+        const u8 new_s = u8((old_stencil & ~stencil_write) | (s & stencil_write));
+        if (zs.bytes == 2)
+        {
+            if (new_z != stored)
+                Write<u16>(p, u16(new_z));
+        }
+        else if (new_z != stored || new_s != old_stencil)
+            Write<u32>(p, (new_z << 8) | new_s);
+        return pass;
+    }
+};
+
 // rows are dealt to the threads in bands of this many
 constexpr int kBand = 16;
 
@@ -690,7 +770,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
 {
     const KelvinState& k = g_kelvin;
     const Surface cs = ColorSurface(), zs = ZetaSurface();
-    if (!cs.address || !cs.pitch || cs.swizzled)
+    if (!cs.address || !cs.pitch)
         return;
     const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     static int logged = 0;
@@ -720,9 +800,9 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const int x1 = std::min<int>(int(cs.width) - 1, int(std::ceil(std::max({a.x, b.x, c.x}))));
     const int y0 = std::max<int>(int(clip_y0), int(std::floor(std::min({a.y, b.y, c.y}))));
     const int y1 = std::min<int>(int(cs.height) - 1, int(std::ceil(std::max({a.y, b.y, c.y}))));
-    const bool depth_test = k.Get(0x30c) && zs.address;
-    const bool depth_write = k.Get(0x35c) && zs.address;
-    const float z_max = zs.bytes == 2 ? 65535.f : 16777215.f;
+    const DepthStencil ds;
+    // with the alpha test on, a pixel it rejects must leave depth and stencil alone: shade first
+    const bool shade_first = k.Get(0x300);
     const u32 write_mask = k.Get(0x358) ? ((k.Get(0x358) & 0x01000000 ? 0xff000000u : 0) | (k.Get(0x358) & 0x00010000 ? 0x00ff0000u : 0) |
                                            (k.Get(0x358) & 0x00000100 ? 0x0000ff00u : 0) | (k.Get(0x358) & 0x00000001 ? 0x000000ffu : 0))
                                         : 0xffffffffu;
@@ -753,16 +833,8 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
                 continue;
             const float wa = ea * inv_area, wb = eb * inv_area, wc = ec * inv_area;
             const float z = a.z * wa + b.z * wb + c.z * wc;
-            u32 zp = 0, zi = 0;
-            if (depth_test || depth_write)
-            {
-                // compared as the integer the buffer holds
-                zp = zs.address + u32(y) * zs.pitch + u32(x) * zs.bytes;
-                const u32 stored = zs.bytes == 2 ? Read<u16>(zp) : Read<u32>(zp) >> 8;
-                zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
-                if (depth_test && !DepthTest(k.Get(0x354), float(zi), float(stored)))
-                    continue;
-            }
+            if (!shade_first && !ds.Test(u32(x), u32(y), z))
+                continue;
             // perspective-correct interpolation of the outputs
             const float pa0 = wa * a.inv_w, pb0 = wb * b.inv_w, pc0 = wc * c.inv_w;
             const float norm = 1.f / (pa0 + pb0 + pc0), pa = pa0 * norm, pb = pb0 * norm, pc = pc0 * norm;
@@ -776,13 +848,8 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
             u32 color;
             if (!ShadePixel(in, cs, u32(x), u32(y), color))
                 continue;
-            if (depth_write)
-            {
-                if (zs.bytes == 2)
-                    Write<u16>(zp, u16(zi));
-                else
-                    Write<u32>(zp, (Read<u32>(zp) & 0xff) | (zi << 8));
-            }
+            if (shade_first && !ds.Test(u32(x), u32(y), z))
+                continue;
             WritePixel(cs, u32(x), u32(y), color, write_mask);
         }
     }
@@ -794,9 +861,9 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
 
 struct Fragments
 {
-    Surface cs, zs;
-    bool depth_test = false, depth_write = false;
-    float z_max = 0;
+    Surface cs;
+    DepthStencil ds;
+    bool shade_first = false;
     u32 write_mask = 0xffffffff;
     int used[16] = {}, used_count = 0;
     int x0 = 0, y0 = 0;
@@ -804,10 +871,8 @@ struct Fragments
     Fragments()
     {
         const KelvinState& k = g_kelvin;
-        cs = ColorSurface(), zs = ZetaSurface();
-        depth_test = k.Get(0x30c) && zs.address;
-        depth_write = k.Get(0x35c) && zs.address;
-        z_max = zs.bytes == 2 ? 65535.f : 16777215.f;
+        cs = ColorSurface();
+        shade_first = k.Get(0x300);
         const u32 m = k.Get(0x358);
         if (m)
             write_mask = (m & 0x01000000 ? 0xff000000u : 0) | (m & 0x00010000 ? 0x00ff0000u : 0) |
@@ -818,24 +883,16 @@ struct Fragments
                 used[used_count++] = o;
         x0 = int(k.Get(0x200) & 0xffff), y0 = int(k.Get(0x204) & 0xffff);
     }
-    bool Usable() const { return cs.address && cs.pitch && !cs.swizzled; }
+    bool Usable() const { return cs.address && cs.pitch; }
 
     // the pixel at (x, y), a fraction t of the way from a to b
     void Pixel(int x, int y, const ScreenVertex& a, const ScreenVertex& b, float t)
     {
         if (x < x0 || y < y0 || x >= int(cs.width) || y >= int(cs.height))
             return;
-        const KelvinState& k = g_kelvin;
         const float z = a.z + (b.z - a.z) * t;
-        u32 zp = 0, zi = 0;
-        if (depth_test || depth_write)
-        {
-            zp = zs.address + u32(y) * zs.pitch + u32(x) * zs.bytes;
-            const u32 stored = zs.bytes == 2 ? Read<u16>(zp) : Read<u32>(zp) >> 8;
-            zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
-            if (depth_test && !DepthTest(k.Get(0x354), float(zi), float(stored)))
-                return;
-        }
+        if (!shade_first && !ds.Test(u32(x), u32(y), z))
+            return;
         // perspective-correct along the line
         const float pa = (1 - t) * a.inv_w, pb = t * b.inv_w, norm = 1.f / (pa + pb);
         PixelInputs in;
@@ -845,13 +902,8 @@ struct Fragments
         u32 color;
         if (!ShadePixel(in, cs, u32(x), u32(y), color))
             return;
-        if (depth_write)
-        {
-            if (zs.bytes == 2)
-                Write<u16>(zp, u16(zi));
-            else
-                Write<u32>(zp, (Read<u32>(zp) & 0xff) | (zi << 8));
-        }
+        if (shade_first && !ds.Test(u32(x), u32(y), z))
+            return;
         WritePixel(cs, u32(x), u32(y), color, write_mask);
     }
 

@@ -54,20 +54,6 @@ u32 BytesPerTexel(u32 f)
     }
 }
 
-// the NV2A's swizzle: the bits of x and y interleaved (x first) while both have them
-u32 Swizzle(u32 x, u32 y, u32 width, u32 height)
-{
-    u32 offset = 0, bit = 0;
-    for (u32 i = 1; i < width || i < height; i <<= 1)
-    {
-        if (i < width)
-            offset |= (x & i ? 1u : 0u) << bit++;
-        if (i < height)
-            offset |= (y & i ? 1u : 0u) << bit++;
-    }
-    return offset;
-}
-
 Texture StageTexture(int stage)
 {
     const KelvinState& k = g_kelvin;
