@@ -722,26 +722,71 @@ bool CancelTimer(u32 timer)
 
 // ---- read/write locks (ERWLOCK; the core keeps its own fields: +0x04 the writer, +0x0c readers)
 
-void AcquireRwLock(u32 lock_object, bool exclusive)
+// ERWLOCK: LockCount 0 (-1 free; each request adds one), WritersWaitingCount 4, ReadersWaitingCount 8,
+// ReadersEntryCount 0xc, WriterEvent 0x10 (a synchronization event), ReaderSemaphore 0x20.
+void AcquireRwLock(u32 l, bool exclusive)
 {
-    const u32 me = CurrentThread()->ethread;
     std::unique_lock lock(g_sched);
-    for (;;)
+    const s32 count = Read<s32>(l) + 1;
+    Write<s32>(l, count);
+    if (exclusive)
     {
-        const u32 writer = Read<u32>(lock_object + 4);
-        const s32 readers = Read<s32>(lock_object + 0xc);
-        if (exclusive ? (!writer && readers == 0) : !writer)
-        {
-            if (exclusive)
-                Write<u32>(lock_object + 4, me);
-            else
-                Write<s32>(lock_object + 0xc, readers + 1);
-            Write<s32>(lock_object, Read<s32>(lock_object) + 1);
+        if (count == 0)
             return;
-        }
-        g_cv.wait_for(lock, std::chrono::milliseconds(50));
+        Write<u32>(l + 4, Read<u32>(l + 4) + 1);
+        while (Signal(l + 0x10) <= 0 && !g_quit) // the releaser hands the lock over through the event
+            g_cv.wait_for(lock, std::chrono::milliseconds(50));
+        SetSignal(l + 0x10, 0);
+        return;
     }
+    if (count == 0)
+    {
+        Write<u32>(l + 0xc, 1);
+        return;
+    }
+    if (Read<u32>(l + 0xc) && !Read<u32>(l + 4))
+    {
+        Write<u32>(l + 0xc, Read<u32>(l + 0xc) + 1);
+        return;
+    }
+    Write<u32>(l + 8, Read<u32>(l + 8) + 1);
+    while (Signal(l + 0x20) <= 0 && !g_quit)
+        g_cv.wait_for(lock, std::chrono::milliseconds(50));
+    SetSignal(l + 0x20, Signal(l + 0x20) - 1);
 }
+
+void ReleaseRwLock(u32 l)
+{
+    std::lock_guard lock(g_sched);
+    const s32 count = Read<s32>(l) - 1;
+    Write<s32>(l, count);
+    if (count < 0)
+    {
+        Write<u32>(l + 0xc, 0);
+        return;
+    }
+    const u32 entered = Read<u32>(l + 0xc);
+    if (entered > 1)
+    {
+        Write<u32>(l + 0xc, entered - 1);
+        return;
+    }
+    if (entered == 0 && Read<u32>(l + 8)) // the writer leaves: every waiting reader goes in
+    {
+        const u32 readers = Read<u32>(l + 8);
+        Write<u32>(l + 0xc, readers);
+        Write<u32>(l + 8, 0);
+        SetSignal(l + 0x20, Signal(l + 0x20) + s32(readers));
+    }
+    else // the writer or the last reader leaves: a waiting writer goes in
+    {
+        Write<u32>(l + 0xc, 0);
+        Write<u32>(l + 4, Read<u32>(l + 4) - 1);
+        SetSignal(l + 0x10, 1);
+    }
+    g_cv.notify_all();
+}
+
 std::atomic<int> g_running{0};
 
 void ThreadDone(ThreadState* s)
@@ -1547,24 +1592,17 @@ void InitKernel()
     // ---- read/write locks
     K(ExInitializeReadWriteLock)
     {
-        std::memset(Ptr(c.Arg(0)), 0, 0x38);
-        Write<s32>(c.Arg(0), -1);
+        const u32 l = c.Arg(0);
+        std::memset(Ptr(l), 0, 0x34); // sizeof(ERWLOCK)
+        Write<s32>(l, -1);
+        InitHeader(l + 0x10, kSynchronizationEvent, 4, 0);
+        InitHeader(l + 0x20, kSemaphore, 5, 0);
+        Write<s32>(l + 0x30, 0x7fffffff);
         return 0;
     } END;
     K(ExAcquireReadWriteLockExclusive) { AcquireRwLock(c.Arg(0), true); return 0; } END;
     K(ExAcquireReadWriteLockShared) { AcquireRwLock(c.Arg(0), false); return 0; } END;
-    K(ExReleaseReadWriteLock)
-    {
-        const u32 l = c.Arg(0);
-        std::lock_guard lock(g_sched);
-        if (Read<u32>(l + 4))
-            Write<u32>(l + 4, 0);
-        else if (Read<s32>(l + 0xc) > 0)
-            Write<s32>(l + 0xc, Read<s32>(l + 0xc) - 1);
-        Write<s32>(l, Read<s32>(l) - 1);
-        g_cv.notify_all();
-        return 0;
-    } END;
+    K(ExReleaseReadWriteLock) { ReleaseRwLock(c.Arg(0)); return 0; } END;
 
     // ---- exceptions: structured exception handling isn't emulated yet; a raised exception ends
     // the program with a report, and an unwind just drops the frames above the target
@@ -1616,22 +1654,30 @@ void InitKernel()
     {
         const u32 h = c.Arg(0);
         const u32 count = Read<u32>(h + 24);
-        if (count == 0 && Read<u32>(h + 4))
+        if (count == 0)
         {
             const u32 va = Read<u32>(h + 4), vsize = Read<u32>(h + 8), raw = Read<u32>(h + 12), rsize = Read<u32>(h + 16);
             const u32 n = std::min(rsize, vsize);
-            if (ReadXbeRange(g_xbe, raw, n, Ptr(va)) && vsize > n)
+            if (va && ReadXbeRange(g_xbe, raw, n, Ptr(va)) && vsize > n)
                 std::memset(Ptr(va + n), 0, vsize - n);
+            for (u32 ref : {Read<u32>(h + 28), Read<u32>(h + 32)}) // the shared head and tail pages
+                if (ref)
+                    Write<u16>(ref, u16(Read<u16>(ref) + 1));
         }
         Write<u32>(h + 24, count + 1);
         return STATUS_SUCCESS;
     } END;
     K(XeUnloadSection)
     {
-        const u32 count = Read<u32>(c.Arg(0) + 24);
+        const u32 h = c.Arg(0);
+        const u32 count = Read<u32>(h + 24);
         if (count == 0)
             return STATUS_INVALID_PARAMETER;
-        Write<u32>(c.Arg(0) + 24, count - 1);
+        Write<u32>(h + 24, count - 1);
+        if (count == 1)
+            for (u32 ref : {Read<u32>(h + 28), Read<u32>(h + 32)})
+                if (ref && Read<u16>(ref))
+                    Write<u16>(ref, u16(Read<u16>(ref) - 1));
         return STATUS_SUCCESS;
     } END;
 
@@ -1911,8 +1957,14 @@ void InitKernel()
         u32 start, size;
         return QueryAllocation(c.Arg(0), start, size) ? size : 0;
     } END;
-    K(MmAllocateSystemMemory) { return AllocContiguous(c.Arg(0), 0x1000, 0, 0xffffffff); } END;
-    K(MmFreeSystemMemory) { FreeContiguous(c.Arg(0)); return 0; } END;
+    K(MmAllocateSystemMemory) // size, protect: PAGE_READONLY or PAGE_READWRITE, with NOCACHE or WRITECOMBINE
+    {
+        const u32 protect = c.Arg(1), base = protect & 0xff, modifiers = protect & ~0xffu;
+        if ((base != 0x02 && base != 0x04) || (modifiers & ~0x600u) || modifiers == 0x600)
+            return 0;
+        return c.Arg(0) ? AllocSystem(c.Arg(0)) : 0;
+    } END;
+    K(MmFreeSystemMemory) { return FreeSystem(c.Arg(0)); } END; // base, size: the pages freed
     K(NtAllocateVirtualMemory)
     {
         // BaseAddress*, ZeroBits, RegionSize*, AllocationType, Protect

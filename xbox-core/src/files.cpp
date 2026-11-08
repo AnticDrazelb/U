@@ -183,6 +183,24 @@ std::string HostPathAsGiven(std::string path, u32 root)
     return "";
 }
 
+// A symbolic link's name as g_links keys it ("d:" for \\??\\D:, else the path with '/'), or why it can't be
+// one: it must be absolute and in an object directory that exists.
+u32 LinkKey(const std::string& name, std::string& key)
+{
+    if (name.empty() || name[0] != '\\')
+        return 0xC0000033; // STATUS_OBJECT_NAME_INVALID
+    key = Lower(name);
+    for (char& ch : key)
+        if (ch == '\\')
+            ch = '/';
+    const std::string parent = key.substr(0, key.rfind('/'));
+    if (!parent.empty() && parent != "/?" "?" && parent != "/device" && parent != "/win32namedobjects")
+        return 0xC000003A; // STATUS_OBJECT_PATH_NOT_FOUND
+    if (key.rfind("/?" "?/", 0) == 0)
+        key = key.substr(4);
+    return 0;
+}
+
 std::string ObjectPath(u32 object_attributes, u32& root)
 {
     root = Read<u32>(object_attributes);
@@ -428,31 +446,48 @@ void CloseHostHandle(int kind, void* host)
 
 void RegisterFileExports(RegisterFn reg)
 {
-    reg("IoCreateSymbolicLink", [](Call& c) -> u64 {
-        const std::string link = Lower(GuestString(c.Arg(0))), device = GuestString(c.Arg(1));
-        std::string key = link;
-        for (char& ch : key)
+    reg("IoCreateSymbolicLink", [](Call& c) -> u64 { // link name, device name (OBJECT_STRING*)
+        if (!c.Arg(0))
+            return STATUS_SUCCESS; // an unnamed link: nothing anyone can find
+        std::string key;
+        if (const u32 status = LinkKey(GuestString(c.Arg(0)), key))
+            return status;
+        // the target: a device, or a file or directory on one
+        const std::string device = GuestString(c.Arg(1));
+        std::string lower = Lower(device);
+        for (char& ch : lower)
             if (ch == '\\')
                 ch = '/';
-        if (key.rfind("/?" "?/", 0) == 0)
-            key = key.substr(4);
+        bool known = false;
+        for (const char* d : {"/device/cdrom0", "/device/harddisk0/partition0", "/device/harddisk0/partition1",
+                              "/device/harddisk0/partition2", "/device/harddisk0/partition3",
+                              "/device/harddisk0/partition4", "/device/harddisk0/partition5"})
+        {
+            const size_t n = std::strlen(d);
+            if (lower.compare(0, n, d) == 0 && (lower.size() == n || lower[n] == '/'))
+                known = true;
+        }
+        if (!known)
+            return STATUS_INVALID_PARAMETER;
+        const std::string host = HostPath(device, 0);
+        struct stat st;
+        if (!host.empty() && host.rfind(kIso, 0) != 0 && stat(host.c_str(), &st) != 0)
+            return STATUS_OBJECT_NAME_NOT_FOUND;
         {
             std::lock_guard lock(g_links_mutex);
+            if (g_links.count(key))
+                return 0xC0000035; // STATUS_OBJECT_NAME_COLLISION
             g_links[key] = device;
         }
-        Log("files: %s -> %s", link.c_str(), device.c_str());
+        Log("files: %s -> %s", GuestString(c.Arg(0)).c_str(), device.c_str());
         return STATUS_SUCCESS;
     });
     reg("IoDeleteSymbolicLink", [](Call& c) -> u64 {
-        std::string key = Lower(GuestString(c.Arg(0)));
-        for (char& ch : key)
-            if (ch == '\\')
-                ch = '/';
-        if (key.rfind("/?" "?/", 0) == 0)
-            key = key.substr(4);
+        std::string key;
+        if (const u32 status = LinkKey(GuestString(c.Arg(0)), key))
+            return status;
         std::lock_guard lock(g_links_mutex);
-        g_links.erase(key);
-        return STATUS_SUCCESS;
+        return g_links.erase(key) ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
     });
     reg("NtCreateFile", [](Call& c) -> u64 {
         // FileHandle*, DesiredAccess, ObjectAttributes, IoStatusBlock, AllocationSize, FileAttributes,

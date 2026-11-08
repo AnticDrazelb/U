@@ -113,7 +113,19 @@ bool LoadXbeData(const std::vector<u8>& d, const std::string& path, XbeInfo& inf
             return false;
         }
         std::memcpy(Ptr(va), d.data() + raw, std::min(rsize, vsize ? vsize : rsize));
+        // the preloaded sections are loaded once, with their shared head and tail pages counted (the
+        // others are in memory too, but count as unloaded until XeLoadSection)
+        const u32 g = section_headers + i * 56;
+        if (Read<u32>(g) & 0x2)
+        {
+            Write<u32>(g + 24, 1);
+            for (u32 ref : {Read<u32>(g + 28), Read<u32>(g + 32)})
+                if (ref)
+                    Write<u16>(ref, u16(Read<u16>(ref) + 1));
+        }
     }
+    info.section_count = section_count;
+    info.section_headers = section_headers;
     if (info.tls_directory)
     {
         info.tls_raw_start = Read<u32>(info.tls_directory);

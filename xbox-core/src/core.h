@@ -85,6 +85,8 @@ u32 AllocContiguous(u32 size, u32 alignment, u32 lowest, u32 highest);
 bool FreeContiguous(u32 base);
 u32 AllocKernel(u32 size, u32 alignment = 16); // never freed
 u32 AllocStack(u32 size);                      // returns the top
+u32 AllocSystem(u32 size);                     // MmAllocateSystemMemory: pages in the stack area
+u32 FreeSystem(u32 base);                      // the pages freed
 u32 PhysicalAddress(u32 guest);
 // The allocation (program or contiguous memory) containing `at`.
 bool QueryAllocation(u32 at, u32& start, u32& size);
@@ -95,6 +97,7 @@ u32 FreePages();
 struct XbeInfo
 {
     u32 base = 0, image_size = 0, entry = 0, thunk_table = 0;
+    u32 section_count = 0, section_headers = 0; // the headers, in guest memory
     u32 tls_directory = 0, tls_raw_start = 0, tls_raw_end = 0, tls_index_address = 0, tls_zero_fill = 0;
     u32 init_flags = 0;
     std::string title;

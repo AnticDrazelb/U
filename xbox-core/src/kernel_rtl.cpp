@@ -655,6 +655,28 @@ void RegisterRtlExports(RegisterFn reg)
     reg("MmIsAddressValid", [](Call& c) -> u64 {
         u32 start, size;
         const u32 a = c.Arg(0);
+        // the program's image: a page only sections that aren't loaded cover isn't there
+        if (a >= g_xbe.base && a - g_xbe.base < g_xbe.image_size)
+        {
+            const u32 page = a & ~0xfffu;
+            bool covered = false;
+            for (u32 i = 0; i < g_xbe.section_count; i++)
+            {
+                const u32 h = g_xbe.section_headers + i * 56, va = Read<u32>(h + 4), vsize = Read<u32>(h + 8);
+                if (vsize && page < ((va + vsize + 0xfff) & ~0xfffu) && page + 0x1000 > (va & ~0xfffu))
+                {
+                    if (Read<u32>(h + 24))
+                        return 1;
+                    // the head and tail pages stay while a neighbouring section that shares them is loaded
+                    const u32 head = Read<u32>(h + 28), tail = Read<u32>(h + 32);
+                    if ((page == (va & ~0xfffu) && head && Read<u16>(head)) ||
+                        (page == ((va + vsize - 1) & ~0xfffu) && tail && Read<u16>(tail)))
+                        return 1;
+                    covered = true;
+                }
+            }
+            return !covered;
+        }
         return QueryAllocation(a, start, size) || (a >= kContiguousBase && a < kContiguousBase + kContiguousSize) ||
                (a >= kKernelBase && a < kKernelBase + kKernelSize) || (a >= kStackBase && a < kStackBase + kStackAreaSize);
     });

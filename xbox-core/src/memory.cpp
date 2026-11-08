@@ -269,6 +269,29 @@ u32 AllocStack(u32 size)
     return p + kPage + size;
 }
 
+u32 AllocSystem(u32 size)
+{
+    std::lock_guard lock(g_mem);
+    const u32 p = g_stacks.Alloc(size, kPage);
+    if (p)
+    {
+        const u32 bytes = (size + kPage - 1) & ~(kPage - 1);
+        platform::Protect(p, bytes, platform::Read | platform::Write | platform::Exec);
+        std::memset(Ptr(p), 0, bytes);
+    }
+    return p;
+}
+
+u32 FreeSystem(u32 base)
+{
+    std::lock_guard lock(g_mem);
+    u32 start, size;
+    if (!g_stacks.Find(base, start, size) || start != base)
+        return 0;
+    g_stacks.Free(base);
+    return size / kPage;
+}
+
 u32 PhysicalAddress(u32 guest)
 {
     if (guest >= kContiguousBase && guest < kContiguousBase + kContiguousSize)
@@ -281,7 +304,7 @@ u32 PhysicalAddress(u32 guest)
 bool QueryAllocation(u32 at, u32& start, u32& size)
 {
     std::lock_guard lock(g_mem);
-    return g_virtual.Find(at, start, size) || g_contiguous.Find(at, start, size);
+    return g_virtual.Find(at, start, size) || g_contiguous.Find(at, start, size) || g_stacks.Find(at, start, size);
 }
 
 u32 FreePages()
