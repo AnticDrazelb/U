@@ -450,6 +450,21 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
         light(true, out[7], out[8]);
     else
         out[7] = out[3], out[8] = out[4];
+    // the point size (oPts): SET_POINT_SIZE (1/8 pixels), or with SET_POINT_PARAMS_ENABLE from the eye
+    // distance: 1/sqrt(A + B d + C d^2) + bias, scaled by the size range from the minimum size, the
+    // range clamped (at most 63.875)
+    if (k.Get(0x318))
+    {
+        const float d = std::sqrt(Dot3(eye_position, eye_position));
+        const float a = k.F(0xa30), b = k.F(0xa34), c = k.F(0xa38), range = k.F(0xa3c), bias = k.F(0xa48),
+                    min_size = k.F(0xa4c);
+        const float lo = std::min(min_size, 63.875f), hi = std::min(range + lo, 63.875f);
+        const float q = a + b * d + c * d * d;
+        const float size = (q > 0 ? 1.f / std::sqrt(q) : 1e30f) + bias;
+        out[6] = Vec4{{std::clamp(size * range + min_size, lo, hi), 0, 0, 1}};
+    }
+    else
+        out[6] = Vec4{{std::max(1.f, float(std::min<u32>(k.Get(0x43c), 0x1ff)) / 8.f), 0, 0, 1}};
     // the fog distance (SET_FOG_GEN_MODE): turned into the fog factor in EmitVertex
     switch (k.Get(0x2a0))
     {
@@ -1008,6 +1023,8 @@ struct Fragments
     bool Usable() const { return cs.address && cs.pitch; }
 
     // the pixel at (x, y), a fraction t of the way from a to b
+    const Vec4* sprite = nullptr; // a point sprite's stage 3 coordinates, for the pixel being drawn
+
     void Pixel(int x, int y, const ScreenVertex& a, const ScreenVertex& b, float t)
     {
         if (x < x0 || y < y0 || x >= int(cs.width) || y >= int(cs.height) || !window.Allows(x, y))
@@ -1022,6 +1039,9 @@ struct Fragments
         for (int n = 0; n < used_count; n++)
             for (int i = 0; i < 4; i++)
                 in.v[used[n]][i] = (a.o[used[n]][i] * pa + b.o[used[n]][i] * pb) * norm;
+        if (sprite)
+            for (int i = 0; i < 4; i++)
+                in.v[12][i] = (*sprite)[i];
         u32 color;
         if (!ShadePixel(in, cs, u32(x), u32(y), color))
             return;
@@ -1042,15 +1062,29 @@ struct Fragments
         }
     }
 
-    // a point: a square of SET_POINT_SIZE (in 1/8 pixels) around it
+    // a point: a square of its size (oPts; SET_POINT_SIZE when a program leaves it) around it; with
+    // SET_POINT_SMOOTH_ENABLE a sprite, stage 3's coordinates going 0..1 across it
     void Point(const ScreenVertex& p)
     {
-        const float size = std::max(1.f, float(g_kelvin.Get(0x43c) & 0x1ff) / 8.f);
+        u32 ax, ay;
+        AntiAliasing(ax, ay);
+        const float base = p.o[6][0] > 0 ? p.o[6][0] : std::max(1.f, float(std::min<u32>(g_kelvin.Get(0x43c), 0x1ff)) / 8.f);
+        const float size = std::min(base, 512.f) * float(ax);
         const int x0p = int(std::floor(p.x - size / 2 + 0.5f)), y0p = int(std::floor(p.y - size / 2 + 0.5f));
         const int n = std::max(1, int(size + 0.5f));
+        const bool sprites = g_kelvin.Get(0x31c);
+        Vec4 coords{{0, 0, 1, 1}};
         for (int y = y0p; y < y0p + n; y++)
             for (int x = x0p; x < x0p + n; x++)
+            {
+                if (sprites)
+                {
+                    coords[0] = (float(x - x0p) + 0.5f) / float(n), coords[1] = (float(y - y0p) + 0.5f) / float(n);
+                    sprite = &coords;
+                }
                 Pixel(x, y, p, p, 0);
+            }
+        sprite = nullptr;
     }
 };
 
