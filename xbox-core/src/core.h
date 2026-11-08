@@ -62,12 +62,16 @@ inline void Write(u32 guest, T v)
 //                          above (the PS4 can't map memory twice).
 //   0x8c000000-0x8cffffff  the core's kernel area: KPCRs, threads, objects, export stubs, data exports
 //   0xd0000000-0xd3ffffff  thread stacks
+//   0xf0000000-0xf7ffffff  physical memory again (write-combined): emulated accesses
 //   0xfd000000-0xffffffff  devices (NV2A at 0xfd000000), kept unmapped: accesses fault and are emulated
 constexpr u32 kRamBase = 0x00010000, kRamEnd = 0x04000000;
 constexpr u32 kContiguousBase = 0x80000000, kContiguousSize = 0x04000000;
 constexpr u32 kKernelBase = 0x8c000000, kKernelSize = 0x01000000;
 constexpr u32 kStackBase = 0xd0000000, kStackAreaSize = 0x04000000;
 constexpr u32 kDeviceBase = 0xfd000000;
+// The GPU's write-combined view of memory: 0xf0000000 + a physical address. Kept unmapped like the
+// devices; accesses are emulated (the PS4 can't map memory twice).
+constexpr u32 kAliasBase = 0xf0000000, kAliasSize = 0x08000000;
 // The RAM's "physical" addresses (what MmGetPhysicalAddress gives and the GPU uses): above the
 // contiguous memory's 64 MiB, so that a physical address names one place.
 constexpr u32 kRamPhysical = 0x04000000;

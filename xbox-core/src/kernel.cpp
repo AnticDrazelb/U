@@ -2189,7 +2189,17 @@ void InitKernel()
         return 0;
     } END;
     K(HalReadSMBusValue) { if (c.Arg(3)) Write<u32>(c.Arg(3), 0); return 0; } END;
-    K(HalWriteSMBusValue) { return 0; } END;
+    K(HalWriteSMBusValue) // address, command, word?, value
+    {
+        // the SMC's power register (0x20, 2): reset, power cycle, shut down: the program ends
+        if ((c.Arg(0) & 0xfe) == 0x20 && c.Arg(1) == 0x02 && (c.Arg(3) == 0x01 || c.Arg(3) == 0x40 || c.Arg(3) == 0x80))
+        {
+            Log("kernel: the SMC was told to %s", c.Arg(3) == 0x80 ? "shut down" : "restart");
+            g_quit = true;
+            WakeAll();
+        }
+        return STATUS_SUCCESS;
+    } END;
     K(ExQueryNonVolatileSetting)
     {
         // ValueIndex, Type*, Value, ValueLength, ResultLength*

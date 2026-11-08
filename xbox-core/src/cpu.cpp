@@ -329,7 +329,7 @@ bool OnFault(platform::Fault& f)
     }
     const u8* code = Ptr<u8>(u32(rip));
     size_t length = 0;
-    if (f.signal == 11 && f.address >= kDeviceBase)
+    if (f.signal == 11 && (f.address >= kDeviceBase || (f.address >= kAliasBase && f.address - kAliasBase < kAliasSize)))
         length = EmulateDeviceAccess(code, f.address, r);
     if (!length)
         length = SkipPrivileged(code, r);

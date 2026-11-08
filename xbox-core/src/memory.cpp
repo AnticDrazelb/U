@@ -200,7 +200,9 @@ void InitMemory()
             at = std::max(at, end);
         }
     }
-    // the devices: reserved, inaccessible
+    // the devices and the write-combined view of memory: reserved, inaccessible
+    if (const std::string a = platform::Reserve(kAliasBase, kAliasSize); !a.empty())
+        Fatal("memory view at %#x not reserved: %s", kAliasBase, a.c_str());
     const std::string e = platform::Reserve(kDeviceBase, 0x03000000);
     if (!e.empty())
         Fatal("device range at %#x not reserved: %s", kDeviceBase, e.c_str());

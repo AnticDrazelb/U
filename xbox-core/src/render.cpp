@@ -74,18 +74,34 @@ Surface ZetaSurface()
 }
 
 // a color as 0xAARRGGBB, written in the surface's format
+// The bits a colour format leaves unused ("X") are stored as zeros (the _Z formats) or ones (_O):
+// format 1 X1R5G5B5_Z, 2 _O, 4 X8R8G8B8_Z, 5 _O, 6 X1A7R8G8B8_Z, 7 _O.
+u32 FixedBits(u32 format, u32 value)
+{
+    switch (format)
+    {
+    case 0x1: return value & 0x7fff;
+    case 0x2: return value | 0x8000;
+    case 0x4: return value & 0x00ffffff;
+    case 0x5: return value | 0xff000000;
+    case 0x6: return value & 0x7fffffff;
+    case 0x7: return value | 0x80000000;
+    }
+    return value;
+}
+
 void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask)
 {
     const u32 p = PixelAddress(s, x, y);
     if (s.bytes == 4)
     {
         const u32 old = Read<u32>(p);
-        Write<u32>(p, (old & ~mask) | (argb & mask));
+        Write<u32>(p, FixedBits(s.format, (old & ~mask) | (argb & mask)));
     }
     else if (s.format == 0x3) // R5G6B5
         Write<u16>(p, u16(((argb >> 8) & 0xf800) | ((argb >> 5) & 0x07e0) | ((argb >> 3) & 0x001f)));
     else if (s.bytes == 2)
-        Write<u16>(p, u16(((argb >> 9) & 0x7c00) | ((argb >> 6) & 0x03e0) | ((argb >> 3) & 0x001f)));
+        Write<u16>(p, u16(FixedBits(s.format, ((argb >> 9) & 0x7c00) | ((argb >> 6) & 0x03e0) | ((argb >> 3) & 0x001f))));
     else
         Write<u8>(p, u8(argb));
 }
@@ -134,10 +150,25 @@ void Clear(u32 flags)
             const u32 color = k.Get(0x1d90);
             const u32 rows = y1 < y0 ? 0 : std::min(y1, s.height - 1) - y0 + 1;
             const int parts = rows * (x1 - x0 + 1) > 16384 ? RasterThreads() : 1;
+            // a 16-bit surface takes the clear value's low half as it is (its own R, G, B fields)
+            u16 mask16 = 0;
+            if (s.bytes == 2)
+            {
+                const bool r565 = s.format == 0x3;
+                if (flags & 0x10) mask16 |= r565 ? 0xf800 : 0x7c00;
+                if (flags & 0x20) mask16 |= r565 ? 0x07e0 : 0x03e0;
+                if (flags & 0x40) mask16 |= 0x001f;
+            }
             RunParts(parts, [&](int part) {
                 for (u32 y = y0 + u32(part); y <= y1 && y < s.height; y += u32(parts))
                     for (u32 x = x0; x <= x1 && x < s.width; x++)
-                        WritePixel(s, x, y, color, mask);
+                        if (s.bytes == 2)
+                        {
+                            const u32 p = PixelAddress(s, x, y);
+                            Write<u16>(p, u16(FixedBits(s.format, (Read<u16>(p) & ~mask16) | (color & mask16))));
+                        }
+                        else
+                            WritePixel(s, x, y, color, mask);
             });
         }
     }

@@ -184,6 +184,25 @@ u32 PhysToGuest(u32 phys)
 
 void InitDevices()
 {
+    // 0xf0000000 + physical address: the memory there, a byte, word or dword at a time
+    AddDevice({kAliasBase, kAliasSize, "memory view",
+               [](u32 offset, u32 size) -> u32 {
+                   const u32 at = PhysToGuest(offset);
+                   if (!at)
+                       return 0;
+                   return size == 1 ? Read<u8>(at) : size == 2 ? Read<u16>(at) : Read<u32>(at);
+               },
+               [](u32 offset, u32 size, u32 value) {
+                   const u32 at = PhysToGuest(offset);
+                   if (!at)
+                       return;
+                   if (size == 1)
+                       Write<u8>(at, u8(value));
+                   else if (size == 2)
+                       Write<u16>(at, u16(value));
+                   else
+                       Write<u32>(at, value);
+               }});
     InitNv2a();
     InitUsb();
     InitAudio();
