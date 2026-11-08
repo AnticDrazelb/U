@@ -7,7 +7,8 @@ It runs on the desktop (Linux x86-64) and builds for the PS4.
 
 **Where it stands:** nxdk's samples run: the C runtime, C++, the Windows API layer, SDL2, the
 NV2A's 3D drawing (vertex programs, textures, register combiners) in a multi-threaded software
-renderer, sound through the AC'97, and the Xbox controller over USB. Games load from a folder or
+renderer, sound through the AC'97 and the APU's voice processor (DirectSound's hardware), and the Xbox
+controller over USB. Games load from a folder or
 straight from a disc image (`.iso`). 280 of the kernel's 337 functions are implemented (most of the rest are the driver model's IRPs and device queues), each new
 one checked by `tests/kernel-test`. No commercial game has been tried yet.
 
@@ -28,7 +29,7 @@ Bottom: `gamma`, `triangle` (black: it draws with the NV2A).*
 | memory | `memory.cpp` | RAM at `0x10000`, contiguous memory at `0x80000000` (separate: the PS4 can't alias), kernel area at `0x8c000000`, stacks at `0xd0000000`, devices from `0xfd000000` unmapped |
 | devices | `devices.cpp`, `cpu.cpp` | an access to device memory faults; the fault handler decodes the instruction (`mov`, `movzx`, ALU ops, `test`) and does it on the device's registers. vblank interrupt with its DPCs at 60 Hz |
 | GPU | `nv2a.cpp`, `render.cpp`, `draw.cpp`, `pixel.cpp` | the NV2A's FIFO (DMA pusher, RAMHT, objects, interrupts, flips) and its 3D engine in software: vertex programs interpreted, triangles rasterized by a pool of threads (bands of rows, in order), textures (swizzled, linear, DXT, palettes), the register combiners, alpha test and blending |
-| sound | `audio.cpp` | the AC'97's bus masters played at 48 kHz (PS4: AudioOut; desktop: `--wav`) |
+| sound | `audio.cpp`, `apu.cpp` | the AC'97's bus masters played at 48 kHz (PS4: AudioOut; desktop: `--wav`); the MCPX APU that DirectSound drives: its front end (voice methods, lists, SSL streams, SGE pages, notifiers) and voice processor (envelopes, PCM and IMA ADPCM, pitch, 32 mix bins); its DSPs aren't run, the voices' own mix is heard |
 | input | `usb.cpp` | the OHCI host controller and an Xbox controller on the port games see as player 1 (PS4: the DualShock 4; desktop: `--pad`) |
 | files | `files.cpp`, `xiso.cpp` | `D:` and `\Device\CdRom0` are the XBE's folder or its disc image (XDVDFS, also inside full dumps); the hard disk's partitions are folders under `xbox-data/`; names match regardless of case |
 

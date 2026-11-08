@@ -178,6 +178,7 @@ void InitDevices()
     InitNv2a();
     InitUsb();
     InitAudio();
+    InitApu();
 }
 
 bool DeviceRead(u32 address, u32 size, u32& value)

@@ -2,6 +2,7 @@
 // registers, and the bus masters' descriptor lists (PCM in 0x100, PCM out 0x110, S/PDIF 0x170)
 // played in real time at 48 kHz. PCM out's samples (16-bit stereo) go to the sound sink; S/PDIF is
 // consumed in step with it. (Games use the APU at 0xfe800000 through DirectSound; that is separate.)
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -14,6 +15,28 @@ namespace xb {
 void (*g_audio_sink)(const s16* samples, size_t frames) = nullptr;
 
 namespace {
+
+// the APU's sound (apu.cpp), mixed into what the AC'97 plays: a ring of stereo frames
+std::mutex g_apu_mutex;
+std::vector<s16> g_apu_ring(48000 * 2 / 4); // a quarter second
+size_t g_apu_read = 0, g_apu_fill = 0;
+
+// Takes up to `frames` APU frames, added into `pcm`; returns how many there were.
+size_t TakeApuSound(s16* pcm, size_t frames)
+{
+    std::lock_guard lock(g_apu_mutex);
+    const size_t capacity = g_apu_ring.size() / 2;
+    const size_t n = std::min(frames, g_apu_fill);
+    for (size_t i = 0; i < n; i++)
+    {
+        const size_t at = (g_apu_read + i) % capacity;
+        for (int c = 0; c < 2; c++)
+            pcm[i * 2 + c] = s16(std::clamp(int(pcm[i * 2 + c]) + int(g_apu_ring[at * 2 + c]), -32768, 32767));
+    }
+    g_apu_read = (g_apu_read + n) % capacity;
+    g_apu_fill -= n;
+    return n;
+}
 
 constexpr u32 kBase = 0xfec00000, kSize = 0x1000, kIrq = 6;
 constexpr u32 kGlobalStatus = 0x130;
@@ -112,6 +135,8 @@ void Player()
             Play(0x170, spdif.data(), spdif.size());
             UpdateIrq();
         }
+        if (TakeApuSound(pcm.data(), kFrames))
+            playing = true;
         if (g_audio_sink && playing)
             g_audio_sink(pcm.data(), kFrames);
     }
@@ -168,6 +193,24 @@ void WriteReg(u32 offset, u32 size, u32 value)
 }
 
 } // namespace
+
+void MixApuSound(const s16* samples, size_t frames)
+{
+    std::lock_guard lock(g_apu_mutex);
+    const size_t capacity = g_apu_ring.size() / 2;
+    for (size_t i = 0; i < frames; i++)
+    {
+        if (g_apu_fill == capacity) // full: the oldest goes
+        {
+            g_apu_read = (g_apu_read + 1) % capacity;
+            g_apu_fill--;
+        }
+        const size_t at = (g_apu_read + g_apu_fill) % capacity;
+        g_apu_ring[at * 2] = samples[i * 2];
+        g_apu_ring[at * 2 + 1] = samples[i * 2 + 1];
+        g_apu_fill++;
+    }
+}
 
 void InitAudio()
 {
