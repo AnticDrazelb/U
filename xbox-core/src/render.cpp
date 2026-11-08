@@ -28,6 +28,18 @@ u32 ColorBytes(u32 format)
 
 } // namespace
 
+// SET_SURFACE_FORMAT's anti-aliasing (bits 12-15): 1 CENTER_CORNER_2 stores two samples across a
+// pixel, 2 SQUARE_OFFSET_4 two by two; the surface is that much bigger and drawing is scaled into it
+void AntiAliasing(u32& x, u32& y)
+{
+    switch ((g_kelvin.Get(0x208) >> 12) & 0xf)
+    {
+    case 1: x = 2, y = 1; return;
+    case 2: x = 2, y = 2; return;
+    default: x = 1, y = 1; return;
+    }
+}
+
 Surface ColorSurface()
 {
     const KelvinState& k = g_kelvin;
@@ -36,8 +48,10 @@ Surface ColorSurface()
     s.format = format & 0xf;
     s.bytes = ColorBytes(s.format);
     s.pitch = k.Get(0x20c) & 0xffff;
-    s.width = (k.Get(0x200) >> 16) + (k.Get(0x200) & 0xffff);
-    s.height = (k.Get(0x204) >> 16) + (k.Get(0x204) & 0xffff);
+    u32 ax, ay;
+    AntiAliasing(ax, ay);
+    s.width = ((k.Get(0x200) >> 16) + (k.Get(0x200) & 0xffff)) * ax;
+    s.height = ((k.Get(0x204) >> 16) + (k.Get(0x204) & 0xffff)) * ay;
     s.swizzled = ((format >> 8) & 0xf) == 2;
     if (s.swizzled) // SET_SURFACE_FORMAT's log2 width and height
     {
@@ -58,8 +72,10 @@ Surface ZetaSurface()
     s.format = zformat;
     s.bytes = zformat == 1 ? 2 : 4;
     s.pitch = k.Get(0x20c) >> 16;
-    s.width = (k.Get(0x200) >> 16) + (k.Get(0x200) & 0xffff);
-    s.height = (k.Get(0x204) >> 16) + (k.Get(0x204) & 0xffff);
+    u32 ax, ay;
+    AntiAliasing(ax, ay);
+    s.width = ((k.Get(0x200) >> 16) + (k.Get(0x200) & 0xffff)) * ax;
+    s.height = ((k.Get(0x204) >> 16) + (k.Get(0x204) & 0xffff)) * ay;
     const u32 format = k.Get(0x208);
     s.swizzled = ((format >> 8) & 0xf) == 2;
     if (s.swizzled)
@@ -130,7 +146,9 @@ void Clear(u32 flags)
 {
     const KelvinState& k = g_kelvin;
     const u32 h = k.Get(0x1d98), v = k.Get(0x1d9c);
-    const u32 x0 = h & 0xffff, x1 = h >> 16, y0 = v & 0xffff, y1 = v >> 16;
+    u32 ax, ay;
+    AntiAliasing(ax, ay);
+    const u32 x0 = (h & 0xffff) * ax, x1 = ((h >> 16) + 1) * ax - 1, y0 = (v & 0xffff) * ay, y1 = ((v >> 16) + 1) * ay - 1;
     if (g_verbose >= 2)
     {
         const Surface s = ColorSurface();

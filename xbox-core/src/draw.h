@@ -43,6 +43,7 @@ inline u32 PixelAddress(const Surface& s, u32 x, u32 y)
 {
     return s.swizzled ? s.address + Swizzle(x, y, s.width, s.height) * s.bytes : s.address + y * s.pitch + x * s.bytes;
 }
+void AntiAliasing(u32& x, u32& y); // the surface's samples per pixel across and down
 Surface ColorSurface();
 Surface ZetaSurface();
 void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask = 0xffffffff);

@@ -659,8 +659,10 @@ ScreenVertex ToScreen(const Vertex& v)
     // for perspective-correct interpolation
     // positions are snapped (truncated) to the rasterizer's 1/16-pixel grid: what the 0.53125 offset
     // Direct3D-style setups add is meant for (the console covers pixel 0 from 0.53125)
-    s.x = std::floor(v.o[0][0] * 16.f) / 16.f;
-    s.y = std::floor(v.o[0][1] * 16.f) / 16.f;
+    u32 ax, ay;
+    AntiAliasing(ax, ay);
+    s.x = std::floor(v.o[0][0] * 16.f) / 16.f * float(ax);
+    s.y = std::floor(v.o[0][1] * 16.f) / 16.f * float(ay);
     s.z = v.o[0][2];
     const float w = v.o[0][3];
     s.inv_w = w != 0 ? 1.f / w : 1.f;
@@ -797,7 +799,9 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         if ((cull == 0x404 && front) || (cull == 0x405 && !front) || cull == 0x408)
             return;
     }
-    const u32 clip_x0 = k.Get(0x200) & 0xffff, clip_y0 = k.Get(0x204) & 0xffff;
+    u32 ax, ay;
+    AntiAliasing(ax, ay);
+    const u32 clip_x0 = (k.Get(0x200) & 0xffff) * ax, clip_y0 = (k.Get(0x204) & 0xffff) * ay;
     const int x0 = std::max<int>(int(clip_x0), int(std::floor(std::min({a.x, b.x, c.x}))));
     const int x1 = std::min<int>(int(cs.width) - 1, int(std::ceil(std::max({a.x, b.x, c.x}))));
     const int y0 = std::max<int>(int(clip_y0), int(std::floor(std::min({a.y, b.y, c.y}))));
@@ -1049,34 +1053,48 @@ void Flush()
             Log("  vertex %zu: pos %g %g %g %g  diffuse %g %g %g %g", i, s[i].o[0][0], s[i].o[0][1], s[i].o[0][2],
                 s[i].o[0][3], s[i].o[3][0], s[i].o[3][1], s[i].o[3][2], s[i].o[3][3]);
     }
-    // the primitive as triangles (indices into s)
-    std::vector<std::array<u32, 3>> tris;
-    auto add = [&](size_t i, size_t j, size_t k) { tris.push_back({u32(i), u32(j), u32(k)}); };
+    // the primitive as triangles (indices into s), each with its provoking vertex (whose colours a flat
+    // shaded triangle takes: SET_FLAT_SHADE_OP, 1 the first, 0 the last) and the edges that belong to
+    // the primitive's outline (bit 0: v0-v1, 1: v1-v2, 2: v2-v0; for polygon modes)
+    struct Tri
+    {
+        u32 v[3];
+        u32 provoking;
+        u8 edges;
+    };
+    std::vector<Tri> tris;
+    const bool first = g_kelvin.Get(0x9fc) == 1;
+    auto add = [&](size_t i, size_t j, size_t k, size_t provoking, u8 edges = 7) {
+        tris.push_back({{u32(i), u32(j), u32(k)}, u32(provoking), edges});
+    };
     switch (g_primitive)
     {
     case 5: // triangles
         for (size_t i = 0; i + 2 < n; i += 3)
-            add(i, i + 1, i + 2);
+            add(i, i + 1, i + 2, first ? i : i + 2);
         break;
     case 6: // triangle strip
         for (size_t i = 0; i + 2 < n; i++)
             if (i & 1)
-                add(i + 1, i, i + 2);
+                add(i + 1, i, i + 2, first ? i : i + 2);
             else
-                add(i, i + 1, i + 2);
+                add(i, i + 1, i + 2, first ? i : i + 2);
         break;
     case 7: // triangle fan
-    case 10: // polygon
         for (size_t i = 1; i + 1 < n; i++)
-            add(0, i, i + 1);
+            add(0, i, i + 1, first ? i : i + 1);
         break;
-    case 8: // quads
+    case 10: // polygon: its outline is the edges between consecutive vertices
+        for (size_t i = 1; i + 1 < n; i++)
+            add(0, i, i + 1, 0, u8((i == 1 ? 1 : 0) | 2 | (i + 2 == n ? 4 : 0))); // first vertex either way
+        break;
+    case 8: // quads (flat: the last vertex either way)
         for (size_t i = 0; i + 3 < n; i += 4)
-            add(i, i + 1, i + 2), add(i, i + 2, i + 3);
+            add(i, i + 1, i + 2, i + 3, 3), add(i, i + 2, i + 3, i + 3, 6);
         break;
-    case 9: // quad strip
+    case 9: // quad strip: split as a triangle strip is (flat: the last vertex either way)
         for (size_t i = 0; i + 3 < n; i += 2)
-            add(i, i + 1, i + 3), add(i, i + 3, i + 2);
+            add(i, i + 1, i + 2, i + 3, 5), add(i + 1, i + 3, i + 2, i + 3, 3);
         break;
     case 1: // points
     case 2: // lines
@@ -1107,24 +1125,76 @@ void Flush()
     default:
         break;
     }
-    // how much there is to draw: small draws stay on this thread
-    float pixels = 0;
-    for (const auto& t : tris)
-    {
-        const ScreenVertex &a = s[t[0]], &b = s[t[1]], &c = s[t[2]];
-        pixels += std::fabs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5f;
-    }
     if (tris.empty())
     {
         g_vertices.clear();
         return;
     }
+    // flat shading (SET_SHADE_MODEL 0x1d00): the provoking vertex's colours over the whole triangle
+    std::vector<ScreenVertex> flat;
+    if (g_kelvin.Get(0x37c) == 0x1d00)
+    {
+        flat.reserve(tris.size() * 3);
+        for (Tri& t : tris)
+            for (u32& v : t.v)
+            {
+                ScreenVertex copy = s[v];
+                for (int o : {3, 4, 7, 8})
+                    copy.o[o] = s[t.provoking].o[o];
+                flat.push_back(copy);
+                v = u32(flat.size() - 1);
+            }
+    }
+    const std::vector<ScreenVertex>& sv = flat.empty() ? s : flat;
     PreparePixels();
+    // polygon modes (SET_FRONT/BACK_POLYGON_MODE: 0x1b00 points, 0x1b01 lines, else filled): those
+    // triangles become their outline's lines or vertices, on this thread
+    const u32 front_mode = g_kelvin.Get(0x38c), back_mode = g_kelvin.Get(0x390);
+    if (front_mode == 0x1b00 || front_mode == 0x1b01 || back_mode == 0x1b00 || back_mode == 0x1b01)
+    {
+        std::vector<Tri> filled;
+        Fragments f;
+        for (const Tri& t : tris)
+        {
+            const ScreenVertex &a = sv[t.v[0]], &b = sv[t.v[1]], &c = sv[t.v[2]];
+            const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            const bool front = g_kelvin.Get(0x3a0) == 0x901 ? area < 0 : area > 0;
+            if (g_kelvin.Get(0x308))
+            {
+                const u32 cull = g_kelvin.Get(0x39c);
+                if ((cull == 0x404 && front) || (cull == 0x405 && !front) || cull == 0x408)
+                    continue;
+            }
+            const u32 mode = front ? front_mode : back_mode;
+            if (mode != 0x1b00 && mode != 0x1b01)
+            {
+                filled.push_back(t);
+                continue;
+            }
+            if (!f.Usable())
+                continue;
+            for (int e = 0; e < 3; e++)
+                if (t.edges & (1 << e))
+                {
+                    if (mode == 0x1b01)
+                        f.Line(sv[t.v[e]], sv[t.v[(e + 1) % 3]]);
+                    else
+                        f.Point(sv[t.v[e]]);
+                }
+        }
+        tris.swap(filled);
+    }
+    float pixels = 0;
+    for (const auto& t : tris)
+    {
+        const ScreenVertex &a = sv[t.v[0]], &b = sv[t.v[1]], &c = sv[t.v[2]];
+        pixels += std::fabs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5f;
+    }
     const int parts = pixels < 4096 ? 1 : RasterThreads();
     const auto start = std::chrono::steady_clock::now();
     RunParts(parts, [&](int part) {
         for (const auto& t : tris)
-            Triangle(s[t[0]], s[t[1]], s[t[2]], part, parts);
+            Triangle(sv[t.v[0]], sv[t.v[1]], sv[t.v[2]], part, parts);
     });
     // -v 1: how long drawing takes, every 2 seconds
     static double busy = 0, area = 0;
