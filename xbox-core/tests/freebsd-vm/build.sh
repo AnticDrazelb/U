@@ -2,6 +2,7 @@
 # Builds xbox-core on FreeBSD (no cmake needed), as the PS4 build is set up where it matters: Jaguar's
 # instruction set (-march=btver2), the executable at 0x400000, src/platform_freebsd.cpp.
 #   tests/freebsd-vm/build.sh [out dir]      (in the VM: run.sh copies the sources in and calls it)
+#   XB_IMAGE_BASE=0x40000000 build.sh ...    linked there instead (the PS4 variant that leaves the Xbox's addresses)
 set -eu
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:-$HOME/xc-bsd}"
@@ -21,5 +22,5 @@ cc $FLAGS -c "$HERE/src/switch.S" -o "$OUT/obj/switch.o"
 fail=0
 for p in $pids; do wait "$p" || fail=1; done
 [ "$fail" = 0 ] || { echo "compile failed" >&2; exit 1; }
-c++ -no-pie -Wl,--image-base=0x400000 -o "$OUT/xbox-core" "$OUT"/obj/*.o -lpthread -lutil -lm
+c++ -no-pie -Wl,--image-base="${XB_IMAGE_BASE:-0x400000}" -o "$OUT/xbox-core" "$OUT"/obj/*.o -lpthread -lutil -lm
 echo "$OUT/xbox-core"

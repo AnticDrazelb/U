@@ -54,7 +54,7 @@ for p in lines:
         fi
     done
     # the core's own tests: the kernel test as an XBE, the disc test as a disc image
-    for t in kernel seh ff lines blit apu rt tex; do
+    for t in kernel seh bigimage ff lines blit apu rt tex; do
         if [ -f "$HERE/tests/$t-test/bin/default.xbe" ]; then
             cp "$HERE/tests/$t-test/bin/default.xbe" "$stage/samples/test-$t.xbe"
         fi
