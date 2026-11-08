@@ -127,6 +127,7 @@ struct PixelState
     V4 final_c0{}, final_c1{};
     u32 program[4] = {};
     u32 dot_map[4] = {}, input[4] = {}, clip_mode = 0, shadow_func = 0;
+    float eye[3] = {}; // SET_EYE_VECTOR: dot reflect specular const's eye
     float bump[4][4] = {}, bump_scale[4] = {}, bump_offset[4] = {};
     bool enabled[4] = {};
     Texture texture[4];
@@ -653,9 +654,23 @@ V4 DotMap(const V4& c, u32 map)
     case 2: return {Sign2(c[0]), Sign2(c[1]), Sign2(c[2]), 0};
     case 3: return {Sign3(c[0]), Sign3(c[1]), Sign3(c[2]), 0};
     case 4: // HILO: two 16-bit values
+    case 5: // HILO hemisphere, D3D's signed mapping: z = sqrt(1 - hi^2 - lo^2)
+    case 6: // ... GL's
+    case 7: // ... two's complement
     {
         auto byte = [](float v) { return u32(Clamp01(v) * 255.f + 0.5f); };
-        return {float(byte(c[3]) << 8 | byte(c[0])) / 65535.f, float(byte(c[1]) << 8 | byte(c[2])) / 65535.f, 1, 0};
+        const u32 hi = byte(c[3]) << 8 | byte(c[0]), lo = byte(c[1]) << 8 | byte(c[2]);
+        if (map == 4)
+            return {float(hi) / 65535.f, float(lo) / 65535.f, 1, 0};
+        auto sign = [map](u32 x) {
+            if (map == 5)
+                return (float(x) - 32768.f) / 32767.f;
+            if (map == 6)
+                return x >= 32768 ? (float(x) - 65535.5f) / 32767.5f : (float(x) + 0.5f) / 32767.5f;
+            return x >= 32768 ? (float(x) - 65536.f) / 32767.f : float(x) / 32767.f;
+        };
+        const float h = sign(hi), l = sign(lo);
+        return {h, l, std::sqrt(std::max(0.f, 1.f - h * h - l * l)), 0};
     }
     default: return {c[0], c[1], c[2], 0};
     }
@@ -745,6 +760,7 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             break;
         }
         case 12: // dot reflect specular (stage 3): the eye vector in the coordinates' w, reflected
+        case 18: // ... with the eye vector a constant (SET_EYE_VECTOR)
         case 13: // dot STR 3D
         case 14: // dot STR cube
         {
@@ -752,15 +768,18 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             if (s < 2 || !enabled)
                 break;
             const float n[3] = {dot[s - 2], dot[s - 1], dot[s]};
-            if (program == 12)
+            if (program == 12 || program == 18)
             {
-                const float e[3] = {in.v[9 + s - 2][3], in.v[9 + s - 1][3], tc[3]};
+                const float e[3] = {program == 18 ? g_ps.eye[0] : in.v[9 + s - 2][3],
+                                    program == 18 ? g_ps.eye[1] : in.v[9 + s - 1][3], program == 18 ? g_ps.eye[2] : tc[3]};
                 const float ne = n[0] * e[0] + n[1] * e[1] + n[2] * e[2], nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
                 const float k = nn != 0 ? 2 * ne / nn : 0;
                 tex[s] = SampleCube(t, k * n[0] - e[0], k * n[1] - e[1], k * n[2] - e[2]);
             }
             else if (program == 14)
                 tex[s] = SampleCube(t, n[0], n[1], n[2]);
+            else if (t.depth > 1)
+                tex[s] = Sample3D(t, n[0], n[1], n[2], 0);
             else
                 tex[s] = Sample(t, n[0], n[1]);
             break;
@@ -773,7 +792,7 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             if (enabled)
                 tex[s] = Sample(t, input[1], input[2]);
             break;
-        default: // 8 (BRDF), 18 (dot reflect specular const): not done
+        default: // 8 (BRDF): not done
         {
             static std::atomic<u32> reported{0};
             if (!(reported.fetch_or(1u << program) & (1u << program)))
@@ -868,6 +887,8 @@ void PreparePixels()
     ps.input[1] = 0, ps.input[2] = (k.Get(0x1e78) >> 16) & 0xf, ps.input[3] = (k.Get(0x1e78) >> 20) & 0xf;
     ps.clip_mode = k.Get(0x17f8);
     ps.shadow_func = k.Get(0x1e6c) & 7; // SET_SHADOW_COMPARE_FUNC
+    for (int i = 0; i < 3; i++)
+        ps.eye[i] = k.F(0x181c + u32(i) * 4);
     for (int i = 0; i < 4; i++)
     {
         for (int j = 0; j < 4; j++)
