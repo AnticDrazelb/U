@@ -316,19 +316,23 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
         out[9 + s] = t;
     }
 
-    // lighting
+    // lighting, for the front (the normal as it is) or the back (reversed, with the back material and
+    // the lights' back colours: SET_LIGHT_TWO_SIDE_ENABLE)
     const u32 light_control = k.Get(0x294);
     const bool lighting = k.Get(0x314), separate_specular = light_control & 1, local_eye = light_control & (1u << 16);
     const bool specular_enable = k.Get(0x3b8);
-    Vec4 d0 = diffuse, d1 = specular;
+    auto light = [&](bool back, Vec4& d0, Vec4& d1) {
+    d0 = diffuse, d1 = specular;
+    const Vec4 n = back ? Vec4{{-eye_normal[0], -eye_normal[1], -eye_normal[2], 0}} : eye_normal;
     if (lighting)
     {
-        const u32 color_material = k.Get(0x298); // sources: 0 the material, 1 diffuse, 2 specular
+        // sources: 0 the material, 1 diffuse, 2 specular (the back's in bits 8-15)
+        const u32 color_material = back ? k.Get(0x298) >> 8 : k.Get(0x298);
         const u32 emission_src = color_material & 3, ambient_src = (color_material >> 2) & 3;
         const u32 diffuse_src = (color_material >> 4) & 3, specular_src = (color_material >> 6) & 3;
         auto source = [&](u32 src) -> const Vec4& { return src == 2 ? specular : diffuse; };
-        const float alpha = diffuse_src == 0 ? k.F(0x3b4) : source(diffuse_src)[3];
-        const Vec4 scene_ambient = Floats(0xa10, 3), emission = Floats(0x3a8, 3);
+        const float alpha = diffuse_src == 0 ? k.F(back ? 0x17ac : 0x3b4) : source(diffuse_src)[3];
+        const Vec4 scene_ambient = Floats(back ? 0x17a0 : 0xa10, 3), emission = Floats(back ? 0x17b0 : 0x3a8, 3);
         if (emission_src == 0 || ambient_src == 0)
         {
             d0 = scene_ambient;
@@ -342,9 +346,8 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
                 d0[c] = source(emission_src)[c] + source(ambient_src)[c] * emission[c];
         d0[3] = alpha;
         d1 = Vec4{{0, 0, 0, specular[3]}};
-        Vec4 params = Floats(0x9e0, 3); // SET_SPECULAR_PARAMS: the specular curve (x + L) / (M x + N)
-        if (params[0] == 0 && params[1] == 0 && params[2] == 0)
-            params = Vec4{{0, -0.494592f, 1.494592f, 0}};
+        const Vec4 params = Floats(back ? 0x1e28 : 0x9e0, 3); // SET_SPECULAR_PARAMS: the specular curve (x + L) / (M x + N);
+                                              // all zero is full specular wherever n.h > 0
         const Vec4 eye = Floats(0xa50);
         Vec4 eye_dir{{0, 0, 0, 0}};
         const float pw = eye_position[3] != 0 ? eye_position[3] : 1;
@@ -362,14 +365,14 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
             if (type == 1)
             {
                 const Vec4 direction = Normalize3(Floats(l + 0x34, 3));
-                n_dot_vp = std::max(0.f, Dot3(eye_normal, direction));
+                n_dot_vp = std::max(0.f, Dot3(n, direction));
                 if (local_eye)
                 {
                     const Vec4 h = Normalize3(Vec4{{direction[0] + eye_dir[0], direction[1] + eye_dir[1], direction[2] + eye_dir[2], 0}});
-                    n_dot_hv = std::max(0.f, Dot3(eye_normal, h));
+                    n_dot_hv = std::max(0.f, Dot3(n, h));
                 }
                 else
-                    n_dot_hv = std::max(0.f, Dot3(eye_normal, Floats(l + 0x28, 3)));
+                    n_dot_hv = std::max(0.f, Dot3(n, Floats(l + 0x28, 3)));
             }
             else
             {
@@ -383,8 +386,8 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
                 const float denominator = att[0] + att[1] * d + att[2] * d * d;
                 attenuation = denominator != 0 ? 1 / denominator : 1;
                 const Vec4 h = Normalize3(Vec4{{vp[0] + eye_dir[0], vp[1] + eye_dir[1], vp[2] + eye_dir[2], 0}});
-                n_dot_vp = std::max(0.f, Dot3(eye_normal, vp));
-                n_dot_hv = std::max(0.f, Dot3(eye_normal, h));
+                n_dot_vp = std::max(0.f, Dot3(n, vp));
+                n_dot_hv = std::max(0.f, Dot3(n, h));
                 if (type == 3) // spot: s = dot(direction, VP) + w, through (s + L) / (M s + N)
                 {
                     const Vec4 spot = Floats(l + 0x4c);
@@ -412,7 +415,9 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
                 const float denom = params[1] * n_dot_hv + params[2];
                 pf = denom == 0 ? 10000.f : denom > 0 ? std::clamp((n_dot_hv + params[0]) / denom, 0.f, 10000.f) : 0;
             }
-            const Vec4 ambient = Floats(l, 3), diffuse_color = Floats(l + 0xc, 3), specular_color = Floats(l + 0x18, 3);
+            const u32 colors = back ? 0xc00 + u32(i) * 0x40 : l;
+            const Vec4 ambient = Floats(colors, 3), diffuse_color = Floats(colors + 0xc, 3),
+                       specular_color = Floats(colors + 0x18, 3);
             for (int c = 0; c < 3; c++)
             {
                 const float a = ambient[c] * attenuation, dl = diffuse_color[c] * attenuation * n_dot_vp;
@@ -423,24 +428,28 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
             }
         }
     }
+    // without SEPARATE_SPECULAR the lit specular goes into the diffuse colour (even with the specular
+    // output off) and the vertex's specular passes through
+    if (!separate_specular && lighting)
+        for (int c = 0; c < 3; c++)
+            d0[c] += d1[c];
     if (!specular_enable)
         d1 = Vec4{{0, 0, 0, 1}};
     else
     {
         if (!separate_specular)
-        {
-            if (lighting)
-                for (int c = 0; c < 3; c++)
-                    d0[c] += d1[c];
             d1 = specular;
-        }
         if (!(light_control & (1u << 17))) // alpha from the material's specular: else 1
             d1[3] = 1;
     }
     for (int c = 0; c < 4; c++)
         d0[c] = std::clamp(d0[c], 0.f, 1.f), d1[c] = std::clamp(d1[c], 0.f, 1.f);
-    out[3] = d0, out[4] = d1;
-    out[7] = in[7], out[8] = in[8];
+    };
+    light(false, out[3], out[4]);
+    if (k.Get(0x17c4) && lighting)
+        light(true, out[7], out[8]);
+    else
+        out[7] = out[3], out[8] = out[4];
     // the fog distance (SET_FOG_GEN_MODE): turned into the fog factor in EmitVertex
     switch (k.Get(0x2a0))
     {
@@ -510,12 +519,22 @@ void EmitVertex(const Vec4 in[16])
     g_vertices.push_back(v);
 }
 
+// An attribute read from an array stays the attribute's current value afterwards: a later draw
+// without that array gets the last vertex's (as the console carries it over).
+void CarryOver(const Vec4 in[16])
+{
+    for (int a = 1; a < 16; a++)
+        if ((g_kelvin.Get(0x1760 + u32(a) * 4) >> 4) & 0xf)
+            g_attribute_default[a] = in[a];
+}
+
 void ArrayVertex(u32 index)
 {
     Vec4 in[16];
     for (int a = 0; a < 16; a++)
         in[a] = FetchAttribute(a, index);
     EmitVertex(in);
+    CarryOver(in);
 }
 
 // ---- the attributes' current values (SET_VERTEX3F, SET_NORMAL3F, SET_DIFFUSE_COLOR4UB, ...,
@@ -643,6 +662,7 @@ void InlineVertices()
             in[a] = v;
         }
         EmitVertex(in);
+        CarryOver(in);
     }
 }
 
@@ -1185,20 +1205,29 @@ void Flush()
         g_vertices.clear();
         return;
     }
-    // flat shading (SET_SHADE_MODEL 0x1d00): the provoking vertex's colours over the whole triangle
+    // flat shading (SET_SHADE_MODEL 0x1d00): the provoking vertex's colours over the whole triangle;
+    // two-sided lighting (SET_LIGHT_TWO_SIDE_ENABLE): a back-facing triangle's colours are its back
+    // colours (oB0, oB1)
     std::vector<ScreenVertex> flat;
-    if (g_kelvin.Get(0x37c) == 0x1d00)
+    const bool flat_shading = g_kelvin.Get(0x37c) == 0x1d00, two_sided = g_kelvin.Get(0x17c4);
+    if (flat_shading || two_sided)
     {
         flat.reserve(tris.size() * 3);
         for (Tri& t : tris)
+        {
+            const ScreenVertex &a = s[t.v[0]], &b = s[t.v[1]], &c = s[t.v[2]];
+            const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            const bool back = two_sided && (g_kelvin.Get(0x3a0) == 0x901 ? area > 0 : area < 0);
             for (u32& v : t.v)
             {
                 ScreenVertex copy = s[v];
-                for (int o : {3, 4, 7, 8})
-                    copy.o[o] = s[t.provoking].o[o];
+                const ScreenVertex& from = flat_shading ? s[t.provoking] : s[v];
+                copy.o[3] = from.o[back ? 7 : 3];
+                copy.o[4] = from.o[back ? 8 : 4];
                 flat.push_back(copy);
                 v = u32(flat.size() - 1);
             }
+        }
     }
     const std::vector<ScreenVertex>& sv = flat.empty() ? s : flat;
     PreparePixels();
