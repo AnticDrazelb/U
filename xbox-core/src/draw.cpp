@@ -771,6 +771,44 @@ struct DepthStencil
 // rows are dealt to the threads in bands of this many
 constexpr int kBand = 16;
 
+// The window clip (SET_WINDOW_CLIP_TYPE, _HORIZONTAL/_VERTICAL: 8 rectangles, min | max << 16,
+// both inclusive): inclusive draws only inside one of them, exclusive only outside all. Until a
+// program sets a window there's no clipping (nxdk's own pbkit never does).
+bool g_window_clip_set = false;
+
+struct WindowClip
+{
+    bool active = false, exclusive = false;
+    int x0[8], x1[8], y0[8], y1[8];
+
+    WindowClip()
+    {
+        if (!g_window_clip_set)
+            return;
+        const KelvinState& k = g_kelvin;
+        exclusive = k.Get(0x2b4) & 1;
+        u32 ax, ay;
+        AntiAliasing(ax, ay);
+        for (int i = 0; i < 8; i++)
+        {
+            const u32 h = k.Get(0x2c0 + i * 4), v = k.Get(0x2e0 + i * 4);
+            x0[i] = int((h & 0xfff) * ax), x1[i] = int((((h >> 16) & 0xfff) + 1) * ax);
+            y0[i] = int((v & 0xfff) * ay), y1[i] = int((((v >> 16) & 0xfff) + 1) * ay);
+        }
+        active = true;
+    }
+
+    bool Allows(int x, int y) const
+    {
+        if (!active)
+            return true;
+        for (int i = 0; i < 8; i++)
+            if (x >= x0[i] && x < x1[i] && y >= y0[i] && y < y1[i])
+                return !exclusive;
+        return exclusive;
+    }
+};
+
 // Draws the part of the triangle in bands `part`, `part + parts`, ...
 void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, int part = 0, int parts = 1)
 {
@@ -809,6 +847,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const int y0 = std::max<int>(int(clip_y0), int(std::floor(std::min({a.y, b.y, c.y}))));
     const int y1 = std::min<int>(int(cs.height) - 1, int(std::ceil(std::max({a.y, b.y, c.y}))));
     const DepthStencil ds;
+    const WindowClip window;
     // with the alpha test on, a pixel it rejects must leave depth and stencil alone: shade first
     const bool shade_first = k.Get(0x300);
     const u32 write_mask = k.Get(0x358) ? ((k.Get(0x358) & 0x01000000 ? 0xff000000u : 0) | (k.Get(0x358) & 0x00010000 ? 0x00ff0000u : 0) |
@@ -868,6 +907,8 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         {
             if (ea < 0 || eb < 0 || ec < 0 || (ea == 0 && !tla) || (eb == 0 && !tlb) || (ec == 0 && !tlc))
                 continue;
+            if (!window.Allows(x, y))
+                continue;
             const float wa = float(ea * inv_area), wb = float(eb * inv_area), wc = float(ec * inv_area);
             const float z = a.z * wa + b.z * wb + c.z * wc;
             if (!shade_first && !ds.Test(u32(x), u32(y), z))
@@ -901,6 +942,7 @@ struct Fragments
 {
     Surface cs;
     DepthStencil ds;
+    WindowClip window;
     bool shade_first = false;
     u32 write_mask = 0xffffffff;
     int used[16] = {}, used_count = 0;
@@ -926,7 +968,7 @@ struct Fragments
     // the pixel at (x, y), a fraction t of the way from a to b
     void Pixel(int x, int y, const ScreenVertex& a, const ScreenVertex& b, float t)
     {
-        if (x < x0 || y < y0 || x >= int(cs.width) || y >= int(cs.height))
+        if (x < x0 || y < y0 || x >= int(cs.width) || y >= int(cs.height) || !window.Allows(x, y))
             return;
         const float z = a.z + (b.z - a.z) * t;
         if (!shade_first && !ds.Test(u32(x), u32(y), z))
@@ -1250,6 +1292,14 @@ void DrawMethod(u32 method, u32 parameter)
     if ((method >= 0x1500 && method < 0x1700) || (method >= 0x1880 && method < 0x1b00))
     {
         CurrentAttribute(method, parameter);
+        return;
+    }
+    if (method >= 0x2c0 && method < 0x300) // SET_WINDOW_CLIP_HORIZONTAL/VERTICAL: this window and the ones after it
+    {
+        const u32 base = method < 0x2e0 ? 0x2c0 : 0x2e0;
+        for (u32 slot = (method - base) / 4; slot < 8; slot++)
+            g_kelvin.regs[(base + slot * 4) / 4] = parameter;
+        g_window_clip_set = true;
         return;
     }
     switch (method)
