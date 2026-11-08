@@ -17,6 +17,10 @@ void xcs_linux_fs_guest(uint64_t kpcr);
 void xcs_linux_fs_host(uint64_t base);
 }
 
+namespace xb {
+extern thread_local bool tl_in_signal_handler; // core.h
+}
+
 namespace xb::platform {
 
 namespace {
@@ -64,7 +68,10 @@ void OnSignal(int sig, siginfo_t* info, void* raw)
     f.signal = sig == SIGSEGV ? 11 : sig;
     f.fs_base = fs;
     f.raw = raw;
-    if (g_handler && g_handler(f))
+    tl_in_signal_handler = true;
+    const bool handled = g_handler && g_handler(f);
+    tl_in_signal_handler = false;
+    if (handled)
     {
         if (guest_fs)
             WrFsBase(fs);

@@ -48,6 +48,10 @@ int32_t sceKernelQueryMemoryProtection(void* address, void** start, void** end, 
 int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
 }
 
+namespace xb {
+extern thread_local bool tl_in_signal_handler; // core.h
+}
+
 namespace xb::platform {
 
 namespace {
@@ -278,7 +282,10 @@ void OnSignal(int sig, siginfo_t* info, void* context)
     f.signal = sig;
     f.fs_base = fs;
     f.raw = context;
-    if (g_handler && g_handler(f))
+    tl_in_signal_handler = true;
+    const bool handled = g_handler && g_handler(f);
+    tl_in_signal_handler = false;
+    if (handled)
     {
         if (guest_fs)
             g_set_fsbase(reinterpret_cast<void*>(fs));

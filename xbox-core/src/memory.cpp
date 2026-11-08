@@ -6,6 +6,8 @@
 #include <map>
 #include <mutex>
 
+#include <unistd.h>
+
 #include "core.h"
 #include "diagnostics.h"
 #include "platform.h"
@@ -14,9 +16,23 @@ namespace xb {
 
 int g_verbose = 1;
 void (*g_log_sink)(const char* line) = nullptr;
+thread_local bool tl_in_signal_handler = false;
+std::atomic<u64> g_lines_dropped_in_handler{0};
 
 void Log(const char* fmt, ...)
 {
+    if (tl_in_signal_handler)
+    {
+        static const bool strict = std::getenv("XB_STRICT_SIGNAL") != nullptr;
+        if (strict)
+        {
+            static const char m[] = "Log called inside the fault handler\n";
+            (void)!write(2, m, sizeof(m) - 1);
+            std::abort();
+        }
+        g_lines_dropped_in_handler++;
+        return;
+    }
     static std::mutex m;
     // each line with the seconds since the start: where the time went
     char line[2048];
