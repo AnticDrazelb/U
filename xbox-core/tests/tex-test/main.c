@@ -5,6 +5,9 @@
 //               (0.5, 0, 0, 0.5) moves stage 1's lookup from u 0.375 (red) to 0.627 (green); with a
 //               zero matrix it stays red (the quad beside it)
 //   bottom right a clip plane stage: coordinates from -1 to 1 across the quad discard its left half
+//   last row    mipmaps: a 64x64 texture whose 7 levels are 7 colours, drawn whole at 64, 32 and 16
+//               pixels (levels 0, 1, 2: red, green, blue with nearest-mipmap filtering) and at 45
+//               (trilinear: level 0.51, half red half green)
 #include <hal/video.h>
 #include <pbkit/pbkit.h>
 #include <string.h>
@@ -91,6 +94,16 @@ int main(void)
                 o |= ((x >> b) & 1) << (2 * b) | ((y >> b) & 1) << (2 * b + 1);
             split[o] = x < 8 ? 0xffff0000 : 0xff00ff00;
         }
+    // the mipmapped texture: levels of 64, 32, ... 1 texels, one colour each
+    static const DWORD level_colors[7] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffff00, 0xffff00ff, 0xff00ffff, 0xffffffff};
+    DWORD *mips = contiguous(21844);
+    for (int l = 0, at = 0; l < 7; l++)
+    {
+        const int n = (64 >> l) * (64 >> l);
+        for (int i = 0; i < n; i++)
+            mips[at + i] = level_colors[l];
+        at += n;
+    }
     for (;;)
     {
         pb_wait_for_vbl();
@@ -150,6 +163,22 @@ int main(void)
         p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1, 0x00002000 | 0x0100);
         float clip[4][4] = {{-1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {-1, 1, 1, 1}};
         p = quad(p, 360, 240, 600, 400, clip, NV097_SET_TEXCOORD0_4F);
+        pb_end(p);
+
+        // mipmaps: stage 0, 7 levels, the max level clamp at 6
+        p = pb_begin();
+        p = pb_push2(p, NV097_SET_TEXTURE_OFFSET, MmGetPhysicalAddress(mips), 0x2 | 2 << 4 | 0x06 << 8 | 7 << 16 | 6 << 20 | 6 << 24);
+        p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, 0x00030303);
+        p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, 0x40000000 | (6 * 256) << 6);
+        p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 1);
+        p = show(p, 0);
+        float uv[4][4] = {{0, 0, 0, 1}, {1, 0, 0, 1}, {1, 1, 0, 1}, {0, 1, 0, 1}};
+        p = pb_push1(p, NV097_SET_TEXTURE_FILTER, 0x01030000); // nearest mipmap nearest
+        p = quad(p, 20, 410, 84, 474, uv, NV097_SET_TEXCOORD0_4F);
+        p = quad(p, 100, 410, 132, 442, uv, NV097_SET_TEXCOORD0_4F);
+        p = quad(p, 150, 410, 166, 426, uv, NV097_SET_TEXCOORD0_4F);
+        p = pb_push1(p, NV097_SET_TEXTURE_FILTER, 0x02060000); // trilinear
+        p = quad(p, 190, 410, 235, 455, uv, NV097_SET_TEXCOORD0_4F);
         pb_end(p);
         while (pb_busy())
             ;

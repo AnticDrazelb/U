@@ -812,6 +812,24 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     for (int o = 0; o < 16; o++)
         if (inputs & (1u << o))
             used[used_count++] = o;
+    // each texture stage's level of detail, from its coordinates' gradients over the triangle
+    float lods[4] = {0, 0, 0, 0};
+    const ScreenVertex& c_ = c;
+    for (int st = 0; st < 4; st++)
+    {
+        if (!(inputs & (1u << (9 + st))))
+            continue;
+        const int o = 9 + st;
+        auto proj = [&](const ScreenVertex& v, int c) { return v.o[o][3] != 0 ? v.o[o][c] / v.o[o][3] : v.o[o][c]; };
+        float d[2][2];
+        for (int c = 0; c < 2; c++)
+        {
+            const float f0 = proj(a, c), f1 = proj(b, c), f2 = proj(c_, c);
+            d[c][0] = ((f1 - f0) * (c_.y - a.y) - (f2 - f0) * (b.y - a.y)) / area;
+            d[c][1] = ((f2 - f0) * (b.x - a.x) - (f1 - f0) * (c_.x - a.x)) / area;
+        }
+        lods[st] = TextureLod(st, d[0][0], d[1][0], d[0][1], d[1][1]);
+    }
     // edge functions, stepped per pixel: e(x+1) = e(x) + dx, e(y+1) = e(y) + dy
     const float sign = area < 0 ? -1.f : 1.f, inv_area = 1.f / std::fabs(area);
     auto edge = [&](const ScreenVertex& p, const ScreenVertex& q, float px, float py) {
@@ -839,6 +857,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
             const float pa0 = wa * a.inv_w, pb0 = wb * b.inv_w, pc0 = wc * c.inv_w;
             const float norm = 1.f / (pa0 + pb0 + pc0), pa = pa0 * norm, pb = pb0 * norm, pc = pc0 * norm;
             PixelInputs in;
+            std::memcpy(in.lod, lods, sizeof(lods));
             for (int n = 0; n < used_count; n++)
             {
                 const int o = used[n];
@@ -896,6 +915,7 @@ struct Fragments
         // perspective-correct along the line
         const float pa = (1 - t) * a.inv_w, pb = t * b.inv_w, norm = 1.f / (pa + pb);
         PixelInputs in;
+        in.lod[0] = in.lod[1] = in.lod[2] = in.lod[3] = 0;
         for (int n = 0; n < used_count; n++)
             for (int i = 0; i < 4; i++)
                 in.v[used[n]][i] = (a.o[used[n]][i] * pa + b.o[used[n]][i] * pb) * norm;

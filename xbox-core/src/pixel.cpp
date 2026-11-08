@@ -35,6 +35,8 @@ struct Texture
     u32 address = 0, palette = 0, format = 0, width = 1, height = 1, pitch = 0, wrap = 0, filter = 0, border = 0;
     bool swizzled = false, compressed = false, cubemap = false;
     u32 face_size = 0; // a cube map face's bytes: its mipmap chain, 128-byte aligned
+    u32 levels = 1;
+    float lod_bias = 0, min_lod = 0, max_lod = 0;
 };
 
 bool IsLinear(u32 f)
@@ -86,6 +88,13 @@ Texture StageTexture(int stage)
     t.filter = k.Get(base + 0x14);
     t.border = k.Get(base + 0x24);
     t.cubemap = (format & 4) && !IsLinear(t.format);
+    if (!IsLinear(t.format))
+        t.levels = std::max<u32>(1, (format >> 16) & 0xf);
+    // SET_TEXTURE_CONTROL0's level clamps and SET_TEXTURE_FILTER's bias: fixed point, 8 fraction bits
+    const u32 control = k.Get(base + 0xc);
+    t.max_lod = float((control >> 6) & 0xfff) / 256.f;
+    t.min_lod = float((control >> 18) & 0xfff) / 256.f;
+    t.lod_bias = float(int32_t(t.filter << 19) >> 19) / 256.f;
     if (t.cubemap)
     {
         const u32 levels = std::max<u32>(1, (format >> 16) & 0xf);
@@ -237,7 +246,64 @@ int Address(int c, u32 size, u32 mode)
     }
 }
 
+V4 SampleLevel(const Texture& t, float u, float v, bool linear);
+
+// the mipmap level l of a swizzled or compressed texture: smaller, after the ones before it
+Texture Level(const Texture& t, u32 l)
+{
+    Texture out = t;
+    u32 w = t.width, h = t.height;
+    for (u32 i = 0; i < l; i++, w = std::max(1u, w / 2), h = std::max(1u, h / 2))
+        out.address += t.compressed ? ((w + 3) / 4) * ((h + 3) / 4) * (t.format == 0x0c ? 8 : 16)
+                                    : w * h * BytesPerTexel(t.format);
+    out.width = w, out.height = h;
+    out.pitch = w * BytesPerTexel(t.format);
+    return out;
+}
+
+// A sample at the level of detail `lod`: magnified (lod <= 0) by the mag filter; minified by the
+// min filter (1 nearest, 2 linear on the base level; 3/4 the nearest level, nearest or linear; 5/6
+// between the two nearest levels; 7 the base level's convolution, as linear here)
+V4 SampleLod(const Texture& t, float u, float v, float lod)
+{
+    const float raw = lod + t.lod_bias;
+    if (raw <= 0 || t.levels <= 1 || (!t.swizzled && !t.compressed))
+    {
+        const u32 mode = raw <= 0 ? (t.filter >> 24) & 0xf : (t.filter >> 16) & 0xff;
+        return SampleLevel(t, u, v, mode != 1 && mode != 3 && mode != 5);
+    }
+    const float top = std::min(t.max_lod, float(t.levels - 1));
+    const float l = std::clamp(raw, std::min(t.min_lod, top), top);
+    const u32 min = (t.filter >> 16) & 0xff;
+    switch (min)
+    {
+    case 1: return SampleLevel(t, u, v, false);
+    case 3: return SampleLevel(Level(t, u32(l + 0.5f)), u, v, false);
+    case 4: return SampleLevel(Level(t, u32(l + 0.5f)), u, v, true);
+    case 5:
+    case 6:
+    {
+        const u32 l0 = u32(l), l1 = std::min(l0 + 1, t.levels - 1);
+        const float f = l - float(l0);
+        const V4 a = SampleLevel(Level(t, l0), u, v, min == 6);
+        if (f == 0 || l1 == l0)
+            return a;
+        const V4 b = SampleLevel(Level(t, l1), u, v, min == 6);
+        V4 c;
+        for (int i = 0; i < 4; i++)
+            c[i] = a[i] + (b[i] - a[i]) * f;
+        return c;
+    }
+    default: return SampleLevel(t, u, v, true);
+    }
+}
+
 V4 Sample(const Texture& t, float u, float v)
+{
+    return SampleLevel(t, u, v, ((t.filter >> 24) & 0xf) != 1);
+}
+
+V4 SampleLevel(const Texture& t, float u, float v, bool linear)
 {
     if (!t.address)
         return {0, 0, 0, 1};
@@ -251,8 +317,7 @@ V4 Sample(const Texture& t, float u, float v)
             return Unpack(t.border);
         return Texel(t, u32(ax), u32(ay));
     };
-    const u32 mag = (t.filter >> 24) & 0xf;
-    if (mag == 1) // nearest
+    if (!linear)
         return fetch(int(std::floor(u)), int(std::floor(v)));
     // bilinear
     const float fu = u - 0.5f, fv = v - 0.5f;
@@ -515,7 +580,7 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             if (!enabled)
                 break;
             const float q = program == 1 && tc[3] != 0 ? tc[3] : 1.f;
-            tex[s] = Sample(t, tc[0] / q, tc[1] / q);
+            tex[s] = SampleLod(t, tc[0] / q, tc[1] / q, in.lod[s]);
             break;
         }
         case 3: // cube map
@@ -540,7 +605,7 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             const float* m = g_ps.bump[s];
             const float u = tc[0] + du * m[0] + dv * m[2], v = tc[1] + du * m[1] + dv * m[3];
             if (enabled)
-                tex[s] = Sample(t, u, v);
+                tex[s] = SampleLod(t, u, v, in.lod[s]);
             if (program == 7)
             {
                 const float l = std::clamp(g_ps.bump_scale[s] * input[0] + g_ps.bump_offset[s], 0.f, 1.f);
@@ -708,6 +773,19 @@ void PreparePixels()
     ps.alpha_test = k.Get(0x300), ps.alpha_func = k.Get(0x33c), ps.alpha_ref = k.Get(0x340) & 0xff;
     ps.blend = k.Get(0x304), ps.blend_sfactor = k.Get(0x344), ps.blend_dfactor = k.Get(0x348);
     ps.blend_equation = k.Get(0x350), ps.blend_color = Unpack(k.Get(0x34c));
+}
+
+float TextureLod(int stage, float dudx, float dvdx, float dudy, float dvdy)
+{
+    const Texture& t = g_ps.texture[stage];
+    if (t.levels <= 1 && t.lod_bias == 0)
+        return 0; // one level: only magnification against minification matters
+    // normalized coordinates are scaled to texels; linear textures' already are
+    const float w = t.swizzled || t.compressed ? float(t.width) : 1.f, h = t.swizzled || t.compressed ? float(t.height) : 1.f;
+    const float x = std::sqrt(dudx * dudx * w * w + dvdx * dvdx * h * h);
+    const float y = std::sqrt(dudy * dudy * w * w + dvdy * dvdy * h * h);
+    const float rho = std::max(x, y);
+    return rho > 0 ? std::log2(rho) : -16.f;
 }
 
 u32 PixelInputMask()

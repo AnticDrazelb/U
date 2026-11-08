@@ -21,5 +21,12 @@ check("bump environment: the lookup moved to green", (100, 320), (0, 255, 0))
 check("bump environment: a zero matrix keeps red", (240, 320), (255, 0, 0))
 check("clip plane: the right half drawn", (560, 320), (255, 255, 255))
 check("clip plane: the left half discarded", (400, 320), (0, 0, 0))
+check("mipmap level 0 at 64 pixels", (52, 442), (255, 0, 0))
+check("mipmap level 1 at 32 pixels", (116, 426), (0, 255, 0))
+check("mipmap level 2 at 16 pixels", (158, 418), (0, 0, 255))
+got = img.getpixel((212, 432))
+ok = abs(got[0] - 125) <= 12 and abs(got[1] - 130) <= 12 and got[2] <= 4
+print(f"{'PASS' if ok else 'FAIL'} trilinear between levels 0 and 1 (212, 432): {got} (expected about (125, 130, 0))")
+failures += not ok
 print(f"texture stage test: {failures} failures")
 sys.exit(1 if failures else 0)

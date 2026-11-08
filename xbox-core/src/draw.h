@@ -60,7 +60,10 @@ void DrawMethod(u32 method, u32 parameter);
 struct PixelInputs
 {
     float v[16][4]; // only what PixelInputMask names is set; indexed like the vertex outputs: 3 diffuse, 4 specular, 9-12 texture coordinates
+    float lod[4];   // each texture stage's level of detail (log2 of texels a pixel), worked out per triangle
 };
+// A stage's level of detail from its coordinates' screen derivatives (as given to the stage).
+float TextureLod(int stage, float dudx, float dvdx, float dudy, float dvdy);
 void PreparePixels(); // the registers ShadePixel reads, decoded for a draw
 u32 PixelInputMask();  // which of PixelInputs' v[] the prepared state reads (bit per output)
 bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out);
