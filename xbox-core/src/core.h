@@ -146,6 +146,8 @@ u64 CallGuestNested(u32 fn, std::initializer_list<u32> args);
 void StartHostThread(GuestThread* t, std::function<void()> body);
 // The guest address of the stub that calls kernel export `ordinal`.
 u32 ExportStub(u32 ordinal);
+// kernel.cpp: an object body with its OBJECT_HEADER; `type` names the exported OBJECT_TYPE
+u32 NewObjectBody(u32 size, const char* type);
 u32 ExceptionDispatcher(); // xcs_raise32's guest address (switch.S)
 u16 GuestCodeSelector();   // the guest's cs and ss (RtlCaptureContext)
 u16 GuestDataSelector();

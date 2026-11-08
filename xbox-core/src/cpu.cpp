@@ -482,7 +482,7 @@ GuestThread* NewGuestThread(u32 stack_size, u32 tls_size, const char* name)
         if (g_xbe.tls_raw_end > g_xbe.tls_raw_start)
             std::memcpy(Ptr(tls), Ptr(g_xbe.tls_raw_start), std::min(g_xbe.tls_raw_end - g_xbe.tls_raw_start, tls_size - 4));
     }
-    t->ethread = AllocKernel(kthread::EthreadSize, 16);
+    t->ethread = NewObjectBody(kthread::EthreadSize, "PsThreadObjectType");
     Write<u8>(t->ethread + 0, 6);                  // ThreadObject
     Write<u8>(t->ethread + 2, kthread::Size / 4); // Size in dwords
     Write<u32>(t->ethread + 8, t->ethread + 8);    // WaitListHead: empty

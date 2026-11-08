@@ -97,6 +97,120 @@ void InitHeader(u32 object, u8 type, u8 size_dwords, s32 signal)
     Write<u32>(object + 12, object + 8);
 }
 
+// ---- data exports and object types
+
+// OBJECT_TYPE: AllocateProcedure, FreeProcedure, CloseProcedure, DeleteProcedure, ParseProcedure,
+// DefaultObject, PoolTag. Close/Delete/Parse point at small routines that do nothing (the types with
+// them have them on the console; the kernel's own object manager here doesn't call them).
+struct TypeInfo
+{
+    const char* name;
+    u32 tag;
+    bool close, del, parse;
+};
+const TypeInfo kTypes[] = {
+    {"ExEventObjectType", 'vevE', false, false, false},     {"ExMutantObjectType", 'atuM', false, true, false},
+    {"ExSemaphoreObjectType", 'ameS', false, false, false}, {"ExTimerObjectType", 'emiT', false, true, false},
+    {"IoCompletionObjectType", 'pmoC', false, true, false}, {"IoDeviceObjectType", 'iveD', false, false, true},
+    {"IoFileObjectType", 'eliF', true, true, true},         {"ObDirectoryObjectType", 'eriD', false, false, false},
+    {"ObSymbolicLinkObjectType", 'bmyS', false, true, false}, {"PsThreadObjectType", 'erhT', false, false, false},
+};
+
+u32 ProcedureStub(int which) // 0 close (2 args), 1 delete (1), 2 parse (7: STATUS_OBJECT_NAME_NOT_FOUND)
+{
+    static u32 code = 0;
+    if (!code)
+    {
+        code = AllocKernel(32, 16);
+        const u8 bytes[] = {0xc2, 0x08, 0x00, 0x90, 0xc2, 0x04, 0x00, 0x90,       // ret 8; ret 4
+                            0xb8, 0x34, 0x00, 0x00, 0xc0, 0xc2, 0x1c, 0x00}; // mov eax, 0xC0000034; ret 28
+        std::memcpy(Ptr(code), bytes, sizeof(bytes));
+    }
+    return code + (which == 0 ? 0 : which == 1 ? 4 : 8);
+}
+
+u32 Ordinal(const char* name)
+{
+    auto it = g_ordinal_by_name.find(name);
+    return it == g_ordinal_by_name.end() ? 0 : it->second;
+}
+
+// A data export's guest variable, made on first use, with what a program reads in it.
+u32 DataExport(u32 ordinal)
+{
+    static std::mutex mutex; // threads can make an object of a type the program doesn't import
+    std::lock_guard lock(mutex);
+    if (g_data[ordinal])
+        return g_data[ordinal];
+    const std::string name = g_by_ordinal[ordinal]->name;
+    u32 p;
+    if (name == "XeImageFileName")
+    {
+        p = AllocKernel(8 + 64, 4);
+        const char* path = "\\Device\\CdRom0\\default.xbe";
+        std::strcpy(Ptr<char>(p + 8), path);
+        Write<u16>(p, u16(std::strlen(path)));
+        Write<u16>(p + 2, u16(std::strlen(path) + 1));
+        Write<u32>(p + 4, p + 8);
+    }
+    else if (name == "XboxKrnlVersion")
+    {
+        p = AllocKernel(8, 4);
+        const u16 v[4] = {1, 0, 5838, 1};
+        std::memcpy(Ptr(p), v, 8);
+    }
+    else if (name == "XboxHardwareInfo")
+    {
+        p = AllocKernel(8, 4);
+        Write<u32>(p, 0x20);       // Flags
+        Write<u8>(p + 4, 0xA2);    // GpuRevision (NV2A A2)
+        Write<u8>(p + 5, 0xD3);    // McpRevision
+    }
+    else if (name == "KeTickCount" || name == "KeTimeIncrement")
+    {
+        p = AllocKernel(4, 4);
+        Write<u32>(p, name == "KeTimeIncrement" ? 10000 : 0);
+        if (name == "KeTickCount")
+            SetTickCountVariable(p);
+    }
+    else
+    {
+        p = AllocKernel(0x100, 16); // object types, pointers (LaunchDataPage = 0), ...
+        for (const TypeInfo& t : kTypes)
+            if (name == t.name)
+            {
+                Write<u32>(p + 0x00, ExportStub(Ordinal("ExAllocatePoolWithTag")));
+                Write<u32>(p + 0x04, ExportStub(Ordinal("ExFreePool")));
+                Write<u32>(p + 0x08, t.close ? ProcedureStub(0) : 0);
+                Write<u32>(p + 0x0c, t.del ? ProcedureStub(1) : 0);
+                Write<u32>(p + 0x10, t.parse ? ProcedureStub(2) : 0);
+                Write<u32>(p + 0x14, 0); // DefaultObject: the object itself
+                Write<u32>(p + 0x18, t.tag);
+            }
+    }
+    g_data[ordinal] = p;
+    return p;
+}
+
+u32 ObjectTypeAddress(const char* type)
+{
+    const u32 ordinal = type ? Ordinal(type) : 0;
+    return ordinal ? DataExport(ordinal) : 0;
+}
+
+// An object with its OBJECT_HEADER (PointerCount, HandleCount, Type, Flags) before the body; the body.
+u32 NewObject(u32 size, const char* type)
+{
+    const u32 header = AllocKernel(0x10 + size, 16);
+    std::memset(Ptr(header), 0, 0x10 + size);
+    Write<u32>(header + 0, 1);
+    Write<u32>(header + 4, 1);
+    Write<u32>(header + 8, ObjectTypeAddress(type));
+    return header + 0x10;
+}
+
+u32 HeaderType(u32 body) { return Read<u32>(body - 8); }
+
 u8 Type(u32 object) { return Read<u8>(object); }
 s32 Signal(u32 object) { return Read<s32>(object + 4); }
 void SetSignal(u32 object, s32 v) { Write<s32>(object + 4, v); }
@@ -230,6 +344,43 @@ u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr, bool
 u32 ObjectOf(u32 handle)
 {
     if (handle == 0xfffffffe) // NtCurrentThread()
+        return CurrentThread() ? CurrentThread()->ethread : 0;
+    std::lock_guard lock(g_handles_mutex);
+    auto it = g_handles.find(handle);
+    return it == g_handles.end() || it->second.kind != 0 ? 0 : it->second.object;
+}
+
+struct Completion
+{
+    u32 key, apc_context, status, information;
+};
+std::unordered_map<u32, std::deque<Completion>> g_completions; // under g_sched
+std::unordered_map<std::string, u32> g_named;                   // devices by name, under g_handles_mutex
+
+u32 PostCompletion(u32 queue, u32 key, u32 apc_context, u32 status, u32 information)
+{
+    std::lock_guard lock(g_sched);
+    auto it = g_completions.find(queue);
+    if (it == g_completions.end())
+        return STATUS_INVALID_HANDLE;
+    it->second.push_back({key, apc_context, status, information});
+    SetSignal(queue, s32(it->second.size()));
+    g_cv.notify_all();
+    return STATUS_SUCCESS;
+}
+
+std::string LowerName(std::string s)
+{
+    for (char& ch : s)
+        if (ch >= 'A' && ch <= 'Z')
+            ch = char(ch - 'A' + 'a');
+    return s;
+}
+
+// Any handle's object body (files, directories and links too).
+u32 BodyOf(u32 handle)
+{
+    if (handle == 0xfffffffe)
         return CurrentThread() ? CurrentThread()->ethread : 0;
     std::lock_guard lock(g_handles_mutex);
     auto it = g_handles.find(handle);
@@ -672,8 +823,23 @@ void EnterCritical(u32 cs)
 
 u32 NewHostHandle(int kind, void* host)
 {
-    return NewHandle(0, kind, host);
+    // the object a program sees through ObReferenceObjectByHandle: a FILE_OBJECT (Type IO_TYPE_FILE),
+    // an object directory or a symbolic link
+    u32 body = 0;
+    if (kind == 1 || kind == 2)
+    {
+        body = NewObject(0x50, "IoFileObjectType");
+        Write<u16>(body, 5);
+        Write<u16>(body + 2, 0x50);
+    }
+    else if (kind == 3)
+        body = NewObject(0x20, "ObDirectoryObjectType");
+    else if (kind == 4)
+        body = NewObject(0x10, "ObSymbolicLinkObjectType");
+    return NewHandle(body, kind, host);
 }
+
+u32 NewObjectBody(u32 size, const char* type) { return NewObject(size, type); }
 
 void* HostOf(u32 handle, int kind)
 {
@@ -843,7 +1009,7 @@ void InitKernel()
     // ---- events, semaphores, mutants
     K(NtCreateEvent)
     {
-        const u32 event = AllocKernel(0x10, 16);
+        const u32 event = NewObject(0x10, "ExEventObjectType");
         InitHeader(event, c.Arg(2) == 0 ? kNotificationEvent : kSynchronizationEvent, 4, c.Arg(3) & 0xff);
         Write<u32>(c.Arg(0), NewHandle(event));
         return STATUS_SUCCESS;
@@ -902,7 +1068,7 @@ void InitKernel()
     } END;
     K(NtCreateSemaphore)
     {
-        const u32 sem = AllocKernel(0x14, 16);
+        const u32 sem = NewObject(0x14, "ExSemaphoreObjectType");
         InitHeader(sem, kSemaphore, 5, s32(c.Arg(2)));
         Write<s32>(sem + 0x10, s32(c.Arg(3)));
         Write<u32>(c.Arg(0), NewHandle(sem));
@@ -939,7 +1105,7 @@ void InitKernel()
     } END;
     K(NtCreateMutant)
     {
-        const u32 m = AllocKernel(0x20, 16);
+        const u32 m = NewObject(0x20, "ExMutantObjectType");
         const bool owned = c.Arg(2) & 0xff;
         InitHeader(m, kMutant, 8, owned ? 0 : 1);
         if (owned)
@@ -1006,11 +1172,17 @@ void InitKernel()
     } END;
     K(ObReferenceObjectByHandle)
     {
-        const u32 o = ObjectOf(c.Arg(0));
+        // handle, object type (NULL: any), object*
+        const u32 o = BodyOf(c.Arg(0));
         if (!o)
         {
             Write<u32>(c.Arg(2), 0);
             return STATUS_INVALID_HANDLE;
+        }
+        if (c.Arg(1) && HeaderType(o) != c.Arg(1))
+        {
+            Write<u32>(c.Arg(2), 0);
+            return 0xC0000024; // STATUS_OBJECT_TYPE_MISMATCH
         }
         Write<u32>(c.Arg(2), o);
         return STATUS_SUCCESS;
@@ -1215,9 +1387,122 @@ void InitKernel()
         return SetTimer(c.Arg(0), s64(u64(c.Arg(1)) | u64(c.Arg(2)) << 32), c.Arg(3), c.Arg(4));
     } END;
     K(KeCancelTimer) { return CancelTimer(c.Arg(0)); } END;
+    // ---- I/O completions (KQUEUE body, type 4: its signal state counts the packets waiting)
+    K(NtCreateIoCompletion) // handle*, access, attributes, count
+    {
+        const u32 q = NewObject(0x28, "IoCompletionObjectType");
+        InitHeader(q, 4, 10, 0);
+        {
+            std::lock_guard lock(g_sched);
+            g_completions[q];
+        }
+        Write<u32>(c.Arg(0), NewHandle(q));
+        return STATUS_SUCCESS;
+    } END;
+    K(NtSetIoCompletion) // handle, key, apc context, status, information
+    {
+        const u32 q = ObjectOf(c.Arg(0));
+        return q ? PostCompletion(q, c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4)) : STATUS_INVALID_HANDLE;
+    } END;
+    K(IoSetIoCompletion) // the completion object, key, apc context, status, information
+    {
+        PostCompletion(c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4));
+        return 0;
+    } END;
+    K(NtRemoveIoCompletion) // handle, key*, apc context*, I/O status block*, timeout*
+    {
+        const u32 q = ObjectOf(c.Arg(0));
+        if (!q)
+            return STATUS_INVALID_HANDLE;
+        for (;;)
+        {
+            {
+                std::lock_guard lock(g_sched);
+                auto it = g_completions.find(q);
+                if (it == g_completions.end())
+                    return STATUS_INVALID_HANDLE;
+                if (!it->second.empty())
+                {
+                    const Completion p = it->second.front();
+                    it->second.pop_front();
+                    SetSignal(q, s32(it->second.size()));
+                    Write<u32>(c.Arg(1), p.key);
+                    Write<u32>(c.Arg(2), p.apc_context);
+                    Write<u32>(c.Arg(3), p.status);
+                    Write<u32>(c.Arg(3) + 4, p.information);
+                    return STATUS_SUCCESS;
+                }
+            }
+            if (WaitObjects({q}, false, c.Arg(4)) == STATUS_TIMEOUT)
+                return STATUS_TIMEOUT;
+        }
+    } END;
+    K(NtQueryIoCompletion) // handle, information* (Depth)
+    {
+        const u32 q = ObjectOf(c.Arg(0));
+        if (!q)
+            return STATUS_INVALID_HANDLE;
+        std::lock_guard lock(g_sched);
+        Write<s32>(c.Arg(1), Signal(q));
+        return STATUS_SUCCESS;
+    } END;
+
+    // ---- devices: named DEVICE_OBJECTs a program makes (ObOpenObjectByName finds them)
+    K(IoCreateDevice) // driver object, extension size, name (OBJECT_STRING*), type, exclusive, device*
+    {
+        const u32 extension = c.Arg(1);
+        const u32 d = NewObject(0x48 + extension, "IoDeviceObjectType");
+        Write<u16>(d, 3); // IO_TYPE_DEVICE
+        Write<u16>(d + 2, 0x48);
+        Write<s32>(d + 4, 0);
+        Write<u32>(d + 8, c.Arg(0));
+        Write<u32>(d + 0x18, extension ? d + 0x48 : 0);
+        Write<u8>(d + 0x1c, u8(c.Arg(3)));
+        Write<u8>(d + 0x1e, 1); // StackSize
+        if (c.Arg(2))
+        {
+            const std::string name = LowerName(GuestString(c.Arg(2)));
+            std::lock_guard lock(g_handles_mutex);
+            if (g_named.count(name))
+                return 0xC0000035; // STATUS_OBJECT_NAME_COLLISION
+            g_named[name] = d;
+        }
+        Write<u32>(c.Arg(5), d);
+        return STATUS_SUCCESS;
+    } END;
+    K(IoDeleteDevice)
+    {
+        std::lock_guard lock(g_handles_mutex);
+        for (auto it = g_named.begin(); it != g_named.end(); ++it)
+            if (it->second == c.Arg(0))
+            {
+                g_named.erase(it);
+                break;
+            }
+        return 0;
+    } END;
+    K(ObOpenObjectByName) // attributes, type (NULL: any), parse context, handle*
+    {
+        const u32 attributes = c.Arg(0), name_string = Read<u32>(attributes + 4);
+        if (!name_string)
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        const std::string name = LowerName(GuestString(name_string));
+        u32 o;
+        {
+            std::lock_guard lock(g_handles_mutex);
+            auto it = g_named.find(name);
+            if (it == g_named.end())
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            o = it->second;
+        }
+        if (c.Arg(1) && HeaderType(o) != c.Arg(1))
+            return 0xC0000024; // STATUS_OBJECT_TYPE_MISMATCH
+        Write<u32>(c.Arg(3), NewHandle(o, 5));
+        return STATUS_SUCCESS;
+    } END;
     K(NtCreateTimer) // handle*, attributes, type
     {
-        const u32 t = AllocKernel(0x28, 16);
+        const u32 t = NewObject(0x28, "ExTimerObjectType");
         InitHeader(t, c.Arg(2) ? kSynchronizationTimer : kNotificationTimer, 10, 0);
         Write<u32>(c.Arg(0), NewHandle(t));
         return STATUS_SUCCESS;
@@ -1845,46 +2130,6 @@ void InitKernel()
 
 void ResolveThunks()
 {
-    // data exports: guest variables with what a program reads in them
-    auto data = [](u32 ordinal) -> u32 {
-        if (g_data[ordinal])
-            return g_data[ordinal];
-        const std::string name = g_by_ordinal[ordinal]->name;
-        u32 p;
-        if (name == "XeImageFileName")
-        {
-            p = AllocKernel(8 + 64, 4);
-            const char* path = "\\Device\\CdRom0\\default.xbe";
-            std::strcpy(Ptr<char>(p + 8), path);
-            Write<u16>(p, u16(std::strlen(path)));
-            Write<u16>(p + 2, u16(std::strlen(path) + 1));
-            Write<u32>(p + 4, p + 8);
-        }
-        else if (name == "XboxKrnlVersion")
-        {
-            p = AllocKernel(8, 4);
-            const u16 v[4] = {1, 0, 5838, 1};
-            std::memcpy(Ptr(p), v, 8);
-        }
-        else if (name == "XboxHardwareInfo")
-        {
-            p = AllocKernel(8, 4);
-            Write<u32>(p, 0x20);       // Flags
-            Write<u8>(p + 4, 0xA2);    // GpuRevision (NV2A A2)
-            Write<u8>(p + 5, 0xD3);    // McpRevision
-        }
-        else if (name == "KeTickCount" || name == "KeTimeIncrement")
-        {
-            p = AllocKernel(4, 4);
-            Write<u32>(p, name == "KeTimeIncrement" ? 10000 : 0);
-            if (name == "KeTickCount")
-                SetTickCountVariable(p);
-        }
-        else
-            p = AllocKernel(0x100, 16); // object types, pointers (LaunchDataPage = 0), ...
-        g_data[ordinal] = p;
-        return p;
-    };
     u32 count = 0, missing = 0;
     std::string missing_names;
     for (u32 at = g_xbe.thunk_table;; at += 4)
@@ -1896,7 +2141,7 @@ void ResolveThunks()
         const Export* e = ordinal < 400 ? g_by_ordinal[ordinal] : nullptr;
         if (!e)
             Fatal("kernel: the XBE imports ordinal %u, which xboxkrnl.exe doesn't have", ordinal);
-        Write<u32>(at, e->kind == 'D' ? data(ordinal) : ExportStub(ordinal));
+        Write<u32>(at, e->kind == 'D' ? DataExport(ordinal) : ExportStub(ordinal));
         count++;
         if (e->kind != 'D' && !g_handlers[ordinal])
         {
