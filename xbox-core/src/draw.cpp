@@ -405,6 +405,95 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
 
 } // namespace
 
+// ---- points and lines: one pixel at a time on the drawing thread (they're few and thin)
+
+struct Fragments
+{
+    Surface cs, zs;
+    bool depth_test = false, depth_write = false;
+    float z_max = 0;
+    u32 write_mask = 0xffffffff;
+    int used[16] = {}, used_count = 0;
+    int x0 = 0, y0 = 0;
+
+    Fragments()
+    {
+        const KelvinState& k = g_kelvin;
+        cs = ColorSurface(), zs = ZetaSurface();
+        depth_test = k.Get(0x30c) && zs.address;
+        depth_write = k.Get(0x35c) && zs.address;
+        z_max = zs.bytes == 2 ? 65535.f : 16777215.f;
+        const u32 m = k.Get(0x358);
+        if (m)
+            write_mask = (m & 0x01000000 ? 0xff000000u : 0) | (m & 0x00010000 ? 0x00ff0000u : 0) |
+                         (m & 0x00000100 ? 0x0000ff00u : 0) | (m & 0x00000001 ? 0x000000ffu : 0);
+        const u32 inputs = PixelInputMask();
+        for (int o = 0; o < 16; o++)
+            if (inputs & (1u << o))
+                used[used_count++] = o;
+        x0 = int(k.Get(0x200) & 0xffff), y0 = int(k.Get(0x204) & 0xffff);
+    }
+    bool Usable() const { return cs.address && cs.pitch && !cs.swizzled; }
+
+    // the pixel at (x, y), a fraction t of the way from a to b
+    void Pixel(int x, int y, const ScreenVertex& a, const ScreenVertex& b, float t)
+    {
+        if (x < x0 || y < y0 || x >= int(cs.width) || y >= int(cs.height))
+            return;
+        const KelvinState& k = g_kelvin;
+        const float z = a.z + (b.z - a.z) * t;
+        u32 zp = 0, zi = 0;
+        if (depth_test || depth_write)
+        {
+            zp = zs.address + u32(y) * zs.pitch + u32(x) * zs.bytes;
+            const u32 stored = zs.bytes == 2 ? Read<u16>(zp) : Read<u32>(zp) >> 8;
+            zi = u32(std::clamp(z, 0.f, z_max) + 0.5f);
+            if (depth_test && !DepthTest(k.Get(0x354), float(zi), float(stored)))
+                return;
+        }
+        // perspective-correct along the line
+        const float pa = (1 - t) * a.inv_w, pb = t * b.inv_w, norm = 1.f / (pa + pb);
+        PixelInputs in;
+        for (int n = 0; n < used_count; n++)
+            for (int i = 0; i < 4; i++)
+                in.v[used[n]][i] = (a.o[used[n]][i] * pa + b.o[used[n]][i] * pb) * norm;
+        u32 color;
+        if (!ShadePixel(in, cs, u32(x), u32(y), color))
+            return;
+        if (depth_write)
+        {
+            if (zs.bytes == 2)
+                Write<u16>(zp, u16(zi));
+            else
+                Write<u32>(zp, (Read<u32>(zp) & 0xff) | (zi << 8));
+        }
+        WritePixel(cs, u32(x), u32(y), color, write_mask);
+    }
+
+    // a line: a pixel a step along its longer axis, its last pixel left out (as GL draws them)
+    void Line(const ScreenVertex& a, const ScreenVertex& b)
+    {
+        const float dx = b.x - a.x, dy = b.y - a.y;
+        const int steps = int(std::ceil(std::max(std::fabs(dx), std::fabs(dy))));
+        for (int i = 0; i < std::max(steps, 1); i++)
+        {
+            const float t = steps ? float(i) / float(steps) : 0.f;
+            Pixel(int(std::floor(a.x + dx * t)), int(std::floor(a.y + dy * t)), a, b, t);
+        }
+    }
+
+    // a point: a square of SET_POINT_SIZE (in 1/8 pixels) around it
+    void Point(const ScreenVertex& p)
+    {
+        const float size = std::max(1.f, float(g_kelvin.Get(0x43c) & 0x1ff) / 8.f);
+        const int x0p = int(std::floor(p.x - size / 2 + 0.5f)), y0p = int(std::floor(p.y - size / 2 + 0.5f));
+        const int n = std::max(1, int(size + 0.5f));
+        for (int y = y0p; y < y0p + n; y++)
+            for (int x = x0p; x < x0p + n; x++)
+                Pixel(x, y, p, p, 0);
+    }
+};
+
 // ---- the rasterizer's threads
 
 namespace {
@@ -530,7 +619,33 @@ void Flush()
         for (size_t i = 0; i + 3 < n; i += 2)
             add(i, i + 1, i + 3), add(i, i + 3, i + 2);
         break;
-    default: // points and lines aren't drawn yet
+    case 1: // points
+    case 2: // lines
+    case 3: // line loop
+    case 4: // line strip
+    {
+        PreparePixels();
+        Fragments f;
+        if (f.Usable())
+        {
+            if (g_primitive == 1)
+                for (size_t i = 0; i < n; i++)
+                    f.Point(s[i]);
+            else if (g_primitive == 2)
+                for (size_t i = 0; i + 1 < n; i += 2)
+                    f.Line(s[i], s[i + 1]);
+            else
+            {
+                for (size_t i = 0; i + 1 < n; i++)
+                    f.Line(s[i], s[i + 1]);
+                if (g_primitive == 3 && n > 2)
+                    f.Line(s[n - 1], s[0]);
+            }
+        }
+        g_vertices.clear();
+        return;
+    }
+    default:
         break;
     }
     // how much there is to draw: small draws stay on this thread
