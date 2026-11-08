@@ -39,6 +39,21 @@ inline u32 Swizzle(u32 x, u32 y, u32 width, u32 height)
     }
     return offset;
 }
+// the 3D swizzle: x, y and z bits interleaved in turn while each has them
+inline u32 Swizzle3(u32 x, u32 y, u32 z, u32 width, u32 height, u32 depth)
+{
+    u32 offset = 0, bit = 0;
+    for (u32 i = 1; i < width || i < height || i < depth; i <<= 1)
+    {
+        if (i < width)
+            offset |= (x & i ? 1u : 0u) << bit++;
+        if (i < height)
+            offset |= (y & i ? 1u : 0u) << bit++;
+        if (i < depth)
+            offset |= (z & i ? 1u : 0u) << bit++;
+    }
+    return offset;
+}
 inline u32 PixelAddress(const Surface& s, u32 x, u32 y)
 {
     return s.swizzled ? s.address + Swizzle(x, y, s.width, s.height) * s.bytes : s.address + y * s.pitch + x * s.bytes;

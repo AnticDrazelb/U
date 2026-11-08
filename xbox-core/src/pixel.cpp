@@ -36,6 +36,7 @@ struct Texture
     bool swizzled = false, compressed = false, cubemap = false;
     u32 face_size = 0; // a cube map face's bytes: its mipmap chain, 128-byte aligned
     u32 levels = 1;
+    u32 depth = 1, slice = 0; // a volume texture's slices, and the one texels come from
     float lod_bias = 0, min_lod = 0, max_lod = 0;
 };
 
@@ -80,6 +81,8 @@ Texture StageTexture(int stage)
         t.width = 1u << ((format >> 20) & 0xf);
         t.height = 1u << ((format >> 24) & 0xf);
         t.pitch = t.width * BytesPerTexel(t.format);
+        if (((format >> 4) & 0xf) == 3) // three dimensions: log2 depth in the top bits
+            t.depth = 1u << ((format >> 28) & 0xf);
     }
     const u32 palette = k.Get(base + 0x20);
     const u32 palette_base = Nv2aDmaAddress(k.Get(palette & 1 ? 0x188 : 0x184));
@@ -192,7 +195,9 @@ V4 Texel(const Texture& t, u32 x, u32 y)
     if (t.compressed)
         return DxtTexel(t, x, y);
     const u32 bpt = BytesPerTexel(t.format);
-    const u32 p = t.address + (t.swizzled ? Swizzle(x, y, t.width, t.height) * bpt : y * t.pitch + x * bpt);
+    const u32 p = t.address + (t.depth > 1 ? (t.swizzled ? Swizzle3(x, y, t.slice, t.width, t.height, t.depth) * bpt
+                                                         : (t.slice * t.height + y) * t.pitch + x * bpt)
+                                           : t.swizzled ? Swizzle(x, y, t.width, t.height) * bpt : y * t.pitch + x * bpt);
     const u32 v = bpt == 1 ? Read<u8>(p) : bpt == 2 ? Read<u16>(p) : Read<u32>(p);
     auto c8 = [](u32 b) { return (b & 255) / 255.f; };
     switch (t.format)
@@ -252,11 +257,11 @@ V4 SampleLevel(const Texture& t, float u, float v, bool linear);
 Texture Level(const Texture& t, u32 l)
 {
     Texture out = t;
-    u32 w = t.width, h = t.height;
-    for (u32 i = 0; i < l; i++, w = std::max(1u, w / 2), h = std::max(1u, h / 2))
-        out.address += t.compressed ? ((w + 3) / 4) * ((h + 3) / 4) * (t.format == 0x0c ? 8 : 16)
-                                    : w * h * BytesPerTexel(t.format);
-    out.width = w, out.height = h;
+    u32 w = t.width, h = t.height, d = t.depth;
+    for (u32 i = 0; i < l; i++, w = std::max(1u, w / 2), h = std::max(1u, h / 2), d = std::max(1u, d / 2))
+        out.address += t.compressed ? ((w + 3) / 4) * ((h + 3) / 4) * (t.format == 0x0c ? 8 : 16) * d
+                                    : w * h * d * BytesPerTexel(t.format);
+    out.width = w, out.height = h, out.depth = d;
     out.pitch = w * BytesPerTexel(t.format);
     return out;
 }
@@ -301,6 +306,50 @@ V4 SampleLod(const Texture& t, float u, float v, float lod)
 V4 Sample(const Texture& t, float u, float v)
 {
     return SampleLevel(t, u, v, ((t.filter >> 24) & 0xf) != 1);
+}
+
+// A volume texture: the level as SampleLod picks it (the nearest), r through ADDRESS's P mode to a
+// slice, or two blended when filtering is linear
+V4 Sample3D(const Texture& t, float u, float v, float r, float lod)
+{
+    Texture lt = t;
+    const float raw = lod + t.lod_bias;
+    bool linear;
+    if (raw <= 0 || t.levels <= 1)
+    {
+        const u32 mag = (t.filter >> 24) & 0xf;
+        linear = mag != 1;
+    }
+    else
+    {
+        const float top = std::min(t.max_lod, float(t.levels - 1));
+        const float l = std::clamp(raw, std::min(t.min_lod, top), top);
+        lt = Level(t, u32(l + 0.5f));
+        const u32 min = (t.filter >> 16) & 0xff;
+        linear = min != 1 && min != 3 && min != 5;
+    }
+    const u32 wrap_p = (t.wrap >> 16) & 0xf;
+    const float z = t.swizzled ? r * float(lt.depth) : r;
+    if (!linear)
+    {
+        const int s = Address(int(std::floor(z)), lt.depth, wrap_p);
+        if (s < 0)
+            return Unpack(t.border);
+        lt.slice = u32(s);
+        return SampleLevel(lt, u, v, false);
+    }
+    const float fz = z - 0.5f;
+    const int z0 = int(std::floor(fz));
+    const float a = fz - float(z0);
+    const int s0 = Address(z0, lt.depth, wrap_p), s1 = Address(z0 + 1, lt.depth, wrap_p);
+    Texture t0 = lt, t1 = lt;
+    t0.slice = s0 < 0 ? 0 : u32(s0), t1.slice = s1 < 0 ? 0 : u32(s1);
+    const V4 c0 = s0 < 0 ? Unpack(t.border) : SampleLevel(t0, u, v, true);
+    const V4 c1 = s1 < 0 ? Unpack(t.border) : SampleLevel(t1, u, v, true);
+    V4 c;
+    for (int i = 0; i < 4; i++)
+        c[i] = c0[i] + (c1[i] - c0[i]) * a;
+    return c;
 }
 
 V4 SampleLevel(const Texture& t, float u, float v, bool linear)
@@ -638,6 +687,8 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
             const float q = program == 1 && tc[3] != 0 ? tc[3] : 1.f;
             if (IsDepthFormat(t.format)) // a shadow map: the depth reference is r (over q)
                 tex[s] = ShadowSample(t, tc[0] / q, tc[1] / q, tc[2] / q);
+            else if (program == 2 && t.depth > 1)
+                tex[s] = Sample3D(t, tc[0], tc[1], tc[2], in.lod[s]);
             else
                 tex[s] = SampleLod(t, tc[0] / q, tc[1] / q, in.lod[s]);
             break;
