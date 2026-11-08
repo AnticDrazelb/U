@@ -8,10 +8,10 @@ file (8 November 2026).
 
 Paste this into a new Claude Code session on the `anticdrazelb/u` repository:
 
-> Read `xbox-core/HANDOFF.md` on branch `X` in full and follow it. Check out branch `X`, set up
-> what §2 says isn't in the repo (the PS4 toolchain per `docs/BUILDING.md`, nxdk in `~/emu/nxdk`,
-> and optionally shadPS4), and build with `xbox-core/build.sh host` and `xbox-core/build.sh ps4`.
-> Then carry on from §5, starting with the console log I'll attach.
+> Read `xbox-core/HANDOFF.md` on branch `X` in full and follow it. Check out branch `X`, run
+> `xbox-core/setup-env.sh shadps4` to set up what §2 says isn't in the repo, and build with
+> `xbox-core/build.sh host` and `xbox-core/build.sh ps4`. Then carry on from §5, starting with the
+> console log I'll attach.
 
 ## 1. The goal and the rules
 
@@ -55,7 +55,11 @@ capture everything.
 | the earlier feasibility bench | `xbox-bench/` (`RESULTS.md`: console measurements) |
 | the New Eden Switch emulator | a separate project of the owner's. Its log-bundling design was copied here; ask the owner if you need it. |
 
-**Not in the repo** (a fresh container must rebuild these):
+**Not in the repo** (a fresh container must rebuild these): `xbox-core/setup-env.sh` does all of
+it on Ubuntu 24.04 in about 15 minutes, plus about 30 for shadPS4 with `setup-env.sh shadps4`. It
+works around a network that refuses apt.llvm.org, go.dev, Microsoft's .NET downloads,
+googlesource.com and GitHub `/archive/` tarballs; its header lists how that differs from
+`docs/BUILDING.md`.
 - **nxdk:** `~/emu/nxdk`, built with its samples. `tests/run-nxdk-samples.sh` builds the samples. Test XBEs are built with `make` in each `tests/*-test`; the disc test also needs `tests/disc-test/make-image.sh`.
 - **shadPS4:** `~/emu/shadPS4/build/shadps4`. It only checks that the app opens and writes its files. It can't run guest code, because it can't place memory at the Xbox's addresses.
 - **NevolutionX homebrew:** `~/emu/homebrew/NevolutionX/NevolutionX.iso`.
@@ -238,3 +242,4 @@ again. So a step that kills the app costs one launch.
 - Raw-disk images live in `/data/xbox-core/hdd/` (`partition0.img`, `partitionN.img`), and the partitions' file systems are folders there (`e/`, `c/`, `x/`, `y/`, `z/`).
 - Don't call `Log`, `malloc` or anything else from libc on a path the signal handler runs. Test with `XB_STRICT_SIGNAL=1`.
 - `out/xbox-core.pkg` is a build output and isn't committed. Rebuild it with `xbox-core/build.sh ps4`.
+- Declare any `extern thread_local` variable `constinit` (and define it that way). Otherwise clang emits a weak reference to its thread-local init function (`_ZTH…`), and `create-fself` stops the PS4 build with "missing module for symbol".
