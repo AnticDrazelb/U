@@ -33,7 +33,8 @@ u32 Pack(const V4& c)
 struct Texture
 {
     u32 address = 0, palette = 0, format = 0, width = 1, height = 1, pitch = 0, wrap = 0, filter = 0, border = 0;
-    bool swizzled = false, compressed = false;
+    bool swizzled = false, compressed = false, cubemap = false;
+    u32 face_size = 0; // a cube map face's bytes: its mipmap chain, 128-byte aligned
 };
 
 bool IsLinear(u32 f)
@@ -84,6 +85,15 @@ Texture StageTexture(int stage)
     t.wrap = k.Get(base + 8);
     t.filter = k.Get(base + 0x14);
     t.border = k.Get(base + 0x24);
+    t.cubemap = (format & 4) && !IsLinear(t.format);
+    if (t.cubemap)
+    {
+        const u32 levels = std::max<u32>(1, (format >> 16) & 0xf);
+        u32 w = t.width, h = t.height, size = 0;
+        for (u32 l = 0; l < levels; l++, w = std::max(1u, w / 2), h = std::max(1u, h / 2))
+            size += t.compressed ? ((w + 3) / 4) * ((h + 3) / 4) * (t.format == 0x0c ? 8 : 16) : w * h * BytesPerTexel(t.format);
+        t.face_size = (size + 127) & ~127u;
+    }
     return t;
 }
 
@@ -104,6 +114,8 @@ struct PixelState
     V4 fog_color{};
     V4 final_c0{}, final_c1{};
     u32 program[4] = {};
+    u32 dot_map[4] = {}, input[4] = {}, clip_mode = 0;
+    float bump[4][4] = {}, bump_scale[4] = {}, bump_offset[4] = {};
     bool enabled[4] = {};
     Texture texture[4];
     bool alpha_test = false, blend = false;
@@ -437,40 +449,164 @@ V4 Combine(const PixelInputs& in, const V4 tex[4])
 
 // ---- the texture stages' programs (SET_SHADER_STAGE_PROGRAM, 5 bits a stage)
 
-void TextureStages(const PixelInputs& in, V4 tex[4])
+// a cube map's texel in direction (x, y, z): the face of the largest component, the other two
+// projected onto it (Direct3D's and GL's convention)
+V4 SampleCube(const Texture& t, float x, float y, float z)
 {
+    const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+    int face;
+    float sc, tc, ma;
+    if (ax >= ay && ax >= az)
+        face = x >= 0 ? 0 : 1, sc = x >= 0 ? -z : z, tc = -y, ma = ax;
+    else if (ay >= az)
+        face = y >= 0 ? 2 : 3, sc = x, tc = y >= 0 ? z : -z, ma = ay;
+    else
+        face = z >= 0 ? 4 : 5, sc = z >= 0 ? x : -x, tc = -y, ma = az;
+    if (ma == 0)
+        return {0, 0, 0, 0};
+    Texture f = t;
+    if (t.cubemap)
+        f.address += u32(face) * t.face_size;
+    return Sample(f, (sc / ma + 1) * 0.5f, (tc / ma + 1) * 0.5f);
+}
+
+// signed components from unsigned texels (SET_DOT_RGBMAPPING's conversions)
+float Sign1(float x) { return (x * 255.f - 128.f) / 127.f; }
+float Sign2(float x) { x *= 255.f; return x >= 128.f ? (x - 255.5f) / 127.5f : (x + 0.5f) / 127.5f; }
+float Sign3(float x) { x *= 255.f; return x >= 128.f ? (x - 256.f) / 127.f : x / 127.f; }
+
+V4 DotMap(const V4& c, u32 map)
+{
+    switch (map)
+    {
+    case 1: return {Sign1(c[0]), Sign1(c[1]), Sign1(c[2]), 0};
+    case 2: return {Sign2(c[0]), Sign2(c[1]), Sign2(c[2]), 0};
+    case 3: return {Sign3(c[0]), Sign3(c[1]), Sign3(c[2]), 0};
+    case 4: // HILO: two 16-bit values
+    {
+        auto byte = [](float v) { return u32(Clamp01(v) * 255.f + 0.5f); };
+        return {float(byte(c[3]) << 8 | byte(c[0])) / 65535.f, float(byte(c[1]) << 8 | byte(c[2])) / 65535.f, 1, 0};
+    }
+    default: return {c[0], c[1], c[2], 0};
+    }
+}
+
+float Dot3(const float* a, const V4& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+// the texture stages' programs (SET_SHADER_STAGE_PROGRAM, 5 bits a stage); false: a clip plane
+// stage discards the pixel
+bool TextureStages(const PixelInputs& in, V4 tex[4])
+{
+    float dot[4] = {};
     for (int s = 0; s < 4; s++)
     {
         tex[s] = {0, 0, 0, 0};
         const u32 program = g_ps.program[s];
-        const bool enabled = g_ps.enabled[s];
+        const Texture& t = g_ps.texture[s];
+        const bool enabled = g_ps.enabled[s] && t.address;
         const float* tc = in.v[9 + s];
+        const V4& input = tex[g_ps.input[s] < 4 ? g_ps.input[s] : 0];
         switch (program)
         {
-        case 0: break; // none
-        case 1:        // 2D projective
-        case 2:        // 3D (its first slice)
-        case 3:        // cube map (not yet: as 2D)
+        case 0: break;  // none
+        case 1:         // 2D projective
+        case 2:         // 3D (its first slice)
         {
             if (!enabled)
                 break;
             const float q = program == 1 && tc[3] != 0 ? tc[3] : 1.f;
-            tex[s] = Sample(g_ps.texture[s], tc[0] / q, tc[1] / q);
+            tex[s] = Sample(t, tc[0] / q, tc[1] / q);
             break;
         }
+        case 3: // cube map
+            if (enabled)
+                tex[s] = SampleCube(t, tc[0], tc[1], tc[2]);
+            break;
         case 4: // pass-through: the coordinates as a colour
             tex[s] = {Clamp01(tc[0]), Clamp01(tc[1]), Clamp01(tc[2]), Clamp01(tc[3])};
             break;
-        default:
+        case 5: // clip plane: each coordinate's sign against its compare mode
+            for (int j = 0; j < 4; j++)
+            {
+                const bool compare = (g_ps.clip_mode >> (4 * s + j)) & 1;
+                if (compare ? tc[j] >= 0 : tc[j] < 0)
+                    return false;
+            }
+            break;
+        case 6: // bump environment map: the input's blue and green, signed, through the 2x2 matrix
+        case 7: // ... with luminance: its red scaling the result
+        {
+            const float du = Sign3(input[2]), dv = Sign3(input[1]);
+            const float* m = g_ps.bump[s];
+            const float u = tc[0] + du * m[0] + dv * m[2], v = tc[1] + du * m[1] + dv * m[3];
+            if (enabled)
+                tex[s] = Sample(t, u, v);
+            if (program == 7)
+            {
+                const float l = std::clamp(g_ps.bump_scale[s] * input[0] + g_ps.bump_offset[s], 0.f, 1.f);
+                for (int c = 0; c < 4; c++)
+                    tex[s][c] *= l;
+            }
+            break;
+        }
+        case 9: // dot ST: (the previous stage's dot, this one's) as coordinates
+            dot[s] = Dot3(tc, DotMap(input, g_ps.dot_map[s]));
+            if (enabled && s > 0)
+                tex[s] = Sample(t, dot[s - 1], dot[s]);
+            break;
+        case 10: // dot ZW: a depth, not done; the dot is kept
+        case 17: // dot product: kept for the stages after
+            dot[s] = Dot3(tc, DotMap(input, g_ps.dot_map[s]));
+            break;
+        case 11: // dot reflect diffuse (stage 2): a normal from stages 1, 2 and the next one's coordinates
+        {
+            dot[s] = Dot3(tc, DotMap(input, g_ps.dot_map[s]));
+            if (s < 3)
+            {
+                const float dn = Dot3(in.v[9 + s + 1], DotMap(tex[g_ps.input[s + 1] & 3], g_ps.dot_map[s + 1]));
+                if (enabled)
+                    tex[s] = SampleCube(t, dot[s - 1], dot[s], dn);
+            }
+            break;
+        }
+        case 12: // dot reflect specular (stage 3): the eye vector in the coordinates' w, reflected
+        case 13: // dot STR 3D
+        case 14: // dot STR cube
+        {
+            dot[s] = Dot3(tc, DotMap(input, g_ps.dot_map[s]));
+            if (s < 2 || !enabled)
+                break;
+            const float n[3] = {dot[s - 2], dot[s - 1], dot[s]};
+            if (program == 12)
+            {
+                const float e[3] = {in.v[9 + s - 2][3], in.v[9 + s - 1][3], tc[3]};
+                const float ne = n[0] * e[0] + n[1] * e[1] + n[2] * e[2], nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+                const float k = nn != 0 ? 2 * ne / nn : 0;
+                tex[s] = SampleCube(t, k * n[0] - e[0], k * n[1] - e[1], k * n[2] - e[2]);
+            }
+            else if (program == 14)
+                tex[s] = SampleCube(t, n[0], n[1], n[2]);
+            else
+                tex[s] = Sample(t, n[0], n[1]);
+            break;
+        }
+        case 15: // dependent on the input's alpha and red
+            if (enabled)
+                tex[s] = Sample(t, input[3], input[0]);
+            break;
+        case 16: // dependent on the input's green and blue
+            if (enabled)
+                tex[s] = Sample(t, input[1], input[2]);
+            break;
+        default: // 8 (BRDF), 18 (dot reflect specular const): not done
         {
             static std::atomic<u32> reported{0};
             if (!(reported.fetch_or(1u << program) & (1u << program)))
-            {
                 Log("nv2a: texture stage program %u isn't done yet", program);
-            }
         }
         }
     }
+    return true;
 }
 
 // ---- the alpha test and blending
@@ -550,6 +686,18 @@ void PreparePixels()
         ps.uses_sum |= (byte & 0xf) == 14;
     ps.final_c0 = Unpack(k.Get(0x1e20)), ps.final_c1 = Unpack(k.Get(0x1e24));
     const u32 programs = k.Get(0x1e70);
+    // the stages' wiring: SET_DOT_RGBMAPPING (4 bits a stage from 1), SET_SHADER_OTHER_STAGE_INPUT
+    // (stages 2 and 3), SET_SHADER_CLIP_PLANE_MODE, the bump environment matrices
+    for (int i = 1; i < 4; i++)
+        ps.dot_map[i] = (k.Get(0x1e74) >> (4 * (i - 1))) & 0xf;
+    ps.input[1] = 0, ps.input[2] = (k.Get(0x1e78) >> 16) & 0xf, ps.input[3] = (k.Get(0x1e78) >> 20) & 0xf;
+    ps.clip_mode = k.Get(0x17f8);
+    for (int i = 0; i < 4; i++)
+    {
+        for (int j = 0; j < 4; j++)
+            ps.bump[i][j] = k.F(0x1b28 + u32(i) * 64 + u32(j) * 4);
+        ps.bump_scale[i] = k.F(0x1b38 + u32(i) * 64), ps.bump_offset[i] = k.F(0x1b3c + u32(i) * 64);
+    }
     for (int s = 0; s < 4; s++)
     {
         ps.program[s] = (programs >> (5 * s)) & 0x1f;
@@ -582,7 +730,8 @@ bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32&
     else
     {
         V4 tex[4];
-        TextureStages(in, tex);
+        if (!TextureStages(in, tex))
+            return false;
         color = Combine(in, tex);
     }
     // the alpha test
