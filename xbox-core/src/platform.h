@@ -53,6 +53,9 @@ std::string WrapSignal(int sig);
 std::string CheckFaultHandler();
 // how the signal handlers were set, for the log
 const char* SignalRoute();
+// A KPCR about to be the guest's fs on this host thread (whose fs base is `host_fs_base`): what the
+// platform's signal delivery needs in it (the PS4's last resort: fs:[0x10]).
+void PrepareKpcr(uint32_t kpcr, uint64_t host_fs_base);
 // Each host thread that runs guest code: its signal stack (a fault in guest code has no usable stack).
 void PrepareThread();
 

@@ -457,7 +457,7 @@ void InitCpu()
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);
-    Log("cpu: fault handlers %s", platform::SignalRoute());
+    LogSync("cpu: fault handlers %s", platform::SignalRoute());
     // Self-test: a guest function that returns fs:[0x18] (the thread's NT_TIB.Self, its KPCR).
     // Right, it shows the switch into 32-bit code, the guest's fs and the way back all work.
     const u32 code = AllocKernel(16, 16);
@@ -548,6 +548,7 @@ u64 CallGuest(GuestThread* t, u32 fn, std::initializer_list<u32> args)
     platform::PrepareThread();
     tl_thread = t;
     Write<u64>(t->kpcr + kpcr::HostFsBase, HostFsBase());
+    platform::PrepareKpcr(t->kpcr, HostFsBase());
     u32 esp = ((t->tls_area ? t->tls_area : t->stack_top) - 64) & ~15u;
     esp -= u32(args.size() * 4 + 15) & ~15u;
     u32 a = esp;
@@ -569,6 +570,7 @@ u64 CallGuestNested(u32 fn, std::initializer_list<u32> args)
     for (u32 v : args)
         Write<u32>(a, v), a += 4;
     Write<u64>(t->kpcr + kpcr::HostFsBase, HostFsBase());
+    platform::PrepareKpcr(t->kpcr, HostFsBase());
     using Enter = u64 (*)(u32, u32, u64);
     const u64 result = reinterpret_cast<Enter>(SwitchEntry(xcs_enter64))(fn, esp, t->kpcr);
     Write<u64>(t->kpcr + kpcr::GuestEsp, saved_esp);

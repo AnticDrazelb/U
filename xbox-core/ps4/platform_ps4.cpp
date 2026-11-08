@@ -41,6 +41,8 @@ struct ModuleInfo
     uint8_t fingerprint[20];
 };
 int32_t sceKernelGetModuleList(int32_t* handles, size_t count, size_t* available);
+int32_t sceKernelGetModuleInfo(int32_t handle, ModuleInfo* info);
+int32_t sceKernelQueryMemoryProtection(void* address, void** start, void** end, uint32_t* protection);
 int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
 }
 
@@ -82,15 +84,87 @@ struct BsdSigaction
 static_assert(sizeof(BsdSigaction) == 32);
 using SyscallFn = int (*)(int, ...);
 SyscallFn g_syscall = nullptr;
+// libkernel's own raw sigaction stub (FreeBSD's: mov rax, 416; mov r10, rcx; syscall; ...), found in
+// its code when no exported name reaches the kernel's sigaction
+using SigactionFn = int (*)(int, const void*, void*);
+SigactionFn g_raw_sigaction = nullptr;
+std::string g_route = "not set";
+// the last resort, when neither is there: libkernel's wrapper finds its thread at fs:[0x10]
+// (struct tcb's tcb_thread); each KPCR gets the host thread's there (NT_TIB's FiberData and
+// ArbitraryUserPointer, otherwise unused), so the wrapper works with the guest's fs too
+bool g_kpcr_tcb = false;
+
+// The raw stub for system call `number` in libkernel's readable code, or null (and why in `how`).
+void* FindSyscallStub(uint32_t number, std::string& how)
+{
+    int32_t handles[256];
+    size_t count = 0;
+    if (sceKernelGetModuleList(handles, 256, &count) != 0)
+    {
+        how = "no module list";
+        return nullptr;
+    }
+    std::string seen;
+    for (size_t m = 0; m < count && m < 256; m++)
+    {
+        ModuleInfo info;
+        std::memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(handles[m], &info) != 0 || !std::strstr(info.name, "libkernel"))
+            continue;
+        for (uint32_t g = 0; g < info.segment_count && g < 4; g++)
+        {
+            const ModuleSegment& s = info.segments[g];
+            char note[160];
+            if (!(s.prot & 4))
+                continue;
+            void* start = nullptr;
+            void* end = nullptr;
+            uint32_t protection = 0;
+            const int32_t q = sceKernelQueryMemoryProtection(s.address, &start, &end, &protection);
+            std::snprintf(note, sizeof(note), "%s%s code %p+%#x (protection %#x%s)", seen.empty() ? "" : "; ", info.name,
+                          s.address, s.size, protection, q != 0 ? ", query failed" : "");
+            seen += note;
+            if (q != 0 || !(protection & 1)) // not readable: execute-only
+                continue;
+            const auto* p = static_cast<const uint8_t*>(s.address);
+            const uint8_t tail[5] = {0x49, 0x89, 0xca, 0x0f, 0x05}; // mov r10, rcx; syscall
+            for (uint32_t i = 0; i + 12 <= s.size; i++)
+            {
+                size_t at = 0;
+                if (p[i] == 0x48 && p[i + 1] == 0xc7 && p[i + 2] == 0xc0) // mov rax, imm32
+                    at = 3;
+                else if (p[i] == 0xb8) // mov eax, imm32
+                    at = 1;
+                else
+                    continue;
+                uint32_t n;
+                std::memcpy(&n, p + i + at, 4);
+                if (n == number && std::memcmp(p + i + at + 4, tail, 5) == 0)
+                {
+                    char found[64];
+                    std::snprintf(found, sizeof(found), " -> its stub at %p", static_cast<const void*>(p + i));
+                    how = seen + found;
+                    return const_cast<uint8_t*>(p + i);
+                }
+            }
+        }
+    }
+    how = seen.empty() ? "no libkernel code segment found" : seen + " -> no stub found";
+    return nullptr;
+}
 static_assert(sizeof(struct sigaction) == sizeof(BsdSigaction), "the sysroot's sigaction is FreeBSD's");
 BsdSigaction g_previous[33]; // by signal: what was there before ours
 bool g_have_previous[33] = {};
 
 int RawSigaction(int sig, const BsdSigaction* action, BsdSigaction* old)
 {
-    if (!g_syscall) // libkernel's (with its wrapper) as a last resort
-        return sigaction(sig, reinterpret_cast<const struct sigaction*>(action), reinterpret_cast<struct sigaction*>(old));
-    return g_syscall(416, sig, action, old);
+    if (g_raw_sigaction)
+        return g_raw_sigaction(sig, action, old);
+    if (g_syscall)
+        return g_syscall(416, sig, action, old);
+    // libkernel's (with its wrapper; g_kpcr_tcb makes that work in guest code)
+    return sigaction(sig, reinterpret_cast<const struct sigaction*>(action), reinterpret_cast<struct sigaction*>(old));
 }
 
 // fs back to the app's when guest code was interrupted; returns the interrupted fs base
@@ -222,6 +296,21 @@ void OnSignal(int sig, siginfo_t* info, void* context)
 std::string Init()
 {
     g_syscall = reinterpret_cast<SyscallFn>(Lookup("syscall"));
+    if (g_syscall)
+        g_route = "set with the kernel's own sigaction (libkernel's syscall())";
+    else
+    {
+        std::string how;
+        g_raw_sigaction = reinterpret_cast<SigactionFn>(FindSyscallStub(416, how));
+        if (g_raw_sigaction)
+            g_route = "set with the kernel's own sigaction (libkernel's raw stub; " + how + ")";
+        else
+        {
+            g_kpcr_tcb = true;
+            g_route = "set with libkernel's sigaction, each KPCR carrying the host thread at fs:[0x10] for its wrapper "
+                      "(syscall() isn't exported; " + how + ")";
+        }
+    }
     g_set_fsbase = reinterpret_cast<SetFsBase>(Lookup("amd64_set_fsbase"));
     g_get_fsbase = reinterpret_cast<GetFsBase>(Lookup("amd64_get_fsbase"));
     if (!g_set_fsbase)
@@ -324,8 +413,16 @@ void InstallFaultHandler(FaultHandler handler)
 
 const char* SignalRoute()
 {
-    return g_syscall ? "set with the kernel's own sigaction (libkernel's syscall())"
-                     : "set with libkernel's sigaction: syscall() isn't exported, so a fault in guest code may kill the app";
+    return g_route.c_str();
+}
+
+void PrepareKpcr(uint32_t kpcr, uint64_t host_fs_base)
+{
+    if (!g_kpcr_tcb || !host_fs_base)
+        return;
+    uint64_t thread;
+    std::memcpy(&thread, reinterpret_cast<const void*>(host_fs_base + 0x10), 8);
+    std::memcpy(reinterpret_cast<void*>(uintptr_t(kpcr) + 0x10), &thread, 8);
 }
 
 std::string CheckFaultHandler()
