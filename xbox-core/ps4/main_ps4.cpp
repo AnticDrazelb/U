@@ -491,7 +491,11 @@ int main()
     g_screen.Open();
     OpenPad();
     StartAudio();
-    Log("xbox-core %s", XB_VERSION);
+    // where the system put the app: inside the Xbox's addresses (below 0x4000000), games whose image
+    // reaches it won't load
+    const uintptr_t code = reinterpret_cast<uintptr_t>(&FindXbes);
+    Log("xbox-core %s, its code at %#llx%s", XB_VERSION, (unsigned long long)code,
+        code < 0x4000000 ? " (inside the Xbox's RAM addresses)" : " (clear of the Xbox's addresses)");
     const std::vector<Entry> xbes = FindXbes();
     // /data/xbox-core/autostart.txt: an XBE's path to run without the menu (tests, a favourite game)
     std::string xbe;
