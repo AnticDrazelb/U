@@ -836,12 +836,23 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         }
         lods[st] = TextureLod(st, d[0][0], d[1][0], d[0][1], d[1][1]);
     }
-    // edge functions, stepped per pixel: e(x+1) = e(x) + dx, e(y+1) = e(y) + dy
-    const float sign = area < 0 ? -1.f : 1.f, inv_area = 1.f / std::fabs(area);
-    auto edge = [&](const ScreenVertex& p, const ScreenVertex& q, float px, float py) {
+    // edge functions, stepped per pixel: e(x+1) = e(x) + dx. In doubles: with positions on the 1/16
+    // grid and centres at +0.5 they're exact, so a centre on an edge is seen as on it, and the fill
+    // rule decides: such a pixel is the triangle's if the edge is a left edge (the inside to its
+    // right) or a top edge (horizontal, the inside below), so neighbours sharing an edge don't both
+    // draw it.
+    const double sign = area < 0 ? -1.0 : 1.0;
+    const double exact_area = std::fabs((double(b.x) - a.x) * (double(c.y) - a.y) - (double(b.y) - a.y) * (double(c.x) - a.x));
+    const double inv_area = 1.0 / exact_area;
+    auto edge = [&](const ScreenVertex& p, const ScreenVertex& q, double px, double py) {
         return sign * ((p.x - px) * (q.y - py) - (p.y - py) * (q.x - px));
     };
-    const float dax = -sign * (c.y - b.y), dbx = -sign * (a.y - c.y), dcx = -sign * (b.y - a.y);
+    auto top_left = [&](const ScreenVertex& p, const ScreenVertex& q) {
+        const double dx_step = sign * (double(p.y) - q.y), dy_step = sign * (double(q.x) - p.x);
+        return dx_step > 0 || (dx_step == 0 && dy_step > 0);
+    };
+    const bool tla = top_left(b, c), tlb = top_left(c, a), tlc = top_left(a, b);
+    const double dax = -sign * (double(c.y) - b.y), dbx = -sign * (double(a.y) - c.y), dcx = -sign * (double(b.y) - a.y);
     for (int y = y0; y <= y1; y++)
     {
         if ((y / kBand) % parts != part)
@@ -849,13 +860,13 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
             y = (y / kBand + 1) * kBand - 1; // to the end of this band
             continue;
         }
-        const float py = y + 0.5f, px0 = x0 + 0.5f;
-        float ea = edge(b, c, px0, py), eb = edge(c, a, px0, py), ec = edge(a, b, px0, py);
+        const double py = y + 0.5, px0 = x0 + 0.5;
+        double ea = edge(b, c, px0, py), eb = edge(c, a, px0, py), ec = edge(a, b, px0, py);
         for (int x = x0; x <= x1; x++, ea += dax, eb += dbx, ec += dcx)
         {
-            if (ea < 0 || eb < 0 || ec < 0)
+            if (ea < 0 || eb < 0 || ec < 0 || (ea == 0 && !tla) || (eb == 0 && !tlb) || (ec == 0 && !tlc))
                 continue;
-            const float wa = ea * inv_area, wb = eb * inv_area, wc = ec * inv_area;
+            const float wa = float(ea * inv_area), wb = float(eb * inv_area), wc = float(ec * inv_area);
             const float z = a.z * wa + b.z * wb + c.z * wc;
             if (!shade_first && !ds.Test(u32(x), u32(y), z))
                 continue;
