@@ -592,13 +592,6 @@ void RegisterRtlExports(RegisterFn reg)
             c.Arg(2) ? Ptr<const char>(c.Arg(2)) : "");
         return 0;
     });
-    reg("RtlGetCallersAddress", [](Call& c) -> u64 {
-        if (c.Arg(0)) Write<u32>(c.Arg(0), 0);
-        if (c.Arg(1)) Write<u32>(c.Arg(1), 0);
-        return 0;
-    });
-    reg("RtlCaptureStackBackTrace", [](Call& c) -> u64 { if (c.Arg(3)) Write<u32>(c.Arg(3), 0); return 0; });
-    reg("RtlWalkFrameChain", [](Call&) -> u64 { return 0; });
     reg("KeBugCheck", [](Call& c) -> u64 { Fatal("kernel: KeBugCheck %#x", c.Arg(0)); return 0; });
 
 
@@ -614,7 +607,6 @@ void RegisterRtlExports(RegisterFn reg)
     reg("HalInitiateShutdown", [](Call&) -> u64 { Log("kernel: HalInitiateShutdown"); g_quit = true; return 0; });
     reg("HalEnableSystemInterrupt", [](Call&) -> u64 { return 0; });
     reg("HalDisableSystemInterrupt", [](Call&) -> u64 { return 0; });
-    reg("HalRequestSoftwareInterrupt", [](Call&) -> u64 { return 0; });
     reg("HalClearSoftwareInterrupt", [](Call&) -> u64 { return 0; });
     reg("KeStallExecutionProcessor", [](Call& c) -> u64 {
         std::this_thread::sleep_for(std::chrono::microseconds(c.Arg(0)));
@@ -622,10 +614,6 @@ void RegisterRtlExports(RegisterFn reg)
     });
     reg("KeSaveFloatingPointState", [](Call&) -> u64 { return STATUS_SUCCESS; });
     reg("KeRestoreFloatingPointState", [](Call&) -> u64 { return STATUS_SUCCESS; });
-    reg("KeEnterCriticalRegion", [](Call&) -> u64 { return 0; });
-    reg("KeLeaveCriticalRegion", [](Call&) -> u64 { return 0; });
-    reg("KeRaiseIrqlToSynchLevel", [](Call&) -> u64 { return 0; });
-    reg("KeIsExecutingDpc", [](Call&) -> u64 { return 0; });
     reg("KeBoostPriorityThread", [](Call&) -> u64 { return 0; });
     reg("KeSetDisableBoostThread", [](Call&) -> u64 { return 0; });
     reg("KeSetPriorityProcess", [](Call&) -> u64 { return 8; });

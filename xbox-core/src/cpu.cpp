@@ -417,18 +417,20 @@ void InitCpu()
     Write<u64>(g_switch + kSlotHandler, reinterpret_cast<u64>(&GateEntry));
     Write<u64>(g_switch + kSlotFsGuest, reinterpret_cast<u64>(platform::FsGuest()));
     Write<u64>(g_switch + kSlotFsHost, reinterpret_cast<u64>(platform::FsHost()));
-    // export stubs: mov eax, ordinal; jmp xcs_gate32
+    // export stubs: mov fs:[0x330], eax (the caller's eax, for RtlCaptureContext); mov eax, ordinal;
+    // jmp xcs_gate32: 16 bytes
     g_stubs = AllocKernel(kExportCount * kStubSize, 16);
     const u32 gate = u32(SwitchEntry(xcs_gate32));
     for (u32 i = 0; i < kExportCount; i++)
     {
         u8* s = Ptr<u8>(g_stubs + i * kStubSize);
-        s[0] = 0xb8;
-        std::memcpy(s + 1, &i, 4);
-        s[5] = 0xe9;
-        const u32 rel = gate - (g_stubs + i * kStubSize + 10);
-        std::memcpy(s + 6, &rel, 4);
-        s[10] = 0xcc;
+        const u8 save_eax[6] = {0x64, 0xa3, 0x30, 0x03, 0x00, 0x00};
+        std::memcpy(s, save_eax, 6);
+        s[6] = 0xb8;
+        std::memcpy(s + 7, &i, 4);
+        s[11] = 0xe9;
+        const u32 rel = gate - (g_stubs + i * kStubSize + 16);
+        std::memcpy(s + 12, &rel, 4);
     }
     Write<u64>(g_switch + kSlotBugCheck, ExportStub(96)); // KeBugCheckEx, for unhandled exceptions
     platform::InstallFaultHandler(OnFault);
@@ -445,6 +447,9 @@ void InitCpu()
         Fatal("cpu self-test: guest code read fs:[0x18] = %#x, expected the KPCR %#x", got, t->kpcr);
     Log("cpu self-test: 32-bit code runs, its fs is its KPCR (%#x)", got);
 }
+
+u16 GuestCodeSelector() { return g_sel32; }
+u16 GuestDataSelector() { return g_ds; }
 
 u32 ExceptionDispatcher()
 {

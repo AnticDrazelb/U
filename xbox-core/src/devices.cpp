@@ -1,6 +1,7 @@
 // Devices: the table of memory-mapped devices (an access faults and the fault handler calls them),
 // level-triggered interrupt lines whose connected service routines run on an "interrupt" guest
 // thread, DPCs, the vblank tick, KeTickCount, and the displayed picture (PNG on the desktop).
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -116,8 +117,12 @@ void RunDpcs(GuestThread* t)
             g_dpcs.pop_front();
         }
         Write<u8>(dpc + 2, 0);
-        // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2)
+        // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2), at dispatch level
+        Write<u8>(t->kpcr + kpcr::Irql, 2);
+        Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 1);
         CallGuest(t, Read<u32>(dpc + 12), {dpc, Read<u32>(dpc + 16), Read<u32>(dpc + 20), Read<u32>(dpc + 24)});
+        Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 0);
+        Write<u8>(t->kpcr + kpcr::Irql, 0);
     }
 }
 
@@ -136,8 +141,12 @@ void RunInterrupts(GuestThread* t)
         }
         if (isrs.empty())
             return;
-        for (u32 i : isrs)
-            CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)}); // ServiceRoutine(Interrupt, ServiceContext)
+        for (u32 i : isrs) // ServiceRoutine(Interrupt, ServiceContext), at the interrupt's level
+        {
+            Write<u8>(t->kpcr + kpcr::Irql, u8(std::max<u32>(3, Read<u8>(i + 0xc))));
+            CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)});
+            Write<u8>(t->kpcr + kpcr::Irql, 0);
+        }
         RunDpcs(t);
     }
 }

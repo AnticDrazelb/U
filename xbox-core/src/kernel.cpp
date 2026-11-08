@@ -361,6 +361,7 @@ struct ThreadState
         bool user;
     };
     std::deque<Apc> apcs;
+    std::deque<u32> dpcs; // DPCs queued by this thread, waiting for its IRQL to drop
 };
 std::unordered_map<GuestThread*, ThreadState*> g_threads;
 
@@ -418,6 +419,55 @@ bool RunApcs(bool alertable)
             CallGuestNested(normal, {context, arg1, arg2});
         user_ran |= a.user;
     }
+}
+
+// The current thread's queued DPCs, run as at dispatch level (DpcRoutineActive set while they run).
+void RunPendingDpcs()
+{
+    GuestThread* t = CurrentThread();
+    const u32 kpcr = t->kpcr;
+    if (Read<u32>(kpcr + kpcr::DpcRoutineActive))
+        return;
+    for (;;)
+    {
+        u32 d;
+        {
+            std::lock_guard lock(g_sched);
+            ThreadState* s = CurrentState();
+            if (!s || s->dpcs.empty())
+                break;
+            d = s->dpcs.front();
+            s->dpcs.pop_front();
+        }
+        Write<u8>(d + 2, 0);
+        const u8 irql = Read<u8>(kpcr + kpcr::Irql);
+        Write<u8>(kpcr + kpcr::Irql, 2);
+        Write<u32>(kpcr + kpcr::DpcRoutineActive, 1);
+        // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2)
+        CallGuestNested(Read<u32>(d + 12), {d, Read<u32>(d + 16), Read<u32>(d + 20), Read<u32>(d + 24)});
+        Write<u32>(kpcr + kpcr::DpcRoutineActive, 0);
+        Write<u8>(kpcr + kpcr::Irql, irql);
+    }
+    Write<u32>(kpcr + kpcr::DpcInterruptRequested, 0);
+}
+
+// Return addresses along the guest's frame pointer chain from `ebp` (inside the thread's stack).
+std::vector<u32> FrameChain(u32 ebp, u32 max)
+{
+    std::vector<u32> out;
+    GuestThread* t = CurrentThread();
+    while (out.size() < max && ebp >= t->stack_limit && ebp + 8 <= t->stack_top && !(ebp & 3))
+    {
+        const u32 ret = Read<u32>(ebp + 4);
+        if (!ret)
+            break;
+        out.push_back(ret);
+        const u32 next = Read<u32>(ebp);
+        if (next <= ebp)
+            break;
+        ebp = next;
+    }
+    return out;
 }
 
 void QueueApc(ThreadState* s, const ThreadState::Apc& a) // under g_sched
@@ -560,7 +610,7 @@ u32 CreateThread(u32 stack, u32 tls, u32 start, u32 context, bool suspended, u32
 {
     GuestThread* t = NewGuestThread(stack, tls, name);
     Write<u32>(t->ethread + kthread::EthreadStartAddress, start);
-    auto* s = new ThreadState{t, {}, suspended ? 1 : 0, false, {}};
+    auto* s = new ThreadState{t, {}, suspended ? 1 : 0, false, {}, {}};
     {
         std::lock_guard lock(g_sched);
         g_threads[t] = s;
@@ -750,12 +800,8 @@ void InitKernel()
     } END;
     K(PsTerminateSystemThread) { ExitThread(); } END;
     K(KeGetCurrentThread) { return CurrentThread()->ethread; } END;
-    K(KeGetCurrentIrql) { return 0; } END;
     K(KeSetBasePriorityThread) { return 0; } END;
     K(KeSetPriorityThread) { return 8; } END;
-    K(KeRaiseIrqlToDpcLevel) { return 0; } END;
-    K(KfRaiseIrql) { return 0; } END;
-    K(KfLowerIrql) { return 0; } END;
     K(NtYieldExecution) { sched_yield(); return STATUS_SUCCESS; } END;
     K(NtResumeThread)
     {
@@ -1353,9 +1399,132 @@ void InitKernel()
         return 0;
     } END;
 
-    // the "...AndRegion" forms: the same (kernel APCs aren't held off here)
-    g_handlers[g_ordinal_by_name["RtlEnterCriticalSectionAndRegion"]] = g_handlers[g_ordinal_by_name["RtlEnterCriticalSection"]];
-    g_handlers[g_ordinal_by_name["RtlLeaveCriticalSectionAndRegion"]] = g_handlers[g_ordinal_by_name["RtlLeaveCriticalSection"]];
+    // the "...AndRegion" forms: the critical region (the thread's KernelApcDisable) around them
+    {
+        const Handler enter = g_handlers[g_ordinal_by_name["RtlEnterCriticalSection"]];
+        const Handler leave = g_handlers[g_ordinal_by_name["RtlLeaveCriticalSection"]];
+        Register("RtlEnterCriticalSectionAndRegion", [enter](Call& c) -> u64 {
+            const u32 t = CurrentThread()->ethread;
+            Write<s32>(t + kthread::KernelApcDisable, Read<s32>(t + kthread::KernelApcDisable) - 1);
+            return enter(c);
+        });
+        Register("RtlLeaveCriticalSectionAndRegion", [leave](Call& c) -> u64 {
+            const u64 r = leave(c);
+            // the region is left once, when the section is free (as the Xbox's kernel does it)
+            if (Read<u32>(c.Arg(0) + 0x18) == 0)
+            {
+                const u32 t = CurrentThread()->ethread;
+                Write<s32>(t + kthread::KernelApcDisable, Read<s32>(t + kthread::KernelApcDisable) + 1);
+            }
+            return r;
+        });
+    }
+    K(KeEnterCriticalRegion)
+    {
+        const u32 t = CurrentThread()->ethread;
+        Write<s32>(t + kthread::KernelApcDisable, Read<s32>(t + kthread::KernelApcDisable) - 1);
+        return 0;
+    } END;
+    K(KeLeaveCriticalRegion)
+    {
+        const u32 t = CurrentThread()->ethread;
+        Write<s32>(t + kthread::KernelApcDisable, Read<s32>(t + kthread::KernelApcDisable) + 1);
+        return 0;
+    } END;
+
+    // ---- the caller's context and its frames (the registers the gate saved in the KPCR)
+    K(RtlCaptureContext) // CONTEXT*: the caller's registers; ContextFlags and the float area untouched
+    {
+        const u32 ctx = c.Arg(0), kpcr = CurrentThread()->kpcr;
+        Write<u32>(ctx + 0x208, Read<u32>(kpcr + kpcr::GuestEdi));
+        Write<u32>(ctx + 0x20c, Read<u32>(kpcr + kpcr::GuestEsi));
+        Write<u32>(ctx + 0x210, Read<u32>(kpcr + kpcr::GuestEbx));
+        Write<u32>(ctx + 0x214, c.frame->edx);
+        Write<u32>(ctx + 0x218, c.frame->ecx);
+        Write<u32>(ctx + 0x21c, Read<u32>(kpcr + kpcr::GuestEax));
+        Write<u32>(ctx + 0x220, Read<u32>(kpcr + kpcr::GuestEbp));
+        Write<u32>(ctx + 0x224, c.frame->ret);
+        Write<u32>(ctx + 0x228, GuestCodeSelector());
+        Write<u32>(ctx + 0x22c, Read<u32>(kpcr + kpcr::GuestEflags));
+        Write<u32>(ctx + 0x230, Guest(&c.frame->args[1])); // after the return and the argument
+        Write<u32>(ctx + 0x234, GuestDataSelector());
+        return 0;
+    } END;
+    K(RtlGetCallersAddress) // caller*, caller's caller*: the return addresses one and two frames up
+    {
+        const u32 ebp = Read<u32>(CurrentThread()->kpcr + kpcr::GuestEbp);
+        const std::vector<u32> frames = FrameChain(ebp, 2);
+        if (c.Arg(0)) Write<u32>(c.Arg(0), frames.size() > 0 ? frames[0] : 0);
+        if (c.Arg(1)) Write<u32>(c.Arg(1), frames.size() > 1 ? frames[1] : 0);
+        return 0;
+    } END;
+    K(RtlWalkFrameChain) // callers*, count, flags: this call's return address, then the frame chain
+    {
+        std::vector<u32> frames = {c.frame->ret};
+        const std::vector<u32> more = FrameChain(Read<u32>(CurrentThread()->kpcr + kpcr::GuestEbp), c.Arg(1));
+        frames.insert(frames.end(), more.begin(), more.end());
+        const u32 n = std::min<u32>(u32(frames.size()), c.Arg(1));
+        for (u32 i = 0; i < n; i++)
+            Write<u32>(c.Arg(0) + i * 4, frames[i]);
+        return n;
+    } END;
+    K(RtlCaptureStackBackTrace) // skip, count, frames*, hash*: the same chain, from `skip` on
+    {
+        std::vector<u32> frames = {c.frame->ret};
+        const std::vector<u32> more = FrameChain(Read<u32>(CurrentThread()->kpcr + kpcr::GuestEbp), 64);
+        frames.insert(frames.end(), more.begin(), more.end());
+        const u32 skip = c.Arg(0), want = c.Arg(1);
+        u32 n = 0, hash = 0;
+        for (u32 i = skip; i < frames.size() && n < want; i++, n++)
+        {
+            Write<u32>(c.Arg(2) + n * 4, frames[i]);
+            hash += frames[i];
+        }
+        if (c.Arg(3))
+            Write<u32>(c.Arg(3), hash);
+        return n;
+    } END;
+
+    // ---- IRQL and DPCs: each thread's in its KPCR (Irql; the PRCB's DpcInterruptRequested and
+    // DpcRoutineActive). A DPC queued at passive level runs at once; one queued at dispatch level or
+    // above (or while another runs) waits until the IRQL drops below dispatch level.
+    K(KeGetCurrentIrql) { return Read<u8>(CurrentThread()->kpcr + kpcr::Irql); } END;
+    K(KfRaiseIrql) // fastcall: the new level; the old one back
+    {
+        const u32 kpcr = CurrentThread()->kpcr;
+        const u8 old = Read<u8>(kpcr + kpcr::Irql);
+        Write<u8>(kpcr + kpcr::Irql, u8(c.Arg(0)));
+        return old;
+    } END;
+    K(KeRaiseIrqlToDpcLevel)
+    {
+        const u32 kpcr = CurrentThread()->kpcr;
+        const u8 old = Read<u8>(kpcr + kpcr::Irql);
+        Write<u8>(kpcr + kpcr::Irql, 2);
+        return old;
+    } END;
+    K(KeRaiseIrqlToSynchLevel)
+    {
+        const u32 kpcr = CurrentThread()->kpcr;
+        const u8 old = Read<u8>(kpcr + kpcr::Irql);
+        Write<u8>(kpcr + kpcr::Irql, 0x1c);
+        return old;
+    } END;
+    K(KfLowerIrql) // fastcall: the new level; pending DPCs run below dispatch level
+    {
+        const u32 kpcr = CurrentThread()->kpcr;
+        Write<u8>(kpcr + kpcr::Irql, u8(c.Arg(0)));
+        if (c.Arg(0) < 2)
+            RunPendingDpcs();
+        return 0;
+    } END;
+    K(KeIsExecutingDpc) { return Read<u32>(CurrentThread()->kpcr + kpcr::DpcRoutineActive) != 0; } END;
+    K(HalRequestSoftwareInterrupt) // level: a dispatch-level request asks for the DPCs
+    {
+        if (c.Arg(0) == 2)
+            Write<u32>(CurrentThread()->kpcr + kpcr::DpcInterruptRequested, 1);
+        return 0;
+    } END;
     K(KeSynchronizeExecution) // interrupt, routine, context: the routine's result
     {
         return u32(CallGuestNested(c.Arg(1), {c.Arg(2)}));
@@ -1371,19 +1540,7 @@ void InitKernel()
         Write<u32>(c.Arg(0), mask & 0x0fffffff);
         return 0;
     } END;
-    K(RtlCaptureContext) // CONTEXT*: what's known of the caller (its stack and return address)
-    {
-        const u32 ctx = c.Arg(0);
-        const u32 flags = Read<u32>(ctx);
-        // the Xbox's CONTEXT: FloatSave (516 bytes) after ContextFlags, then Edi 0x208 .. SegSs 0x234
-        std::memset(Ptr(ctx + 4), 0, 0x238 - 4);
-        Write<u32>(ctx, flags | 0x10007); // CONTEXT_i386 | CONTROL | INTEGER | SEGMENTS
-        Write<u32>(ctx + 0x214, c.frame->edx);
-        Write<u32>(ctx + 0x218, c.frame->ecx);
-        Write<u32>(ctx + 0x224, c.frame->ret);             // Eip
-        Write<u32>(ctx + 0x230, Guest(&c.frame->args[1])); // Esp after the return (stdcall, one argument)
-        return 0;
-    } END;
+
 
     // ---- memory
     K(MmAllocateContiguousMemory) { return AllocContiguous(c.Arg(0), 0x1000, 0, 0xffffffff); } END;
@@ -1539,7 +1696,7 @@ void InitKernel()
         Write<u32>(d + 16, c.Arg(2));
         return 0;
     } END;
-    K(KeInsertQueueDpc)
+    K(KeInsertQueueDpc) // dpc, argument 1, argument 2: whether it was queued
     {
         const u32 d = c.Arg(0);
         if (Read<u8>(d + 2))
@@ -1547,10 +1704,37 @@ void InitKernel()
         Write<u8>(d + 2, 1);
         Write<u32>(d + 20, c.Arg(1));
         Write<u32>(d + 24, c.Arg(2));
-        QueueDpc(d);
+        ThreadState* s;
+        {
+            std::lock_guard lock(g_sched);
+            s = CurrentState();
+        }
+        if (!s) // the interrupt thread's (an ISR's): it runs them after the ISRs
+        {
+            QueueDpc(d);
+            return 1;
+        }
+        const u32 kpcr = s->thread->kpcr;
+        {
+            std::lock_guard lock(g_sched);
+            s->dpcs.push_back(d);
+        }
+        Write<u32>(kpcr + kpcr::DpcInterruptRequested, 1);
+        if (Read<u8>(kpcr + kpcr::Irql) < 2 && !Read<u32>(kpcr + kpcr::DpcRoutineActive))
+            RunPendingDpcs();
         return 1;
     } END;
-    K(KeRemoveQueueDpc) { Write<u8>(c.Arg(0) + 2, 0); return 1; } END;
+    K(KeRemoveQueueDpc) // dpc: whether it was queued (and now isn't)
+    {
+        const u32 d = c.Arg(0);
+        if (!Read<u8>(d + 2))
+            return 0;
+        Write<u8>(d + 2, 0);
+        std::lock_guard lock(g_sched);
+        for (auto& [t, s] : g_threads)
+            std::erase(s->dpcs, d);
+        return 1;
+    } END;
 
     // ---- strings, status codes
     K(RtlInitAnsiString)

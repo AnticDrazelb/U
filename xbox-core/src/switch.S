@@ -12,7 +12,8 @@
 //
 //   xcs_enter64(fn, esp, kpcr)  calls fn (cdecl/stdcall; arguments already on the guest stack at esp)
 //                               and returns edx:eax. Nests: a kernel call may call back into the guest.
-//   xcs_gate32                  32-bit: target of the per-export stubs ("mov eax, ordinal; jmp").
+//   xcs_gate32                  32-bit: target of the per-export stubs ("mov fs:[0x330], eax;
+//                               mov eax, ordinal; jmp").
 //                               Calls the handler with the frame (below) on the emulator's stack and
 //                               returns to the guest with the handler's eax, edx, popping its bytes.
 //   xcs_bail64                  the fault handler resumes a guest that can't go on here: the call
@@ -129,6 +130,14 @@ gate64:
     push %rdi
     mov %rsp, %r13          // the frame (callee-saved across the calls below)
     mov %fs:0x320, %r12
+    // the guest's other registers at the call (its eax the stub saved at 0x330), for the kernel's
+    // context functions; the flags before anything here changes them
+    pushfq
+    popq 0x344(%r12)
+    mov %ebx, 0x334(%r12)
+    mov %ebp, 0x338(%r12)
+    mov %esi, 0x33c(%r12)
+    mov %edi, 0x340(%r12)
     mov %r13, 0x328(%r12)
     and $-16, %rsp
     mov 0x300(%r12), %rdi

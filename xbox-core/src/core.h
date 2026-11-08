@@ -113,11 +113,14 @@ namespace kpcr {
 constexpr u32 NtTibStackBase = 0x04, NtTibStackLimit = 0x08, NtTibSelf = 0x18, SelfPcr = 0x1c, Prcb = 0x20,
               Irql = 0x24, CurrentThread = 0x28, Size = 0x300;
 constexpr u32 HostFsBase = 0x300, HostThread = 0x308, HostRsp = 0x310, HostSegs = 0x318, Self = 0x320,
-              GuestEsp = 0x328, BlockSize = 0x340;
+              GuestEsp = 0x328, GuestEax = 0x330, GuestEbx = 0x334, GuestEbp = 0x338, GuestEsi = 0x33c,
+              GuestEdi = 0x340, GuestEflags = 0x344, BlockSize = 0x360;
+// the PRCB's DPC fields, in the KPCR
+constexpr u32 DpcInterruptRequested = 0x4c, DpcRoutineActive = 0x58;
 } // namespace kpcr
 namespace kthread {
 constexpr u32 StackBase = 0x1c, StackLimit = 0x20, KernelStack = 0x24, TlsData = 0x28, Priority = 0x32,
-              HasTerminated = 0x77, Size = 0x110;
+              KernelApcDisable = 0x68, SuspendCount = 0x75, HasTerminated = 0x77, Size = 0x110;
 constexpr u32 EthreadUniqueThread = 0x12c, EthreadStartAddress = 0x130, EthreadSize = 0x140;
 } // namespace kthread
 
@@ -144,6 +147,8 @@ void StartHostThread(GuestThread* t, std::function<void()> body);
 // The guest address of the stub that calls kernel export `ordinal`.
 u32 ExportStub(u32 ordinal);
 u32 ExceptionDispatcher(); // xcs_raise32's guest address (switch.S)
+u16 GuestCodeSelector();   // the guest's cs and ss (RtlCaptureContext)
+u16 GuestDataSelector();
 
 // ---- kernel
 
