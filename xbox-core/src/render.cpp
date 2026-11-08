@@ -175,13 +175,108 @@ void KelvinMethod(u32 method, u32 parameter)
     }
 }
 
+// ---- the 2D engines: context surfaces (0x62: source and destination, format, pitches), beta
+// (0x12: the blend factor), image blit (0x9f: a rectangle from source to destination)
+
+namespace {
+
+struct Surfaces2D
+{
+    u32 dma_source = 0, dma_dest = 0, format = 0, source_pitch = 0, dest_pitch = 0, source_offset = 0, dest_offset = 0;
+} g_surfaces2d;
+u32 g_beta = 0;
+struct ImageBlit
+{
+    u32 operation = 3, in_x = 0, in_y = 0, out_x = 0, out_y = 0;
+} g_blit;
+
+void Blit(u32 width, u32 height)
+{
+    const Surfaces2D& s = g_surfaces2d;
+    u32 bpp;
+    switch (s.format)
+    {
+    case 0x01: bpp = 1; break;          // Y8
+    case 0x04: bpp = 2; break;          // R5G6B5
+    case 0x06: case 0x07: case 0x0a: case 0x0b: bpp = 4; break; // X8R8G8B8 (two), A8R8G8B8, Y32
+    default:
+        Log("nv2a: blit from surfaces of format %#x isn't done", s.format);
+        return;
+    }
+    const u32 source_base = Nv2aDmaAddress(s.dma_source), dest_base = Nv2aDmaAddress(s.dma_dest);
+    if (!source_base || !dest_base)
+        return;
+    const u32 source = source_base + s.source_offset + g_blit.in_y * s.source_pitch + g_blit.in_x * bpp;
+    const u32 dest = dest_base + s.dest_offset + g_blit.out_y * s.dest_pitch + g_blit.out_x * bpp;
+    const u32 row_bytes = width * bpp;
+    if (g_verbose >= 2)
+        Log("nv2a: blit %ux%u from %#x (pitch %u) to %#x (pitch %u), operation %u", width, height, source, s.source_pitch,
+            dest, s.dest_pitch, g_blit.operation);
+    // rows in the order that survives an overlap
+    const bool bottom_up = dest > source;
+    for (u32 n = 0; n < height; n++)
+    {
+        const u32 y = bottom_up ? height - 1 - n : n;
+        u8* d = Ptr<u8>(dest + y * s.dest_pitch);
+        const u8* src = Ptr<u8>(source + y * s.source_pitch);
+        if (g_blit.operation == 2 && bpp == 4) // BLEND_AND: by beta (eight bits of fraction)
+        {
+            const u32 beta = g_beta >> 16, max = 0x7f80;
+            for (u32 x = 0; x < width; x++)
+                for (u32 c = 0; c < 3; c++)
+                    d[x * 4 + c] = u8((src[x * 4 + c] * beta + d[x * 4 + c] * (max - beta)) / max);
+        }
+        else
+            std::memmove(d, src, row_bytes);
+        if (s.format == 0x07 || s.format == 0x06) // X8R8G8B8: alpha 0xff; with Z8: 0
+            for (u32 x = 0; x < width; x++)
+                d[x * 4 + 3] = s.format == 0x07 ? 0xff : 0;
+    }
+}
+
+} // namespace
+
 void RenderOtherClass(u32 cls, u32 method, u32 parameter)
 {
-    static bool reported[256] = {};
-    if (!reported[cls & 0xff] && method)
+    switch (cls)
     {
-        reported[cls & 0xff] = true;
-        Log("nv2a: class %#x isn't drawn yet (method %#x)", cls, method);
+    case 0x62: // context surfaces 2D
+        switch (method)
+        {
+        case 0x184: g_surfaces2d.dma_source = parameter; return;
+        case 0x188: g_surfaces2d.dma_dest = parameter; return;
+        case 0x300: g_surfaces2d.format = parameter; return;
+        case 0x304: g_surfaces2d.source_pitch = parameter & 0xffff, g_surfaces2d.dest_pitch = parameter >> 16; return;
+        case 0x308: g_surfaces2d.source_offset = parameter & 0x07ffffff; return;
+        case 0x30c: g_surfaces2d.dest_offset = parameter & 0x07ffffff; return;
+        }
+        break;
+    case 0x12: // beta
+        if (method == 0x300)
+            g_beta = parameter & 0x80000000 ? 0 : parameter & 0x7f800000;
+        if (method == 0x300 || method == 0)
+            return;
+        break;
+    case 0x9f: // image blit
+        switch (method)
+        {
+        case 0x19c: return; // its context surfaces: the one 0x62 object
+        case 0x2fc: g_blit.operation = parameter; return;
+        case 0x300: g_blit.in_x = parameter & 0xffff, g_blit.in_y = parameter >> 16; return;
+        case 0x304: g_blit.out_x = parameter & 0xffff, g_blit.out_y = parameter >> 16; return;
+        case 0x308:
+            if ((parameter & 0xffff) && (parameter >> 16))
+                Blit(parameter & 0xffff, parameter >> 16);
+            return;
+        }
+        break;
+    }
+    static bool reported[256][0x800 / 4] = {};
+    if (method && method < 0x800 && !reported[cls & 0xff][method / 4])
+    {
+        reported[cls & 0xff][method / 4] = true;
+        if (g_verbose >= 1 || (cls != 0x62 && cls != 0x9f && cls != 0x12 && cls != 0x39))
+            Log("nv2a: class %#x method %#x isn't done yet", cls, method);
     }
 }
 
