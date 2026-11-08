@@ -214,10 +214,252 @@ Vec4 FetchAttribute(int a, u32 index)
     return v;
 }
 
+// ---- the fixed-function pipeline (SET_TRANSFORM_EXECUTION_MODE fixed): what Direct3D's fixed
+// pipeline asks of the NV2A, from the method registers. Matrices are 4 rows of 4 floats; a vector
+// times one is its dot product with each row.
+
+float Dot4(const Vec4& a, const Vec4& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]; }
+float Dot3(const Vec4& a, const Vec4& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+Vec4 Normalize3(const Vec4& a)
+{
+    const float l = std::sqrt(Dot3(a, a));
+    return l > 0 ? Vec4{{a[0] / l, a[1] / l, a[2] / l, 0}} : a;
+}
+
+// the 4 floats of a method's data at `method`
+Vec4 Floats(u32 method, int n = 4, float w = 0)
+{
+    Vec4 v{{0, 0, 0, w}};
+    for (int i = 0; i < n; i++)
+        v[i] = g_kelvin.F(method + u32(i) * 4);
+    return v;
+}
+
+// v times the matrix whose rows start at `method`
+Vec4 Transform(const Vec4& v, u32 method)
+{
+    Vec4 out;
+    for (int r = 0; r < 4; r++)
+        out[r] = Dot4(v, Floats(method + u32(r) * 16));
+    return out;
+}
+
+void FixedFunction(const Vec4 in[16], Vec4 out[16])
+{
+    const KelvinState& k = g_kelvin;
+    const Vec4 &position = in[0], &weight = in[1], &diffuse = in[3], &specular = in[4];
+    const Vec4 normal{{in[2][0], in[2][1], in[2][2], 0}};
+    // skinning (SET_SKIN_MODE): blended model-view matrices; "G" modes make the last weight 1 - the rest
+    static const int kCount[7] = {0, 2, 2, 3, 3, 4, 4};
+    const u32 skin = std::min<u32>(k.Get(0x328), 6);
+    const int count = kCount[skin];
+    const bool generated = skin == 1 || skin == 3 || skin == 5;
+    Vec4 eye_position{{0, 0, 0, 0}}, eye_normal{{0, 0, 0, 0}};
+    if (count == 0)
+    {
+        eye_position = Transform(position, 0x480);
+        eye_normal = Transform(normal, 0x580);
+    }
+    else
+    {
+        float rest = 1;
+        for (int i = 0; i < count; i++)
+        {
+            float w = weight[i];
+            if (generated)
+            {
+                w = i < count - 1 ? weight[i] : rest;
+                rest -= weight[i];
+            }
+            const Vec4 p = Transform(position, 0x480 + u32(i) * 0x40), n = Transform(normal, 0x580 + u32(i) * 0x40);
+            for (int c = 0; c < 4; c++)
+                eye_position[c] += p[c] * w, eye_normal[c] += n[c] * w;
+        }
+    }
+    eye_normal[3] = 0;
+    if (k.Get(0x3a4)) // SET_NORMALIZATION_ENABLE
+        eye_normal = Normalize3(eye_normal);
+
+    // texture coordinates: texgen per channel (SET_TEXGEN_S..Q), then the texture matrix
+    const bool infinite_viewer = k.Get(0x9cc) == 1;
+    for (int s = 0; s < 4; s++)
+    {
+        Vec4 t = in[9 + s];
+        for (int c = 0; c < 4; c++)
+        {
+            const u32 mode = k.Get(0x3c0 + u32(s) * 0x10 + u32(c) * 4);
+            if (mode == 0)
+                continue;
+            const Vec4 plane = Floats(0x840 + u32(s) * 0x40 + u32(c) * 0x10);
+            if (mode == 0x2400) // eye linear
+                t[c] = Dot4(plane, eye_position);
+            else if (mode == 0x2401) // object linear
+                t[c] = Dot4(plane, position);
+            else if (c < 3 && mode == 0x8511) // normal map
+                t[c] = eye_normal[c];
+            else if (c < 3 && (mode == 0x2402 || mode == 0x8512)) // sphere map, reflection map
+            {
+                const Vec4 u = infinite_viewer ? Vec4{{0, 0, 1, 0}} : Normalize3(eye_position);
+                const float d = 2 * Dot3(eye_normal, u);
+                const Vec4 r{{u[0] - d * eye_normal[0], u[1] - d * eye_normal[1], u[2] - d * eye_normal[2], 0}};
+                if (mode == 0x8512)
+                    t[c] = r[c];
+                else
+                {
+                    const float m = 2 * std::sqrt(r[0] * r[0] + r[1] * r[1] + (r[2] + 1) * (r[2] + 1));
+                    t[c] = m > 0 ? r[c] / m + 0.5f : 0.5f;
+                }
+            }
+        }
+        if (k.Get(0x420 + u32(s) * 4)) // SET_TEXTURE_MATRIX_ENABLE
+            t = Transform(t, 0x6c0 + u32(s) * 0x40);
+        out[9 + s] = t;
+    }
+
+    // lighting
+    const u32 light_control = k.Get(0x294);
+    const bool lighting = k.Get(0x314), separate_specular = light_control & 1, local_eye = light_control & (1u << 16);
+    const bool specular_enable = k.Get(0x3b8);
+    Vec4 d0 = diffuse, d1 = specular;
+    if (lighting)
+    {
+        const u32 color_material = k.Get(0x298); // sources: 0 the material, 1 diffuse, 2 specular
+        const u32 emission_src = color_material & 3, ambient_src = (color_material >> 2) & 3;
+        const u32 diffuse_src = (color_material >> 4) & 3, specular_src = (color_material >> 6) & 3;
+        auto source = [&](u32 src) -> const Vec4& { return src == 2 ? specular : diffuse; };
+        const float alpha = diffuse_src == 0 ? k.F(0x3b4) : source(diffuse_src)[3];
+        const Vec4 scene_ambient = Floats(0xa10, 3), emission = Floats(0x3a8, 3);
+        if (emission_src == 0 || ambient_src == 0)
+        {
+            d0 = scene_ambient;
+            const u32 added = emission_src != 0 ? emission_src : ambient_src != 0 ? ambient_src : 0;
+            if (added)
+                for (int c = 0; c < 3; c++)
+                    d0[c] += source(added)[c] * emission[c];
+        }
+        else
+            for (int c = 0; c < 3; c++)
+                d0[c] = source(emission_src)[c] + source(ambient_src)[c] * emission[c];
+        d0[3] = alpha;
+        d1 = Vec4{{0, 0, 0, specular[3]}};
+        Vec4 params = Floats(0x9e0, 3); // SET_SPECULAR_PARAMS: the specular curve (x + L) / (M x + N)
+        if (params[0] == 0 && params[1] == 0 && params[2] == 0)
+            params = Vec4{{0, -0.494592f, 1.494592f, 0}};
+        const Vec4 eye = Floats(0xa50);
+        Vec4 eye_dir{{0, 0, 0, 0}};
+        const float pw = eye_position[3] != 0 ? eye_position[3] : 1;
+        const Vec4 p{{eye_position[0] / pw, eye_position[1] / pw, eye_position[2] / pw, 0}};
+        if (local_eye && eye[3] != 0)
+            eye_dir = Normalize3(Vec4{{eye[0] / eye[3] - p[0], eye[1] / eye[3] - p[1], eye[2] / eye[3] - p[2], 0}});
+        const u32 mask = k.Get(0x3bc);
+        for (int i = 0; i < 8; i++)
+        {
+            const u32 type = (mask >> (2 * i)) & 3; // 1 infinite, 2 local, 3 spot
+            if (!type)
+                continue;
+            const u32 l = 0x1000 + u32(i) * 0x80;
+            float attenuation = 1, n_dot_vp, n_dot_hv;
+            if (type == 1)
+            {
+                const Vec4 direction = Normalize3(Floats(l + 0x34, 3));
+                n_dot_vp = std::max(0.f, Dot3(eye_normal, direction));
+                if (local_eye)
+                {
+                    const Vec4 h = Normalize3(Vec4{{direction[0] + eye_dir[0], direction[1] + eye_dir[1], direction[2] + eye_dir[2], 0}});
+                    n_dot_hv = std::max(0.f, Dot3(eye_normal, h));
+                }
+                else
+                    n_dot_hv = std::max(0.f, Dot3(eye_normal, Floats(l + 0x28, 3)));
+            }
+            else
+            {
+                const Vec4 at = Floats(l + 0x5c, 3);
+                Vec4 vp{{at[0] - p[0], at[1] - p[1], at[2] - p[2], 0}};
+                const float d = std::sqrt(Dot3(vp, vp));
+                if (d > k.F(l + 0x24)) // out of range
+                    continue;
+                vp = Normalize3(vp);
+                const Vec4 att = Floats(l + 0x68, 3);
+                const float denominator = att[0] + att[1] * d + att[2] * d * d;
+                attenuation = denominator != 0 ? 1 / denominator : 1;
+                const Vec4 h = Normalize3(Vec4{{vp[0] + eye_dir[0], vp[1] + eye_dir[1], vp[2] + eye_dir[2], 0}});
+                n_dot_vp = std::max(0.f, Dot3(eye_normal, vp));
+                n_dot_hv = std::max(0.f, Dot3(eye_normal, h));
+                if (type == 3) // spot: s = dot(direction, VP) + w, through (s + L) / (M s + N)
+                {
+                    const Vec4 spot = Floats(l + 0x4c);
+                    const float sv = Dot3(spot, vp) + spot[3];
+                    if (sv <= 0)
+                        attenuation = 0;
+                    else if (sv < 1)
+                    {
+                        Vec4 falloff = Floats(l + 0x40, 3);
+                        if (falloff[0] == 0 && falloff[1] == 0 && falloff[2] == 0)
+                            falloff = Vec4{{0, -0.494592f, 1.494592f, 0}};
+                        float factor = 0;
+                        if (sv > -falloff[0])
+                        {
+                            const float denom = falloff[1] * sv + falloff[2];
+                            factor = denom == 0 ? 1 : denom > 0 ? std::clamp((sv + falloff[0]) / denom, 0.f, 1.f) : 0;
+                        }
+                        attenuation *= factor;
+                    }
+                }
+            }
+            float pf = 0;
+            if (n_dot_vp > 0 && n_dot_hv > -params[0])
+            {
+                const float denom = params[1] * n_dot_hv + params[2];
+                pf = denom == 0 ? 10000.f : denom > 0 ? std::clamp((n_dot_hv + params[0]) / denom, 0.f, 10000.f) : 0;
+            }
+            const Vec4 ambient = Floats(l, 3), diffuse_color = Floats(l + 0xc, 3), specular_color = Floats(l + 0x18, 3);
+            for (int c = 0; c < 3; c++)
+            {
+                const float a = ambient[c] * attenuation, dl = diffuse_color[c] * attenuation * n_dot_vp;
+                const float sl = specular_color[c] * attenuation * pf;
+                d0[c] += ambient_src == 0 ? a : source(ambient_src)[c] * a;
+                d0[c] += diffuse_src == 0 ? dl : source(diffuse_src)[c] * dl;
+                d1[c] += specular_src == 0 ? sl : source(specular_src)[c] * sl;
+            }
+        }
+    }
+    if (!specular_enable)
+        d1 = Vec4{{0, 0, 0, 1}};
+    else
+    {
+        if (!separate_specular)
+        {
+            if (lighting)
+                for (int c = 0; c < 3; c++)
+                    d0[c] += d1[c];
+            d1 = specular;
+        }
+        if (!(light_control & (1u << 17))) // alpha from the material's specular: else 1
+            d1[3] = 1;
+    }
+    for (int c = 0; c < 4; c++)
+        d0[c] = std::clamp(d0[c], 0.f, 1.f), d1[c] = std::clamp(d1[c], 0.f, 1.f);
+    out[3] = d0, out[4] = d1;
+    out[7] = in[7], out[8] = in[8];
+    out[5] = in[5];
+
+    // the position: the composite matrix (the model-view one already in it, unless skinning), the
+    // divide by w, the viewport's offset
+    Vec4 pos = Transform(count == 0 ? position : eye_position, 0x680);
+    float w = pos[3];
+    if (std::fabs(w) < 1e-20f)
+        w = w < 0 ? -1e-20f : 1e-20f;
+    const Vec4 offset = Floats(0xa20);
+    out[0] = Vec4{{pos[0] / w + offset[0], pos[1] / w + offset[1], pos[2] / w, w}};
+}
+
 void EmitVertex(const Vec4 in[16])
 {
     Vertex v;
-    RunProgram(in, v.o);
+    if ((g_kelvin.Get(0x1e94) & 3) == 2) // SET_TRANSFORM_EXECUTION_MODE: a program
+        RunProgram(in, v.o);
+    else
+        FixedFunction(in, v.o);
     g_vertices.push_back(v);
 }
 
@@ -227,6 +469,104 @@ void ArrayVertex(u32 index)
     for (int a = 0; a < 16; a++)
         in[a] = FetchAttribute(a, index);
     EmitVertex(in);
+}
+
+// ---- the attributes' current values (SET_VERTEX3F, SET_NORMAL3F, SET_DIFFUSE_COLOR4UB, ...,
+// SET_VERTEX_DATA*): what an attribute without an array holds; the position's last part ends a vertex
+
+void CurrentAttribute(u32 method, u32 parameter)
+{
+    auto f = [&] { float v; std::memcpy(&v, &parameter, 4); return v; };
+    auto lo = [&] { return float(int16_t(parameter & 0xffff)); };
+    auto hi = [&] { return float(int16_t(parameter >> 16)); };
+    auto ub = [&](Vec4& v) {
+        for (int c = 0; c < 4; c++)
+            v[c] = float((parameter >> (8 * c)) & 0xff) / 255.f;
+    };
+    Vec4* a = g_attribute_default;
+    bool ends_vertex = false;
+    // floats into an attribute from `base`, `n` of them; `w1`: the fourth set to 1
+    auto floats = [&](u32 base, int attr, bool w1, int last) {
+        const int slot = int(method - base) / 4;
+        a[attr][slot] = f();
+        if (w1)
+            a[attr][3] = 1;
+        ends_vertex = attr == 0 && slot == last;
+    };
+    auto shorts2 = [&](int attr) { a[attr] = Vec4{{lo(), hi(), 0, 1}}; };
+    auto shorts4 = [&](u32 base, int attr) {
+        const int part = int(method - base) / 4;
+        a[attr][part * 2] = lo(), a[attr][part * 2 + 1] = hi();
+    };
+    if (method < 0x150c) floats(0x1500, 0, true, 2);                                // VERTEX3F
+    else if (method >= 0x1518 && method < 0x1528) floats(0x1518, 0, false, 3);      // VERTEX4F
+    else if (method >= 0x1530 && method < 0x153c) floats(0x1530, 2, false, -1);     // NORMAL3F
+    else if (method >= 0x1540 && method < 0x1548)                                   // NORMAL3S
+    {
+        const int part = int(method - 0x1540) / 4;
+        a[2][part * 2] = std::max(-1.f, lo() / 32767.f);
+        if (part == 0)
+            a[2][1] = std::max(-1.f, hi() / 32767.f);
+    }
+    else if (method >= 0x1550 && method < 0x1560) floats(0x1550, 3, false, -1);     // DIFFUSE_COLOR4F
+    else if (method >= 0x1560 && method < 0x156c) floats(0x1560, 3, true, -1);      // DIFFUSE_COLOR3F
+    else if (method == 0x156c) ub(a[3]);                                            // DIFFUSE_COLOR4UB
+    else if (method >= 0x1570 && method < 0x1580) floats(0x1570, 4, false, -1);     // SPECULAR_COLOR4F
+    else if (method >= 0x1580 && method < 0x158c) floats(0x1580, 4, true, -1);      // SPECULAR_COLOR3F
+    else if (method == 0x158c) ub(a[4]);                                            // SPECULAR_COLOR4UB
+    else if (method >= 0x1590 && method < 0x1640)                                   // TEXCOORD0..3
+    {
+        // per stage: 2F, 2S, 4F, 4S at these offsets
+        static const u32 k2f[4] = {0x1590, 0x15b8, 0x15e0, 0x1608}, k2s[4] = {0x1598, 0x15c0, 0x15e8, 0x1610};
+        static const u32 k4f[4] = {0x15a0, 0x15c8, 0x15f0, 0x1620}, k4s[4] = {0x15b0, 0x15d8, 0x1600, 0x1630};
+        for (int s = 0; s < 4; s++)
+        {
+            const int attr = 9 + s;
+            if (method >= k2f[s] && method < k2f[s] + 8) { floats(k2f[s], attr, false, -1); a[attr][2] = 0, a[attr][3] = 1; }
+            else if (method == k2s[s]) shorts2(attr);
+            else if (method >= k4f[s] && method < k4f[s] + 16) floats(k4f[s], attr, false, -1);
+            else if (method >= k4s[s] && method < k4s[s] + 8) shorts4(k4s[s], attr);
+        }
+    }
+    else if (method == 0x1698) { const float v = f(); a[5] = Vec4{{v, v, v, v}}; }  // FOG_COORD
+    else if (method == 0x169c) a[1] = Vec4{{f(), 0, 0, 1}};                          // WEIGHT1F
+    else if (method >= 0x16a0 && method < 0x16d0)                                   // WEIGHT2F..4F
+    {
+        const u32 base = method < 0x16b0 ? 0x16a0 : method < 0x16c0 ? 0x16b0 : 0x16c0;
+        floats(base, 1, false, -1);
+    }
+    else if (method >= 0x1880 && method < 0x1900)                                   // VERTEX_DATA2F_M
+    {
+        const int slot = int(method - 0x1880) / 4, attr = slot / 2, part = slot % 2;
+        a[attr][part] = f(), a[attr][2] = 0, a[attr][3] = 1;
+        ends_vertex = attr == 0 && part == 1;
+    }
+    else if (method >= 0x1900 && method < 0x1940)                                   // VERTEX_DATA2S
+    {
+        const int attr = int(method - 0x1900) / 4;
+        shorts2(attr);
+        ends_vertex = attr == 0;
+    }
+    else if (method >= 0x1940 && method < 0x1980)                                   // VERTEX_DATA4UB
+    {
+        const int attr = int(method - 0x1940) / 4;
+        ub(a[attr]);
+        ends_vertex = attr == 0;
+    }
+    else if (method >= 0x1980 && method < 0x1a00)                                   // VERTEX_DATA4S_M
+    {
+        const int slot = int(method - 0x1980) / 4, attr = slot / 2, part = slot % 2;
+        a[attr][part * 2] = lo(), a[attr][part * 2 + 1] = hi();
+        ends_vertex = attr == 0 && part == 1;
+    }
+    else if (method >= 0x1a00 && method < 0x1b00)                                   // VERTEX_DATA4F_M
+    {
+        const int slot = int(method - 0x1a00) / 4, attr = slot / 4, part = slot % 4;
+        a[attr][part] = f();
+        ends_vertex = attr == 0 && part == 3;
+    }
+    if (ends_vertex && g_primitive)
+        EmitVertex(g_attribute_default);
 }
 
 // INLINE_ARRAY: the enabled attributes of each vertex, one after another
@@ -314,7 +654,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         logged++;
         Log("nv2a: triangle area %g; surface %#x %ux%u swizzled %d; cull %u/%#x front %#x; depth test %u func %#x "
             "write %u; color mask %#x; zeta %#x",
-            area, cs.address, cs.width, cs.height, cs.swizzled, k.Get(0x308), k.Get(0x39c), k.Get(0x3b8), k.Get(0x30c),
+            area, cs.address, cs.width, cs.height, cs.swizzled, k.Get(0x308), k.Get(0x39c), k.Get(0x3a0), k.Get(0x30c),
             k.Get(0x354), k.Get(0x35c), k.Get(0x358), zs.address);
     }
     if (area == 0)
@@ -325,7 +665,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
         // screen y points down: a positive area is clockwise on screen; front is clockwise unless
         // SET_FRONT_FACE says counter-clockwise (0x901), as in Direct3D
         const bool clockwise = area > 0;
-        const bool front = k.Get(0x3b8) == 0x901 ? !clockwise : clockwise;
+        const bool front = k.Get(0x3a0) == 0x901 ? !clockwise : clockwise;
         const u32 cull = k.Get(0x39c);
         if ((cull == 0x404 && front) || (cull == 0x405 && !front) || cull == 0x408)
             return;
@@ -705,14 +1045,9 @@ void DrawMethod(u32 method, u32 parameter)
             g_constant_word = 0, g_constant_cursor++;
         return;
     }
-    if (method >= 0x1500 && method < 0x1700) // SET_VERTEX4F and friends: the attributes' current values
+    if ((method >= 0x1500 && method < 0x1700) || (method >= 0x1880 && method < 0x1b00))
     {
-        if (method >= 0x1518 && method < 0x1528)
-        {
-            std::memcpy(&g_attribute_default[0][(method - 0x1518) / 4], &parameter, 4);
-            if (method == 0x1524 && g_primitive) // the fourth component ends a vertex
-                EmitVertex(g_attribute_default);
-        }
+        CurrentAttribute(method, parameter);
         return;
     }
     switch (method)
