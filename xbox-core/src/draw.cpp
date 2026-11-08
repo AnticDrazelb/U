@@ -6,6 +6,7 @@
 //
 // The vertex program's encoding is the NV2A's (xemu documents it in pgraph/glsl/vsh-prog.c).
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -1287,7 +1288,90 @@ void Flush()
             }
         }
     }
-    const std::vector<ScreenVertex>& sv = flat.empty() ? s : flat;
+    const std::vector<ScreenVertex>* source = flat.empty() ? &s : &flat;
+    // Clipping, as the NV2A clips: in front of the eye (w > 0) and, unless SET_ZMIN_MAX_CONTROL clamps
+    // z (bit 4), between SET_CLIP_MIN and SET_CLIP_MAX in z. A vertex behind the eye was divided by
+    // its w and lands mirrored on the screen, so a triangle crossing the eye's plane came out as a
+    // huge inverted one (garbage across the picture, and hundreds of full-screen fills a frame).
+    // (x*w, y*w, z*w, w) of the divided position is linear in clip space, and so are the other
+    // outputs: each triangle is cut against the planes there (Sutherland-Hodgman) and divided again.
+    std::vector<ScreenVertex> clipped_vertices;
+    {
+        constexpr float kMinW = 1e-5f;
+        const bool clip_z = !(g_kelvin.Get(0x1d78) & 0x10);
+        const float zmin = std::bit_cast<float>(g_kelvin.Get(0x394)), zmax = std::bit_cast<float>(g_kelvin.Get(0x398));
+        const bool z_range = clip_z && zmax > zmin;
+        auto distances = [&](const ScreenVertex& v, float d[3]) {
+            const float w = v.o[0][3], hz = v.o[0][2] * w;
+            d[0] = w - kMinW;
+            d[1] = z_range ? hz - zmin * w : 1.f;
+            d[2] = z_range ? zmax * w - hz : 1.f;
+        };
+        bool any = false;
+        for (const Tri& t : tris)
+            for (u32 v : t.v)
+            {
+                float d[3];
+                distances((*source)[v], d);
+                any |= !(d[0] >= 0 && d[1] >= 0 && d[2] >= 0);
+            }
+        if (any)
+        {
+            std::vector<Tri> kept;
+            kept.reserve(tris.size());
+            clipped_vertices = *source;
+            // the point a fraction t from p to q, as a new vertex
+            auto between = [&](u32 pi, u32 qi, float t) {
+                const ScreenVertex p = clipped_vertices[pi], q = clipped_vertices[qi];
+                Vertex v;
+                for (int i = 1; i < 16; i++)
+                    for (int c = 0; c < 4; c++)
+                        v.o[i][c] = p.o[i][c] + (q.o[i][c] - p.o[i][c]) * t;
+                const float wp = p.o[0][3], wq = q.o[0][3], w = wp + (wq - wp) * t;
+                for (int c = 0; c < 3; c++)
+                {
+                    const float hp = p.o[0][c] * wp, hq = q.o[0][c] * wq;
+                    v.o[0][c] = (hp + (hq - hp) * t) / w;
+                }
+                v.o[0][3] = w;
+                clipped_vertices.push_back(ToScreen(v));
+                return u32(clipped_vertices.size() - 1);
+            };
+            for (const Tri& t : tris)
+            {
+                std::vector<u32> poly(t.v, t.v + 3), next;
+                for (int plane = 0; plane < 3 && !poly.empty(); plane++)
+                {
+                    next.clear();
+                    for (size_t e = 0; e < poly.size(); e++)
+                    {
+                        const u32 a = poly[e], b = poly[(e + 1) % poly.size()];
+                        float da[3], db[3];
+                        distances(clipped_vertices[a], da);
+                        distances(clipped_vertices[b], db);
+                        if (da[plane] >= 0)
+                            next.push_back(a);
+                        if ((da[plane] >= 0) != (db[plane] >= 0))
+                            next.push_back(between(a, b, da[plane] / (da[plane] - db[plane])));
+                    }
+                    poly.swap(next);
+                }
+                if (poly.size() == 3 && poly[0] == t.v[0] && poly[1] == t.v[1] && poly[2] == t.v[2])
+                    kept.push_back(t);
+                else
+                    for (size_t i = 1; i + 1 < poly.size(); i++)
+                        kept.push_back({{poly[0], poly[i], poly[i + 1]}, t.provoking, 7});
+            }
+            tris.swap(kept);
+            source = &clipped_vertices;
+            if (tris.empty())
+            {
+                g_vertices.clear();
+                return;
+            }
+        }
+    }
+    const std::vector<ScreenVertex>& sv = *source;
     PreparePixels();
     // polygon modes (SET_FRONT/BACK_POLYGON_MODE: 0x1b00 points, 0x1b01 lines, else filled): those
     // triangles become their outline's lines or vertices, on this thread
@@ -1327,10 +1411,15 @@ void Flush()
         tris.swap(filled);
     }
     float pixels = 0;
+    const Surface on = ColorSurface();
     for (const auto& t : tris)
     {
         const ScreenVertex &a = sv[t.v[0]], &b = sv[t.v[1]], &c = sv[t.v[2]];
-        pixels += std::fabs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5f;
+        // its area, but no more than the part of its bounding box on the surface (one reaching far
+        // past the screen covers at most the screen)
+        const float bw = std::clamp(std::max({a.x, b.x, c.x}), 0.f, float(on.width)) - std::clamp(std::min({a.x, b.x, c.x}), 0.f, float(on.width));
+        const float bh = std::clamp(std::max({a.y, b.y, c.y}), 0.f, float(on.height)) - std::clamp(std::min({a.y, b.y, c.y}), 0.f, float(on.height));
+        pixels += std::min(std::fabs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5f, bw * bh);
     }
     const int parts = pixels < 4096 ? 1 : RasterThreads();
     const auto start = std::chrono::steady_clock::now();

@@ -1,6 +1,6 @@
 // xbox-core: runs an original Xbox program (XBE) on this machine's CPU.
 //
-//   xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC | --pad button@seconds,...] [-v 0|1|2]
+//   xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC | --pad button@seconds,...] [--shots prefix] [-v 0|1|2]
 //
 // --seconds stops it after S seconds (Xbox programs rarely end on their own); --png saves the
 // picture on the screen at the end; --wav records the sound. --pad holds controller input from the
@@ -59,7 +59,7 @@ bool ParsePad(const std::string& spec, xb::PadState& pad)
 int main(int argc, char** argv)
 {
     using namespace xb;
-    std::string xbe, png, wav, pad;
+    std::string xbe, png, wav, pad, shots;
     for (int i = 1; i < argc; i++)
     {
         const std::string a = argv[i];
@@ -71,6 +71,8 @@ int main(int argc, char** argv)
             wav = argv[++i];
         else if (a == "--pad" && i + 1 < argc)
             pad = argv[++i];
+        else if (a == "--shots" && i + 1 < argc)
+            shots = argv[++i];
         else if (a == "-v" && i + 1 < argc)
             g_verbose = std::atoi(argv[++i]);
         else
@@ -78,7 +80,7 @@ int main(int argc, char** argv)
     }
     if (xbe.empty())
     {
-        Log("usage: xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC | --pad button@seconds,...] [-v 0|1|2]");
+        Log("usage: xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC | --pad button@seconds,...] [--shots prefix] [-v 0|1|2]");
         return 1;
     }
     // --wav: what the program plays, recorded (48 kHz, 16-bit stereo)
@@ -144,6 +146,19 @@ int main(int argc, char** argv)
         std::thread([state] {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             SetPad(state);
+        }).detach();
+    }
+    if (!shots.empty())
+    {
+        // the screen every second: <prefix>-001.png, -002.png, ... (to follow a game through its menus)
+        std::thread([shots] {
+            for (int n = 1;; n++)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                char name[32];
+                std::snprintf(name, sizeof(name), "-%03d.png", n);
+                SaveFramebuffer(shots + name);
+            }
         }).detach();
     }
     RunXbe();
