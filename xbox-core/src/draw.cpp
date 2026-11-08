@@ -469,8 +469,8 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
 }
 
 // The fog factor from the fog distance in output 5 (SET_FOG_MODE, SET_FOG_PARAMS), as the NV2A
-// computes it per vertex: linear x + d*y; exp and exp2 through powers of two; "abs" modes take the
-// magnitude. 1 when fog is off.
+// computes it per vertex: linear x + d*y; exp and exp2 through powers of two; "abs" modes use the
+// distance's magnitude. 1 when fog is off.
 void FogFactor(Vec4 out[16])
 {
     const KelvinState& k = g_kelvin;
@@ -479,17 +479,19 @@ void FogFactor(Vec4 out[16])
         out[5] = Vec4{{1, 1, 1, 1}};
         return;
     }
-    const float d = out[5][0], x = k.F(0x9c0), y = k.F(0x9c4);
     const u32 mode = k.Get(0x29c);
+    // the "abs" modes (EXP_ABS 0x802, EXP2_ABS 0x803, LINEAR_ABS 0x804) take the distance's magnitude
+    const bool abs_mode = mode == 0x802 || mode == 0x803 || mode == 0x804;
+    const float d = abs_mode ? std::fabs(out[5][0]) : out[5][0], x = k.F(0x9c0), y = k.F(0x9c4);
     float f;
-    if (mode == 0x800 || mode == 0x802) // exp
+    if (mode == 0x800) // exp
         f = x + std::exp2(d * y * 16.f) - 1.5f;
+    else if (mode == 0x802) // exp_abs: the exponent's magnitude, negated (as the console shows it)
+        f = x + std::exp2(-std::fabs(d * y) * 16.f) - 1.5f;
     else if (mode == 0x801 || mode == 0x803) // exp2
         f = x + std::exp2(-d * d * y * y * 32.f) - 1.5f;
     else // linear
         f = x + d * y - 1.f;
-    if (mode == 0x802 || mode == 0x803 || mode == 0x804)
-        f = std::fabs(f);
     if (std::isinf(d))
         f = mode == 0x802 || mode == 0x803 ? 0.f : 1.f;
     else if (std::isnan(f))
