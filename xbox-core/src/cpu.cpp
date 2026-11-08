@@ -408,6 +408,7 @@ GuestThread* CurrentThread()
 
 void InitCpu()
 {
+    Log("cpu: looking up the platform's functions");
     const std::string problem = platform::Init();
     if (!problem.empty())
         Fatal("%s", problem.c_str());
@@ -457,6 +458,7 @@ void InitCpu()
     const u8 test[] = {0x64, 0xa1, 0x18, 0x00, 0x00, 0x00, 0xc3}; // mov eax, fs:[0x18]; ret
     std::memcpy(Ptr(code), test, sizeof(test));
     GuestThread* t = NewGuestThread(0x4000, 0, "self-test");
+    Log("cpu self-test: switching to 32-bit code (if the app dies here, the console refuses it)");
     const u32 got = u32(CallGuest(t, code, {}));
     if (got != t->kpcr)
         Fatal("cpu self-test: guest code read fs:[0x18] = %#x, expected the KPCR %#x", got, t->kpcr);

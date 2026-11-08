@@ -190,15 +190,17 @@ Screen g_screen;
 std::mutex g_log_mutex;
 std::deque<std::string> g_log_lines;
 FILE* g_log_file = nullptr;
+FILE* g_usb_log = nullptr; // the same lines on a USB drive as they come: there even after a crash
 
 void LogSink(const char* line)
 {
     std::lock_guard lock(g_log_mutex);
-    if (g_log_file)
-    {
-        std::fprintf(g_log_file, "%s\n", line);
-        std::fflush(g_log_file);
-    }
+    for (FILE* f : {g_log_file, g_usb_log})
+        if (f)
+        {
+            std::fprintf(f, "%s\n", line);
+            std::fflush(f);
+        }
     g_log_lines.push_back(line);
     const std::string l = line;
     if (l.rfind("FATAL", 0) == 0 || l.find("guest fault") != std::string::npos || l.find("guest halted") != std::string::npos)
@@ -445,6 +447,8 @@ std::string Menu(const std::vector<Entry>& xbes)
 
 // The library: the front end's screen, the pad's presses (held directions repeat; the left stick
 // steers too), until a game is chosen. "" when the screen can't be drawn that way (fonts missing).
+std::vector<std::string> UsbLogFolders();
+
 std::string Library(const std::vector<std::string>& system)
 {
     fe::LibraryPaths paths{{"/app0/samples"}, "/data/xbox-core/games", "/data/xbox-core/covers", kHistoryFile};
@@ -459,7 +463,23 @@ std::string Library(const std::vector<std::string>& system)
                           {"/data/xbox-core/boot-trace.log", 60}, {kLogFile, 60}},
                          "/data/xbox-core/diagnostics.txt",
                          kDataDir};
-    fe::LibraryUi ui(fe::ScanLibrary(paths), g_settings, ui_paths, XB_VERSION);
+    std::vector<fe::Game> games = fe::ScanLibrary(paths);
+    {
+        // a diagnostics report every time, in the data folder and the USB drives' log folders
+        fe::DiagnosticsInput d;
+        d.system = system;
+        d.settings = &g_settings;
+        d.games = games;
+        d.usb_roots = fe::UsbRoots(ui_paths.usb);
+        d.data_dir = kDataDir;
+        d.logs = ui_paths.logs;
+        std::vector<std::string> outputs{ui_paths.report};
+        for (const std::string& dir : UsbLogFolders())
+            outputs.push_back(dir + "/diagnostics.txt");
+        for (const std::string& w : fe::WriteDiagnostics(d, outputs))
+            Log("diagnostics report: %s", w.c_str());
+    }
+    fe::LibraryUi ui(std::move(games), g_settings, ui_paths, XB_VERSION);
     if (!ui.Ready())
         return "";
     std::string user = "Player";
@@ -595,6 +615,51 @@ void PresentLoop()
     }
 }
 
+// USB drives' log folders: <drive>/xbox-core-logs, made where a drive is there.
+std::vector<std::string> UsbLogFolders()
+{
+    std::vector<std::string> out;
+    for (const std::string& root : fe::UsbRoots({"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4",
+                                                 "/mnt/usb5", "/mnt/usb6", "/mnt/usb7"}))
+    {
+        const std::string dir = root + "/xbox-core-logs";
+        mkdir(dir.c_str(), 0777);
+        struct stat st;
+        if (stat(dir.c_str(), &st) == 0)
+            out.push_back(dir);
+    }
+    return out;
+}
+
+void CopyFileTo(const std::string& from, const std::string& to)
+{
+    FILE* in = std::fopen(from.c_str(), "rb");
+    if (!in)
+        return;
+    if (FILE* out = std::fopen(to.c_str(), "wb"))
+    {
+        char buf[65536];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0)
+            std::fwrite(buf, 1, n, out);
+        std::fclose(out);
+    }
+    std::fclose(in);
+}
+
+// What the last session left (its log, the crash log, the boot trace) onto each USB drive, at the
+// start, before anything that could fail: after a crash, opening the app again puts them there.
+void SaveLogsToUsb(const std::vector<std::string>& folders)
+{
+    const std::pair<const char*, const char*> files[] = {
+        {"/data/xbox-core/log.txt", "previous-log.txt"},       {"/data/xbox-core/crash.log", "crash.log"},
+        {"/data/xbox-core/boot-trace.log", "boot-trace.log"}, {"/data/xbox-core/boot-trace-launcher.log", "boot-trace-launcher.log"},
+        {"/data/xbox-core/boot-trace-game.log", "boot-trace-game.log"}, {"/data/xbox-core/history.txt", "history.txt"}};
+    for (const std::string& dir : folders)
+        for (const auto& [from, name] : files)
+            CopyFileTo(from, dir + "/" + name);
+}
+
 void LoadSystemModules()
 {
     const std::pair<const char*, uint32_t> modules[] = {{"SystemService", 0x80000010},
@@ -616,9 +681,14 @@ int main()
 {
     mkdir(kDataDir, 0777);
     mkdir("/data/xbox-core/games", 0777);
-    // the last session's log stays for the diagnostics report (it ran the game being asked about)
+    // the last session's files onto USB drives first, then its log kept for the diagnostics report
+    // (it ran the game being asked about); this session's log goes to the drive as it's written
+    const std::vector<std::string> usb_logs = UsbLogFolders();
+    SaveLogsToUsb(usb_logs);
     std::rename(kLogFile, "/data/xbox-core/log-previous.txt");
     g_log_file = std::fopen(kLogFile, "w");
+    if (!usb_logs.empty())
+        g_usb_log = std::fopen((usb_logs.front() + "/live-log.txt").c_str(), "w");
     g_log_sink = LogSink;
     g_fatal_hook = [] {
         for (;;)
@@ -672,16 +742,23 @@ int main()
     g_running = xbe;
     fe::RecordRun(kHistoryFile, xbe, "");
     std::thread([xbe] {
+        Log("launch: setting up memory");
         InitMemory();
+        Log("launch: setting up the CPU");
         InitCpu();
+        Log("launch: devices");
         InitDevices();
+        Log("launch: kernel");
         InitKernel();
+        Log("launch: loading %s", xbe.c_str());
         std::string error;
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
         SetDataDirectory("/data/xbox-core/hdd");
+        Log("launch: kernel imports");
         ResolveThunks();
         StartVblank();
+        Log("launch: running the program");
         RunXbe();
         RecordResult("Ended by itself");
         Log("the program ended; close the app (PS button) to choose another");

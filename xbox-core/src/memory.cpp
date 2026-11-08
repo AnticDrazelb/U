@@ -188,6 +188,7 @@ void InitMemory()
             end = (end + page - 1) & ~(page - 1);
             if (start > at)
             {
+                Log("memory: mapping the %s at %#x (%#x bytes)", r.what, at, start - at);
                 std::string e;
                 if (!MapGuest(at, start - at, r.exec, e))
                     Fatal("%s at %#x (%#x bytes): %s", r.what, at, start - at, e.c_str());
