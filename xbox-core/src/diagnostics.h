@@ -40,7 +40,9 @@ void LogState(const char* title);
 // The stats line every 10 s, and the hang watchdog: frames (or draws) stop for 20 s after some
 // came, or none 90 s after the start: the guest's state to hang.log (once, until they come again),
 // with the host's thread stacks if `host_stacks` is given (the PS4's crash log can).
-void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char* file, const char* title));
+// `after`: called after each snapshot (the PS4 writes the log bundle then).
+void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char* file, const char* title),
+                  void (*after)());
 
 // A program running (RunXbe) or not: the watchdog watches only while one is, from its start.
 void SetRunning(bool running);

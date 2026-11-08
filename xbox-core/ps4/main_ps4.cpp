@@ -697,7 +697,12 @@ int main()
     g_system = {std::string("xbox-core ") + XB_VERSION + " (written as the app started)"};
     WriteLogBundle({});
     if (const std::vector<std::string> drives = UsbDrives(); !drives.empty())
+    {
+        // the last run's live log kept (reopening the app to bundle the logs mustn't wipe it)
+        std::rename((drives.front() + "/xbox-core-live-log.txt").c_str(),
+                    (drives.front() + "/xbox-core-live-log-previous.txt").c_str());
         g_usb_log = std::fopen((drives.front() + "/xbox-core-live-log.txt").c_str(), "w");
+    }
     g_log_sink = LogSink;
     {
         struct sigaction action;
@@ -775,13 +780,13 @@ int main()
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
         SetDataDirectory("/data/xbox-core/hdd");
-        diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks);
-        // the logs onto the USB drives every minute while it runs: a console that freezes hard
-        // (nothing runs to write them) still leaves the last minute's
+        diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks, [] { WriteLogBundle({}); });
+        // the logs onto the USB drives every 15 s while it runs: a console that freezes hard
+        // (nothing runs to write them), or an app closed from the home screen, still leaves them
         std::thread([] {
             for (;;)
             {
-                std::this_thread::sleep_for(std::chrono::seconds(60));
+                std::this_thread::sleep_for(std::chrono::seconds(15));
                 WriteLogBundle({});
             }
         }).detach();

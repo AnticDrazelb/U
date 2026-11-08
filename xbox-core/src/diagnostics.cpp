@@ -66,6 +66,10 @@ void Put(Out out, const char* fmt, ...)
 std::atomic<bool> g_run{false};
 std::atomic<u32> g_run_number{0};
 std::atomic<u32> g_failures_logged{0};
+// every kernel call, as it starts and as it ends, for the first ones of a run: the start-up's
+// every step, and the last thing a program did before it stopped
+constexpr u32 kTraceCalls = 5000;
+std::atomic<u32> g_traced{0};
 
 const char* Name(u32 ordinal)
 {
@@ -118,6 +122,8 @@ void CallStarted(GuestThread* t, u32 ordinal, u32 a0, u32 a1, u32 a2, u32 a3, u3
     t->calls[i] = {ordinal, a0, a1, a2, a3, return_eip, 0, float(Seconds())};
     t->in_call = ordinal + 1;
     t->call_started = float(Seconds());
+    if (g_traced++ < kTraceCalls)
+        Log("call %u> %s(%#x, %#x, %#x, %#x) from %#x", t->id, Name(ordinal), a0, a1, a2, a3, return_eip);
 }
 
 void CallEnded(GuestThread* t, u32 result)
@@ -129,6 +135,8 @@ void CallEnded(GuestThread* t, u32 result)
     {
         CallRecord& r = t->calls[(n - 1) % GuestThread::kCallRecords];
         r.result = result;
+        if (g_traced < kTraceCalls)
+            Log("call %u< %s = %#x", t->id, Name(r.ordinal), result);
         // an NTSTATUS error (nothing of the guest's is at 0xc0000000: no pointer looks like one)
         if (result >= 0xC0000000u && result < 0xC0010000u && g_failures_logged++ < 3000)
             Log("kernel: %s(%#x, %#x, %#x, %#x) from %#x failed: %#x", Name(r.ordinal), r.a0, r.a1, r.a2, r.a3, r.eip,
@@ -219,18 +227,24 @@ void LogState(const char* title)
 void SetRunning(bool running)
 {
     if (running)
+    {
         g_run_number++;
+        g_traced = 0;
+        Log("trace: the first %u kernel calls, each as it starts (\"call <thread>>\") and ends (\"call <thread><\")",
+            kTraceCalls);
+    }
     g_run = running;
 }
 
-void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*, const char*))
+void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*, const char*), void (*after)())
 {
-    std::thread([hang_file, host_stacks] {
+    std::thread([hang_file, host_stacks, after] {
         u64 last_frames = 0, last_draws = 0, last_calls = 0, last_methods = 0;
         u64 last_ordinal[400] = {};
         u32 screen_changes = 0;
         double last_activity = Seconds(), last_stats = Seconds();
         bool any_activity = false, hung = false;
+        double last_snapshot = 0;
         u32 run_number = 0;
         double run_start = Seconds();
         for (;;)
@@ -244,6 +258,7 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 run_number = g_run_number;
                 run_start = last_activity = last_stats = now;
                 any_activity = hung = false;
+                last_snapshot = 0;
             }
             const u64 frames = g_frames, draws = g_draws;
             static u64 seen_frames = 0, seen_draws = 0;
@@ -266,7 +281,8 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 if (hung)
                 {
                     hung = false;
-                    Log("hang watchdog: frames again");
+                    last_snapshot = 0;
+                    Log("watchdog: frames again");
                 }
             }
             // the figures, every 10 s
@@ -296,24 +312,32 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 last_stats = now;
                 screen_changes = 0;
             }
-            // the watchdog
+            // the watchdog: no picture 10 s into a program, or none for 10 s after there was one: a
+            // snapshot of every thread (the guest's and the host's: where each is running), and again
+            // every 30 s while it lasts (does it move?), each into the log bundle
             const double quiet = now - last_activity;
-            if (!hung && ((any_activity && quiet >= 20) || (!any_activity && now - run_start >= 90)))
+            if (quiet >= 10 && (last_snapshot == 0 || now - last_snapshot >= 30))
             {
-                hung = true;
-                const char* reason = any_activity ? "no frames, draws or picture changes for 20 s after they had started"
-                                                  : "no frame, draw or picture 90 s after the program started";
-                Log("hang watchdog: %s: every thread's state in %s and below", reason, hang_file.c_str());
+                if (!hung)
+                    hung = true;
+                last_snapshot = now;
+                const char* reason = any_activity ? "no frames, draws or picture changes for 10 s after they had started"
+                                                  : "no frame, draw or picture yet";
+                Log("watchdog: %s (%.0f s into the program): every thread's state in %s and below", reason, now - run_start,
+                    hang_file.c_str());
                 const int fd = open(hang_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd >= 0)
                 {
-                    Put(Out{fd}, "hang watchdog at %.1f s: %s\n\n", now, reason);
+                    Put(Out{fd}, "watchdog at %.1f s (%.0f s into the program), xbox-core built %s %s: %s\n\n", now,
+                        now - run_start, __DATE__, __TIME__, reason);
                     WriteStateLockFree(fd);
                     close(fd);
                 }
                 if (host_stacks)
-                    host_stacks(hang_file.c_str(), "every host thread at the hang");
-                LogState("hang");
+                    host_stacks(hang_file.c_str(), "every host thread (a guest thread's rip is its EIP)");
+                LogState("watchdog");
+                if (after)
+                    after();
             }
         }
     }).detach();

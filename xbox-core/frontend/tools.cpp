@@ -476,7 +476,16 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
             uint64_t size = 0;
             const std::string text = ReadEnd(in.data_dir + "/" + n, kLimit, size);
             line("");
-            line("===== " + n + " (" + std::to_string(size) + " bytes" + (size > kLimit ? ", its last 8 MiB" : "") + ") =====");
+            std::string when;
+            struct stat st;
+            if (stat((in.data_dir + "/" + n).c_str(), &st) == 0)
+            {
+                char b[40];
+                const time_t t = st.st_mtime;
+                std::strftime(b, sizeof(b), ", written %Y-%m-%d %H:%M:%S", std::localtime(&t));
+                when = b;
+            }
+            line("===== " + n + " (" + std::to_string(size) + " bytes" + (size > kLimit ? ", its last 8 MiB" : "") + when + ") =====");
             r += Symbolize(text, symbols);
             if (!r.empty() && r.back() != '\n')
                 r += '\n';
