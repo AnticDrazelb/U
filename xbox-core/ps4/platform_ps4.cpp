@@ -50,13 +50,13 @@ namespace {
 
 constexpr uint32_t kPage = 16 * 1024;
 constexpr int32_t kMapFixed = 0x10;
-constexpr int kSigIll = 4, kSigBus = 10, kSigSegv = 11, kSaSiginfo = 0x40, kSaOnstack = 0x1;
+constexpr int kSigIll = 4, kSigTrap = 5, kSigFpe = 8, kSigBus = 10, kSigSegv = 11, kSaSiginfo = 0x40, kSaOnstack = 0x1;
 constexpr int kMcontextOffset = 0x40;
 // FreeBSD mcontext, in 8-byte units: rdi 1, rsi 2, rdx 3, rcx 4, rax 7, rbx 8, rbp 9, addr 17,
 // rip 20, cs 21, rflags 22, rsp 23; mc_fsbase after the 512-byte FPU state (16-aligned at 28)
 constexpr int kGprIndex[8] = {7, 4, 3, 8, 23, 9, 2, 1};
 constexpr int kAddr = 17, kRip = 20, kCs = 21, kRflags = 22, kFsBase = 92;
-constexpr int kSignals[3] = {kSigSegv, kSigBus, kSigIll};
+constexpr int kSignals[5] = {kSigSegv, kSigBus, kSigIll, kSigFpe, kSigTrap};
 constexpr uint16_t kUserFs32 = 0x13; // GUFS32: the fs selector whose base is the thread's fs base
 
 using SetFsBase = int (*)(void*);
@@ -65,7 +65,7 @@ SetFsBase g_set_fsbase = nullptr;
 GetFsBase g_get_fsbase = nullptr;
 bool g_load_fs_selector = false;
 FaultHandler g_handler = nullptr;
-struct sigaction g_old[3];
+struct sigaction g_old[5];
 
 int32_t Prot(int access)
 {
@@ -152,7 +152,7 @@ void OnSignal(int sig, siginfo_t*, void* context)
         return;
     }
     // not ours: the crash log's handlers get it when the instruction runs again
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
         if (kSignals[i] == sig)
             sigaction(sig, &g_old[i], nullptr);
 }
@@ -256,7 +256,7 @@ void InstallFaultHandler(FaultHandler handler)
     std::memcpy(&action, &function, sizeof(function)); // the handler union is the first member
     action.sa_flags = kSaSiginfo | kSaOnstack;
     sigemptyset(&action.sa_mask);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
         sigaction(kSignals[i], &action, &g_old[i]);
 }
 

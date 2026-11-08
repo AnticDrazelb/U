@@ -4,7 +4,7 @@
 #   build.sh ps4    eboot.bin in ~/xc-ps4, packaged with nxdk's samples as out/xbox-core.pkg
 # The PS4 build needs Crema's toolchain and sysroot (docs/BUILDING.md); the samples come from an nxdk
 # checkout with them built (NXDK_DIR, tests/run-nxdk-samples.sh builds them); the core's tests come
-# from tests/kernel-test and tests/disc-test (make, then disc-test/make-image.sh).
+# from tests/*-test (make in each; disc-test also needs its make-image.sh).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NXDK_DIR="${NXDK_DIR:-$HOME/emu/nxdk}"
@@ -41,9 +41,11 @@ ps4)
         fi
     done
     # the core's own tests: the kernel test as an XBE, the disc test as a disc image
-    if [ -f "$HERE/tests/kernel-test/bin/default.xbe" ]; then
-        cp "$HERE/tests/kernel-test/bin/default.xbe" "$stage/samples/test-kernel.xbe"
-    fi
+    for t in kernel seh ff lines; do
+        if [ -f "$HERE/tests/$t-test/bin/default.xbe" ]; then
+            cp "$HERE/tests/$t-test/bin/default.xbe" "$stage/samples/test-$t.xbe"
+        fi
+    done
     if [ -f "$HERE/tests/disc-test/disc-test.iso" ]; then
         cp "$HERE/tests/disc-test/disc-test.iso" "$stage/samples/test-disc.iso"
     fi

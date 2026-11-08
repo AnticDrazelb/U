@@ -693,6 +693,17 @@ void InitKernel()
         }
     RegisterFileExports(Register);
     RegisterRtlExports(Register);
+    K(KeBugCheckEx) // the program's end, with its reason (an unhandled exception: 0x8e, code, address)
+    {
+        if (c.Arg(0) == 0x8e)
+            Log("kernel: unhandled exception %#x at %#x: the program ends", c.Arg(1), c.Arg(2));
+        else
+            Log("kernel: KeBugCheckEx %#x (%#x, %#x, %#x, %#x): the program ends", c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3),
+                c.Arg(4));
+        g_quit = true;
+        WakeAll();
+        ExitThread();
+    } END;
 
     // ---- debugging, firmware
     K(DbgPrint)
@@ -710,14 +721,18 @@ void InitKernel()
         WakeAll();
         ExitThread();
     } END;
-    K(RtlRaiseException)
+    K(RtlRaiseException) // record: dispatched in the guest (switch.S, xcs_raise32)
     {
         const u32 record = c.Arg(0);
-        Log("kernel: RtlRaiseException: code %#x at %#x", Read<u32>(record), Read<u32>(record + 12));
-        g_quit = true;
-        ExitThread();
+        if (!Read<u32>(record + 12))
+            Write<u32>(record + 12, c.frame->ret); // ExceptionAddress: where it was raised
+        if (g_verbose >= 2)
+            Log("kernel: exception %#x raised at %#x", Read<u32>(record), Read<u32>(record + 12));
+        // return into the dispatcher with eax = the record, edx = the eip to resume at
+        const u32 eip = c.frame->ret;
+        c.frame->ret = ExceptionDispatcher();
+        return u64(record) | u64(eip) << 32;
     } END;
-
     // ---- threads
     K(PsCreateSystemThreadEx)
     {
@@ -1230,8 +1245,33 @@ void InitKernel()
     Register("ExRaiseException", [raise](Call& c) -> u64 { raise(Read<u32>(c.Arg(0))); return 0; });
     K(RtlUnwind) // target frame, target ip, exception record, return value
     {
-        if (c.Arg(0))
-            Write<u32>(CurrentThread()->kpcr, c.Arg(0)); // NtTib.ExceptionList
+        // every handler above the target is called with the unwinding flags (they run their
+        // __finally blocks and local unwinds), and taken off the chain
+        const u32 target = c.Arg(0);
+        const u32 kpcr = CurrentThread()->kpcr;
+        u32 record = c.Arg(2);
+        const u32 own = record ? 0 : PoolAlloc(0x50 + 0x238 + 8);
+        if (own)
+        {
+            std::memset(Ptr(own), 0, 0x50 + 0x238 + 8);
+            record = own;
+            Write<u32>(record, 0xC0000027); // STATUS_UNWIND
+            Write<u32>(record + 12, c.frame->ret);
+        }
+        Write<u32>(record + 4, Read<u32>(record + 4) | (target ? 0x2u : 0x6u)); // UNWINDING (| EXIT_UNWIND)
+        const u32 context = own ? own + 0x50 : PoolAlloc(0x238 + 8);
+        const u32 dispatcher_context = context + 0x238;
+        for (u32 frame = Read<u32>(kpcr); frame && frame != 0xffffffff && frame != target;)
+        {
+            const u32 handler = Read<u32>(frame + 4);
+            CallGuestNested(handler, {record, frame, context, dispatcher_context});
+            const u32 next = Read<u32>(frame);
+            Write<u32>(kpcr, next); // NtTib.ExceptionList
+            frame = next;
+        }
+        if (target)
+            Write<u32>(kpcr, target);
+        PoolFree(own ? own : context);
         return c.Arg(3);
     } END;
 
@@ -1335,10 +1375,13 @@ void InitKernel()
     {
         const u32 ctx = c.Arg(0);
         const u32 flags = Read<u32>(ctx);
-        std::memset(Ptr(ctx + 4), 0, 0xcc - 4);
+        // the Xbox's CONTEXT: FloatSave (516 bytes) after ContextFlags, then Edi 0x208 .. SegSs 0x234
+        std::memset(Ptr(ctx + 4), 0, 0x238 - 4);
         Write<u32>(ctx, flags | 0x10007); // CONTEXT_i386 | CONTROL | INTEGER | SEGMENTS
-        Write<u32>(ctx + 0xb8, c.frame->ret);             // Eip
-        Write<u32>(ctx + 0xc4, Guest(&c.frame->args[0])); // Esp after the return
+        Write<u32>(ctx + 0x214, c.frame->edx);
+        Write<u32>(ctx + 0x218, c.frame->ecx);
+        Write<u32>(ctx + 0x224, c.frame->ret);             // Eip
+        Write<u32>(ctx + 0x230, Guest(&c.frame->args[1])); // Esp after the return (stdcall, one argument)
         return 0;
     } END;
 

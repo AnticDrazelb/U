@@ -36,8 +36,8 @@ void WrFsBase(uint64_t v)
 }
 
 FaultHandler g_handler = nullptr;
-struct sigaction g_old[3];
-constexpr int kSignals[3] = {SIGSEGV, SIGBUS, SIGILL};
+struct sigaction g_old[5];
+constexpr int kSignals[5] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
 
 void OnSignal(int sig, siginfo_t* info, void* raw)
 {
@@ -70,7 +70,7 @@ void OnSignal(int sig, siginfo_t* info, void* raw)
             WrFsBase(fs);
         return;
     }
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
         if (kSignals[i] == sig)
             sigaction(sig, &g_old[i], nullptr);
 }
@@ -158,7 +158,7 @@ void InstallFaultHandler(FaultHandler handler)
     action.sa_sigaction = OnSignal;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&action.sa_mask);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
         sigaction(kSignals[i], &action, &g_old[i]);
 }
 

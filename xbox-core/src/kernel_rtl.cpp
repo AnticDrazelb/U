@@ -600,10 +600,7 @@ void RegisterRtlExports(RegisterFn reg)
     reg("RtlCaptureStackBackTrace", [](Call& c) -> u64 { if (c.Arg(3)) Write<u32>(c.Arg(3), 0); return 0; });
     reg("RtlWalkFrameChain", [](Call&) -> u64 { return 0; });
     reg("KeBugCheck", [](Call& c) -> u64 { Fatal("kernel: KeBugCheck %#x", c.Arg(0)); return 0; });
-    reg("KeBugCheckEx", [](Call& c) -> u64 {
-        Fatal("kernel: KeBugCheckEx %#x (%#x, %#x, %#x, %#x)", c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3), c.Arg(4));
-        return 0;
-    });
+
 
     // ---- HAL, SMC and the rest that needs little more than an answer
     reg("HalReadSMCTrayState", [](Call& c) -> u64 { // closed, with a disc

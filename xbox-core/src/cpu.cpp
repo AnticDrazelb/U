@@ -11,7 +11,8 @@
 #include "platform.h"
 
 extern "C" {
-extern const unsigned char xcs_begin[], xcs_end[], xcs_enter64[], xcs_gate32[], xcs_bail64[], xcs_back64[];
+extern const unsigned char xcs_begin[], xcs_end[], xcs_enter64[], xcs_gate32[], xcs_bail64[], xcs_back64[],
+    xcs_raise32[], xcs_fault32[];
 }
 
 namespace xb {
@@ -19,7 +20,7 @@ namespace xb {
 namespace {
 
 constexpr int kSlotSel32 = 0, kSlotSel64 = 8, kSlotGuestDs = 16, kSlotHandler = 24, kSlotFsGuest = 32,
-              kSlotFsHost = 40;
+              kSlotFsHost = 40, kSlotBugCheck = 48;
 constexpr u32 kExportCount = 400, kStubSize = 16;
 
 u32 g_switch = 0; // the switch's copy below 4 GiB
@@ -268,6 +269,53 @@ size_t SkipPrivileged(const u8* p, Regs& r)
     return 0;
 }
 
+// A fault in guest code becomes a structured exception, dispatched in the guest (switch.S,
+// xcs_fault32) when the thread has handlers: the EXCEPTION_RECORD and the interrupted esp, edx, ecx,
+// eax go on its stack. Not for faults in the dispatcher itself, nor without a usable stack.
+bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
+{
+    if (!t)
+        return false;
+    const u32 eip = u32(*f.rip), esp = r.Get(4);
+    const u32 chain = Read<u32>(t->kpcr); // NtTib.ExceptionList
+    if (!chain || chain == 0xffffffff)
+        return false;
+    if (eip >= g_switch && eip < g_switch + u32(xcs_end - xcs_begin))
+        return false;
+    if (esp < t->stack_limit + 0x1000 || esp > t->stack_top)
+        return false;
+    u32 code;
+    switch (f.signal)
+    {
+    case 8: code = 0xC0000094; break;  // SIGFPE: integer divide by zero
+    case 4: code = 0xC000001D; break;  // SIGILL: illegal instruction
+    case 5: code = 0x80000003; break;  // SIGTRAP: breakpoint
+    default: code = 0xC0000005; break; // access violation
+    }
+    const u32 record = (esp - 0x50) & ~3u;
+    std::memset(Ptr(record), 0, 0x50);
+    Write<u32>(record, code);
+    Write<u32>(record + 12, eip);
+    if (code == 0xC0000005)
+    {
+        Write<u32>(record + 16, 2); // NumberParameters: read (0) or write, and the address
+        Write<u32>(record + 20, 0);
+        Write<u32>(record + 24, f.address);
+    }
+    const u32 frame = record - 16;
+    Write<u32>(frame, r.Get(0));
+    Write<u32>(frame + 4, r.Get(1));
+    Write<u32>(frame + 8, r.Get(2));
+    Write<u32>(frame + 12, esp);
+    if (g_verbose >= 1)
+        Log("cpu: exception %#x at %#x (address %#x) in thread %u: to its handlers", code, eip, f.address, t->id);
+    r.Set(0, record);
+    r.Set(2, eip);
+    r.Set(4, frame);
+    *f.rip = SwitchEntry(xcs_fault32);
+    return true;
+}
+
 bool OnFault(platform::Fault& f)
 {
     const u64 rip = *f.rip;
@@ -291,6 +339,8 @@ bool OnFault(platform::Fault& f)
         return true;
     }
     GuestThread* t = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+    if (code[0] != 0xf4 && DeliverException(f, r, t))
+        return true;
     if (code[0] == 0xf4) // hlt: the program stopped (an assertion, a fatal error): its message
     {
         const u32 ebp = r.Get(5);
@@ -380,6 +430,7 @@ void InitCpu()
         std::memcpy(s + 6, &rel, 4);
         s[10] = 0xcc;
     }
+    Write<u64>(g_switch + kSlotBugCheck, ExportStub(96)); // KeBugCheckEx, for unhandled exceptions
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);
@@ -393,6 +444,11 @@ void InitCpu()
     if (got != t->kpcr)
         Fatal("cpu self-test: guest code read fs:[0x18] = %#x, expected the KPCR %#x", got, t->kpcr);
     Log("cpu self-test: 32-bit code runs, its fs is its KPCR (%#x)", got);
+}
+
+u32 ExceptionDispatcher()
+{
+    return u32(SwitchEntry(xcs_raise32));
 }
 
 u32 ExportStub(u32 ordinal)

@@ -17,12 +17,20 @@
 //                               returns to the guest with the handler's eax, edx, popping its bytes.
 //   xcs_bail64                  the fault handler resumes a guest that can't go on here: the call
 //                               returns 0xbad0bad0ffffffff.
+//   xcs_raise32                 32-bit: structured exception dispatch, in the guest as on the Xbox:
+//                               RtlRaiseException (or a fault) returns here with eax = the
+//                               EXCEPTION_RECORD and edx = the eip to report; the caller's other
+//                               registers as they were. Saves them as a CONTEXT, calls the handlers
+//                               of the fs:[0] chain until one takes it (an __except jumps away from
+//                               here) or continues (the CONTEXT is resumed); none: KeBugCheckEx.
+//   xcs_fault32                 the same for a fault: the fault handler has pushed the interrupted
+//                               code's esp, edx, ecx, eax (eax on top) and set eax, edx as above.
 // Gate frame (on the guest stack, linear): rdi, rsi (8 each), then eax = ordinal, ecx, edx, the return
 // address, the stack arguments. The handler writes the results over it: [0] eax, [1] edx, [2] bytes
 // to pop above the return address.
     .section .rodata.xcs, "a"
     .p2align 7
-    .globl xcs_begin, xcs_end, xcs_enter64, xcs_gate32, xcs_bail64, xcs_back64
+    .globl xcs_begin, xcs_end, xcs_enter64, xcs_gate32, xcs_bail64, xcs_back64, xcs_raise32, xcs_fault32
 xcs_begin:
 slot_sel32:     .quad 0     // 0   32-bit user code selector
 slot_sel64:     .quad 0     // 8   64-bit user code selector
@@ -30,6 +38,7 @@ slot_guest_ds:  .quad 0     // 16  data selector for ds, es
 slot_handler:   .quad 0     // 24  void (*)(uint32_t* frame, uint64_t kpcr)
 slot_fs_guest:  .quad 0     // 32  void (*)(uint64_t kpcr): fs base = the KPCR
 slot_fs_host:   .quad 0     // 40  void (*)(uint64_t base): fs base = the emulator's
+slot_bugcheck:  .quad 0     // 48  the guest address of KeBugCheckEx's export stub
     .p2align 7
 
     .code64
@@ -144,6 +153,91 @@ gate64:
     mov %r8d, %edx
     lretq
 
+    // The Xbox's CONTEXT: ContextFlags 0, FloatSave (516 bytes), Edi 0x208, Esi 0x20c, Ebx 0x210,
+    // Edx 0x214, Ecx 0x218, Eax 0x21c, Ebp 0x220, Eip 0x224, SegCs 0x228, EFlags 0x22c, Esp 0x230,
+    // SegSs 0x234; 0x238 bytes.
+    .code32
+xcs_raise32:
+    push %esp                   // the caller's esp (push takes esp's value before it moves)
+    push $0                     // edx, ecx, eax: a call's, not kept across it
+    push $0
+    push $0
+xcs_fault32:
+    sub $0x238, %esp
+    mov %edi, 0x208(%esp)
+    mov %esi, 0x20c(%esp)
+    mov %ebx, 0x210(%esp)
+    mov 0x238(%esp), %ecx
+    mov %ecx, 0x21c(%esp)       // eax
+    mov 0x23c(%esp), %ecx
+    mov %ecx, 0x218(%esp)       // ecx
+    mov 0x240(%esp), %ecx
+    mov %ecx, 0x214(%esp)       // edx
+    mov %ebp, 0x220(%esp)
+    mov %edx, 0x224(%esp)       // eip
+    mov %cs, %ecx
+    mov %ecx, 0x228(%esp)
+    pushf
+    pop %ecx
+    mov %ecx, 0x22c(%esp)
+    mov 0x244(%esp), %ecx
+    mov %ecx, 0x230(%esp)       // esp
+    mov %ss, %ecx
+    mov %ecx, 0x234(%esp)
+    movl $0x10007, (%esp)       // CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS
+    mov %eax, %esi              // the record
+    mov %esp, %edi              // the context
+    sub $4, %esp                // the handlers' DispatcherContext
+    movl $0, (%esp)
+    mov %fs:0, %ebx
+3:  cmp $0xffffffff, %ebx
+    je 5f
+    test %ebx, %ebx
+    jz 5f
+    push %esp                   // &DispatcherContext (push takes esp's value before it moves)
+    push %edi
+    push %ebx
+    push %esi
+    call *4(%ebx)               // handler(record, frame, context, &dispatcher context)
+    add $16, %esp
+    test %eax, %eax
+    jz 4f                       // ExceptionContinueExecution
+    cmp $1, %eax
+    jne 5f                      // nested or collided: not handled here
+    mov (%ebx), %ebx            // ExceptionContinueSearch: the next frame
+    jmp 3b
+4:  // resume the context: eip, eax, edi and eflags go below its esp, the rest straight in
+    mov 0x230(%edi), %eax
+    mov 0x224(%edi), %ecx
+    mov 0x21c(%edi), %edx
+    mov 0x22c(%edi), %ebx
+    mov 0x208(%edi), %esi
+    mov %ecx, -4(%eax)
+    mov %edx, -8(%eax)
+    mov %esi, -12(%eax)
+    mov %ebx, -16(%eax)
+    mov 0x210(%edi), %ebx
+    mov 0x214(%edi), %edx
+    mov 0x218(%edi), %ecx
+    mov 0x220(%edi), %ebp
+    mov 0x20c(%edi), %esi
+    lea -16(%eax), %esp
+    popf
+    pop %edi
+    pop %eax
+    ret
+5:  // nobody took it: KeBugCheckEx(KERNEL_MODE_EXCEPTION_NOT_HANDLED, code, address, 0, 0)
+    push $0
+    push $0
+    push 12(%esi)
+    push (%esi)
+    push $0x8e
+    call 6f
+6:  pop %ecx
+    call *(slot_bugcheck - 6b)(%ecx)
+7:  jmp 7b
+
+    .code64
 xcs_end:
 
 // The emulator's fs functions on Linux with FSGSBASE: wrfsbase, no system call. In compatibility
