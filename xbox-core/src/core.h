@@ -28,7 +28,7 @@ using s64 = std::int64_t;
 void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 // Set while this thread is in the fault handler (a signal handler): Log drops lines there (on the PS4
 // the C library can't be used in it; XB_STRICT_SIGNAL=1 makes it abort instead, to find them).
-extern thread_local bool tl_in_signal_handler;
+extern thread_local constinit bool tl_in_signal_handler;
 extern std::atomic<u64> g_lines_dropped_in_handler;
 extern void (*g_log_sink)(const char* line); // also gets every log line (the PS4's screen and log file)
 // A line that must be on the disk before what comes next (a step that may kill the app): logged,

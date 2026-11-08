@@ -49,7 +49,7 @@ int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
 }
 
 namespace xb {
-extern thread_local bool tl_in_signal_handler; // core.h
+extern thread_local constinit bool tl_in_signal_handler; // core.h
 }
 
 namespace xb::platform {

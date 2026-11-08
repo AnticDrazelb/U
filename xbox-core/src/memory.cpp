@@ -16,7 +16,7 @@ namespace xb {
 
 int g_verbose = 1;
 void (*g_log_sink)(const char* line) = nullptr;
-thread_local bool tl_in_signal_handler = false;
+constinit thread_local bool tl_in_signal_handler = false;
 std::atomic<u64> g_lines_dropped_in_handler{0};
 
 void Log(const char* fmt, ...)

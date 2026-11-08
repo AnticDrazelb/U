@@ -18,7 +18,7 @@ void xcs_linux_fs_host(uint64_t base);
 }
 
 namespace xb {
-extern thread_local bool tl_in_signal_handler; // core.h
+extern thread_local constinit bool tl_in_signal_handler; // core.h
 }
 
 namespace xb::platform {
