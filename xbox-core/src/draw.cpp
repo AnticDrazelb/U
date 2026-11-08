@@ -657,8 +657,10 @@ ScreenVertex ToScreen(const Vertex& v)
     ScreenVertex s;
     // the NV2A's vertex programs write screen coordinates (the viewport is in the program); w is kept
     // for perspective-correct interpolation
-    s.x = v.o[0][0];
-    s.y = v.o[0][1];
+    // positions are snapped (truncated) to the rasterizer's 1/16-pixel grid: what the 0.53125 offset
+    // Direct3D-style setups add is meant for (the console covers pixel 0 from 0.53125)
+    s.x = std::floor(v.o[0][0] * 16.f) / 16.f;
+    s.y = std::floor(v.o[0][1] * 16.f) / 16.f;
     s.z = v.o[0][2];
     const float w = v.o[0][3];
     s.inv_w = w != 0 ? 1.f / w : 1.f;
