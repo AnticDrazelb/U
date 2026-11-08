@@ -301,6 +301,12 @@ u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr, bool
                 return STATUS_USER_APC;
             continue;
         }
+        if (me && Read<u8>(me + kthread::SuspendCount) && !g_quit)
+        {
+            // a suspended thread takes nothing: what's signaled meanwhile waits for it to resume
+            g_cv.wait_for(lock, std::chrono::milliseconds(50));
+            continue;
+        }
         if (all && !objects.empty())
         {
             bool ok = true;
@@ -326,8 +332,9 @@ u32 WaitObjects(const std::vector<u32>& objects, bool all, u32 timeout_ptr, bool
         {
             if (g_cv.wait_until(lock, deadline) == std::cv_status::timeout && Clock::now() >= deadline)
             {
-                // one last look
-                for (size_t i = 0; i < objects.size() && !all; i++)
+                // one last look (a suspended thread's wait just times out)
+                const bool suspended = me && Read<u8>(me + kthread::SuspendCount);
+                for (size_t i = 0; i < objects.size() && !all && !suspended; i++)
                     if (IsSignaled(objects[i], me))
                     {
                         Acquire(objects[i], me);
@@ -528,6 +535,57 @@ ThreadState* StateOf(u32 ethread) // under g_sched
         if (t->ethread == ethread)
             return s;
     return nullptr;
+}
+
+// Suspension: the KTHREAD's SuspendCount (at most 0x7f), under g_sched. A suspended thread stops when
+// it next leaves a kernel call (a wait it was in included), or before it starts.
+int SuspendThread(u32 ethread) // the previous count, or -1 at the limit
+{
+    const u8 n = Read<u8>(ethread + kthread::SuspendCount);
+    if (n >= 0x7f)
+        return -1;
+    Write<u8>(ethread + kthread::SuspendCount, u8(n + 1));
+    return n;
+}
+
+int ResumeThread(u32 ethread) // the previous count
+{
+    const u8 n = Read<u8>(ethread + kthread::SuspendCount);
+    if (n)
+        Write<u8>(ethread + kthread::SuspendCount, u8(n - 1));
+    g_cv.notify_all();
+    return n;
+}
+
+void StopWhileSuspended(GuestThread* t)
+{
+    std::unique_lock lock(g_sched);
+    while (Read<u8>(t->ethread + kthread::SuspendCount) && !g_quit)
+        g_cv.wait_for(lock, std::chrono::milliseconds(50));
+}
+
+// From a kernel call: raises the exception `record` describes in the calling thread, dispatched in the
+// guest (switch.S, xcs_raise32) as the kernel's own exceptions are. The handler returns what this gives.
+u64 RaiseRecord(Call& c, u32 record)
+{
+    if (!Read<u32>(record + 12))
+        Write<u32>(record + 12, c.frame->ret); // ExceptionAddress: where it was raised
+    if (g_verbose >= 2)
+        Log("kernel: exception %#x raised at %#x", Read<u32>(record), Read<u32>(record + 12));
+    // return into the dispatcher with eax = the record, edx = the eip to resume at
+    const u32 eip = c.frame->ret;
+    c.frame->ret = ExceptionDispatcher();
+    return u64(record) | u64(eip) << 32;
+}
+
+// A status raised as a noncontinuable exception (ExRaiseStatus, RtlRaiseStatus).
+u64 Raise(Call& c, u32 status)
+{
+    const u32 record = PoolAlloc(0x50); // EXCEPTION_RECORD; a raise is rare, so it isn't freed
+    std::memset(Ptr(record), 0, 0x50);
+    Write<u32>(record, status);
+    Write<u32>(record + 4, 1); // EXCEPTION_NONCONTINUABLE
+    return RaiseRecord(c, record);
 }
 
 bool HasApcs(ThreadState* s, bool alertable)
@@ -806,7 +864,8 @@ u32 CreateThread(u32 stack, u32 tls, u32 start, u32 context, bool suspended, u32
 {
     GuestThread* t = NewGuestThread(stack, tls, name);
     Write<u32>(t->ethread + kthread::EthreadStartAddress, start);
-    auto* s = new ThreadState{t, {}, suspended ? 1 : 0, false, {}, {}};
+    auto* s = new ThreadState{t, {}, 0, false, {}, {}};
+    Write<u8>(t->ethread + kthread::SuspendCount, suspended ? 1 : 0);
     {
         std::lock_guard lock(g_sched);
         g_threads[t] = s;
@@ -817,7 +876,7 @@ u32 CreateThread(u32 stack, u32 tls, u32 start, u32 context, bool suspended, u32
     StartHostThread(t, [s, start, context, system_routine] {
         {
             std::unique_lock lock(g_sched);
-            while (s->suspend > 0 && !g_quit)
+            while (Read<u8>(s->thread->ethread + kthread::SuspendCount) && !g_quit)
                 g_cv.wait_for(lock, std::chrono::milliseconds(100));
         }
         if (!setjmp(s->exit) && !g_quit)
@@ -983,18 +1042,10 @@ void InitKernel()
         WakeAll();
         ExitThread();
     } END;
-    K(RtlRaiseException) // record: dispatched in the guest (switch.S, xcs_raise32)
-    {
-        const u32 record = c.Arg(0);
-        if (!Read<u32>(record + 12))
-            Write<u32>(record + 12, c.frame->ret); // ExceptionAddress: where it was raised
-        if (g_verbose >= 2)
-            Log("kernel: exception %#x raised at %#x", Read<u32>(record), Read<u32>(record + 12));
-        // return into the dispatcher with eax = the record, edx = the eip to resume at
-        const u32 eip = c.frame->ret;
-        c.frame->ret = ExceptionDispatcher();
-        return u64(record) | u64(eip) << 32;
-    } END;
+    K(RtlRaiseException) { return RaiseRecord(c, c.Arg(0)); } END; // record
+    K(ExRaiseException) { return RaiseRecord(c, c.Arg(0)); } END;
+    K(RtlRaiseStatus) { return Raise(c, c.Arg(0)); } END;
+    K(ExRaiseStatus) { return Raise(c, c.Arg(0)); } END;
     // ---- threads
     K(PsCreateSystemThreadEx)
     {
@@ -1018,23 +1069,26 @@ void InitKernel()
     K(NtResumeThread)
     {
         const u32 object = ObjectOf(c.Arg(0));
+        if (!object || Type(object) != kThread)
+            return STATUS_INVALID_HANDLE;
         std::lock_guard lock(g_sched);
-        for (auto& [t, s] : g_threads)
-            if (t->ethread == object)
-            {
-                if (c.Arg(1))
-                    Write<u32>(c.Arg(1), u32(s->suspend));
-                if (s->suspend > 0)
-                    s->suspend--;
-            }
-        g_cv.notify_all();
+        const int old = ResumeThread(object);
+        if (c.Arg(1))
+            Write<u32>(c.Arg(1), u32(old));
         return STATUS_SUCCESS;
     } END;
-    K(NtSuspendThread)
+    K(NtSuspendThread) // handle, previous count*
     {
+        const u32 object = ObjectOf(c.Arg(0));
+        if (!object || Type(object) != kThread)
+            return STATUS_INVALID_HANDLE;
+        std::lock_guard lock(g_sched);
+        const int old = SuspendThread(object);
+        if (old < 0)
+            return 0xC000004A; // STATUS_SUSPEND_COUNT_EXCEEDED
         if (c.Arg(1))
-            Write<u32>(c.Arg(1), 0);
-        return STATUS_SUCCESS; // threads that already run aren't stopped
+            Write<u32>(c.Arg(1), u32(old));
+        return STATUS_SUCCESS;
     } END;
     K(KeDelayExecutionThread) // mode, alertable, interval: a wait for nothing
     {
@@ -1357,18 +1411,19 @@ void InitKernel()
             Write<u32>(c.Arg(1), id);
         return STATUS_SUCCESS;
     } END;
-    K(KeSuspendThread) { return 0; } END;
+    K(KeSuspendThread) // the previous count; past the limit, raises STATUS_SUSPEND_COUNT_EXCEEDED
+    {
+        int old;
+        {
+            std::lock_guard lock(g_sched);
+            old = SuspendThread(c.Arg(0));
+        }
+        return old < 0 ? Raise(c, 0xC000004A) : u32(old);
+    } END;
     K(KeResumeThread)
     {
         std::lock_guard lock(g_sched);
-        ThreadState* s = StateOf(c.Arg(0));
-        if (!s)
-            return 0;
-        const int old = s->suspend;
-        if (s->suspend > 0)
-            s->suspend--;
-        g_cv.notify_all();
-        return u32(old);
+        return u32(ResumeThread(c.Arg(0)));
     } END;
     K(KeAlertThread) { return 0; } END;
     K(KeAlertResumeThread) { return 0; } END;
@@ -1605,17 +1660,6 @@ void InitKernel()
     K(ExAcquireReadWriteLockShared) { AcquireRwLock(c.Arg(0), false); return 0; } END;
     K(ExReleaseReadWriteLock) { ReleaseRwLock(c.Arg(0)); return 0; } END;
 
-    // ---- exceptions: structured exception handling isn't emulated yet; a raised exception ends
-    // the program with a report, and an unwind just drops the frames above the target
-    auto raise = [](u32 code) {
-        Log("kernel: an exception was raised: code %#x (structured exception handling isn't emulated yet)", code);
-        g_quit = true;
-        WakeAll();
-        ExitThread();
-    };
-    Register("ExRaiseStatus", [raise](Call& c) -> u64 { raise(c.Arg(0)); return 0; });
-    Register("RtlRaiseStatus", [raise](Call& c) -> u64 { raise(c.Arg(0)); return 0; });
-    Register("ExRaiseException", [raise](Call& c) -> u64 { raise(Read<u32>(c.Arg(0))); return 0; });
     K(RtlUnwind) // target frame, target ip, exception record, return value
     {
         // every handler above the target is called with the unwinding flags (they run their
@@ -2228,6 +2272,8 @@ void KernelCall(GateFrame* frame, GuestThread* thread)
     frame->eax = u32(result);
     frame->ecx = u32(result >> 32);
     frame->edx = bytes;
+    if (thread && Read<u8>(thread->ethread + kthread::SuspendCount))
+        StopWhileSuspended(thread);
 }
 
 int RunXbe()
