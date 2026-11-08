@@ -65,7 +65,72 @@ SetFsBase g_set_fsbase = nullptr;
 GetFsBase g_get_fsbase = nullptr;
 bool g_load_fs_selector = false;
 FaultHandler g_handler = nullptr;
-struct sigaction g_old[5];
+
+// Signal handlers set with the kernel itself (sigaction through libkernel's syscall(), number 416),
+// not libkernel's sigaction: that one installs its threading library's wrapper, which reads the
+// thread's data through fs before calling the handler, and guest code runs with fs at its KPCR;
+// so a signal in guest code (any fault: a register access, a privileged instruction, an exception)
+// crashed inside the wrapper and the console killed the app with nothing logged. Ours put the
+// app's fs back first; what isn't ours goes on to the handler that was there (the crash log's, the
+// stack dump's: the wrapper, called directly with the app's fs).
+struct BsdSigaction
+{
+    void (*handler)(int, siginfo_t*, void*);
+    int32_t flags;
+    uint32_t mask[4];
+};
+static_assert(sizeof(BsdSigaction) == 32);
+using SyscallFn = int (*)(int, ...);
+SyscallFn g_syscall = nullptr;
+static_assert(sizeof(struct sigaction) == sizeof(BsdSigaction), "the sysroot's sigaction is FreeBSD's");
+BsdSigaction g_previous[33]; // by signal: what was there before ours
+bool g_have_previous[33] = {};
+
+int RawSigaction(int sig, const BsdSigaction* action, BsdSigaction* old)
+{
+    if (!g_syscall) // libkernel's (with its wrapper) as a last resort
+        return sigaction(sig, reinterpret_cast<const struct sigaction*>(action), reinterpret_cast<struct sigaction*>(old));
+    return g_syscall(416, sig, action, old);
+}
+
+// fs back to the app's when guest code was interrupted; returns the interrupted fs base
+uint64_t HostFs(void* context, bool& guest_fs)
+{
+    auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
+    uint64_t fs = regs[kFsBase];
+    if (g_get_fsbase)
+    {
+        void* base = nullptr;
+        if (g_get_fsbase(&base) == 0)
+            fs = reinterpret_cast<uint64_t>(base);
+    }
+    guest_fs = fs && fs < 0x100000000ull;
+    if (guest_fs)
+        g_set_fsbase(reinterpret_cast<void*>(*reinterpret_cast<const uint64_t*>(fs + 0x300)));
+    return fs;
+}
+
+// the handler that was there before ours, called as the kernel would
+bool CallPrevious(int sig, siginfo_t* info, void* context)
+{
+    if (sig <= 0 || sig > 32 || !g_have_previous[sig])
+        return false;
+    const auto h = g_previous[sig].handler;
+    if (reinterpret_cast<uintptr_t>(h) <= 1) // SIG_DFL, SIG_IGN
+        return false;
+    h(sig, info, context);
+    return true;
+}
+
+// a signal that isn't a fault of ours (the stack dump's, SIGSYS): on to its handler, with the app's fs
+void Trampoline(int sig, siginfo_t* info, void* context)
+{
+    bool guest_fs;
+    const uint64_t fs = HostFs(context, guest_fs);
+    CallPrevious(sig, info, context);
+    if (guest_fs)
+        g_set_fsbase(reinterpret_cast<void*>(fs));
+}
 
 int32_t Prot(int access)
 {
@@ -120,21 +185,13 @@ void FsHostImpl(uint64_t base)
     g_set_fsbase(reinterpret_cast<void*>(base));
 }
 
-void OnSignal(int sig, siginfo_t*, void* context)
+void OnSignal(int sig, siginfo_t* info, void* context)
 {
     auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
     // the interrupted fs base: a KPCR when guest code (or the switch) ran; the emulator's own first.
     // Asked of the kernel (the handler runs with the interrupted fs base); else the context's copy.
-    uint64_t fs = regs[kFsBase];
-    if (g_get_fsbase)
-    {
-        void* base = nullptr;
-        if (g_get_fsbase(&base) == 0)
-            fs = reinterpret_cast<uint64_t>(base);
-    }
-    const bool guest_fs = fs && fs < 0x100000000ull;
-    if (guest_fs)
-        g_set_fsbase(reinterpret_cast<void*>(*reinterpret_cast<const uint64_t*>(fs + 0x300)));
+    bool guest_fs;
+    const uint64_t fs = HostFs(context, guest_fs);
     Fault f{};
     for (int i = 0; i < 8; i++)
         f.gpr[i] = &regs[kGprIndex[i]];
@@ -151,16 +208,20 @@ void OnSignal(int sig, siginfo_t*, void* context)
             g_set_fsbase(reinterpret_cast<void*>(fs));
         return;
     }
-    // not ours: the crash log's handlers get it when the instruction runs again
-    for (int i = 0; i < 5; i++)
-        if (kSignals[i] == sig)
-            sigaction(sig, &g_old[i], nullptr);
+    // not ours: the crash log's handler, now (with the app's fs); if it returns, the default
+    // action when the instruction runs again
+    CallPrevious(sig, info, context);
+    BsdSigaction fallback{};
+    if (g_have_previous[sig])
+        fallback = g_previous[sig];
+    RawSigaction(sig, &fallback, nullptr);
 }
 
 } // namespace
 
 std::string Init()
 {
+    g_syscall = reinterpret_cast<SyscallFn>(Lookup("syscall"));
     g_set_fsbase = reinterpret_cast<SetFsBase>(Lookup("amd64_set_fsbase"));
     g_get_fsbase = reinterpret_cast<GetFsBase>(Lookup("amd64_get_fsbase"));
     if (!g_set_fsbase)
@@ -250,14 +311,62 @@ void SetCs(Fault& fault, uint16_t cs)
 void InstallFaultHandler(FaultHandler handler)
 {
     g_handler = handler;
-    struct sigaction action;
-    std::memset(&action, 0, sizeof(action));
-    void (*function)(int, siginfo_t*, void*) = OnSignal;
-    std::memcpy(&action, &function, sizeof(function)); // the handler union is the first member
-    action.sa_flags = kSaSiginfo | kSaOnstack;
-    sigemptyset(&action.sa_mask);
+    BsdSigaction action{};
+    action.handler = OnSignal;
+    action.flags = kSaSiginfo | kSaOnstack;
     for (int i = 0; i < 5; i++)
-        sigaction(kSignals[i], &action, &g_old[i]);
+    {
+        const int sig = kSignals[i];
+        if (RawSigaction(sig, &action, &g_previous[sig]) == 0)
+            g_have_previous[sig] = true;
+    }
+}
+
+const char* SignalRoute()
+{
+    return g_syscall ? "set with the kernel's own sigaction (libkernel's syscall())"
+                     : "set with libkernel's sigaction: syscall() isn't exported, so a fault in guest code may kill the app";
+}
+
+std::string CheckFaultHandler()
+{
+    std::string replaced;
+    for (int i = 0; i < 5; i++)
+    {
+        const int sig = kSignals[i];
+        BsdSigaction current{};
+        if (RawSigaction(sig, nullptr, &current) != 0)
+            return "sigaction (the kernel's) failed";
+        if (current.handler == OnSignal)
+            continue;
+        replaced += (replaced.empty() ? "" : ", ") + std::to_string(sig);
+        g_previous[sig] = current;
+        g_have_previous[sig] = true;
+        BsdSigaction action{};
+        action.handler = OnSignal;
+        action.flags = kSaSiginfo | kSaOnstack;
+        RawSigaction(sig, &action, nullptr);
+    }
+    return replaced.empty() ? "" : "signals " + replaced + " had another handler: ours put back";
+}
+
+std::string WrapSignal(int sig)
+{
+    if (sig <= 0 || sig > 32)
+        return "no such signal";
+    BsdSigaction current{};
+    if (RawSigaction(sig, nullptr, &current) != 0)
+        return "sigaction (the kernel's) failed";
+    if (current.handler == Trampoline || current.handler == OnSignal)
+        return "";
+    BsdSigaction action = current;
+    action.handler = Trampoline;
+    action.flags |= kSaSiginfo | kSaOnstack;
+    g_previous[sig] = current;
+    g_have_previous[sig] = true;
+    if (RawSigaction(sig, &action, nullptr) != 0)
+        return "sigaction (the kernel's) failed";
+    return "";
 }
 
 // Crema's runtime gives every thread a signal stack (ps4_install_signal_stack).

@@ -32,6 +32,7 @@
 #include "../src/diagnostics.h"
 #include "../src/core.h"
 #include "../src/kernel.h"
+#include "../src/platform.h"
 
 extern "C" {
 size_t sceKernelGetDirectMemorySize(void);
@@ -194,6 +195,19 @@ std::mutex g_log_mutex;
 std::deque<std::string> g_log_lines;
 FILE* g_log_file = nullptr;
 FILE* g_usb_log = nullptr; // the same lines on a USB drive as they come: there even after a crash
+
+// The log files onto the disk (fsync): what's written is kept even when the console kills the app,
+// or goes down itself. Every half second (a thread), and at once for LogSync's lines.
+void SyncLogs()
+{
+    std::lock_guard lock(g_log_mutex);
+    for (FILE* f : {g_log_file, g_usb_log})
+        if (f)
+        {
+            std::fflush(f);
+            fsync(fileno(f));
+        }
+}
 
 void LogSink(const char* line)
 {
@@ -704,6 +718,14 @@ int main()
         g_usb_log = std::fopen((drives.front() + "/xbox-core-live-log.txt").c_str(), "w");
     }
     g_log_sink = LogSink;
+    g_log_sync = SyncLogs;
+    std::thread([] {
+        for (;;)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            SyncLogs();
+        }
+    }).detach();
     {
         struct sigaction action;
         std::memset(&action, 0, sizeof(action));
@@ -767,15 +789,15 @@ int main()
     g_running = xbe;
     fe::RecordRun(kHistoryFile, xbe, "");
     std::thread([xbe] {
-        Log("launch: setting up memory");
+        LogSync("launch: setting up memory");
         InitMemory();
-        Log("launch: setting up the CPU");
+        LogSync("launch: setting up the CPU");
         InitCpu();
-        Log("launch: devices");
+        LogSync("launch: devices");
         InitDevices();
-        Log("launch: kernel");
+        LogSync("launch: kernel");
         InitKernel();
-        Log("launch: loading %s", xbe.c_str());
+        LogSync("launch: loading %s", xbe.c_str());
         std::string error;
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
@@ -790,10 +812,20 @@ int main()
                 WriteLogBundle({});
             }
         }).detach();
-        Log("launch: kernel imports");
+        LogSync("launch: kernel imports");
         ResolveThunks();
         StartVblank();
-        Log("launch: running the program");
+        // signals that can arrive while guest code runs, made safe there: the stack dump's (its
+        // handler set by a first dump, of the app alone) and SIGSYS's; the fault handler checked
+        ps4_dump_thread_stacks("/data/xbox-core/stacks-at-launch.log", "every host thread at the launch");
+        for (int sig : {12, 30})
+        {
+            const std::string problem = platform::WrapSignal(sig);
+            Log("launch: signal %d %s", sig, problem.empty() ? "safe in guest code" : problem.c_str());
+        }
+        if (const std::string handler = platform::CheckFaultHandler(); !handler.empty())
+            Log("launch: %s", handler.c_str());
+        LogSync("launch: running the program");
         RunXbe();
         RecordResult("Ended by itself");
         WriteLogBundle({});

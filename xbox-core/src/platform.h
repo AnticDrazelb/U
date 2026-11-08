@@ -45,6 +45,14 @@ struct Fault
 void SetCs(Fault& fault, uint16_t cs);
 using FaultHandler = bool (*)(Fault& fault);
 void InstallFaultHandler(FaultHandler handler);
+// A signal someone else handles (the stack dump's, SIGSYS) made safe to arrive in guest code: the
+// app's own state (fs) back before its handler runs. "" when done, else why not. The PS4's.
+std::string WrapSignal(int sig);
+// The fault handler still the one the kernel calls (something may have set another): put back if
+// not; "" when it was, else what was found.
+std::string CheckFaultHandler();
+// how the signal handlers were set, for the log
+const char* SignalRoute();
 // Each host thread that runs guest code: its signal stack (a fault in guest code has no usable stack).
 void PrepareThread();
 

@@ -33,6 +33,20 @@ void Log(const char* fmt, ...)
         g_log_sink(line);
 }
 
+void (*g_log_sync)() = nullptr;
+
+void LogSync(const char* fmt, ...)
+{
+    char text[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    Log("%s", text);
+    if (g_log_sync)
+        g_log_sync();
+}
+
 void (*g_fatal_hook)() = nullptr;
 
 void Fatal(const char* fmt, ...)

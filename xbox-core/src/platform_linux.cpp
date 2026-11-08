@@ -162,6 +162,10 @@ void InstallFaultHandler(FaultHandler handler)
         sigaction(kSignals[i], &action, &g_old[i]);
 }
 
+std::string WrapSignal(int) { return ""; }
+std::string CheckFaultHandler() { return ""; }
+const char* SignalRoute() { return "set with sigaction"; }
+
 void PrepareThread()
 {
     thread_local bool done = false;

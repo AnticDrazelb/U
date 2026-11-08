@@ -27,6 +27,10 @@ using s64 = std::int64_t;
 
 void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 extern void (*g_log_sink)(const char* line); // also gets every log line (the PS4's screen and log file)
+// A line that must be on the disk before what comes next (a step that may kill the app): logged,
+// then the log files synced (g_log_sync).
+void LogSync(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+extern void (*g_log_sync)();
 extern void (*g_fatal_hook)(); // runs before Fatal ends the process
 [[noreturn]] void Fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 extern int g_verbose; // 0 quiet, 1 kernel calls not yet seen, 2 every kernel call

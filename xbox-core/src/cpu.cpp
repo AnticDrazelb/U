@@ -457,6 +457,7 @@ void InitCpu()
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);
+    Log("cpu: fault handlers %s", platform::SignalRoute());
     // Self-test: a guest function that returns fs:[0x18] (the thread's NT_TIB.Self, its KPCR).
     // Right, it shows the switch into 32-bit code, the guest's fs and the way back all work.
     const u32 code = AllocKernel(16, 16);
@@ -468,6 +469,19 @@ void InitCpu()
     if (got != t->kpcr)
         Fatal("cpu self-test: guest code read fs:[0x18] = %#x, expected the KPCR %#x", got, t->kpcr);
     Log("cpu self-test: 32-bit code runs, its fs is its KPCR (%#x)", got);
+    // and a fault in it, as every game makes (a privileged instruction here; a register access, an
+    // exception): the console's signal, to the emulator's handler, and back into 32-bit code
+    const std::string handler = platform::CheckFaultHandler();
+    if (!handler.empty())
+        Log("cpu self-test: %s", handler.c_str());
+    const u8 faulting[] = {0xfa, 0xfb, 0x64, 0xa1, 0x18, 0x00, 0x00, 0x00, 0xc3}; // cli; sti; mov eax, fs:[0x18]; ret
+    std::memcpy(Ptr(code), faulting, sizeof(faulting));
+    LogSync("cpu self-test: a fault in 32-bit code (cli, sti) to the emulator (if the app dies here, faults in "
+            "guest code don't reach it)");
+    const u32 after = u32(CallGuest(t, code, {}));
+    if (after != t->kpcr)
+        Fatal("cpu self-test: after the faults guest code read fs:[0x18] = %#x, expected the KPCR %#x", after, t->kpcr);
+    Log("cpu self-test: faults in 32-bit code are handled, and the guest's fs is intact after them");
 }
 
 u16 GuestCodeSelector() { return g_sel32; }

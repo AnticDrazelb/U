@@ -508,7 +508,11 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
         const std::string part = out + ".part";
         if (FILE* f = std::fopen(part.c_str(), "w"))
         {
-            const bool ok = std::fwrite(r.data(), 1, r.size(), f) == r.size();
+            bool ok = std::fwrite(r.data(), 1, r.size(), f) == r.size();
+            // on the disk before it replaces the last one (a USB stick keeps nothing of a write the
+            // console didn't sync before it went down)
+            ok = std::fflush(f) == 0 && ok;
+            fsync(fileno(f));
             if (std::fclose(f) == 0 && ok && std::rename(part.c_str(), out.c_str()) == 0)
                 written.push_back(out);
             else
