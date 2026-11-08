@@ -1,5 +1,8 @@
 # xbox-core: original Xbox programs on the host's own CPU
 
+> Picking up the work? Read [HANDOFF.md](HANDOFF.md) first: the current state, the PS4 crash
+> investigation, how to build and test, and what to do next.
+
 The emulator core that [xbox-bench](../xbox-bench/README.md) showed is possible on the PS4. Xbox
 programs (XBEs) run **natively in 32-bit compatibility mode**: no recompiler, no BIOS, no Xbox
 kernel. A high-level kernel answers the program's calls to `xboxkrnl.exe` on the host.
