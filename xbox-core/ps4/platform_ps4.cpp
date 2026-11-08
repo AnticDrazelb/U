@@ -3,6 +3,7 @@
 // on consoles: the 32-bit code segment is 0x33, the LDT is off, direct memory maps once, the app's
 // executable is at 0x400000.
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -467,9 +468,10 @@ std::string WrapSignal(int sig)
     return "";
 }
 
-// Crema's runtime gives every thread a 64 KiB signal stack (ps4_install_signal_stack): too little for
-// the fault handler, which emulates the hardware a register access reaches (the GPU's command
-// processing, a draw) on it. A thread that runs guest code gets 1 MiB instead.
+// Crema's runtime gives every thread a 64 KiB signal stack (ps4_install_signal_stack), from the heap.
+// The fault handler can need more (it emulates the hardware a register access reaches). Bigger
+// ones come from a pool in the app's own .bss, and only once the self-test has seen one work (a
+// 1 MiB one from the heap killed the app at the first fault). Threads past the pool keep Crema's.
 struct BsdSignalStack
 {
     void* sp;
@@ -477,20 +479,24 @@ struct BsdSignalStack
     int32_t flags;
 };
 extern "C" int ps4_sigaltstack_xb(const BsdSignalStack* stack, BsdSignalStack* old) __asm__("sigaltstack");
+constexpr size_t kBigStack = 256 * 1024, kBigStacks = 48;
+alignas(64) uint8_t g_stack_pool[kBigStacks][kBigStack];
+std::atomic<uint32_t> g_stacks_used{0};
+std::atomic<bool> g_big_stacks{false};
+
+void UseBigSignalStacks(bool on) { g_big_stacks = on; }
 
 void PrepareThread()
 {
-    thread_local bool done = false;
-    if (done)
+    thread_local bool installed = false;
+    if (installed || !g_big_stacks)
         return;
-    done = true;
-    constexpr size_t kSize = 1024 * 1024;
-    if (void* stack = std::malloc(kSize))
-    {
-        const BsdSignalStack s{stack, kSize, 0};
-        if (ps4_sigaltstack_xb(&s, nullptr) != 0)
-            std::free(stack);
-    }
+    installed = true;
+    const uint32_t slot = g_stacks_used++;
+    if (slot >= kBigStacks)
+        return;
+    const BsdSignalStack s{g_stack_pool[slot], kBigStack, 0};
+    ps4_sigaltstack_xb(&s, nullptr);
 }
 
 } // namespace xb::platform

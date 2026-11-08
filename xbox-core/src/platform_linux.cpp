@@ -167,6 +167,8 @@ std::string CheckFaultHandler() { return ""; }
 const char* SignalRoute() { return "set with sigaction"; }
 void PrepareKpcr(uint32_t, uint64_t) {}
 
+void UseBigSignalStacks(bool) {}
+
 void PrepareThread()
 {
     thread_local bool done = false;

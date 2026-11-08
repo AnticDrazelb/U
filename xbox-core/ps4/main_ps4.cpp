@@ -792,6 +792,7 @@ int main()
         LogSync("launch: setting up memory");
         InitMemory();
         LogSync("launch: setting up the CPU");
+        g_selftest_file = "/data/xbox-core/selftest-step.txt";
         InitCpu();
         LogSync("launch: devices");
         InitDevices();

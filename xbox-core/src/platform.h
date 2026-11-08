@@ -58,5 +58,7 @@ const char* SignalRoute();
 void PrepareKpcr(uint32_t kpcr, uint64_t host_fs_base);
 // Each host thread that runs guest code: its signal stack (a fault in guest code has no usable stack).
 void PrepareThread();
+// Bigger signal stacks for the threads PrepareThread sees from now on (the PS4's; off at first).
+void UseBigSignalStacks(bool on);
 
 } // namespace xb::platform

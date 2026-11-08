@@ -4,6 +4,7 @@
 // The host's side of it (memory, fs, signals) is in platform_*.cpp.
 #include <cctype>
 #include <cstdio>
+#include <unistd.h>
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
@@ -337,6 +338,8 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
     return true;
 }
 
+std::atomic<bool> g_fault_log{false}; // the first faults logged and synced from the handler (the self-test's step)
+
 bool OnFault(platform::Fault& f)
 {
     const u64 rip = *f.rip;
@@ -352,7 +355,7 @@ bool OnFault(platform::Fault& f)
     // the first faults, each on the disk before it's handled: if handling one kills the app, the
     // log ends with it
     static std::atomic<u32> s_faults{0};
-    if (const u32 n = s_faults++; n < 300)
+    if (const u32 n = g_fault_log ? s_faults++ : 300; n < 300)
     {
         GuestThread* ft = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
         LogSync("cpu: fault %u in thread %u: signal %d at %#x, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
@@ -481,30 +484,96 @@ void InitCpu()
     if (got != t->kpcr)
         Fatal("cpu self-test: guest code read fs:[0x18] = %#x, expected the KPCR %#x", got, t->kpcr);
     Log("cpu self-test: 32-bit code runs, its fs is its KPCR (%#x)", got);
-    // and a fault in it, as every game makes (a privileged instruction here; a register access, an
-    // exception): the console's signal, to the emulator's handler, and back into 32-bit code
+    // Then faults in it, as every game makes (a privileged instruction here; a register access,
+    // an exception): the console's signal, to the emulator's handler, and back into 32-bit code.
+    // In steps, each named in g_selftest_file before it runs: a step the last run died in is left
+    // out, and what it would switch on stays off (the app recovers by itself; the log says which).
+    std::string died;
+    if (!g_selftest_file.empty())
+        if (FILE* f = std::fopen(g_selftest_file.c_str(), "r"))
+        {
+            // the step, then the build it was this one's (another build tries every step again)
+            char line[64] = {}, build[64] = {};
+            if (std::fgets(line, sizeof(line), f) && std::fgets(build, sizeof(build), f) &&
+                std::string(build).rfind(__DATE__ " " __TIME__, 0) == 0)
+                died = line;
+            std::fclose(f);
+            while (!died.empty() && (died.back() == '\n' || died.back() == '\r'))
+                died.pop_back();
+        }
+    if (!died.empty())
+        LogSync("cpu self-test: the last run died in the step \"%s\"", died.c_str());
+    auto step = [&](const char* name, const char* what) {
+        if (died == name)
+        {
+            LogSync("cpu self-test: step \"%s\" left out (%s stays off): the last run died in it", name, what);
+            return false;
+        }
+        if (!g_selftest_file.empty())
+            if (FILE* f = std::fopen(g_selftest_file.c_str(), "w"))
+            {
+                std::fprintf(f, "%s\n%s\n", name, __DATE__ " " __TIME__);
+                std::fflush(f);
+                fsync(fileno(f));
+                std::fclose(f);
+            }
+        LogSync("cpu self-test: step \"%s\": %s (if the app dies here, the next start leaves it out)", name, what);
+        return true;
+    };
     const std::string handler = platform::CheckFaultHandler();
     if (!handler.empty())
         Log("cpu self-test: %s", handler.c_str());
     const u8 faulting[] = {0xfa, 0xfb, 0x64, 0xa1, 0x18, 0x00, 0x00, 0x00, 0xc3}; // cli; sti; mov eax, fs:[0x18]; ret
     std::memcpy(Ptr(code), faulting, sizeof(faulting));
-    LogSync("cpu self-test: a fault in 32-bit code (cli, sti) to the emulator (if the app dies here, faults in "
-            "guest code don't reach it)");
-    const u32 after = u32(CallGuest(t, code, {}));
-    if (after != t->kpcr)
-        Fatal("cpu self-test: after the faults guest code read fs:[0x18] = %#x, expected the KPCR %#x", after, t->kpcr);
-    Log("cpu self-test: faults in 32-bit code are handled, and the guest's fs is intact after them");
-    // again on a thread of its own, as the program's threads run (their own signal stacks)
-    GuestThread* t2 = NewGuestThread(0x4000, 0, "self-test 2");
-    std::atomic<u32> other{0};
-    LogSync("cpu self-test: the same on a new thread (if the app dies here, faults on the program's threads don't "
-            "reach the emulator)");
-    StartHostThread(t2, [&] { other = u32(CallGuest(t2, code, {})) | 1u; });
-    for (int i = 0; i < 5000 && !other; i++)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if ((other & ~1u) != (t2->kpcr & ~1u))
-        Fatal("cpu self-test: on a new thread, guest code read fs:[0x18] = %#x, expected the KPCR %#x", other.load(), t2->kpcr);
-    Log("cpu self-test: faults on a new thread are handled too");
+    auto fault_test = [&](GuestThread* on) {
+        const u32 after = u32(CallGuest(on, code, {}));
+        if (after != on->kpcr)
+            Fatal("cpu self-test: after the faults guest code read fs:[0x18] = %#x, expected the KPCR %#x", after, on->kpcr);
+    };
+    if (step("fault", "a fault in 32-bit code, to the emulator's handler"))
+    {
+        fault_test(t);
+        Log("cpu self-test: faults in 32-bit code are handled, and the guest's fs is intact after them");
+    }
+    if (step("fault log", "each of the first faults logged to the disk from the handler"))
+    {
+        g_fault_log = true;
+        fault_test(t);
+        Log("cpu self-test: faults logged from the handler");
+    }
+    bool big_stacks = false;
+    if (step("signal stack", "a bigger signal stack for each thread that runs guest code"))
+    {
+        big_stacks = true;
+        platform::UseBigSignalStacks(true);
+        fault_test(t);
+        Log("cpu self-test: faults handled on the bigger signal stack");
+    }
+    if (step("new thread", "a fault on a new thread, as the program's threads run"))
+    {
+        GuestThread* t2 = NewGuestThread(0x4000, 0, "self-test 2");
+        std::atomic<u32> other{0};
+        StartHostThread(t2, [&] { other = u32(CallGuest(t2, code, {})) | 1u; });
+        for (int i = 0; i < 5000 && !other; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if ((other & ~1u) != (t2->kpcr & ~1u))
+            Fatal("cpu self-test: on a new thread, guest code read fs:[0x18] = %#x, expected the KPCR %#x", other.load(),
+                  t2->kpcr);
+        Log("cpu self-test: faults on a new thread are handled too");
+    }
+    // a step that killed a run stays left out in the runs after (a new build tries every step again)
+    if (!g_selftest_file.empty())
+    {
+        if (died.empty())
+            std::remove(g_selftest_file.c_str());
+        else if (FILE* f = std::fopen(g_selftest_file.c_str(), "w"))
+        {
+            std::fprintf(f, "%s\n%s\n", died.c_str(), __DATE__ " " __TIME__);
+            std::fclose(f);
+        }
+    }
+    LogSync("cpu self-test: done (fault logging %s, bigger signal stacks %s)", g_fault_log ? "on" : "off",
+            big_stacks ? "on" : "off");
 }
 
 u16 GuestCodeSelector() { return g_sel32; }

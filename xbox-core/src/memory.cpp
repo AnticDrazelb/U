@@ -34,6 +34,7 @@ void Log(const char* fmt, ...)
 }
 
 void (*g_log_sync)() = nullptr;
+std::string g_selftest_file;
 
 void LogSync(const char* fmt, ...)
 {
