@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "platform.h"
 
 extern "C" {
@@ -311,6 +312,9 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
     std::memset(Ptr(record), 0, 0x50);
     Write<u32>(record, code);
     Write<u32>(record + 12, eip);
+    // every guest exception counted; the first hundred logged with where
+    if (diag::g_exceptions++ < 100)
+        Log("exception %#x at %#x in thread %u (fault address %#x): to the program's handlers", code, eip, t->id, f.address);
     if (code == 0xC0000005)
     {
         Write<u32>(record + 16, 2); // NumberParameters: read (0) or write, and the address
@@ -394,6 +398,7 @@ bool OnFault(platform::Fault& f)
         ebp = next;
     }
     Log("  called from:%s", chain.c_str());
+    diag::LogState("guest fault");
     *f.rip = SwitchEntry(xcs_bail64);
     platform::SetCs(f, g_sel64);
     return true;
@@ -481,6 +486,7 @@ u32 ExportStub(u32 ordinal)
 GuestThread* NewGuestThread(u32 stack_size, u32 tls_size, const char* name)
 {
     auto* t = new GuestThread;
+    diag::RegisterThread(t);
     t->id = g_next_thread_id++;
     t->name = name;
     stack_size = std::max<u32>((stack_size + 0xfff) & ~0xfffu, 64 * 1024);

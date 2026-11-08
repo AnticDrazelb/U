@@ -19,6 +19,7 @@
 #include <sched.h>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "kernel.h"
 
 namespace xb {
@@ -570,7 +571,7 @@ u64 RaiseRecord(Call& c, u32 record)
 {
     if (!Read<u32>(record + 12))
         Write<u32>(record + 12, c.frame->ret); // ExceptionAddress: where it was raised
-    if (g_verbose >= 2)
+    if (diag::g_exceptions++ < 100 || g_verbose >= 2)
         Log("kernel: exception %#x raised at %#x", Read<u32>(record), Read<u32>(record + 12));
     // return into the dispatcher with eax = the record, edx = the eip to resume at
     const u32 eip = c.frame->ret;
@@ -2259,6 +2260,11 @@ void ResolveThunks()
     Log("kernel: %u imports, %u of them not implemented yet:%s", count, missing, missing_names.c_str());
 }
 
+const char* KernelExportName(u32 ordinal)
+{
+    return ordinal < 400 && g_by_ordinal[ordinal] ? g_by_ordinal[ordinal]->name : nullptr;
+}
+
 void KernelCall(GateFrame* frame, GuestThread* thread)
 {
     const u32 ordinal = frame->eax;
@@ -2269,13 +2275,16 @@ void KernelCall(GateFrame* frame, GuestThread* thread)
     {
         if (g_verbose >= 2)
             Log("[%u] %s(%#x, %#x, %#x, %#x)", thread ? thread->id : 0, e->name, c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3));
+        diag::CallStarted(thread, ordinal, c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3), frame->ret);
         result = g_handlers[ordinal](c);
+        diag::CallEnded(thread, u32(result));
     }
     else
     {
         std::lock_guard lock(g_report_mutex);
         if (g_reported.insert(ordinal).second)
             Log("kernel: %s (ordinal %u) isn't implemented: returning STATUS_NOT_IMPLEMENTED", e ? e->name : "?", ordinal);
+        diag::Note("kernel export", std::string(e ? e->name : "?") + " (ordinal " + std::to_string(ordinal) + ")");
     }
     // results: eax, edx; bytes the callee pops (stdcall; fastcall's stack part)
     const u32 bytes = !e ? 0 : e->kind == 'F' ? (e->arg_bytes > 8 ? e->arg_bytes - 8 : 0) : e->arg_bytes;

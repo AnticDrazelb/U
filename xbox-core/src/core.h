@@ -131,8 +131,20 @@ constexpr u32 StackBase = 0x1c, StackLimit = 0x20, KernelStack = 0x24, TlsData =
 constexpr u32 EthreadUniqueThread = 0x12c, EthreadStartAddress = 0x130, EthreadSize = 0x140;
 } // namespace kthread
 
+// a kernel call, as a thread's report shows it (diagnostics.h)
+struct CallRecord
+{
+    u32 ordinal, a0, a1, a2, a3, eip, result;
+    float at; // seconds since the start
+};
+
 struct GuestThread
 {
+    static constexpr u32 kCallRecords = 24;
+    CallRecord calls[kCallRecords] = {}; // its latest kernel calls, a ring
+    std::atomic<u32> calls_next{0};
+    std::atomic<u32> in_call{0}; // the kernel call it's in (ordinal + 1), 0 none
+    float call_started = 0;
     u32 kpcr = 0;     // KPCR block (with the host block)
     u32 ethread = 0;  // ETHREAD (its KTHREAD header is a waitable object: signaled when it ends)
     u32 stack_top = 0, stack_limit = 0;
@@ -141,6 +153,7 @@ struct GuestThread
     std::string name;
 };
 GuestThread* CurrentThread(); // the calling host thread's guest thread, or nullptr
+const char* KernelExportName(u32 ordinal); // kernel.cpp: an export's name, or nullptr
 
 void InitCpu();
 // Creates a guest thread (KPCR, ETHREAD, stack, TLS from the XBE) without starting it.

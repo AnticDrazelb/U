@@ -144,6 +144,36 @@ bool LoadXbeData(const std::vector<u8>& d, const std::string& path, XbeInfo& inf
         }
     Log("xbe: \"%s\" (%s), base %#x, image %#x, entry %#x, kernel thunks at %#x, TLS %#x", info.title.c_str(), kind,
         info.base, info.image_size, info.entry, info.thunk_table, info.tls_directory);
+    // what the program is: its certificate, its sections, the XDK libraries it was built with
+    if (certificate >= info.base && certificate - info.base + 0xb0 <= d.size())
+    {
+        const size_t c = certificate - info.base;
+        Log("xbe: title ID %08X, version %#x, region %#x, ratings %#x, media types %#x, disc %u", Get32(d, c + 0x8),
+            Get32(d, c + 0xac), Get32(d, c + 0xa0), Get32(d, c + 0xa4), Get32(d, c + 0x9c), Get32(d, c + 0xa8));
+    }
+    Log("xbe: init flags %#x, stack %#x, heap %#x/%#x, %u sections:", info.init_flags, Get32(d, 0x130), Get32(d, 0x134),
+        Get32(d, 0x138), section_count);
+    for (u32 i = 0; i < section_count; i++)
+    {
+        const size_t h = section_headers - info.base + size_t(i) * 56;
+        const u32 name_at = Get32(d, h + 0x14);
+        std::string name;
+        for (size_t k = name_at - info.base; name_at >= info.base && k < d.size() && d[k] && name.size() < 16; k++)
+            name += char(d[k]);
+        Log("  %-10s at %#010x, %#x bytes (%#x in the file at %#x), flags %#x", name.c_str(), Get32(d, h + 4),
+            Get32(d, h + 8), Get32(d, h + 0x10), Get32(d, h + 0xc), Get32(d, h));
+    }
+    const u32 lib_count = Get32(d, 0x160), libs = Get32(d, 0x164);
+    std::string versions;
+    for (u32 i = 0; i < lib_count && libs >= info.base && libs - info.base + (i + 1) * 16 <= d.size(); i++)
+    {
+        const size_t l = libs - info.base + size_t(i) * 16;
+        char lib[64];
+        std::snprintf(lib, sizeof(lib), "%s%.8s %u.%u.%u", versions.empty() ? "" : ", ", reinterpret_cast<const char*>(&d[l]),
+                      d[l + 8] | d[l + 9] << 8, d[l + 10] | d[l + 11] << 8, d[l + 12] | d[l + 13] << 8);
+        versions += lib;
+    }
+    Log("xbe: built with %s", versions.empty() ? "no library versions listed" : versions.c_str());
     return true;
 }
 

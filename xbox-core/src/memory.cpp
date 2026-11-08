@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "platform.h"
 
 namespace xb {
@@ -17,10 +18,12 @@ void (*g_log_sink)(const char* line) = nullptr;
 void Log(const char* fmt, ...)
 {
     static std::mutex m;
+    // each line with the seconds since the start: where the time went
     char line[2048];
+    const int stamp = std::snprintf(line, sizeof(line), "[%9.3f] ", diag::Seconds());
     va_list ap;
     va_start(ap, fmt);
-    std::vsnprintf(line, sizeof(line), fmt, ap);
+    std::vsnprintf(line + stamp, sizeof(line) - size_t(stamp), fmt, ap);
     va_end(ap);
     std::lock_guard lock(m);
     std::fputs(line, stdout);
@@ -40,6 +43,9 @@ void Fatal(const char* fmt, ...)
     std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     Log("FATAL: %s", line);
+    static std::atomic<bool> once{false};
+    if (!once.exchange(true))
+        diag::LogState("fatal error");
     if (g_fatal_hook)
         g_fatal_hook(); // the PS4: keeps the message on screen
     std::_Exit(2);

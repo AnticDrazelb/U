@@ -2,6 +2,7 @@
 // \Device\CdRom0 are the game's folder, or its disc image (read-only, through xiso.cpp); the hard
 // disk's partitions (E:, T:, U:, Z: and \Device\Harddisk0\PartitionN) are folders under a data
 // folder. Also the XcSHA* exports.
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <map>
@@ -14,6 +15,7 @@
 #include <unistd.h>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "kernel.h"
 #include "sha1.h"
 #include "xiso.h"
@@ -279,7 +281,26 @@ void MakeDirs(const std::string& path)
             mkdir(path.substr(0, i).c_str(), 0755);
 }
 
+u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 disposition, u32 options, u32 access);
+
+// Every open the guest asks for, logged with where it went and how it ended (the first 4000; then
+// only failures), failures counted: a game that can't find its files says which.
 u32 Open(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 disposition, u32 options, u32 access)
+{
+    const u32 status = OpenFile(handle_ptr, object_attributes, io_status, disposition, options, access);
+    static std::atomic<u32> logged{0};
+    u32 root;
+    const std::string xbox = ObjectPath(object_attributes, root);
+    const bool failed = status >= 0x80000000u;
+    if (logged++ < 4000 || failed)
+        Log("file: %s %s (access %#x, disposition %u) -> %s: %#x", failed ? "FAILED" : "open", xbox.c_str(), access,
+            disposition, HostPath(xbox, root).c_str(), status);
+    if (failed && disposition == 1) // opening something that should be there
+        diag::Note("file not found or not opened", xbox);
+    return status;
+}
+
+u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 disposition, u32 options, u32 access)
 {
     u32 root;
     const std::string xbox = ObjectPath(object_attributes, root);

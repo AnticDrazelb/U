@@ -115,3 +115,23 @@ into `/data/xbox-core/games`, one after another in the background, checking the 
 `xbox-core-diagnostics.txt` on each USB drive: the app and console, the settings, every game's
 facts and last result, and the ends of the last session's log (`log-previous.txt`: the game you
 just ran) and the crash logs.
+
+## Logs and diagnostics
+
+Everything goes into one file at the top of each USB drive, `xbox-core-logs.txt` (as New Eden's
+`eden-ps4-logs.txt`): every `.log` and `.txt` in `/data/xbox-core` (the last 8 MiB of each), code
+addresses named from the package's `symbols.txt`. It's written as the app starts, when the
+library opens, every minute while a program runs, when it ends, stops on an error or crashes;
+`xbox-core-live-log.txt` beside it gets the log line by line. What the logs hold:
+
+- every line timed (seconds since the start); each launch step before it's taken
+- the program: its certificate, sections and the XDK libraries it was built with
+- every file it opens (where that went, and how it ended; failures counted)
+- what wasn't emulated, counted: kernel exports, GPU methods, device registers, files not found
+- every guest exception (the first hundred with where)
+- a line every 10 s: frames, picture changes, draws, kernel calls (the busiest), GPU methods,
+  threads, free memory
+- `hang.log` when frames stop for 20 s (or none come in 90 s): each guest thread's kernel call and
+  its latest 24 calls with their arguments, the GPU's latest 256 methods, the host's thread stacks
+- `crash.log` on a crash: the host's registers and stack (named), the same guest state; a guest
+  fault or a fatal error puts it in the log too; SIGSYS (a refused system call) is caught as well

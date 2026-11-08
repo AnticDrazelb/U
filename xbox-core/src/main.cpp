@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "kernel.h"
 
 namespace {
@@ -99,6 +100,7 @@ int main(int argc, char** argv)
     if (!LoadGame(xbe, error))
         Fatal("%s: %s", xbe.c_str(), error.c_str());
     SetDataDirectory("xbox-data");
+    diag::StartMonitor("hang.log", nullptr);
     ResolveThunks();
     StartVblank();
     if (!pad.empty() && pad.find('@') != std::string::npos)

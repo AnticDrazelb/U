@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "draw.h"
 #include "nv2a.h"
 
@@ -1170,6 +1171,7 @@ namespace {
 
 void Flush()
 {
+    diag::g_draws++;
     std::vector<ScreenVertex> s;
     s.reserve(g_vertices.size());
     for (const Vertex& v : g_vertices)

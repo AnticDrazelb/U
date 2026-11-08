@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "draw.h"
 #include "nv2a.h"
 
@@ -338,8 +339,9 @@ void RenderOtherClass(u32 cls, u32 method, u32 parameter)
     if (method && method < 0x800 && !reported[cls & 0xff][method / 4])
     {
         reported[cls & 0xff][method / 4] = true;
-        if (g_verbose >= 1 || (cls != 0x62 && cls != 0x9f && cls != 0x12 && cls != 0x39))
-            Log("nv2a: class %#x method %#x isn't done yet", cls, method);
+        char what[64];
+        std::snprintf(what, sizeof(what), "class %#x method %#x", cls, method);
+        diag::Note("GPU method", what);
     }
 }
 

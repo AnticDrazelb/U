@@ -29,6 +29,18 @@ ps4)
     stage="$build/stage"
     rm -rf "$stage" && mkdir -p "$stage/sce_sys" "$stage/samples" "$stage/ui"
     cp "$HERE"/frontend/assets/* "$stage/ui/" # the library's fonts (and their licence)
+    # the app's functions by address (relative to .text, as crash.log gives them), so the log bundle
+    # names the code a crash report points at
+    nm="$(command -v /opt/llvm21/bin/llvm-nm || command -v llvm-nm)"
+    "$nm" -n -S -C --defined-only "$build/xbox-core" | python3 -c '
+import sys
+lines = [l.split(None, 3) for l in sys.stdin]
+base = next((int(p[0], 16) for p in lines if len(p) == 3 and p[2] == "__text_start"), 0)
+base = next((int(p[0], 16) for p in lines if len(p) >= 3 and p[-1].strip() == "__text_start"), base)
+for p in lines:
+    if len(p) == 4 and p[2] in "tTwW":
+        print("%x %s %s" % (int(p[0], 16) - base, p[1], p[3].rstrip()))
+' > "$stage/symbols.txt"
     cp "$build/xbox-core_eboot/eboot.bin" "$stage/"
     [ -z "${XB_ELF_TYPE:-}" ] || python3 "$HERE/../xbox-bench/tools/set-elf-type.py" "$stage/eboot.bin" "$XB_ELF_TYPE"
     cp "$HERE/../xbox-bench/sce_sys/icon0.png" "$stage/sce_sys/"

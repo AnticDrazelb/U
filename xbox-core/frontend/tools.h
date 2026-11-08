@@ -81,6 +81,10 @@ struct DiagnosticsInput
     std::vector<std::string> usb_roots;
     std::string data_dir;
     std::vector<std::pair<std::string, size_t>> logs; // a file, how many of its last lines
+    // New Eden's way instead: every .log and .txt in data_dir (the last 8 MiB of each), code
+    // addresses named from `symbols` ("<address> <size> <name>" lines, hex, relative to .text)
+    bool all_logs = false;
+    std::string symbols;
 };
 std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std::vector<std::string>& outputs);
 

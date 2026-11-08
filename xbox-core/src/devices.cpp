@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "devices.h"
 #include "kernel.h"
 
@@ -214,6 +215,12 @@ bool DeviceRead(u32 address, u32 size, u32& value)
     value = 0;
     if (const Device* d = Find(address))
         value = d->read(address - d->base, size);
+    else
+    {
+        char what[48];
+        std::snprintf(what, sizeof(what), "read at %#x", address & ~0xfffu);
+        diag::Note("device register (no device)", what);
+    }
     if (g_verbose >= 3)
         Log("dev read  %#010x/%u = %#x", address, size, value);
     return true; // what nothing answers reads as 0
@@ -225,6 +232,12 @@ bool DeviceWrite(u32 address, u32 size, u32 value)
         Log("dev write %#010x/%u = %#x", address, size, value);
     if (const Device* d = Find(address))
         d->write(address - d->base, size, value);
+    else
+    {
+        char what[48];
+        std::snprintf(what, sizeof(what), "write at %#x", address & ~0xfffu);
+        diag::Note("device register (no device)", what);
+    }
     return true;
 }
 

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -28,6 +29,7 @@
 #include <stb/stb_easy_font.h>
 
 #include "../frontend/ui.h"
+#include "../src/diagnostics.h"
 #include "../src/core.h"
 #include "../src/kernel.h"
 
@@ -39,6 +41,7 @@ int32_t sceKernelCreateEqueue(OrbisKernelEqueue* queue, const char* name);
 int32_t sceKernelWaitEqueue(OrbisKernelEqueue queue, void* events, int32_t count, int32_t* out, uint32_t* timeout_us);
 int32_t sceSysmoduleLoadModuleInternal(uint32_t id);
 void ps4_boot_trace(const char* stage); // port/ps4_crashlog.cpp
+void ps4_dump_thread_stacks(const char* path, const char* reason); // port/ps4_sampler.cpp
 struct SwVersion
 {
     uint64_t size;
@@ -203,7 +206,7 @@ void LogSink(const char* line)
         }
     g_log_lines.push_back(line);
     const std::string l = line;
-    if (l.rfind("FATAL", 0) == 0 || l.find("guest fault") != std::string::npos || l.find("guest halted") != std::string::npos)
+    if (l.find("] FATAL: ") != std::string::npos || l.find("guest fault") != std::string::npos || l.find("guest halted") != std::string::npos)
         std::thread([l] { RecordResult("Stopped: " + l.substr(0, 160)); }).detach();
     while (g_log_lines.size() > 18)
         g_log_lines.pop_front();
@@ -625,15 +628,28 @@ void WriteLogBundle(const std::vector<fe::Game>& games)
     d.games = games;
     d.usb_roots = UsbDrives();
     d.data_dir = kDataDir;
-    d.logs = {{"/data/xbox-core/log-previous.txt", 1500}, {kLogFile, 600},
-              {"/data/xbox-core/crash.log", 600},          {"/data/xbox-core/boot-trace.log", 120},
-              {"/data/xbox-core/boot-trace-game.log", 120}, {"/data/xbox-core/boot-trace-launcher.log", 120},
-              {kHistoryFile, 200}};
+    d.all_logs = true; // every log in the data folder, code addresses named
+    d.symbols = "/app0/symbols.txt";
     std::vector<std::string> outputs{"/data/xbox-core/diagnostics.txt"};
     for (const std::string& drive : d.usb_roots)
         outputs.push_back(drive + "/xbox-core-logs.txt");
     for (const std::string& w : fe::WriteDiagnostics(d, outputs))
         Log("logs written: %s", w.c_str());
+}
+
+// SIGSYS: the console refusing a system call (the crash log doesn't take that signal). Where it
+// happened goes straight into the logs (write() only), then the app ends.
+void OnSigsys(int, siginfo_t*, void* context)
+{
+    const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + 0x40);
+    char line[200];
+    const int n = std::snprintf(line, sizeof(line),
+                                "FATAL: SIGSYS: the console refused a system call at rip %#llx (rax %#llx: its number)\n",
+                                (unsigned long long)regs[20], (unsigned long long)regs[7]);
+    for (FILE* f : {g_log_file, g_usb_log})
+        if (f && n > 0)
+            (void)!write(fileno(f), line, size_t(n));
+    _exit(140);
 }
 
 void LoadSystemModules()
@@ -667,6 +683,15 @@ int main()
     if (const std::vector<std::string> drives = UsbDrives(); !drives.empty())
         g_usb_log = std::fopen((drives.front() + "/xbox-core-live-log.txt").c_str(), "w");
     g_log_sink = LogSink;
+    {
+        struct sigaction action;
+        std::memset(&action, 0, sizeof(action));
+        void (*handler)(int, siginfo_t*, void*) = OnSigsys;
+        std::memcpy(&action, &handler, sizeof(handler));
+        action.sa_flags = 0x40 | 0x1; // SA_SIGINFO, SA_ONSTACK
+        sigemptyset(&action.sa_mask);
+        sigaction(12, &action, nullptr); // SIGSYS
+    }
     g_fatal_hook = [] {
         WriteLogBundle({});
         for (;;)
@@ -734,6 +759,16 @@ int main()
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
         SetDataDirectory("/data/xbox-core/hdd");
+        diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks);
+        // the logs onto the USB drives every minute while it runs: a console that freezes hard
+        // (nothing runs to write them) still leaves the last minute's
+        std::thread([] {
+            for (;;)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(60));
+                WriteLogBundle({});
+            }
+        }).detach();
         Log("launch: kernel imports");
         ResolveThunks();
         StartVblank();
@@ -744,4 +779,17 @@ int main()
         Log("the program ended; close the app (PS button) to choose another");
     }).detach();
     PresentLoop();
+}
+
+// The crash log's hooks (port/ps4_crashlog.cpp): the guest's side of a crash. Into crash.log
+// without locks (each guest thread's kernel call and latest calls, the GPU's latest methods), then,
+// with locks allowed, the same and what wasn't emulated into the log.
+extern "C" void ps4_crash_guest_regs(int fd)
+{
+    xb::diag::WriteStateLockFree(fd);
+}
+extern "C" void ps4_crash_guest_info()
+{
+    xb::diag::LogState("crash");
+    WriteLogBundle({});
 }

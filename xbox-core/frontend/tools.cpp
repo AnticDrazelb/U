@@ -302,6 +302,106 @@ void Copier::Run()
 
 // ---- diagnostics
 
+namespace {
+
+// The app's functions by address (relative to .text), for crash reports' code addresses.
+struct Symbols
+{
+    struct Entry
+    {
+        uint64_t address, size;
+        std::string name;
+    };
+    std::vector<Entry> entries;
+
+    void Load(const std::string& file)
+    {
+        FILE* f = std::fopen(file.c_str(), "r");
+        if (!f)
+            return;
+        char line[1024];
+        while (std::fgets(line, sizeof(line), f))
+        {
+            char* end = nullptr;
+            const uint64_t address = std::strtoull(line, &end, 16);
+            const uint64_t size = std::strtoull(end, &end, 16);
+            while (*end == ' ')
+                end++;
+            std::string name = end;
+            while (!name.empty() && (name.back() == '\n' || name.back() == '\r'))
+                name.pop_back();
+            if (!name.empty())
+                entries.push_back({address, size, name});
+        }
+        std::fclose(f);
+        std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) { return a.address < b.address; });
+    }
+    std::string Name(uint64_t address) const
+    {
+        auto it = std::upper_bound(entries.begin(), entries.end(), address,
+                                   [](uint64_t a, const Entry& e) { return a < e.address; });
+        if (it == entries.begin())
+            return "";
+        --it;
+        if (it->size && address >= it->address + it->size)
+            return "";
+        char off[32];
+        std::snprintf(off, sizeof(off), "+0x%llx", (unsigned long long)(address - it->address));
+        return it->name + off;
+    }
+};
+
+// A log's text with the app's code addresses named: "elf 0x..." and the stack lines
+// "[rsp+0x..] 0x..." of crash.log and hang.log.
+std::string Symbolize(const std::string& text, const Symbols& symbols)
+{
+    if (symbols.entries.empty())
+        return text;
+    std::string out;
+    size_t at = 0;
+    while (at < text.size())
+    {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos)
+            end = text.size();
+        std::string line = text.substr(at, end - at);
+        std::string names;
+        auto name_at = [&](size_t pos) {
+            const uint64_t a = std::strtoull(line.c_str() + pos, nullptr, 16);
+            const std::string n = symbols.Name(a);
+            if (!n.empty())
+                names += "  <" + n + ">";
+        };
+        for (size_t p = line.find("elf 0x"); p != std::string::npos; p = line.find("elf 0x", p + 1))
+            name_at(p + 4);
+        if (line.find("[rsp+0x") != std::string::npos)
+            if (const size_t p = line.rfind(" 0x"); p != std::string::npos)
+                name_at(p + 1);
+        out += line + names + "\n";
+        at = end + 1;
+    }
+    return out;
+}
+
+std::string ReadEnd(const std::string& path, size_t limit, uint64_t& size)
+{
+    std::string text;
+    size = 0;
+    if (FILE* f = std::fopen(path.c_str(), "rb"))
+    {
+        fseeko(f, 0, SEEK_END);
+        size = uint64_t(ftello(f));
+        const uint64_t start = size > limit ? size - limit : 0;
+        fseeko(f, off_t(start), SEEK_SET);
+        text.resize(size_t(size - start));
+        text.resize(std::fread(text.data(), 1, text.size(), f));
+        std::fclose(f);
+    }
+    return text;
+}
+
+} // namespace
+
 std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std::vector<std::string>& outputs)
 {
     std::string r;
@@ -348,7 +448,41 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
         const uint64_t f = FreeSpace(u);
         line(u + (f ? ", " + FormatSize(f) + " free" : ""));
     }
-    for (const auto& [file, n] : in.logs)
+    if (in.all_logs)
+    {
+        // every log in the data folder, as New Eden bundles them
+        Symbols symbols;
+        if (!in.symbols.empty())
+            symbols.Load(in.symbols);
+        if (symbols.entries.empty())
+            line("(no symbols in this build: code addresses without names)");
+        std::vector<std::string> names;
+        if (DIR* d = opendir(in.data_dir.c_str()))
+        {
+            while (dirent* e = readdir(d))
+            {
+                const std::string n = e->d_name;
+                const bool log = n.size() > 4 && (strcasecmp(n.c_str() + n.size() - 4, ".log") == 0 ||
+                                                  strcasecmp(n.c_str() + n.size() - 4, ".txt") == 0);
+                if (log && n != "diagnostics.txt")
+                    names.push_back(n);
+            }
+            closedir(d);
+        }
+        std::sort(names.begin(), names.end());
+        constexpr size_t kLimit = size_t(8) << 20;
+        for (const std::string& n : names)
+        {
+            uint64_t size = 0;
+            const std::string text = ReadEnd(in.data_dir + "/" + n, kLimit, size);
+            line("");
+            line("===== " + n + " (" + std::to_string(size) + " bytes" + (size > kLimit ? ", its last 8 MiB" : "") + ") =====");
+            r += Symbolize(text, symbols);
+            if (!r.empty() && r.back() != '\n')
+                r += '\n';
+        }
+    }
+    for (const auto& [file, n] : in.all_logs ? std::vector<std::pair<std::string, size_t>>{} : in.logs)
     {
         line("");
         line("== " + file + " (last " + std::to_string(n) + " lines)");
@@ -358,14 +492,20 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
         for (const std::string& l : lines)
             line(l);
     }
+    // each written whole beside, then put in place: never half a file where the last one was
     std::vector<std::string> written;
     for (const std::string& out : outputs)
-        if (FILE* f = std::fopen(out.c_str(), "w"))
+    {
+        const std::string part = out + ".part";
+        if (FILE* f = std::fopen(part.c_str(), "w"))
         {
             const bool ok = std::fwrite(r.data(), 1, r.size(), f) == r.size();
-            if (std::fclose(f) == 0 && ok)
+            if (std::fclose(f) == 0 && ok && std::rename(part.c_str(), out.c_str()) == 0)
                 written.push_back(out);
+            else
+                std::remove(part.c_str());
         }
+    }
     return written;
 }
 

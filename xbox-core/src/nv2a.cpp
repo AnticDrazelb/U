@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "core.h"
+#include "diagnostics.h"
 #include "devices.h"
 #include "nv2a.h"
 
@@ -294,6 +295,7 @@ bool Method(u32 subchannel, u32 method, u32 parameter)
         R(PGRAPH_CTX_SWITCH1 + 4 * i) = R(PGRAPH_CTX_CACHE1 + 0x20 * i + subchannel * 4);
     R(PGRAPH_CTX_SWITCH1) = (R(PGRAPH_CTX_SWITCH1) & ~0xffu) | g_subchannel_class[subchannel];
     const u32 cls = g_subchannel_class[subchannel];
+    diag::Method(cls, method, parameter);
     if (g_verbose >= 4)
         Log("nv2a: [%u] class %#x method %#06x = %#x", subchannel, cls, method, parameter);
     if (cls != 0x97)
@@ -467,6 +469,8 @@ void WriteReg(u32 offset, u32 size, u32 value)
         g_kick.notify_all();
     if (offset == PMC_INTR_EN_0 || offset == PGRAPH_INTR_EN || offset == PCRTC_INTR_EN || offset == PFIFO_INTR_EN_0)
         UpdateIrq();
+    if (offset == PCRTC_START)
+        diag::g_frames++;
     if (offset == PCRTC_START && g_verbose >= 2)
         Log("nv2a: display start %#x", value);
 }
