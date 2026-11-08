@@ -26,6 +26,7 @@ Bottom: `gamma`, `triangle` (black: it draws with the NV2A).*
 | threads | `cpu.cpp`, `kernel.cpp` | one host thread per guest thread; KPCR, ETHREAD and stack in guest memory, TLS laid out as the Xbox kernel does (`[StackBase + _tls_index*4]`) |
 | objects | `kernel.cpp` | events, semaphores, mutants, timers, threads, critical sections, read/write locks in the Xbox's own layouts in guest memory; waits on a host condition variable; APCs run in alertable waits; timers fire from their own thread (DPCs, APCs, periods) |
 | library | `kernel_rtl.cpp` | the Rtl string, memory, integer and printf functions, the pool, interlocked lists, HMAC-SHA1 and RC4 |
+| library | `kernel_crypto.cpp` | DES and triple DES (ECB, CBC), RSA over the console's key blobs, PKCS #1 signature checks |
 | memory | `memory.cpp` | RAM at `0x10000`, contiguous memory at `0x80000000` (separate: the PS4 can't alias), kernel area at `0x8c000000`, stacks at `0xd0000000`, devices from `0xfd000000` unmapped |
 | devices | `devices.cpp`, `cpu.cpp` | an access to device memory faults; the fault handler decodes the instruction (`mov`, `movzx`, ALU ops, `test`) and does it on the device's registers. vblank interrupt with its DPCs at 60 Hz |
 | GPU | `nv2a.cpp`, `render.cpp`, `draw.cpp`, `pixel.cpp` | the NV2A's FIFO (DMA pusher, RAMHT, objects, interrupts, flips) and its 3D engine in software: vertex programs interpreted, triangles rasterized by a pool of threads (bands of rows, in order), textures (swizzled, linear, DXT, palettes), the register combiners, alpha test and blending |

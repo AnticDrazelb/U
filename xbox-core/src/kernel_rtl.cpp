@@ -604,9 +604,6 @@ void RegisterRtlExports(RegisterFn reg)
         s.Final(Ptr<u8>(c.Arg(6)));
         return 0;
     });
-    // signatures are taken as valid (what the console's keys sign, we can't check without them)
-    reg("XcVerifyPKCS1Signature", [](Call&) -> u64 { return 1; });
-    reg("XcPKGetKeyLen", [](Call& c) -> u64 { return c.Arg(0) ? Read<u32>(c.Arg(0) + 0x10) / 8 : 0; });
     reg("XcCryptService", [](Call&) -> u64 { return 0; });
     reg("XcUpdateCrypto", [](Call&) -> u64 { return 0; });
 

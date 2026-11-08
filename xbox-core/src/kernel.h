@@ -27,6 +27,9 @@ void RegisterRtlExports(RegisterFn reg);
 u32 PoolAlloc(u32 size);
 void PoolFree(u32 p);
 
+// kernel_crypto.cpp: DES and triple DES, RSA
+void RegisterCryptoExports(RegisterFn reg);
+
 // files.cpp
 void RegisterFileExports(RegisterFn reg);
 void CloseHostHandle(int kind, void* host);

@@ -954,6 +954,7 @@ void InitKernel()
         }
     RegisterFileExports(Register);
     RegisterRtlExports(Register);
+    RegisterCryptoExports(Register);
     K(KeBugCheckEx) // the program's end, with its reason (an unhandled exception: 0x8e, code, address)
     {
         if (c.Arg(0) == 0x8e)

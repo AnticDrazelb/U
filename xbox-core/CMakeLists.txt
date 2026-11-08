@@ -14,7 +14,7 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(CORE_SOURCES src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp)
+set(CORE_SOURCES src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp)
 if (PS4)
     add_executable(xbox-core ${CORE_SOURCES} ps4/platform_ps4.cpp ps4/main_ps4.cpp)
     # Crema's runtime, its log folder moved to /data/xbox-core (crash.log, boot-trace.log)
