@@ -294,6 +294,56 @@ void OnSignal(int sig, siginfo_t* info, void* context)
 }
 
 } // namespace
+void OnSignalEntry(int sig, siginfo_t* info, void* context) { OnSignal(sig, info, context); }
+void TrampolineEntry(int sig, siginfo_t* info, void* context) { Trampoline(sig, info, context); }
+
+} // namespace xb::platform
+
+// The handlers as the kernel calls them: through an entry that aligns the stack to 16 bytes first
+// (the kernel's own sigaction gives no promise of it, libkernel's wrapper did that; formatting a
+// log line in the handler uses SSE stores that fault on a misaligned stack, and a fault in the
+// handler ends the app), and notes the stack pointer it came with (the self-test logs it).
+extern "C" {
+__attribute__((used, visibility("hidden"))) uint64_t xb_signal_rsp = 0;
+__attribute__((used, visibility("hidden"))) void xb_on_signal(int sig, siginfo_t* info, void* context)
+{
+    xb::platform::OnSignalEntry(sig, info, context);
+}
+__attribute__((used, visibility("hidden"))) void xb_on_trampoline(int sig, siginfo_t* info, void* context)
+{
+    xb::platform::TrampolineEntry(sig, info, context);
+}
+void xb_signal_entry(int, siginfo_t*, void*);
+void xb_trampoline_entry(int, siginfo_t*, void*);
+}
+__asm__(R"(
+    .text
+    .p2align 4
+    .globl xb_signal_entry
+    .hidden xb_signal_entry
+xb_signal_entry:
+    movq %rsp, xb_signal_rsp(%rip)
+    pushq %rbp
+    movq %rsp, %rbp
+    andq $-16, %rsp
+    call xb_on_signal
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    .p2align 4
+    .globl xb_trampoline_entry
+    .hidden xb_trampoline_entry
+xb_trampoline_entry:
+    pushq %rbp
+    movq %rsp, %rbp
+    andq $-16, %rsp
+    call xb_on_trampoline
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+)");
+
+namespace xb::platform {
 
 std::string Init()
 {
@@ -403,7 +453,7 @@ void InstallFaultHandler(FaultHandler handler)
 {
     g_handler = handler;
     BsdSigaction action{};
-    action.handler = OnSignal;
+    action.handler = xb_signal_entry;
     action.flags = kSaSiginfo | kSaOnstack;
     for (int i = 0; i < 5; i++)
     {
@@ -412,6 +462,8 @@ void InstallFaultHandler(FaultHandler handler)
             g_have_previous[sig] = true;
     }
 }
+
+uint64_t LastSignalStack() { return ::xb_signal_rsp; }
 
 const char* SignalRoute()
 {
@@ -436,13 +488,13 @@ std::string CheckFaultHandler()
         BsdSigaction current{};
         if (RawSigaction(sig, nullptr, &current) != 0)
             return "sigaction (the kernel's) failed";
-        if (current.handler == OnSignal)
+        if (current.handler == xb_signal_entry)
             continue;
         replaced += (replaced.empty() ? "" : ", ") + std::to_string(sig);
         g_previous[sig] = current;
         g_have_previous[sig] = true;
         BsdSigaction action{};
-        action.handler = OnSignal;
+        action.handler = xb_signal_entry;
         action.flags = kSaSiginfo | kSaOnstack;
         RawSigaction(sig, &action, nullptr);
     }
@@ -456,10 +508,10 @@ std::string WrapSignal(int sig)
     BsdSigaction current{};
     if (RawSigaction(sig, nullptr, &current) != 0)
         return "sigaction (the kernel's) failed";
-    if (current.handler == Trampoline || current.handler == OnSignal)
+    if (current.handler == xb_trampoline_entry || current.handler == xb_signal_entry)
         return "";
     BsdSigaction action = current;
-    action.handler = Trampoline;
+    action.handler = xb_trampoline_entry;
     action.flags |= kSaSiginfo | kSaOnstack;
     g_previous[sig] = current;
     g_have_previous[sig] = true;

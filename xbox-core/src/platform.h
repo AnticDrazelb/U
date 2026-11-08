@@ -53,6 +53,8 @@ std::string WrapSignal(int sig);
 std::string CheckFaultHandler();
 // how the signal handlers were set, for the log
 const char* SignalRoute();
+// The stack pointer the last fault's handler was entered with (0: not known), for the log.
+uint64_t LastSignalStack();
 // A KPCR about to be the guest's fs on this host thread (whose fs base is `host_fs_base`): what the
 // platform's signal delivery needs in it (the PS4's last resort: fs:[0x10]).
 void PrepareKpcr(uint32_t kpcr, uint64_t host_fs_base);

@@ -534,6 +534,10 @@ void InitCpu()
     {
         fault_test(t);
         Log("cpu self-test: faults in 32-bit code are handled, and the guest's fs is intact after them");
+        if (const u64 rsp = platform::LastSignalStack())
+            LogSync("cpu self-test: the kernel entered the fault handler with its stack at %#llx (%llu past 16-byte "
+                    "alignment; a function expects 8: the entry realigns it)",
+                    (unsigned long long)rsp, (unsigned long long)(rsp & 15));
     }
     if (step("fault log", "each of the first faults logged to the disk from the handler"))
     {
