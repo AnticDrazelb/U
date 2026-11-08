@@ -27,7 +27,8 @@ ps4)
         -DXB_IMAGE_BASE="${XB_IMAGE_BASE:-}"
     ninja -C "$build"
     stage="$build/stage"
-    rm -rf "$stage" && mkdir -p "$stage/sce_sys" "$stage/samples"
+    rm -rf "$stage" && mkdir -p "$stage/sce_sys" "$stage/samples" "$stage/ui"
+    cp "$HERE"/frontend/assets/* "$stage/ui/" # the library's fonts (and their licence)
     cp "$build/xbox-core_eboot/eboot.bin" "$stage/"
     [ -z "${XB_ELF_TYPE:-}" ] || python3 "$HERE/../xbox-bench/tools/set-elf-type.py" "$stage/eboot.bin" "$XB_ELF_TYPE"
     cp "$HERE/../xbox-bench/sce_sys/icon0.png" "$stage/sce_sys/"

@@ -95,3 +95,15 @@ Xbox's addresses below it. The real console could (xbox-bench).
    (points, lines, cube maps, bump mapping, fog), structured exception handling, and the rest of the
    kernel's I/O calls.
 4. **Drawing on the PS4's GPU** instead of the CPU, once games show what they need.
+
+## The PS4 library
+
+The app opens on a library of what it can run: the samples it carries and your games in
+`/data/xbox-core/games` (a folder with `default.xbe` and its files, or a disc image `<name>.iso`).
+Each shows its own title, title ID and region (read from its XBE), its size, and when it last ran
+and how that ended. Cover art is yours to add: `cover.jpg`/`cover.png` in a game's folder,
+`<name>.jpg` beside an image, or `/data/xbox-core/covers/<title ID>.jpg`; without one a cover is
+drawn from the title. L1/R1 switch to Settings (the log while a game starts, the picture's scaling,
+the library's order) and About. Triangle on a game can make it start with the app; hold L1 while the
+app opens to get back to the library. The screen is drawn in software (`frontend/`, fonts: Inter,
+SIL OFL); `ui-preview` (desktop build) renders it to PNG files.

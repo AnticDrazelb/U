@@ -1,8 +1,11 @@
-// xbox-core on the PS4: a menu of XBEs (the samples in the package, and /data/xbox-core/games/<name>/
-// default.xbe), then the chosen one running natively, its screen scaled up on VideoOut, the log on
-// top (L3+R3 together hide it). The log also goes to /data/xbox-core/log.txt. One program per start of
-// the app: to run another, close it (PS button) and open it again.
+// xbox-core on the PS4: the library (frontend/: the samples in the package and the player's games in
+// /data/xbox-core/games, with covers, details and history), then the chosen one running natively,
+// its screen scaled up on VideoOut, the log on top for a while (L3+R3 together toggle it). The log
+// also goes to /data/xbox-core/log.txt. One program per start of the app: to run another, close it
+// (PS button) and open it again.
 #include <algorithm>
+#include <atomic>
+#include <ctime>
 #include <strings.h>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +27,7 @@
 #include <orbis/VideoOut.h>
 #include <stb/stb_easy_font.h>
 
+#include "../frontend/ui.h"
 #include "../src/core.h"
 #include "../src/kernel.h"
 
@@ -43,6 +47,24 @@ using namespace xb;
 
 constexpr const char* kDataDir = "/data/xbox-core";
 constexpr const char* kLogFile = "/data/xbox-core/log.txt";
+constexpr const char* kHistoryFile = "/data/xbox-core/history.txt";
+constexpr const char* kSettingsFile = "/data/xbox-core/settings.txt";
+constexpr const char* kAutostartFile = "/data/xbox-core/autostart.txt";
+
+fe::Settings g_settings;
+std::string g_running;            // the game running, for its history
+std::atomic<bool> g_result_recorded{false};
+
+// how the run went: the history's "last run". A final result (how it stopped) is written once;
+// progress ("showed its picture") until then.
+void RecordResult(const std::string& result, bool final = true)
+{
+    if (g_running.empty() || g_result_recorded)
+        return;
+    if (final && g_result_recorded.exchange(true))
+        return;
+    fe::RecordRun(kHistoryFile, g_running, result);
+}
 constexpr size_t MB = 1024 * 1024;
 
 void Trace(const std::string& s)
@@ -171,6 +193,9 @@ void LogSink(const char* line)
         std::fflush(g_log_file);
     }
     g_log_lines.push_back(line);
+    const std::string l = line;
+    if (l.rfind("FATAL", 0) == 0 || l.find("guest fault") != std::string::npos || l.find("guest halted") != std::string::npos)
+        std::thread([l] { RecordResult("Stopped: " + l.substr(0, 160)); }).detach();
     while (g_log_lines.size() > 18)
         g_log_lines.pop_front();
 }
@@ -411,10 +436,74 @@ std::string Menu(const std::vector<Entry>& xbes)
     }
 }
 
+// The library: the front end's screen, the pad's presses (held directions repeat; the left stick
+// steers too), until a game is chosen. "" when the screen can't be drawn that way (fonts missing).
+std::string Library()
+{
+    fe::LibraryPaths paths{{"/app0/samples"}, "/data/xbox-core/games", "/data/xbox-core/covers", kHistoryFile};
+    fe::UiPaths ui_paths{"/app0/ui", kSettingsFile, kAutostartFile,
+                         {"Games: /data/xbox-core/games/<name>/default.xbe (with its files), or <name>.iso",
+                          "Covers: cover.jpg or cover.png beside a game (or <name>.jpg beside an .iso),",
+                          "or /data/xbox-core/covers/<title ID>.jpg, the title ID as the details show it."}};
+    fe::LibraryUi ui(fe::ScanLibrary(paths), g_settings, ui_paths, XB_VERSION);
+    if (!ui.Ready())
+        return "";
+    std::string user = "Player";
+    int32_t id = -1;
+    char name[32] = {};
+    if (sceUserServiceGetInitialUser(&id) == 0 && sceUserServiceGetUserName(id, name, sizeof(name)) == 0 && name[0])
+        user = name;
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t previous = PadButtons();
+    double held_since = 0, last_repeat = 0;
+    for (;;)
+    {
+        OrbisPadData pad{};
+        const bool connected = ReadPad(pad);
+        uint32_t buttons = connected ? pad.buttons : 0;
+        if (connected) // the left stick as the directions
+        {
+            if (pad.leftStick.x < 50) buttons |= ORBIS_PAD_BUTTON_LEFT;
+            if (pad.leftStick.x > 205) buttons |= ORBIS_PAD_BUTTON_RIGHT;
+            if (pad.leftStick.y < 50) buttons |= ORBIS_PAD_BUTTON_UP;
+            if (pad.leftStick.y > 205) buttons |= ORBIS_PAD_BUTTON_DOWN;
+        }
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        constexpr uint32_t kDirections = ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT;
+        uint32_t pressed = buttons & ~previous;
+        if ((buttons & kDirections) && (buttons & kDirections) == (previous & kDirections))
+        {
+            if (t - held_since > 0.4 && t - last_repeat > 0.11) // held: repeat
+                pressed |= buttons & kDirections, last_repeat = t;
+        }
+        else
+            held_since = t;
+        previous = buttons;
+        fe::Input in;
+        in.up = pressed & ORBIS_PAD_BUTTON_UP, in.down = pressed & ORBIS_PAD_BUTTON_DOWN;
+        in.left = pressed & ORBIS_PAD_BUTTON_LEFT, in.right = pressed & ORBIS_PAD_BUTTON_RIGHT;
+        in.cross = pressed & ORBIS_PAD_BUTTON_CROSS, in.circle = pressed & ORBIS_PAD_BUTTON_CIRCLE;
+        in.square = pressed & ORBIS_PAD_BUTTON_SQUARE, in.triangle = pressed & ORBIS_PAD_BUTTON_TRIANGLE;
+        in.l1 = pressed & ORBIS_PAD_BUTTON_L1, in.r1 = pressed & ORBIS_PAD_BUTTON_R1;
+        if (const fe::Game* g = ui.Update(in))
+            return g->path;
+        if (uint32_t* fb = g_screen.Begin())
+        {
+            const time_t now = time(nullptr);
+            char clock[16];
+            std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&now));
+            fe::Canvas canvas(fb, Screen::kWidth, Screen::kHeight, Screen::kWidth);
+            ui.Draw(canvas, t, clock, user);
+            g_screen.End();
+        }
+        usleep(8 * 1000);
+    }
+}
+
 // The guest's picture, scaled by a whole number to fit, centred; the log on top unless hidden.
 void PresentLoop()
 {
-    bool show_log = true;
+    bool show_log = g_settings.show_log, saw_picture = false;
     uint32_t previous = PadButtons();
     const auto start = std::chrono::steady_clock::now();
     constexpr uint32_t kLogToggle = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
@@ -436,7 +525,39 @@ void PresentLoop()
         }
         const DisplayInfo d = GetDisplay();
         Screen::Fill(fb, 0, 0, Screen::kWidth, Screen::kHeight, 0x000000);
-        if (d.valid)
+        if (d.valid && !saw_picture)
+        {
+            saw_picture = true;
+            std::thread([] { RecordResult("Showed its picture", false); }).detach();
+        }
+        if (d.valid && g_settings.picture != 0)
+        {
+            // fit 4:3 (the full height) or fill the screen, nearest texel
+            const int ow = g_settings.picture == 1 ? Screen::kHeight * 4 / 3 : Screen::kWidth, oh = Screen::kHeight;
+            const int x0 = (Screen::kWidth - ow) / 2;
+            static std::vector<int> columns;
+            columns.resize(size_t(ow));
+            for (int x = 0; x < ow; x++)
+                columns[size_t(x)] = x * d.width / ow;
+            std::vector<uint32_t> line(size_t(d.width));
+            int last = -1;
+            for (int y = 0; y < oh; y++)
+            {
+                const int sy = y * d.height / oh;
+                uint32_t* row = fb + size_t(y) * Screen::kWidth + x0;
+                if (sy == last)
+                {
+                    std::memcpy(row, row - Screen::kWidth, size_t(ow) * 4);
+                    continue;
+                }
+                last = sy;
+                for (int x = 0; x < d.width; x++)
+                    line[size_t(x)] = Screen::Native(DisplayPixel(d, x, sy));
+                for (int x = 0; x < ow; x++)
+                    row[x] = line[size_t(columns[size_t(x)])];
+            }
+        }
+        else if (d.valid)
         {
             const int scale = std::max(1, std::min(Screen::kWidth / d.width, Screen::kHeight / d.height));
             const int x0 = (Screen::kWidth - d.width * scale) / 2, y0 = (Screen::kHeight - d.height * scale) / 2;
@@ -508,9 +629,17 @@ int main()
         while (!xbe.empty() && (xbe.back() == '\n' || xbe.back() == '\r' || xbe.back() == ' '))
             xbe.pop_back();
     }
+    // holding L1 while the app opens: the library, whatever autostart says
+    if (PadButtons() & ORBIS_PAD_BUTTON_L1)
+        xbe.clear();
+    g_settings.Load(kSettingsFile);
+    if (xbe.empty())
+        xbe = Library();
     if (xbe.empty())
         xbe = Menu(xbes);
     Log("starting %s", xbe.c_str());
+    g_running = xbe;
+    fe::RecordRun(kHistoryFile, xbe, "");
     std::thread([xbe] {
         InitMemory();
         InitCpu();
@@ -523,6 +652,7 @@ int main()
         ResolveThunks();
         StartVblank();
         RunXbe();
+        RecordResult("Ended by itself");
         Log("the program ended; close the app (PS button) to choose another");
     }).detach();
     PresentLoop();
