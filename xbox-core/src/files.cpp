@@ -169,6 +169,8 @@ std::string HostPathAsGiven(std::string path, u32 root)
         }
         return "";
     }
+    if (lower == "/device/harddisk0/partition0") // the raw disk
+        return g_data_dir + "/partition0.img";
     const std::pair<const char*, std::string> devices[] = {
         {"/device/cdrom0", g_game_dir},
         {"/device/harddisk0/partition1", g_data_dir + "/e"},
@@ -426,6 +428,9 @@ void SetDataDirectory(const std::string& dir)
     // the hard disk's partitions, so that listing them works before a program writes there
     for (const char* p : {"", "/c", "/e", "/t", "/u", "/x", "/y", "/z"})
         mkdir((dir + p).c_str(), 0755);
+    // the raw disk (partition 0: its config sectors), empty until a program writes them
+    if (FILE* f = std::fopen((dir + "/partition0.img").c_str(), "ab"))
+        std::fclose(f);
 }
 
 void CloseHostHandle(int kind, void* host)
