@@ -3,7 +3,9 @@
 //   left    an unlit quad, a colour at each corner (red, green, blue, white)
 //   middle  a lit quad: one infinite light of diffuse (1, 0.5, 0.25) along the normal and a scene
 //           ambient of 0.1: (1.1 -> 1, 0.6, 0.35) = (255, 153, 89) everywhere
-//   right   a quad lit by a spot light above its centre: brightest there, dimmer outwards
+//   right   a quad lit by a point light above its centre: brightest there, dimmer outwards
+//   bottom  a red quad in linear fog, its fog coordinate 0 on the left and 1 on the right, the fog
+//           blue: red on the left, (128, 0, 128) in the middle, blue on the right
 // Positions are in pixels: the composite matrix is the identity, the viewport offset 0.
 #include <hal/video.h>
 #include <pbkit/pbkit.h>
@@ -57,6 +59,7 @@ int main(void)
         p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE, 0);
         p = pb_push1(p, NV097_SET_CULL_FACE_ENABLE, 0);
         p = pb_push1(p, NV097_SET_COMBINER_CONTROL, 0);
+        p = pb_push1(p, NV097_SET_FOG_ENABLE, 0);
         p = push_floats(p, NV097_SET_COMPOSITE_MATRIX, 16, identity);
         p = push_floats(p, NV097_SET_MODEL_VIEW_MATRIX, 16, identity);
         p = push_floats(p, NV097_SET_INVERSE_MODEL_VIEW_MATRIX, 16, identity);
@@ -112,6 +115,36 @@ int main(void)
                 }
                 p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
             }
+        pb_end(p);
+
+        // fog: linear, from the fog coordinate (start 0, end 1: x = 2, y = -1), blue; the final
+        // combiner blends v0 into it by the fog factor (A = fog.a, B = v0, C = fog.rgb, G = v0.a)
+        p = pb_begin();
+        p = pb_push1(p, NV097_SET_LIGHTING_ENABLE, 0);
+        p = pb_push1(p, NV097_SET_COMBINER_CONTROL, 1);
+        p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW, 0);
+        p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW, 0);
+        p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW, 0);
+        p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW, 0);
+        p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0, 0x13040300);
+        p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1, 0x00001400);
+        p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 0);
+        p = pb_push1(p, NV097_SET_FOG_ENABLE, 1);
+        p = pb_push1(p, NV097_SET_FOG_MODE, NV097_SET_FOG_MODE_V_LINEAR);
+        p = pb_push1(p, NV097_SET_FOG_GEN_MODE, NV097_SET_FOG_GEN_MODE_V_FOG_X);
+        const float fog_params[3] = {2, -1, 0};
+        p = push_floats(p, NV097_SET_FOG_PARAMS, 3, fog_params);
+        p = pb_push1(p, NV097_SET_FOG_COLOR, 0xffff0000); // ABGR: blue
+        p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_QUADS);
+        const float fx[4] = {20, 620, 620, 20}, fy[4] = {370, 370, 460, 460}, fogc[4] = {0, 1, 1, 0};
+        for (int i = 0; i < 4; i++)
+        {
+            const float v[4] = {fx[i], fy[i], 0, 1};
+            p = pb_push1(p, NV097_SET_DIFFUSE_COLOR4I, 0xff0000ff);
+            p = push_floats(p, NV097_SET_FOG_COORD, 1, &fogc[i]);
+            p = push_floats(p, NV097_SET_VERTEX4F, 4, v);
+        }
+        p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
         pb_end(p);
         while (pb_busy())
             ;

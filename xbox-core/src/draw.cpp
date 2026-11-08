@@ -441,7 +441,22 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
         d0[c] = std::clamp(d0[c], 0.f, 1.f), d1[c] = std::clamp(d1[c], 0.f, 1.f);
     out[3] = d0, out[4] = d1;
     out[7] = in[7], out[8] = in[8];
-    out[5] = in[5];
+    // the fog distance (SET_FOG_GEN_MODE): turned into the fog factor in EmitVertex
+    switch (k.Get(0x2a0))
+    {
+    case 0: out[5][0] = std::clamp(specular[3], 0.f, 1.f); break;                          // specular alpha
+    case 1: out[5][0] = std::sqrt(Dot3(eye_position, eye_position)); break;                // radial
+    case 2:                                                                                // planar
+    case 3:                                                                                // abs planar
+    {
+        const Vec4 plane = Floats(0x9d0);
+        out[5][0] = Dot3(plane, eye_position) + plane[3];
+        if (k.Get(0x2a0) == 3)
+            out[5][0] = std::fabs(out[5][0]);
+        break;
+    }
+    default: out[5][0] = in[5][0];                                                         // the fog coordinate
+    }
 
     // the position: the composite matrix (the model-view one already in it, unless skinning), the
     // divide by w, the viewport's offset
@@ -453,6 +468,35 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
     out[0] = Vec4{{pos[0] / w + offset[0], pos[1] / w + offset[1], pos[2] / w, w}};
 }
 
+// The fog factor from the fog distance in output 5 (SET_FOG_MODE, SET_FOG_PARAMS), as the NV2A
+// computes it per vertex: linear x + d*y; exp and exp2 through powers of two; "abs" modes take the
+// magnitude. 1 when fog is off.
+void FogFactor(Vec4 out[16])
+{
+    const KelvinState& k = g_kelvin;
+    if (!k.Get(0x2a4)) // SET_FOG_ENABLE
+    {
+        out[5] = Vec4{{1, 1, 1, 1}};
+        return;
+    }
+    const float d = out[5][0], x = k.F(0x9c0), y = k.F(0x9c4);
+    const u32 mode = k.Get(0x29c);
+    float f;
+    if (mode == 0x800 || mode == 0x802) // exp
+        f = x + std::exp2(d * y * 16.f) - 1.5f;
+    else if (mode == 0x801 || mode == 0x803) // exp2
+        f = x + std::exp2(-d * d * y * y * 32.f) - 1.5f;
+    else // linear
+        f = x + d * y - 1.f;
+    if (mode == 0x802 || mode == 0x803 || mode == 0x804)
+        f = std::fabs(f);
+    if (std::isinf(d))
+        f = mode == 0x802 || mode == 0x803 ? 0.f : 1.f;
+    else if (std::isnan(f))
+        f = mode == 0x802 || mode == 0x803 ? 0.f : 1.f;
+    out[5] = Vec4{{f, f, f, f}};
+}
+
 void EmitVertex(const Vec4 in[16])
 {
     Vertex v;
@@ -460,6 +504,7 @@ void EmitVertex(const Vec4 in[16])
         RunProgram(in, v.o);
     else
         FixedFunction(in, v.o);
+    FogFactor(v.o);
     g_vertices.push_back(v);
 }
 

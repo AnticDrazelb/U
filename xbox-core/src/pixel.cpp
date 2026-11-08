@@ -115,6 +115,7 @@ struct PixelState
     Stage stage[8];
     u32 cw0 = 0, cw1 = 0;
     bool uses_ef = false, uses_sum = false;
+    V4 fog_color{};
     V4 final_c0{}, final_c1{};
     u32 program[4] = {};
     bool enabled[4] = {};
@@ -401,8 +402,11 @@ V4 FinalInput(const Registers& regs, u32 byte, const V4& sum, const V4& ef)
 V4 Combine(const PixelInputs& in, const V4 tex[4])
 {
     Registers regs;
-    for (int i : {0, 1, 2, 3, 6, 7, 12, 13, 14, 15})
+    for (int i : {0, 1, 2, 6, 7, 12, 13, 14, 15})
         regs.r[i] = {0, 0, 0, 0};
+    // fog: its colour (SET_FOG_COLOR, red in the low byte) and the interpolated factor
+    regs.r[3] = g_ps.fog_color;
+    regs.r[3][3] = Clamp01(in.v[5][0]);
     regs.r[4] = {in.v[3][0], in.v[3][1], in.v[3][2], in.v[3][3]}; // v0: diffuse
     regs.r[5] = {in.v[4][0], in.v[4][1], in.v[4][2], in.v[4][3]}; // v1: specular
     for (int i = 0; i < 4; i++)
@@ -548,6 +552,8 @@ void PreparePixels()
         st.alpha = (st.aocw & 0xfff) != 0 || (st.ocw & (3u << 18));
     }
     ps.cw0 = k.Get(0x288), ps.cw1 = k.Get(0x28c);
+    const u32 fog = k.Get(0x2a8);
+    ps.fog_color = {(fog & 255) / 255.f, ((fog >> 8) & 255) / 255.f, ((fog >> 16) & 255) / 255.f, (fog >> 24) / 255.f};
     ps.uses_ef = ps.uses_sum = false;
     for (u32 byte : {ps.cw0 >> 24, (ps.cw0 >> 16) & 0xff, (ps.cw0 >> 8) & 0xff, ps.cw0 & 0xff, (ps.cw1 >> 8) & 0xff})
     {
@@ -574,7 +580,7 @@ u32 PixelInputMask()
 {
     if (!g_ps.combiners)
         return 1u << 3;
-    u32 mask = 1u << 3 | 1u << 4;
+    u32 mask = 1u << 3 | 1u << 4 | 1u << 5; // and the fog factor
     for (int s = 0; s < 4; s++)
         if (g_ps.program[s])
             mask |= 1u << (9 + s);
