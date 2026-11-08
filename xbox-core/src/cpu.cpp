@@ -261,6 +261,21 @@ size_t SkipPrivileged(const u8* p, Regs& r)
         if (p[1] == 0x20 || p[1] == 0x22) // mov from/to control register
             return 3;
         return 0;
+    case 0xcd:
+        // int 2dh: the kernel's debug service (eax 1: print the ecx string of edx bytes; 2, 3:
+        // symbol loading). With no debugger the kernel carries on past the int 3 that follows.
+        if (p[1] == 0x2d)
+        {
+            if (r.Get(0) == 1 && r.Get(1) >= kRamBase && r.Get(2) < 4096)
+            {
+                std::string text(Ptr<const char>(r.Get(1)), r.Get(2));
+                while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                    text.pop_back();
+                Log("DbgPrint: %s", text.c_str());
+            }
+            return p[2] == 0xcc ? 3 : 2;
+        }
+        return 0;
     case 0x66:
         if (p[1] == 0xed) { r.Set(0, r.Get(0) & 0xffff0000); return 2; }
         if (p[1] == 0xef) return 2;

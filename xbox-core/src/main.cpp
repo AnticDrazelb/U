@@ -1,6 +1,6 @@
 // xbox-core: runs an original Xbox program (XBE) on this machine's CPU.
 //
-//   xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC] [-v 0|1|2]
+//   xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC | --pad button@seconds,...] [-v 0|1|2]
 //
 // --seconds stops it after S seconds (Xbox programs rarely end on their own); --png saves the
 // picture on the screen at the end; --wav records the sound. --pad holds controller input from the
@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 #include "core.h"
@@ -76,7 +77,7 @@ int main(int argc, char** argv)
     }
     if (xbe.empty())
     {
-        Log("usage: xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC] [-v 0|1|2]");
+        Log("usage: xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC | --pad button@seconds,...] [-v 0|1|2]");
         return 1;
     }
     // --wav: what the program plays, recorded (48 kHz, 16-bit stereo)
@@ -100,7 +101,40 @@ int main(int argc, char** argv)
     SetDataDirectory("xbox-data");
     ResolveThunks();
     StartVblank();
-    if (!pad.empty())
+    if (!pad.empty() && pad.find('@') != std::string::npos)
+    {
+        // a script: "a@3,down@5,a+x@7": each press (buttons joined by +) at its second, for 0.2 s
+        std::vector<std::pair<double, PadState>> presses;
+        size_t at = 0;
+        while (at < pad.size())
+        {
+            size_t end = pad.find(',', at);
+            if (end == std::string::npos)
+                end = pad.size();
+            const std::string item = pad.substr(at, end - at);
+            at = end + 1;
+            const size_t sign = item.find('@');
+            std::string buttons = item.substr(0, sign);
+            for (char& c : buttons)
+                if (c == '+')
+                    c = ',';
+            PadState state;
+            if (sign == std::string::npos || !ParsePad(buttons, state))
+                Fatal("--pad %s: unknown input", item.c_str());
+            presses.push_back({std::atof(item.c_str() + sign + 1), state});
+        }
+        std::thread([presses] {
+            const auto start = std::chrono::steady_clock::now();
+            for (const auto& [when, state] : presses)
+            {
+                std::this_thread::sleep_until(start + std::chrono::duration<double>(when));
+                SetPad(state);
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                SetPad(PadState{});
+            }
+        }).detach();
+    }
+    else if (!pad.empty())
     {
         PadState state;
         if (!ParsePad(pad, state))
