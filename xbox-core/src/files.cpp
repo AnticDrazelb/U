@@ -412,6 +412,11 @@ void SetDataDirectory(const std::string& dir)
 
 void CloseHostHandle(int kind, void* host)
 {
+    if (kind == 4) // a symbolic link object: its target
+    {
+        delete static_cast<std::string*>(host);
+        return;
+    }
     if (kind == 1 || kind == 2)
     {
         auto* f = static_cast<HostFile*>(host);
@@ -610,7 +615,149 @@ void RegisterFileExports(RegisterFn reg)
         }
         return STATUS_OBJECT_NAME_NOT_FOUND;
     });
-    reg("NtOpenSymbolicLinkObject", [](Call&) -> u64 { return STATUS_OBJECT_NAME_NOT_FOUND; });
+    // symbolic links: the drive letters (the program's own, else the defaults)
+    reg("NtOpenSymbolicLinkObject", [](Call& c) -> u64 { // handle*, attributes
+        u32 root;
+        std::string name = Lower(ObjectPath(c.Arg(1), root));
+        for (char& ch : name)
+            if (ch == '\\')
+                ch = '/';
+        if (name.rfind("/?" "?/", 0) == 0)
+            name = name.substr(4);
+        if (name.size() != 2 || name[1] != ':')
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        std::string target;
+        {
+            std::lock_guard lock(g_links_mutex);
+            if (auto it = g_links.find(name); it != g_links.end())
+                target = it->second;
+        }
+        if (target.empty())
+            switch (name[0])
+            {
+            case 'd': target = "\\Device\\CdRom0"; break;
+            case 'c': target = "\\Device\\Harddisk0\\Partition2"; break;
+            case 'e': target = "\\Device\\Harddisk0\\Partition1"; break;
+            case 'x': target = "\\Device\\Harddisk0\\Partition3"; break;
+            case 'y': target = "\\Device\\Harddisk0\\Partition4"; break;
+            case 'z': target = "\\Device\\Harddisk0\\Partition5"; break;
+            default: return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+        Write<u32>(c.Arg(0), NewHostHandle(4, new std::string(target)));
+        return STATUS_SUCCESS;
+    });
+    reg("NtQuerySymbolicLinkObject", [](Call& c) -> u64 { // handle, target (OBJECT_STRING)*, length*
+        auto* target = static_cast<std::string*>(HostOf(c.Arg(0), 4));
+        if (!target)
+            return STATUS_INVALID_HANDLE;
+        const u32 s = c.Arg(1), max = Read<u16>(s + 2), buffer = Read<u32>(s + 4);
+        if (c.Arg(2))
+            Write<u32>(c.Arg(2), u32(target->size()));
+        if (target->size() > max)
+            return 0xC0000023; // STATUS_BUFFER_TOO_SMALL
+        std::memcpy(Ptr(buffer), target->data(), target->size());
+        Write<u16>(s, u16(target->size()));
+        return STATUS_SUCCESS;
+    });
+    reg("NtCreateDirectoryObject", [](Call& c) -> u64 { Write<u32>(c.Arg(0), NewHostHandle(3, nullptr)); return STATUS_SUCCESS; });
+    reg("IoCreateFile", [](Call& c) -> u64 {
+        // as NtCreateFile, with Options after CreateOptions
+        return Open(c.Arg(0), c.Arg(2), c.Arg(3), c.Arg(7), c.Arg(8), c.Arg(1));
+    });
+    reg("NtDeleteFile", [](Call& c) -> u64 { // attributes
+        u32 root;
+        const std::string host = HostPath(ObjectPath(c.Arg(0), root), root);
+        std::string in_image;
+        if (host.empty())
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        if (InIso(host, in_image))
+            return STATUS_ACCESS_DENIED;
+        if (unlink(host.c_str()) == 0 || rmdir(host.c_str()) == 0)
+            return STATUS_SUCCESS;
+        return errno == ENOENT ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_ACCESS_DENIED;
+    });
+    // NtReadFileScatter / NtWriteFileGather: handle, event, apc, context, io status, segments (a page
+    // pointer each: FILE_SEGMENT_ELEMENT is 4 bytes on the Xbox), length, offset*
+    auto scatter = [](Call& c, bool write) -> u64 {
+        HostFile* f = FileOf(c.Arg(0));
+        if (!f || f->directory || (!f->iso && f->fd < 0))
+            return STATUS_INVALID_HANDLE;
+        if (write && f->iso)
+            return STATUS_ACCESS_DENIED;
+        s64 at = c.Arg(7) ? Read<s64>(c.Arg(7)) : (f->iso ? f->position : lseek(f->fd, 0, SEEK_CUR));
+        u32 done = 0;
+        for (u32 i = 0; done < c.Arg(6); i++)
+        {
+            const u32 page = Read<u32>(c.Arg(5) + i * 4), n = std::min<u32>(4096, c.Arg(6) - done);
+            ssize_t got;
+            if (f->iso)
+                got = ssize_t(IsoRead(*f->iso, u64(at), n, Ptr(page)));
+            else
+                got = write ? pwrite(f->fd, Ptr(page), n, off_t(at)) : pread(f->fd, Ptr(page), n, off_t(at));
+            if (got <= 0)
+                break;
+            done += u32(got), at += got;
+            if (u32(got) < n)
+                break;
+        }
+        if (f->iso)
+            f->position = at;
+        else if (!c.Arg(7))
+            lseek(f->fd, off_t(at), SEEK_SET);
+        const u32 status = !write && done == 0 && c.Arg(6) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
+        SetIo(c.Arg(4), status, done);
+        if (c.Arg(1))
+            WakeAll();
+        return status;
+    };
+    reg("NtReadFileScatter", [scatter](Call& c) -> u64 { return scatter(c, false); });
+    reg("NtWriteFileGather", [scatter](Call& c) -> u64 { return scatter(c, true); });
+    // device controls: the disk's geometry and partitions, as XAPI asks when it mounts drives
+    auto ioctl = [](u32 code, u32 out, u32 out_length) -> u32 { // returns bytes written
+        if (out && out_length)
+            std::memset(Ptr(out), 0, out_length);
+        switch (code)
+        {
+        case 0x70000:   // IOCTL_DISK_GET_DRIVE_GEOMETRY: 8 GiB of 512-byte sectors
+        case 0x2404c:   // IOCTL_CDROM_GET_DRIVE_GEOMETRY
+            if (out_length < 24)
+                return 0;
+            Write<s64>(out, code == 0x70000 ? 8ll * 1024 * 1024 * 1024 / 512 : 3820880); // cylinders
+            Write<u32>(out + 8, code == 0x70000 ? 12 : 11);                              // fixed / removable
+            Write<u32>(out + 12, 1);
+            Write<u32>(out + 16, 1);
+            Write<u32>(out + 20, code == 0x70000 ? 512 : 2048);
+            return 24;
+        case 0x74004: // IOCTL_DISK_GET_PARTITION_INFO: a 750 MiB partition, recognized
+            if (out_length < 32)
+                return 0;
+            Write<s64>(out, 0x80000);
+            Write<s64>(out + 8, 750ll * 1024 * 1024);
+            Write<u32>(out + 20, 1);
+            Write<u8>(out + 24, 0x0b); // FAT32
+            Write<u8>(out + 26, 1);
+            return 32;
+        }
+        return 0;
+    };
+    reg("NtDeviceIoControlFile", [ioctl](Call& c) -> u64 {
+        // handle, event, apc, context, io status, code, in, in length, out, out length
+        const u32 n = ioctl(c.Arg(5), c.Arg(8), c.Arg(9));
+        SetIo(c.Arg(4), STATUS_SUCCESS, n);
+        if (c.Arg(1))
+            WakeAll();
+        return STATUS_SUCCESS;
+    });
+    reg("IoSynchronousDeviceIoControlRequest", [ioctl](Call& c) -> u64 {
+        // code, device, in, in length, out, out length, returned length*, internal
+        const u32 n = ioctl(c.Arg(0), c.Arg(4), c.Arg(5));
+        if (c.Arg(6))
+            Write<u32>(c.Arg(6), n);
+        return STATUS_SUCCESS;
+    });
+    reg("NtFsControlFile", [](Call& c) -> u64 { SetIo(c.Arg(4), STATUS_SUCCESS, 0); return STATUS_SUCCESS; });
+    reg("IoDismountVolume", [](Call&) -> u64 { return STATUS_SUCCESS; });
+    reg("IoDismountVolumeByName", [](Call&) -> u64 { return STATUS_SUCCESS; });
     reg("NtQueryDirectoryObject", [](Call& c) -> u64 {
         // DirectoryHandle, Buffer, Length, RestartScan, Context*, ReturnLength*
         if (!HostOf(c.Arg(0), 3) && !IsHandleKind(c.Arg(0), 3))

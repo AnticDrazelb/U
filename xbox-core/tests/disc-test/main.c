@@ -80,6 +80,43 @@ int main(void)
     check("GetFileAttributesEx", GetFileAttributesExA("D:\\data\\big.bin", GetFileExInfoStandard, &attributes) &&
                                      attributes.nFileSizeLow == 300000);
 
+    // the D: link
+    OBJECT_ATTRIBUTES oa;
+    ANSI_STRING name;
+    HANDLE link;
+    RtlInitAnsiString(&name, "\\??\\D:");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    char target_text[64];
+    ANSI_STRING target = {0, sizeof(target_text), target_text};
+    check("NtOpenSymbolicLinkObject D:", NtOpenSymbolicLinkObject(&link, &oa) == 0);
+    check("NtQuerySymbolicLinkObject: \\Device\\CdRom0", NtQuerySymbolicLinkObject(link, &target, NULL) == 0 &&
+                                                          target.Length == 14 && memcmp(target_text, "\\Device\\CdRom0", 14) == 0);
+    NtClose(link);
+
+    // a file made and deleted on E:
+    f = CreateFileA("E:\\disc-test.tmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    check("create E:\\disc-test.tmp", f != INVALID_HANDLE_VALUE && WriteFile(f, "x", 1, &got, NULL));
+    CloseHandle(f);
+    check("DeleteFile", DeleteFileA("E:\\disc-test.tmp") && GetFileAttributesA("E:\\disc-test.tmp") == INVALID_FILE_ATTRIBUTES);
+
+    // a scatter read: two pages of big.bin from 4096 on
+    unsigned char *pages = MmAllocateContiguousMemory(8192);
+    FILE_SEGMENT_ELEMENT segments[3] = {0};
+    segments[0].Buffer = pages;
+    segments[1].Buffer = pages + 4096;
+    HANDLE raw;
+    IO_STATUS_BLOCK io;
+    RtlInitAnsiString(&name, "\\??\\D:\\data\\big.bin");
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    NtOpenFile(&raw, GENERIC_READ | SYNCHRONIZE, &oa, &io, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT);
+    LARGE_INTEGER offset = {.QuadPart = 4096};
+    check("NtReadFileScatter", NtReadFileScatter(raw, NULL, NULL, NULL, &io, segments, 8192, &offset) == 0 &&
+                                   io.Information == 8192 && pattern_ok(pages, 4096, 8192));
+    DISK_GEOMETRY geometry;
+    check("IOCTL_DISK_GET_DRIVE_GEOMETRY", NtDeviceIoControlFile(raw, NULL, NULL, NULL, &io, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0,
+                                                                 &geometry, sizeof(geometry)) == 0 && geometry.BytesPerSector == 512);
+    NtClose(raw);
+
     DbgPrint("disc test: %d failures\n", failures);
     debugPrint("disc test: %d failures\n", failures);
     for (;;)

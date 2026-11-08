@@ -8,7 +8,7 @@ It runs on the desktop (Linux x86-64) and builds for the PS4.
 **Where it stands:** nxdk's samples run: the C runtime, C++, the Windows API layer, SDL2, the
 NV2A's 3D drawing (vertex programs, textures, register combiners) in a multi-threaded software
 renderer, sound through the AC'97, and the Xbox controller over USB. Games load from a folder or
-straight from a disc image (`.iso`). 210 of the kernel's 337 functions are implemented, each new
+straight from a disc image (`.iso`). 280 of the kernel's 337 functions are implemented (most of the rest are the driver model's IRPs and device queues), each new
 one checked by `tests/kernel-test`. No commercial game has been tried yet.
 
 ![nxdk samples in xbox-core](tests/samples.png)

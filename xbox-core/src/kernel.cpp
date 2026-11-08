@@ -1313,6 +1313,35 @@ void InitKernel()
         return 0;
     } END;
 
+    // the "...AndRegion" forms: the same (kernel APCs aren't held off here)
+    g_handlers[g_ordinal_by_name["RtlEnterCriticalSectionAndRegion"]] = g_handlers[g_ordinal_by_name["RtlEnterCriticalSection"]];
+    g_handlers[g_ordinal_by_name["RtlLeaveCriticalSectionAndRegion"]] = g_handlers[g_ordinal_by_name["RtlLeaveCriticalSection"]];
+    K(KeSynchronizeExecution) // interrupt, routine, context: the routine's result
+    {
+        return u32(CallGuestNested(c.Arg(1), {c.Arg(2)}));
+    } END;
+    K(RtlMapGenericMask) // access mask*, GENERIC_MAPPING* { read, write, execute, all }
+    {
+        u32 mask = Read<u32>(c.Arg(0));
+        const u32 m = c.Arg(1);
+        if (mask & 0x80000000) mask |= Read<u32>(m);      // GENERIC_READ
+        if (mask & 0x40000000) mask |= Read<u32>(m + 4);  // GENERIC_WRITE
+        if (mask & 0x20000000) mask |= Read<u32>(m + 8);  // GENERIC_EXECUTE
+        if (mask & 0x10000000) mask |= Read<u32>(m + 12); // GENERIC_ALL
+        Write<u32>(c.Arg(0), mask & 0x0fffffff);
+        return 0;
+    } END;
+    K(RtlCaptureContext) // CONTEXT*: what's known of the caller (its stack and return address)
+    {
+        const u32 ctx = c.Arg(0);
+        const u32 flags = Read<u32>(ctx);
+        std::memset(Ptr(ctx + 4), 0, 0xcc - 4);
+        Write<u32>(ctx, flags | 0x10007); // CONTEXT_i386 | CONTROL | INTEGER | SEGMENTS
+        Write<u32>(ctx + 0xb8, c.frame->ret);             // Eip
+        Write<u32>(ctx + 0xc4, Guest(&c.frame->args[0])); // Esp after the return
+        return 0;
+    } END;
+
     // ---- memory
     K(MmAllocateContiguousMemory) { return AllocContiguous(c.Arg(0), 0x1000, 0, 0xffffffff); } END;
     K(MmAllocateContiguousMemoryEx) { return AllocContiguous(c.Arg(0), c.Arg(3), c.Arg(1), c.Arg(2)); } END;
