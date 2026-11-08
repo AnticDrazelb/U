@@ -91,6 +91,8 @@ rm -rf ~/emu/run/game && cp -r ~/xc-ps4/stage ~/emu/run/game && rm -rf ~/emu/run
 cd ~/emu/run && DISPLAY=:99 timeout 25 ~/emu/shadPS4/build/shadps4 ~/emu/run/game/eboot.bin
 ```
 Its files land in `~/emu/run/user/data/xbox-core/`. Its USB drive is `~/emu/run/user/mnt/usb0`.
+They only go there if `~/emu/run/user` exists (otherwise `~/.local/share/shadPS4`). The first run
+spends most of 25 s setting shadPS4 up: if nothing was written, run it again.
 
 ## 3. What the console logs give you
 

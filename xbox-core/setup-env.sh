@@ -183,8 +183,13 @@ if [ "${1:-}" = shadps4 ]; then
     git -C "$SH" submodule update -q --init --recursive
     # spdlog downloads fmt as a GitHub /archive/ tarball, which may be refused: a clone of the tag
     [ -d "$HOME/emu/fmt-12.1.0" ] || git clone -q --depth 1 -b 12.1.0 https://github.com/fmtlib/fmt "$HOME/emu/fmt-12.1.0"
+    # LLVM's libc++: clang 21 can't compile shadPS4's std::ranges::to with Ubuntu's libstdc++ 13 or 14
     cmake -S "$SH" -B "$SH/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFETCHCONTENT_SOURCE_DIR_FMT="$HOME/emu/fmt-12.1.0" \
-        -DCMAKE_C_COMPILER=/opt/llvm21/bin/clang -DCMAKE_CXX_COMPILER=/opt/llvm21/bin/clang++ > "$LOG/shadps4.log" 2>&1
+        -DCMAKE_C_COMPILER=/opt/llvm21/bin/clang -DCMAKE_CXX_COMPILER=/opt/llvm21/bin/clang++ \
+        -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+        -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/opt/llvm21/lib/x86_64-unknown-linux-gnu" > "$LOG/shadps4.log" 2>&1
     ninja -C "$HOME/emu/shadPS4/build" >> "$LOG/shadps4.log" 2>&1
+    # a user/ folder beside where it runs keeps its files there (HANDOFF's paths), not in ~/.local/share
+    mkdir -p "$HOME/emu/run/user"
 fi
 echo "setup done. Logs in $LOG. Next: xbox-core/build.sh host && xbox-core/build.sh ps4"
