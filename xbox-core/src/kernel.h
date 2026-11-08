@@ -31,6 +31,8 @@ void PoolFree(u32 p);
 void RegisterFileExports(RegisterFn reg);
 void CloseHostHandle(int kind, void* host);
 void SetGameDirectory(const std::string& dir);
+// Loads a game: a default.xbe (its folder is D:) or a disc image (.iso: its default.xbe; D: is the image).
+bool LoadGame(const std::string& path, std::string& error);
 void SetDataDirectory(const std::string& dir); // the hard disk's partitions (E:, T:, ...) live under it
 
 // handles (kernel.cpp): kind 1 = file, 2 = directory

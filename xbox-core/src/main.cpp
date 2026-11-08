@@ -1,6 +1,6 @@
 // xbox-core: runs an original Xbox program (XBE) on this machine's CPU.
 //
-//   xbox-core <default.xbe> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC] [-v 0|1|2]
+//   xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC] [-v 0|1|2]
 //
 // --seconds stops it after S seconds (Xbox programs rarely end on their own); --png saves the
 // picture on the screen at the end; --wav records the sound. --pad holds controller input from the
@@ -76,7 +76,7 @@ int main(int argc, char** argv)
     }
     if (xbe.empty())
     {
-        Log("usage: xbox-core <default.xbe> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC] [-v 0|1|2]");
+        Log("usage: xbox-core <default.xbe | game.iso> [--seconds S] [--png out.png] [--wav out.wav] [--pad SPEC] [-v 0|1|2]");
         return 1;
     }
     // --wav: what the program plays, recorded (48 kHz, 16-bit stereo)
@@ -95,10 +95,8 @@ int main(int argc, char** argv)
     InitDevices();
     InitKernel();
     std::string error;
-    if (!LoadXbe(xbe, g_xbe, error))
+    if (!LoadGame(xbe, error))
         Fatal("%s: %s", xbe.c_str(), error.c_str());
-    const size_t slash = xbe.find_last_of('/');
-    SetGameDirectory(slash == std::string::npos ? "." : xbe.substr(0, slash));
     SetDataDirectory("xbox-data");
     ResolveThunks();
     StartVblank();

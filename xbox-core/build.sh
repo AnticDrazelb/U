@@ -3,7 +3,8 @@
 #   build.sh host   desktop build in ~/xc-host (run: ~/xc-host/xbox-core default.xbe --seconds 5 --png out.png)
 #   build.sh ps4    eboot.bin in ~/xc-ps4, packaged with nxdk's samples as out/xbox-core.pkg
 # The PS4 build needs Crema's toolchain and sysroot (docs/BUILDING.md); the samples come from an nxdk
-# checkout with them built (NXDK_DIR, tests/run-nxdk-samples.sh builds them).
+# checkout with them built (NXDK_DIR, tests/run-nxdk-samples.sh builds them); the core's tests come
+# from tests/kernel-test and tests/disc-test (make, then disc-test/make-image.sh).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 NXDK_DIR="${NXDK_DIR:-$HOME/emu/nxdk}"
@@ -32,6 +33,13 @@ ps4)
             echo "sample $s not built ($xbe): left out" >&2
         fi
     done
+    # the core's own tests: the kernel test as an XBE, the disc test as a disc image
+    if [ -f "$HERE/tests/kernel-test/bin/default.xbe" ]; then
+        cp "$HERE/tests/kernel-test/bin/default.xbe" "$stage/samples/test-kernel.xbe"
+    fi
+    if [ -f "$HERE/tests/disc-test/disc-test.iso" ]; then
+        cp "$HERE/tests/disc-test/disc-test.iso" "$stage/samples/test-disc.iso"
+    fi
     mkdir -p "$HOME/xc-ps4/no-modules" "$HERE/../out"
     pkg="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR="$HOME/xc-ps4/no-modules" \
         "$HERE/../scripts/make-pkg.sh" "$stage" XBCR00001 "xbox-core" "$(cat "$HERE/VERSION")" XBOXCORE "$HOME/xc-ps4/out" |

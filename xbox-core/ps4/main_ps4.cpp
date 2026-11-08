@@ -3,6 +3,7 @@
 // top (L3+R3 together hide it). The log also goes to /data/xbox-core/log.txt. One program per start of
 // the app: to run another, close it (PS button) and open it again.
 #include <algorithm>
+#include <strings.h>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -321,8 +322,9 @@ struct Entry
     std::string name, path;
 };
 
-// The samples in the package are /app0/samples/<name>.xbe; the player's own programs are
-// /data/xbox-core/games/<name>/default.xbe (with their files beside them: that folder is D:).
+// The samples in the package are /app0/samples/<name>.xbe; the player's own games are
+// /data/xbox-core/games/<name>/default.xbe (with their files beside them: that folder is D:) or disc
+// images, /data/xbox-core/games/<name>.iso (or an .iso inside a game's folder).
 std::vector<Entry> FindXbes()
 {
     std::vector<Entry> out;
@@ -331,8 +333,10 @@ std::vector<Entry> FindXbes()
         while (dirent* e = readdir(d))
         {
             const std::string name = e->d_name;
-            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".xbe") == 0)
-                out.push_back({"sample: " + name.substr(0, name.size() - 4), "/app0/samples/" + name});
+            if (name.size() > 4 && (name.compare(name.size() - 4, 4, ".xbe") == 0 || name.compare(name.size() - 4, 4, ".iso") == 0))
+                out.push_back({"sample: " + name.substr(0, name.size() - 4) +
+                                   (name.compare(name.size() - 4, 4, ".iso") == 0 ? " (disc image)" : ""),
+                               "/app0/samples/" + name});
         }
         closedir(d);
     }
@@ -342,10 +346,28 @@ std::vector<Entry> FindXbes()
         {
             if (e->d_name[0] == '.')
                 continue;
-            const std::string path = std::string("/data/xbox-core/games/") + e->d_name + "/default.xbe";
+            const std::string name = e->d_name, folder = "/data/xbox-core/games/" + name;
+            auto is_iso = [](const std::string& n) {
+                return n.size() > 4 && strcasecmp(n.c_str() + n.size() - 4, ".iso") == 0;
+            };
+            if (is_iso(name))
+            {
+                out.push_back({name.substr(0, name.size() - 4) + " (disc image)", folder});
+                continue;
+            }
             struct stat st;
-            if (stat(path.c_str(), &st) == 0)
-                out.push_back({e->d_name, path});
+            if (stat((folder + "/default.xbe").c_str(), &st) == 0)
+                out.push_back({name, folder + "/default.xbe"});
+            else if (DIR* inner = opendir(folder.c_str())) // a folder holding a disc image
+            {
+                while (dirent* f = readdir(inner))
+                    if (is_iso(f->d_name))
+                    {
+                        out.push_back({name + " (disc image)", folder + "/" + f->d_name});
+                        break;
+                    }
+                closedir(inner);
+            }
         }
         closedir(d);
     }
@@ -372,7 +394,7 @@ std::string Menu(const std::vector<Entry>& xbes)
             Screen::Fill(fb, 0, 0, Screen::kWidth, Screen::kHeight, 0x101418);
             Screen::Fill(fb, 0, 0, Screen::kWidth, 6, 0x48E06C);
             Screen::Text(fb, 64, 48, "xbox-core " XB_VERSION ": original Xbox programs, run natively", 0x7EE787, 3.0f);
-            Screen::Text(fb, 64, 110, "UP/DOWN choose, X run. Your own: /data/xbox-core/games/<name>/default.xbe", 0xF2CC60, 2.0f);
+            Screen::Text(fb, 64, 110, "UP/DOWN choose, X run. Yours: /data/xbox-core/games/<name>/default.xbe or <name>.iso", 0xF2CC60, 2.0f);
             if (xbes.empty())
                 Screen::Text(fb, 64, 180, "no XBEs found", 0xFF6B6B, 2.0f);
             for (size_t i = 0; i < xbes.size(); i++)
@@ -491,9 +513,8 @@ int main()
         InitDevices();
         InitKernel();
         std::string error;
-        if (!LoadXbe(xbe, g_xbe, error))
+        if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
-        SetGameDirectory(xbe.substr(0, xbe.find_last_of('/')));
         SetDataDirectory("/data/xbox-core/hdd");
         ResolveThunks();
         StartVblank();

@@ -1,6 +1,7 @@
 // Files: the Xbox's object paths mapped to host folders, and the Nt*File exports. D: and
-// \Device\CdRom0 are the game's folder; the hard disk's partitions (E:, T:, U:, Z: and
-// \Device\Harddisk0\PartitionN) are folders under a data folder. Also the XcSHA* exports.
+// \Device\CdRom0 are the game's folder, or its disc image (read-only, through xiso.cpp); the hard
+// disk's partitions (E:, T:, U:, Z: and \Device\Harddisk0\PartitionN) are folders under a data
+// folder. Also the XcSHA* exports.
 #include <cerrno>
 #include <cstdio>
 #include <map>
@@ -9,11 +10,13 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "core.h"
 #include "kernel.h"
 #include "sha1.h"
+#include "xiso.h"
 
 namespace xb {
 
@@ -25,13 +28,26 @@ constexpr u32 STATUS_SUCCESS = 0, STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034, STA
               STATUS_INVALID_PARAMETER = 0xC000000D, STATUS_NOT_IMPLEMENTED = 0xC0000002,
               STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA, STATUS_NOT_A_DIRECTORY = 0xC0000103;
 
-std::string g_game_dir = ".";
+std::string g_game_dir = "."; // or kIso, for a disc image
 std::string g_data_dir = "xbox-data";
 std::mutex g_links_mutex;
 std::map<std::string, std::string> g_links; // lower-case "\??\d:" -> device path
 
+// what a path in the disc image maps to: this prefix, then its path in the image
+const std::string kIso = "\x01xiso:";
+
+bool InIso(const std::string& path, std::string& in_image)
+{
+    if (path.rfind(kIso, 0) != 0)
+        return false;
+    in_image = path.substr(kIso.size());
+    return true;
+}
+
 struct HostFile
 {
+    const IsoEntry* iso = nullptr; // a file or folder in the disc image
+    s64 position = 0;              // the image's files' current position
     int fd = -1;
     std::string path;
     bool directory = false;
@@ -62,15 +78,73 @@ std::string Lower(std::string s)
     return s;
 }
 
+std::string HostPathAsGiven(std::string path, u32 root);
+
+// The host path with each part spelled as it is on the host, case aside (the Xbox's file systems
+// ignore case; the host's may not). Parts that don't exist yet stay as given.
+std::mutex g_case_mutex;
+std::map<std::string, std::string> g_case_cache; // a path as asked -> as found
+
+std::string ResolveCase(const std::string& path)
+{
+    struct stat st;
+    if (path.empty() || stat(path.c_str(), &st) == 0)
+        return path;
+    std::lock_guard lock(g_case_mutex);
+    if (auto it = g_case_cache.find(path); it != g_case_cache.end() && stat(it->second.c_str(), &st) == 0)
+        return it->second;
+    std::string out;
+    size_t i = 0;
+    if (path[0] == '/')
+        out = "/", i = 1;
+    bool resolving = true;
+    while (i <= path.size())
+    {
+        size_t end = path.find('/', i);
+        if (end == std::string::npos)
+            end = path.size();
+        std::string part = path.substr(i, end - i);
+        i = end + 1;
+        if (part.empty())
+            continue;
+        const std::string dir = out.empty() ? "." : out;
+        const std::string sep = out.empty() || out.back() == '/' ? "" : "/";
+        if (resolving && stat((out + sep + part).c_str(), &st) != 0)
+        {
+            bool found = false;
+            if (DIR* d = opendir(dir.c_str()))
+            {
+                while (dirent* e = readdir(d))
+                    if (strcasecmp(e->d_name, part.c_str()) == 0)
+                    {
+                        part = e->d_name, found = true;
+                        break;
+                    }
+                closedir(d);
+            }
+            resolving = found;
+        }
+        out += sep + part;
+    }
+    g_case_cache[path] = out;
+    return out;
+}
+
 // An Xbox object path -> a host path, or "" if it isn't a file system path.
 std::string HostPath(std::string path, u32 root)
 {
-    if (root)
-        if (auto* dir = static_cast<HostFile*>(HostOf(root, 2)))
-            return dir->path + "/" + path;
+    const std::string host = HostPathAsGiven(path, root);
+    return host.rfind(kIso, 0) == 0 ? host : ResolveCase(host);
+}
+
+std::string HostPathAsGiven(std::string path, u32 root)
+{
     for (char& c : path)
         if (c == '\\')
             c = '/';
+    if (root)
+        if (auto* dir = static_cast<HostFile*>(HostOf(root, 2)))
+            return dir->path + "/" + path;
     std::string lower = Lower(path);
     if (lower.rfind("/?" "?/", 0) == 0)
         path = path.substr(4), lower = lower.substr(4);
@@ -129,16 +203,53 @@ s64 FileTime(const struct timespec& t)
     return s64(t.tv_sec) * 10000000 + t.tv_nsec / 100 + 116444736000000000LL;
 }
 
-// FILE_NETWORK_OPEN_INFORMATION (0x38 bytes)
-void NetworkOpenInfo(const struct stat& st, u32 out)
+// what the queries report about a file, from the host or the disc image
+struct Info
 {
-    Write<s64>(out + 0x00, FileTime(st.st_ctim));
-    Write<s64>(out + 0x08, FileTime(st.st_atim));
-    Write<s64>(out + 0x10, FileTime(st.st_mtim));
-    Write<s64>(out + 0x18, FileTime(st.st_mtim));
-    Write<s64>(out + 0x20, (st.st_size + 4095) & ~4095LL);
-    Write<s64>(out + 0x28, st.st_size);
-    Write<u32>(out + 0x30, S_ISDIR(st.st_mode) ? 0x10 : 0x80); // DIRECTORY / NORMAL
+    s64 size = 0, created = 0, accessed = 0, written = 0;
+    bool directory = false, read_only = false;
+};
+
+bool StatPath(const std::string& path, Info& info)
+{
+    std::string in_image;
+    if (InIso(path, in_image))
+    {
+        const IsoEntry* e = IsoFind(in_image);
+        if (!e)
+            return false;
+        info.size = e->size;
+        info.directory = e->directory;
+        info.created = info.accessed = info.written = IsoTime();
+        info.read_only = true;
+        return true;
+    }
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0)
+        return false;
+    info.size = st.st_size;
+    info.directory = S_ISDIR(st.st_mode);
+    info.created = FileTime(st.st_ctim);
+    info.accessed = FileTime(st.st_atim);
+    info.written = FileTime(st.st_mtim);
+    return true;
+}
+
+u32 Attributes(const Info& info)
+{
+    return info.directory ? 0x10 : info.read_only ? 0x01 : 0x80; // DIRECTORY, READONLY, NORMAL
+}
+
+// FILE_NETWORK_OPEN_INFORMATION (0x38 bytes)
+void NetworkOpenInfo(const Info& info, u32 out)
+{
+    Write<s64>(out + 0x00, info.created);
+    Write<s64>(out + 0x08, info.accessed);
+    Write<s64>(out + 0x10, info.written);
+    Write<s64>(out + 0x18, info.written);
+    Write<s64>(out + 0x20, (info.size + 4095) & ~4095LL);
+    Write<s64>(out + 0x28, info.size);
+    Write<u32>(out + 0x30, Attributes(info));
 }
 
 void MakeDirs(const std::string& path)
@@ -159,6 +270,35 @@ u32 Open(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 disposition, 
             Log("files: %s: not a file system path", xbox.c_str());
         SetIo(io_status, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+    std::string in_image;
+    if (InIso(host, in_image))
+    {
+        const IsoEntry* e = IsoFind(in_image);
+        const bool write = access & (0x40000000 | 0x2 | 0x4 | 0x10000000);
+        u32 status = STATUS_SUCCESS;
+        if (!e)
+            status = disposition == 1 || disposition == 4 ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_ACCESS_DENIED;
+        else if (write || disposition == 2 || disposition == 0 || disposition == 4 || disposition == 5)
+            status = disposition == 2 ? STATUS_OBJECT_NAME_COLLISION : STATUS_ACCESS_DENIED; // read-only media
+        else if ((options & 1) && !e->directory)
+            status = STATUS_NOT_A_DIRECTORY;
+        if (status != STATUS_SUCCESS)
+        {
+            if (g_verbose >= 1)
+                Log("files: %s (disc image): %#x", xbox.c_str(), status);
+            SetIo(io_status, status, 0);
+            return status;
+        }
+        auto* f = new HostFile;
+        f->path = host;
+        f->iso = e;
+        f->directory = e->directory;
+        Write<u32>(handle_ptr, NewHostHandle(f->directory ? 2 : 1, f));
+        SetIo(io_status, STATUS_SUCCESS, 1);
+        if (g_verbose >= 1)
+            Log("files: %s -> disc image /%s", xbox.c_str(), in_image.c_str());
+        return STATUS_SUCCESS;
     }
     struct stat st;
     const bool exists = stat(host.c_str(), &st) == 0;
@@ -231,6 +371,37 @@ void SetGameDirectory(const std::string& dir)
     g_game_dir = dir;
 }
 
+bool LoadGame(const std::string& path, std::string& error)
+{
+    const bool image = path.size() > 4 && Lower(path.substr(path.size() - 4)) == ".iso";
+    if (!image)
+    {
+        if (!LoadXbe(path, g_xbe, error))
+            return false;
+        const size_t slash = path.find_last_of('/');
+        SetGameDirectory(slash == std::string::npos ? "." : path.substr(0, slash));
+        return true;
+    }
+    if (!MountIso(path, error))
+        return false;
+    const IsoEntry* e = IsoFind("default.xbe");
+    if (!e || e->directory)
+    {
+        error = path + " has no default.xbe";
+        return false;
+    }
+    std::vector<u8> data(e->size);
+    if (IsoRead(*e, 0, data.size(), data.data()) != data.size())
+    {
+        error = "can't read default.xbe from " + path;
+        return false;
+    }
+    if (!LoadXbeData(data, "xiso:default.xbe", g_xbe, error))
+        return false;
+    SetGameDirectory(kIso);
+    return true;
+}
+
 void SetDataDirectory(const std::string& dir)
 {
     g_data_dir = dir;
@@ -290,10 +461,16 @@ void RegisterFileExports(RegisterFn reg)
     reg("NtReadFile", [](Call& c) -> u64 {
         // FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset*
         HostFile* f = FileOf(c.Arg(0));
-        if (!f || f->fd < 0)
+        if (!f || (f->fd < 0 && !(f->iso && !f->directory)))
             return STATUS_INVALID_HANDLE;
         ssize_t n;
-        if (c.Arg(7))
+        if (f->iso)
+        {
+            const s64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? Read<s64>(c.Arg(7)) : f->position;
+            n = ssize_t(IsoRead(*f->iso, u64(at), c.Arg(6), Ptr(c.Arg(5))));
+            f->position = at + n;
+        }
+        else if (c.Arg(7))
             n = pread(f->fd, Ptr(c.Arg(5)), c.Arg(6), off_t(Read<s64>(c.Arg(7))));
         else
             n = read(f->fd, Ptr(c.Arg(5)), c.Arg(6));
@@ -307,6 +484,8 @@ void RegisterFileExports(RegisterFn reg)
     });
     reg("NtWriteFile", [](Call& c) -> u64 {
         HostFile* f = FileOf(c.Arg(0));
+        if (f && f->iso)
+            return STATUS_ACCESS_DENIED;
         if (!f || f->fd < 0)
             return STATUS_INVALID_HANDLE;
         ssize_t n;
@@ -322,26 +501,34 @@ void RegisterFileExports(RegisterFn reg)
         HostFile* f = FileOf(c.Arg(0));
         if (!f)
             return STATUS_INVALID_HANDLE;
-        struct stat st;
-        if (stat(f->path.c_str(), &st) != 0)
+        Info info;
+        if (!StatPath(f->path, info))
             return STATUS_OBJECT_NAME_NOT_FOUND;
         const u32 out = c.Arg(2);
         switch (c.Arg(4))
         {
+        case 4: // FileBasicInformation
+            Write<s64>(out, info.created);
+            Write<s64>(out + 8, info.accessed);
+            Write<s64>(out + 16, info.written);
+            Write<s64>(out + 24, info.written);
+            Write<u32>(out + 32, Attributes(info));
+            SetIo(c.Arg(1), 0, 40);
+            return STATUS_SUCCESS;
         case 5: // FileStandardInformation
-            Write<s64>(out, (st.st_size + 4095) & ~4095LL);
-            Write<s64>(out + 8, st.st_size);
+            Write<s64>(out, (info.size + 4095) & ~4095LL);
+            Write<s64>(out + 8, info.size);
             Write<u32>(out + 16, 1);
             Write<u8>(out + 20, 0);
-            Write<u8>(out + 21, S_ISDIR(st.st_mode));
+            Write<u8>(out + 21, info.directory);
             SetIo(c.Arg(1), 0, 24);
             return STATUS_SUCCESS;
         case 14: // FilePositionInformation
-            Write<s64>(out, f->fd >= 0 ? lseek(f->fd, 0, SEEK_CUR) : 0);
+            Write<s64>(out, f->iso ? f->position : f->fd >= 0 ? lseek(f->fd, 0, SEEK_CUR) : 0);
             SetIo(c.Arg(1), 0, 8);
             return STATUS_SUCCESS;
         case 34: // FileNetworkOpenInformation
-            NetworkOpenInfo(st, out);
+            NetworkOpenInfo(info, out);
             SetIo(c.Arg(1), 0, 0x38);
             return STATUS_SUCCESS;
         }
@@ -353,6 +540,14 @@ void RegisterFileExports(RegisterFn reg)
         if (!f)
             return STATUS_INVALID_HANDLE;
         const u32 in = c.Arg(2);
+        if (f->iso)
+        {
+            if (c.Arg(4) != 14)
+                return STATUS_ACCESS_DENIED; // read-only media
+            f->position = Read<s64>(in);
+            SetIo(c.Arg(1), 0, 0);
+            return STATUS_SUCCESS;
+        }
         switch (c.Arg(4))
         {
         case 14: // FilePositionInformation
@@ -378,10 +573,10 @@ void RegisterFileExports(RegisterFn reg)
     reg("NtQueryFullAttributesFile", [](Call& c) -> u64 {
         u32 root;
         const std::string host = HostPath(ObjectPath(c.Arg(0), root), root);
-        struct stat st;
-        if (host.empty() || stat(host.c_str(), &st) != 0)
+        Info info;
+        if (host.empty() || !StatPath(host, info))
             return STATUS_OBJECT_NAME_NOT_FOUND;
-        NetworkOpenInfo(st, c.Arg(1));
+        NetworkOpenInfo(info, c.Arg(1));
         return STATUS_SUCCESS;
     });
     reg("NtQueryVolumeInformationFile", [](Call& c) -> u64 {
@@ -463,7 +658,13 @@ void RegisterFileExports(RegisterFn reg)
             dir->pattern = c.Arg(8) ? GuestString(c.Arg(8)) : "*";
             if (dir->pattern.empty())
                 dir->pattern = "*";
-            if (DIR* d = opendir(dir->path.c_str()))
+            if (dir->iso)
+            {
+                for (u32 child : dir->iso->children)
+                    if (Matches(dir->pattern.c_str(), IsoEntryAt(child).name.c_str()))
+                        dir->listing.push_back(IsoEntryAt(child).name);
+            }
+            else if (DIR* d = opendir(dir->path.c_str()))
             {
                 while (dirent* e = readdir(d))
                     if (std::strcmp(e->d_name, ".") && std::strcmp(e->d_name, "..") &&
@@ -483,8 +684,8 @@ void RegisterFileExports(RegisterFn reg)
             return 0x80000006; // STATUS_NO_MORE_FILES
         }
         const std::string& name = dir->listing[dir->next];
-        struct stat st{};
-        stat((dir->path + "/" + name).c_str(), &st);
+        Info info;
+        StatPath(dir->path + "/" + name, info);
         const u32 out = c.Arg(5);
         if (c.Arg(6) < 64 + name.size())
             return 0x80000005; // STATUS_BUFFER_OVERFLOW
@@ -492,13 +693,13 @@ void RegisterFileExports(RegisterFn reg)
         // FILE_DIRECTORY_INFORMATION (the name in 8-bit characters, as on the Xbox)
         Write<u32>(out + 0, 0);
         Write<u32>(out + 4, u32(dir->next));
-        Write<s64>(out + 8, FileTime(st.st_ctim));
-        Write<s64>(out + 16, FileTime(st.st_atim));
-        Write<s64>(out + 24, FileTime(st.st_mtim));
-        Write<s64>(out + 32, FileTime(st.st_mtim));
-        Write<s64>(out + 40, st.st_size);
-        Write<s64>(out + 48, (st.st_size + 4095) & ~4095LL);
-        Write<u32>(out + 56, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
+        Write<s64>(out + 8, info.created);
+        Write<s64>(out + 16, info.accessed);
+        Write<s64>(out + 24, info.written);
+        Write<s64>(out + 32, info.written);
+        Write<s64>(out + 40, info.size);
+        Write<s64>(out + 48, (info.size + 4095) & ~4095LL);
+        Write<u32>(out + 56, Attributes(info));
         Write<u32>(out + 60, u32(name.size()));
         std::memcpy(Ptr(out + 64), name.data(), name.size());
         SetIo(c.Arg(4), STATUS_SUCCESS, u32(64 + name.size()));

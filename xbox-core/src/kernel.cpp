@@ -1245,13 +1245,9 @@ void InitKernel()
         if (count == 0 && Read<u32>(h + 4))
         {
             const u32 va = Read<u32>(h + 4), vsize = Read<u32>(h + 8), raw = Read<u32>(h + 12), rsize = Read<u32>(h + 16);
-            if (FILE* f = std::fopen(g_xbe.path.c_str(), "rb"))
-            {
-                const u32 n = std::min(rsize, vsize);
-                if (std::fseek(f, long(raw), SEEK_SET) == 0 && std::fread(Ptr(va), 1, n, f) == n && vsize > n)
-                    std::memset(Ptr(va + n), 0, vsize - n);
-                std::fclose(f);
-            }
+            const u32 n = std::min(rsize, vsize);
+            if (ReadXbeRange(g_xbe, raw, n, Ptr(va)) && vsize > n)
+                std::memset(Ptr(va + n), 0, vsize - n);
         }
         Write<u32>(h + 24, count + 1);
         return STATUS_SUCCESS;

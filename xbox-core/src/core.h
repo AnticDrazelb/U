@@ -101,6 +101,9 @@ struct XbeInfo
     std::string path; // the file it was loaded from (XeLoadSection reads sections again from it)
 };
 bool LoadXbe(const std::string& path, XbeInfo& info, std::string& error);
+// the same from the file's bytes; `path` is where they came from ("xiso:<path>" inside the disc image)
+bool LoadXbeData(const std::vector<u8>& data, const std::string& path, XbeInfo& info, std::string& error);
+bool ReadXbeRange(const XbeInfo& info, u32 offset, u32 n, void* out); // its file's bytes, again
 extern XbeInfo g_xbe;
 
 // ---- CPU: guest threads

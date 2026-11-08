@@ -5,6 +5,7 @@
 #include <iterator>
 
 #include "core.h"
+#include "xiso.h"
 
 namespace xb {
 
@@ -40,6 +41,26 @@ bool LoadXbe(const std::string& path, XbeInfo& info, std::string& error)
         return false;
     }
     const std::vector<u8> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return LoadXbeData(d, path, info, error);
+}
+
+bool ReadXbeRange(const XbeInfo& info, u32 offset, u32 n, void* out)
+{
+    if (info.path.rfind("xiso:", 0) == 0)
+    {
+        const IsoEntry* e = IsoFind(info.path.substr(5));
+        return e && IsoRead(*e, offset, n, out) == n;
+    }
+    FILE* f = std::fopen(info.path.c_str(), "rb");
+    if (!f)
+        return false;
+    const bool ok = std::fseek(f, long(offset), SEEK_SET) == 0 && std::fread(out, 1, n, f) == n;
+    std::fclose(f);
+    return ok;
+}
+
+bool LoadXbeData(const std::vector<u8>& d, const std::string& path, XbeInfo& info, std::string& error)
+{
     if (d.size() < 0x178 || std::memcmp(d.data(), "XBEH", 4) != 0)
     {
         error = "not an XBE";
