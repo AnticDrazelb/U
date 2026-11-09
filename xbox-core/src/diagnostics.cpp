@@ -159,9 +159,45 @@ void CallEnded(GuestThread* t, u32 result)
     t->in_call = 0;
 }
 
+// Faults counted by instruction (lock-free: this can run in the signal handler): the hottest ones are
+// what backpatching or a faster path would save most on.
+struct FaultSite
+{
+    std::atomic<u32> eip{0};
+    std::atomic<u64> count{0};
+    u8 code[8];
+    u32 address;
+};
+constexpr u32 kFaultSites = 1024;
+FaultSite g_fault_sites[kFaultSites];
+
+void CountFaultSite(u32 eip, u32 address, const u8* code)
+{
+    for (u32 i = 0, h = (eip * 2654435761u) % kFaultSites; i < 16; i++, h = (h + 1) % kFaultSites)
+    {
+        FaultSite& s = g_fault_sites[h];
+        u32 cur = s.eip.load(std::memory_order_relaxed);
+        if (cur == 0)
+        {
+            if (s.eip.compare_exchange_strong(cur, eip))
+            {
+                std::memcpy(s.code, code, 8);
+                s.address = address;
+                cur = eip;
+            }
+        }
+        if (cur == eip)
+        {
+            s.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
 void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, const u32 regs[8], const char* outcome)
 {
     g_faults++;
+    CountFaultSite(eip, address, code);
     FaultRecord& r = g_fault_ring[g_fault_next.fetch_add(1) % kFaultRing];
     r.at = float(Seconds());
     r.thread = thread, r.eip = eip, r.address = address, r.signal = signal, r.outcome = outcome;
@@ -232,6 +268,23 @@ void WriteState(Out fd)
             const CallRecord& c = t->calls[(n - shown + k) % GuestThread::kCallRecords];
             Put(fd, "    %9.3f %s(%#x, %#x, %#x, %#x) from %#x = %#x\n", double(c.at), Name(c.ordinal), c.a0, c.a1, c.a2, c.a3,
                 c.eip, c.result);
+        }
+    }
+    {
+        // the instructions that fault most
+        u32 order[kFaultSites], used = 0;
+        for (u32 i = 0; i < kFaultSites; i++)
+            if (g_fault_sites[i].eip.load())
+                order[used++] = i;
+        std::sort(order, order + used, [](u32 a, u32 b) { return g_fault_sites[a].count.load() > g_fault_sites[b].count.load(); });
+        Put(fd, "faults by instruction (the most frequent of %u; backpatched hardware accesses so far: %llu at %u sites):\n",
+            used, (unsigned long long)BackpatchedAccessCount(), BackpatchedSiteCount());
+        for (u32 k = 0; k < used && k < 16; k++)
+        {
+            const FaultSite& f = g_fault_sites[order[k]];
+            Put(fd, "    %10llu  eip %#x  address %#x  code %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                (unsigned long long)f.count.load(), f.eip.load(), f.address, f.code[0], f.code[1], f.code[2], f.code[3],
+                f.code[4], f.code[5], f.code[6], f.code[7]);
         }
     }
     const u32 fn = g_fault_next.load();

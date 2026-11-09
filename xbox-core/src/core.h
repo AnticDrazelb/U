@@ -198,6 +198,10 @@ struct GateFrame // on the guest stack (see switch.S)
 void InitKernel();
 void ResolveThunks(); // fills the XBE's kernel thunk table
 void KernelCall(GateFrame* frame, GuestThread* thread);
+// A hardware access by a backpatched instruction (cpu.cpp), through the gate's stub 399.
+void BackpatchedAccess(GateFrame* frame);
+u64 BackpatchedAccessCount();
+u32 BackpatchedSiteCount();
 int RunXbe(); // the start-up thread; returns when the program ends (or the time limit passes)
 extern std::atomic<bool> g_quit;
 extern double g_time_limit;

@@ -3,6 +3,11 @@
 // emulated instruction by instruction, privileged instructions skipped, anything else reported.
 // The host's side of it (memory, fs, signals) is in platform_*.cpp.
 #include <cctype>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstdio>
 #include <unistd.h>
 #include <cstdlib>
@@ -106,7 +111,8 @@ size_t ModrmExtra(const u8* p)
 }
 
 // Emulates one instruction at `code` that accessed device memory at `address`. Returns its length.
-size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r)
+// With `memory`, the access is to ordinary guest memory (a backpatched instruction that met RAM).
+size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = false)
 {
     const u8* p = code;
     u32 size = 4;
@@ -122,11 +128,18 @@ size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r)
     const u8 op = *p++;
     auto read = [&](u32 bytes) {
         u32 v = 0;
-        if (!DeviceRead(address, bytes, v))
+        if (memory)
+            std::memcpy(&v, Ptr(address), bytes);
+        else if (!DeviceRead(address, bytes, v))
             v = 0;
         return v;
     };
-    auto write = [&](u32 bytes, u32 v) { DeviceWrite(address, bytes, v); };
+    auto write = [&](u32 bytes, u32 v) {
+        if (memory)
+            std::memcpy(Ptr(address), &v, bytes);
+        else
+            DeviceWrite(address, bytes, v);
+    };
     auto reg_of = [&](const u8* m) { return (m[0] >> 3) & 7; };
     auto end = [&](const u8* m, size_t imm) { return size_t(m + 1 + ModrmExtra(m) + imm - code); };
     auto get_reg = [&](int reg, u32 bytes) { return bytes == 1 ? r.Get8(reg) : r.Get(reg) & (bytes == 2 ? 0xffff : ~0u); };
@@ -239,6 +252,404 @@ size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r)
     }
     }
     return 0;
+}
+
+// ---- backpatching: a hardware-register access costs a fault (on the PS4 a signal and four context
+// switches, ~10 us). The first time an instruction faults on device memory it is rewritten as a
+// jump to a thunk of its own (pushfd; pushad; push site; call the gate's device-access stub; popad;
+// popfd; jmp back), which reaches BackpatchedAccess through the kernel-call gate (~0.2 us) with the
+// registers and flags on the guest stack; the decoder above does the access on a saved copy of the
+// original instruction. Only instructions of 5 bytes or more in the program's own image whose first
+// 5 bytes lie in one aligned 8-byte word are patched (one atomic store), so another thread never
+// sees half a jump. XB_NO_BACKPATCH=1 turns it off.
+constexpr u32 kBackpatchOrdinal = 399; // a free slot of the export stubs (xboxkrnl's end at 379)
+struct PatchSite
+{
+    u32 eip, length, span, thunk;
+    u8 code[16];
+};
+constexpr u32 kThunkMoved = 14; // where a thunk's copy of the moved instructions starts
+std::mutex g_patch_mutex;
+std::deque<PatchSite> g_sites;                 // by site number (stable: a deque only grows)
+std::unordered_map<u32, u32> g_site_by_eip;    // under g_patch_mutex
+std::unordered_set<u32> g_refused;             // instructions that can't be patched, under g_patch_mutex
+std::atomic<u32> g_site_count{0};
+std::atomic<u64> g_backpatched_accesses{0};
+constexpr u32 kMaxSites = 4096, kThunkSize = 48;
+u32 g_thunks = 0;
+
+bool IsDeviceAddress(u32 a)
+{
+    return a >= kDeviceBase || (a >= kAliasBase && a - kAliasBase < kAliasSize);
+}
+
+// The data address of the memory operand of the instruction at `code`, from the registers; false if
+// it has none this decodes.
+bool EffectiveAddress(const u8* code, const Regs& r, u32 esp, u32& ea)
+{
+    const u8* p = code;
+    while (*p == 0x66 || *p == 0x2e || *p == 0x3e || *p == 0x26 || *p == 0x36 || *p == 0xf0)
+        p++;
+    if (*p == 0x64 || *p == 0x65)
+        return false; // fs/gs-relative: not device memory
+    u8 op = *p++;
+    if (op >= 0xa0 && op <= 0xa3)
+    {
+        std::memcpy(&ea, p, 4);
+        return true;
+    }
+    if (op == 0x0f)
+        op = *p++;
+    auto reg = [&](int i) { return i == 4 ? esp : r.Get(i); };
+    const int mod = p[0] >> 6, rm = p[0] & 7;
+    if (mod == 3)
+        return false;
+    const u8* d = p + 1;
+    u32 a = 0;
+    if (rm == 4)
+    {
+        const u8 sib = *d++;
+        const int scale = sib >> 6, index = (sib >> 3) & 7, base = sib & 7;
+        if (index != 4)
+            a += reg(index) << scale;
+        if (base == 5 && mod == 0)
+        {
+            u32 disp;
+            std::memcpy(&disp, d, 4);
+            d += 4;
+            a += disp;
+        }
+        else
+            a += reg(base);
+    }
+    else if (rm == 5 && mod == 0)
+    {
+        u32 disp;
+        std::memcpy(&disp, d, 4);
+        ea = disp;
+        return true;
+    }
+    else
+        a += reg(rm);
+    if (mod == 1)
+        a += u32(s32(int8_t(*d)));
+    else if (mod == 2)
+    {
+        u32 disp;
+        std::memcpy(&disp, d, 4);
+        a += disp;
+    }
+    ea = a;
+    return true;
+}
+
+// The length of an instruction that can run anywhere (moved into a thunk after a patched one: no
+// relative branch, no call), or 0. The common ones after a register access: mov, ALU ops, lea,
+// movzx/movsx, push/pop, mov reg imm, ret.
+size_t MovableLength(const u8* p)
+{
+    const u8* q = p;
+    while (*q == 0x66 || *q == 0x2e || *q == 0x3e || *q == 0x26 || *q == 0x36)
+        q++;
+    const bool word = q != p && (p[0] == 0x66 || q[-1] == 0x66);
+    const u8 op = *q++;
+    auto modrm = [&](size_t imm) { return size_t(q - p) + 1 + ModrmExtra(q) + imm; };
+    if ((op & 0xc4) == 0x00 && (op & 7) < 4) // ALU r/m forms 00-03, 08-0b, ..., 38-3b
+        return modrm(0);
+    if (op >= 0x50 && op <= 0x5f) // push/pop reg
+        return size_t(q - p);
+    if (op >= 0x88 && op <= 0x8b) // mov
+        return modrm(0);
+    if (op == 0x8d) // lea
+        return modrm(0);
+    if (op >= 0xb8 && op <= 0xbf) // mov reg, imm
+        return size_t(q - p) + (word ? 2 : 4);
+    if (op == 0xc7)
+        return modrm(word ? 2 : 4);
+    if (op == 0xc6 || op == 0x83)
+        return modrm(1);
+    if (op == 0x81)
+        return modrm(word ? 2 : 4);
+    if (op == 0x85 || op == 0x84)
+        return modrm(0);
+    if (op == 0xc3) // ret
+        return size_t(q - p);
+    if (op == 0xc2) // ret imm16
+        return size_t(q - p) + 2;
+    if (op == 0x0f && (*q == 0xb6 || *q == 0xb7 || *q == 0xbe || *q == 0xbf))
+    {
+        q++;
+        return modrm(0);
+    }
+    return 0;
+}
+
+// Whether anything in the program could jump into (begin, end): a relative jump or call aimed there,
+// or the address itself stored as data (a jump table). Conservative: a false alarm only means no patch.
+bool MaybeBranchTarget(u32 begin, u32 end)
+{
+    if (end <= begin + 1)
+        return false;
+    const u8* image = Ptr<u8>(g_xbe.base);
+    const u32 size = g_xbe.image_size;
+    for (u32 i = 0; i + 5 <= size; i++)
+    {
+        const u8 b = image[i];
+        u32 target = 0;
+        if (b == 0xe8 || b == 0xe9)
+        {
+            s32 rel;
+            std::memcpy(&rel, image + i + 1, 4);
+            target = g_xbe.base + i + 5 + u32(rel);
+        }
+        else if (b == 0xeb || (b >= 0x70 && b <= 0x7f) || b == 0xe3)
+            target = g_xbe.base + i + 2 + u32(s32(int8_t(image[i + 1])));
+        else if (b == 0x0f && i + 6 <= size && image[i + 1] >= 0x80 && image[i + 1] <= 0x8f)
+        {
+            s32 rel;
+            std::memcpy(&rel, image + i + 2, 4);
+            target = g_xbe.base + i + 6 + u32(rel);
+        }
+        if (target > begin && target < end)
+            return true;
+        u32 word;
+        std::memcpy(&word, image + i, 4);
+        if (word > begin && word < end)
+            return true;
+    }
+    return false;
+}
+
+// Writes `n` bytes at `at` in one atomic store: 8 bytes if they fit in an aligned 8-byte word, else 16
+// (cmpxchg16b, which the PS4's Jaguar has) if they fit in an aligned 16-byte block.
+bool CanWriteAtomic(u32 at, u32 n)
+{
+    return (at & 7) + n <= 8 || (at & 15) + n <= 16;
+}
+
+bool WriteAtomic(u32 at, const u8* data, u32 n)
+{
+    if ((at & 7) + n <= 8)
+    {
+        const u32 word = at & ~7u;
+        u8 bytes[8];
+        std::memcpy(bytes, Ptr(word), 8);
+        std::memcpy(bytes + (at - word), data, n);
+        u64 value;
+        std::memcpy(&value, bytes, 8);
+        __atomic_store_n(Ptr<u64>(word), value, __ATOMIC_SEQ_CST);
+        return true;
+    }
+    if ((at & 15) + n <= 16)
+    {
+        const u32 block = at & ~15u;
+        u64* p = Ptr<u64>(block);
+        for (;;)
+        {
+            u64 lo = p[0], hi = p[1];
+            u8 bytes[16];
+            std::memcpy(bytes, &lo, 8);
+            std::memcpy(bytes + 8, &hi, 8);
+            std::memcpy(bytes + (at - block), data, n);
+            u64 new_lo, new_hi;
+            std::memcpy(&new_lo, bytes, 8);
+            std::memcpy(&new_hi, bytes + 8, 8);
+            bool ok;
+            __asm__ volatile("lock cmpxchg16b %1\n\tsete %0"
+                             : "=q"(ok), "+m"(*reinterpret_cast<volatile u64(*)[2]>(p)), "+a"(lo), "+d"(hi)
+                             : "b"(new_lo), "c"(new_hi)
+                             : "cc", "memory");
+            if (ok)
+                return true;
+        }
+    }
+    return false;
+}
+
+bool WriteJump(u32 eip, u32 target)
+{
+    u8 jump[5] = {0xe9};
+    const u32 rel = target - (eip + 5);
+    std::memcpy(jump + 1, &rel, 4);
+    return WriteAtomic(eip, jump, 5);
+}
+
+// A code cave near `eip` for a 5-byte jump: padding that never runs, within a short jump's reach of
+// eip + 2. Runs of int3 (0xcc: MSVC's filler between functions, so the XDK's) or nops right after a
+// function's end (pop ebp or leave, then ret: clang's). 0 if there's none. Caves used are remembered.
+std::unordered_set<u32> g_caves_used; // under g_patch_mutex
+u32 FindCave(u32 eip)
+{
+    const u32 from = std::max(g_xbe.base + 2, eip + 2 >= 128 ? eip + 2 - 128 : 0), to = eip + 2 + 127 - 5;
+    if (to + 8 >= g_xbe.base + g_xbe.image_size)
+        return 0;
+    auto is_nop_run = [](const u8* p) {
+        // the multi-byte nops: 90, 66 90, 0f 1f 00, 0f 1f 40 00, 0f 1f 44 00 00, 66 0f 1f 44 00 00, ...
+        return p[0] == 0x90 || (p[0] == 0x66 && (p[1] == 0x90 || p[1] == 0x0f || p[1] == 0x2e || p[1] == 0x66)) ||
+               (p[0] == 0x0f && p[1] == 0x1f);
+    };
+    for (u32 a = from; a <= to; a++)
+    {
+        if (a + 5 > eip && a < eip + 16)
+            continue; // not over the instruction itself
+        bool reserved = false;
+        for (u32 k = 0; k < 5 && !reserved; k++)
+            reserved = g_caves_used.count(a + k) != 0;
+        if (reserved)
+            continue;
+        const u8* p = Ptr<u8>(a);
+        if (p[0] == 0xcc && p[1] == 0xcc && p[2] == 0xcc && p[3] == 0xcc && p[4] == 0xcc && p[-1] == 0xcc)
+            return a; // inside a run of int3 (not its first byte: that one may follow a call's last byte)
+        // nops starting right after "pop ebp; ret" or "leave; ret", 5 bytes of them at least
+        if ((p[-1] == 0xc3 && (p[-2] == 0x5d || p[-2] == 0xc9)) && is_nop_run(p))
+        {
+            u32 len = 0;
+            while (len < 16 && (p[len] == 0x90 || p[len] == 0x66 || p[len] == 0x0f || p[len] == 0x1f || p[len] == 0x00 ||
+                                p[len] == 0x40 || p[len] == 0x44 || p[len] == 0x84 || p[len] == 0x80 || p[len] == 0x2e))
+                len++;
+            if (len >= 5)
+                return a;
+        }
+    }
+    return 0;
+}
+
+// After the fault at `eip` (an instruction of `length` bytes) was emulated: its patch, if it can have
+// one. An instruction shorter than the jump takes the movable instructions after it into its thunk.
+// Returns where the faulting thread goes on: after the instruction, or (if what followed it moved)
+// to the thunk's copy of what follows.
+u32 Backpatch(u32 eip, size_t length)
+{
+    const u32 next = eip + u32(length);
+    static const bool off = std::getenv("XB_NO_BACKPATCH") != nullptr;
+    if (tl_in_signal_handler || off || length > 15 || eip < g_xbe.base || eip + 16 >= g_xbe.base + g_xbe.image_size)
+        return next;
+    std::lock_guard lock(g_patch_mutex);
+    if (g_site_by_eip.count(eip) || g_refused.count(eip) || g_sites.size() >= kMaxSites)
+        return next;
+    // a short instruction: a short jump to a 5-byte jump in nearby padding, if there is some
+    static const bool no_caves = std::getenv("XB_NO_CAVES") != nullptr;
+    static const char* only_cave = std::getenv("XB_ONLY_CAVE"); // debugging: just the cave patch at this address
+    static u32 caves_made = 0;
+    static const u32 max_caves = std::getenv("XB_MAX_CAVES") ? u32(std::atoi(std::getenv("XB_MAX_CAVES"))) : ~0u;
+    const bool direct = length >= 5 && CanWriteAtomic(eip, 5);
+    if (!direct && length >= 2 && !no_caves && (!only_cave || std::strtoul(only_cave, nullptr, 0) == eip) && caves_made < max_caves)
+        if (const u32 cave = CanWriteAtomic(eip, 2) ? FindCave(eip) : 0; cave && ++caves_made)
+        {
+            if (!g_thunks)
+                g_thunks = AllocKernel(kMaxSites * kThunkSize, 16);
+            const u32 site = u32(g_sites.size());
+            const u32 thunk = g_thunks + site * kThunkSize;
+            PatchSite ps{eip, u32(length), u32(length), thunk, {}};
+            std::memcpy(ps.code, Ptr<u8>(eip), length);
+            u8* t = Ptr<u8>(thunk);
+            size_t n = 0;
+            t[n++] = 0x9c, t[n++] = 0x60, t[n++] = 0x68;
+            std::memcpy(t + n, &site, 4), n += 4;
+            t[n++] = 0xe8;
+            const u32 call_rel = ExportStub(kBackpatchOrdinal) - (thunk + u32(n) + 4);
+            std::memcpy(t + n, &call_rel, 4), n += 4;
+            t[n++] = 0x61, t[n++] = 0x9d, t[n++] = 0xe9;
+            const u32 back_rel = next - (thunk + u32(n) + 4);
+            std::memcpy(t + n, &back_rel, 4), n += 4;
+            // the cave's jump first (it never runs until the short jump is there), then the short jump
+            u8* c = Ptr<u8>(cave);
+            c[0] = 0xe9;
+            const u32 cave_rel = thunk - (cave + 5);
+            std::memcpy(c + 1, &cave_rel, 4);
+            const u8 short_jump[2] = {0xeb, u8(int8_t(s32(cave) - s32(eip + 2)))};
+            g_sites.push_back(ps);
+            g_site_by_eip[eip] = site;
+            g_site_count++;
+            for (u32 k = 0; k < 5; k++)
+                g_caves_used.insert(cave + k);
+            if (!WriteAtomic(eip, short_jump, 2))
+                return next;
+            if (site < 64 || std::getenv("XB_LOG_PATCHES"))
+                Log("cpu: hardware access at %#x patched (site %u, %u bytes: a short jump to padding at %#x: %02x %02x %02x)",
+                    eip, site, u32(length), cave, ps.code[0], ps.code[1], ps.code[2]);
+            return next;
+        }
+    // the span replaced: the instruction and, if it's short, the movable ones after it
+    u32 span = u32(length);
+    while (span < 5)
+    {
+        const size_t more = MovableLength(Ptr<u8>(eip + span));
+        const u8 last = Ptr<u8>(eip + span)[0];
+        if (!more)
+            break;
+        span += u32(more);
+        if (last == 0xc3 || last == 0xc2)
+            break; // a ret: nothing after it is reached through here
+    }
+    if (span < 5 || !CanWriteAtomic(eip, 5) || (span > length && MaybeBranchTarget(eip, eip + span)))
+    {
+        g_refused.insert(eip);
+        return next;
+    }
+    if (!g_thunks)
+        g_thunks = AllocKernel(kMaxSites * kThunkSize, 16);
+    const u32 site = u32(g_sites.size());
+    const u32 thunk = g_thunks + site * kThunkSize;
+    PatchSite ps{eip, u32(length), span, thunk, {}};
+    std::memcpy(ps.code, Ptr<u8>(eip), length);
+    u8* t = Ptr<u8>(thunk);
+    size_t n = 0;
+    t[n++] = 0x9c; // pushfd
+    t[n++] = 0x60; // pushad
+    t[n++] = 0x68; // push site
+    std::memcpy(t + n, &site, 4), n += 4;
+    t[n++] = 0xe8; // call the stub
+    const u32 call_rel = ExportStub(kBackpatchOrdinal) - (thunk + u32(n) + 4);
+    std::memcpy(t + n, &call_rel, 4), n += 4;
+    t[n++] = 0x61; // popad
+    t[n++] = 0x9d; // popfd
+    // the moved instructions, then back to what follows them
+    std::memcpy(t + n, Ptr<u8>(eip + u32(length)), span - length), n += span - length;
+    t[n++] = 0xe9;
+    const u32 back_rel = (eip + span) - (thunk + u32(n) + 4);
+    std::memcpy(t + n, &back_rel, 4), n += 4;
+    if (n > kThunkSize)
+        return next;
+    g_sites.push_back(ps);
+    g_site_by_eip[eip] = site;
+    g_site_count++;
+    if (!WriteJump(eip, thunk))
+        return next;
+    const u32 resume = span > length ? thunk + kThunkMoved : next;
+    if (site < 64 || std::getenv("XB_LOG_PATCHES"))
+        Log("cpu: hardware access at %#x patched (site %u, %u bytes%s: %02x %02x %02x %02x %02x %02x)", eip, site, span,
+            span > length ? " with the instructions after it" : "", ps.code[0], ps.code[1], ps.code[2], ps.code[3],
+            ps.code[4], ps.code[5]);
+    return resume;
+}
+
+// A thread at `eip` inside a patched span (it faulted on the instruction just as another thread
+// patched it, or it was between two of the moved instructions): where it goes on instead.
+bool PatchedSpanResume(u32 eip, u32& resume)
+{
+    if (tl_in_signal_handler || g_site_count == 0)
+        return false;
+    std::lock_guard lock(g_patch_mutex);
+    auto it = g_site_by_eip.find(eip);
+    if (it != g_site_by_eip.end())
+    {
+        const u8 b = Ptr<u8>(eip)[0];
+        if (b != 0xe9 && b != 0xeb)
+            return false; // not written (yet): emulated as before
+        resume = eip; // the jump into the thunk is there now
+        return true;
+    }
+    for (const PatchSite& ps : g_sites)
+        if (eip > ps.eip && eip < ps.eip + ps.span)
+        {
+            if (eip < ps.eip + ps.length)
+                return false;
+            // a boundary between moved instructions: the same place in the thunk's copy
+            resume = ps.thunk + kThunkMoved + (eip - ps.eip - ps.length);
+            return true;
+        }
+    return false;
 }
 
 // Privileged instructions a game may run (the real kernel would): skipped. Returns the length.
@@ -369,8 +780,22 @@ int HandleGuestFault(platform::Fault& f)
         diag::RecordFault(fault_thread ? fault_thread->id : 0, f.signal, u32(rip), f.address, code, regs, outcome);
     };
     size_t length = 0;
-    if (f.signal == 11 && (f.address >= kDeviceBase || (f.address >= kAliasBase && f.address - kAliasBase < kAliasSize)))
+    // inside a patched span (patched by another thread after this one faulted, or stopped between
+    // moved instructions): on from the matching place
+    if (u32 resume; PatchedSpanResume(u32(rip), resume))
+    {
+        *f.rip = resume;
+        return 0;
+    }
+    const bool device = f.signal == 11 && IsDeviceAddress(f.address);
+    if (device)
         length = EmulateDeviceAccess(code, f.address, r);
+    if (device && length)
+    {
+        record("a hardware register, emulated");
+        *f.rip = Backpatch(u32(rip), length);
+        return 0;
+    }
     if (!length)
         length = SkipPrivileged(code, r);
     if (length)
@@ -486,6 +911,48 @@ extern "C" u32 FaultResumed(u64 kpcr_address)
 }
 
 } // namespace
+
+// A backpatched instruction, through the gate: its thunk pushed eflags, then the registers (pushad),
+// then its site number. Done on the original instruction with those registers, which popad and popfd
+// then restore.
+void BackpatchedAccess(GateFrame* frame)
+{
+    frame->edx = 4; // the site number: popped as stdcall pops its arguments
+    const u32 site = frame->args[0];
+    if (site >= g_site_count)
+        return;
+    const PatchSite& ps = g_sites[site];
+    // args[1..8]: edi esi ebp esp ebx edx ecx eax (pushad's order in memory); args[9]: eflags
+    static constexpr int kSlot[8] = {8, 7, 6, 5, 4, 3, 2, 1}; // eax..edi -> args index
+    u64 g[8], eflags = frame->args[9];
+    for (int i = 0; i < 8; i++)
+        g[i] = frame->args[kSlot[i]];
+    platform::Fault f{};
+    for (int i = 0; i < 8; i++)
+        f.gpr[i] = &g[i];
+    f.eflags = &eflags;
+    Regs r{f};
+    const u32 esp = frame->args[4] + 4; // the instruction's esp: before pushfd
+    u32 ea = 0;
+    if (!EffectiveAddress(ps.code, r, esp, ea))
+        return;
+    g_backpatched_accesses++;
+    // as long as the console's own access takes, at least: a register read crosses the PCI bus there
+    // (about 1 us), and drivers wait by counting reads, which mustn't run out before the device changes
+    static const double min_us = std::getenv("XB_ACCESS_US") ? std::atof(std::getenv("XB_ACCESS_US")) : 1.0;
+    const auto start = std::chrono::steady_clock::now();
+    EmulateDeviceAccess(ps.code, ea, r, !IsDeviceAddress(ea));
+    if (IsDeviceAddress(ea))
+        while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() < min_us)
+            __builtin_ia32_pause();
+    for (int i = 0; i < 8; i++)
+        if (i != 4)
+            frame->args[kSlot[i]] = u32(g[i]);
+    frame->args[9] = u32(eflags);
+}
+
+u64 BackpatchedAccessCount() { return g_backpatched_accesses; }
+u32 BackpatchedSiteCount() { return g_site_count; }
 
 GuestThread* CurrentThread()
 {

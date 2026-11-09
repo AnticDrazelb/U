@@ -247,19 +247,31 @@ again. So a step that kills the app costs one launch.
    - overlapped I/O now ends as NT's does (event set, APC queued, completion port posted): before,
      a game waiting on an overlapped read's event or a `ReadFileEx` routine waited forever
 
-4. **Performance on the console:** every hardware-register access now costs a signal, two context
-   switches and two `amd64_set_fsbase` calls. xbox-bench measured 7.3 µs per access before this
-   change. If games are slow, decode-and-emulate the common access patterns in the handler without
-   the C library, or patch hot paths.
+4. **Performance on the console: hardware accesses are backpatched** (`cpu.cpp`, "backpatching").
+   A register access used to cost a fault every time (on the PS4 a signal and four context
+   switches, ~10 us). Now the first fault at an instruction rewrites it: a jump to a thunk of its
+   own (pushfd, pushad, call the gate's stub 399, popad, popfd, jump back) that does the access
+   through the kernel-call gate on a saved copy of the instruction. The jump is a 5-byte one when it
+   can be written in one atomic store (8 bytes, or 16 with cmpxchg16b), else a 2-byte short jump to
+   a 5-byte one in nearby padding that never runs (int3 runs, or nops after `pop ebp/leave; ret`);
+   failing both, a short instruction takes the simple instructions after it into its thunk, when
+   nothing in the image can jump between them. ClassiCube: 655,000 faults a minute became 39,000.
+   The end-of-run report lists the instructions that still fault most ("faults by instruction") and
+   how many accesses went through patches. `XB_NO_BACKPATCH=1` turns it off, `XB_NO_CAVES=1` the
+   padding jumps, `XB_LOG_PATCHES=1` logs every patch.
 
-5. **The "high" build** (linked at 0x1000000000) crashed at open on the owner's console. It's
-   low priority. Use the normal build.
+5. **Games bigger than ~4 MiB** need the app out of the Xbox's addresses: the PS4 puts it at
+   0x400000. `xbox-core-1g.pkg` (XBCR00002) is linked at 0x40000000 as a fixed-address program;
+   the FreeBSD VM shows the core works there (`tests/bigimage-test`: a 12 MiB image fails at
+   0x400000, passes at 0x40000000). Whether the PS4's loader accepts it is the console's answer to
+   give. (The old "high" build, at 0x1000000000, crashed at open: above 4 GiB, 32-bit absolute
+   addresses in the code can't reach.)
 
-6. **Optional leftovers:** NV2A gaps (W-buffering, bump maps, signed blends, line widths), and the
+6. **Optional leftovers:** NV2A gaps (W-buffering, the BRDF texture mode, signed blends, line widths), and the
    APU's DSPs.
 
 7. **Drawing speed.** The renderer is software. ClassiCube's world draws at ~11 frames/s on the
-   desktop (3 raster threads); the time is spread over the pixel pipeline (combiners, texture
+   desktop before backpatching, ~14 after (3 raster threads); the time is spread over the pixel pipeline (combiners, texture
    stages, swizzling), with no single hot spot. Before the w/z clipping fix (8409972) it was 1
    frame/s. For Halo at speed on the PS4 the NV2A must eventually draw on the PS4's GPU: the repo
    already has Mesa for the PS4 (Crema's), which is the way there.

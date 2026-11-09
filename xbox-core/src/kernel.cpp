@@ -2363,6 +2363,11 @@ const char* KernelExportName(u32 ordinal)
 void KernelCall(GateFrame* frame, GuestThread* thread)
 {
     const u32 ordinal = frame->eax;
+    if (ordinal == 399)
+    {
+        BackpatchedAccess(frame);
+        return;
+    }
     const Export* e = ordinal < 400 ? g_by_ordinal[ordinal] : nullptr;
     Call c{frame, thread, e && e->kind == 'F'};
     u64 result = STATUS_NOT_IMPLEMENTED;
