@@ -135,6 +135,7 @@ public:
             }
         return buffers[current];
     }
+    int Current() const { return current; }
     void End()
     {
         sceVideoOutSubmitFlip(handle, current, ORBIS_VIDEO_OUT_FLIP_VSYNC, int64_t(++flips));
@@ -599,14 +600,39 @@ void PresentLoop()
         previous = buttons;
         if (connected)
             FeedGuestPad(pad);
+        const DisplayInfo d = GetDisplay();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const bool log_on = show_log && (now < 15 || !d.valid);
+        // Nothing new to show (the same picture, layout and no log over it): the screen keeps the last
+        // flip, and the CPU time (a 1080p frame is 8 MiB to write) stays the game's.
+        u64 hash = 0xcbf29ce484222325ull ^ (u64(d.address) << 32) ^ u64(d.width) << 16 ^ u64(d.height) ^ u64(g_settings.picture) << 60;
+        if (d.valid)
+        {
+            const u32 bytes = u32(d.height) * d.pitch;
+            const u64* p = Ptr<const u64>(d.address);
+            for (u32 i = 0; i < bytes / 8; i++)
+                hash = (hash ^ p[i]) * 0x100000001b3ull;
+        }
+        static u64 shown = 0;
+        static bool shown_log = true;
+        if (!log_on && !shown_log && hash == shown)
+        {
+            usleep(4 * 1000);
+            continue;
+        }
         uint32_t* fb = g_screen.Begin();
         if (!fb)
         {
             usleep(16 * 1000);
             continue;
         }
-        const DisplayInfo d = GetDisplay();
-        Screen::Fill(fb, 0, 0, Screen::kWidth, Screen::kHeight, 0x000000);
+        shown = hash, shown_log = log_on;
+        // each buffer cleared only when what covers it changes (the picture overwrites its own area)
+        static u64 layout_of[Screen::kFrames] = {};
+        const u64 layout = (u64(d.valid) << 63) | (u64(d.width) << 40) | (u64(d.height) << 20) | (u64(g_settings.picture) << 4) | u64(log_on);
+        if (layout_of[g_screen.Current()] != layout || log_on)
+            Screen::Fill(fb, 0, 0, Screen::kWidth, Screen::kHeight, 0x000000);
+        layout_of[g_screen.Current()] = layout;
         if (d.valid && !saw_picture)
         {
             saw_picture = true;
@@ -656,8 +682,7 @@ void PresentLoop()
                     std::memcpy(row + size_t(s) * Screen::kWidth, row, size_t(d.width) * scale * 4);
             }
         }
-        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        if (show_log && (t < 15 || !d.valid))
+        if (log_on)
             DrawLog(fb, Screen::kHeight - 20 * 18 - 24);
         g_screen.End();
     }

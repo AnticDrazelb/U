@@ -26,18 +26,25 @@ struct Surface
     u32 address = 0, pitch = 0, width = 0, height = 0, bytes = 4, format = 0;
     bool swizzled = false; // then width and height are powers of two, pixels in the NV2A's swizzle order
 };
-// the NV2A's swizzle: the bits of x and y interleaved (x first) while both have them
+// the NV2A's swizzle: the bits of x and y interleaved (x first) while both have them, then the
+// larger one's remaining bits. In closed form: the low bits spread apart (Morton order), the rest on top.
+inline u32 SpreadBits(u32 v) // bit i to bit 2i (16 bits)
+{
+    v &= 0xffff;
+    v = (v | (v << 8)) & 0x00ff00ff;
+    v = (v | (v << 4)) & 0x0f0f0f0f;
+    v = (v | (v << 2)) & 0x33333333;
+    v = (v | (v << 1)) & 0x55555555;
+    return v;
+}
 inline u32 Swizzle(u32 x, u32 y, u32 width, u32 height)
 {
-    u32 offset = 0, bit = 0;
-    for (u32 i = 1; i < width || i < height; i <<= 1)
-    {
-        if (i < width)
-            offset |= (x & i ? 1u : 0u) << bit++;
-        if (i < height)
-            offset |= (y & i ? 1u : 0u) << bit++;
-    }
-    return offset;
+    const u32 wb = width > 1 ? 31 - __builtin_clz(width - 1) + 1 : 0;   // bits of x
+    const u32 hb = height > 1 ? 31 - __builtin_clz(height - 1) + 1 : 0; // bits of y
+    const u32 m = wb < hb ? wb : hb, low = (1u << m) - 1;
+    const u32 interleaved = SpreadBits(x & low) | (SpreadBits(y & low) << 1);
+    const u32 rest = wb > hb ? (x & ((1u << wb) - 1)) >> m : (y & ((1u << hb) - 1)) >> m;
+    return interleaved | (rest << (2 * m));
 }
 // the 3D swizzle: x, y and z bits interleaved in turn while each has them
 inline u32 Swizzle3(u32 x, u32 y, u32 z, u32 width, u32 height, u32 depth)

@@ -960,9 +960,36 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
             y = (y / kBand + 1) * kBand - 1; // to the end of this band
             continue;
         }
-        const double py = y + 0.5, px0 = x0 + 0.5;
-        double ea = edge(b, c, px0, py), eb = edge(c, a, px0, py), ec = edge(a, b, px0, py);
-        for (int x = x0; x <= x1; x++, ea += dax, eb += dbx, ec += dcx)
+        const double py = y + 0.5;
+        // the row's span: each edge function is linear along the row, so where all three are >= 0
+        // is solved for, a pixel wider each side (the test below stays exact, the fill rule too)
+        int xs = x0, xe = x1;
+        {
+            const double e0[3] = {edge(b, c, x0 + 0.5, py), edge(c, a, x0 + 0.5, py), edge(a, b, x0 + 0.5, py)};
+            const double d[3] = {dax, dbx, dcx};
+            bool empty = false;
+            for (int i = 0; i < 3 && !empty; i++)
+            {
+                if (d[i] > 0)
+                {
+                    const double first = std::ceil(-e0[i] / d[i]) - 1; // the first x where it's >= 0, less one
+                    if (first > double(xs - x0))
+                        xs = first > double(x1 - x0) ? x1 + 1 : x0 + int(first);
+                }
+                else if (d[i] < 0)
+                {
+                    const double last = std::floor(e0[i] / -d[i]) + 1; // the last x where it's >= 0, plus one
+                    if (last < double(xe - x0))
+                        xe = last < 0 ? x0 - 1 : x0 + int(last);
+                }
+                else if (e0[i] < 0)
+                    empty = true;
+            }
+            if (empty || xs > xe)
+                continue;
+        }
+        double ea = edge(b, c, xs + 0.5, py), eb = edge(c, a, xs + 0.5, py), ec = edge(a, b, xs + 0.5, py);
+        for (int x = xs; x <= xe; x++, ea += dax, eb += dbx, ec += dcx)
         {
             if (ea < 0 || eb < 0 || ec < 0 || (ea == 0 && !tla) || (eb == 0 && !tlb) || (ec == 0 && !tlc))
                 continue;
