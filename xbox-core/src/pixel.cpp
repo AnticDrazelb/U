@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 #include "core.h"
 #include "draw.h"
+#include "gpu.h"
 #include "nv2a.h"
 
 namespace xb {
@@ -929,6 +931,90 @@ u32 PixelInputMask()
         if (g_ps.program[s])
             mask |= 1u << (9 + s);
     return mask;
+}
+
+namespace {
+// the bytes a texture's texels take (every level, every face), for hashing and overlap checks
+u32 TextureBytes(const Texture& t)
+{
+    if (!t.swizzled && !t.compressed)
+        return t.pitch * t.height;
+    u32 total = 0, w = t.width, h = t.height;
+    for (u32 l = 0; l < t.levels; l++, w = std::max(1u, w / 2), h = std::max(1u, h / 2))
+        total += t.compressed ? ((w + 3) / 4) * ((h + 3) / 4) * (t.format == 0x0c ? 8 : 16) : w * h * BytesPerTexel(t.format);
+    return t.cubemap ? t.face_size * 6 : total;
+}
+} // namespace
+
+bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& blend)
+{
+    const PixelState& ps = g_ps;
+    std::memset(&u, 0, sizeof(u));
+    auto put = [](float* to, const V4& v) {
+        for (int i = 0; i < 4; i++)
+            to[i] = v[i];
+    };
+    u.control[0] = ps.combiners ? ps.stages : 0;
+    u.control[1] = ps.cw0, u.control[2] = ps.cw1;
+    u.control[3] = (ps.uses_ef ? 1u : 0u) | (ps.uses_sum ? 2u : 0u) | (ps.alpha_test ? 4u : 0u);
+    u.alpha_test[0] = ps.alpha_func, u.alpha_test[1] = ps.alpha_ref;
+    for (u32 s = 0; s < ps.stages; s++)
+    {
+        const Stage& st = ps.stage[s];
+        u.stage_words[s][0] = st.icw, u.stage_words[s][1] = st.ocw, u.stage_words[s][2] = st.aicw, u.stage_words[s][3] = st.aocw;
+        put(u.stage_c0[s], st.c0), put(u.stage_c1[s], st.c1);
+        u.stage_flags[s / 4] |= ((st.rgb ? 1u : 0u) | (st.alpha ? 2u : 0u)) << (8 * (s % 4));
+    }
+    put(u.fog_color, ps.fog_color), put(u.final_c0, ps.final_c0), put(u.final_c1, ps.final_c1);
+    u.clip_mode[0] = ps.clip_mode;
+    for (int s = 0; s < 4; s++)
+    {
+        tex[s] = gpu::TextureInfo{};
+        const u32 program = ps.combiners ? ps.program[s] : 0;
+        u.program[s] = program;
+        u.stage_input[s] = ps.input[s];
+        for (int j = 0; j < 4; j++)
+            u.bump[s][j] = ps.bump[s][j];
+        u.bump_lum[s][0] = ps.bump_scale[s], u.bump_lum[s][1] = ps.bump_offset[s];
+        u.tex_scale[s][0] = u.tex_scale[s][1] = 1;
+        switch (program)
+        {
+        case 0: case 4: case 5: continue; // no texture read
+        case 1: case 2: case 3: case 6: case 7: case 15: case 16: break;
+        default: return false; // dot products, BRDF: not on the GPU yet
+        }
+        const Texture& t = ps.texture[s];
+        if (!ps.enabled[s] || !t.address)
+            continue;
+        if (IsDepthFormat(t.format) || t.depth > 1 || (program == 3) != t.cubemap)
+            return false; // shadow maps, volumes: not yet
+        u.enabled[s] = 1;
+        u.kind[s] = t.cubemap ? 1 : 0;
+        gpu::TextureInfo& i = tex[s];
+        i.used = true;
+        i.address = t.address, i.bytes = TextureBytes(t), i.palette = t.format == 0x0b ? t.palette : 0;
+        i.format = t.format, i.width = t.width, i.height = t.height, i.levels = t.levels, i.pitch = t.pitch;
+        i.cube = t.cubemap, i.normalized = t.swizzled || t.compressed;
+        i.wrap = t.wrap, i.filter = t.filter, i.border = t.border;
+        i.lod_bias = t.lod_bias, i.min_lod = t.min_lod, i.max_lod = t.max_lod;
+        if (!i.normalized)
+            u.tex_scale[s][0] = 1.f / float(t.width), u.tex_scale[s][1] = 1.f / float(t.height);
+    }
+    blend.enabled = ps.blend;
+    blend.sfactor = ps.blend_sfactor, blend.dfactor = ps.blend_dfactor, blend.equation = ps.blend_equation;
+    blend.color = Pack(ps.blend_color);
+    return true;
+}
+
+void DecodeStageTexture(int stage, u32 face, u32 level, u32* argb)
+{
+    Texture t = g_ps.texture[stage];
+    if (t.cubemap)
+        t.address += face * t.face_size;
+    const Texture lt = level ? Level(t, level) : t;
+    for (u32 y = 0; y < lt.height; y++)
+        for (u32 x = 0; x < lt.width; x++)
+            argb[y * lt.width + x] = Pack(Texel(lt, x, y));
 }
 
 bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out)

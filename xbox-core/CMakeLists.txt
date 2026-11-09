@@ -14,7 +14,19 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(CORE_SOURCES src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/diagnostics.cpp)
+set(CORE_SOURCES src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
+# The GPU path's shaders: SPIR-V made at build time (nothing is compiled at run time, which the PS4
+# couldn't do), as C arrays the code includes
+find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+foreach(stage vert frag)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/shaders/nv2a_${stage}.h
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${GLSLANG_VALIDATOR} -V --vn nv2a_${stage} -o ${CMAKE_BINARY_DIR}/shaders/nv2a_${stage}.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/nv2a.${stage}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/nv2a.${stage})
+    list(APPEND SHADER_HEADERS ${CMAKE_BINARY_DIR}/shaders/nv2a_${stage}.h)
+endforeach()
+set_source_files_properties(src/gpu_vulkan.cpp PROPERTIES OBJECT_DEPENDS "${SHADER_HEADERS}")
 set(FRONTEND_SOURCES frontend/canvas.cpp frontend/library.cpp frontend/tools.cpp frontend/ui.cpp)
 if (PS4)
     add_executable(xbox-core ${CORE_SOURCES} ${FRONTEND_SOURCES} ps4/platform_ps4.cpp ps4/main_ps4.cpp)
@@ -54,6 +66,23 @@ if (PS4)
         file(WRITE ${CMAKE_BINARY_DIR}/xb-link.x "${xb_script}")
         string(REPLACE "${PS4_LINK_SCRIPT}" "${CMAKE_BINARY_DIR}/xb-link.x" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
     endif()
+    # the GPU path: RADV (scripts/build-mesa.sh) linked in, its headers from Mesa's tree. It makes the
+    # app ~40 MiB, which at 0x400000 would take most of the Xbox's 64 MiB: only in builds linked away
+    # from the Xbox's addresses (XB_IMAGE_BASE), unless asked for.
+    if (XB_IMAGE_BASE)
+        set(XB_GPU_LINK_DEFAULT ON)
+    else()
+        set(XB_GPU_LINK_DEFAULT OFF)
+    endif()
+    option(XB_GPU_LINK "link RADV: drawing on the PS4's GPU" ${XB_GPU_LINK_DEFAULT})
+    set(PS4_MESA_SOURCE "$ENV{HOME}/cemups4-build/src/mesa" CACHE PATH "Mesa PS4 source directory")
+    target_include_directories(xbox-core PRIVATE ${PS4_MESA_SOURCE}/include)
+    if (XB_GPU_LINK)
+        ps4_link_mesa(xbox-core)
+        target_link_libraries(xbox-core PRIVATE ${PS4_SYSROOT}/lib/libz.a) # Mesa's
+    else()
+        target_compile_definitions(xbox-core PRIVATE XB_NO_VULKAN)
+    endif()
     ps4_add_eboot(xbox-core)
 else()
     add_executable(xbox-core ${CORE_SOURCES} src/platform_linux.cpp src/main.cpp)
@@ -62,7 +91,10 @@ else()
     # the PS4 front end's screen, drawn to PNG files
     add_executable(ui-preview ${FRONTEND_SOURCES} tools/ui-preview.cpp)
 endif()
-target_include_directories(xbox-core PRIVATE src)
+target_include_directories(xbox-core PRIVATE src ${CMAKE_BINARY_DIR}/shaders)
+if (NOT PS4)
+    target_link_libraries(xbox-core PRIVATE ${CMAKE_DL_LIBS}) # libvulkan, opened at run time
+endif()
 target_compile_definitions(xbox-core PRIVATE XB_VERSION="${XB_VERSION}")
 set_source_files_properties(${CORE_SOURCES} src/platform_linux.cpp src/main.cpp ps4/platform_ps4.cpp ps4/main_ps4.cpp
     PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter")

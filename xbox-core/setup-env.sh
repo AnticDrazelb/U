@@ -13,8 +13,9 @@
 #   - create-fself and create-gp4 are built with Ubuntu's Go 1.22, PkgTool.Core with Ubuntu's .NET 8
 #     (retargeted from net6.0)
 #   - libsmb2 and libnfs are cloned at their tags (GitHub /archive/ tarballs are refused)
-#   - libturbojpeg and the Crema-only parts (Mesa, Cemu, the other deps) aren't built: xbox-core
-#     doesn't use them
+#   - Mesa 26.0.8 and libdrm 2.4.125 come from Ubuntu's source pool (gitlab.freedesktop.org refused)
+#   - libturbojpeg and the Crema-only parts (Cemu, the other deps) aren't built: xbox-core doesn't
+#     use them
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -32,7 +33,8 @@ clone() { # clone <github owner/repo> <dir> [rev]
 step "apt packages"
 sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build cmake pkg-config python3-venv \
-    python3-pil nasm golang-go dotnet-sdk-8.0 xvfb flex bison libxml2-dev >/dev/null
+    python3-pil nasm golang-go dotnet-sdk-8.0 xvfb flex bison libxml2-dev \
+    glslang-tools libvulkan-dev vulkan-tools mesa-vulkan-drivers >/dev/null
 
 step "clang 21 (/opt/llvm21)"
 if [ ! -x /opt/llvm21/bin/clang ]; then
@@ -149,6 +151,27 @@ mkdir -p "$D"
 [ -d "$D/libsmb2" ] || git clone -q --depth 1 -b v6.0.0 https://github.com/sahlberg/libsmb2 "$D/libsmb2"
 [ -d "$D/libnfs" ] || git clone -q --depth 1 -b libnfs-8.0.0 https://github.com/sahlberg/libnfs "$D/libnfs"
 [ -f "$SYS/lib/libsmb2.a" ] && [ -f "$SYS/lib/libnfs.a" ] || "$REPO/scripts/build-deps.sh" libsmb2 libnfs
+[ -d "$D/zlib" ] || git clone -q --depth 1 -b v1.3.1 https://github.com/madler/zlib "$D/zlib"
+[ -f "$SYS/lib/libz.a" ] || "$REPO/scripts/build-deps.sh" zlib
+
+step "RADV for the PS4 (Mesa 26.0.8 + patches/mesa-ps4*, ~/cemups4-build/build/mesa): the GPU path"
+# Mesa's own hosts may be unreachable; Ubuntu's source pool has the release tarballs
+M="$HOME/cemups4-build/src"
+if [ ! -d "$M/mesa" ]; then
+    curl -sSL -o "$DL/mesa.tar.xz" http://archive.ubuntu.com/ubuntu/pool/main/m/mesa/mesa_26.0.8.orig.tar.xz
+    mkdir -p "$M/mesa" && tar -xJf "$DL/mesa.tar.xz" -C "$M/mesa" --strip-components=1 && rm "$DL/mesa.tar.xz"
+    (cd "$M/mesa" && git init -q && git add -A >/dev/null && git -c user.email=b@x -c user.name=b commit -qm "mesa 26.0.8")
+    for p in mesa-ps4 mesa-ps4-aligned-vertex-fetch mesa-ps4-vertex-fetch-switch mesa-ps4-flush-all-draws mesa-ps4-gs-ring-probe; do
+        git -C "$M/mesa" apply --exclude=src/amd/common/ac_ps4_drm.c "$REPO/patches/$p.patch"
+    done
+fi
+if [ ! -d "$M/libdrm" ]; then
+    curl -sSL -o "$DL/libdrm.tar.xz" http://archive.ubuntu.com/ubuntu/pool/main/libd/libdrm/libdrm_2.4.125.orig.tar.xz
+    mkdir -p "$M/libdrm" && tar -xJf "$DL/libdrm.tar.xz" -C "$M/libdrm" --strip-components=1 && rm "$DL/libdrm.tar.xz"
+fi
+V="$HOME/cemups4-build/mesa-venv"
+[ -x "$V/bin/meson" ] || { python3 -m venv "$V" && "$V/bin/pip" install -q meson mako pyyaml packaging; }
+[ -f "$HOME/cemups4-build/build/mesa/src/amd/vulkan/libvulkan_radeon.a" ] || "$REPO/scripts/build-mesa.sh" setup > "$LOG/mesa.log" 2>&1
 
 step "nxdk (~/emu/nxdk), its samples, the core's tests, NevolutionX"
 export NXDK_DIR="$HOME/emu/nxdk" PATH="$HOME/emu/nxdk/bin:/opt/llvm21/bin:$PATH"

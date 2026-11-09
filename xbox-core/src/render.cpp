@@ -7,6 +7,7 @@
 #include "core.h"
 #include "diagnostics.h"
 #include "draw.h"
+#include "gpu.h"
 #include "nv2a.h"
 
 namespace xb {
@@ -227,7 +228,13 @@ void KelvinMethod(u32 method, u32 parameter)
         k.regs[method / 4] = parameter;
     switch (method)
     {
-    case 0x1d94: // CLEAR_SURFACE
+    case 0x1d94: // CLEAR_SURFACE: on the GPU's copies of the surfaces when the GPU draws
+        if (gpu::Enabled())
+        {
+            if (gpu::Clear(parameter))
+                break;
+            gpu::Sync();
+        }
         Clear(parameter);
         break;
     case 0x1d70: // BACK_END_WRITE_SEMAPHORE_RELEASE: a value written where the driver waits for it
@@ -256,6 +263,8 @@ struct ImageBlit
 
 void Blit(u32 width, u32 height)
 {
+    if (gpu::Enabled())
+        gpu::Sync(); // the surfaces' current content, in memory
     const Surfaces2D& s = g_surfaces2d;
     u32 bpp;
     switch (s.format)

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core.h"
+#include "gpu.h"
 #include "diagnostics.h"
 #include "devices.h"
 #include "kernel.h"
@@ -312,6 +313,9 @@ void StartVblank()
             {
                 next += std::chrono::microseconds(16683);
                 g_vblanks++;
+                // what the GPU drew, in memory for the picture (and anything else reading it)
+                if (gpu::Enabled())
+                    gpu::Sync();
                 Nv2aVblank();
             }
             RunInterrupts(t);
@@ -352,6 +356,8 @@ u32 DisplayPixel(const DisplayInfo& d, int x, int y)
 
 bool SaveFramebuffer(const std::string& path)
 {
+    if (gpu::Enabled())
+        gpu::Sync();
     const DisplayInfo d = GetDisplay();
     if (!d.valid)
     {

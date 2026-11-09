@@ -18,6 +18,7 @@
 
 #include "core.h"
 #include "diagnostics.h"
+#include "gpu.h"
 #include "draw.h"
 #include "nv2a.h"
 
@@ -868,6 +869,43 @@ struct WindowClip
     }
 };
 
+} // namespace
+
+// The window clip as one rectangle [x0, x1) x [y0, y1), when it is one (none set: the whole
+// surface; inclusive with every non-empty window inside the largest; exclusive with no window): the
+// GPU path's scissor. False when it takes more than a rectangle.
+bool WindowClipRect(int& x0, int& y0, int& x1, int& y1)
+{
+    x0 = y0 = 0, x1 = y1 = 1 << 30;
+    const WindowClip w;
+    if (!w.active)
+        return true;
+    int best = -1;
+    long best_area = -1;
+    for (int i = 0; i < 8; i++)
+        if (w.x1[i] > w.x0[i] && w.y1[i] > w.y0[i])
+        {
+            const long area = long(w.x1[i] - w.x0[i]) * (w.y1[i] - w.y0[i]);
+            if (area > best_area)
+                best = i, best_area = area;
+        }
+    if (w.exclusive)
+        return best < 0; // nothing excluded
+    if (best < 0)
+    {
+        x1 = y1 = 0; // nothing included: nothing drawn
+        return true;
+    }
+    for (int i = 0; i < 8; i++)
+        if (w.x1[i] > w.x0[i] && w.y1[i] > w.y0[i] &&
+            (w.x0[i] < w.x0[best] || w.x1[i] > w.x1[best] || w.y0[i] < w.y0[best] || w.y1[i] > w.y1[best]))
+            return false;
+    x0 = w.x0[best], y0 = w.y0[best], x1 = w.x1[best], y1 = w.y1[best];
+    return true;
+}
+
+namespace {
+
 // Draws the part of the triangle in bands `part`, `part + parts`, ...
 void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, int part = 0, int parts = 1)
 {
@@ -1263,6 +1301,8 @@ void Flush()
     case 4: // line strip
     {
         PreparePixels();
+        if (gpu::Enabled())
+            gpu::Sync(); // drawn in software, on the surfaces' current content
         Fragments f;
         if (f.Usable())
         {
@@ -1400,6 +1440,53 @@ void Flush()
     }
     const std::vector<ScreenVertex>& sv = *source;
     PreparePixels();
+    // On the GPU when it's on and does this state: the triangles the rasterizer would draw (culled
+    // and zero-area ones left out as Triangle leaves them), as screen-space vertices.
+    if (gpu::Enabled())
+    {
+        const bool fill = g_kelvin.Get(0x38c) != 0x1b00 && g_kelvin.Get(0x38c) != 0x1b01 &&
+                          g_kelvin.Get(0x390) != 0x1b00 && g_kelvin.Get(0x390) != 0x1b01;
+        int wx0, wy0, wx1, wy1;
+        if (fill && WindowClipRect(wx0, wy0, wx1, wy1))
+        {
+            static thread_local std::vector<gpu::Vertex> gv;
+            gv.clear();
+            const bool culling = g_kelvin.Get(0x308);
+            const u32 cull = g_kelvin.Get(0x39c);
+            const bool ccw_front = g_kelvin.Get(0x3a0) == 0x901;
+            for (const Tri& t : tris)
+            {
+                const ScreenVertex &a = sv[t.v[0]], &b = sv[t.v[1]], &c = sv[t.v[2]];
+                const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                if (area == 0)
+                    continue;
+                if (culling)
+                {
+                    const bool front = ccw_front ? !(area > 0) : area > 0;
+                    if ((cull == 0x404 && front) || (cull == 0x405 && !front) || cull == 0x408)
+                        continue;
+                }
+                for (u32 v : t.v)
+                {
+                    const ScreenVertex& x = sv[v];
+                    gpu::Vertex out;
+                    out.pos[0] = x.x, out.pos[1] = x.y, out.pos[2] = x.z, out.pos[3] = x.o[0][3];
+                    std::memcpy(out.diffuse, x.o[3].v, 16);
+                    std::memcpy(out.specular, x.o[4].v, 16);
+                    std::memcpy(out.fog, x.o[5].v, 16);
+                    for (int i = 0; i < 4; i++)
+                        std::memcpy(out.tex[i], x.o[9 + i].v, 16);
+                    gv.push_back(out);
+                }
+            }
+            if (gpu::DrawTriangles(gv.data(), u32(gv.size() / 3)))
+            {
+                g_vertices.clear();
+                return;
+            }
+        }
+        gpu::Sync(); // drawn in software, on the surfaces' current content
+    }
     // polygon modes (SET_FRONT/BACK_POLYGON_MODE: 0x1b00 points, 0x1b01 lines, else filled): those
     // triangles become their outline's lines or vertices, on this thread
     const u32 front_mode = g_kelvin.Get(0x38c), back_mode = g_kelvin.Get(0x390);

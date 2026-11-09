@@ -70,6 +70,8 @@ Surface ColorSurface();
 Surface ZetaSurface();
 void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask = 0xffffffff);
 u32 ReadPixel(const Surface& s, u32 x, u32 y);
+bool WindowClipRect(int& x0, int& y0, int& x1, int& y1); // the window clip as one rectangle, if it is one
+u32 FixedBits(u32 format, u32 value); // a colour's unused bits as the surface format stores them
 
 // draw.cpp: runs fn(0) .. fn(parts - 1) on the rasterizer's threads; how many it has
 void RunParts(int parts, const std::function<void(int)>& fn);
@@ -88,6 +90,12 @@ struct PixelInputs
 // A stage's level of detail from its coordinates' screen derivatives (as given to the stage).
 float TextureLod(int stage, float dudx, float dvdx, float dudy, float dvdy);
 void PreparePixels(); // the registers ShadePixel reads, decoded for a draw
+// The prepared state for the GPU path (gpu.h): false if it uses what the GPU path doesn't do yet.
+namespace gpu { struct Uniforms; struct TextureInfo; struct BlendState; }
+bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& blend);
+// A texture stage's texels, decoded as the software path reads them: level `level` (of face `face`
+// for a cube map), width >> level by height >> level ARGB words.
+void DecodeStageTexture(int stage, u32 face, u32 level, u32* argb);
 u32 PixelInputMask();  // which of PixelInputs' v[] the prepared state reads (bit per output)
 bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out);
 

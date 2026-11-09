@@ -270,24 +270,39 @@ again. So a step that kills the app costs one launch.
 6. **Optional leftovers:** NV2A gaps (W-buffering, the BRDF texture mode, signed blends, line widths), and the
    APU's DSPs.
 
-7. **Drawing speed: the main limit now.** The renderer is software: about 5 Mpixels/s per desktop
-   thread on nxdk's mesh sample, ~600 cycles a pixel, spread over the interpreted pixel pipeline
-   (texture fetch and filtering, the combiners, depth), with no single hot spot. Halo at 640x480
-   with its multitexturing needs perhaps 35 Mpixels/s for 30 frames/s; six Jaguar cores give
-   roughly 10, so expect single-digit frame rates until this improves. The `stats:` line shows
-   "drawing N% of the time": the console's figure decides what to do. In order of payoff/effort:
-   - **Shade in batches** (a row span's pixels together): each combiner stage, texture stage and
-     input mapping decoded once per batch, the per-pixel work simple loops the compiler vectorizes.
-     The same float operations in the same order keep the pictures bit-identical (check with the
-     GPU tests: `tests/*-test`, against `tests/*.png`). Likely 2-4x.
-   - **Draw on the PS4's GPU.** The repo's Mesa build for the PS4 is RADV (Vulkan; Crema renders
-     with it on the console), and Mesa's lavapipe runs Vulkan on the desktop for testing. An NV2A
-     renderer on Vulkan (vertex programs and combiners as generated shaders, textures decoded and
-     uploaded, surfaces as images read back for the display and the CPU) is weeks of work, but it is
-     what makes Halo fast.
-   Done already: clipping (8409972, 1 -> 11 frames/s in ClassiCube), the closed-form swizzle and
-   per-row spans (10b258a, ~5%), backpatched register accesses (02d6e4a). On the PS4 the present
-   loop no longer rewrites an unchanged 1080p frame 60 times a second.
+7. **Drawing on the GPU (Vulkan): `src/gpu_vulkan.cpp`, `src/gpu.h`, `src/shaders/`.** The CPU keeps
+   what is per vertex (vertex programs, fog, clipping, culling, flat and two-sided colours) and hands
+   the triangles to Vulkan, which rasterizes and runs the texture stages and combiners (one
+   shader, `nv2a.frag`, that reads the NV2A's state from a uniform buffer: SPIR-V made at build
+   time, nothing compiled at run time), depth, stencil and blending. Surfaces are images, written
+   back to guest memory at each vblank, before CPU-side clears/blits/line and point draws, and
+   before a texture reads one (render to texture); a hash check notices CPU writes before the next
+   GPU use. Textures are decoded with the software path's `Texel()` and cached by content.
+   - **Where it runs:** the desktop with `XB_GPU=1` (any driver; lavapipe here:
+     `mesa-vulkan-drivers`), and the PS4 in `xbox-core-1g` only: RADV (Mesa 26.0.8 + the repo's
+     `patches/mesa-ps4*`, `scripts/build-mesa.sh`) is linked in, which makes the app ~41 MiB, too
+     big for 0x400000. The normal package keeps software drawing (`XB_NO_VULKAN`).
+   - **On the console:** the GPU starts with the first draw; `/data/xbox-core/gpu-step.txt` notes
+     the step, so if starting RADV kills the app, the next run of that build draws in software and
+     logs why. Log lines: `gpu: on: <device>`, `gpu: off: <why>`, `gpu: the first frames were drawn`.
+   - **Checked (desktop, lavapipe):** the regression set with `XB_GPU=1` passes; the GPU tests'
+     pictures (ff, lines, blit, rt, tex) and the triangle, mesh and gamma samples match the
+     software renderer within rounding; ClassiCube's world and NevolutionX's menu are right.
+   - **Not on the GPU yet (drawn in software after a write-back):** points and lines, polygon
+     modes, the dot-product texture modes (9-14, 17, 18) and BRDF, shadow maps, volume textures,
+     float depth buffers, window clips that aren't one rectangle, partial-channel or 16-bit colour
+     clears. `XB_GPU_DEBUG=1` logs why a draw went to software.
+   - **Next:** measure on the console (`stats:` "drawing N%" falls to ~0 when the GPU draws; the
+     frame rate is the figure), then move the remaining modes over, starting with whatever the
+     console log shows Halo using. Write-backs at every vblank are simple and safe but cost a
+     readback a frame; tracking which surface is displayed would trim it.
+
+8. **Software drawing speed** (the normal package, and anything the GPU path doesn't do): about 5
+   Mpixels/s per desktop thread, ~600 cycles a pixel, spread over the interpreted pixel pipeline.
+   Shading in batches was tried and was slower (small triangles; a patch is in no commit). Done:
+   clipping (8409972, ClassiCube 1 -> 11 frames/s), the closed-form swizzle and per-row spans
+   (10b258a), backpatched register accesses (02d6e4a); the PS4 present loop no longer rewrites an
+   unchanged 1080p frame.
 
 ## 6. Things to know
 

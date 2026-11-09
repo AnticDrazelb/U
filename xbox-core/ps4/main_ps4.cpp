@@ -30,6 +30,7 @@
 
 #include "../frontend/ui.h"
 #include "../src/diagnostics.h"
+#include "../src/gpu.h"
 #include "../src/core.h"
 #include "../src/kernel.h"
 #include "../src/platform.h"
@@ -871,6 +872,9 @@ int main()
         InitCpu();
         LogSync("launch: devices");
         InitDevices();
+        // drawing on the GPU (RADV), unless starting it killed the last run of this build
+        gpu::SetGuardFile("/data/xbox-core/gpu-step.txt");
+        gpu::SetWanted(true);
         LogSync("launch: kernel");
         InitKernel();
         LogSync("launch: loading %s", xbe.c_str());
