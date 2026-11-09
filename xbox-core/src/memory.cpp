@@ -164,10 +164,36 @@ void Fatal(const char* fmt, ...)
     std::_Exit(2);
 }
 
+namespace {
+// the guest's mapped ranges, for GuestMapped (lock-free: the fault path asks it)
+constexpr int kMappedRanges = 32;
+std::atomic<u64> g_mapped[kMappedRanges]; // base << 32 | (size >> 12), 0 unused
+std::atomic<int> g_mapped_count{0};
+} // namespace
+
 bool MapGuest(u32 base, u32 size, bool exec, std::string& error)
 {
     error = platform::Map(base, size, platform::Read | platform::Write | (exec ? platform::Exec : 0));
+    if (error.empty())
+        if (const int i = g_mapped_count.load(); i < kMappedRanges)
+        {
+            g_mapped[i].store((u64(base) << 32) | (size >> 12));
+            g_mapped_count.store(i + 1);
+        }
     return error.empty();
+}
+
+bool GuestMapped(u32 address, u32 length)
+{
+    const int n = g_mapped_count.load();
+    for (int i = 0; i < n; i++)
+    {
+        const u64 v = g_mapped[i].load();
+        const u64 base = v >> 32, end = base + (u64(u32(v)) << 12);
+        if (address >= base && u64(address) + length <= end)
+            return true;
+    }
+    return false;
 }
 
 namespace {

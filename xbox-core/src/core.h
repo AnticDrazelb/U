@@ -110,6 +110,7 @@ u32 FreeSystem(u32 base);                      // the pages freed
 u32 PhysicalAddress(u32 guest);
 // The allocation (program or contiguous memory) containing `at`.
 bool QueryAllocation(u32 at, u32& start, u32& size);
+bool GuestMapped(u32 address, u32 length); // the whole range is mapped guest memory (lock-free)
 u32 FreePages();
 
 // ---- XBE

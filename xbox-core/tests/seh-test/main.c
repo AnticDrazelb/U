@@ -95,6 +95,15 @@ int main(void)
     }
     check("an access violation in __try is caught", fault_caught == 1 && fault_code == 0xC0000005);
 
+    // 5b: a call through a null function pointer: a jump to nowhere, an access violation at eip 0
+    volatile DWORD null_code = 0;
+    void (*volatile nothing)(void) = 0;
+    __try {
+        nothing();
+    } __except (null_code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+    }
+    check("a call through a null pointer is caught", null_code == 0xC0000005);
+
     // 6: an integer division by zero
     volatile DWORD divide_code = 0;
     __try {

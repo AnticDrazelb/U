@@ -731,9 +731,50 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
     std::memset(Ptr(record), 0, 0x50);
     Write<u32>(record, code);
     Write<u32>(record + 12, eip);
-    // every guest exception counted; the first hundred logged with where
+    // every guest exception counted; the first hundred logged with where, all the registers, the
+    // calls that led there (the frame pointer chain), the stack and the handler chain
     if (diag::g_exceptions++ < 100)
+    {
         Log("exception %#x at %#x in thread %u (fault address %#x): to the program's handlers", code, eip, t->id, f.address);
+        Log("  eax %#x ecx %#x edx %#x ebx %#x esp %#x ebp %#x esi %#x edi %#x eflags %#x", r.Get(0), r.Get(1), r.Get(2),
+            r.Get(3), esp, r.Get(5), r.Get(6), r.Get(7), u32(*f.eflags));
+        auto on_stack = [&](u32 a) { return a >= t->stack_limit && a + 4 <= t->stack_top && !(a & 3); };
+        std::string calls, stack, handlers;
+        char b[24];
+        for (u32 ebp = r.Get(5), n = 0; n < 16 && on_stack(ebp) && on_stack(ebp + 4); n++)
+        {
+            std::snprintf(b, sizeof(b), " %#x", Read<u32>(ebp + 4));
+            calls += b;
+            const u32 next = Read<u32>(ebp);
+            if (next <= ebp)
+                break;
+            ebp = next;
+        }
+        for (u32 i = 0; i < 32 && on_stack(esp + i * 4); i++)
+        {
+            std::snprintf(b, sizeof(b), "%s%08x", i % 8 ? " " : (i ? "\n    " : "    "), Read<u32>(esp + i * 4));
+            stack += b;
+        }
+        for (u32 rec = chain, n = 0; n < 8 && on_stack(rec) && on_stack(rec + 4); n++)
+        {
+            std::snprintf(b, sizeof(b), " %#x->%#x", rec, Read<u32>(rec + 4));
+            handlers += b;
+            rec = Read<u32>(rec);
+        }
+        Log("  called from (frame chain):%s", calls.c_str());
+        Log("  handler records (address->handler):%s", handlers.c_str());
+        Log("  stack at esp:\n%s", stack.c_str());
+        if (GuestMapped(eip > 16 ? eip - 16 : 0, 48))
+        {
+            std::string around;
+            for (u32 i = 0; i < 48; i++)
+            {
+                std::snprintf(b, sizeof(b), i == 16 ? " [%02x" : (i == 17 ? "] %02x" : " %02x"), Read<u8>(eip - 16 + i));
+                around += b;
+            }
+            Log("  code around eip (16 before, [eip]):%s", around.c_str());
+        }
+    }
     if (code == 0xC0000005)
     {
         Write<u32>(record + 16, 2); // NumberParameters: read (0) or write, and the address
@@ -764,7 +805,11 @@ int HandleGuestFault(platform::Fault& f)
     const u64 rip = *f.rip;
     const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
     Regs r{f};
-    const u8* code = Ptr<u8>(u32(rip));
+    // the instruction's bytes; zeros when eip isn't mapped (a jump to nowhere: an access violation
+    // for the program, not a read the emulator itself faults on)
+    static const u8 kNoCode[16] = {};
+    const bool code_mapped = GuestMapped(u32(rip), 16);
+    const u8* code = code_mapped ? Ptr<u8>(u32(rip)) : kNoCode;
     // the faulting guest thread: its KPCR's, or (no fs base known) the one whose stack holds esp
     GuestThread* const fault_thread =
         guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : diag::ThreadByStack(r.Get(4));
@@ -777,9 +822,10 @@ int HandleGuestFault(platform::Fault& f)
     if (const u32 n = g_fault_log ? s_faults++ : 300; n < 300)
     {
         GuestThread* ft = fault_thread;
-        LogSync("cpu: fault %u in thread %u: signal %d at %#x, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
-                "ecx %#x edx %#x esp %#x", n + 1, ft ? ft->id : 0, f.signal, u32(rip), f.address, code[0], code[1], code[2],
-                code[3], code[4], code[5], r.Get(0), r.Get(1), r.Get(2), r.Get(4));
+        LogSync("cpu: fault %u in thread %u: signal %d at %#x%s, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
+                "ecx %#x edx %#x ebx %#x esp %#x ebp %#x esi %#x edi %#x", n + 1, ft ? ft->id : 0, f.signal, u32(rip),
+                code_mapped ? "" : " (not mapped)", f.address, code[0], code[1], code[2], code[3], code[4], code[5], r.Get(0),
+                r.Get(1), r.Get(2), r.Get(3), r.Get(4), r.Get(5), r.Get(6), r.Get(7));
     }
     // every fault into the ring the reports show (the last ones, all their registers and code)
     auto record = [&](const char* outcome) {
