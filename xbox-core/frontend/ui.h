@@ -1,5 +1,7 @@
-// The front end's screen (1920x1080): a header with the tabs (Library, Settings, About), the library
-// as a grid of covers with the chosen game's details beside it, and the controller's hints below.
+// The front end's screen (1920x1080), light and friendly: a title and the clock at the top, the
+// collection as a carousel of covers (the chosen one raised and glowing, a caption under each), a dock
+// of the four places (Collection, Settings, Tools, About) at the bottom, the controller's hints in
+// the corners.
 // Drawn in software into any RGBA buffer: the PS4's scan-out, or a PNG (tools/ui-preview).
 #pragma once
 
@@ -60,9 +62,11 @@ private:
     const Covers& CoversFor(const Game& g);
     Image GeneratedCover(const Game& g, int w, int h);
     void BuildBackground();
-    void DrawHeader(Canvas& c, const std::string& clock);
+    void DrawHeader(Canvas& c, const std::string& clock, const std::string& user);
+    void DrawDock(Canvas& c);
+    void DrawIcon(Canvas& c, int tab, int cx, int cy, Color color, Color back);
     void DrawLibrary(Canvas& c, double seconds);
-    void DrawDetails(Canvas& c, const Game& g);
+    void DrawInfo(Canvas& c, const Game& g, int y);
     void DrawSettings(Canvas& c);
     void DrawAbout(Canvas& c);
     void DrawTools(Canvas& c);
@@ -83,7 +87,8 @@ private:
     bool ready = false;
     Tab tab = kLibrary;
     size_t selected = 0;
-    int first_row = 0;
+    int first = 0;      // the first card the carousel shows
+    float scroll = 0;   // where it is drawn from: easing towards `first`
     int setting = 0;
     bool options_open = false;
     int option = 0;

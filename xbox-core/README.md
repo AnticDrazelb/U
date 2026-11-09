@@ -101,13 +101,16 @@ Xbox's addresses below it. The real console could (xbox-bench).
 
 ## The PS4 library
 
-The app opens on a library of what it can run: the samples it carries and your games in
+The app opens on your collection: a carousel of covers (left and right move, up and down a page at
+a time, the chosen game raised with its facts underneath), a dock of the four places (Collection,
+Settings, Tools, About; L1/R1 move between them) and the buttons' hints in the corners, on a light
+mint background. The collection is the samples the app carries and your games in
 `/data/xbox-core/games` (a folder with `default.xbe` and its files, or a disc image `<name>.iso`).
 Each shows its own title, title ID and region (read from its XBE), its size, and when it last ran
 and how that ended. Cover art is yours to add: `cover.jpg`/`cover.png` in a game's folder,
 `<name>.jpg` beside an image, or `/data/xbox-core/covers/<title ID>.jpg`; without one a cover is
-drawn from the title. L1/R1 switch to Settings (the log while a game starts, the picture's scaling,
-the library's order), Tools and About. Triangle on a game can make it start with the app; hold L1 while the
+drawn from the title. Settings has the log while a game starts, the picture's scaling and the
+library's order. Triangle on a game can make it start with the app; hold L1 while the
 app opens to get back to the library. The screen is drawn in software (`frontend/`, fonts: Inter,
 SIL OFL); `ui-preview` (desktop build) renders it to PNG files.
 

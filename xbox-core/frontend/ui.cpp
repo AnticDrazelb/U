@@ -7,16 +7,16 @@
 namespace fe {
 namespace {
 
-// the palette: dark panels, a green accent
-const Color kText = Rgb(0xF2F4F5), kDim = Rgb(0x9AA3AB), kFaint = Rgb(0x5E666E);
-const Color kAccent = Rgb(0x84D94A), kAccentDark = Rgb(0x2F5A1C);
-const Color kPanel = Rgb(0x1A1E22), kPanelEdge = Rgb(0x2C3238), kRaised = Rgb(0x262B30);
+// the palette: a light mint world, deep green text, a fresh green accent and an aqua glow
+const Color kText = Rgb(0x1E3A22), kDim = Rgb(0x4E6B52), kFaint = Rgb(0x7E9A80);
+const Color kAccent = Rgb(0x2FA84F), kAccentDark = Rgb(0xD5F0C8), kGlow = Rgb(0x3FE0C5);
+const Color kPanel = Rgb(0xFFFFFF, 170), kPanelEdge = Rgb(0xFFFFFF, 235), kRaised = Rgb(0xFFFFFF, 240);
+const Color kOnAccent = Rgb(0xFFFFFF);
 
-constexpr int kCols = 4, kVisibleRows = 2;
-constexpr int kCardW = 228, kCardH = 318, kGridX = 62, kGridY = 238, kStepX = 258, kStepY = 356;
-constexpr int kPanelX = 1100, kPanelY = 228, kPanelW = 780, kPanelH = 762;
-constexpr int kLargeW = 270, kLargeH = 378;
-constexpr int kHeaderH = 108, kTabsY = 116, kTabsH = 92, kHintsY = 1004;
+// the carousel: portrait covers (a case's shape), the chosen one larger
+constexpr int kCardW = 262, kCardH = 370, kLargeW = 300, kLargeH = 424;
+constexpr int kVisible = 5, kStepX = 344, kCarouselX = 118, kCarouselY = 236, kCaptionH = 86;
+constexpr int kDockY = 846, kDockH = 138, kHintsY = 1010;
 
 uint32_t Hash(const std::string& s)
 {
@@ -80,7 +80,7 @@ LibraryUi::LibraryUi(std::vector<Game> g, Settings& s, UiPaths p, std::string v)
             bold.Load(paths.assets + "/Inter-Bold.otf");
     autostart_game = ReadFirstLine(paths.autostart);
     Sort();
-    selected = 0, first_row = 0;
+    selected = 0, first = 0, scroll = 0;
     BuildBackground();
 }
 
@@ -98,7 +98,8 @@ void LibraryUi::Sort()
     for (size_t i = 0; i < games.size(); i++)
         if (games[i].path == keep)
             selected = i;
-    first_row = std::max(0, int(selected) / kCols - (kVisibleRows - 1));
+    first = std::max(0, int(selected) - (kVisible - 1));
+    scroll = float(first);
 }
 
 void LibraryUi::Toast(const std::string& text)
@@ -229,15 +230,13 @@ const Game* LibraryUi::Update(const Input& in)
         }
         const int n = int(games.size());
         int s = int(selected);
-        if (in.left && s % kCols > 0) s--;
-        if (in.right && s % kCols < kCols - 1 && s + 1 < n) s++;
-        if (in.up && s >= kCols) s -= kCols;
-        if (in.down && s + kCols < n) s += kCols;
-        else if (in.down && s / kCols < (n - 1) / kCols) s = n - 1; // the last row's end
+        if (in.left && s > 0) s--;
+        if (in.right && s + 1 < n) s++;
+        if (in.up) s = std::max(0, s - kVisible);      // a page at a time
+        if (in.down) s = std::min(n - 1, s + kVisible);
         selected = size_t(s);
-        const int row = s / kCols;
-        if (row < first_row) first_row = row;
-        if (row >= first_row + kVisibleRows) first_row = row - kVisibleRows + 1;
+        if (s < first) first = s;
+        if (s >= first + kVisible) first = s - kVisible + 1;
         if (in.cross)
             return &games[selected];
         if (in.triangle)
@@ -282,32 +281,34 @@ Image LibraryUi::GeneratedCover(const Game& g, int w, int h)
     img.rgba.assign(size_t(w) * h * 4, 255);
     Canvas c = CanvasOf(img);
     const float k = float(w) / float(kCardW);
+    // a bright card in the game's own colour, soft shapes floating in it
     const float hue = float(Hash(g.title) % 360) / 360.f;
-    c.VerticalGradient(0, 0, w, h, Hsv(hue, 0.55f, 0.42f), Hsv(hue, 0.65f, 0.16f));
-    // light rays from the top corner
-    for (int i = 0; i < 3; i++)
-        c.Line(float(w) * (0.15f + 0.3f * float(i)), 0, float(w) * (0.6f + 0.35f * float(i)), float(h), 18.f * k,
-               Rgb(0xFFFFFF, 10));
-    // the top band, as a disc case's
-    const int band = int(40 * k);
-    c.Fill(0, 0, w, band, Rgb(0x111417, 235));
-    c.Fill(0, band, w, std::max(1, int(3 * k)), kAccent);
+    c.VerticalGradient(0, 0, w, h, Hsv(hue, 0.42f, 0.98f), Hsv(std::fmod(hue + 0.08f, 1.f), 0.62f, 0.78f));
+    const uint32_t seed = Hash(g.path);
+    for (int i = 0; i < 6; i++)
+    {
+        const float cx = float((seed >> (i * 5)) % 100) / 100.f * float(w), cy = float((seed >> (i * 3 + 2)) % 100) / 100.f * float(h);
+        c.Circle(cx, cy, (24.f + float((seed >> i) % 50)) * k, Rgb(0xFFFFFF, 34));
+    }
+    // a disc in the corner
+    const float dr = 54 * k;
+    c.Circle(float(w) - dr * 0.55f, float(h) - dr * 0.55f, dr, Rgb(0xFFFFFF, 70));
+    c.Circle(float(w) - dr * 0.55f, float(h) - dr * 0.55f, dr * 0.32f, Hsv(hue, 0.5f, 0.85f));
+    // the kind, as a chip
     const std::string tag = g.sample ? "SAMPLE" : !g.usb.empty() ? "USB" : g.kind == "Disc image" ? "DISC" : "GAME";
-    semibold.Draw(c, int(12 * k), int(11 * k), tag, 17 * k, kAccent);
-    // the title, centred in the middle
-    const float size = 30 * k;
-    const auto lines = bold.Wrap(g.title, size, w - int(32 * k), 4);
-    int y = (h - int(lines.size()) * int(size * 1.2f)) / 2;
+    const int tw = semibold.Measure(tag, 17 * k) + int(24 * k);
+    c.RoundRect(int(14 * k), int(14 * k), tw, int(30 * k), int(15 * k), Rgb(0xFFFFFF, 215));
+    semibold.Draw(c, int(26 * k), int(19 * k), tag, 17 * k, Hsv(hue, 0.7f, 0.45f));
+    // the title, big, in the middle
+    const float size = 32 * k;
+    const auto lines = bold.Wrap(g.title, size, w - int(36 * k), 4);
+    int y = (h - int(lines.size()) * int(size * 1.18f)) / 2 - int(10 * k);
     for (const std::string& l : lines)
     {
-        bold.Draw(c, (w - bold.Measure(l, size)) / 2, y, l, size, kText);
-        y += int(size * 1.2f);
-    }
-    if (g.title_id)
-    {
-        char id[16];
-        std::snprintf(id, sizeof(id), "%08X", g.title_id);
-        regular.Draw(c, (w - regular.Measure(id, 16 * k)) / 2, h - int(34 * k), id, 16 * k, Rgb(0xFFFFFF, 140));
+        const int x = (w - bold.Measure(l, size)) / 2;
+        bold.Draw(c, x + int(2 * k), y + int(3 * k), l, size, Rgb(0x000000, 60));
+        bold.Draw(c, x, y, l, size, Rgb(0xFFFFFF));
+        y += int(size * 1.18f);
     }
     return img;
 }
@@ -334,260 +335,299 @@ const LibraryUi::Covers& LibraryUi::CoversFor(const Game& g)
 
 // ---- the screen
 
+namespace {
+// the background's pattern: small outlines scattered on a grid (a controller, a plus, a power sign,
+// a ring), each drawn faintly
+void PatternIcon(Canvas& c, int kind, float x, float y, float s, Color col)
+{
+    switch (kind)
+    {
+    case 0: // a controller
+        c.RoundRect(int(x - s), int(y - s * 0.45f), int(2 * s), int(s * 0.9f), int(s * 0.45f), col, 3);
+        c.Line(x - s * 0.55f, y, x - s * 0.25f, y, 3, col);
+        c.Line(x - s * 0.4f, y - s * 0.15f, x - s * 0.4f, y + s * 0.15f, 3, col);
+        c.Circle(x + s * 0.45f, y - s * 0.08f, s * 0.08f, col);
+        c.Circle(x + s * 0.3f, y + s * 0.1f, s * 0.08f, col);
+        break;
+    case 1: // a plus
+        c.Line(x - s * 0.5f, y, x + s * 0.5f, y, 4, col);
+        c.Line(x, y - s * 0.5f, x, y + s * 0.5f, 4, col);
+        break;
+    case 2: // a power sign
+        c.Circle(x, y, s * 0.55f, col, 3);
+        c.Line(x, y - s * 0.75f, x, y - s * 0.1f, 4, col);
+        break;
+    default: // a ring
+        c.Circle(x, y, s * 0.4f, col, 3);
+    }
+}
+} // namespace
+
 void LibraryUi::BuildBackground()
 {
     background.assign(size_t(kWidth) * kHeight, 0);
     Canvas c(background.data(), kWidth, kHeight, kWidth);
-    c.VerticalGradient(0, 0, kWidth, kHeight, Rgb(0x1E2226), Rgb(0x0C0E10));
-    // a soft diagonal band of light across the top right
-    for (int y = 0; y < kHeight; y++)
-        for (int x = 900; x < kWidth; x++)
+    c.VerticalGradient(0, 0, kWidth, kHeight, Rgb(0xE6F7D6), Rgb(0xB5E39B));
+    // a glow behind the carousel
+    for (int y = 120; y < 860; y++)
+        for (int x = 0; x < kWidth; x += 1)
         {
-            const float d = float(x) - 0.55f * float(y) - 1450.f;
-            if (std::fabs(d) < 220)
-                c.Blend(x, y, Rgb(0xFFFFFF), 0.035f * (1 - std::fabs(d) / 220.f));
+            const float dx = (float(x) - 960.f) / 1000.f, dy = (float(y) - 470.f) / 380.f;
+            const float d = dx * dx + dy * dy;
+            if (d < 1)
+                c.Blend(x, y, Rgb(0xFFFFFF), 0.30f * (1 - d));
         }
-    c.Fill(0, 0, kWidth, kHeaderH, Rgb(0x111316, 225));
-    c.Fill(0, kHeaderH, kWidth, 2, kPanelEdge);
-    c.Fill(0, kTabsY + kTabsH, kWidth, 2, Rgb(0x23282D));
-    c.Fill(0, kHintsY, kWidth, kHeight - kHintsY, Rgb(0x111316, 235));
-    c.Fill(0, kHintsY, kWidth, 2, kPanelEdge);
+    // the pattern
+    uint32_t r = 12345;
+    for (int gy = 0; gy < 14; gy++)
+        for (int gx = 0; gx < 22; gx++)
+        {
+            r = r * 1103515245u + 12345u;
+            const float x = float(gx) * 92.f + 40.f + float((r >> 8) % 30), y = float(gy) * 82.f + 30.f + float((r >> 16) % 30);
+            PatternIcon(c, int((r >> 24) % 4), x, y, 22.f + float((r >> 4) % 8), Rgb(0x6FBF57, 46));
+        }
 }
 
-void LibraryUi::DrawHeader(Canvas& c, const std::string& clock)
+// the four places' icons: a grid of cases, a gear, a wrench, a circled i
+void LibraryUi::DrawIcon(Canvas& c, int t, int cx, int cy, Color col, Color back)
 {
-    // the emblem: a rounded green tile with the initials
-    c.RoundRect(44, 22, 64, 64, 16, kAccentDark);
-    c.RoundRect(44, 22, 64, 64, 16, kAccent, 3);
-    bold.Draw(c, 44 + (64 - bold.Measure("xc", 30)) / 2, 36, "xc", 30, kAccent);
-    semibold.Draw(c, 132, 22, "xbox-core", 44, kText);
-    regular.Draw(c, 134 + semibold.Measure("xbox-core", 44) + 18, 40, "Original Xbox on PS4", 24, kDim);
-    const int cw = semibold.Measure(clock, 40);
-    semibold.Draw(c, kWidth - 60 - cw, 28, clock, 40, kText);
-    const std::string v = "v" + version;
-    regular.Draw(c, kWidth - 60 - cw - 40 - regular.Measure(v, 22), 42, v, 22, kFaint);
+    if (t == kLibrary)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            const int x = cx - 24 + i * 17;
+            c.RoundRect(x, cy - 18, 14, 36, 3, col);
+            c.Fill(x + 3, cy - 12, 8, 3, back);
+        }
+    }
+    else if (t == kSettings)
+    {
+        for (int k = 0; k < 8; k++)
+        {
+            const float a = float(k) * 3.14159f / 4;
+            c.Line(cx + std::cos(a) * 10, cy + std::sin(a) * 10, cx + std::cos(a) * 18, cy + std::sin(a) * 18, 7, col);
+        }
+        c.Circle(float(cx), float(cy), 13, col, 6);
+    }
+    else if (t == kTools)
+    {
+        c.Line(float(cx - 14), float(cy + 15), float(cx + 6), float(cy - 5), 8, col);
+        c.Circle(float(cx + 9), float(cy - 9), 10, col, 5);
+        c.Fill(cx + 9, cy - 21, 11, 10, back);
+    }
+    else
+    {
+        c.Circle(float(cx), float(cy), 18, col);
+        c.Fill(cx - 2, cy - 2, 5, 12, back);
+        c.Fill(cx - 2, cy - 10, 5, 5, back);
+    }
+}
 
-    static const char* kNames[kTabs] = {"LIBRARY", "SETTINGS", "TOOLS", "ABOUT"};
+void LibraryUi::DrawHeader(Canvas& c, const std::string& clock, const std::string& user)
+{
+    bold.Draw(c, 62, 40, "YOUR ORIGINAL XBOX COLLECTION", 50, kText);
+    regular.Draw(c, 64, 102, "Player 1: " + user + "  \xC2\xB7  DualShock 4 as the controller", 26, kDim);
+    const int cw = semibold.Measure(clock, 40);
+    semibold.Draw(c, kWidth - 62 - cw, 42, clock, 40, kText);
+    std::string under = "v" + version;
+    if (tab == kLibrary && !games.empty())
+        under = std::to_string(selected + 1) + " of " + std::to_string(games.size()) + (games.size() == 1 ? " game" : " games") +
+                "   \xC2\xB7   " + under;
+    regular.Draw(c, kWidth - 62 - regular.Measure(under, 22), 100, under, 22, kDim);
+}
+
+void LibraryUi::DrawDock(Canvas& c)
+{
+    static const char* kNames[kTabs] = {"Collection", "Settings", "Tools", "About"};
+    static const char* kSubs[kTabs] = {"Your games", "Picture & order", "Copy & reports", "Help & credits"};
+    const int item = 236, w = item * kTabs + 40, x0 = (kWidth - w) / 2;
+    c.RoundRect(x0 + 4, kDockY + 8, w, kDockH, kDockH / 2, Rgb(0x2E6B2E, 40));
+    c.RoundRect(x0, kDockY, w, kDockH, kDockH / 2, Rgb(0xFFFFFF, 225));
     for (int i = 0; i < kTabs; i++)
     {
-        const int x = 60 + i * 200, w = 190, cx = x + w / 2;
+        const int cx = x0 + 20 + item * i + item / 2;
         const bool on = tab == i;
         if (on)
-        {
-            c.RoundRect(x, kTabsY, w, kTabsH, 10, kRaised);
-            c.Fill(x, kTabsY + kTabsH - 6, w, 6, kAccent);
-        }
-        const Color ic = on ? kText : kDim;
-        const int iy = kTabsY + 14;
-        if (i == kLibrary) // books on a shelf
-        {
-            c.RoundRect(cx - 20, iy, 9, 30, 2, ic);
-            c.RoundRect(cx - 7, iy, 9, 30, 2, ic);
-            c.Line(float(cx + 8), float(iy + 2), float(cx + 18), float(iy + 29), 8, ic);
-        }
-        else if (i == kSettings) // a gear
-        {
-            for (int t = 0; t < 8; t++)
-            {
-                const float a = float(t) * 3.14159f / 4;
-                c.Line(cx + std::cos(a) * 10, iy + 15 + std::sin(a) * 10, cx + std::cos(a) * 17, iy + 15 + std::sin(a) * 17, 6, ic);
-            }
-            c.Circle(float(cx), float(iy + 15), 12, ic, 5);
-        }
-        else if (i == kTools) // a wrench
-        {
-            c.Line(float(cx - 13), float(iy + 28), float(cx + 6), float(iy + 9), 7, ic);
-            c.Circle(float(cx + 9), float(iy + 6), 9, ic, 4);
-            c.Fill(cx + 9, iy - 4, 9, 9, on ? kRaised : Rgb(0x15181B));
-        }
-        else // a circled i
-        {
-            c.Circle(float(cx), float(iy + 15), 16, ic);
-            c.Fill(cx - 2, iy + 13, 5, 11, on ? kRaised : Rgb(0x15181B));
-            c.Fill(cx - 2, iy + 6, 5, 5, on ? kRaised : Rgb(0x15181B));
-        }
-        const int lw = semibold.Measure(kNames[i], 22);
-        semibold.Draw(c, cx - lw / 2, kTabsY + 54, kNames[i], 22, on ? kText : kDim);
+            c.RoundRect(cx - item / 2 + 10, kDockY + 10, item - 20, kDockH - 20, 30, Rgb(0xE3F6D8));
+        const Color tile = on ? kAccent : Rgb(0xDDF1D1);
+        c.RoundRect(cx - 32, kDockY + 18, 64, 56, 16, tile);
+        DrawIcon(c, i, cx, kDockY + 46, on ? kOnAccent : kAccent, tile);
+        const int lw = semibold.Measure(kNames[i], 24);
+        semibold.Draw(c, cx - lw / 2, kDockY + 80, kNames[i], 24, kText);
+        const int sw = regular.Measure(kSubs[i], 17);
+        regular.Draw(c, cx - sw / 2, kDockY + 108, kSubs[i], 17, kDim);
     }
 }
 
 void LibraryUi::Glyph(Canvas& c, int cx, int cy, char button, int r)
 {
-    c.Circle(float(cx), float(cy), float(r), Rgb(0x2A2F34));
-    c.Circle(float(cx), float(cy), float(r), Rgb(0x3A4148), 2);
+    c.Circle(float(cx), float(cy), float(r), Rgb(0xFFFFFF));
+    c.Circle(float(cx), float(cy), float(r), Rgb(0x9CCB8C), 2);
     const float s = float(r) * 0.45f;
     switch (button)
     {
     case 'x': // cross
-        c.Line(cx - s, cy - s, cx + s, cy + s, 3, Rgb(0x7DB4F0));
-        c.Line(cx - s, cy + s, cx + s, cy - s, 3, Rgb(0x7DB4F0));
+        c.Line(cx - s, cy - s, cx + s, cy + s, 3, Rgb(0x3E7BD6));
+        c.Line(cx - s, cy + s, cx + s, cy - s, 3, Rgb(0x3E7BD6));
         break;
     case 'o': // circle
-        c.Circle(float(cx), float(cy), s, Rgb(0xF07070), 3);
+        c.Circle(float(cx), float(cy), s, Rgb(0xE0474C), 3);
         break;
     case 's': // square
-        c.RoundRect(int(cx - s), int(cy - s), int(2 * s), int(2 * s), 1, Rgb(0xE79AD8), 3);
+        c.RoundRect(int(cx - s), int(cy - s), int(2 * s), int(2 * s), 1, Rgb(0xC85BB5), 3);
         break;
     case 't': // triangle
-        c.Line(cx, cy - s, cx - s, cy + s * 0.8f, 3, Rgb(0x4FD9A6));
-        c.Line(cx - s, cy + s * 0.8f, cx + s, cy + s * 0.8f, 3, Rgb(0x4FD9A6));
-        c.Line(cx + s, cy + s * 0.8f, cx, cy - s, 3, Rgb(0x4FD9A6));
+        c.Line(cx, cy - s, cx - s, cy + s * 0.8f, 3, Rgb(0x1FA77E));
+        c.Line(cx - s, cy + s * 0.8f, cx + s, cy + s * 0.8f, 3, Rgb(0x1FA77E));
+        c.Line(cx + s, cy + s * 0.8f, cx, cy - s, 3, Rgb(0x1FA77E));
         break;
     case 'L': case 'R': // shoulder buttons
-        c.RoundRect(cx - r, cy - r * 2 / 3, 2 * r, r * 4 / 3, 6, Rgb(0x2A2F34));
+        c.RoundRect(cx - r, cy - r * 2 / 3, 2 * r, r * 4 / 3, 8, Rgb(0xFFFFFF));
+        c.RoundRect(cx - r, cy - r * 2 / 3, 2 * r, r * 4 / 3, 8, Rgb(0x9CCB8C), 2);
         bold.Draw(c, cx - bold.Measure(button == 'L' ? "L1" : "R1", 16) / 2, cy - 10, button == 'L' ? "L1" : "R1", 16, kText);
         break;
     }
 }
 
-void LibraryUi::DrawHints(Canvas& c, const std::string& user)
+void LibraryUi::DrawHints(Canvas& c, const std::string&)
 {
     std::vector<std::pair<char, std::string>> hints;
     if (tab == kLibrary && options_open)
-        hints = {{'x', "SELECT"}, {'o', "BACK"}};
+        hints = {{'o', "Back"}, {'x', "Select"}};
     else if (tab == kLibrary)
-        hints = {{'x', "PLAY"}, {'t', "OPTIONS"}, {'s', "SORT"}, {'L', ""}, {'R', "TABS"}};
+        hints = {{'s', "Sort"}, {'t', "Options"}, {'x', "Start"}};
     else if (tab == kSettings)
-        hints = {{'x', "CHANGE"}, {'L', ""}, {'R', "TABS"}};
+        hints = {{'x', "Change"}};
     else if (tab == kTools && usb_view)
-        hints = {{'x', "COPY"}, {'s', "CANCEL COPY"}, {'t', "LOOK AGAIN"}, {'o', "BACK"}};
+        hints = {{'o', "Back"}, {'t', "Look again"}, {'s', "Cancel copy"}, {'x', "Copy"}};
     else if (tab == kTools)
-        hints = {{'x', "SELECT"}, {'L', ""}, {'R', "TABS"}};
-    else
-        hints = {{'L', ""}, {'R', "TABS"}};
-    int x = 62;
-    const int cy = kHintsY + 38;
-    for (const auto& [button, label] : hints)
+        hints = {{'x', "Select"}};
+    const int cy = kHintsY + 34;
+    // left: the controller, and the shoulders that move between places
     {
-        Glyph(c, x + 20, cy, button);
-        x += 50;
-        if (!label.empty())
-            x += semibold.Draw(c, x, cy - 13, label, 26, kText) + 46;
-        else
-            x -= 4;
+        const float x = 92, y = float(cy);
+        c.RoundRect(int(x - 30), int(y - 16), 60, 32, 16, kText);
+        c.Circle(x - 12, y, 6, Rgb(0xFFFFFF));
+        c.Circle(x + 12, y, 6, Rgb(0xFFFFFF));
+        Glyph(c, 166, cy, 'L', 22);
+        Glyph(c, 220, cy, 'R', 22);
+        semibold.Draw(c, 252, cy - 14, "Move between places", 24, kText);
     }
-    // the player
-    const int uw = semibold.Measure(user, 28);
-    const int ux = kWidth - 60 - uw;
-    semibold.Draw(c, ux, cy - 15, user, 28, kText);
-    c.Circle(float(ux - 34), float(cy - 8), 9, kText);
-    c.RoundRect(ux - 52, cy + 3, 36, 18, 9, kText);
+    // right: this place's buttons, right-aligned
+    int x = kWidth - 62;
+    for (auto it = hints.rbegin(); it != hints.rend(); ++it)
+    {
+        const int lw = semibold.Measure(it->second, 26);
+        x -= lw;
+        semibold.Draw(c, x, cy - 15, it->second, 26, kText);
+        x -= 34;
+        Glyph(c, x, cy, it->first, 22);
+        x -= 52;
+    }
     if (now < toast_until && !toast.empty())
     {
-        const int tw = regular.Measure(toast, 24) + 48;
-        c.RoundRect((kWidth - tw) / 2, kHintsY - 70, tw, 52, 26, Rgb(0x2B3036, 245));
-        c.RoundRect((kWidth - tw) / 2, kHintsY - 70, tw, 52, 26, kAccent, 2);
-        regular.Draw(c, (kWidth - tw) / 2 + 24, kHintsY - 57, toast, 24, kText);
+        const int tw = regular.Measure(toast, 24) + 56;
+        const int ty = kDockY - 74;
+        c.RoundRect((kWidth - tw) / 2, ty, tw, 54, 27, Rgb(0x1E3A22, 235));
+        regular.Draw(c, (kWidth - tw) / 2 + 28, ty + 14, toast, 24, Rgb(0xFFFFFF));
     }
 }
 
-void LibraryUi::DrawDetails(Canvas& c, const Game& g)
+// the chosen game's facts, on one line under the carousel
+void LibraryUi::DrawInfo(Canvas& c, const Game& g, int y)
 {
-    c.RoundRect(kPanelX, kPanelY, kPanelW, kPanelH, 18, kPanel);
-    c.RoundRect(kPanelX, kPanelY, kPanelW, kPanelH, 18, kPanelEdge, 2);
-    const Covers& cv = CoversFor(g);
-    const int px = kPanelX + 28, py = kPanelY + 28;
-    c.RoundRect(px + 6, py + 8, kLargeW, kLargeH, 10, Rgb(0x000000, 120));
-    c.Draw(cv.large, px, py, 10);
-    // the title and what kind of file it is
-    const int tx = px + kLargeW + 30, tw = kPanelX + kPanelW - 28 - tx;
-    int y = py - 4;
-    for (const std::string& l : bold.Wrap(g.title, 40, tw, 3))
-    {
-        bold.Draw(c, tx, y, l, 40, kText);
-        y += 48;
-    }
-    y += 6;
-    regular.Draw(c, tx, y, regular.Fit(g.kind + (g.usb.empty() ? "" : " on USB (" + g.usb + ")") + "  \xC2\xB7  " + g.file_name, 22, tw), 22, kDim);
-    y += 46;
-    c.Fill(tx, y, tw, 2, kPanelEdge);
-    y += 20;
     char id[24];
-    std::snprintf(id, sizeof(id), g.title_id ? "%08X" : "Unknown", g.title_id);
-    const std::pair<const char*, std::string> facts[] = {
-        {"TITLE ID", id}, {"REGION", RegionName(g.region)}, {"SIZE", FormatSize(g.size)}};
-    for (const auto& [label, value] : facts)
-    {
-        semibold.Draw(c, tx, y, label, 19, kAccent);
-        regular.Draw(c, tx, y + 24, regular.Fit(value, 24, tw), 24, kText);
-        y += 64;
-    }
-    // history, under the cover
-    y = py + kLargeH + 26;
-    const std::string played = g.plays ? FormatDate(g.last_played) + "  (" + std::to_string(g.plays) + (g.plays == 1 ? " run)" : " runs)") : "Never";
-    const std::pair<const char*, std::string> history[] = {
-        {"LAST PLAYED", played}, {"LAST RUN", g.last_result.empty() ? "-" : g.last_result}};
-    for (const auto& [label, value] : history)
-    {
-        semibold.Draw(c, px, y, label, 19, kAccent);
-        regular.Draw(c, px + 190, y - 3, regular.Fit(value, 24, kPanelW - 56 - 190), 24, kText);
-        y += 38;
-    }
-    // the actions
-    const int bx = px, bw = kPanelW - 56;
-    int by = kPanelY + kPanelH - 26 - 3 * 62 - 2 * 12;
-    auto button = [&](const std::string& label, char glyph, bool primary) {
-        c.RoundRect(bx, by, bw, 62, 12, primary ? Rgb(0x23301C) : kRaised);
-        c.RoundRect(bx, by, bw, 62, 12, primary ? kAccent : Rgb(0x353B42), primary ? 4 : 2);
-        semibold.Draw(c, bx + 32, by + 15, label, 29, kText);
-        Glyph(c, bx + bw - 42, by + 31, glyph, 21);
-        by += 74;
-    };
-    button("PLAY NOW", 'x', true);
-    button(IsAutostart(g) ? "STARTS WITH THE APP" : "OPTIONS", 't', false);
-    button(settings.sort ? "SORT: RECENTLY PLAYED" : "SORT: TITLE", 's', false);
+    std::snprintf(id, sizeof(id), g.title_id ? "%08X" : "unknown", g.title_id);
+    std::string line = std::string("Title ID ") + id + "   \xC2\xB7   " + RegionName(g.region) + "   \xC2\xB7   " + FormatSize(g.size) +
+                       "   \xC2\xB7   " + (g.plays ? "Last played " + FormatDate(g.last_played) : "Never played");
+    if (!g.last_result.empty())
+        line += "   \xC2\xB7   " + g.last_result;
+    if (IsAutostart(g))
+        line += "   \xC2\xB7   Starts with the app";
+    line = regular.Fit(line, 22, kWidth - 200);
+    const int lw = regular.Measure(line, 22) + 48;
+    c.RoundRect((kWidth - lw) / 2, y, lw, 44, 22, Rgb(0xFFFFFF, 150));
+    regular.Draw(c, (kWidth - lw) / 2 + 24, y + 10, line, 22, kDim);
 }
 
 void LibraryUi::DrawLibrary(Canvas& c, double seconds)
 {
     if (games.empty())
     {
-        bold.Draw(c, 62, 280, "No games yet", 48, kText);
-        int y = 360;
+        const int w = 1100, x = (kWidth - w) / 2, y = 300;
+        c.RoundRect(x, y, w, 300, 30, kRaised);
+        bold.Draw(c, x + 48, y + 44, "Your collection is empty", 44, kText);
+        int ly = y + 120;
         for (const std::string& l : paths.help)
         {
-            regular.Draw(c, 62, y, l, 26, kDim);
-            y += 40;
+            regular.Draw(c, x + 48, ly, regular.Fit(l, 24, w - 96), 24, kDim);
+            ly += 40;
         }
         return;
     }
-    const int rows = (int(games.size()) + kCols - 1) / kCols;
-    for (int r = first_row; r < std::min(rows, first_row + kVisibleRows); r++)
-        for (int col = 0; col < kCols; col++)
+    // the carousel eases to where it should be
+    scroll += (float(first) - scroll) * 0.3f;
+    if (std::fabs(scroll - float(first)) < 0.01f)
+        scroll = float(first);
+    const int lo = std::max(0, int(std::floor(scroll)) - 1), hi = std::min(int(games.size()), int(std::ceil(scroll)) + kVisible + 1);
+    auto draw_card = [&](int i) {
+        const float slot = float(i) - scroll;
+        const bool on = size_t(i) == selected;
+        const int w = on ? kLargeW : kCardW, h = on ? kLargeH : kCardH;
+        const int cx = kCarouselX + int(slot * float(kStepX)) + kCardW / 2;
+        const int x = cx - w / 2, y = kCarouselY + (on ? -22 : 10);
+        if (x + w < 0 || x > kWidth)
+            return;
+        const Game& g = games[size_t(i)];
+        const Covers& cv = CoversFor(g);
+        if (on)
         {
-            const size_t i = size_t(r * kCols + col);
-            if (i >= games.size())
-                break;
-            const int x = kGridX + col * kStepX, y = kGridY + (r - first_row) * kStepY;
-            c.RoundRect(x + 5, y + 8, kCardW, kCardH, 12, Rgb(0x000000, 110));
-            c.Draw(CoversFor(games[i]).card, x, y, 10);
-            if (i == selected)
-            {
-                // a glowing frame, breathing slowly
-                const float pulse = 0.5f + 0.5f * float(std::sin(seconds * 3.0));
-                c.RoundRect(x - 14, y - 14, kCardW + 28, kCardH + 28, 22, Rgb(0x84D94A, uint8_t(40 + 50 * pulse)), 6);
-                c.RoundRect(x - 9, y - 9, kCardW + 18, kCardH + 18, 18, kAccent, 6);
-            }
-            if (IsAutostart(games[i]))
-            {
-                c.RoundRect(x + kCardW - 40, y + kCardH - 40, 30, 30, 15, kAccent);
-                c.Line(float(x + kCardW - 30), float(y + kCardH - 33), float(x + kCardW - 30), float(y + kCardH - 17), 3, Rgb(0x111316));
-                c.Line(float(x + kCardW - 30), float(y + kCardH - 33), float(x + kCardW - 18), float(y + kCardH - 25), 3, Rgb(0x111316));
-                c.Line(float(x + kCardW - 30), float(y + kCardH - 17), float(x + kCardW - 18), float(y + kCardH - 25), 3, Rgb(0x111316));
-            }
+            const float pulse = 0.5f + 0.5f * float(std::sin(seconds * 3.0));
+            c.RoundRect(x - 20, y - 20, w + 40, h + 40, 34, Rgb(0x3FE0C5, uint8_t(40 + 40 * pulse)), 10);
+            c.RoundRect(x - 9, y - 9, w + 18, h + 18, 26, Rgb(0xFFFFFF));
+            c.RoundRect(x - 9, y - 9, w + 18, h + 18, 26, kGlow, 4);
         }
-    // where in the list: a scroll bar, and the count
-    if (rows > kVisibleRows)
+        else
+            c.RoundRect(x + 6, y + 10, w, h, 20, Rgb(0x2E6B2E, 45));
+        c.Draw(on ? cv.large : cv.card, x, y, 18);
+        if (IsAutostart(g)) // a play mark: starts with the app
+        {
+            const int px = x + w - 46, py = y + 14;
+            c.Circle(float(px + 16), float(py + 16), 18, kAccent);
+            c.Line(float(px + 11), float(py + 7), float(px + 11), float(py + 25), 3, Rgb(0xFFFFFF));
+            c.Line(float(px + 11), float(py + 7), float(px + 25), float(py + 16), 3, Rgb(0xFFFFFF));
+            c.Line(float(px + 11), float(py + 25), float(px + 25), float(py + 16), 3, Rgb(0xFFFFFF));
+        }
+        // the caption: the title and what it is
+        const int ly = kCarouselY + kLargeH + (on ? 6 : 0) - 8, lw = kCardW + (on ? 30 : 0), lx = cx - lw / 2;
+        c.RoundRect(lx, ly, lw, kCaptionH, 20, on ? Rgb(0xFFFFFF, 245) : Rgb(0xFFFFFF, 190));
+        const std::string title = semibold.Fit(g.title, 23, lw - 28);
+        semibold.Draw(c, cx - semibold.Measure(title, 23) / 2, ly + 14, title, 23, kText);
+        std::string sub = g.sample ? "Sample program" : !g.usb.empty() ? "On USB" : g.kind;
+        if (g.plays)
+            sub += "  \xC2\xB7  played " + std::to_string(g.plays) + (g.plays == 1 ? " time" : " times");
+        sub = regular.Fit(sub, 18, lw - 28);
+        regular.Draw(c, cx - regular.Measure(sub, 18) / 2, ly + 48, sub, 18, kDim);
+    };
+    for (int i = lo; i < hi; i++)
+        if (size_t(i) != selected)
+            draw_card(i);
+    draw_card(int(selected)); // on top
+    // arrows when there's more either side
+    const int ay = kCarouselY + kCardH / 2;
+    if (first > 0)
     {
-        const int track = kVisibleRows * kStepY - 30, top = kGridY;
-        const int knob = std::max(60, track * kVisibleRows / rows);
-        const int at = top + (track - knob) * first_row / std::max(1, rows - kVisibleRows);
-        c.RoundRect(1068, top, 8, track, 4, Rgb(0x2A2F34));
-        c.RoundRect(1068, at, 8, knob, 4, kAccent);
+        c.Circle(58, float(ay), 26, Rgb(0xFFFFFF, 220));
+        c.Line(64, float(ay - 10), 52, float(ay), 4, kAccent);
+        c.Line(52, float(ay), 64, float(ay + 10), 4, kAccent);
     }
-    const std::string count = std::to_string(selected + 1) + " / " + std::to_string(games.size());
-    regular.Draw(c, 1060 - regular.Measure(count, 22), kTabsY + kTabsH + 2 - 34, count, 22, kFaint);
-    DrawDetails(c, games[selected]);
+    if (first + kVisible < int(games.size()))
+    {
+        c.Circle(kWidth - 58, float(ay), 26, Rgb(0xFFFFFF, 220));
+        c.Line(kWidth - 64, float(ay - 10), kWidth - 52, float(ay), 4, kAccent);
+        c.Line(kWidth - 52, float(ay), kWidth - 64, float(ay + 10), 4, kAccent);
+    }
+    DrawInfo(c, games[selected], kDockY - 66);
     if (options_open)
         DrawOptions(c);
 }
@@ -595,22 +635,21 @@ void LibraryUi::DrawLibrary(Canvas& c, double seconds)
 void LibraryUi::DrawOptions(Canvas& c)
 {
     const Game& g = games[selected];
-    const int w = 700, h = 300, x = kPanelX + (kPanelW - w) / 2, y = kPanelY + 240;
-    c.Fill(0, kHeaderH, kWidth, kHintsY - kHeaderH, Rgb(0x000000, 120));
-    c.RoundRect(x, y, w, h, 18, Rgb(0x20252A));
-    c.RoundRect(x, y, w, h, 18, kAccent, 2);
-    bold.Draw(c, x + 32, y + 26, bold.Fit(g.title, 32, w - 64), 32, kText);
+    const int w = 760, h = 300, x = (kWidth - w) / 2, y = 330;
+    c.Fill(0, 0, kWidth, kHeight, Rgb(0x1E3A22, 90));
+    c.RoundRect(x + 6, y + 10, w, h, 30, Rgb(0x1E3A22, 60));
+    c.RoundRect(x, y, w, h, 30, Rgb(0xFFFFFF));
+    bold.Draw(c, x + 36, y + 28, bold.Fit(g.title, 32, w - 72), 32, kText);
     const std::string items[2] = {IsAutostart(g) ? "Don't start this game with the app" : "Start this game when the app opens",
                                   "Close"};
     for (int i = 0; i < 2; i++)
     {
-        const int iy = y + 92 + i * 76;
+        const int iy = y + 96 + i * 80;
         if (option == i)
-        {
-            c.RoundRect(x + 20, iy, w - 40, 62, 10, kRaised);
-            c.RoundRect(x + 20, iy, w - 40, 62, 10, kAccent, 3);
-        }
-        semibold.Draw(c, x + 44, iy + 17, items[i], 26, option == i ? kText : kDim);
+            c.RoundRect(x + 22, iy, w - 44, 64, 20, Rgb(0xE3F6D8));
+        if (option == i)
+            c.RoundRect(x + 22, iy, w - 44, 64, 20, kAccent, 3);
+        semibold.Draw(c, x + 48, iy + 18, items[i], 26, option == i ? kText : kDim);
     }
 }
 
@@ -624,7 +663,8 @@ void LibraryUi::DrawSettings(Canvas& c)
     static const char* kHelp[3] = {"The first seconds of the log over the game's picture (L3 + R3 toggles it in a game).",
                                    "How the game's picture is scaled to the TV.",
                                    "Your games come first, then the samples."};
-    int y = 250;
+    bold.Draw(c, 62, 200, "Settings", 40, kText);
+    int y = 270;
     for (int i = 0; i < 3; i++)
     {
         const bool on = setting == i;
@@ -648,11 +688,11 @@ void LibraryUi::DrawSettings(Canvas& c)
 
 void LibraryUi::DrawAbout(Canvas& c)
 {
-    c.RoundRect(62, 240, 1796, 744, 18, kPanel);
-    c.RoundRect(62, 240, 1796, 744, 18, kPanelEdge, 2);
-    bold.Draw(c, 100, 272, "xbox-core " + version, 44, kText);
-    regular.Draw(c, 100, 332, "Runs original Xbox programs natively on the PS4: their code on its CPU, a kernel of its own, the GPU, sound and controllers emulated.", 24, kDim);
-    int y = 400;
+    c.RoundRect(62, 176, 1796, 590, 30, kPanel);
+    c.RoundRect(62, 176, 1796, 590, 30, kPanelEdge, 2);
+    bold.Draw(c, 100, 204, "xbox-core " + version, 44, kText);
+    regular.Draw(c, 100, 264, "Runs original Xbox programs natively on the PS4: their code on its CPU, a kernel of its own, the GPU, sound and controllers emulated.", 24, kDim);
+    int y = 324;
     semibold.Draw(c, 100, y, "ADDING GAMES", 20, kAccent);
     y += 36;
     for (const std::string& l : paths.help)
@@ -686,7 +726,7 @@ void LibraryUi::DrawCopyProgress(Canvas& c, int x, int y, int w)
                   copy.queued ? ("   (" + std::to_string(copy.queued) + " more queued)").c_str() : "");
     semibold.Draw(c, x + 28, y + 18, semibold.Fit("Copying " + copy.current, 28, w - 56), 28, kText);
     regular.Draw(c, x + 28, y + 56, line, 22, kDim);
-    c.RoundRect(x + 28, y + 92, w - 56, 12, 6, Rgb(0x2A2F34));
+    c.RoundRect(x + 28, y + 92, w - 56, 12, 6, Rgb(0xD5EBC9));
     if (f > 0)
         c.RoundRect(x + 28, y + 92, std::max(12, int(float(w - 56) * f)), 12, 6, kAccent);
 }
@@ -699,10 +739,10 @@ void LibraryUi::DrawTools(Canvas& c)
         std::string drives;
         for (const std::string& u : usb_roots)
             drives += (drives.empty() ? "" : ", ") + u;
-        bold.Draw(c, 62, 236, "Copy from USB to the hard drive", 36, kText);
-        regular.Draw(c, 62, 286, "USB: " + (drives.empty() ? std::string("no drive found") : drives) + "     Hard drive free: " +
+        bold.Draw(c, 62, 176, "Copy from USB to the hard drive", 36, kText);
+        regular.Draw(c, 62, 226, "USB: " + (drives.empty() ? std::string("no drive found") : drives) + "     Hard drive free: " +
                                      (free ? FormatSize(free) : "unknown"), 22, kDim);
-        const int list_y = 330, row_h = 64, visible = copy.busy ? 8 : 9;
+        const int list_y = 270, row_h = 64, visible = copy.busy ? 5 : 7;
         if (usb_games.empty())
         {
             regular.Draw(c, 62, list_y + 20, "No games found. Put .iso files or game folders (with default.xbe) at the top of the", 26, kDim);
@@ -725,17 +765,18 @@ void LibraryUi::DrawTools(Canvas& c)
                 const char* tag = now_copying ? "COPYING" : "ON HDD";
                 const int tw = semibold.Measure(tag, 18) + 24;
                 c.RoundRect(1830 - tw, y + 17, tw, 30, 15, now_copying ? kAccent : kAccentDark);
-                semibold.Draw(c, 1830 - tw + 12, y + 21, tag, 18, now_copying ? Rgb(0x111316) : kAccent);
+                semibold.Draw(c, 1830 - tw + 12, y + 21, tag, 18, now_copying ? kOnAccent : kAccent);
             }
         }
         if (copy.busy)
-            DrawCopyProgress(c, 62, kHintsY - 214, 1796);
+            DrawCopyProgress(c, 62, kDockY - 140, 1796);
         return;
     }
     const std::pair<const char*, const char*> rows[2] = {
         {"Copy games from USB to the hard drive", "Disc images and game folders from a USB drive into /data/xbox-core/games."},
         {"Write a diagnostics report", "A text file about the app, your library and the last run's log, to show when asking for help."}};
-    int y = 250;
+    bold.Draw(c, 62, 200, "Tools", 40, kText);
+    int y = 270;
     for (int i = 0; i < 2; i++)
     {
         const bool on = tool == i;
@@ -764,7 +805,7 @@ void LibraryUi::Draw(Canvas& c, double seconds, const std::string& clock, const 
 {
     now = seconds;
     c.CopyFrom(Canvas(background.data(), kWidth, kHeight, kWidth));
-    DrawHeader(c, clock);
+    DrawHeader(c, clock, user);
     if (tab == kLibrary)
         DrawLibrary(c, seconds);
     else if (tab == kSettings)
@@ -773,6 +814,7 @@ void LibraryUi::Draw(Canvas& c, double seconds, const std::string& clock, const 
         DrawTools(c);
     else
         DrawAbout(c);
+    DrawDock(c);
     DrawHints(c, user);
 }
 
