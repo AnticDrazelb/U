@@ -9,7 +9,7 @@ OUT="${1:-$HOME/xc-bsd}"
 mkdir -p "$OUT/obj"
 VERSION="$(head -1 "$HERE/VERSION")"
 FLAGS="-O2 -g -march=btver2 -Wall -Wextra -Wno-unused-parameter -I$HERE/src -DXB_NO_VULKAN -DXB_VERSION=\"$VERSION\""
-SOURCES="memory xbe cpu kernel kernel_rtl kernel_crypto files xiso devices nv2a render draw pixel usb audio apu diagnostics gpu_vulkan platform_freebsd main"
+SOURCES="memory xbe cpu kernel kernel_rtl kernel_crypto files xiso devices nv2a render draw pixel usb audio apu nic diagnostics gpu_vulkan platform_freebsd main"
 # this build's identity (as cmake/build-id.cmake writes it for the other builds)
 printf 'namespace xb { extern const char* const kBuildId; const char* const kBuildId = "%s %s"; }\n' \
     "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')" > "$OUT/obj/build_id.cpp"

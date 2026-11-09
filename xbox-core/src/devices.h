@@ -33,5 +33,6 @@ u32 Nv2aDisplayStart();   // PCRTC_START: the physical address shown
 void InitUsb();
 void InitAudio();
 void InitApu();
+void InitNic(); // nic.cpp
 
 } // namespace xb

@@ -52,6 +52,7 @@ void CompleteFileIo(u32 event, u32 apc_routine, u32 apc_context, u32 io_status_b
 void QueueDpc(u32 kdpc);
 void SetDisplayMode(u32 mode, u32 format, u32 pitch, u32 framebuffer);
 void SetTickCountVariable(u32 address);
+bool RemoveQueuedDpc(u32 kdpc); // an interrupt routine's queued DPC taken off the queue (KeRemoveQueueDpc)
 void SetTimeVariable(bool system_time, u32 address); // KeSystemTime / KeInterruptTime: kept current
 s64 InterruptTime();                                // 100 ns units since the start
 

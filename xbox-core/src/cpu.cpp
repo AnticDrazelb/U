@@ -1057,8 +1057,8 @@ void BackpatchedAccess(GateFrame* frame)
     {
         static std::atomic<u32> told{0};
         if (told++ < 20)
-            Log("cpu: the patched instruction at %#x accessed %#x, which isn't mapped (the Xbox would fault): "
-                "not done", ps.eip, ea);
+            Log("cpu: the patched instruction at %#x in thread %u accessed %#x, which isn't mapped (the Xbox would "
+                "fault): not done", ps.eip, CurrentThread() ? CurrentThread()->id : 0, ea);
         return;
     }
     // as long as the console's own access takes, at least: a register read crosses the PCI bus there

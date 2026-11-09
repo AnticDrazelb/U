@@ -31,6 +31,10 @@ u32 g_isr_running = 0;
 std::condition_variable g_isr_done;
 std::atomic<GuestThread*> g_interrupt_thread{nullptr};
 std::deque<u32> g_dpcs;
+// DPCs queued by interrupt routines (counted) and finished or removed (counted): a thread at normal
+// level waits for the ones queued before it to finish where the single-processor Xbox would have
+// run them already (KeDisconnectInterrupt)
+u64 g_dpcs_queued = 0, g_dpcs_done = 0;
 std::atomic<u32> g_tick_count_variable{0};
 std::atomic<u64> g_vblanks{0};
 
@@ -124,6 +128,17 @@ void RunDpcs(GuestThread* t)
             g_dpcs.pop_front();
         }
         Write<u8>(dpc + 2, 0);
+        struct Done
+        {
+            ~Done()
+            {
+                {
+                    std::lock_guard lock(g_irq_mutex);
+                    g_dpcs_done++;
+                }
+                g_isr_done.notify_all();
+            }
+        } done;
         // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2), at dispatch level
         Write<u8>(t->kpcr + kpcr::Irql, 2);
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 1);
@@ -226,6 +241,7 @@ void InitDevices()
     InitUsb();
     InitAudio();
     InitApu();
+    InitNic();
 }
 
 bool DeviceRead(u32 address, u32 size, u32& value)
@@ -275,8 +291,15 @@ void DisconnectInterrupt(u32 kinterrupt)
     std::erase(g_interrupts, kinterrupt);
     // a routine of it running now finishes before this returns (not when the routine itself, on the
     // interrupt thread, disconnects)
+    // and, as on the single-processor Xbox where they run before any thread at normal level does,
+    // the DPCs interrupt routines queued before this
     if (CurrentThread() != g_interrupt_thread.load())
-        g_isr_done.wait(lock, [&] { return g_isr_running != kinterrupt || g_quit; });
+    {
+        const u64 queued = g_dpcs_queued;
+        g_isr_done.wait_for(lock, std::chrono::seconds(2), [&] {
+            return (g_isr_running != kinterrupt && g_dpcs_done >= queued) || g_quit;
+        });
+    }
 }
 
 void QueueDpc(u32 kdpc)
@@ -284,8 +307,24 @@ void QueueDpc(u32 kdpc)
     {
         std::lock_guard lock(g_irq_mutex);
         g_dpcs.push_back(kdpc);
+        g_dpcs_queued++;
     }
     g_irq_cv.notify_all();
+}
+
+bool RemoveQueuedDpc(u32 kdpc)
+{
+    bool removed = false;
+    {
+        std::lock_guard lock(g_irq_mutex);
+        const size_t before = g_dpcs.size();
+        std::erase(g_dpcs, kdpc);
+        removed = g_dpcs.size() != before;
+        g_dpcs_done += before - g_dpcs.size();
+    }
+    if (removed)
+        g_isr_done.notify_all();
+    return removed;
 }
 
 void SetDisplayMode(u32 mode, u32 format, u32 pitch, u32 framebuffer)

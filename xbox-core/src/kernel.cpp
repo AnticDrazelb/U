@@ -2368,6 +2368,7 @@ void InitKernel()
         if (!Read<u8>(d + 2))
             return 0;
         Write<u8>(d + 2, 0);
+        RemoveQueuedDpc(d); // one an interrupt routine queued (on the interrupt thread's queue)
         std::lock_guard lock(g_sched);
         for (auto& [t, s] : g_threads)
             std::erase(s->dpcs, d);
