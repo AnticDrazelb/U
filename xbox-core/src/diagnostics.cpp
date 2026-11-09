@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "devices.h"
 
 #include <algorithm>
 #include <chrono>
@@ -227,6 +228,43 @@ void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, c
     std::memcpy(r.code, code, sizeof(r.code));
 }
 
+struct DeviceRegister
+{
+    std::atomic<u32> address{0};
+    std::atomic<u64> reads{0}, writes{0};
+    std::atomic<u32> last{0};
+};
+constexpr u32 kDeviceRegisters = 1024, kDeviceRing = 64;
+DeviceRegister g_device_registers[kDeviceRegisters];
+struct DeviceRecord
+{
+    float at;
+    u32 address, value;
+    u8 size, write;
+};
+DeviceRecord g_device_ring[kDeviceRing];
+std::atomic<u32> g_device_next{0};
+
+void DeviceAccess(u32 address, u32 size, u32 value, bool write)
+{
+    for (u32 i = 0, h = (address * 2654435761u) % kDeviceRegisters; i < 16; i++, h = (h + 1) % kDeviceRegisters)
+    {
+        DeviceRegister& r = g_device_registers[h];
+        u32 cur = r.address.load(std::memory_order_relaxed);
+        if (cur == 0 && r.address.compare_exchange_strong(cur, address))
+            cur = address;
+        if (cur == address)
+        {
+            (write ? r.writes : r.reads).fetch_add(1, std::memory_order_relaxed);
+            r.last.store(value, std::memory_order_relaxed);
+            break;
+        }
+    }
+    DeviceRecord& d = g_device_ring[g_device_next.fetch_add(1) % kDeviceRing];
+    d.at = TscSeconds(Tsc());
+    d.address = address, d.value = value, d.size = u8(size), d.write = write;
+}
+
 void Method(u32 cls, u32 method, u32 parameter)
 {
     g_methods++;
@@ -316,6 +354,30 @@ void WriteState(Out fd)
             Put(fd, "    %10llu  eip %#x  address %#x  code %02x %02x %02x %02x %02x %02x %02x %02x\n",
                 (unsigned long long)f.count.load(), f.eip.load(), f.address, f.code[0], f.code[1], f.code[2], f.code[3],
                 f.code[4], f.code[5], f.code[6], f.code[7]);
+        }
+    }
+    {
+        // the device registers read most (a program waiting on hardware polls one), and the latest accesses
+        u32 order[kDeviceRegisters], used = 0;
+        for (u32 i = 0; i < kDeviceRegisters; i++)
+            if (g_device_registers[i].address.load())
+                order[used++] = i;
+        std::sort(order, order + used, [](u32 a, u32 b) {
+            return g_device_registers[a].reads.load() > g_device_registers[b].reads.load();
+        });
+        Put(fd, "device registers by reads (of %u; a thread waiting on hardware polls the first ones):\n", used);
+        for (u32 k = 0; k < used && k < 16; k++)
+        {
+            const DeviceRegister& r = g_device_registers[order[k]];
+            Put(fd, "    %10llu reads %8llu writes  %#010x (%s)  last %#x\n", (unsigned long long)r.reads.load(),
+                (unsigned long long)r.writes.load(), r.address.load(), DeviceName(r.address.load()), r.last.load());
+        }
+        const u32 dn = g_device_next.load(), dshown = std::min(dn, kDeviceRing);
+        Put(fd, "the latest %u device register accesses (time, read/write, address, size, value):\n", dshown);
+        for (u32 k = 0; k < dshown; k++)
+        {
+            const DeviceRecord& r = g_device_ring[(dn - dshown + k) % kDeviceRing];
+            Put(fd, "    %9.3f %s %#010x/%u %#x\n", double(r.at), r.write ? "write" : "read ", r.address, r.size, r.value);
         }
     }
     const u32 fn = g_fault_next.load();

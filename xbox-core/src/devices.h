@@ -16,6 +16,7 @@ struct Device
     std::function<void(u32 offset, u32 size, u32 value)> write;
 };
 void AddDevice(const Device& device);
+const char* DeviceName(u32 address); // the device at an address, or "no device"
 
 // Interrupt lines (the Xbox's IRQs): level-triggered. The NV2A is 3, USB 1 and 9, the APU 5, AC97 6.
 void SetIrq(int line, bool level);

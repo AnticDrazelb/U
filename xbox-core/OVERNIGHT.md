@@ -44,3 +44,12 @@ retail game is to need it. Each item says how it is checked without the game.
   stack enumerates the hub (address 2) then the gamepad behind it (address 3) in the usb and
   sdl_gamecontroller samples; with --pad a the sdl_gamecontroller sample shows "A:1" for
   controller 1 (045e:0202); regression 12/12 both ways.
+
+- **7, what a hang shows.** Every device register access is counted per register (reads, writes,
+  the last value) and kept in a ring of the latest 64, lock-free (diag::DeviceAccess, from
+  DeviceRead/DeviceWrite). The end-of-run report and the watchdog's hang.log list the 16 registers
+  read most, named by device ("nic", "apu", "ohci0"...), and the latest accesses: a game waiting on
+  hardware shows the register it polls and the value it keeps getting, in one log (the network
+  adapter's hang took a round trip to find). Checked: the httpd sample's report lists the adapter's
+  registers; regression 12/12 both ways.
+

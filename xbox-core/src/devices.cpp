@@ -244,6 +244,12 @@ void InitDevices()
     InitNic();
 }
 
+const char* DeviceName(u32 address)
+{
+    const Device* d = Find(address);
+    return d ? d->name : "no device";
+}
+
 bool DeviceRead(u32 address, u32 size, u32& value)
 {
     value = 0;
@@ -255,6 +261,7 @@ bool DeviceRead(u32 address, u32 size, u32& value)
         std::snprintf(what, sizeof(what), "read at %#x", address & ~0xfffu);
         diag::Note("device register (no device)", what);
     }
+    diag::DeviceAccess(address, size, value, false);
     if (g_verbose >= 3)
         Log("dev read  %#010x/%u = %#x", address, size, value);
     return true; // what nothing answers reads as 0
@@ -264,6 +271,7 @@ bool DeviceWrite(u32 address, u32 size, u32 value)
 {
     if (g_verbose >= 3)
         Log("dev write %#010x/%u = %#x", address, size, value);
+    diag::DeviceAccess(address, size, value, true);
     if (const Device* d = Find(address))
         d->write(address - d->base, size, value);
     else
