@@ -643,6 +643,7 @@ void RegisterFileExports(RegisterFn reg)
             lseek(f->fd, off_t(at + length), SEEK_SET);
             const u32 status = length == 0 && c.Arg(6) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
             LogRaw(f, "read", at, c.Arg(6), status);
+            Log("disk: (into %#x)", c.Arg(5));
             SetIo(c.Arg(4), status, length);
             if (c.Arg(1))
                 WakeAll();

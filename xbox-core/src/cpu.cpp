@@ -715,6 +715,15 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
     const u32 chain = Read<u32>(t->kpcr); // NtTib.ExceptionList
     if (!chain || chain == 0xffffffff)
         return false;
+    // a first handler record that can't be dispatched (its handler 0 or not mapped: the stack
+    // overwritten) would only fault again, each time deeper in the stack until it runs out: the
+    // fault is reported as unhandled instead
+    if (!GuestMapped(chain, 8) || !GuestMapped(Read<u32>(chain + 4), 1) || Read<u32>(chain + 4) < kRamBase)
+    {
+        Log("cpu: thread %u's exception handler record at %#x points at %#x: not dispatched (the stack was overwritten?)",
+            t->id, chain, GuestMapped(chain, 8) ? Read<u32>(chain + 4) : 0);
+        return false;
+    }
     if (eip >= g_switch && eip < g_switch + u32(xcs_end - xcs_begin))
         return false;
     if (esp < t->stack_limit + 0x1000 || esp > t->stack_top)
@@ -740,17 +749,19 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
             r.Get(3), esp, r.Get(5), r.Get(6), r.Get(7), u32(*f.eflags));
         auto on_stack = [&](u32 a) { return a >= t->stack_limit && a + 4 <= t->stack_top && !(a & 3); };
         std::string calls, stack, handlers;
+        std::vector<u32> returns;
         char b[24];
         for (u32 ebp = r.Get(5), n = 0; n < 16 && on_stack(ebp) && on_stack(ebp + 4); n++)
         {
             std::snprintf(b, sizeof(b), " %#x", Read<u32>(ebp + 4));
             calls += b;
+            returns.push_back(Read<u32>(ebp + 4));
             const u32 next = Read<u32>(ebp);
             if (next <= ebp)
                 break;
             ebp = next;
         }
-        for (u32 i = 0; i < 32 && on_stack(esp + i * 4); i++)
+        for (u32 i = 0; i < 128 && on_stack(esp + i * 4); i++)
         {
             std::snprintf(b, sizeof(b), "%s%08x", i % 8 ? " " : (i ? "\n    " : "    "), Read<u32>(esp + i * 4));
             stack += b;
@@ -774,6 +785,27 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
             }
             Log("  code around eip (16 before, [eip]):%s", around.c_str());
         }
+        // the code that made each call in the chain: 384 bytes before each return address (to read
+        // what the program was doing there; the first few exceptions only)
+        if (diag::g_exceptions <= 4)
+            for (size_t k = 0; k < returns.size() && k < 4; k++)
+            {
+                const u32 ret = returns[k], from = ret > 384 ? ret - 384 : 0;
+                if (!ret || !GuestMapped(from, 384 + 32))
+                    continue;
+                std::string bytes;
+                for (u32 a = from; a < ret + 32; a++)
+                {
+                    if ((a - from) % 32 == 0)
+                    {
+                        std::snprintf(b, sizeof(b), "\n    %08x:", a);
+                        bytes += b;
+                    }
+                    std::snprintf(b, sizeof(b), " %02x", Read<u8>(a));
+                    bytes += b;
+                }
+                Log("  code before the return address %#x:%s", ret, bytes.c_str());
+            }
     }
     if (code == 0xC0000005)
     {
