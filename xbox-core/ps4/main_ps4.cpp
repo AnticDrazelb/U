@@ -316,6 +316,13 @@ bool ReadPad(OrbisPadData& out)
     if (g_pad < 0 || scePadReadState(g_pad, &state.data) != 0 || !state.data.connected)
         return false;
     out = state.data;
+    // bit 31: the system holds the input (its menu is open, xemu-ps4's notes): nothing pressed
+    if (out.buttons & 0x80000000u)
+    {
+        out.buttons = 0;
+        out.leftStick.x = out.leftStick.y = out.rightStick.x = out.rightStick.y = 128;
+        out.analogButtons.l2 = out.analogButtons.r2 = 0;
+    }
     return true;
 }
 uint32_t PadButtons()

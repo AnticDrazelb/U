@@ -279,6 +279,23 @@ void SetTickCountVariable(u32 address)
     g_tick_count_variable = address;
 }
 
+std::atomic<u32> g_system_time_variable{0}, g_interrupt_time_variable{0};
+void SetTimeVariable(bool system_time, u32 address)
+{
+    (system_time ? g_system_time_variable : g_interrupt_time_variable) = address;
+}
+
+namespace {
+// a KSYSTEM_TIME as the clock interrupt writes it: High2Time, LowPart, High1Time (a reader takes
+// High1Time, LowPart, then checks High2Time against it)
+void WriteSystemTime(u32 at, s64 value)
+{
+    Write<u32>(at + 8, u32(u64(value) >> 32));
+    Write<u32>(at, u32(value));
+    Write<u32>(at + 4, u32(u64(value) >> 32));
+}
+} // namespace
+
 void StartVblank()
 {
     // KeTickCount: milliseconds since start
@@ -289,6 +306,10 @@ void StartVblank()
             if (const u32 v = g_tick_count_variable)
                 Write<u32>(v, u32(std::chrono::duration_cast<std::chrono::milliseconds>(
                                       std::chrono::steady_clock::now() - start).count()));
+            if (const u32 v = g_system_time_variable)
+                WriteSystemTime(v, SystemTime());
+            if (const u32 v = g_interrupt_time_variable)
+                WriteSystemTime(v, InterruptTime());
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }).detach();

@@ -73,7 +73,53 @@ int main(void)
     // debugger, a disk with a model number
     check("HalDiskCachePartitionCount is 3", HalDiskCachePartitionCount == 3);
     check("KdDebuggerNotPresent", KdDebuggerNotPresent == 1);
-    check("HalDiskModelNumber", HalDiskModelNumber.Length > 0 && HalDiskModelNumber.Buffer != NULL);
+    {
+        // the EEPROM's settings at their indices (XC_LANGUAGE 7, XC_FACTORY_GAME_REGION 0x104, ...)
+        ULONG type = 0, value = 0, length = 0;
+        check("EEPROM language: English",
+              ExQueryNonVolatileSetting(7, &type, &value, 4, &length) == 0 && value == 1 && type == 4 && length == 4);
+        check("EEPROM game region: North America", ExQueryNonVolatileSetting(0x104, &type, &value, 4, &length) == 0 && value == 1);
+        check("EEPROM AV region: NTSC-M 60 Hz", ExQueryNonVolatileSetting(0x103, &type, &value, 4, &length) == 0 && value == 0x00400100);
+        UCHAR all[256];
+        check("the whole EEPROM",
+              ExQueryNonVolatileSetting(0xFFFF, &type, all, sizeof(all), &length) == 0 && length == 256 && all[0x2C] == 1 && all[0x90] == 1);
+        check("an unknown setting isn't found", ExQueryNonVolatileSetting(0x50, &type, &value, 4, &length) != 0);
+        // the SMBus: the SMC's AV pack and version; nothing at an empty address
+        ULONG smc = 0;
+        check("SMC AV pack: S-Video", HalReadSMBusValue(0x20, 0x04, FALSE, &smc) == 0 && smc == 4);
+        ULONG v[3] = {0};
+        HalWriteSMBusValue(0x20, 0x01, FALSE, 0);
+        HalReadSMBusValue(0x20, 0x01, FALSE, &v[0]);
+        HalReadSMBusValue(0x20, 0x01, FALSE, &v[1]);
+        HalReadSMBusValue(0x20, 0x01, FALSE, &v[2]);
+        check("SMC version P01", v[0] == 'P' && v[1] == '0' && v[2] == '1');
+        check("no device at an empty SMBus address", HalReadSMBusValue(0x40, 0x00, FALSE, &smc) != 0);
+        check("HalBootSMCVideoMode: S-Video", HalBootSMCVideoMode == 4);
+        // the PCI configuration space: the NV2A on bus 1, the first USB controller where its
+        // registers are, an empty slot all ones
+        ULONG id = 0, bar = 0, empty = 0;
+        UCHAR irq = 0;
+        HalReadWritePCISpace(1, 0, 0, &id, 4, FALSE);
+        check("PCI: the NV2A on bus 1", id == 0x02a010de);
+        HalReadWritePCISpace(0, 2, 0x10, &bar, 4, FALSE);
+        HalReadWritePCISpace(0, 2, 0x3c, &irq, 1, FALSE);
+        check("PCI: USB 0 at 0xfed00000, IRQ 1", bar == 0xfed00000 && irq == 1);
+        ULONG ones = 0xffffffff, size = 0;
+        HalReadWritePCISpace(0, 2, 0x10, &ones, 4, TRUE);
+        HalReadWritePCISpace(0, 2, 0x10, &size, 4, FALSE);
+        HalReadWritePCISpace(0, 2, 0x10, &bar, 4, TRUE);
+        check("PCI: a BAR's size", size == 0xfffff000);
+        HalReadWritePCISpace(0, 20, 0, &empty, 4, FALSE);
+        check("PCI: an empty slot", empty == 0xffffffff);
+        // the clock's variables move, and interrupt time counts from the start
+        const ULONG before = KeInterruptTime.LowPart;
+        LARGE_INTEGER wait;
+        wait.QuadPart = -20 * 10000; // 20 ms
+        KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        check("KeInterruptTime moves", KeInterruptTime.LowPart != before);
+        check("KeSystemTime is the date", KeSystemTime.High1Time > 0x01000000);
+        check("KeQueryInterruptTime counts from the start", KeQueryInterruptTime() < 36000000000ULL);
+    }
     check("ExQueryPoolBlockSize", ExQueryPoolBlockSize(p) >= 100);
     memset(p, 0xab, 100);
     ExFreePool(p);

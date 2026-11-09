@@ -181,15 +181,20 @@ u32 DataExport(u32 ordinal)
         p = AllocKernel(4, 4);
         Write<u8>(p, 1); // a retail console: no kernel debugger
     }
-    else if (name == "HalDiskModelNumber" || name == "HalDiskSerialNumber")
+    else if (name == "HalBootSMCVideoMode")
     {
-        // STRINGs (Length, MaximumLength, Buffer) with the disk's identity, as ATA reports it
-        const char* text = name == "HalDiskModelNumber" ? "XBOXCORE VIRTUAL DISK" : "XC0000000001";
-        p = AllocKernel(8 + 48, 4);
-        std::strcpy(Ptr<char>(p + 8), text);
-        Write<u16>(p, u16(std::strlen(text)));
-        Write<u16>(p + 2, u16(std::strlen(text) + 1));
-        Write<u32>(p + 4, p + 8);
+        // the AV pack the SMC reported at boot, in its own numbering: 4, S-Video (as the SMC's
+        // register 4 and AV_QUERY_AV_CAPABILITIES answer). HalDiskModelNumber and
+        // HalDiskSerialNumber stay zero: Cxbx-Reloaded has them as null PANSI_STRINGs, nxdk as STRINGs;
+        // zero is empty either way
+        p = AllocKernel(4, 4);
+        Write<u32>(p, 4);
+    }
+    else if (name == "KeInterruptTime" || name == "KeSystemTime")
+    {
+        // KSYSTEM_TIME (LowPart, High1Time, High2Time), kept current by the clock thread
+        p = AllocKernel(12, 4);
+        SetTimeVariable(name == "KeSystemTime", p);
     }
     else if (name == "KeTickCount" || name == "KeTimeIncrement")
     {
@@ -215,6 +220,188 @@ u32 DataExport(u32 ordinal)
     }
     g_data[ordinal] = p;
     return p;
+}
+
+// The EEPROM (256 bytes, XBOX_EEPROM's layout) as a North American retail console leaves the
+// factory: game region North America, NTSC-M at 60 Hz, English, stereo, no parental limits. Every
+// ExQueryNonVolatileSetting index reads from it (each setting, the user section 0xFF, the encrypted
+// section 0xFFFE, all of it 0xFFFF). The checksums stay zero: only boot code and dashboards check them.
+struct EepromField
+{
+    u32 index, offset, size, type; // type: 1 REG_SZ-like binary (3) or REG_DWORD (4)
+};
+constexpr u32 kRegBinary = 3, kRegDword = 4;
+constexpr EepromField kEepromFields[] = {
+    {0x00, 0x64, 4, kRegDword},   {0x01, 0x68, 4, kRegBinary},  {0x02, 0x78, 4, kRegDword},  {0x03, 0x88, 4, kRegDword},
+    {0x04, 0x6C, 4, kRegBinary},  {0x05, 0x7C, 4, kRegDword},   {0x06, 0x8C, 4, kRegDword},  {0x07, 0x90, 4, kRegDword},
+    {0x08, 0x94, 4, kRegDword},   {0x09, 0x98, 4, kRegDword},   {0x0A, 0x9C, 4, kRegDword},  {0x0B, 0xA0, 4, kRegDword},
+    {0x0C, 0xA4, 4, kRegDword},   {0x0D, 0xA8, 4, kRegDword},   {0x0E, 0xAC, 4, kRegDword},  {0x0F, 0xB0, 4, kRegDword},
+    {0x10, 0xB4, 4, kRegDword},   {0x11, 0xB8, 4, kRegDword},   {0x12, 0xBC, 4, kRegDword},  {0xFF, 0x60, 0x60, kRegBinary},
+    {0x100, 0x34, 12, kRegBinary}, {0x101, 0x40, 6, kRegBinary}, {0x102, 0x48, 16, kRegBinary}, {0x103, 0x58, 4, kRegDword},
+    {0x104, 0x2C, 4, kRegDword},  {0xFFFE, 0x00, 0x30, kRegBinary}, {0xFFFF, 0x00, 0x100, kRegBinary},
+};
+std::mutex g_eeprom_mutex;
+
+const EepromField* FindEepromField(u32 index)
+{
+    for (const EepromField& f : kEepromFields)
+        if (f.index == index)
+            return &f;
+    return nullptr;
+}
+
+u8* Eeprom()
+{
+    static u8 e[256];
+    static bool made = false;
+    if (!made)
+    {
+        made = true;
+        auto put = [&](u32 offset, u32 v) { std::memcpy(e + offset, &v, 4); };
+        put(0x2C, 0x00000001);            // game region: North America
+        std::memcpy(e + 0x34, "000000000001", 12); // serial number
+        const u8 mac[6] = {0x02, 0x58, 0x43, 0x00, 0x00, 0x01}; // a locally administered address
+        std::memcpy(e + 0x40, mac, 6);
+        put(0x58, 0x00400100);            // AV region: NTSC-M, 60 Hz
+        put(0x90, 1);                     // language: English
+        put(0x94, 0);                     // video flags: the XDK's defaults
+        put(0x98, 0);                     // audio: stereo
+        put(0x9C, 0);                     // parental control (games): everything
+        put(0xA4, 0);                     // parental control (movies): everything
+        put(0xBC, 1);                     // DVD region 1
+    }
+    return e;
+}
+
+// The SMBus as a retail console has it: the SMC (0x20), the video encoder (Conexant, 0x8A), the
+// temperature monitor (0x98), the EEPROM (0xA8); nothing else answers. The SMC's registers as
+// Cxbx-Reloaded's model and the PIC's documentation give them: version "P01" a character per read,
+// the tray closed with a disc, the AV pack S-Video (4, its numbering), CPU 45 C, board 40 C.
+std::mutex g_smbus_mutex;
+u8 g_smc[0x40] = {};
+u32 g_smc_version_at = 0;
+
+bool SmbusRead(u8 address, u8 command, bool word, u32& value)
+{
+    std::lock_guard lock(g_smbus_mutex);
+    value = 0;
+    switch (address & 0xfe)
+    {
+    case 0x20: // the SMC
+        switch (command)
+        {
+        case 0x01: value = u8("P01"[g_smc_version_at++ % 3]); break;
+        case 0x03: value = 0x60; break; // tray: closed, media present (as HalReadSMCTrayState)
+        case 0x04: value = 4; break;    // AV pack: S-Video
+        case 0x09: value = 45; break;   // CPU temperature
+        case 0x0A: value = 40; break;   // board temperature
+        case 0x0F: value = g_smc[0x0E]; break; // reads back what 0x0E was written
+        case 0x1C: case 0x1D: case 0x1E: case 0x1F: value = 0; break; // the PIC challenge
+        default: value = command < sizeof(g_smc) ? g_smc[command] : 0; break;
+        }
+        return true;
+    case 0x98: // the temperature monitor (ADM1032): 0 the board, 1 the CPU
+        value = command == 0 ? 40 : command == 1 ? 45 : 0;
+        return true;
+    case 0xA8: // the EEPROM, byte (or word) at `command`
+    {
+        std::lock_guard eeprom_lock(g_eeprom_mutex);
+        const u8* e = Eeprom();
+        value = e[command] | (word && command < 255 ? u32(e[command + 1]) << 8 : 0u);
+        return true;
+    }
+    case 0x8A: // the Conexant video encoder: present (its registers read 0)
+        return true;
+    }
+    return false;
+}
+
+void SmbusWrite(u8 address, u8 command, u32 value)
+{
+    std::lock_guard lock(g_smbus_mutex);
+    if ((address & 0xfe) == 0x20 && command < sizeof(g_smc))
+    {
+        g_smc[command] = u8(value);
+        if (command == 0x01)
+            g_smc_version_at = 0; // writing the version register restarts its string
+    }
+}
+
+// The PCI configuration space as the retail kernel leaves it once it has booted: each MCPX and
+// NV2A function with its IDs (NVIDIA's, as xemu's machine has them), class, the base address the
+// kernel programmed (where this emulator's devices are) and its interrupt line. A slot with no
+// device reads all ones, as on the bus.
+struct PciFunction
+{
+    u32 bus, device, function;
+    u16 device_id;
+    u32 class_rev; // class << 8 | revision
+    u32 bar_index, bar, bar_size, irq;
+    u8 space[256];
+};
+std::mutex g_pci_mutex;
+PciFunction g_pci[] = {
+    {0, 0, 0, 0x02a5, 0x06000000 | 0xD3, 0, 0, 0, 0, {}},                       // host bridge
+    {0, 1, 0, 0x01b2, 0x06010000 | 0xD3, 0, 0, 0, 0, {}},                       // LPC (ISA) bridge
+    {0, 1, 1, 0x01b4, 0x0c050000 | 0xD3, 1, 0xc000, 0x10, 0, {}},              // SMBus (I/O)
+    {0, 2, 0, 0x01c2, 0x0c031000 | 0xD3, 0, 0xfed00000, 0x1000, 1, {}},         // USB 0 (OHCI)
+    {0, 3, 0, 0x01c2, 0x0c031000 | 0xD3, 0, 0xfed08000, 0x1000, 9, {}},         // USB 1 (OHCI)
+    {0, 4, 0, 0x01c3, 0x02000000 | 0xD3, 0, 0xfef00000, 0x400, 4, {}},          // network
+    {0, 5, 0, 0x01b0, 0x04010000 | 0xD3, 0, 0xfe800000, 0x80000, 5, {}},        // APU
+    {0, 6, 0, 0x01b1, 0x04010000 | 0xD3, 2, 0xfec00000, 0x1000, 6, {}},         // AC'97
+    {0, 9, 0, 0x01bc, 0x01018a00 | 0xD3, 4, 0xff60, 0x10, 14, {}},              // IDE (bus master I/O)
+    {0, 30, 0, 0x01b7, 0x06040000 | 0xD3, 0, 0, 0, 0, {}},                      // AGP bridge
+    {1, 0, 0, 0x02a0, 0x03000000 | 0xA2, 0, 0xfd000000, 0x1000000, 3, {}},      // NV2A
+};
+
+PciFunction* FindPci(u32 bus, u32 device, u32 function)
+{
+    for (PciFunction& f : g_pci)
+        if (f.bus == bus && f.device == device && f.function == function)
+        {
+            if (!f.space[0]) // filled on first use
+            {
+                auto put32 = [&](u32 at, u32 v) { std::memcpy(f.space + at, &v, 4); };
+                put32(0x00, 0x10de | u32(f.device_id) << 16);
+                put32(0x04, 0x02b00007); // I/O, memory, bus master on; status: 66 MHz, fast back-to-back
+                put32(0x08, f.class_rev);
+                f.space[0x0e] = (f.device == 30 || (f.device == 1 && f.function == 0)) ? 0x01 : 0x00; // header type
+                if (f.bar_size)
+                    put32(0x10 + 4 * f.bar_index, f.bar | (f.bar < 0x10000 ? 1u : 0u)); // I/O BARs: bit 0
+                if (f.device == 30) // the AGP bridge: bus 1 behind it
+                    put32(0x18, 0x00010100);
+                f.space[0x3c] = u8(f.irq);
+                f.space[0x3d] = f.irq ? 1 : 0;
+            }
+            return &f;
+        }
+    return nullptr;
+}
+
+void PciAccess(u32 bus, u32 device, u32 function, u32 offset, u32 buffer, u32 length, bool write)
+{
+    std::lock_guard lock(g_pci_mutex);
+    PciFunction* f = FindPci(bus, device, function);
+    for (u32 i = 0; i < length; i++)
+    {
+        const u32 at = offset + i;
+        if (!write)
+            Write<u8>(buffer + i, f && at < 256 ? f->space[at] : 0xff);
+        else if (f && at < 256 && at >= 4) // the IDs and class are read-only
+            f->space[at] = Read<u8>(buffer + i);
+    }
+    // a BAR written all ones answers its size mask (the sizing handshake), then its address again
+    if (write && f && f->bar_size)
+    {
+        const u32 bar_at = 0x10 + 4 * f->bar_index;
+        u32 v;
+        std::memcpy(&v, f->space + bar_at, 4);
+        if ((v | 0xf) == 0xffffffff)
+            v = ~(f->bar_size - 1) | (f->bar < 0x10000 ? 1u : 0u);
+        else if (v != (f->bar | (f->bar < 0x10000 ? 1u : 0u)))
+            Log("kernel: PCI %u:%u.%u's BAR moved to %#x (the device stays at %#x)", bus, device, function, v, f->bar);
+        std::memcpy(f->space + bar_at, &v, 4);
+    }
 }
 
 u32 ObjectTypeAddress(const char* type)
@@ -1003,6 +1190,13 @@ bool IsHandleKind(u32 handle, int kind)
     return it != g_handles.end() && it->second.kind == kind;
 }
 
+s64 InterruptTime()
+{
+    // 100 ns units since the start (the clock interrupt's count)
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count() / 100;
+}
+
 s64 SystemTime()
 {
     // 100 ns units since 1601-01-01
@@ -1150,7 +1344,7 @@ void InitKernel()
         return u64(double(ns) * 0.73333333); // 733.33 MHz
     } END;
     K(KeQueryPerformanceFrequency) { return 733333333; } END;
-    K(KeQueryInterruptTime) { return u64(SystemTime()); } END;
+    K(KeQueryInterruptTime) { return u64(InterruptTime()); } END; // since the start, not the date
 
     // ---- events, semaphores, mutants
     K(NtCreateEvent)
@@ -2291,12 +2485,19 @@ void InitKernel()
     } END;
     K(HalReadWritePCISpace)
     {
-        // BusNumber, SlotNumber, RegisterNumber, Buffer, Length, WritePCISpace
-        if (!(c.Arg(5) & 0xff))
-            std::memset(Ptr(c.Arg(3)), 0xff, c.Arg(4));
+        // BusNumber, SlotNumber (device | function << 5), RegisterNumber, Buffer, Length, Write
+        PciAccess(c.Arg(0), c.Arg(1) & 0x1f, (c.Arg(1) >> 5) & 7, c.Arg(2), c.Arg(3), c.Arg(4), c.Arg(5) & 0xff);
         return 0;
     } END;
-    K(HalReadSMBusValue) { if (c.Arg(3)) Write<u32>(c.Arg(3), 0); return 0; } END;
+    K(HalReadSMBusValue) // address, command, word?, value*
+    {
+        u32 value;
+        if (!SmbusRead(u8(c.Arg(0)), u8(c.Arg(1)), c.Arg(2) & 0xff, value))
+            return 0xC0000001; // STATUS_UNSUCCESSFUL: no device answers there
+        if (c.Arg(3))
+            Write<u32>(c.Arg(3), value);
+        return STATUS_SUCCESS;
+    } END;
     K(HalWriteSMBusValue) // address, command, word?, value
     {
         // the SMC's power register (0x20, 2): reset, power cycle, shut down: the program ends
@@ -2306,41 +2507,48 @@ void InitKernel()
             g_quit = true;
             WakeAll();
         }
+        const u8 device = u8(c.Arg(0)) & 0xfe;
+        if (device != 0x20 && device != 0x8A && device != 0x98 && device != 0xA8)
+            return 0xC0000001; // nothing answers there
+        if (device == 0xA8)
+        {
+            std::lock_guard lock(g_eeprom_mutex);
+            Eeprom()[c.Arg(1) & 0xff] = u8(c.Arg(3));
+            if (c.Arg(2) & 0xff && (c.Arg(1) & 0xff) < 255)
+                Eeprom()[(c.Arg(1) & 0xff) + 1] = u8(c.Arg(3) >> 8);
+        }
+        SmbusWrite(u8(c.Arg(0)), u8(c.Arg(1)), c.Arg(3));
         return STATUS_SUCCESS;
     } END;
     K(ExQueryNonVolatileSetting)
     {
-        // ValueIndex, Type*, Value, ValueLength, ResultLength*
-        if (c.Arg(0) == 0xffff) // the whole EEPROM: 256 bytes (zeros: no keys, no user settings)
-        {
-            if (c.Arg(1))
-                Write<u32>(c.Arg(1), 3); // REG_BINARY
-            if (c.Arg(3) < 256)
-                return 0xC0000023; // STATUS_BUFFER_TOO_SMALL
-            std::memset(Ptr(c.Arg(2)), 0, 256);
-            if (c.Arg(4))
-                Write<u32>(c.Arg(4), 256);
-            return STATUS_SUCCESS;
-        }
+        // ValueIndex, Type*, Value, ValueLength, ResultLength*: from the EEPROM image
+        const EepromField* field = FindEepromField(c.Arg(0));
+        if (!field)
+            return 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+        std::lock_guard lock(g_eeprom_mutex);
+        const u8* eeprom = Eeprom();
         if (c.Arg(1))
-            Write<u32>(c.Arg(1), 4); // REG_DWORD
-        if (c.Arg(2) && c.Arg(3))
-            std::memset(Ptr(c.Arg(2)), 0, c.Arg(3));
-        u32 value = 0;
-        switch (c.Arg(0))
-        {
-        case 0x103: value = 0x00400100; break; // video: NTSC-M, 480p allowed
-        case 0x104: value = 0; break;          // audio
-        case 0x107: value = 1; break;          // language: English
-        case 0x108: value = 1; break;          // parental control: none
-        }
-        if (c.Arg(2) && c.Arg(3) >= 4)
-            Write<u32>(c.Arg(2), value);
+            Write<u32>(c.Arg(1), field->type);
         if (c.Arg(4))
-            Write<u32>(c.Arg(4), 4);
+            Write<u32>(c.Arg(4), field->size);
+        if (c.Arg(3) < field->size)
+            return 0xC0000023; // STATUS_BUFFER_TOO_SMALL
+        std::memset(Ptr(c.Arg(2)), 0, c.Arg(3));
+        std::memcpy(Ptr(c.Arg(2)), eeprom + field->offset, field->size);
         return STATUS_SUCCESS;
     } END;
-    K(ExSaveNonVolatileSetting) { return STATUS_SUCCESS; } END;
+    K(ExSaveNonVolatileSetting)
+    {
+        // ValueIndex, Type, Value, ValueLength: the user's settings (the factory and encrypted
+        // sections are written at the factory)
+        const EepromField* field = FindEepromField(c.Arg(0));
+        if (!field || c.Arg(0) > 0xff)
+            return 0xC000000D;
+        std::lock_guard lock(g_eeprom_mutex);
+        std::memcpy(Eeprom() + field->offset, Ptr(c.Arg(2)), std::min<u32>(c.Arg(3), field->size));
+        return STATUS_SUCCESS;
+    } END;
 }
 
 u32 KernelObjectOf(u32 handle)
