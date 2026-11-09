@@ -95,6 +95,11 @@ int main(int argc, char** argv)
         };
     }
     InitMemory();
+    if (const char* trail = std::getenv("XB_FAULT_TRAIL"))
+    {
+        ReportFaultTrail(trail);
+        g_fault_trail_file = trail; // the fault path's forensic trail (the PS4 always keeps one)
+    }
     InitCpu();
     InitDevices();
     InitKernel();

@@ -10,6 +10,8 @@
 //   libthr         libthr's sigaction, its wrapper in front     (what crashed the console)
 //   libthr-kpcr    libthr's, each KPCR carrying fs:[0x10]       (PS4: the last resort)
 #include <cerrno>
+#include <fcntl.h>
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -319,4 +321,34 @@ void PrepareThread()
     sigaltstack(&st, nullptr);
 }
 
+// the fault trail: pwrite (async-signal-safe here) into a ring of records
+namespace {
+int g_trail_fd = -1;
+std::atomic<uint32_t> g_trail_seq{0};
+}
+bool OpenFaultTrail(const std::string& path, std::string& how)
+{
+    g_trail_fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+    how = g_trail_fd >= 0 ? "pwrite" : "can't open " + path;
+    return g_trail_fd >= 0;
+}
+
+void Trail(uint32_t stage, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    if (g_trail_fd < 0)
+        return;
+    TrailRecord r;
+    r.magic = 0x52544258;
+    r.seq = g_trail_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    r.stage = stage;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    r.tsc = (uint64_t(hi) << 32) | lo;
+    r.thread = uint32_t(reinterpret_cast<uintptr_t>(&r) >> 16);
+    r.a = a, r.b = b, r.c = c, r.d = d;
+    if (pwrite(g_trail_fd, &r, sizeof(r), off_t((r.seq - 1) % kTrailRecords) * off_t(sizeof(r))) < 0)
+        return;
+}
+
 } // namespace xb::platform
+

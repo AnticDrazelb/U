@@ -63,4 +63,19 @@ void PrepareThread();
 // Bigger signal stacks for the threads PrepareThread sees from now on (the PS4's; off at first).
 void UseBigSignalStacks(bool on);
 
+// The fault trail (forensics): a fixed-size record for each stage of the fault path, written straight
+// to a file by the kernel's own pwrite (no C library: safe in the signal handler), into a ring of
+// kTrailRecords slots. The records are in the kernel's cache the moment each call returns, so a run
+// that dies anywhere in the path leaves the last ones; the next start reads them (ReadFaultTrail).
+struct TrailRecord
+{
+    uint32_t magic, seq, stage, thread; // magic 'XBTR'; seq from 1; thread: a host thread's id
+    uint64_t a, b, c, d;
+    uint64_t tsc;
+};
+constexpr uint32_t kTrailRecords = 4096;
+// Opens (empties) the trail file; false if it can't. The platform's raw pwrite is found here.
+bool OpenFaultTrail(const std::string& path, std::string& how);
+void Trail(uint32_t stage, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0);
+
 } // namespace xb::platform

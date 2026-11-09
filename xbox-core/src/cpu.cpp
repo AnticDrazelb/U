@@ -8,8 +8,11 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <algorithm>
 #include <cstdio>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
@@ -860,10 +863,14 @@ int HandleGuestFault(platform::Fault& f)
 bool OnFault(platform::Fault& f)
 {
     if (f.cs != g_sel32)
+    {
+        platform::Trail(4, 0, *f.rip, f.fs_base, f.address);
         return false; // the emulator's own: the crash log's
+    }
     const u32 eip = u32(*f.rip);
     const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
     const bool in_switch = eip >= g_switch && eip < g_switch + u32(xcs_end - xcs_begin);
+    platform::Trail(4, (!guest_fs || in_switch) ? 1 : 2, eip, f.fs_base, f.address);
     if (!guest_fs || in_switch)
     {
         if (HandleGuestFault(f) != 0)
@@ -889,6 +896,7 @@ bool OnFault(platform::Fault& f)
 extern "C" u32 FaultResumed(u64 kpcr_address)
 {
     const u32 k = u32(kpcr_address);
+    platform::Trail(6, k, Read<u32>(k + kpcr::FaultEip), Read<u32>(k + kpcr::FaultSignal), Read<u32>(k + kpcr::FaultAddress));
     u64 gpr[8], rip = Read<u32>(k + kpcr::FaultEip), eflags = Read<u32>(k + kpcr::FaultEflags);
     for (int i = 0; i < 8; i++)
         gpr[i] = Read<u32>(k + kpcr::FaultRegs + u32(i) * 4);
@@ -907,6 +915,7 @@ extern "C" u32 FaultResumed(u64 kpcr_address)
         Write<u32>(k + kpcr::FaultRegs + u32(i) * 4, u32(gpr[i]));
     Write<u32>(k + kpcr::FaultEip, u32(rip));
     Write<u32>(k + kpcr::FaultEflags, u32(eflags));
+    platform::Trail(7, u32(result), rip, eflags, Read<u32>(k + kpcr::FaultRegs + 4 * 4));
     return u32(result);
 }
 
@@ -959,6 +968,72 @@ GuestThread* CurrentThread()
     return tl_thread;
 }
 
+namespace {
+// The stages the fault path writes to the trail (platform::Trail), for the report of the last run's.
+const char* StageName(u32 stage)
+{
+    switch (stage)
+    {
+    case 1: return "handler entered: signal, rip, cs, its stack";
+    case 2: return "the context: fs base, fault address, trapno | err << 32, rflags | ss << 32";
+    case 4: return "classified: 0 not ours, 1 handled in the handler, 2 sent to xcs_fault64; eip, fs base, address";
+    case 5: return "handler returning to: rip, cs, guest fs, rsp";
+    case 6: return "xcs_fault64 reached FaultResumed: KPCR, eip, signal, address";
+    case 7: return "FaultResumed done: result, eip, eflags, esp";
+    case 8: return "self-test: about to fault (step number)";
+    case 9: return "self-test: the step passed (step number)";
+    case 10: return "not ours: on to the previous handler (signal, its handler, rip)";
+    case 100: return "trail opened: OnFault, FaultResumed, the switch, xcs_fault64's entry";
+    default: return "?";
+    }
+}
+
+} // namespace
+
+// The last run's trail, in order, to <trail>-previous.txt and its end to the log: how far the last
+// fault got if the run died in the fault path. Done once for each trail file written since.
+void ReportFaultTrail(const std::string& path)
+{
+    std::string text_path = path;
+    if (text_path.size() > 4 && text_path.compare(text_path.size() - 4, 4, ".bin") == 0)
+        text_path.resize(text_path.size() - 4);
+    text_path += "-previous.txt";
+    struct stat bin, txt;
+    if (stat(path.c_str(), &bin) != 0 || (stat(text_path.c_str(), &txt) == 0 && txt.st_mtime > bin.st_mtime))
+        return; // no trail, or already reported
+    std::vector<platform::TrailRecord> records;
+    if (FILE* f = std::fopen(path.c_str(), "rb"))
+    {
+        platform::TrailRecord r;
+        while (std::fread(&r, sizeof(r), 1, f) == 1)
+            if (r.magic == 0x52544258 && r.seq)
+                records.push_back(r);
+        std::fclose(f);
+    }
+    if (records.empty())
+        return;
+    std::sort(records.begin(), records.end(), [](const auto& a, const auto& b) { return a.seq < b.seq; });
+    FILE* out = std::fopen(text_path.c_str(), "w");
+    auto line = [&](const platform::TrailRecord& r) {
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "#%u stage %u (%s) thread %#x: %#llx %#llx %#llx %#llx", r.seq, r.stage,
+                      StageName(r.stage), r.thread, (unsigned long long)r.a, (unsigned long long)r.b,
+                      (unsigned long long)r.c, (unsigned long long)r.d);
+        return std::string(buf);
+    };
+    if (out)
+    {
+        std::fprintf(out, "the fault trail of the run before this one: %zu records (the last %u kept), oldest first\n",
+                     records.size(), platform::kTrailRecords);
+        for (const auto& r : records)
+            std::fprintf(out, "%s\n", line(r).c_str());
+        std::fclose(out);
+    }
+    LogSync("cpu: the last run's fault trail: %zu records, the last ones (all in %s):", records.size(), text_path.c_str());
+    for (size_t i = records.size() > 12 ? records.size() - 12 : 0; i < records.size(); i++)
+        LogSync("  %s", line(records[i]).c_str());
+}
+
 void InitCpu()
 {
     Log("cpu: looking up the platform's functions");
@@ -1003,6 +1078,18 @@ void InitCpu()
     }
     Write<u64>(g_switch + kSlotBugCheck, ExportStub(96)); // KeBugCheckEx, for unhandled exceptions
     Write<u64>(g_switch + kSlotFault, reinterpret_cast<u64>(&FaultResumed));
+    if (!g_fault_trail_file.empty())
+    {
+        std::string how;
+        if (platform::OpenFaultTrail(g_fault_trail_file, how))
+        {
+            LogSync("cpu: fault trail in %s (%s)", g_fault_trail_file.c_str(), how.c_str());
+            platform::Trail(100, reinterpret_cast<u64>(&OnFault), reinterpret_cast<u64>(&FaultResumed), g_switch,
+                            SwitchEntry(xcs_fault64));
+        }
+        else
+            LogSync("cpu: no fault trail: %s", how.c_str());
+    }
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);
@@ -1037,7 +1124,9 @@ void InitCpu()
         }
     if (!died.empty())
         LogSync("cpu self-test: the last run died in the step \"%s\"", died.c_str());
+    u32 step_number = 0;
     auto step = [&](const char* name, const char* what) {
+        step_number++;
         if (died == name)
         {
             LogSync("cpu self-test: step \"%s\" left out (%s stays off): the last run died in it", name, what);
@@ -1052,6 +1141,7 @@ void InitCpu()
                 std::fclose(f);
             }
         LogSync("cpu self-test: step \"%s\": %s (if the app dies here, the next start leaves it out)", name, what);
+        platform::Trail(8, step_number);
         return true;
     };
     const std::string handler = platform::CheckFaultHandler();
@@ -1068,6 +1158,7 @@ void InitCpu()
     {
         fault_test(t);
         Log("cpu self-test: faults in 32-bit code are handled, and the guest's fs is intact after them");
+        platform::Trail(9, step_number);
         if (const u64 rsp = platform::LastSignalStack())
             LogSync("cpu self-test: the kernel entered the fault handler with its stack at %#llx (%llu past 16-byte "
                     "alignment; a function expects 8: the entry realigns it)",
@@ -1078,6 +1169,7 @@ void InitCpu()
         g_fault_log = true;
         fault_test(t);
         Log("cpu self-test: faults logged from the handler");
+        platform::Trail(9, step_number);
     }
     bool big_stacks = false;
     if (step("signal stack", "a bigger signal stack for each thread that runs guest code"))
@@ -1086,6 +1178,7 @@ void InitCpu()
         platform::UseBigSignalStacks(true);
         fault_test(t);
         Log("cpu self-test: faults handled on the bigger signal stack");
+        platform::Trail(9, step_number);
     }
     if (step("new thread", "a fault on a new thread, as the program's threads run"))
     {
@@ -1098,6 +1191,7 @@ void InitCpu()
             Fatal("cpu self-test: on a new thread, guest code read fs:[0x18] = %#x, expected the KPCR %#x", other.load(),
                   t2->kpcr);
         Log("cpu self-test: faults on a new thread are handled too");
+        platform::Trail(9, step_number);
     }
     // a step that killed a run stays left out in the runs after (a new build tries every step again)
     if (!g_selftest_file.empty())

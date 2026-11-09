@@ -19,12 +19,13 @@ ps4)
     #   XB_IMAGE_BASE=0x1000000000   link the app there (default: 0, loaded at 0x400000)
     #   XB_ELF_TYPE=exec             make it a fixed-address program (../xbox-bench/tools/set-elf-type.py)
     #   XB_TITLE_ID, XB_NAME         its title ID and file name
+    #   XB_GPU_LINK=ON/OFF           RADV linked in or not (default: only with XB_IMAGE_BASE)
     # shellcheck disable=SC1091
     source "$HERE/../scripts/ps4-env.sh"
     build="$HOME/xc-ps4${XB_TITLE_ID:+-$XB_TITLE_ID}"
     ps4_cmake -S "$HERE" -B "$build" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$HERE/../toolchain/ps4-cemu.cmake" -DPS4_PAID=0x3800000000000035 \
-        -DXB_IMAGE_BASE="${XB_IMAGE_BASE:-}"
+        -DXB_IMAGE_BASE="${XB_IMAGE_BASE:-}" ${XB_GPU_LINK:+-DXB_GPU_LINK=$XB_GPU_LINK}
     ninja -C "$build"
     stage="$build/stage"
     rm -rf "$stage" && mkdir -p "$stage/sce_sys" "$stage/samples" "$stage/ui"

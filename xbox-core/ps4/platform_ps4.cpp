@@ -8,7 +8,9 @@
 #include <cstring>
 #include <string>
 
+#include <fcntl.h>
 #include <signal.h>
+#include <unistd.h>
 
 #include "../src/platform.h"
 
@@ -94,6 +96,11 @@ SyscallFn g_syscall = nullptr;
 // its code when no exported name reaches the kernel's sigaction
 using SigactionFn = int (*)(int, const void*, void*);
 SigactionFn g_raw_sigaction = nullptr;
+// the fault trail's file and libkernel's raw pwrite stub (system call 476)
+using PwriteFn = long (*)(int, const void*, size_t, long);
+PwriteFn g_raw_pwrite = nullptr;
+int g_trail_fd = -1;
+std::atomic<uint32_t> g_trail_seq{0};
 std::string g_route = "not set";
 // the last resort, when neither is there: libkernel's wrapper finds its thread at fs:[0x10]
 // (struct tcb's tcb_thread); each KPCR gets the host thread's there (NT_TIB's FiberData and
@@ -265,6 +272,8 @@ void FsHostImpl(uint64_t base)
     g_set_fsbase(reinterpret_cast<void*>(base));
 }
 
+uint64_t xb_signal_rsp_value();
+
 void OnSignal(int sig, siginfo_t* info, void* context)
 {
     auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
@@ -272,6 +281,11 @@ void OnSignal(int sig, siginfo_t* info, void* context)
     // Asked of the kernel (the handler runs with the interrupted fs base); else the context's copy.
     bool guest_fs;
     const uint64_t fs = HostFs(context, guest_fs);
+    // the trail (after the app's fs is back: the raw stub's error path would read the thread's data):
+    // 1 the handler entered (signal, rip, cs, the stack it was entered on); 2 the context (fs base,
+    // the fault address, trapno | err << 32, rflags, ss)
+    Trail(1, uint64_t(sig), regs[kRip], regs[kCs], xb_signal_rsp_value());
+    Trail(2, fs, regs[kAddr], (regs[16] & 0xffffffff) | (regs[19] << 32), regs[kRflags] | (regs[24] << 32));
     Fault f{};
     for (int i = 0; i < 8; i++)
         f.gpr[i] = &regs[kGprIndex[i]];
@@ -287,10 +301,13 @@ void OnSignal(int sig, siginfo_t* info, void* context)
     tl_in_signal_handler = false;
     if (handled)
     {
+        // 5 returning to (rip, cs), with the fs base given back, on the stack the context holds
+        Trail(5, regs[kRip], regs[kCs], guest_fs ? fs : 0, regs[23]);
         if (guest_fs)
             g_set_fsbase(reinterpret_cast<void*>(fs));
         return;
     }
+    Trail(10, uint64_t(sig), g_have_previous[sig] ? reinterpret_cast<uint64_t>(g_previous[sig].handler) : 0, regs[kRip]);
     // not ours: the crash log's handler, now (with the app's fs); if it returns, the default
     // action when the instruction runs again
     CallPrevious(sig, info, context);
@@ -471,6 +488,46 @@ void InstallFaultHandler(FaultHandler handler)
 }
 
 uint64_t LastSignalStack() { return ::xb_signal_rsp; }
+namespace {
+uint64_t xb_signal_rsp_value() { return ::xb_signal_rsp; }
+}
+
+bool OpenFaultTrail(const std::string& path, std::string& how)
+{
+    std::string where;
+    g_raw_pwrite = reinterpret_cast<PwriteFn>(FindSyscallStub(476, where));
+    if (!g_raw_pwrite)
+    {
+        how = "no raw pwrite stub (" + where + ")";
+        return false;
+    }
+    g_trail_fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (g_trail_fd < 0)
+    {
+        how = "can't open " + path;
+        return false;
+    }
+    char at[32];
+    std::snprintf(at, sizeof(at), "%p", reinterpret_cast<void*>(g_raw_pwrite));
+    how = std::string("raw pwrite at ") + at;
+    return true;
+}
+
+void Trail(uint32_t stage, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    if (g_trail_fd < 0 || !g_raw_pwrite)
+        return;
+    TrailRecord r;
+    r.magic = 0x52544258; // "XBTR"
+    r.seq = g_trail_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    r.stage = stage;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    r.tsc = (uint64_t(hi) << 32) | lo;
+    r.thread = uint32_t(reinterpret_cast<uintptr_t>(&r) >> 16); // the stack it runs on: tells threads apart
+    r.a = a, r.b = b, r.c = c, r.d = d;
+    g_raw_pwrite(g_trail_fd, &r, sizeof(r), long((r.seq - 1) % kTrailRecords) * long(sizeof(r)));
+}
 
 const char* SignalRoute()
 {

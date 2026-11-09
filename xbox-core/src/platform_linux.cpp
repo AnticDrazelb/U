@@ -1,5 +1,7 @@
 // Linux x86-64: mmap, wrfsbase (FSGSBASE, kernel 5.9+), the ucontext of a signal.
 #include <cerrno>
+#include <fcntl.h>
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -57,6 +59,9 @@ void OnSignal(int sig, siginfo_t* info, void* raw)
     }
     auto* uc = static_cast<ucontext_t*>(raw);
     greg_t* g = uc->uc_mcontext.gregs;
+    Trail(1, uint64_t(sig), uint64_t(g[REG_RIP]), uint64_t(g[REG_CSGSFS] & 0xffff), uint64_t(g[REG_RSP]));
+    Trail(2, fs, uint64_t(reinterpret_cast<uintptr_t>(info->si_addr)), uint64_t(g[REG_TRAPNO]) | (uint64_t(g[REG_ERR]) << 32),
+          uint64_t(g[REG_EFL]));
     Fault f{};
     const int order[8] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI};
     for (int i = 0; i < 8; i++)
@@ -73,6 +78,7 @@ void OnSignal(int sig, siginfo_t* info, void* raw)
     tl_in_signal_handler = false;
     if (handled)
     {
+        Trail(5, uint64_t(g[REG_RIP]), uint64_t(g[REG_CSGSFS] & 0xffff), guest_fs ? fs : 0, uint64_t(g[REG_RSP]));
         if (guest_fs)
             WrFsBase(fs);
         return;
@@ -189,4 +195,38 @@ void PrepareThread()
     sigaltstack(&st, nullptr);
 }
 
+// the fault trail: pwrite (async-signal-safe here) into a ring of records
+namespace {
+int g_trail_fd = -1;
+std::atomic<uint32_t> g_trail_seq{0};
+}
+bool OpenFaultTrail(const std::string& path, std::string& how)
+{
+    g_trail_fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+    how = g_trail_fd >= 0 ? "pwrite" : "can't open " + path;
+    return g_trail_fd >= 0;
+}
+
+void Trail(uint32_t stage, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    if (g_trail_fd < 0)
+        return;
+    TrailRecord r;
+    r.magic = 0x52544258;
+    r.seq = g_trail_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    r.stage = stage;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    r.tsc = (uint64_t(hi) << 32) | lo;
+    r.thread = uint32_t(reinterpret_cast<uintptr_t>(&r) >> 16);
+    r.a = a, r.b = b, r.c = c, r.d = d;
+    if (pwrite(g_trail_fd, &r, sizeof(r), off_t((r.seq - 1) % kTrailRecords) * off_t(sizeof(r))) < 0)
+        return;
+    // tests of the trail itself: killed outright at a stage, as the console kills an app
+    static const int die_at = std::getenv("XB_TRAIL_DIE_AT") ? std::atoi(std::getenv("XB_TRAIL_DIE_AT")) : -1;
+    if (int(stage) == die_at)
+        kill(getpid(), SIGKILL);
+}
+
 } // namespace xb::platform
+

@@ -703,6 +703,11 @@ std::vector<std::string> UsbDrives()
 // Every log in one file at the top of each USB drive, xbox-core-logs.txt (as New Eden's
 // eden-ps4-logs.txt): written as the app starts, when the library opens and when a program ends;
 // also /data/xbox-core/diagnostics.txt.
+#ifndef XB_VARIANT
+#define XB_VARIANT "dev"
+#endif
+// each package (where it is linked, RADV in it or not) its own trail, so they can't overwrite each other's
+const char* const kFaultTrail = "/data/xbox-core/fault-trail-" XB_VARIANT ".bin";
 std::vector<std::string> g_system; // the report's first lines: the app and the console
 void WriteLogBundle(const std::vector<fe::Game>& games)
 {
@@ -783,8 +788,11 @@ int main()
             std::fclose(f);
         }
     }
+    // the fault path's trail from the last run (a run the console killed in the fault path leaves where
+    // it got): decoded into the data folder, so this start's log bundle carries it
+    ReportFaultTrail(kFaultTrail);
     g_log_file = std::fopen(kLogFile, "w");
-    g_system = {std::string("xbox-core ") + XB_VERSION + " (written as the app started)"};
+    g_system = {std::string("xbox-core ") + XB_VERSION + " (" XB_VARIANT ", built " __DATE__ " " __TIME__ ", written as the app started)"};
     WriteLogBundle({});
     if (const std::vector<std::string> drives = UsbDrives(); !drives.empty())
     {
@@ -869,6 +877,7 @@ int main()
         InitMemory();
         LogSync("launch: setting up the CPU");
         g_selftest_file = "/data/xbox-core/selftest-step.txt";
+        g_fault_trail_file = kFaultTrail;
         InitCpu();
         LogSync("launch: devices");
         InitDevices();
