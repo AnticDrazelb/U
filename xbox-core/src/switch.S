@@ -99,7 +99,7 @@ xcs_bail64:
     mov $0xffffffff, %r13d
     mov $0xbad0bad0, %r14d
 leave64:
-    mov %fs:0x320, %r12     // fs is the guest's: its base is the KPCR
+    mov %r12d, %r12d        // the KPCR, from the handler (not from fs: what the kernel left there)
     and $-16, %rsp
     mov 0x300(%r12), %rdi
     call *slot_fs_host(%rip) // on the guest's stack: a few bytes

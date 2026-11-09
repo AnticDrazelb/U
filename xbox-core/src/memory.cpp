@@ -16,21 +16,91 @@ namespace xb {
 
 int g_verbose = 1;
 void (*g_log_sink)(const char* line) = nullptr;
-constinit thread_local bool tl_in_signal_handler = false;
 std::atomic<u64> g_lines_dropped_in_handler{0};
+// XB_STRICT_SIGNAL=1: a line logged inside the fault handler aborts the run (read before any handler)
+const bool g_strict_signal = std::getenv("XB_STRICT_SIGNAL") != nullptr;
+
+namespace {
+void DroppedInHandler()
+{
+    if (g_strict_signal)
+    {
+        static const char m[] = "Log called inside the fault handler\n";
+        (void)!write(2, m, sizeof(m) - 1);
+        std::abort();
+    }
+    g_lines_dropped_in_handler++;
+}
+} // namespace
+
+// Which threads are inside the fault handler, without thread-local storage: on the PS4 the handler
+// runs with the interrupted fs base, a KPCR when guest code faulted, so anything fs-relative there
+// (a thread_local, fs:0 as the TLS block's pointer) reads the guest's KPCR and ends the app. Each
+// thread in the handler holds a slot with the bounds of the signal stack it runs on (the kernel's
+// answer, so exact: no two threads' stacks overlap); a thread is in the handler when its stack
+// pointer is within one.
+namespace {
+constexpr int kHandlerSlots = 64;
+constexpr u64 kOwnStackSpan = 64 * 1024; // a handler on the thread's own stack: this much below its entry
+std::atomic<u64> g_handler_hi[kHandlerSlots], g_handler_lo[kHandlerSlots];
+std::atomic<int> g_handlers_in{0};
+inline u64 StackPointer()
+{
+    u64 sp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+    return sp;
+}
+} // namespace
+
+int EnterSignalHandler(u64 lo, u64 hi)
+{
+    if (!hi)
+    {
+        hi = StackPointer() + 4096; // not on a signal stack: the thread's own, below this frame
+        lo = hi - kOwnStackSpan;
+    }
+    for (int i = 0; i < kHandlerSlots; i++)
+    {
+        u64 free = 0;
+        if (g_handler_hi[i].compare_exchange_strong(free, ~0ull))
+        {
+            g_handler_lo[i].store(lo);
+            g_handler_hi[i].store(hi);
+            g_handlers_in.fetch_add(1);
+            return i;
+        }
+    }
+    return -1;
+}
+
+void LeaveSignalHandler(int slot)
+{
+    if (slot < 0)
+        return;
+    g_handlers_in.fetch_sub(1);
+    g_handler_lo[slot].store(0);
+    g_handler_hi[slot].store(0);
+}
+
+bool InSignalHandler()
+{
+    if (g_handlers_in.load(std::memory_order_acquire) == 0)
+        return false;
+    const u64 sp = StackPointer();
+    for (int i = 0; i < kHandlerSlots; i++)
+    {
+        const u64 hi = g_handler_hi[i].load(std::memory_order_acquire);
+        if (hi && hi != ~0ull && sp < hi && sp >= g_handler_lo[i].load(std::memory_order_relaxed))
+            return true;
+    }
+    return false;
+}
 
 void Log(const char* fmt, ...)
 {
-    if (tl_in_signal_handler)
+    if (InSignalHandler())
     {
-        static const bool strict = std::getenv("XB_STRICT_SIGNAL") != nullptr;
-        if (strict)
-        {
-            static const char m[] = "Log called inside the fault handler\n";
-            (void)!write(2, m, sizeof(m) - 1);
-            std::abort();
-        }
-        g_lines_dropped_in_handler++;
+        DroppedInHandler();
         return;
     }
     static std::mutex m;
@@ -55,13 +125,18 @@ std::string g_fault_trail_file;
 
 void LogSync(const char* fmt, ...)
 {
+    if (InSignalHandler())
+    {
+        DroppedInHandler(); // before any formatting: the C library's keeps per-thread state behind fs
+        return;
+    }
     char text[2048];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(text, sizeof(text), fmt, ap);
     va_end(ap);
     Log("%s", text);
-    if (g_log_sync)
+    if (g_log_sync && !InSignalHandler())
         g_log_sync();
 }
 

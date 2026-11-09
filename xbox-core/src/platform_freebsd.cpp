@@ -30,7 +30,8 @@
 #include "platform.h"
 
 namespace xb {
-extern thread_local constinit bool tl_in_signal_handler; // core.h
+int EnterSignalHandler(uint64_t lo, uint64_t hi); // core.h: the handler's threads, without thread-local storage
+void LeaveSignalHandler(int slot);
 }
 
 namespace xb::platform {
@@ -107,9 +108,13 @@ void OnSignal(int sig, siginfo_t* info, void* raw)
     f.signal = sig;
     f.fs_base = fs;
     f.raw = raw;
-    tl_in_signal_handler = true;
+    // the signal stack this runs on (the kernel's answer)
+    stack_t on{};
+    const bool alt = sigaltstack(nullptr, &on) == 0 && (on.ss_flags & SS_ONSTACK);
+    const uint64_t lo = alt ? reinterpret_cast<uint64_t>(on.ss_sp) : 0;
+    const int handler_slot = EnterSignalHandler(lo, alt ? lo + on.ss_size : 0);
     const bool handled = g_handler && g_handler(f);
-    tl_in_signal_handler = false;
+    LeaveSignalHandler(handler_slot);
     if (handled)
     {
         if (guest_fs)
@@ -236,6 +241,13 @@ uint64_t HostFsBase()
     __asm__ volatile("mov %%fs:0, %0" : "=r"(v)); // the thread control block points to itself
     return v;
 }
+
+void SetSwitchArg(Fault& fault, uint64_t value)
+{
+    static_cast<ucontext_t*>(fault.raw)->uc_mcontext.mc_r12 = value;
+}
+
+void SetKpcrFinder(KpcrFinder) {} // FreeBSD's kernel reports the fs base truly
 
 void SetCs(Fault& fault, uint16_t cs)
 {

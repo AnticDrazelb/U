@@ -77,6 +77,14 @@ export NXDK_DIR=~/emu/nxdk PATH="$HOME/emu/nxdk/bin:/opt/llvm21/bin:$PATH"
 Run it from a scratch folder, because it creates `xbox-data/` there.
 
 **Regression set** (must stay at 0 failures): `tests/regression.sh` runs all of it on the desktop.
+Run it a second time as `XB_TEST_FS_AS_PS4=1 tests/regression.sh`: the fault handler then behaves as
+the PS4's (the system reports the fs base as 0; the handler runs with fs on an unmapped page until it
+sets the host's from the KPCR the finder gives), so anything fs-relative in the handler's path (a
+`thread_local`, the C library's per-thread state, `clock_gettime`, a mutex) fails at once with
+"fs-relative access in the fault handler's path at <rip>; <code addresses>" instead of killing the
+console app silently. That is what killed every Nov 9 build at the first guest fault (a thread_local
+flag set in the handler); the console's fault trail (`fault-trail-*-previous.txt` in the log bundle)
+showed it dying between stages 2 and 4.
 - `tests/kernel-test/bin/default.xbe`
 - `tests/seh-test/bin/default.xbe`
 - `tests/disc-test/disc-test.iso`

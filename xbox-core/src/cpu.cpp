@@ -524,8 +524,10 @@ u32 FindCave(u32 eip)
 u32 Backpatch(u32 eip, size_t length)
 {
     const u32 next = eip + u32(length);
+    if (InSignalHandler())
+        return next; // nothing below (a static's guard, a mutex) runs in the handler
     static const bool off = std::getenv("XB_NO_BACKPATCH") != nullptr;
-    if (tl_in_signal_handler || off || length > 15 || eip < g_xbe.base || eip + 16 >= g_xbe.base + g_xbe.image_size)
+    if (off || length > 15 || eip < g_xbe.base || eip + 16 >= g_xbe.base + g_xbe.image_size)
         return next;
     std::lock_guard lock(g_patch_mutex);
     if (g_site_by_eip.count(eip) || g_refused.count(eip) || g_sites.size() >= kMaxSites)
@@ -631,7 +633,7 @@ u32 Backpatch(u32 eip, size_t length)
 // patched it, or it was between two of the moved instructions): where it goes on instead.
 bool PatchedSpanResume(u32 eip, u32& resume)
 {
-    if (tl_in_signal_handler || g_site_count == 0)
+    if (g_site_count == 0 || InSignalHandler())
         return false;
     std::lock_guard lock(g_patch_mutex);
     auto it = g_site_by_eip.find(eip);
@@ -763,8 +765,9 @@ int HandleGuestFault(platform::Fault& f)
     const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
     Regs r{f};
     const u8* code = Ptr<u8>(u32(rip));
+    // the faulting guest thread: its KPCR's, or (no fs base known) the one whose stack holds esp
     GuestThread* const fault_thread =
-        guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+        guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : diag::ThreadByStack(r.Get(4));
     u32 regs[8];
     for (int i = 0; i < 8; i++)
         regs[i] = r.Get(i);
@@ -773,7 +776,7 @@ int HandleGuestFault(platform::Fault& f)
     static std::atomic<u32> s_faults{0};
     if (const u32 n = g_fault_log ? s_faults++ : 300; n < 300)
     {
-        GuestThread* ft = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread)) : nullptr;
+        GuestThread* ft = fault_thread;
         LogSync("cpu: fault %u in thread %u: signal %d at %#x, address %#x, code %02x %02x %02x %02x %02x %02x, eax %#x "
                 "ecx %#x edx %#x esp %#x", n + 1, ft ? ft->id : 0, f.signal, u32(rip), f.address, code[0], code[1], code[2],
                 code[3], code[4], code[5], r.Get(0), r.Get(1), r.Get(2), r.Get(4));
@@ -860,6 +863,22 @@ int HandleGuestFault(platform::Fault& f)
 // handler directly). A fault in guest code is saved in the thread's KPCR and the thread sent on to
 // xcs_fault64, which has it handled (FaultResumed) on the emulator's stack and resumes the guest.
 // What can't go there (no KPCR, a fault in the switch's own code) is handled here as before.
+uint64_t FindKpcr(uint64_t kernel_value, uint64_t context_value, uint64_t rsp, uint16_t cs)
+{
+    auto is_kpcr = [](uint64_t k) {
+        return k >= kKernelBase && k + kpcr::Self + 8 <= u64(kKernelBase) + kKernelSize &&
+               Read<u32>(u32(k) + kpcr::NtTibSelf) == k && Read<u64>(u32(k) + kpcr::Self) == k;
+    };
+    if (is_kpcr(kernel_value))
+        return kernel_value;
+    if (is_kpcr(context_value))
+        return context_value;
+    if (cs == g_sel32 && rsp < 0x100000000ull)
+        if (const GuestThread* t = diag::ThreadByStack(u32(rsp)); t && is_kpcr(t->kpcr))
+            return t->kpcr;
+    return 0;
+}
+
 bool OnFault(platform::Fault& f)
 {
     if (f.cs != g_sel32)
@@ -871,6 +890,12 @@ bool OnFault(platform::Fault& f)
     const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
     const bool in_switch = eip >= g_switch && eip < g_switch + u32(xcs_end - xcs_begin);
     platform::Trail(4, (!guest_fs || in_switch) ? 1 : 2, eip, f.fs_base, f.address);
+    if (!guest_fs)
+    {
+        // 3 no KPCR from the fs base: the thread its esp says, and that thread's KPCR
+        const GuestThread* by_stack = diag::ThreadByStack(u32(*f.gpr[4]));
+        platform::Trail(3, u32(*f.gpr[4]), by_stack ? by_stack->id : 0, by_stack ? by_stack->kpcr : 0, f.signal);
+    }
     if (!guest_fs || in_switch)
     {
         if (HandleGuestFault(f) != 0)
@@ -889,6 +914,7 @@ bool OnFault(platform::Fault& f)
     Write<u32>(k + kpcr::FaultAddress, f.address);
     *f.rip = SwitchEntry(xcs_fault64);
     platform::SetCs(f, g_sel64);
+    platform::SetSwitchArg(f, k);
     return true;
 }
 
@@ -976,6 +1002,9 @@ const char* StageName(u32 stage)
     {
     case 1: return "handler entered: signal, rip, cs, its stack";
     case 2: return "the context: fs base, fault address, trapno | err << 32, rflags | ss << 32";
+    case 3: return "no KPCR from the fs base: esp, the guest thread its stack is, that thread's KPCR, signal";
+    case 11: return "the fs base, in detail: the kernel's answer (result << 32 | ok), its value, the context's copy, the context's flags | fs selector << 32";
+    case 12: return "in the handler's table: its signal stack (base, size: 0 the thread's own), slot";
     case 4: return "classified: 0 not ours, 1 handled in the handler, 2 sent to xcs_fault64; eip, fs base, address";
     case 5: return "handler returning to: rip, cs, guest fs, rsp";
     case 6: return "xcs_fault64 reached FaultResumed: KPCR, eip, signal, address";
@@ -1090,6 +1119,7 @@ void InitCpu()
         else
             LogSync("cpu: no fault trail: %s", how.c_str());
     }
+    platform::SetKpcrFinder(FindKpcr);
     platform::InstallFaultHandler(OnFault);
     platform::PrepareThread();
     Log("cpu: 32-bit code segment %#x, 64-bit %#x, data %#x; switch at %#x", g_sel32, g_sel64, g_ds, g_switch);

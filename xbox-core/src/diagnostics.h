@@ -34,6 +34,7 @@ void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, c
 void Method(u32 cls, u32 method, u32 parameter);
 // a guest thread, kept for the reports (never freed, so a crash report can read them)
 void RegisterThread(GuestThread* t);
+GuestThread* ThreadByStack(u32 esp); // the guest thread whose stack holds esp (lock-free: the fault handler's)
 
 // The guest's state as text, without locks or allocation (a crash report's): each thread with
 // the kernel call it's in and its latest ones, the GPU's latest methods. To `fd` with write().

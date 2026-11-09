@@ -21,6 +21,21 @@ std::atomic<u64> g_frames{0}, g_draws{0}, g_kernel_calls{0}, g_methods{0}, g_exc
 namespace {
 
 const auto g_start = std::chrono::steady_clock::now();
+inline uint64_t Tsc()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (uint64_t(hi) << 32) | lo;
+}
+const uint64_t g_tsc_start = Tsc();
+// seconds since the start from the time-stamp counter, with no C library (the fault handler's
+// clock): the counter's rate measured against the clock since the start, out of the handler
+std::atomic<double> g_tsc_per_second{0};
+float TscSeconds(uint64_t tsc)
+{
+    const double rate = g_tsc_per_second.load(std::memory_order_relaxed);
+    return rate > 0 ? float(double(tsc - g_tsc_start) / rate) : 0.0f;
+}
 
 std::mutex g_notes_mutex;
 std::map<std::string, std::map<std::string, u64>> g_notes;
@@ -94,7 +109,13 @@ const char* Name(u32 ordinal)
 
 } // namespace
 
-double Seconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count(); }
+double Seconds()
+{
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+    if (s > 0.2)
+        g_tsc_per_second.store(double(Tsc() - g_tsc_start) / s, std::memory_order_relaxed);
+    return s;
+}
 
 void Note(const char* category, const std::string& what)
 {
@@ -200,7 +221,7 @@ void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, c
     g_faults++;
     CountFaultSite(eip, address, code);
     FaultRecord& r = g_fault_ring[g_fault_next.fetch_add(1) % kFaultRing];
-    r.at = float(Seconds());
+    r.at = TscSeconds(Tsc()); // no clock call: this runs in the fault handler
     r.thread = thread, r.eip = eip, r.address = address, r.signal = signal, r.outcome = outcome;
     std::memcpy(r.regs, regs, sizeof(r.regs));
     std::memcpy(r.code, code, sizeof(r.code));
@@ -210,6 +231,15 @@ void Method(u32 cls, u32 method, u32 parameter)
 {
     g_methods++;
     g_method_ring[g_method_next.fetch_add(1) % kMethodRing] = {cls, method, parameter};
+}
+
+GuestThread* ThreadByStack(u32 esp)
+{
+    const u32 n = std::min<u32>(g_thread_count.load(std::memory_order_acquire), kMaxThreads);
+    for (u32 i = 0; i < n; i++)
+        if (GuestThread* t = g_threads[i]; t && esp >= t->stack_limit && esp < t->stack_top)
+            return t;
+    return nullptr;
 }
 
 void RegisterThread(GuestThread* t)

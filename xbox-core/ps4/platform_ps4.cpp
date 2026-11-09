@@ -51,7 +51,8 @@ int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
 }
 
 namespace xb {
-extern thread_local constinit bool tl_in_signal_handler; // core.h
+int EnterSignalHandler(uint64_t lo, uint64_t hi); // core.h: the handler's threads, without thread-local storage
+void LeaveSignalHandler(int slot);
 }
 
 namespace xb::platform {
@@ -99,6 +100,16 @@ SigactionFn g_raw_sigaction = nullptr;
 // the fault trail's file and libkernel's raw pwrite stub (system call 476)
 using PwriteFn = long (*)(int, const void*, size_t, long);
 PwriteFn g_raw_pwrite = nullptr;
+// libkernel's raw sigaltstack stub (system call 53): the handler asks which signal stack it's on
+struct RawSignalStack
+{
+    void* sp;
+    size_t size;
+    int32_t flags;
+};
+using SigaltstackFn = int (*)(const RawSignalStack*, RawSignalStack*);
+SigaltstackFn g_raw_sigaltstack = nullptr;
+KpcrFinder g_find_kpcr = nullptr;
 int g_trail_fd = -1;
 std::atomic<uint32_t> g_trail_seq{0};
 std::string g_route = "not set";
@@ -181,17 +192,38 @@ int RawSigaction(int sig, const BsdSigaction* action, BsdSigaction* old)
 }
 
 // fs back to the app's when guest code was interrupted; returns the interrupted fs base
-uint64_t HostFs(void* context, bool& guest_fs)
+// how HostFs found the fs base, for the trail: the kernel's answer (result << 32 | asked), its value
+struct FsAnswer
+{
+    uint64_t asked = 0, kernel_value = 0;
+};
+
+uint64_t HostFs(void* context, bool& guest_fs, FsAnswer* answer = nullptr)
 {
     auto* regs = reinterpret_cast<uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
     uint64_t fs = regs[kFsBase];
+    uint64_t asked = 0, kernel_value = 0;
     if (g_get_fsbase)
     {
         void* base = nullptr;
-        if (g_get_fsbase(&base) == 0)
-            fs = reinterpret_cast<uint64_t>(base);
+        const int r = g_get_fsbase(&base);
+        asked = (uint64_t(uint32_t(r)) << 32) | 1;
+        kernel_value = reinterpret_cast<uint64_t>(base);
+        if (r == 0)
+            fs = kernel_value;
     }
-    guest_fs = fs && fs < 0x100000000ull;
+    // what the system reports isn't trusted to be the KPCR (on the console it reported 0 for guest
+    // code whose fs is its KPCR): the finder checks each and, for 32-bit code, the thread by its stack
+    if (g_find_kpcr)
+    {
+        const uint64_t k = g_find_kpcr(asked == 1 ? kernel_value : 0, regs[kFsBase], regs[23], uint16_t(regs[kCs]));
+        guest_fs = k != 0;
+        fs = k ? k : fs;
+    }
+    else
+        guest_fs = fs && fs < 0x100000000ull;
+    if (answer)
+        *answer = {asked, kernel_value};
     if (guest_fs)
         g_set_fsbase(reinterpret_cast<void*>(*reinterpret_cast<const uint64_t*>(fs + 0x300)));
     return fs;
@@ -280,12 +312,16 @@ void OnSignal(int sig, siginfo_t* info, void* context)
     // the interrupted fs base: a KPCR when guest code (or the switch) ran; the emulator's own first.
     // Asked of the kernel (the handler runs with the interrupted fs base); else the context's copy.
     bool guest_fs;
-    const uint64_t fs = HostFs(context, guest_fs);
+    FsAnswer answer;
+    const uint64_t fs = HostFs(context, guest_fs, &answer);
     // the trail (after the app's fs is back: the raw stub's error path would read the thread's data):
     // 1 the handler entered (signal, rip, cs, the stack it was entered on); 2 the context (fs base,
     // the fault address, trapno | err << 32, rflags, ss)
     Trail(1, uint64_t(sig), regs[kRip], regs[kCs], xb_signal_rsp_value());
     Trail(2, fs, regs[kAddr], (regs[16] & 0xffffffff) | (regs[19] << 32), regs[kRflags] | (regs[24] << 32));
+    // 11 where the fs base came from: the kernel's answer, its value, the context's copy, the
+    // context's flags | the fs selector << 32
+    Trail(11, answer.asked, answer.kernel_value, regs[kFsBase], (regs[18] & 0xffffffff) | (((regs[16] >> 32) & 0xffff) << 32));
     Fault f{};
     for (int i = 0; i < 8; i++)
         f.gpr[i] = &regs[kGprIndex[i]];
@@ -296,9 +332,14 @@ void OnSignal(int sig, siginfo_t* info, void* context)
     f.signal = sig;
     f.fs_base = fs;
     f.raw = context;
-    tl_in_signal_handler = true;
+    // the signal stack this runs on (the kernel's answer through the raw stub: nothing fs-relative)
+    RawSignalStack on{};
+    const bool alt = g_raw_sigaltstack && g_raw_sigaltstack(nullptr, &on) == 0 && (on.flags & 1); // SS_ONSTACK
+    const uint64_t lo = alt ? reinterpret_cast<uint64_t>(on.sp) : 0;
+    const int handler_slot = EnterSignalHandler(lo, alt ? lo + on.size : 0);
+    Trail(12, lo, alt ? on.size : 0, handler_slot);
     const bool handled = g_handler && g_handler(f);
-    tl_in_signal_handler = false;
+    LeaveSignalHandler(handler_slot);
     if (handled)
     {
         // 5 returning to (rip, cs), with the fs base given back, on the stack the context holds
@@ -371,6 +412,10 @@ namespace xb::platform {
 
 std::string Init()
 {
+    {
+        std::string where; // the fault handler's question: which signal stack it is on
+        g_raw_sigaltstack = reinterpret_cast<SigaltstackFn>(FindSyscallStub(53, where));
+    }
     g_syscall = reinterpret_cast<SyscallFn>(Lookup("syscall"));
     if (g_syscall)
         g_route = "set with the kernel's own sigaction (libkernel's syscall())";
@@ -466,6 +511,13 @@ uint64_t HostFsBase()
     __asm__ volatile("mov %%fs:0, %0" : "=r"(v)); // FreeBSD's thread control block points to itself
     return v;
 }
+
+void SetSwitchArg(Fault& fault, uint64_t value)
+{
+    reinterpret_cast<uint64_t*>(static_cast<char*>(fault.raw) + kMcontextOffset)[12] = value; // mc_r12
+}
+
+void SetKpcrFinder(KpcrFinder finder) { g_find_kpcr = finder; }
 
 void SetCs(Fault& fault, uint16_t cs)
 {

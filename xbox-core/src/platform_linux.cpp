@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include <sys/auxv.h>
+#include <sys/syscall.h>
 #include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -20,7 +21,8 @@ void xcs_linux_fs_host(uint64_t base);
 }
 
 namespace xb {
-extern thread_local constinit bool tl_in_signal_handler; // core.h
+int EnterSignalHandler(uint64_t lo, uint64_t hi); // core.h: the handler's threads, without thread-local storage
+void LeaveSignalHandler(int slot);
 }
 
 namespace xb::platform {
@@ -43,13 +45,65 @@ void WrFsBase(uint64_t v)
 
 FaultHandler g_handler = nullptr;
 struct sigaction g_old[5];
+// XB_TEST_FS_AS_PS4=1: the handler behaves as the PS4's does: the fs base isn't asked for (reported
+// 0) or given back, so the handler runs with the guest's KPCR as fs, and anything fs-relative in its
+// path (a thread_local, the C library's per-thread state) ends the run as it ends the app there
+bool g_fs_as_ps4 = false;
+KpcrFinder g_find_kpcr = nullptr;
+int g_trail_die_at = -1;
+
+// a system call without the C library (whose wrappers keep per-thread state behind fs)
+long RawSyscall(long n, long a = 0, long b = 0, long c = 0, long d = 0)
+{
+    long r;
+    register long r10 __asm__("r10") = d;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+    return r;
+}
 constexpr int kSignals[5] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
 
 void OnSignal(int sig, siginfo_t* info, void* raw)
 {
     // The guest's fs may be current (its base below 4 GiB): the emulator's first, from the KPCR's
     // host block (C++ thread-locals live behind fs).
-    const uint64_t fs = RdFsBase();
+    // (in the PS4 test, the handler's fs is an unmapped page until it returns: anything fs-relative
+    // in its path faults at once, where on the console it might read the KPCR and end later)
+    const uint64_t poisoned_from = g_fs_as_ps4 ? RdFsBase() : 0;
+    if (g_fs_as_ps4 && poisoned_from == 0x1000)
+    {
+        // a fault with the handler's poisoned fs: something fs-relative ran in the handler's path.
+        // Where (rip, then the code addresses on its stack), written without anything fs-relative.
+        auto* c = static_cast<ucontext_t*>(raw);
+        char line[512];
+        int n = 0;
+        auto hex = [&](uint64_t v) {
+            line[n++] = ' ', line[n++] = '0', line[n++] = 'x';
+            for (int i = 60; i >= 0; i -= 4)
+                line[n++] = "0123456789abcdef"[(v >> i) & 15];
+        };
+        static const char head[] = "fs-relative access in the fault handler's path at";
+        for (const char ch : head)
+            if (ch)
+                line[n++] = ch;
+        hex(uint64_t(c->uc_mcontext.gregs[REG_RIP]));
+        line[n++] = ';';
+        const auto* sp = reinterpret_cast<const uint64_t*>(c->uc_mcontext.gregs[REG_RSP]);
+        for (int i = 0; i < 400 && n < 480; i++)
+            if (sp[i] >= 0x500000000000ull && sp[i] < 0x700000000000ull && sp[i] < reinterpret_cast<uint64_t>(&RawSyscall) + 0x2000000 &&
+                sp[i] > reinterpret_cast<uint64_t>(&RawSyscall) - 0x2000000)
+                hex(sp[i]);
+        line[n++] = '\n';
+        RawSyscall(SYS_write, 2, reinterpret_cast<long>(line), n);
+        RawSyscall(SYS_kill, RawSyscall(SYS_getpid), SIGKILL);
+    }
+    if (g_fs_as_ps4)
+        WrFsBase(0x1000);
+    // (the PS4 test: the system's answer is 0, as there; the KPCR from the finder, as there)
+    auto* uc0 = static_cast<ucontext_t*>(raw);
+    const uint64_t fs = !g_fs_as_ps4 ? RdFsBase()
+                        : g_find_kpcr ? g_find_kpcr(0, 0, uint64_t(uc0->uc_mcontext.gregs[REG_RSP]),
+                                                    uint16_t(uc0->uc_mcontext.gregs[REG_CSGSFS] & 0xffff))
+                                      : 0;
     const bool guest_fs = fs && fs < 0x100000000ull;
     if (guest_fs)
     {
@@ -73,16 +127,24 @@ void OnSignal(int sig, siginfo_t* info, void* raw)
     f.signal = sig == SIGSEGV ? 11 : sig;
     f.fs_base = fs;
     f.raw = raw;
-    tl_in_signal_handler = true;
+    // the signal stack this runs on (the kernel's answer: the raw system call, no C library state)
+    stack_t on{};
+    const bool alt = RawSyscall(SYS_sigaltstack, 0, reinterpret_cast<long>(&on)) == 0 && (on.ss_flags & SS_ONSTACK);
+    const uint64_t lo = alt ? reinterpret_cast<uint64_t>(on.ss_sp) : 0;
+    const int handler_slot = EnterSignalHandler(lo, alt ? lo + on.ss_size : 0);
     const bool handled = g_handler && g_handler(f);
-    tl_in_signal_handler = false;
+    LeaveSignalHandler(handler_slot);
     if (handled)
     {
         Trail(5, uint64_t(g[REG_RIP]), uint64_t(g[REG_CSGSFS] & 0xffff), guest_fs ? fs : 0, uint64_t(g[REG_RSP]));
         if (guest_fs)
             WrFsBase(fs);
+        if (g_fs_as_ps4)
+            WrFsBase(poisoned_from);
         return;
     }
+    if (g_fs_as_ps4)
+        WrFsBase(poisoned_from);
     for (int i = 0; i < 5; i++)
         if (kSignals[i] == sig)
             sigaction(sig, &g_old[i], nullptr);
@@ -157,6 +219,13 @@ uint64_t HostFsBase()
     return v;
 }
 
+void SetSwitchArg(Fault& fault, uint64_t value)
+{
+    static_cast<ucontext_t*>(fault.raw)->uc_mcontext.gregs[REG_R12] = greg_t(value);
+}
+
+void SetKpcrFinder(KpcrFinder finder) { g_find_kpcr = finder; }
+
 void SetCs(Fault& fault, uint16_t cs)
 {
     greg_t* g = static_cast<ucontext_t*>(fault.raw)->uc_mcontext.gregs;
@@ -167,6 +236,7 @@ void SetCs(Fault& fault, uint16_t cs)
 void InstallFaultHandler(FaultHandler handler)
 {
     g_handler = handler;
+    g_fs_as_ps4 = std::getenv("XB_TEST_FS_AS_PS4") != nullptr;
     struct sigaction action{};
     action.sa_sigaction = OnSignal;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
@@ -204,6 +274,8 @@ bool OpenFaultTrail(const std::string& path, std::string& how)
 {
     g_trail_fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
     how = g_trail_fd >= 0 ? "pwrite" : "can't open " + path;
+    if (const char* at = std::getenv("XB_TRAIL_DIE_AT"))
+        g_trail_die_at = std::atoi(at);
     return g_trail_fd >= 0;
 }
 
@@ -220,12 +292,12 @@ void Trail(uint32_t stage, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
     r.tsc = (uint64_t(hi) << 32) | lo;
     r.thread = uint32_t(reinterpret_cast<uintptr_t>(&r) >> 16);
     r.a = a, r.b = b, r.c = c, r.d = d;
-    if (pwrite(g_trail_fd, &r, sizeof(r), off_t((r.seq - 1) % kTrailRecords) * off_t(sizeof(r))) < 0)
+    if (RawSyscall(SYS_pwrite64, g_trail_fd, reinterpret_cast<long>(&r), sizeof(r),
+                   long((r.seq - 1) % kTrailRecords) * long(sizeof(r))) < 0)
         return;
     // tests of the trail itself: killed outright at a stage, as the console kills an app
-    static const int die_at = std::getenv("XB_TRAIL_DIE_AT") ? std::atoi(std::getenv("XB_TRAIL_DIE_AT")) : -1;
-    if (int(stage) == die_at)
-        kill(getpid(), SIGKILL);
+    if (int(stage) == g_trail_die_at)
+        RawSyscall(SYS_kill, RawSyscall(SYS_getpid), SIGKILL);
 }
 
 } // namespace xb::platform

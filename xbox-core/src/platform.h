@@ -43,6 +43,14 @@ struct Fault
     void* raw;
 };
 void SetCs(Fault& fault, uint16_t cs);
+// r12 in the resumed context: xcs_fault64's KPCR (it doesn't read it from fs, which the handler's
+// kernel may report and restore differently)
+void SetSwitchArg(Fault& fault, uint64_t value);
+// The KPCR of a fault, when the fs base the system reports may not be it (the PS4's): the first of
+// the kernel's answer and the context's copy that is a KPCR, else (32-bit code) the guest thread
+// whose stack holds rsp; 0 none. Lock-free and fs-free: the handler asks it before anything else.
+using KpcrFinder = uint64_t (*)(uint64_t kernel_value, uint64_t context_value, uint64_t rsp, uint16_t cs);
+void SetKpcrFinder(KpcrFinder finder);
 using FaultHandler = bool (*)(Fault& fault);
 void InstallFaultHandler(FaultHandler handler);
 // A signal someone else handles (the stack dump's, SIGSYS) made safe to arrive in guest code: the
