@@ -111,6 +111,16 @@ int main(void)
         check("PCI: a BAR's size", size == 0xfffff000);
         HalReadWritePCISpace(0, 20, 0, &empty, 4, FALSE);
         check("PCI: an empty slot", empty == 0xffffffff);
+        // the second USB controller (OHCI 1.0a): it answers, resets, and keeps the HCCA aligned
+        volatile ULONG *usb1 = (volatile ULONG *)0xfed08000;
+        check("USB 1: OHCI 1.0", (usb1[0] & 0xff) == 0x10);
+        usb1[0x18 / 4] = 0x12345678;
+        check("USB 1: the HCCA's low bits read 0", usb1[0x18 / 4] == 0x12345600);
+        usb1[0x04 / 4] = 0x80;
+        usb1[0x08 / 4] = 1; // host controller reset
+        check("USB 1: reset", usb1[0x04 / 4] == 0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
+                                  usb1[0x34 / 4] == 0x27782edf && usb1[0x44 / 4] == 0x628);
+        check("USB 1: nothing plugged in", (usb1[0x54 / 4] & 1) == 0 && (usb1[0x5c / 4] & 1) == 0);
         // the clock's variables move, and interrupt time counts from the start
         const ULONG before = KeInterruptTime.LowPart;
         LARGE_INTEGER wait;
