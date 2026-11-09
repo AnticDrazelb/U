@@ -79,6 +79,10 @@ int RasterThreads();
 
 // draw.cpp: vertices, the vertex program, rasterization and the combiners
 void DrawMethod(u32 method, u32 parameter);
+// the occlusion count (SET_ZPASS_PIXEL_COUNT_ENABLE): pixels that passed every test while it is on,
+// read by GET_REPORT; while it is on, draws are counted in software (exactly)
+extern std::atomic<bool> g_zpass_enabled;
+extern std::atomic<u64> g_zpass_count;
 
 // pixel.cpp: a pixel's colour from its interpolated inputs (textures, the register combiners, the
 // alpha test and blending with what `target` holds); false when the alpha test discards it

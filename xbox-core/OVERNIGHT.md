@@ -16,7 +16,7 @@ retail game is to need it. Each item says how it is checked without the game.
    Check: the usb sample and the kernel test still pass; a test that resets the second controller.
 2. **USB as the XDK's driver uses it:** audit `usb.cpp` against the OHCI 1.0a register set (every
    register, the root hub's port bits, the done queue, frame number, interrupts) and fix gaps.
-3. **The APU and DirectSound start-up:** what DirectSound waits on when it starts (the front end,
+3. **(checked; DSP part moved to 10) The APU and DirectSound start-up:** what DirectSound waits on when it starts (the front end,
    the GP and EP DSPs' reset and idle bits, the mailboxes), against xemu's APU registers; make
    every wait it can make finish.
 4. **NV2A coverage against xemu's method list:** every PGRAPH method xemu handles that this doesn't
@@ -29,6 +29,9 @@ retail game is to need it. Each item says how it is checked without the game.
    loop a thread spins in (the code around its eip, the device registers it reads).
 8. **HANDOFF.md** brought up to date with all of tonight.
 9. **Morning summary** below, the final packages sent.
+10. **The GP DSP (a DSP56300 interpreter)**, if time allows: xemu runs the GP 1000 cycles a frame
+    even with its DSP option off, so DirectSound may wait on GP microcode at start-up. Halo's next
+    log will show it (APU registers at the top of "device registers by reads").
 
 ## Done
 
@@ -52,4 +55,21 @@ retail game is to need it. Each item says how it is checked without the game.
   hardware shows the register it polls and the value it keeps getting, in one log (the network
   adapter's hang took a round trip to find). Checked: the httpd sample's report lists the adapter's
   registers; regression 12/12 both ways.
+
+- **3, the APU front end, checked against xemu's.** The PIO window (free count 0x80, every method
+  xemu's VP takes), trapped-method interrupts, notifies and the voice processor match; what differs
+  is that the GP and EP DSPs' microcode doesn't run (moved to item 10, pending Halo's log).
+
+- **4 (first part), NV2A against xemu's PGRAPH.** Classes: xemu does 0x12, 0x44, 0x62, 0x9f and
+  0x97 (0x39, which Halo's log noted, it ignores too); this does all but 0x44 (pattern colours,
+  which xemu only stores). Kelvin: the occlusion reports were missing. CLEAR_REPORT_VALUE,
+  SET_ZPASS_PIXEL_COUNT_ENABLE and GET_REPORT now count the pixels that pass every test and write
+  the report (timestamp, count, 0) into the report DMA, as xemu does; while counting is on, draws
+  go to the software renderer (exact counts). Found on the way and fixed: **depth at the far plane
+  was written back as 0** (GPU write-back and the software encode alike: in float, 16777215 + 0.5
+  rounds to 2^24, which the 24-bit depth's shift into the depth-stencil word made 0), so every
+  cleared depth pixel became the nearest depth whenever the GPU's surfaces went back to memory.
+  Checked: tests/report-test (new, in the regression set): 5000 pixels for a 100x50 quad, the
+  depth test halving a second one, a cleared count 0, in software and on the GPU; the ff, rt, tex
+  and blit picture checks pass in both renderers; regression 13/13 normally, PS4-like and GPU.
 

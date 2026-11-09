@@ -388,8 +388,10 @@ void WriteBack(GpuSurface& g)
     for (u32 y = 0; y < h; y++)
         for (u32 x = 0; x < w; x++)
         {
-            const float v = std::clamp(z[y * w + x] * g.z_max, 0.f, g.z_max);
-            const u32 zi = u32(v + 0.5f), p = PixelAddress(g.s, x, y);
+            // in double, and no higher than the largest value: in float, 1.0 * 16777215 + 0.5 rounds
+            // to 2^24, which the 24-bit depth's shift into the depth-stencil word turned into 0
+            const double v = std::clamp(double(z[y * w + x]) * double(g.z_max), 0.0, double(g.z_max));
+            const u32 zi = std::min(u32(v + 0.5), u32(g.z_max)), p = PixelAddress(g.s, x, y);
             if (g.s.bytes == 2)
                 Write<u16>(p, u16(zi));
             else

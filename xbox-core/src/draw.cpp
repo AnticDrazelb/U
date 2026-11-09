@@ -24,6 +24,9 @@
 
 namespace xb {
 
+std::atomic<bool> g_zpass_enabled{false};
+std::atomic<u64> g_zpass_count{0};
+
 namespace {
 
 struct Vec4
@@ -743,8 +746,8 @@ struct DepthStencil
     u32 Encode(float z) const
     {
         z = std::clamp(z, 0.f, z_max);
-        if (!z_float)
-            return u32(z + 0.5f);
+        if (!z_float) // rounded in double, no higher than the largest (in float, z_max + 0.5 is 2^24)
+            return std::min(u32(double(z) + 0.5), u32(z_max));
         u32 bits;
         std::memcpy(&bits, &z, 4);
         if (zs.bytes == 4)
@@ -1053,6 +1056,8 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
                 continue;
             if (shade_first && !ds.Test(u32(x), u32(y), z))
                 continue;
+            if (g_zpass_enabled.load(std::memory_order_relaxed))
+                g_zpass_count.fetch_add(1, std::memory_order_relaxed);
             WritePixel(cs, u32(x), u32(y), color, write_mask);
         }
     }
@@ -1114,6 +1119,8 @@ struct Fragments
             return;
         if (shade_first && !ds.Test(u32(x), u32(y), z))
             return;
+        if (g_zpass_enabled.load(std::memory_order_relaxed))
+            g_zpass_count.fetch_add(1, std::memory_order_relaxed);
         WritePixel(cs, u32(x), u32(y), color, write_mask);
     }
 
@@ -1441,8 +1448,9 @@ void Flush()
     const std::vector<ScreenVertex>& sv = *source;
     PreparePixels();
     // On the GPU when it's on and does this state: the triangles the rasterizer would draw (culled
-    // and zero-area ones left out as Triangle leaves them), as screen-space vertices.
-    if (gpu::Enabled())
+    // and zero-area ones left out as Triangle leaves them), as screen-space vertices. (Not while
+    // pixels are being counted for an occlusion report: those draws are counted in software.)
+    if (gpu::Enabled() && !g_zpass_enabled.load(std::memory_order_relaxed))
     {
         const bool fill = g_kelvin.Get(0x38c) != 0x1b00 && g_kelvin.Get(0x38c) != 0x1b01 &&
                           g_kelvin.Get(0x390) != 0x1b00 && g_kelvin.Get(0x390) != 0x1b01;

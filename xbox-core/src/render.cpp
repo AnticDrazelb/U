@@ -237,6 +237,28 @@ void KelvinMethod(u32 method, u32 parameter)
         }
         Clear(parameter);
         break;
+    case 0x17c8: // CLEAR_REPORT_VALUE: the occlusion count to 0
+        g_zpass_count = 0;
+        break;
+    case 0x17cc: // SET_ZPASS_PIXEL_COUNT_ENABLE
+        if (parameter && gpu::Enabled())
+            gpu::Sync(); // what the GPU drew, in memory before software draws on it
+        g_zpass_enabled = parameter != 0;
+        break;
+    case 0x17d0: // GET_REPORT: the count, at the offset in the report DMA (a 64-bit timestamp, the
+                 // count, then 0), as xemu documents it
+        if (const u32 base = Nv2aDmaAddress(k.Get(0x1a8)))
+        {
+            const u32 at = base + (parameter & 0x00ffffff);
+            const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+            Write<u32>(at, u32(ns));
+            Write<u32>(at + 4, u32(ns >> 32));
+            Write<u32>(at + 8, u32(std::min<u64>(g_zpass_count.load(), 0xffffffffu)));
+            Write<u32>(at + 12, 0);
+        }
+        break;
     case 0x1d70: // BACK_END_WRITE_SEMAPHORE_RELEASE: a value written where the driver waits for it
         if (const u32 base = Nv2aDmaAddress(k.Get(0x1a4)))
             Write<u32>(base + k.Get(0x1d6c), parameter);

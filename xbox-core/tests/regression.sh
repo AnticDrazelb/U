@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The regression set (HANDOFF §2) on the desktop build: the kernel, SEH and disc tests (0 failures),
+# The regression set (HANDOFF §2) on the desktop build: the kernel, SEH, disc and report tests (0 failures),
 # nxdk's samples (each runs and draws: PNGs in the output folder to compare with tests/*.png) and
 # NevolutionX (reaches its language menu), all with XB_STRICT_SIGNAL=1. Exit status 1 if any fails.
 #   tests/regression.sh [build dir, default ~/xc-host]
@@ -19,7 +19,7 @@ run() { # name, file, seconds, extra args
     timeout 300 "$CORE" "$file" --seconds "$secs" --png "$name.png" "$@" > "$name.log" 2>&1
     local rc=$?
     local r
-    r=$(grep -oE "(kernel|SEH|disc|big image) test: [0-9]+ failures" "$name.log" | tail -1)
+    r=$(grep -oE "(kernel|SEH|disc|big image|report) test: [0-9]+ failures" "$name.log" | tail -1)
     if [ $rc -ne 0 ] || { [ -n "$r" ] && [[ "$r" != *" 0 failures" ]]; } || grep -q "lines dropped in the fault handler: [1-9]" "$name.log"; then
         echo "FAIL $name (exit $rc) ${r:-}"; fail=1
     else
@@ -31,6 +31,7 @@ run seh "$HERE/seh-test/bin/default.xbe" 4
 run bigimage "$HERE/bigimage-test/bin/default.xbe" 3
 run disc-folder "$HERE/disc-test/bin/default.xbe" 4
 run disc-image "$HERE/disc-test/disc-test.iso" 4
+run report "$HERE/report-test/bin/default.xbe" 3
 for s in triangle mesh xaudio sdl usb sdl_gamecontroller; do
     run "$s" "$NXDK_DIR/samples/$s/bin/default.xbe" 5
 done
