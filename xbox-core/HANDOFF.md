@@ -270,11 +270,24 @@ again. So a step that kills the app costs one launch.
 6. **Optional leftovers:** NV2A gaps (W-buffering, the BRDF texture mode, signed blends, line widths), and the
    APU's DSPs.
 
-7. **Drawing speed.** The renderer is software. ClassiCube's world draws at ~11 frames/s on the
-   desktop before backpatching, ~14 after (3 raster threads); the time is spread over the pixel pipeline (combiners, texture
-   stages, swizzling), with no single hot spot. Before the w/z clipping fix (8409972) it was 1
-   frame/s. For Halo at speed on the PS4 the NV2A must eventually draw on the PS4's GPU: the repo
-   already has Mesa for the PS4 (Crema's), which is the way there.
+7. **Drawing speed: the main limit now.** The renderer is software: about 5 Mpixels/s per desktop
+   thread on nxdk's mesh sample, ~600 cycles a pixel, spread over the interpreted pixel pipeline
+   (texture fetch and filtering, the combiners, depth), with no single hot spot. Halo at 640x480
+   with its multitexturing needs perhaps 35 Mpixels/s for 30 frames/s; six Jaguar cores give
+   roughly 10, so expect single-digit frame rates until this improves. The `stats:` line shows
+   "drawing N% of the time": the console's figure decides what to do. In order of payoff/effort:
+   - **Shade in batches** (a row span's pixels together): each combiner stage, texture stage and
+     input mapping decoded once per batch, the per-pixel work simple loops the compiler vectorizes.
+     The same float operations in the same order keep the pictures bit-identical (check with the
+     GPU tests: `tests/*-test`, against `tests/*.png`). Likely 2-4x.
+   - **Draw on the PS4's GPU.** The repo's Mesa build for the PS4 is RADV (Vulkan; Crema renders
+     with it on the console), and Mesa's lavapipe runs Vulkan on the desktop for testing. An NV2A
+     renderer on Vulkan (vertex programs and combiners as generated shaders, textures decoded and
+     uploaded, surfaces as images read back for the display and the CPU) is weeks of work, but it is
+     what makes Halo fast.
+   Done already: clipping (8409972, 1 -> 11 frames/s in ClassiCube), the closed-form swizzle and
+   per-row spans (10b258a, ~5%), backpatched register accesses (02d6e4a). On the PS4 the present
+   loop no longer rewrites an unchanged 1080p frame 60 times a second.
 
 ## 6. Things to know
 

@@ -1459,6 +1459,7 @@ void Flush()
     static auto report = start;
     const auto end = std::chrono::steady_clock::now();
     busy += std::chrono::duration<double>(end - start).count();
+    diag::g_raster_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
     area += pixels;
     if (g_verbose >= 1 && end - report > std::chrono::seconds(2))
     {

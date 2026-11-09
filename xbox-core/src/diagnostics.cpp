@@ -15,6 +15,7 @@
 
 namespace xb::diag {
 
+std::atomic<u64> g_raster_ns{0};
 std::atomic<u64> g_frames{0}, g_draws{0}, g_kernel_calls{0}, g_methods{0}, g_exceptions{0};
 
 namespace {
@@ -416,12 +417,17 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 std::string top;
                 for (size_t i = 0; i < busiest.size() && i < 5; i++)
                     top += std::string(i ? ", " : "") + Name(busiest[i].second) + " " + std::to_string(busiest[i].first);
-                Log("stats: %.1f frames/s, the picture changed in %u of the last %.0f s, %.0f draws/s, %.0f kernel calls/s (%s), "
-                    "%.0f GPU methods/s, %u guest threads, %u MiB free",
+                static u64 last_raster = 0, last_faults = 0, last_patched = 0;
+                const u64 raster = g_raster_ns, faults = g_faults, patched = BackpatchedAccessCount();
+                Log("stats: %.1f frames/s, the picture changed in %u of the last %.0f s, %.0f draws/s, drawing %.0f%% of the "
+                    "time, %.0f kernel calls/s (%s), %.0f GPU methods/s, %.0f faults/s, %.0f patched hardware accesses/s, "
+                    "%u guest threads, %u MiB free",
                     double(frames - last_frames) / span, screen_changes, span, double(draws - last_draws) / span,
-                    double(calls - last_calls) / span,
-                    top.empty() ? "none" : top.c_str(), double(methods - last_methods) / span, g_thread_count.load(),
+                    100.0 * double(raster - last_raster) / 1e9 / span, double(calls - last_calls) / span,
+                    top.empty() ? "none" : top.c_str(), double(methods - last_methods) / span,
+                    double(faults - last_faults) / span, double(patched - last_patched) / span, g_thread_count.load(),
                     FreePages() * 4096 / (1024 * 1024));
+                last_raster = raster, last_faults = faults, last_patched = patched;
                 last_frames = frames, last_draws = draws, last_calls = calls, last_methods = methods;
                 last_stats = now;
                 screen_changes = 0;

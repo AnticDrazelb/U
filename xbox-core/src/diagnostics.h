@@ -12,6 +12,7 @@
 namespace xb::diag {
 
 // counters the stats line and the reports read
+extern std::atomic<u64> g_raster_ns; // time the rasterizer's threads were busy (all draws)
 extern std::atomic<u64> g_frames;      // flips the guest asked for (PCRTC start, the flip counter)
 extern std::atomic<u64> g_draws;       // primitives drawn
 extern std::atomic<u64> g_kernel_calls;
