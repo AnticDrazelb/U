@@ -78,6 +78,7 @@ void LeaveSignalHandler(int slot)
     if (slot < 0)
         return;
     g_handlers_in.fetch_sub(1);
+    g_handler_hi[slot].store(~0ull); // being cleared: readers skip it, then free
     g_handler_lo[slot].store(0);
     g_handler_hi[slot].store(0);
 }
@@ -89,8 +90,13 @@ bool InSignalHandler()
     const u64 sp = StackPointer();
     for (int i = 0; i < kHandlerSlots; i++)
     {
-        const u64 hi = g_handler_hi[i].load(std::memory_order_acquire);
-        if (hi && hi != ~0ull && sp < hi && sp >= g_handler_lo[i].load(std::memory_order_relaxed))
+        // a consistent pair: the upper bound the same before and after the lower one is read (a slot
+        // being set or cleared holds ~0 there), and a lower bound set
+        const u64 hi = g_handler_hi[i].load();
+        if (!hi || hi == ~0ull || sp >= hi)
+            continue;
+        const u64 lo = g_handler_lo[i].load();
+        if (lo && sp >= lo && g_handler_hi[i].load() == hi)
             return true;
     }
     return false;
