@@ -69,6 +69,11 @@ int main(void)
     // the pool
     PVOID p = ExAllocatePoolWithTag(100, 'tset');
     check("ExAllocatePoolWithTag", p != NULL);
+    // the retail kernel's data: three cache partitions (XAPI's utility drive divides by them), no
+    // debugger, a disk with a model number
+    check("HalDiskCachePartitionCount is 3", HalDiskCachePartitionCount == 3);
+    check("KdDebuggerNotPresent", KdDebuggerNotPresent == 1);
+    check("HalDiskModelNumber", HalDiskModelNumber.Length > 0 && HalDiskModelNumber.Buffer != NULL);
     check("ExQueryPoolBlockSize", ExQueryPoolBlockSize(p) >= 100);
     memset(p, 0xab, 100);
     ExFreePool(p);

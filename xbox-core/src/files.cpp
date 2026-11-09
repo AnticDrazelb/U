@@ -537,7 +537,19 @@ void SetDataDirectory(const std::string& dir)
         mkdir((dir + p).c_str(), 0755);
     // the raw disk (partition 0: its config sectors), empty until a program writes them
     if (FILE* f = std::fopen((dir + "/partition0.img").c_str(), "ab"))
+    {
+        // a new one as a formatted retail disk has it (XboxHDM's, xemu's image): sector 3's refurb
+        // info signature, everything else zeros (the cache table in sector 4 included)
+        struct stat st;
+        if (fstat(fileno(f), &st) == 0 && st.st_size == 0) // (not ftell: where append mode starts varies)
+        {
+            static const u8 sectors[0x610] = {};
+            std::fwrite(sectors, 1, 0x600, f);
+            std::fwrite("BRFR", 1, 4, f);
+            std::fwrite(sectors, 1, 0x200 - 4, f);
+        }
         std::fclose(f);
+    }
 }
 
 void CloseHostHandle(int kind, void* host)

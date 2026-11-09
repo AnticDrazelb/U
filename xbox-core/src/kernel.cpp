@@ -168,6 +168,29 @@ u32 DataExport(u32 ordinal)
         Write<u8>(p + 4, 0xA2);    // GpuRevision (NV2A A2)
         Write<u8>(p + 5, 0xD3);    // McpRevision
     }
+    else if (name == "HalDiskCachePartitionCount")
+    {
+        // the retail disk's three cache partitions (X:, Y:, Z:): XAPI's utility drive keeps its
+        // least-recently-used table of them in partition 0's sector 4, shifting (count - 1) entries;
+        // 0 here made that a copy of -12 bytes (Halo's stack overrun at its start)
+        p = AllocKernel(4, 4);
+        Write<u32>(p, 3);
+    }
+    else if (name == "KdDebuggerNotPresent")
+    {
+        p = AllocKernel(4, 4);
+        Write<u8>(p, 1); // a retail console: no kernel debugger
+    }
+    else if (name == "HalDiskModelNumber" || name == "HalDiskSerialNumber")
+    {
+        // STRINGs (Length, MaximumLength, Buffer) with the disk's identity, as ATA reports it
+        const char* text = name == "HalDiskModelNumber" ? "XBOXCORE VIRTUAL DISK" : "XC0000000001";
+        p = AllocKernel(8 + 48, 4);
+        std::strcpy(Ptr<char>(p + 8), text);
+        Write<u16>(p, u16(std::strlen(text)));
+        Write<u16>(p + 2, u16(std::strlen(text) + 1));
+        Write<u32>(p + 4, p + 8);
+    }
     else if (name == "KeTickCount" || name == "KeTimeIncrement")
     {
         p = AllocKernel(4, 4);
