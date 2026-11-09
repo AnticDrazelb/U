@@ -574,6 +574,7 @@ struct Completion
     u32 key, apc_context, status, information;
 };
 std::unordered_map<u32, std::deque<Completion>> g_completions; // under g_sched
+u32 g_av_saved_data = 0;                                        // AvSetSavedDataAddress's
 std::unordered_map<std::string, u32> g_named;                   // devices by name, under g_handles_mutex
 
 u32 PostCompletion(u32 queue, u32 key, u32 apc_context, u32 status, u32 information)
@@ -2467,9 +2468,271 @@ void InitKernel()
         return 0;
     } END;
 
+    // ---- kernel queues (KQUEUE: header, EntryListHead 0x10, CurrentCount 0x18, MaximumCount 0x1c,
+    // ThreadListHead 0x20; its signal state counts the entries), as NT keeps them
+    static const auto list_empty = [](u32 head) { Write<u32>(head, head), Write<u32>(head + 4, head); };
+    static const auto list_unlink = [](u32 entry) {
+        const u32 f = Read<u32>(entry), b = Read<u32>(entry + 4);
+        Write<u32>(b, f), Write<u32>(f + 4, b);
+    };
+    static const auto list_insert_after = [](u32 at, u32 entry) { // entry between at and at's Flink
+        const u32 f = Read<u32>(at);
+        Write<u32>(entry, f), Write<u32>(entry + 4, at), Write<u32>(f + 4, entry), Write<u32>(at, entry);
+    };
+    K(KeInitializeQueue) // queue, count (0: one per processor)
+    {
+        const u32 q = c.Arg(0);
+        InitHeader(q, 4, 10, 0);
+        list_empty(q + 0x10);
+        Write<u32>(q + 0x18, 0);
+        Write<u32>(q + 0x1c, c.Arg(1) ? c.Arg(1) : 1);
+        list_empty(q + 0x20);
+        return 0;
+    } END;
+    static const auto insert_queue = [](u32 q, u32 entry, bool head) -> u64 {
+        std::lock_guard lock(g_sched);
+        const s32 before = Signal(q);
+        if (head)
+            list_insert_after(q + 0x10, entry);
+        else
+            list_insert_after(Read<u32>(q + 0x14), entry); // after the last
+        SetSignal(q, before + 1);
+        g_cv.notify_all();
+        return u32(before);
+    };
+    K(KeInsertQueue) { return insert_queue(c.Arg(0), c.Arg(1), false); } END;         // queue, entry: the previous count
+    K(KeInsertHeadQueue) { return insert_queue(c.Arg(0), c.Arg(1), true); } END;
+    K(KeRemoveQueue) // queue, wait mode, timeout*: the first entry, or STATUS_TIMEOUT (as NT returns it)
+    {
+        const u32 q = c.Arg(0);
+        for (;;)
+        {
+            {
+                std::lock_guard lock(g_sched);
+                const u32 first = Read<u32>(q + 0x10);
+                if (first != q + 0x10)
+                {
+                    list_unlink(first);
+                    SetSignal(q, Signal(q) - 1);
+                    return first;
+                }
+            }
+            if (WaitObjects({q}, false, c.Arg(2)) == STATUS_TIMEOUT)
+                return STATUS_TIMEOUT;
+        }
+    } END;
+    K(KeRundownQueue) // queue: every entry taken off, the first returned (the rest still linked to it)
+    {
+        const u32 q = c.Arg(0), head = q + 0x10;
+        std::lock_guard lock(g_sched);
+        const u32 first = Read<u32>(head);
+        if (first == head)
+            return 0;
+        const u32 last = Read<u32>(head + 4);
+        Write<u32>(last, first), Write<u32>(first + 4, last); // the entries a ring without the head
+        list_empty(head);
+        SetSignal(q, 0);
+        return first;
+    } END;
+
+    // ---- device queues (KDEVICE_QUEUE: Type 0, Size 2, Busy 3, DeviceListHead 4; an entry:
+    // DeviceListEntry 0, SortKey 8, Inserted 12), as nxdk declares them and NT keeps them
+    K(KeInitializeDeviceQueue) // queue
+    {
+        const u32 q = c.Arg(0);
+        Write<u16>(q, 0x14); // DeviceQueueObject
+        Write<u8>(q + 2, 12);
+        Write<u8>(q + 3, 0);
+        list_empty(q + 4);
+        return 0;
+    } END;
+    static const auto insert_device = [](u32 q, u32 entry, bool by_key, u32 key) -> u64 {
+        std::lock_guard lock(g_sched);
+        if (!Read<u8>(q + 3)) // not busy: the device takes it now; it isn't queued
+        {
+            Write<u8>(q + 3, 1);
+            Write<u8>(entry + 12, 0);
+            return 0;
+        }
+        u32 at = Read<u32>(q + 8); // the last
+        if (by_key)
+        {
+            Write<u32>(entry + 8, key);
+            at = q + 4; // after the last entry whose key is no greater
+            for (u32 e = Read<u32>(q + 4); e != q + 4; e = Read<u32>(e))
+                if (Read<u32>(e + 8) <= key)
+                    at = e;
+        }
+        list_insert_after(at, entry);
+        Write<u8>(entry + 12, 1);
+        return 1;
+    };
+    K(KeInsertDeviceQueue) { return insert_device(c.Arg(0), c.Arg(1), false, 0); } END;
+    K(KeInsertByKeyDeviceQueue) { return insert_device(c.Arg(0), c.Arg(1), true, c.Arg(2)); } END;
+    static const auto remove_device = [](u32 q, bool by_key, u32 key) -> u64 {
+        std::lock_guard lock(g_sched);
+        const u32 head = q + 4;
+        if (Read<u32>(head) == head) // empty: the device is idle
+        {
+            Write<u8>(q + 3, 0);
+            return 0;
+        }
+        u32 e = Read<u32>(head);
+        if (by_key) // the first whose key is at least `key`, else the first
+            for (u32 x = Read<u32>(head); x != head; x = Read<u32>(x))
+                if (Read<u32>(x + 8) >= key)
+                {
+                    e = x;
+                    break;
+                }
+        list_unlink(e);
+        Write<u8>(e + 12, 0);
+        return e;
+    };
+    K(KeRemoveDeviceQueue) { return remove_device(c.Arg(0), false, 0); } END;
+    K(KeRemoveByKeyDeviceQueue) { return remove_device(c.Arg(0), true, c.Arg(1)); } END;
+    K(KeRemoveEntryDeviceQueue) // queue, entry: whether it was queued
+    {
+        std::lock_guard lock(g_sched);
+        const u32 e = c.Arg(1);
+        if (!Read<u8>(e + 12))
+            return 0;
+        list_unlink(e);
+        Write<u8>(e + 12, 0);
+        return 1;
+    } END;
+    K(KiUnlockDispatcherDatabase) { return 0; } END; // fastcall: old IRQL (this kernel's dispatcher has its own lock)
+    K(IoQueueThreadIrp) { return 0; } END;            // the thread's IRP list: this kernel never cancels them
+    K(IoStartNextPacketByKey) // DeviceObject, Cancelable, Key: no queue here (as IoStartNextPacket)
+    {
+        Write<u32>(c.Arg(0) + 0x10, 0);
+        return 0;
+    } END;
+
+    // ---- share access (SHARE_ACCESS: OpenCount, Readers, Writers, Deleters, SharedRead,
+    // SharedWrite, SharedDelete; FILE_OBJECT byte 2: DeletePending, ReadAccess 0x2, WriteAccess 0x4,
+    // DeleteAccess 0x8, SharedRead 0x10, SharedWrite 0x20, SharedDelete 0x40), NT's rules
+    static const auto file_access = [](u32 access, u32 share, u32 file) {
+        const bool r = access & 0x21, w = access & 0x6, d = access & 0x10000;
+        u8 bits = Read<u8>(file + 2) & 0x81;
+        bits |= (r ? 0x2 : 0) | (w ? 0x4 : 0) | (d ? 0x8 : 0);
+        if (r || w || d)
+            bits |= (share & 1 ? 0x10 : 0) | (share & 2 ? 0x20 : 0) | (share & 4 ? 0x40 : 0);
+        Write<u8>(file + 2, bits);
+        return bits;
+    };
+    K(IoCheckShareAccess) // DesiredAccess, DesiredShareAccess, FileObject, ShareAccess, Update
+    {
+        const u32 sa = c.Arg(3);
+        const u8 b = file_access(c.Arg(0), c.Arg(1), c.Arg(2));
+        const bool r = b & 0x2, w = b & 0x4, d = b & 0x8;
+        if (!(r || w || d))
+            return STATUS_SUCCESS;
+        const bool sr = b & 0x10, sw = b & 0x20, sd = b & 0x40;
+        const u8 open = Read<u8>(sa);
+        if ((r && Read<u8>(sa + 4) < open) || (w && Read<u8>(sa + 5) < open) || (d && Read<u8>(sa + 6) < open) ||
+            (Read<u8>(sa + 1) && !sr) || (Read<u8>(sa + 2) && !sw) || (Read<u8>(sa + 3) && !sd))
+            return 0xC0000043; // STATUS_SHARING_VIOLATION
+        if (c.Arg(4) & 0xff)
+        {
+            Write<u8>(sa, u8(open + 1));
+            Write<u8>(sa + 1, u8(Read<u8>(sa + 1) + r)), Write<u8>(sa + 2, u8(Read<u8>(sa + 2) + w));
+            Write<u8>(sa + 3, u8(Read<u8>(sa + 3) + d)), Write<u8>(sa + 4, u8(Read<u8>(sa + 4) + sr));
+            Write<u8>(sa + 5, u8(Read<u8>(sa + 5) + sw)), Write<u8>(sa + 6, u8(Read<u8>(sa + 6) + sd));
+        }
+        return STATUS_SUCCESS;
+    } END;
+    K(IoSetShareAccess) // DesiredAccess, DesiredShareAccess, FileObject, ShareAccess
+    {
+        const u32 sa = c.Arg(3);
+        const u8 b = file_access(c.Arg(0), c.Arg(1), c.Arg(2));
+        const bool any = b & 0xe;
+        Write<u8>(sa, any ? 1 : 0);
+        Write<u8>(sa + 1, b & 0x2 ? 1 : 0), Write<u8>(sa + 2, b & 0x4 ? 1 : 0), Write<u8>(sa + 3, b & 0x8 ? 1 : 0);
+        Write<u8>(sa + 4, any && (b & 0x10) ? 1 : 0), Write<u8>(sa + 5, any && (b & 0x20) ? 1 : 0);
+        Write<u8>(sa + 6, any && (b & 0x40) ? 1 : 0);
+        return 0;
+    } END;
+    K(IoRemoveShareAccess) // FileObject, ShareAccess
+    {
+        const u8 b = Read<u8>(c.Arg(0) + 2);
+        const u32 sa = c.Arg(1);
+        if (!(b & 0xe))
+            return 0;
+        Write<u8>(sa, u8(Read<u8>(sa) - 1));
+        Write<u8>(sa + 1, u8(Read<u8>(sa + 1) - ((b & 0x2) ? 1 : 0))), Write<u8>(sa + 2, u8(Read<u8>(sa + 2) - ((b & 0x4) ? 1 : 0)));
+        Write<u8>(sa + 3, u8(Read<u8>(sa + 3) - ((b & 0x8) ? 1 : 0))), Write<u8>(sa + 4, u8(Read<u8>(sa + 4) - ((b & 0x10) ? 1 : 0)));
+        Write<u8>(sa + 5, u8(Read<u8>(sa + 5) - ((b & 0x20) ? 1 : 0))), Write<u8>(sa + 6, u8(Read<u8>(sa + 6) - ((b & 0x40) ? 1 : 0)));
+        return 0;
+    } END;
+
+    // ---- objects a program makes itself (ObCreateObject with one of the kernel's types), named
+    // through the same table as devices
+    static std::unordered_map<u32, std::string> pending_names; // object -> its name, until ObInsertObject (under g_handles_mutex)
+    K(ObCreateObject) // ObjectType, ObjectAttributes, ObjectBodySize, Object*
+    {
+        const char* type_name = nullptr;
+        for (const TypeInfo& t : kTypes)
+            if (DataExport(Ordinal(t.name)) == c.Arg(0))
+                type_name = t.name;
+        const u32 o = NewObject(std::max<u32>(c.Arg(2), 4), type_name ? type_name : "IoFileObjectType");
+        std::memset(Ptr(o), 0, std::max<u32>(c.Arg(2), 4));
+        if (const u32 attributes = c.Arg(1); attributes && Read<u32>(attributes + 4))
+        {
+            std::lock_guard lock(g_handles_mutex);
+            pending_names[o] = LowerName(GuestString(Read<u32>(attributes + 4)));
+        }
+        Write<u32>(c.Arg(3), o);
+        return STATUS_SUCCESS;
+    } END;
+    K(ObInsertObject) // Object, ObjectAttributes, ObjectPointerBias, Handle*
+    {
+        const u32 o = c.Arg(0);
+        {
+            std::lock_guard lock(g_handles_mutex);
+            auto it = pending_names.find(o);
+            if (it != pending_names.end())
+            {
+                if (g_named.count(it->second))
+                    return 0xC0000035; // STATUS_OBJECT_NAME_COLLISION
+                g_named[it->second] = o;
+                pending_names.erase(it);
+            }
+        }
+        if (c.Arg(3))
+            Write<u32>(c.Arg(3), NewHandle(o));
+        return STATUS_SUCCESS;
+    } END;
+    K(ObReferenceObjectByName) // ObjectName (OBJECT_STRING*), Attributes, ObjectType, ParseContext, Object*
+    {
+        if (!c.Arg(0))
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        const std::string name = LowerName(GuestString(c.Arg(0)));
+        u32 o;
+        {
+            std::lock_guard lock(g_handles_mutex);
+            auto it = g_named.find(name);
+            if (it == g_named.end())
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            o = it->second;
+        }
+        if (c.Arg(2) && HeaderType(o) != c.Arg(2))
+            return 0xC0000024; // STATUS_OBJECT_TYPE_MISMATCH
+        Write<u32>(c.Arg(4), o);
+        return STATUS_SUCCESS;
+    } END;
+
+    // ---- port I/O in blocks: no device answers on the I/O ports here (as `in` reads them: 0)
+    K(READ_PORT_BUFFER_UCHAR) { std::memset(Ptr(c.Arg(1)), 0, c.Arg(2)); return 0; } END;
+    K(READ_PORT_BUFFER_USHORT) { std::memset(Ptr(c.Arg(1)), 0, c.Arg(2) * 2); return 0; } END;
+    K(READ_PORT_BUFFER_ULONG) { std::memset(Ptr(c.Arg(1)), 0, c.Arg(2) * 4); return 0; } END;
+    K(WRITE_PORT_BUFFER_UCHAR) { return 0; } END;
+    K(WRITE_PORT_BUFFER_USHORT) { return 0; } END;
+    K(WRITE_PORT_BUFFER_ULONG) { return 0; } END;
+
     // ---- audio/video, hardware
-    K(AvGetSavedDataAddress) { return 0; } END;
-    K(AvSetSavedDataAddress) { return 0; } END;
+    K(AvGetSavedDataAddress) { return g_av_saved_data; } END; // what AvSetSavedDataAddress left (a frame kept across a reboot)
+    K(AvSetSavedDataAddress) { g_av_saved_data = c.Arg(0); return 0; } END;
     K(AvSendTVEncoderOption)
     {
         // RegisterBase, Option, Param, Result*: AV_QUERY_AV_CAPABILITIES answers an NTSC-M

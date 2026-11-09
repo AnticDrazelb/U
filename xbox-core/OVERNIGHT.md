@@ -73,3 +73,18 @@ retail game is to need it. Each item says how it is checked without the game.
   depth test halving a second one, a cleared count 0, in software and on the GPU; the ff, rt, tex
   and blit picture checks pass in both renderers; regression 13/13 normally, PS4-like and GPU.
 
+- **5, kernel exports.** 36 of the 366 had no implementation (an unknown export's stub returns 0).
+  Now done as NT does them: kernel queues (KeInitializeQueue, KeInsertQueue, KeInsertHeadQueue,
+  KeRemoveQueue with its timeout, KeRundownQueue), device queues (KeInitializeDeviceQueue, the
+  insert/remove calls by order and by key, KeRemoveEntryDeviceQueue; layout as nxdk declares it:
+  Cxbx-Reloaded's offset comments disagree with its own field order), share access
+  (IoCheck/Set/RemoveShareAccess, NT's sharing-violation rules on the FILE_OBJECT's bits), objects a
+  program makes and names (ObCreateObject, ObInsertObject, ObReferenceObjectByName, through the
+  device name table), the port-buffer reads and writes, KiUnlockDispatcherDatabase,
+  IoQueueThreadIrp, IoStartNextPacketByKey; AvSet/GetSavedDataAddress keep the address. Left out on
+  purpose: the IRP builders and IofCallDriver (IoAllocateIrp, IoBuild*Request, ...), because the
+  Xbox's IO_STACK_LOCATION isn't settled (Cxbx-Reloaded asserts 0x18 bytes without the fields NT
+  has; nxdk doesn't declare it) and a wrong layout is worse than the logged stub; Cxbx-Reloaded
+  leaves all of them unimplemented. Checked: 11 new kernel-test checks; regression 13/13 in all three
+  modes.
+

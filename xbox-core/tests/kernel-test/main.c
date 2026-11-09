@@ -121,6 +121,49 @@ int main(void)
         check("USB 1: reset", usb1[0x04 / 4] == 0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
                                   usb1[0x34 / 4] == 0x27782edf && usb1[0x44 / 4] == 0x628);
         check("USB 1: nothing plugged in", (usb1[0x54 / 4] & 1) == 0 && (usb1[0x5c / 4] & 1) == 0);
+        // kernel queues: in order, at the head, a timeout when empty, a rundown of what is left
+        static KQUEUE q;
+        static LIST_ENTRY e1, e2, e3;
+        KeInitializeQueue(&q, 0);
+        KeInsertQueue(&q, &e1);
+        KeInsertQueue(&q, &e2);
+        KeInsertHeadQueue(&q, &e3);
+        check("KeRemoveQueue: the head insert first, then in order",
+              KeRemoveQueue(&q, KernelMode, NULL) == &e3 && KeRemoveQueue(&q, KernelMode, NULL) == &e1);
+        LARGE_INTEGER brief;
+        brief.QuadPart = -10000; // 1 ms
+        check("KeRundownQueue: what is left", KeRundownQueue(&q) == &e2 && KeRundownQueue(&q) == NULL);
+        check("KeRemoveQueue: a timeout when empty", (ULONG_PTR)KeRemoveQueue(&q, KernelMode, &brief) == 0x102);
+        // device queues: busy after the first insert, then by key
+        static KDEVICE_QUEUE dq;
+        static KDEVICE_QUEUE_ENTRY d1, d2, d3;
+        KeInitializeDeviceQueue(&dq);
+        const BOOLEAN first_queued = KeInsertDeviceQueue(&dq, &d1);
+        KeInsertByKeyDeviceQueue(&dq, &d2, 20);
+        KeInsertByKeyDeviceQueue(&dq, &d3, 10);
+        check("device queue: the first goes straight to the device", !first_queued && dq.Busy);
+        check("device queue: by key", KeRemoveDeviceQueue(&dq) == &d3 && KeRemoveByKeyDeviceQueue(&dq, 15) == &d2);
+        check("device queue: idle when empty", KeRemoveDeviceQueue(&dq) == NULL && !dq.Busy);
+        // share access: a reader that doesn't share writing keeps a writer out
+        static SHARE_ACCESS sa;
+        static FILE_OBJECT f1, f2;
+        IoSetShareAccess(0x1 /* FILE_READ_DATA */, 1 /* FILE_SHARE_READ */, &f1, &sa);
+        check("IoCheckShareAccess: a writer refused while a reader doesn't share writing",
+              IoCheckShareAccess(0x2 /* FILE_WRITE_DATA */, 3, &f2, &sa, FALSE) == 0xC0000043);
+        check("IoCheckShareAccess: another reader allowed", IoCheckShareAccess(0x1, 1, &f2, &sa, TRUE) == 0 && sa.OpenCount == 2);
+        // an object a program makes and names, found by its name
+        ANSI_STRING oname;
+        RtlInitAnsiString(&oname, "\\xbox-core-test-object");
+        OBJECT_ATTRIBUTES oa = {NULL, &oname, 0};
+        PVOID made = NULL, found = NULL;
+        HANDLE oh = NULL;
+        check("ObCreateObject / ObInsertObject", ObCreateObject(&ExEventObjectType, &oa, sizeof(KEVENT), &made) == 0 &&
+                                                     ObInsertObject(made, &oa, 0, &oh) == 0 && oh != NULL);
+        check("ObReferenceObjectByName", ObReferenceObjectByName(&oname, 0, NULL, NULL, &found) == 0 && found == made);
+        // what AvSetSavedDataAddress leaves, AvGetSavedDataAddress gives
+        AvSetSavedDataAddress((PVOID)0x1234000);
+        check("AvGetSavedDataAddress", AvGetSavedDataAddress() == (PVOID)0x1234000);
+        AvSetSavedDataAddress(NULL);
         // the clock's variables move, and interrupt time counts from the start
         const ULONG before = KeInterruptTime.LowPart;
         LARGE_INTEGER wait;
