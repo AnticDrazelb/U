@@ -82,7 +82,7 @@ std::string g_status = "off";
 // that dies there leaves it, and the next run of the same build keeps the GPU off.
 std::string g_guard_file;
 bool g_guard_pending = false;
-const char* const kBuild = __DATE__ " " __TIME__;
+const char* const kBuild = kBuildId; // this build (not this file's compile time)
 
 void Guard(const char* step)
 {

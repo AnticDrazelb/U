@@ -790,8 +790,8 @@ int main()
             const time_t now = time(nullptr);
             char when[32];
             std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-            std::fprintf(f, "\n--- xbox-core %s (built %s %s) started %s: what follows is from this run\n", XB_VERSION,
-                         __DATE__, __TIME__, when);
+            std::fprintf(f, "\n--- xbox-core %s (build %s) started %s: what follows is from this run\n", XB_VERSION,
+                         kBuildId, when);
             std::fclose(f);
         }
     }
@@ -799,7 +799,7 @@ int main()
     // it got): decoded into the data folder, so this start's log bundle carries it
     ReportFaultTrail(kFaultTrail);
     g_log_file = std::fopen(kLogFile, "w");
-    g_system = {std::string("xbox-core ") + XB_VERSION + " (" XB_VARIANT ", built " __DATE__ " " __TIME__ ", written as the app started)"};
+    g_system = {std::string("xbox-core ") + XB_VERSION + " (" XB_VARIANT ", build " + kBuildId + ", written as the app started)"};
     WriteLogBundle({});
     if (const std::vector<std::string> drives = UsbDrives(); !drives.empty())
     {
@@ -859,7 +859,7 @@ int main()
     std::vector<std::string> system;
     {
         char line[256];
-        std::snprintf(line, sizeof(line), "xbox-core %s, built %s %s", XB_VERSION, __DATE__, __TIME__);
+        std::snprintf(line, sizeof(line), "xbox-core %s, build %s", XB_VERSION, kBuildId);
         system.push_back(line);
         std::snprintf(line, sizeof(line), "app code at %#llx (%s)", (unsigned long long)code,
                       code < 0x4000000 ? "inside the Xbox's RAM addresses: the normal package" : "clear of them: the high package");

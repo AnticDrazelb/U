@@ -1050,6 +1050,17 @@ void BackpatchedAccess(GateFrame* frame)
     if (!EffectiveAddress(ps.code, r, esp, ea))
         return;
     g_backpatched_accesses++;
+    // an access by the patched instruction to memory that isn't mapped (its register pointing nowhere
+    // this time): the Xbox would fault; it isn't done (the registers stay as they were), and said,
+    // rather than the emulator faulting on it itself
+    if (!IsDeviceAddress(ea) && !GuestMapped(ea, 16))
+    {
+        static std::atomic<u32> told{0};
+        if (told++ < 20)
+            Log("cpu: the patched instruction at %#x accessed %#x, which isn't mapped (the Xbox would fault): "
+                "not done", ps.eip, ea);
+        return;
+    }
     // as long as the console's own access takes, at least: a register read crosses the PCI bus there
     // (about 1 us), and drivers wait by counting reads, which mustn't run out before the device changes
     static const double min_us = std::getenv("XB_ACCESS_US") ? std::atof(std::getenv("XB_ACCESS_US")) : 1.0;
@@ -1224,7 +1235,7 @@ void InitCpu()
             // the step, then the build it was this one's (another build tries every step again)
             char line[64] = {}, build[64] = {};
             if (std::fgets(line, sizeof(line), f) && std::fgets(build, sizeof(build), f) &&
-                std::string(build).rfind(__DATE__ " " __TIME__, 0) == 0)
+                std::string(build).rfind(kBuildId, 0) == 0)
                 died = line;
             std::fclose(f);
             while (!died.empty() && (died.back() == '\n' || died.back() == '\r'))
@@ -1243,7 +1254,7 @@ void InitCpu()
         if (!g_selftest_file.empty())
             if (FILE* f = std::fopen(g_selftest_file.c_str(), "w"))
             {
-                std::fprintf(f, "%s\n%s\n", name, __DATE__ " " __TIME__);
+                std::fprintf(f, "%s\n%s\n", name, kBuildId);
                 std::fflush(f);
                 fsync(fileno(f));
                 std::fclose(f);
@@ -1308,7 +1319,7 @@ void InitCpu()
             std::remove(g_selftest_file.c_str());
         else if (FILE* f = std::fopen(g_selftest_file.c_str(), "w"))
         {
-            std::fprintf(f, "%s\n%s\n", died.c_str(), __DATE__ " " __TIME__);
+            std::fprintf(f, "%s\n%s\n", died.c_str(), kBuildId);
             std::fclose(f);
         }
     }

@@ -42,7 +42,8 @@ extern void (*g_log_sync)();
 // left out of this one, with what it would switch on.
 extern std::string g_selftest_file;
 extern std::string g_fault_trail_file; // the fault path's forensic trail (platform.h), when set
-void ReportFaultTrail(const std::string& path); // a trail file a run left: decoded to <name>-previous.txt and the log
+void ReportFaultTrail(const std::string& path);
+extern const char* const kBuildId; // this build's identity: its time and a random tag (new each build) // a trail file a run left: decoded to <name>-previous.txt and the log
 extern void (*g_fatal_hook)(); // runs before Fatal ends the process
 [[noreturn]] void Fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 extern int g_verbose; // 0 quiet, 1 kernel calls not yet seen, 2 every kernel call

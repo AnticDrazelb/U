@@ -10,6 +10,10 @@ mkdir -p "$OUT/obj"
 VERSION="$(head -1 "$HERE/VERSION")"
 FLAGS="-O2 -g -march=btver2 -Wall -Wextra -Wno-unused-parameter -I$HERE/src -DXB_NO_VULKAN -DXB_VERSION=\"$VERSION\""
 SOURCES="memory xbe cpu kernel kernel_rtl kernel_crypto files xiso devices nv2a render draw pixel usb audio apu diagnostics gpu_vulkan platform_freebsd main"
+# this build's identity (as cmake/build-id.cmake writes it for the other builds)
+printf 'namespace xb { extern const char* const kBuildId; const char* const kBuildId = "%s %s"; }\n' \
+    "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')" > "$OUT/obj/build_id.cpp"
+c++ -std=c++20 -c "$OUT/obj/build_id.cpp" -o "$OUT/obj/build_id.o"
 pids=""
 headers_changed=0
 cat "$HERE"/src/*.h "$HERE"/src/*.inc 2>/dev/null | cmp -s - "$OUT/obj/headers.built" || headers_changed=1

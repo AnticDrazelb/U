@@ -478,8 +478,8 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 const int fd = open(hang_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd >= 0)
                 {
-                    Put(Out{fd}, "watchdog at %.1f s (%.0f s into the program), xbox-core built %s %s: %s\n\n", now,
-                        now - run_start, __DATE__, __TIME__, reason);
+                    Put(Out{fd}, "watchdog at %.1f s (%.0f s into the program), xbox-core build %s: %s\n\n", now,
+                        now - run_start, kBuildId, reason);
                     WriteStateLockFree(fd);
                     close(fd);
                 }

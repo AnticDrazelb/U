@@ -14,7 +14,11 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(CORE_SOURCES src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
+# this build's identity (cmake/build-id.cmake), written anew each build
+add_custom_target(build_id ALL
+    COMMAND ${CMAKE_COMMAND} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-id.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp)
+set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
 # The GPU path's shaders: SPIR-V made at build time (nothing is compiled at run time, which the PS4
 # couldn't do), as C arrays the code includes
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
@@ -30,6 +34,7 @@ set_source_files_properties(src/gpu_vulkan.cpp PROPERTIES OBJECT_DEPENDS "${SHAD
 set(FRONTEND_SOURCES frontend/canvas.cpp frontend/library.cpp frontend/tools.cpp frontend/ui.cpp)
 if (PS4)
     add_executable(xbox-core ${CORE_SOURCES} ${FRONTEND_SOURCES} ps4/platform_ps4.cpp ps4/main_ps4.cpp)
+    add_dependencies(xbox-core build_id)
     # Crema's runtime, its log folder moved to /data/xbox-core (crash.log, boot-trace.log)
     set(RUNTIME_SOURCES)
     foreach(source ${PS4_RUNTIME_SOURCES})
@@ -97,6 +102,7 @@ if (PS4)
     ps4_add_eboot(xbox-core)
 else()
     add_executable(xbox-core ${CORE_SOURCES} src/platform_linux.cpp src/main.cpp)
+    add_dependencies(xbox-core build_id)
     find_package(Threads REQUIRED)
     target_link_libraries(xbox-core PRIVATE Threads::Threads)
     # the PS4 front end's screen, drawn to PNG files

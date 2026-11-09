@@ -25,6 +25,11 @@ std::mutex g_irq_mutex;
 std::condition_variable g_irq_cv;
 u32 g_lines = 0;               // asserted interrupt lines
 std::vector<u32> g_interrupts; // connected KINTERRUPTs
+// the service routine the interrupt thread is in (its KINTERRUPT), 0 none: KeDisconnectInterrupt
+// waits it out, as the kernel's synchronizes with the interrupt, so no routine runs after it returns
+u32 g_isr_running = 0;
+std::condition_variable g_isr_done;
+std::atomic<GuestThread*> g_interrupt_thread{nullptr};
 std::deque<u32> g_dpcs;
 std::atomic<u32> g_tick_count_variable{0};
 std::atomic<u64> g_vblanks{0};
@@ -145,9 +150,21 @@ void RunInterrupts(GuestThread* t)
             return;
         for (u32 i : isrs) // ServiceRoutine(Interrupt, ServiceContext), at the interrupt's level
         {
+            {
+                // still connected? (a KeDisconnectInterrupt since the list was taken: not called)
+                std::lock_guard lock(g_irq_mutex);
+                if (std::find(g_interrupts.begin(), g_interrupts.end(), i) == g_interrupts.end())
+                    continue;
+                g_isr_running = i;
+            }
             Write<u8>(t->kpcr + kpcr::Irql, u8(std::max<u32>(3, Read<u8>(i + 0xc))));
             CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)});
             Write<u8>(t->kpcr + kpcr::Irql, 0);
+            {
+                std::lock_guard lock(g_irq_mutex);
+                g_isr_running = 0;
+            }
+            g_isr_done.notify_all();
         }
         RunDpcs(t);
     }
@@ -254,8 +271,12 @@ void ConnectInterrupt(u32 vector, u32 kinterrupt)
 
 void DisconnectInterrupt(u32 kinterrupt)
 {
-    std::lock_guard lock(g_irq_mutex);
+    std::unique_lock lock(g_irq_mutex);
     std::erase(g_interrupts, kinterrupt);
+    // a routine of it running now finishes before this returns (not when the routine itself, on the
+    // interrupt thread, disconnects)
+    if (CurrentThread() != g_interrupt_thread.load())
+        g_isr_done.wait(lock, [&] { return g_isr_running != kinterrupt || g_quit; });
 }
 
 void QueueDpc(u32 kdpc)
@@ -315,6 +336,7 @@ void StartVblank()
     }).detach();
     // the interrupt thread: vblank at 60 Hz, service routines of asserted lines, DPCs
     GuestThread* t = NewGuestThread(0x10000, 0, "interrupts");
+    g_interrupt_thread = t;
     StartHostThread(t, [t] {
         auto next = std::chrono::steady_clock::now();
         while (!g_quit)
