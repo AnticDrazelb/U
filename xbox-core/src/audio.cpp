@@ -14,6 +14,7 @@
 namespace xb {
 
 void (*g_audio_sink)(const s16* samples, size_t frames) = nullptr;
+size_t (*g_audio_queued)() = nullptr;
 
 namespace {
 
@@ -172,13 +173,29 @@ void ResetMixer()
 
 void Player()
 {
-    // 10 ms at a time: 480 stereo frames
+    // 10 ms at a time: 480 stereo frames, on the clock; where the sink says what it holds (the
+    // console's sound device, which plays on its own clock) a little faster or slower to keep about
+    // 40 ms there: the two clocks never quite agree, and a sink that ran dry or over would be heard
     constexpr size_t kFrames = 480;
+    constexpr size_t kLow = 1024, kHigh = 3072; // frames queued in the sink
     std::vector<s16> pcm(kFrames * 2), spdif(kFrames * 2);
     auto next = std::chrono::steady_clock::now();
+    bool fed = false; // the sink was given sound last time (its fill means something)
     while (!g_quit)
     {
-        next += std::chrono::milliseconds(10);
+        auto period = std::chrono::microseconds(10000);
+        if (g_audio_queued && fed)
+        {
+            const size_t queued = g_audio_queued();
+            if (queued < kLow)
+                period = std::chrono::microseconds(9000);
+            else if (queued > kHigh)
+                period = std::chrono::microseconds(11000);
+        }
+        next += period;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - next > std::chrono::milliseconds(100))
+            next = now; // far behind (a stall): start again from now, not a burst of catching up
         std::this_thread::sleep_until(next);
         bool playing;
         {
@@ -193,6 +210,7 @@ void Player()
             playing = true;
         if (g_audio_sink && playing)
             g_audio_sink(pcm.data(), kFrames);
+        fed = playing;
     }
 }
 
@@ -287,6 +305,13 @@ void WriteReg(u32 offset, u32 size, u32 value)
 
 } // namespace
 
+// what the APU's frame thread has queued here (xemu's throttle() reads it as its stream's), in bytes
+int ApuQueuedBytes()
+{
+    std::lock_guard lock(g_apu_mutex);
+    return int(g_apu_fill * 4);
+}
+
 void MixApuSound(const s16* samples, size_t frames)
 {
     std::lock_guard lock(g_apu_mutex);
@@ -315,3 +340,5 @@ void InitAudio()
 }
 
 } // namespace xb
+
+extern "C" int xb_apu_queued_bytes(void) { return xb::ApuQueuedBytes(); }

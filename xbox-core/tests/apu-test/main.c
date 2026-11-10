@@ -118,11 +118,13 @@ int main(void)
     APU(0x2054) = APU(0x2060) = APU(0x206c) = 0xffff; // the voice lists, empty
     APU(0x2000) = 1 << 3;                          // SECTL: the sample counter running
 
+    // (once the sound's buffering has filled: the frames run ahead of the clock once, at the start)
+    Sleep(200);
     DWORD start = APU(0x200c);
-    Sleep(100);
+    Sleep(500);
     DWORD counted = APU(0x200c) - start;
-    DbgPrint("  100 ms: %u samples counted\n", (unsigned)counted);
-    check("the global sample count runs at 48 kHz", counted > 3800 && counted < 6000);
+    DbgPrint("  500 ms: %u samples counted\n", (unsigned)counted);
+    check("the global sample count runs at 48 kHz", counted > 21600 && counted < 26400);
 
     voice(100, 0, 0, samples - 1, 1);          // 1 kHz, full volume
     voice(101, -4096, 6 * 64, samples - 1, 1); // 500 Hz, -6 dB

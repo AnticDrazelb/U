@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,13 +87,68 @@ int main(int argc, char** argv)
     // --wav: what the program plays, recorded (48 kHz, 16-bit stereo)
     static FILE* wav_file = nullptr;
     static u32 wav_frames = 0;
+    static std::mutex wav_mutex;
     if (!wav.empty() && (wav_file = std::fopen(wav.c_str(), "wb")))
     {
         std::fseek(wav_file, 44, SEEK_SET);
         g_audio_sink = [](const s16* samples, size_t frames) {
+            std::lock_guard lock(wav_mutex);
             std::fwrite(samples, 4, frames, wav_file);
             wav_frames += u32(frames);
         };
+        // XB_WAV_DEVICE=1: recorded as the console's sound device plays it (its ring, prebuffered,
+        // taken 256 frames at a time on its own 48 kHz clock), silences included
+        if (const char* e = std::getenv("XB_WAV_DEVICE"); e && e[0] == '1')
+        {
+            static std::vector<s16> ring(48000 / 4 * 2);
+            static size_t ring_read = 0, ring_write = 0;
+            static std::mutex ring_mutex;
+            g_audio_sink = [](const s16* samples, size_t frames) {
+                std::lock_guard lock(ring_mutex);
+                const size_t n = ring.size() / 2;
+                for (size_t i = 0; i < frames; i++, ring_write++)
+                {
+                    if (ring_write - ring_read >= n)
+                        ring_read++;
+                    ring[(ring_write % n) * 2] = samples[i * 2];
+                    ring[(ring_write % n) * 2 + 1] = samples[i * 2 + 1];
+                }
+            };
+            g_audio_queued = [] {
+                std::lock_guard lock(ring_mutex);
+                return ring_write - ring_read;
+            };
+            std::thread([] {
+                std::vector<s16> grain(256 * 2);
+                bool starved = true;
+                const auto start = std::chrono::steady_clock::now();
+                for (u64 played = 0; !g_quit; played += 256)
+                {
+                    {
+                        std::lock_guard lock(ring_mutex);
+                        const size_t n = ring.size() / 2, have = ring_write - ring_read;
+                        if (starved && have >= 1024)
+                            starved = false;
+                        if (!starved && have < 256)
+                            starved = true;
+                        for (size_t i = 0; i < 256; i++)
+                        {
+                            const bool take = !starved && ring_read < ring_write;
+                            grain[i * 2] = take ? ring[(ring_read % n) * 2] : 0;
+                            grain[i * 2 + 1] = take ? ring[(ring_read % n) * 2 + 1] : 0;
+                            if (take)
+                                ring_read++;
+                        }
+                    }
+                    {
+                        std::lock_guard lock(wav_mutex);
+                        std::fwrite(grain.data(), 4, 256, wav_file);
+                        wav_frames += 256;
+                    }
+                    std::this_thread::sleep_until(start + std::chrono::microseconds((played + 256) * 1000000 / 48000));
+                }
+            }).detach();
+        }
     }
     InitMemory();
     if (const char* trail = std::getenv("XB_FAULT_TRAIL"))
@@ -171,6 +227,7 @@ int main(int argc, char** argv)
         SaveFramebuffer(png);
     if (wav_file)
     {
+        std::lock_guard lock(wav_mutex);
         // the RIFF header, now that the length is known
         const u32 data = wav_frames * 4;
         const u32 header[11] = {0x46464952, 36 + data, 0x45564157, 0x20746d66, 16, 0x00020001, 48000, 48000 * 4,

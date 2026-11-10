@@ -283,6 +283,8 @@ void GetRumble(u16& left, u16& right);
 
 // Sound: the AC'97's PCM output, 48 kHz 16-bit stereo, as it plays (audio.cpp)
 extern void (*g_audio_sink)(const s16* samples, size_t frames);
+// the frames the sink holds, not yet played (a sound device's queue); null: a sink with no queue
+extern size_t (*g_audio_queued)();
 void StartVblank();
 
 } // namespace xb

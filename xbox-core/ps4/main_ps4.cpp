@@ -272,21 +272,35 @@ void StartAudio()
     if (port < 0)
         return;
     g_audio_sink = AudioSink;
+    g_audio_queued = [] {
+        std::lock_guard lock(g_audio_mutex);
+        return size_t(g_ring_write - g_ring_read);
+    };
     std::thread([port] {
         std::vector<int16_t> grain(256 * 2);
+        // a little held before playing (and again after the ring ran dry): one short silence where
+        // the producer falls behind, not a grain of silence at every hiccup
+        constexpr size_t kPrebuffer = 1024; // frames: 21 ms
+        bool starved = true;
         for (;;)
         {
             {
                 std::unique_lock lock(g_audio_mutex);
-                g_audio_cv.wait_for(lock, std::chrono::milliseconds(20),
-                                    [] { return g_ring_write - g_ring_read >= 256; });
+                g_audio_cv.wait_for(lock, std::chrono::milliseconds(20), [&] {
+                    return g_ring_write - g_ring_read >= (starved ? kPrebuffer : 256);
+                });
+                const size_t have = g_ring_write - g_ring_read;
+                if (starved && have >= kPrebuffer)
+                    starved = false;
+                if (!starved && have < 256)
+                    starved = true;
                 for (size_t i = 0; i < 256; i++)
                 {
-                    const bool have = g_ring_read < g_ring_write;
+                    const bool take = !starved && g_ring_read < g_ring_write;
                     const size_t at = (g_ring_read % kRingFrames) * 2;
-                    grain[i * 2] = have ? g_ring[at] : 0;
-                    grain[i * 2 + 1] = have ? g_ring[at + 1] : 0;
-                    if (have)
+                    grain[i * 2] = take ? g_ring[at] : 0;
+                    grain[i * 2 + 1] = take ? g_ring[at + 1] : 0;
+                    if (take)
                         g_ring_read++;
                 }
             }
