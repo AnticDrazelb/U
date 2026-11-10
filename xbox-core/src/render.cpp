@@ -114,6 +114,8 @@ void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask)
     if (s.bytes == 4)
     {
         const u32 old = Read<u32>(p);
+        if (s.format == 0x6 || s.format == 0x7) // X1A7R8G8B8: alpha's top 7 bits in bits 24-30
+            argb = (argb & 0x00ffffffu) | ((argb >> 25) << 24), mask = (mask & 0x00ffffffu) | (mask & 0xff000000u ? 0x7f000000u : 0);
         Write<u32>(p, FixedBits(s.format, (old & ~mask) | (argb & mask)));
     }
     else if (s.format == 0x3) // R5G6B5
@@ -128,7 +130,19 @@ u32 ReadPixel(const Surface& s, u32 x, u32 y)
 {
     const u32 p = PixelAddress(s, x, y);
     if (s.bytes == 4)
-        return Read<u32>(p);
+    {
+        // a format without alpha reads alpha 1 whatever its X bits hold; X1A7R8G8B8's 7 bits widened
+        // (nxdk_pgraph_tests' Blend_surface captures: blending by the destination's alpha)
+        const u32 v = Read<u32>(p);
+        if (s.format == 0x4 || s.format == 0x5)
+            return v | 0xff000000u;
+        if (s.format == 0x6 || s.format == 0x7)
+        {
+            const u32 a7 = (v >> 24) & 0x7f;
+            return (v & 0x00ffffffu) | ((a7 << 1) | (a7 >> 6)) << 24;
+        }
+        return v;
+    }
     if (s.format == 0x3)
     {
         const u16 v = Read<u16>(p);

@@ -1109,6 +1109,11 @@ bool DrawTriangles(const Vertex* vertices, u32 count)
     const u32 m = k.Get(0x358);
     PipelineKey key{};
     key.blend = blend.enabled, key.sfactor = blend.sfactor, key.dfactor = blend.dfactor, key.equation = blend.equation;
+    // a surface format without alpha (X1R5G5B5, R5G6B5, X8R8G8B8) reads the destination's alpha as 1;
+    // the GPU's image keeps an alpha all the same: the factors that read it, as with 1
+    if (cs.format >= 0x1 && cs.format <= 0x5)
+        for (u32* f : {&key.sfactor, &key.dfactor})
+            *f = *f == 0x0304 ? 0x0001 : *f == 0x0305 ? 0x0000 : *f == 0x0308 ? 0x0000 : *f;
     key.has_depth = has_depth, key.depth_test = depth.test, key.depth_write = depth.write, key.depth_func = depth.func;
     key.stencil = has_depth && depth.stencil;
     key.depth_shader = depth_shader;
