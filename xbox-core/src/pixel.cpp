@@ -256,7 +256,20 @@ V4 TexelRaw(const Texture& t, u32 x, u32 y)
     case 0x3a: case 0x3f: return {c8(v), c8(v >> 8), c8(v >> 16), c8(v >> 24)};        // A8B8G8R8
     case 0x3b: case 0x40: return {c8(v >> 8), c8(v >> 16), c8(v >> 24), c8(v)};        // B8G8R8A8
     case 0x3c: case 0x41: return {c8(v >> 24), c8(v >> 16), c8(v >> 8), c8(v)};        // R8G8B8A8
-    case 0x2c: case 0x30: case 0x32: case 0x35:                                        // 16-bit depth/luminance
+    case 0x32: case 0x35: // Y16: red 1, green the high byte, blue the low (the console's captures; as xemu)
+        return {1, c8(v >> 8), c8(v), 1};
+    case 0x24: case 0x25: // YUY2 (Y0 U Y1 V) and UYVY (U Y0 V Y1): a pair of texels shares U and V; BT.601
+    {
+        const u32 pair = p & ~3u;
+        const u32 w = Read<u32>(pair);
+        const bool yuy2 = t.format == 0x24;
+        const int luma = int((w >> (yuy2 ? ((x & 1) ? 16 : 0) : ((x & 1) ? 24 : 8))) & 255) - 16;
+        const int u = int((w >> (yuy2 ? 8 : 0)) & 255) - 128, vv = int((w >> (yuy2 ? 24 : 16)) & 255) - 128;
+        auto clip = [](int c) { return std::clamp(c, 0, 255) / 255.f; };
+        return {clip((298 * luma + 409 * vv + 128) >> 8), clip((298 * luma - 100 * u - 208 * vv + 128) >> 8),
+                clip((298 * luma + 516 * u + 128) >> 8), 1};
+    }
+    case 0x2c: case 0x30:                                                              // 16-bit depth
     {
         const float l = (v & 0xffff) / 65535.f;
         return {l, l, l, 1};
