@@ -1227,24 +1227,49 @@ struct Fragments
         u32 ax, ay;
         AntiAliasing(ax, ay);
         const float width = float(g_kelvin.Get(0x380) & 0x1ff) / 8.f * float(ax);
+        if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(b.x) || !std::isfinite(b.y))
+            return;
         const double dx = double(b.x) - a.x, dy = double(b.y) - a.y, len = std::sqrt(dx * dx + dy * dy);
         if (len == 0 || width <= 0)
             return;
         const double ux = dx / len, uy = dy / len, half = width / 2.0;
-        // the rectangle's corners bound the pixels to look at
+        // the rows the rectangle's corners span, within the surface
         const double nx = -uy * half, ny = ux * half;
-        const double xs[4] = {a.x + nx, a.x - nx, b.x + nx, b.x - nx}, ys[4] = {a.y + ny, a.y - ny, b.y + ny, b.y - ny};
-        const int px0 = int(std::floor(*std::min_element(xs, xs + 4))), px1 = int(std::ceil(*std::max_element(xs, xs + 4)));
-        const int py0 = int(std::floor(*std::min_element(ys, ys + 4))), py1 = int(std::ceil(*std::max_element(ys, ys + 4)));
+        const double ys[4] = {a.y + ny, a.y - ny, b.y + ny, b.y - ny};
+        const int py0 = int(std::max(std::floor(*std::min_element(ys, ys + 4)), double(y0)));
+        const int py1 = int(std::min(std::ceil(*std::max_element(ys, ys + 4)), double(cs.height) - 1));
         for (int y = py0; y <= py1; y++)
-            for (int x = px0; x <= px1; x++)
+        {
+            // along = (px - a.x) ux + ry uy in [0, len), across = ry ux - (px - a.x) uy in [-half, half),
+            // px the pixel centre: each a range of px on this row (a pixel wider each side; the test
+            // below is exact)
+            const double ry = y + 0.5 - a.y;
+            double lo = -1e300, hi = 1e300;
+            auto range = [&](double k, double c, double from, double to) { // from <= k * (px - a.x) + c < to
+                if (k == 0)
+                {
+                    if (c < from || c >= to)
+                        lo = 1, hi = 0;
+                    return;
+                }
+                const double p = (from - c) / k, q = (to - c) / k;
+                lo = std::max(lo, std::min(p, q)), hi = std::min(hi, std::max(p, q));
+            };
+            range(ux, ry * uy, 0, len);
+            range(-uy, ry * ux, -half, half);
+            if (lo > hi)
+                continue;
+            const int xs = int(std::max(std::floor(a.x + lo - 0.5) - 1, double(x0)));
+            const int xe = int(std::min(std::ceil(a.x + hi - 0.5) + 1, double(cs.width) - 1));
+            for (int x = xs; x <= xe; x++)
             {
-                const double rx = x + 0.5 - a.x, ry = y + 0.5 - a.y;
+                const double rx = x + 0.5 - a.x;
                 const double along = rx * ux + ry * uy, across = ry * ux - rx * uy;
                 if (along < 0 || along >= len || across < -half || across >= half)
                     continue;
                 Pixel(x, y, a, b, float(along / len));
             }
+        }
     }
 
     // a point: a square of its size (oPts; SET_POINT_SIZE when a program leaves it) around it; with
