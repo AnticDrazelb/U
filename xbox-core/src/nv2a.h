@@ -13,5 +13,7 @@ void RenderOtherClass(u32 cls, u32 method, u32 parameter);
 
 // nv2a.cpp: the guest address a DMA object (its instance in RAMIN) starts at; its limit.
 u32 Nv2aDmaAddress(u32 instance, u32* limit = nullptr);
+// a graphics object's class, from its instance in RAMIN (0: none)
+u32 Nv2aObjectClass(u32 instance);
 
 } // namespace xb

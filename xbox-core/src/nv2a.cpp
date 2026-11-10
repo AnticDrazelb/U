@@ -537,6 +537,11 @@ u32 Nv2aDisplayStart()
     return R(PCRTC_START);
 }
 
+u32 Nv2aObjectClass(u32 instance)
+{
+    return instance ? Ramin32(instance) & 0xff : 0;
+}
+
 u32 Nv2aDmaAddress(u32 instance, u32* limit)
 {
     const Dma d = LoadDma(instance);

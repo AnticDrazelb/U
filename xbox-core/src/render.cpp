@@ -324,7 +324,10 @@ u32 g_beta = 0;
 struct ImageBlit
 {
     u32 operation = 3, in_x = 0, in_y = 0, out_x = 0, out_y = 0;
+    bool clipped = false; // bound to a clip rectangle object (class 0x19)
 } g_blit;
+// the clip rectangle object (0x19): SET_POINT, SET_SIZE
+u32 g_clip_x = 0, g_clip_y = 0, g_clip_w = 0x7fff, g_clip_h = 0x7fff;
 
 void Blit(u32 width, u32 height)
 {
@@ -344,8 +347,19 @@ void Blit(u32 width, u32 height)
     const u32 source_base = Nv2aDmaAddress(s.dma_source), dest_base = Nv2aDmaAddress(s.dma_dest);
     if (!source_base || !dest_base)
         return;
-    const u32 source = source_base + s.source_offset + g_blit.in_y * s.source_pitch + g_blit.in_x * bpp;
-    const u32 dest = dest_base + s.dest_offset + g_blit.out_y * s.dest_pitch + g_blit.out_x * bpp;
+    // bound to a clip rectangle: only the destination pixels inside it (the console's captures,
+    // nxdk_pgraph_tests' ImgBlt_Clip)
+    u32 in_x = g_blit.in_x, in_y = g_blit.in_y, out_x = g_blit.out_x, out_y = g_blit.out_y;
+    if (g_blit.clipped)
+    {
+        const u32 x0 = std::max(out_x, g_clip_x), y0 = std::max(out_y, g_clip_y);
+        const u32 x1 = std::min(out_x + width, g_clip_x + g_clip_w), y1 = std::min(out_y + height, g_clip_y + g_clip_h);
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        in_x += x0 - out_x, in_y += y0 - out_y, out_x = x0, out_y = y0, width = x1 - x0, height = y1 - y0;
+    }
+    const u32 source = source_base + s.source_offset + in_y * s.source_pitch + in_x * bpp;
+    const u32 dest = dest_base + s.dest_offset + out_y * s.dest_pitch + out_x * bpp;
     const u32 row_bytes = width * bpp;
     if (g_verbose >= 2)
         Log("nv2a: blit %ux%u from %#x (pitch %u) to %#x (pitch %u), operation %u", width, height, source, s.source_pitch,
@@ -395,9 +409,22 @@ void RenderOtherClass(u32 cls, u32 method, u32 parameter)
         if (method == 0x300 || method == 0)
             return;
         break;
+    case 0x19: // clip rectangle
+        if (method == 0x300)
+        {
+            g_clip_x = parameter & 0xffff, g_clip_y = parameter >> 16;
+            return;
+        }
+        if (method == 0x304)
+        {
+            g_clip_w = parameter & 0xffff, g_clip_h = parameter >> 16;
+            return;
+        }
+        break;
     case 0x9f: // image blit
         switch (method)
         {
+        case 0x188: g_blit.clipped = Nv2aObjectClass(parameter) == 0x19; return; // SET_CONTEXT_CLIP_RECTANGLE
         case 0x19c: return; // its context surfaces: the one 0x62 object
         case 0x2fc: g_blit.operation = parameter; return;
         case 0x300: g_blit.in_x = parameter & 0xffff, g_blit.in_y = parameter >> 16; return;
