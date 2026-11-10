@@ -430,6 +430,8 @@ void WriteReg(u32 offset, u32 size, u32 value)
             R(PFIFO_CACHE1_DMA_PUT) = value;
             g_kick.notify_all();
         }
+        else if ((offset & 0xffff) == 0x48) // REF: the driver's own counter, read back as written (as xemu has it)
+            R(PFIFO_CACHE1_REF) = value;
         return;
     }
     if (offset >= kPramin)
