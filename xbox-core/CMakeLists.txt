@@ -23,8 +23,9 @@ set(XEMU_DIR src/third_party/xemu/hw/xbox/mcpx/apu)
 set(XEMU_APU_SOURCES ${XEMU_DIR}/apu.c ${XEMU_DIR}/vp/vp.c ${XEMU_DIR}/monitor.c ${XEMU_DIR}/debug.c ${XEMU_DIR}/dsp/gp_ep.c
     ${XEMU_DIR}/dsp/dsp.c ${XEMU_DIR}/dsp/dsp_c.c ${XEMU_DIR}/dsp/dsp_dma.c ${XEMU_DIR}/dsp/interp/dsp_cpu.c
     src/third_party/libsamplerate/samplerate.c src/third_party/libsamplerate/src_sinc.c
-    src/third_party/libsamplerate/src_linear.c src/third_party/libsamplerate/src_zoh.c)
-set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp ${XEMU_APU_SOURCES} src/nic.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
+    src/third_party/libsamplerate/src_linear.c src/third_party/libsamplerate/src_zoh.c
+    src/third_party/xemu/hw/xbox/mcpx/nvnet/nvnet.c src/third_party/xemu/shim/xb_qemu_timer.c)
+set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/xemu_glue.cpp ${XEMU_APU_SOURCES} src/nic.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
 # The GPU path's shaders: SPIR-V made at build time (nothing is compiled at run time, which the PS4
 # couldn't do), as C arrays the code includes
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
@@ -125,10 +126,10 @@ endif()
 target_include_directories(xbox-core PRIVATE src ${CMAKE_BINARY_DIR}/shaders)
 # xemu's code: its QEMU headers stood in for by shim/
 set_source_files_properties(${XEMU_APU_SOURCES} PROPERTIES
-    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp/interp;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/libsamplerate"
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp/interp;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/libsamplerate;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/hw/xbox/mcpx/nvnet"
     COMPILE_DEFINITIONS "HAVE_STDBOOL_H;PACKAGE=\"libsamplerate\";VERSION=\"0.2.2\";ENABLE_SINC_FAST_CONVERTER;CPU_CLIPS_POSITIVE=0;CPU_CLIPS_NEGATIVE=0"
     COMPILE_OPTIONS "-w")
-set_source_files_properties(src/apu.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu")
+set_source_files_properties(src/apu.cpp src/xemu_glue.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu")
 if (NOT PS4)
     target_link_libraries(xbox-core PRIVATE ${CMAKE_DL_LIBS}) # libvulkan, opened at run time
 endif()

@@ -11,11 +11,6 @@
 
 extern "C" {
 #include "hw/xbox/mcpx/apu/apu.h"
-#include "ui/xemu-settings.h"
-
-// xemu's audio settings at its defaults, but 2 voice workers (the PS4's cores are the program's too)
-struct XbXemuConfig g_config = {{false, false, true, 1.0f, {2}}};
-struct AddressSpace { int unused; } address_space_memory;
 }
 
 namespace xb {
@@ -25,12 +20,6 @@ void MixApuSound(const s16* samples, size_t frames); // audio.cpp
 namespace {
 
 constexpr u32 kBase = 0xfe800000, kSize = 0x80000, kIrq = 5;
-
-u32 Phys(u64 address, u32 bytes)
-{
-    const u32 g = PhysToGuest(u32(address));
-    return g && GuestMapped(g, bytes) ? g : 0;
-}
 
 u32 ReadReg(u32 offset, u32 size) { return u32(xb_mcpx_apu_read(offset, size)); }
 
@@ -55,14 +44,5 @@ void InitApu()
 
 } // namespace xb
 
-// what xemu's APU calls (its shims: src/third_party/xemu/shim)
-extern "C" {
-uint32_t xb_phys_ld32(uint64_t a) { const xb::u32 g = xb::Phys(a, 4); return g ? xb::Read<xb::u32>(g) : 0; }
-uint32_t xb_phys_ld16(uint64_t a) { const xb::u32 g = xb::Phys(a, 2); return g ? xb::Read<xb::u16>(g) : 0; }
-uint32_t xb_phys_ld8(uint64_t a) { const xb::u32 g = xb::Phys(a, 1); return g ? xb::Read<xb::u8>(g) : 0; }
-void xb_phys_st32(uint64_t a, uint32_t v) { if (const xb::u32 g = xb::Phys(a, 4)) xb::Write<xb::u32>(g, v); }
-void xb_phys_st8(uint64_t a, uint32_t v) { if (const xb::u32 g = xb::Phys(a, 1)) xb::Write<xb::u8>(g, xb::u8(v)); }
-uint64_t xb_ram_size(void) { return xb::kContiguousSize; }
-void xb_apu_irq(int level) { xb::SetIrq(5, level != 0); }
-void xb_apu_sound(const int16_t* stereo, int frames) { xb::MixApuSound(stereo, size_t(frames)); }
-}
+// where xemu's APU's sound goes
+extern "C" void xb_apu_sound(const int16_t* stereo, int frames) { xb::MixApuSound(stereo, size_t(frames)); }

@@ -6,3 +6,12 @@
 static inline uint32_t ldl_le_p(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline void stl_le_p(void *p, uint32_t v) { memcpy(p, &v, 4); }
 #endif
+#ifndef XB_XEMU_BSWAP_LE
+#define XB_XEMU_BSWAP_LE
+#define cpu_to_le16(x) ((uint16_t)(x))
+#define cpu_to_le32(x) ((uint32_t)(x))
+#define le16_to_cpu(x) ((uint16_t)(x))
+#define le32_to_cpu(x) ((uint32_t)(x))
+static inline uint32_t lduw_le_p(const void *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+static inline void stw_le_p(void *p, uint16_t v) { memcpy(p, &v, 2); }
+#endif

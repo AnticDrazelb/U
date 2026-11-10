@@ -337,6 +337,7 @@ void xb_mcpx_apu_init(uint8_t *ram_ptr)
     MCPXAPUState *d = calloc(1, sizeof(MCPXAPUState));
     g_state = d;
     d->ram_ptr = ram_ptr;
+    d->parent_obj.irq = 5; /* xbox-core: IRQ 5 */
 
     d->set_irq = false;
     d->exiting = false;
