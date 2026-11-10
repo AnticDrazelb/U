@@ -446,9 +446,13 @@ V4 SampleLevel(const Texture& t, float u, float v, bool linear)
         return Texel(t, u32(ax), u32(ay));
     };
     // nearest: a pixel exactly on a texel's edge takes the texel after it; the interpolated coordinate
-    // can come out a hair under the edge, so it's moved on by 1/256 of a texel (as the GPU path does)
+    // can come out a hair under the edge (float error, relative to its size), so it's moved on by about
+    // that much: small enough not to move an edge visibly when a texture is magnified a lot
     if (!linear)
-        return fetch(int(std::floor(u + 1.f / 256.f)), int(std::floor(v + 1.f / 256.f)));
+    {
+        auto nudge = [](float c) { return c + std::max(std::fabs(c), 1.f) * 4e-6f; };
+        return fetch(int(std::floor(nudge(u))), int(std::floor(nudge(v))));
+    }
     // bilinear
     const float fu = u - 0.5f, fv = v - 0.5f;
     const int x0 = int(std::floor(fu)), y0 = int(std::floor(fv));
@@ -1129,11 +1133,11 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
         // nearest filtering (mag 1; min 1 or 3): a pixel exactly on a texel's edge takes the texel
         // after it, as the software path's floor(u) does; the GPU's interpolated coordinate can come
         // out a hair under the edge (an nxdk_pgraph_tests checkerboard a pixel off at every square's
-        // edge): moved on by 1/256 of a texel, past such rounding and short of any other texel
+        // edge): moved on by a few float steps, past such rounding and short of moving an edge visibly
         const u32 mag = (t.filter >> 24) & 0xf, min = (t.filter >> 16) & 0xff;
         u.tex_scale[s][2] = u.tex_scale[s][3] = 0;
-        if (mag == 1 && (min == 1 || min == 3))
-            u.tex_scale[s][2] = 1.f / 256.f / float(t.width), u.tex_scale[s][3] = 1.f / 256.f / float(t.height);
+        if (mag == 1 && (min == 1 || min == 3)) // a few float steps in [0, 1]: not a visible fraction of a magnified texel
+            u.tex_scale[s][2] = u.tex_scale[s][3] = 2e-6f;
     }
     blend.enabled = ps.blend;
     blend.sfactor = ps.blend_sfactor, blend.dfactor = ps.blend_dfactor, blend.equation = ps.blend_equation;

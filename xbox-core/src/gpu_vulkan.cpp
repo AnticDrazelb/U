@@ -1069,6 +1069,8 @@ bool DrawTriangles(const Vertex* vertices, u32 count)
     BlendState blend;
     if (!GpuPixelSetup(u, tex, blend))
         return Declined(3);
+    if (!(g_kelvin.Get(0x290) & (1u << 20)))
+        return Declined(8); // linear (not perspective-correct) interpolation: in software
     // the w-buffer and the polygon offset (filled triangles: SET_POLY_OFFSET_FILL_ENABLE): the depth
     // written by the shader that does them
     const bool w_buffer = g_kelvin.Get(0x290) & (1u << 16), offset_on = g_kelvin.Get(0x338);

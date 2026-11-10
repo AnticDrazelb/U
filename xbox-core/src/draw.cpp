@@ -1119,6 +1119,7 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const int y0 = std::max<int>(int(clip_y0), int(std::floor(std::min({a.y, b.y, c.y}))));
     const int y1 = std::min<int>(int(cs.height) - 1, int(std::ceil(std::max({a.y, b.y, c.y}))));
     const DepthStencil ds;
+    const bool perspective = k.Get(0x290) & (1u << 20); // SET_CONTROL0's TEXTURE_PERSPECTIVE_ENABLE
     // the polygon offset's slope: the steepest of z's (or with the w-buffer 1/w's) gradients
     DepthStencil::Offset offset;
     if (ds.active)
@@ -1220,8 +1221,12 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
                 continue;
             const float wa = float(ea * inv_area), wb = float(eb * inv_area), wc = float(ec * inv_area);
             // perspective-correct interpolation of the outputs (and w: 1 / the interpolated 1/w)
+            // (with SET_CONTROL0's TEXTURE_PERSPECTIVE_ENABLE clear: the outputs interpolated linearly
+            // on the screen, as the console's captures of Texture_perspective show)
             const float pa0 = wa * a.inv_w, pb0 = wb * b.inv_w, pc0 = wc * c.inv_w;
-            const float norm = 1.f / (pa0 + pb0 + pc0), pa = pa0 * norm, pb = pb0 * norm, pc = pc0 * norm;
+            const float norm = 1.f / (pa0 + pb0 + pc0);
+            const float pa = perspective ? pa0 * norm : wa, pb = perspective ? pb0 * norm : wb,
+                        pc = perspective ? pc0 * norm : wc;
             float z = 0;
             // w for the w-buffer in doubles, from the edge functions (exact on the 1/16 grid): equal w's
             // give exactly that w (in float, 0.99999994 for 1, stored as 0 where the console has 1)
@@ -1302,9 +1307,11 @@ struct Fragments
             return;
         PixelInputs in;
         in.lod[0] = in.lod[1] = in.lod[2] = in.lod[3] = 0;
+        const bool perspective = g_kelvin.Get(0x290) & (1u << 20); // else linearly along the line
         for (int n = 0; n < used_count; n++)
             for (int i = 0; i < 4; i++)
-                in.v[used[n]][i] = (a.o[used[n]][i] * pa + b.o[used[n]][i] * pb) * norm;
+                in.v[used[n]][i] = perspective ? (a.o[used[n]][i] * pa + b.o[used[n]][i] * pb) * norm
+                                               : a.o[used[n]][i] * (1 - t) + b.o[used[n]][i] * t;
         if (sprite)
             for (int i = 0; i < 4; i++)
                 in.v[12][i] = (*sprite)[i];

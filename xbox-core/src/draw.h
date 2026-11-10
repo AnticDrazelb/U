@@ -13,12 +13,14 @@ struct KelvinState
     u32 regs[0x2000 / 4] = {};
     // what a program finds before it sets them: SET_COLOR_MASK with every channel on (pbkit and
     // Direct3D set it so at start-up; a mask of 0 writes no colour)
-    // the colour mask with every channel on, lines 1 pixel wide (SET_LINE_WIDTH in eighths), as
-    // pbkit and Direct3D set them: a program that never sets them gets what it would on the console
+    // the colour mask with every channel on, lines 1 pixel wide (SET_LINE_WIDTH in eighths),
+    // perspective-correct texturing, as pbkit and Direct3D set them: a program that never sets them
+    // gets what it would on the console
     KelvinState()
     {
         regs[0x358 / 4] = 0x01010101;
         regs[0x380 / 4] = 8;
+        regs[0x290 / 4] = 1u << 20; // SET_CONTROL0: perspective-correct texturing, as pbkit and Direct3D set it
     }
     u32 Get(u32 method) const { return regs[method / 4]; }
     float F(u32 method) const
