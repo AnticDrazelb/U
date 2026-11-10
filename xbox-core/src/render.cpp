@@ -480,6 +480,9 @@ void RenderOtherClass(u32 cls, u32 method, u32 parameter)
         switch (method)
         {
         case 0x188: g_blit.clipped = Nv2aObjectClass(parameter) == 0x19; return; // SET_CONTEXT_CLIP_RECTANGLE
+        // its other context objects (colour key, pattern, ROP, beta1, beta4): bound, not used by the
+        // operations done here (SRCCOPY, BLEND_AND with the 0x12 beta)
+        case 0x184: case 0x18c: case 0x190: case 0x194: case 0x198: return;
         case 0x19c: return; // its context surfaces: the one 0x62 object
         case 0x2fc: g_blit.operation = parameter; return;
         case 0x300: g_blit.in_x = parameter & 0xffff, g_blit.in_y = parameter >> 16; return;
