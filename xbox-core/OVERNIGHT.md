@@ -157,3 +157,15 @@ retail game is to need it. Each item says how it is checked without the game.
   Full software run: 2307 -> 2425 of 3110 (78.0%) before the fog and antialiasing fixes (about
   +45 more). Open: the shadow comparator's raw-value tests (the console compares in units these
   tests don't make plain), bump mapping, the signed blend equations.
+
+- **4 (continued): w, borders, colour key and alpha kill, points, surface alpha** (eec94b1, 3bf6b76,
+  a022514, a7fefd2, 8581dd7). Positions' w clamped away from 0 and infinity as the NV2A does, only
+  negative w clipped (W_param 16 -> 41/110; ClassiCube checked in both renderers). Textures with their
+  own border texels (Texture_border 1 -> 12/18). Alpha kill (Direct3D's ALPHAKILL, used for
+  alpha-tested foliage) and the colour key were not done at all: now in both renderers (Color_key
+  6 -> 18/18 both). Points: SET_POINT_SIZE unless point params, pixels by coverage (Point_size
+  8 -> 17/21, Point_params 16 -> 21/25, Point_sprite 4/4). Surface formats' alpha as blending
+  reads it (Blend_surface software 16 -> 24/32, GPU 22 -> 32/32). Tried and kept out: rounding
+  vertex positions to the 1/16 grid instead of truncating (Blend_surface 24 -> 9).
+- **05:20: the session's machine restarted** (the queued hourly check-ins arrived at once); the
+  GPU path's full run and the FreeBSD VM were restarted; nothing committed was lost.
