@@ -154,6 +154,35 @@ int main(void)
             check("AC97: and goes once the box's status is cleared", (*glob_sta & 0x10) == 0);
             MmFreeContiguousMemory(desc);
         }
+        // the GP DSP runs its microcode: booted from scratch memory (its scatter-gather list), as
+        // DirectSound loads it: "bset #0, X:$10" then "jmp $1"; the frames running, X:$10 becomes 1
+        {
+            ULONG *table = MmAllocateContiguousMemory(4096), *code = MmAllocateContiguousMemory(4096);
+            for (int i = 0; i < 1024; i++)
+                code[i] = 0;
+            code[0] = 0x0A1020; // bset #0, X:$10
+            code[1] = 0x0C0001; // jmp $1
+            table[0] = MmGetPhysicalAddress(code);
+            table[1] = 0;
+            volatile ULONG *apu = (volatile ULONG *)0xfe800000;
+            apu[0x2040 / 4] = MmGetPhysicalAddress(table); // GPSADDR
+            apu[0x20d4 / 4] = 0;                          // GPSMAXSGE: one page
+            volatile ULONG *gp = (volatile ULONG *)0xfe830000;
+            gp[0x10] = 0;
+            gp[0xfffc / 4] = 0;            // in reset
+            gp[0xfffc / 4] = 3;            // out: the bootstrap copies the microcode in
+            const ULONG sectl = apu[0x2000 / 4];
+            apu[0x2000 / 4] = sectl | 0x8;  // the frames run (XCNTMODE)
+            const ULONG start = KeTickCount;
+            while (gp[0x10] != 1 && KeTickCount - start < 500)
+                ;
+            check("APU: the GP DSP runs the microcode it boots from scratch memory", gp[0x10] == 1);
+            check("APU: its program memory holds that microcode", gp[0xa000 / 4] == 0x0A1020 && gp[0xa004 / 4] == 0x0C0001);
+            gp[0xfffc / 4] = 0;
+            apu[0x2000 / 4] = sectl;
+            MmFreeContiguousMemory(table);
+            MmFreeContiguousMemory(code);
+        }
         // string copies to and from device memory (DirectSound copies the GP DSP's memory with rep
         // movsd): rep stosd in, rep movsd out, then a backwards rep movsd in from RAM
         {

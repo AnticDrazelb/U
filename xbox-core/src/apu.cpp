@@ -2,9 +2,12 @@
 // methods (0x20000 on) and keeps the voices (128 bytes each, an array in guest memory at
 // NV_PAPU_VPVADDR) and their lists; the voice processor mixes every active voice, each 32-sample frame
 // at 48 kHz, into 32 mix bins. The GP and EP DSPs (Motorola 56300s running DirectSound's effects and
-// encoder microcode) aren't run: their memories hold what is written there, and the sound heard is the
-// voices' own mix, at each voice's loudest bin volume (as xemu's voice-processor monitor). Register,
-// method and voice layouts as xemu documents them (hw/xbox/mcpx/apu); the code is this core's own.
+// encoder microcode) run on xemu's DSP56300 interpreter (src/third_party/xemu-dsp, GPL-2), driven as
+// xemu drives them with its DSP option off: 1000 cycles of the GP each frame, of the EP each 8th, their
+// scratch and FIFO DMA through the APU's scatter-gather lists, the EP's main output silent; the sound
+// heard is the voices' own mix, at each voice's loudest bin volume (xemu's voice-processor monitor).
+// DirectSound waits on the DSPs' microcode at start-up (Halo spins on it). Register, method and voice
+// layouts as xemu documents them (hw/xbox/mcpx/apu); the GP/EP glue follows xemu's gp_ep.c.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -14,6 +17,10 @@
 
 #include "core.h"
 #include "devices.h"
+
+extern "C" {
+#include "third_party/xemu-dsp/dsp.h"
+}
 
 namespace xb {
 
@@ -45,6 +52,9 @@ u32 g_regs[0x20000 / 4] = {};
 u32 g_gp_regs[0x10000 / 4] = {}, g_ep_regs[0x10000 / 4] = {}; // the DSPs' memories and registers, as written
 u64 g_frames = 0;
 bool g_irq_level = false;
+DSPState* g_gp = nullptr;
+DSPState* g_ep = nullptr;
+u32 g_ep_frame_div = 0;
 
 u32& Reg(u32 offset) { return g_regs[offset / 4]; }
 
@@ -662,6 +672,8 @@ void Frame(float out[kFrame][2])
     }
 }
 
+void DspFrame(const float out[kFrame][2]); // below
+
 void Thread()
 {
     // 15 frames (480 samples, 10 ms) at a time
@@ -684,6 +696,7 @@ void Thread()
             {
                 float out[kFrame][2];
                 Frame(out);
+                DspFrame(out);
                 g_frames++;
                 for (int s = 0; s < kFrame; s++)
                     for (int c = 0; c < 2; c++)
@@ -700,6 +713,183 @@ void Thread()
     }
 }
 
+// ---- the GP and EP DSPs (xemu's gp_ep.c, adapted): scratch memory and FIFOs reach guest memory
+// through scatter-gather lists of 4 KiB pages (8-byte entries: the page's physical address, control)
+
+constexpr u32 GPSADDR = 0x2040, GPFADDR = 0x2044, EPSADDR = 0x2048, EPFADDR = 0x204c, GPSMAXSGE = 0x20d4,
+              GPFMAXSGE = 0x20d8, EPSMAXSGE = 0x20dc, EPFMAXSGE = 0x20e0, GPOFBASE0 = 0x3024, GPIFBASE0 = 0x3064,
+              EPOFBASE0 = 0x4024, EPIFBASE0 = 0x4064; // a FIFO's base, end and cur at +0, +4, +8; FIFOs 0x10 apart
+constexpr u32 kDspRst = 0xfffc, kRstBits = 3; // GPRST/EPRST: GPRST | GPDSPRST running
+
+void ScatterGather(u32 sge_base, u32 max_sge, u8* ptr, u32 addr, size_t len, bool to_guest)
+{
+    u32 entry = addr / 4096, in_page = addr % 4096, chunk = 4096 - in_page;
+    while (len > 0)
+    {
+        if (entry > max_sge)
+            return;
+        const u32 at = PhysToGuest(sge_base + entry * 8);
+        const u32 page = at && GuestMapped(at, 4) ? Read<u32>(at) : 0;
+        chunk = u32(std::min<size_t>(chunk, len));
+        const u32 guest = PhysToGuest(page + in_page);
+        if (guest && GuestMapped(guest, chunk))
+        {
+            if (to_guest)
+                std::memcpy(Ptr<u8>(guest), ptr, chunk);
+            else
+                std::memcpy(ptr, Ptr<u8>(guest), chunk);
+        }
+        else if (!to_guest)
+            std::memset(ptr, 0, chunk);
+        ptr += chunk;
+        len -= chunk;
+        entry++;
+        in_page = 0;
+        chunk = 4096;
+    }
+}
+
+u32 CircularScatterGather(u32 sge_base, u32 max_sge, u8* ptr, u32 base, u32 end, u32 cur, size_t len, bool to_guest)
+{
+    if (end <= base)
+        return cur;
+    while (len > 0)
+    {
+        const u32 chunk = u32(std::min<size_t>(end - cur, len));
+        ScatterGather(sge_base, max_sge, ptr, cur, chunk, to_guest);
+        ptr += chunk;
+        len -= chunk;
+        cur += chunk;
+        if (cur >= end)
+            cur = base;
+    }
+    return cur;
+}
+
+void FifoRw(u32 out_base, u32 in_base, u32 count_out, u32 count_in, u32 sge, u32 max_sge, u8* ptr, unsigned index,
+            size_t len, bool to_guest)
+{
+    if (index >= (to_guest ? count_out : count_in))
+        return;
+    const u32 r = (to_guest ? out_base : in_base) + 0x10 * index;
+    const u32 base = Reg(r) & 0xffffff, end = Reg(r + 4) & 0xffffff;
+    u32 cur = Reg(r + 8) & 0xffffff;
+    if (end <= base)
+        return;
+    if (cur >= end)
+        cur = base + (cur - base) % (end - base);
+    if (cur < base)
+        cur = base;
+    cur = CircularScatterGather(Reg(sge), Reg(max_sge), ptr, base, end, cur, len, to_guest);
+    Reg(r + 8) = (Reg(r + 8) & ~0xffffffu) | cur;
+}
+
+extern "C" void GpScratchRw(void*, uint8_t* ptr, uint32_t addr, size_t len, bool to_guest)
+{
+    ScatterGather(Reg(GPSADDR), Reg(GPSMAXSGE), ptr, addr, len, to_guest);
+}
+extern "C" void EpScratchRw(void*, uint8_t* ptr, uint32_t addr, size_t len, bool to_guest)
+{
+    ScatterGather(Reg(EPSADDR), Reg(EPSMAXSGE), ptr, addr, len, to_guest);
+}
+extern "C" void GpFifoRw(void*, uint8_t* ptr, unsigned int index, size_t len, bool to_guest)
+{
+    FifoRw(GPOFBASE0, GPIFBASE0, 4, 2, GPFADDR, GPFMAXSGE, ptr, index, len, to_guest);
+}
+extern "C" void EpFifoRw(void*, uint8_t* ptr, unsigned int index, size_t len, bool to_guest)
+{
+    // the main output (FIFO 0, to the AC'97's buffers) silent: the voices' mix is what's heard
+    static std::vector<u8> silence;
+    if (to_guest && index == 0)
+    {
+        if (silence.size() < len)
+            silence.assign(len, 0);
+        ptr = silence.data();
+    }
+    FifoRw(EPOFBASE0, EPIFBASE0, 4, 2, EPFADDR, EPFMAXSGE, ptr, index, len, to_guest);
+}
+
+// GP and EP register windows (offsets within their 64 KiB): X memory at 0 (GP 0x1000 words, EP
+// 0xc00), the GP's mix buffer at 0x5000 (X:0x1400, 0x400 words), Y at 0x6000 (GP 0x800, EP 0x100),
+// P at 0xa000 (0x1000), the reset register at 0xfffc; anything else kept as written.
+bool DspWindow(bool gp, u32 offset, char& space, u32& address)
+{
+    const u32 w = offset / 4;
+    if (offset < (gp ? 0x1000u : 0xc00u) * 4)
+        return space = 'X', address = w, true;
+    if (gp && offset >= 0x5000 && offset < 0x5000 + 0x400 * 4)
+        return space = 'X', address = 0x1400 + (offset - 0x5000) / 4, true;
+    if (offset >= 0x6000 && offset < 0x6000 + (gp ? 0x800u : 0x100u) * 4)
+        return space = 'Y', address = (offset - 0x6000) / 4, true;
+    if (offset >= 0xa000 && offset < 0xa000 + 0x1000 * 4)
+        return space = 'P', address = (offset - 0xa000) / 4, true;
+    return false;
+}
+
+u32 DspRead(bool gp, u32 offset)
+{
+    char space;
+    u32 address;
+    if (DspWindow(gp, offset, space, address))
+        return dsp_read_memory(gp ? g_gp : g_ep, space, address);
+    return (gp ? g_gp_regs : g_ep_regs)[offset / 4];
+}
+
+void DspWrite(bool gp, u32 offset, u32 value)
+{
+    char space;
+    u32 address;
+    if (DspWindow(gp, offset, space, address))
+    {
+        dsp_write_memory(gp ? g_gp : g_ep, space, address, value & 0xffffff);
+        return;
+    }
+    u32& reg = (gp ? g_gp_regs : g_ep_regs)[offset / 4];
+    if (offset == kDspRst)
+    {
+        DSPState* d = gp ? g_gp : g_ep;
+        const bool was = (reg & kRstBits) == kRstBits, now = (value & kRstBits) == kRstBits;
+        if (!now)
+            dsp_reset(d);
+        else if (!was)
+        {
+            dsp_bootstrap(d);
+            static int told = 0;
+            if (told++ < 8)
+                Log("apu: the %s DSP starts (its microcode bootstrapped)", gp ? "GP" : "EP");
+        }
+        if (!gp)
+            g_ep_frame_div = 0;
+    }
+    reg = value;
+}
+
+float FloatClamp(float v) { return std::clamp(v, -1.f, 1.f); }
+
+// One frame of the DSPs: the voices' front left and right into the GP's mix buffer (bins 0 and 1),
+// then 1000 cycles of the GP, and of the EP every 8th frame (xemu's, with its DSP option off).
+void DspFrame(const float out[kFrame][2])
+{
+    for (int c = 0; c < 2; c++)
+        for (int s = 0; s < kFrame; s++)
+        {
+            const double v = double(FloatClamp(out[s][c])) * (8.0 * 0x100000);
+            const s32 i = v >= double(0x7fffff) ? 0x7fffff : v <= -8.0 * 0x100000 ? -0x800000 : s32(v);
+            dsp_write_memory(g_gp, 'X', u32(0x1400 + c * kFrame + s), u32(i) & 0xffffff);
+        }
+    auto run = [](DSPState* d) {
+        dsp_start_frame(d);
+        dsp_set_halt_requested(d, false);
+        dsp_set_cycle_count(d, 0);
+        dsp_run(d, 1000);
+    };
+    if ((g_gp_regs[kDspRst / 4] & kRstBits) == kRstBits)
+        run(g_gp);
+    if ((g_ep_regs[kDspRst / 4] & kRstBits) == kRstBits && g_ep_frame_div % 8 == 0)
+        run(g_ep);
+    g_ep_frame_div++;
+}
+
 // ---- registers
 
 u32 ReadReg(u32 offset, u32)
@@ -708,9 +898,9 @@ u32 ReadReg(u32 offset, u32)
     if (offset >= 0x20000 && offset < 0x30000) // the front end's method window
         return offset - 0x20000 == 0x10 ? 0x80 : 0; // NV1BA0_PIO_FREE: room for methods
     if (offset >= 0x30000 && offset < 0x40000)
-        return g_gp_regs[(offset - 0x30000) / 4];
+        return DspRead(true, (offset - 0x30000) & ~3u);
     if (offset >= 0x50000 && offset < 0x60000)
-        return g_ep_regs[(offset - 0x50000) / 4];
+        return DspRead(false, (offset - 0x50000) & ~3u);
     if (offset == XGSCNT) // the global sample count
         return u32(g_frames * kFrame);
     return offset < 0x20000 ? Reg(offset & ~3u) : 0;
@@ -727,12 +917,12 @@ void WriteReg(u32 offset, u32, u32 value)
     }
     if (offset >= 0x30000 && offset < 0x40000)
     {
-        g_gp_regs[(offset - 0x30000) / 4] = value;
+        DspWrite(true, (offset - 0x30000) & ~3u, value);
         return;
     }
     if (offset >= 0x50000 && offset < 0x60000)
     {
-        g_ep_regs[(offset - 0x50000) / 4] = value;
+        DspWrite(false, (offset - 0x50000) & ~3u, value);
         return;
     }
     if (offset >= 0x20000)
@@ -757,6 +947,11 @@ void InitApu()
 {
     for (int l = 0; l < 3; l++)
         g_regs[kListTop[l] / 4] = 0xffff;
+    if (!g_gp)
+    {
+        g_gp = dsp_init(nullptr, GpScratchRw, GpFifoRw, true);
+        g_ep = dsp_init(nullptr, EpScratchRw, EpFifoRw, false);
+    }
     AddDevice({kBase, kSize, "apu", ReadReg, WriteReg});
     std::thread(Thread).detach();
 }

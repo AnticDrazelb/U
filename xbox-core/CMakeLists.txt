@@ -18,7 +18,7 @@ endif()
 add_custom_target(build_id ALL
     COMMAND ${CMAKE_COMMAND} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-id.cmake
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp)
-set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/nic.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
+set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/third_party/xemu-dsp/dsp.c src/third_party/xemu-dsp/dsp_c.c src/third_party/xemu-dsp/dsp_dma.c src/third_party/xemu-dsp/interp/dsp_cpu.c src/nic.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
 # The GPU path's shaders: SPIR-V made at build time (nothing is compiled at run time, which the PS4
 # couldn't do), as C arrays the code includes
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
@@ -117,6 +117,8 @@ else()
     add_executable(ui-preview ${FRONTEND_SOURCES} tools/ui-preview.cpp)
 endif()
 target_include_directories(xbox-core PRIVATE src ${CMAKE_BINARY_DIR}/shaders)
+# xemu's DSP56300 interpreter (GPL-2): its QEMU headers stood in for by shim/
+set_source_files_properties(src/third_party/xemu-dsp/dsp.c src/third_party/xemu-dsp/dsp_c.c src/third_party/xemu-dsp/dsp_dma.c src/third_party/xemu-dsp/interp/dsp_cpu.c PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu-dsp/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu-dsp;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu-dsp/interp" COMPILE_OPTIONS "-w")
 if (NOT PS4)
     target_link_libraries(xbox-core PRIVATE ${CMAKE_DL_LIBS}) # libvulkan, opened at run time
 endif()

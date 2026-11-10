@@ -141,3 +141,9 @@ library opens, every minute while a program runs, when it ends, stops on an erro
   its latest 24 calls with their arguments, the GPU's latest 256 methods, the host's thread stacks
 - `crash.log` on a crash: the host's registers and stack (named), the same guest state; a guest
   fault or a fatal error puts it in the log too; SIGSYS (a refused system call) is caught as well
+
+## Licence
+
+xbox-core is distributed under the GNU General Public License, version 2 or later (`COPYING`): it
+includes xemu's DSP56300 interpreter (`src/third_party/xemu-dsp`, GPL-2.0-or-later), which runs the
+audio processor's DSPs, and its APU glue follows xemu's.
