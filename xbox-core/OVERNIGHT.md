@@ -191,8 +191,8 @@ retail game is to need it. Each item says how it is checked without the game.
   **Full software run: 2612 of 3110 (84.0%)**, from 2307 (74.2%) at the start of the night. The
   GPU path matches or beats software on every suite but Texture_projective_2D (8-12 edge pixels an
   image: Vulkan's coverage rule).
-  Looked at and left: Front_face's fill-mode cases (the console colours one triangle of a quad
-  with front colours and one with back: a facing rule per triangle to work out), the shadow
+  Looked at and left: Front_face's fill-mode cases (their quads have vertices with w 0 and
+  infinity: the same edge cases as W_param, not a facing rule), the shadow
   comparator's raw values, bump mapping, the signed blend equations.
 
 - **The GPU path for what games need on the console** (eabc691, 1b7df1c, 8b34a4f, 83b4aee). On the
