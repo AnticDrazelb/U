@@ -20,6 +20,7 @@
  */
 
 #include "nv2a_int.h"
+void xb_diag_frame(void);
 
 uint64_t pcrtc_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -66,6 +67,7 @@ void pcrtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         val &= 0x07FFFFFF;
         // assert(val < memory_region_size(d->vram));
         d->pcrtc.start = val;
+        xb_diag_frame(); /* xbox-core: a flip, for its reports */
 
         NV2A_DPRINTF("PCRTC_START - %x %x %x %x\n",
                 d->vram_ptr[val+64], d->vram_ptr[val+64+1],

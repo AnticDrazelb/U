@@ -7,6 +7,7 @@
 
 #include "core.h"
 #include "devices.h"
+#include "diagnostics.h"
 
 extern "C" {
 #include "ui/xemu-settings.h"
@@ -78,5 +79,11 @@ void xb_xemu_log(const char* fmt, ...)
 }
 struct Error;
 Error* error_fatal = nullptr;
+Error* error_abort = nullptr;
+
+// xemu's NV2A into the diagnostics' counters (the stats line, the watchdog, the reports)
+void xb_diag_method(uint32_t cls, uint32_t method, uint32_t parameter) { diag::Method(cls, method, parameter); }
+void xb_diag_draw(void) { diag::g_draws++; }
+void xb_diag_frame(void) { diag::g_frames++; }
 void xb_pci_irq(int irq, int level) { SetIrq(u32(irq), level != 0); }
 }

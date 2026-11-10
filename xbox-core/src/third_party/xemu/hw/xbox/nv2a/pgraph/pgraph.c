@@ -23,6 +23,10 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include <unistd.h>
+/* xbox-core: the diagnostics' counters (src/xemu_glue.cpp) */
+void xb_diag_method(uint32_t cls, uint32_t method, uint32_t parameter);
+void xb_diag_draw(void);
+void xb_diag_frame(void);
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -701,6 +705,7 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
                                        NV_PGRAPH_CTX_SWITCH1_GRCLASS);
 
     pgraph_method_log(subchannel, graphics_class, method, parameter);
+    xb_diag_method(graphics_class, method, parameter); /* xbox-core: its reports */
 
     if (subchannel != 0) {
         // catches context switching issues on xbox d3d
@@ -2432,6 +2437,7 @@ DEF_METHOD_INC(NV097, SET_EYE_DIRECTION)
 DEF_METHOD(NV097, SET_BEGIN_END)
 {
     if (parameter == NV097_SET_BEGIN_END_OP_END) {
+        xb_diag_draw(); /* xbox-core: its reports */
         if (pg->primitive_mode == PRIM_TYPE_INVALID) {
             NV2A_DPRINTF("End without Begin!\n");
             pgraph_reset_inline_buffers(pg);
