@@ -120,7 +120,8 @@ static void pgraph_vk_process_pending(NV2AState *d)
     if (qatomic_read(&r->downloads_pending) ||
         qatomic_read(&r->download_dirty_surfaces_pending) ||
         qatomic_read(&d->pgraph.sync_pending) ||
-        qatomic_read(&d->pgraph.flush_pending)
+        qatomic_read(&d->pgraph.flush_pending) ||
+        qatomic_read(&d->pgraph.xb_idle_sync_pending)
     ) {
         qemu_mutex_unlock(&d->pfifo.lock);
         qemu_mutex_lock(&d->pgraph.lock);
@@ -135,6 +136,13 @@ static void pgraph_vk_process_pending(NV2AState *d)
         }
         if (qatomic_read(&d->pgraph.flush_pending)) {
             pgraph_vk_flush(d);
+        }
+        if (qatomic_read(&d->pgraph.xb_idle_sync_pending)) {
+            /* xbox-core: the work so far done (reports written), the surfaces drawn in RAM */
+            pgraph_vk_finish(&d->pgraph, VK_FINISH_REASON_STALLED);
+            pgraph_vk_download_dirty_surfaces(d);
+            qatomic_set(&d->pgraph.xb_idle_sync_pending, false);
+            qemu_event_set(&d->pgraph.xb_idle_sync_complete);
         }
         qemu_mutex_unlock(&d->pgraph.lock);
         qemu_mutex_lock(&d->pfifo.lock);

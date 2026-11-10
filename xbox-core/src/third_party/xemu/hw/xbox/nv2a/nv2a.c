@@ -324,10 +324,33 @@ void xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
     xb_bql_unlock();
 }
 
+/* PGRAPH's status read with the push buffer drained (pbkit's pb_busy, Direct3D's idle checks): on the
+ * console the GPU is idle only once its work is done, reports written and surfaces in memory; xemu's
+ * renderer finishes that later, so here it is made to now (once per new PUT) */
+static void idle_sync(NV2AState *d)
+{
+    static uint32_t synced_put = 0xffffffff;
+    const uint32_t put = qatomic_read(&d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT]);
+    const uint32_t get = qatomic_read(&d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET]);
+    if (get != put || put == synced_put || !d->pgraph.renderer) {
+        return;
+    }
+    qemu_mutex_lock(&d->pfifo.lock);
+    qemu_event_reset(&d->pgraph.xb_idle_sync_complete);
+    qatomic_set(&d->pgraph.xb_idle_sync_pending, true);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    qemu_event_wait(&d->pgraph.xb_idle_sync_complete);
+    synced_put = put;
+}
+
 uint64_t xb_nv2a_read(uint64_t addr, unsigned int size)
 {
     NV2AState *d = g_nv2a;
     uint64_t r = 0;
+    if (addr == 0x400700) {
+        idle_sync(d);
+    }
     xb_bql_lock();
     if (addr >= 0x700000 && addr < 0x800000) {
         /* RAMIN */

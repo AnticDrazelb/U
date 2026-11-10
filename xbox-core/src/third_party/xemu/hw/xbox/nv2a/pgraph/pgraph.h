@@ -254,6 +254,11 @@ typedef struct PGRAPHState {
     bool sync_pending;
     QemuEvent sync_complete;
 
+    /* xbox-core: the program saw the GPU idle; the renderer's work so far finished, its reports
+     * written and the surfaces drawn downloaded (nv2a.c: xb_nv2a_read) */
+    bool xb_idle_sync_pending;
+    QemuEvent xb_idle_sync_complete;
+
     bool framebuffer_in_use;
     QemuCond framebuffer_released;
 

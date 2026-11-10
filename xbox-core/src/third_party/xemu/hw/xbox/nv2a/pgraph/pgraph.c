@@ -223,6 +223,7 @@ void pgraph_init(NV2AState *d)
     qemu_mutex_init(&pg->lock);
     qemu_mutex_init(&pg->renderer_lock);
     qemu_event_init(&pg->sync_complete, false);
+    qemu_event_init(&pg->xb_idle_sync_complete, false);
     qemu_event_init(&pg->flush_complete, false);
     qemu_cond_init(&pg->framebuffer_released);
     qemu_event_init(&pg->renderer_switch_complete, false);
