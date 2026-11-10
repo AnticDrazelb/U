@@ -37,6 +37,7 @@ void SyncRange(u32, u32) {}
 
 #include "nv2a_frag.h" // SPIR-V, made at build time from shaders/nv2a.frag (glslangValidator --vn)
 #include "nv2a_vert.h"
+#include "nv2a_frag_depth.h" // the same, with XB_DEPTH: writes the depth itself
 
 #ifdef __PS4__
 // RADV, linked in: its ICD entry point (Crema's port of it, port/mesa)
@@ -62,7 +63,7 @@ namespace {
     X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateGraphicsPipelines) X(vkCmdBeginRendering)       \
     X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindVertexBuffers) X(vkCmdSetViewport) X(vkCmdSetScissor)        \
     X(vkCmdPushConstants) X(vkCmdPushDescriptorSetKHR) X(vkCmdDraw) X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) \
-    X(vkCmdCopyImageToBuffer) X(vkCmdClearAttachments) X(vkCmdSetBlendConstants)
+    X(vkCmdCopyImageToBuffer) X(vkCmdClearAttachments) X(vkCmdSetBlendConstants) X(vkDestroyPipeline)
 
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_ = nullptr;
 PFN_vkCreateInstance vkCreateInstance_ = nullptr;
@@ -134,7 +135,7 @@ VkCommandBuffer g_cmd = VK_NULL_HANDLE;
 VkFence g_fence = VK_NULL_HANDLE;
 VkDescriptorSetLayout g_set_layout = VK_NULL_HANDLE;
 VkPipelineLayout g_layout = VK_NULL_HANDLE;
-VkShaderModule g_vert = VK_NULL_HANDLE, g_frag = VK_NULL_HANDLE;
+VkShaderModule g_vert = VK_NULL_HANDLE, g_frag = VK_NULL_HANDLE, g_frag_depth = VK_NULL_HANDLE;
 bool g_recording = false;
 u64 g_epoch = 1; // advances at each Sync: textures are rehashed once an epoch at most
 
@@ -565,14 +566,14 @@ VkSampler Sampler(const TextureInfo& t)
 
 struct PipelineKey
 {
-    bool blend, has_depth, depth_test, depth_write, stencil;
+    bool blend, has_depth, depth_test, depth_write, stencil, depth_shader;
     u32 sfactor, dfactor, equation, depth_func, write_mask;
     u32 stencil_func, stencil_ref, stencil_mask, stencil_write, op_fail, op_zfail, op_zpass;
     bool operator<(const PipelineKey& o) const
     {
-        return std::tie(blend, has_depth, depth_test, depth_write, stencil, sfactor, dfactor, equation, depth_func, write_mask,
+        return std::tie(depth_shader, blend, has_depth, depth_test, depth_write, stencil, sfactor, dfactor, equation, depth_func, write_mask,
                         stencil_func, stencil_ref, stencil_mask, stencil_write, op_fail, op_zfail, op_zpass) <
-               std::tie(o.blend, o.has_depth, o.depth_test, o.depth_write, o.stencil, o.sfactor, o.dfactor, o.equation,
+               std::tie(o.depth_shader, o.blend, o.has_depth, o.depth_test, o.depth_write, o.stencil, o.sfactor, o.dfactor, o.equation,
                         o.depth_func, o.write_mask, o.stencil_func, o.stencil_ref, o.stencil_mask, o.stencil_write,
                         o.op_fail, o.op_zfail, o.op_zpass);
     }
@@ -592,7 +593,17 @@ VkStencilOp StencilOp(u32 op)
     default: return VK_STENCIL_OP_KEEP;
     }
 }
-std::map<PipelineKey, VkPipeline> g_pipelines;
+// Pipelines by their state, with the epoch each was last used in. Bounded: past kMaxPipelines, the
+// ones used longest ago are destroyed after a Sync (nothing recorded then uses them). Each is the
+// driver's compiled shaders (several MB in llvmpipe): kept forever, nxdk_pgraph_tests' blend suite
+// (every factor, equation and mask) grew the emulator by 85 MB a second until it was killed.
+struct CachedPipeline
+{
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    u64 used = 0;
+};
+std::map<PipelineKey, CachedPipeline> g_pipelines;
+constexpr size_t kMaxPipelines = 128;
 
 VkBlendFactor Factor(u32 f)
 {
@@ -632,11 +643,14 @@ VkBlendOp Equation(u32 e)
 VkPipeline Pipeline(const PipelineKey& k)
 {
     if (auto it = g_pipelines.find(k); it != g_pipelines.end())
-        return it->second;
+    {
+        it->second.used = g_epoch;
+        return it->second.pipeline;
+    }
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = g_vert, stages[0].pName = "main";
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = g_frag, stages[1].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = k.depth_shader ? g_frag_depth : g_frag, stages[1].pName = "main";
     VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[8];
     for (u32 i = 0; i < 8; i++)
@@ -693,7 +707,7 @@ VkPipeline Pipeline(const PipelineKey& k)
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines_(g_device, VK_NULL_HANDLE, 1, &info, nullptr, &p) != VK_SUCCESS)
         p = VK_NULL_HANDLE;
-    g_pipelines[k] = p;
+    g_pipelines[k] = {p, g_epoch};
     return p;
 }
 
@@ -829,6 +843,8 @@ bool Init(std::string& why)
     vkCreateShaderModule_(g_device, &smi, nullptr, &g_vert);
     smi.codeSize = sizeof(nv2a_frag), smi.pCode = nv2a_frag;
     vkCreateShaderModule_(g_device, &smi, nullptr, &g_frag);
+    smi.codeSize = sizeof(nv2a_frag_depth), smi.pCode = nv2a_frag_depth;
+    vkCreateShaderModule_(g_device, &smi, nullptr, &g_frag_depth);
     VkDescriptorSetLayoutBinding bindings[3]{};
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
@@ -945,6 +961,27 @@ void SyncLocked()
         Free(img);
     g_trash.clear();
     g_vertices.used = g_uniforms.used = g_staging.used = 0;
+    // the pipeline cache back to half its bound, the ones used longest ago destroyed (none is in use:
+    // the commands that used them have run)
+    if (g_pipelines.size() > kMaxPipelines)
+    {
+        std::vector<u64> ages;
+        ages.reserve(g_pipelines.size());
+        for (const auto& [key, c] : g_pipelines)
+            ages.push_back(c.used);
+        std::nth_element(ages.begin(), ages.begin() + kMaxPipelines / 2, ages.end(), std::greater<u64>());
+        const u64 keep_from = ages[kMaxPipelines / 2];
+        size_t kept = 0;
+        for (auto it = g_pipelines.begin(); it != g_pipelines.end();)
+            if (it->second.used > keep_from || (it->second.used == keep_from && kept < kMaxPipelines / 2))
+                ++kept, ++it;
+            else
+            {
+                if (it->second.pipeline)
+                    vkDestroyPipeline_(g_device, it->second.pipeline, nullptr);
+                it = g_pipelines.erase(it);
+            }
+    }
     g_epoch++;
     static u32 syncs = 0;
     if (g_guard_pending && ++syncs >= 120) // two seconds of frames drawn and written back
@@ -1032,6 +1069,12 @@ bool DrawTriangles(const Vertex* vertices, u32 count)
     BlendState blend;
     if (!GpuPixelSetup(u, tex, blend))
         return Declined(3);
+    // the w-buffer and the polygon offset (filled triangles: SET_POLY_OFFSET_FILL_ENABLE): the depth
+    // written by the shader that does them
+    const bool w_buffer = g_kelvin.Get(0x290) & (1u << 16), offset_on = g_kelvin.Get(0x338);
+    u.depth[0] = 1.f / depth.z_max, u.depth[1] = offset_on ? std::bit_cast<float>(g_kelvin.Get(0x388)) : 0.f;
+    u.depth[2] = offset_on ? std::bit_cast<float>(g_kelvin.Get(0x384)) : 0.f, u.depth[3] = w_buffer ? 1.f : 0.f;
+    const bool depth_shader = has_depth && (w_buffer || offset_on);
     // the textures first (uploads end any rendering), then the surfaces
     VkDescriptorImageInfo images2d[4], cubes[4];
     for (int s = 0; s < 4; s++)
@@ -1068,6 +1111,7 @@ bool DrawTriangles(const Vertex* vertices, u32 count)
     key.blend = blend.enabled, key.sfactor = blend.sfactor, key.dfactor = blend.dfactor, key.equation = blend.equation;
     key.has_depth = has_depth, key.depth_test = depth.test, key.depth_write = depth.write, key.depth_func = depth.func;
     key.stencil = has_depth && depth.stencil;
+    key.depth_shader = depth_shader;
     if (key.stencil)
     {
         key.stencil_func = depth.stencil_func, key.stencil_ref = depth.stencil_ref, key.stencil_mask = depth.stencil_mask;

@@ -79,6 +79,9 @@ int main(void)
     p = push_floats(p, NV097_SET_VIEWPORT_OFFSET, 4, zero4);
     p = pb_push1(p, NV097_SET_SKIN_MODE, NV097_SET_SKIN_MODE_OFF);
     p = pb_push1(p, NV097_SET_CONTEXT_DMA_REPORT, 3);
+    // depth as z (pbkit starts with the w-buffer on: SET_CONTROL0 0x00110001; with w 1 both quads
+    // below would store 1)
+    p = pb_push1(p, NV097_SET_CONTROL0, 0x00100001);
 
     // 1: a 100x50 quad with no depth test: all 5000 pixels counted
     p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE, 0);

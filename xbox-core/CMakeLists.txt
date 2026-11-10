@@ -30,6 +30,14 @@ foreach(stage vert frag)
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/nv2a.${stage})
     list(APPEND SHADER_HEADERS ${CMAKE_BINARY_DIR}/shaders/nv2a_${stage}.h)
 endforeach()
+# the fragment shader that writes depth itself (w-buffer, polygon offset): only for draws that need it,
+# as writing depth turns off the GPU's early depth test
+add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/shaders/nv2a_frag_depth.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+    COMMAND ${GLSLANG_VALIDATOR} -V -DXB_DEPTH --vn nv2a_frag_depth -o ${CMAKE_BINARY_DIR}/shaders/nv2a_frag_depth.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/nv2a.frag
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/nv2a.frag)
+list(APPEND SHADER_HEADERS ${CMAKE_BINARY_DIR}/shaders/nv2a_frag_depth.h)
 set_source_files_properties(src/gpu_vulkan.cpp PROPERTIES OBJECT_DEPENDS "${SHADER_HEADERS}")
 set(FRONTEND_SOURCES frontend/canvas.cpp frontend/library.cpp frontend/tools.cpp frontend/ui.cpp)
 if (PS4)

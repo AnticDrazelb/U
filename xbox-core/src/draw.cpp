@@ -739,6 +739,58 @@ struct DepthStencil
     u32 op_fail = 0, op_zfail = 0, op_zpass = 0;
     float z_max = 0;
     bool z_float = false; // SET_CONTROL0's Z_FORMAT: depth stored as floats
+    bool w_buffer = false; // SET_CONTROL0's Z_PERSPECTIVE_ENABLE: w stored in place of z
+    bool z_clamp = false;  // SET_ZMIN_MAX_CONTROL: depths outside SET_CLIP_MIN/MAX clamped (else culled)
+    float clip_min = 0, clip_max = 0;
+
+    // A primitive's polygon offset (SET_POLY_OFFSET_POINT/LINE/FILL_ENABLE, the method given): the
+    // bias (SET_POLYGON_OFFSET_BIAS), and the scale factor (SET_POLYGON_OFFSET_SCALE_FACTOR) times
+    // the primitive's steepest slope in screen space, of z, or with the w-buffer of 1/w (as xemu
+    // has it; its notes say the console takes the slope at the first pixel drawn, the same on a plane)
+    struct Offset
+    {
+        float bias = 0, factor = 0, slope = 0;
+    };
+    static Offset OffsetFor(u32 enable_method, float slope)
+    {
+        const KelvinState& k = g_kelvin;
+        Offset o;
+        if (!k.Get(enable_method))
+            return o;
+        o.bias = std::bit_cast<float>(k.Get(0x388));
+        o.factor = std::bit_cast<float>(k.Get(0x384));
+        o.slope = std::isfinite(slope) ? slope : 0;
+        return o;
+    }
+
+    // The depth a pixel stores, from its interpolated z and w (perspective-correct): w with the
+    // w-buffer (the console's captures store floor(w), or w as a float), with the offset; outside
+    // the clip range clamped or culled (false), as SET_ZMIN_MAX_CONTROL says
+    bool Value(float z, float w, const Offset& o, float& out) const
+    {
+        float v;
+        if (w_buffer)
+        {
+            v = w;
+            if (v > 0)
+                v += o.bias + o.factor * o.slope * v * v;
+            else
+                v = 3.4028235e38f; // past the horizon: as far as can be
+            if (std::isnan(v))
+                v = 3.4028235e38f;
+        }
+        else
+            v = z + o.bias + o.factor * o.slope;
+        if (clip_max > clip_min)
+        {
+            if (z_clamp)
+                v = std::clamp(v, clip_min, clip_max);
+            else if (!(v >= clip_min && v <= clip_max))
+                return false;
+        }
+        out = v;
+        return true;
+    }
 
     // a depth as stored: fixed point, or the float formats (24 bits: a float without its sign and
     // last 7 mantissa bits; 16 bits: 4 exponent bits with a bias of 7, 12 mantissa), which order
@@ -746,8 +798,8 @@ struct DepthStencil
     u32 Encode(float z) const
     {
         z = std::clamp(z, 0.f, z_max);
-        if (!z_float) // rounded in double, no higher than the largest (in float, z_max + 0.5 is 2^24)
-            return std::min(u32(double(z) + 0.5), u32(z_max));
+        if (!z_float) // truncated, as the console stores it (its captures: 0xff8691 where rounding gives 0xff8692)
+            return std::min(u32(double(z)), u32(z_max));
         u32 bits;
         std::memcpy(&bits, &z, 4);
         if (zs.bytes == 4)
@@ -774,6 +826,9 @@ struct DepthStencil
         stencil_write = k.Get(0x360) & 0xff;
         op_fail = k.Get(0x370), op_zfail = k.Get(0x374), op_zpass = k.Get(0x378);
         z_float = k.Get(0x290) & (1u << 12);
+        w_buffer = k.Get(0x290) & (1u << 16);
+        z_clamp = k.Get(0x1d78) & 0x10;
+        clip_min = std::bit_cast<float>(k.Get(0x394)), clip_max = std::bit_cast<float>(k.Get(0x398));
         z_max = z_float ? (zs.bytes == 2 ? 511.9375f : 3.4028235e38f) : zs.bytes == 2 ? 65535.f : 16777215.f;
         active = depth_test || depth_write || stencil;
         static const bool debug_stencil = std::getenv("XB_DEBUG_STENCIL") != nullptr;
@@ -952,6 +1007,16 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const int y0 = std::max<int>(int(clip_y0), int(std::floor(std::min({a.y, b.y, c.y}))));
     const int y1 = std::min<int>(int(cs.height) - 1, int(std::ceil(std::max({a.y, b.y, c.y}))));
     const DepthStencil ds;
+    // the polygon offset's slope: the steepest of z's (or with the w-buffer 1/w's) gradients
+    DepthStencil::Offset offset;
+    if (ds.active)
+    {
+        auto f = [&](const ScreenVertex& v) { return ds.w_buffer ? v.inv_w : v.z; };
+        const float f0 = f(a), f1 = f(b), f2 = f(c);
+        const float dx = ((f1 - f0) * (c.y - a.y) - (f2 - f0) * (b.y - a.y)) / area;
+        const float dy = ((f2 - f0) * (b.x - a.x) - (f1 - f0) * (c.x - a.x)) / area;
+        offset = DepthStencil::OffsetFor(0x338, std::max(std::fabs(dx), std::fabs(dy)));
+    }
     const WindowClip window;
     // with the alpha test on, a pixel it rejects must leave depth and stencil alone: shade first
     const bool shade_first = k.Get(0x300);
@@ -1042,12 +1107,20 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
             if (!window.Allows(x, y))
                 continue;
             const float wa = float(ea * inv_area), wb = float(eb * inv_area), wc = float(ec * inv_area);
-            const float z = a.z * wa + b.z * wb + c.z * wc;
-            if (!shade_first && !ds.Test(u32(x), u32(y), z))
-                continue;
-            // perspective-correct interpolation of the outputs
+            // perspective-correct interpolation of the outputs (and w: 1 / the interpolated 1/w)
             const float pa0 = wa * a.inv_w, pb0 = wb * b.inv_w, pc0 = wc * c.inv_w;
             const float norm = 1.f / (pa0 + pb0 + pc0), pa = pa0 * norm, pb = pb0 * norm, pc = pc0 * norm;
+            float z = 0;
+            // w for the w-buffer in doubles, from the edge functions (exact on the 1/16 grid): equal w's
+            // give exactly that w (in float, 0.99999994 for 1, stored as 0 where the console has 1)
+            if (ds.active && !ds.Value(a.z * wa + b.z * wb + c.z * wc,
+                                       ds.w_buffer ? float(exact_area / (ea / double(a.o[0][3]) + eb / double(b.o[0][3]) +
+                                                                         ec / double(c.o[0][3])))
+                                                   : norm,
+                                       offset, z))
+                continue;
+            if (!shade_first && !ds.Test(u32(x), u32(y), z))
+                continue;
             PixelInputs in;
             std::memcpy(in.lod, lods, sizeof(lods));
             for (int n = 0; n < used_count; n++)
@@ -1100,16 +1173,21 @@ struct Fragments
 
     // the pixel at (x, y), a fraction t of the way from a to b
     const Vec4* sprite = nullptr; // a point sprite's stage 3 coordinates, for the pixel being drawn
+    DepthStencil::Offset offset;  // the polygon offset: lines' or points' (bias only: no slope)
 
     void Pixel(int x, int y, const ScreenVertex& a, const ScreenVertex& b, float t)
     {
         if (x < x0 || y < y0 || x >= int(cs.width) || y >= int(cs.height) || !window.Allows(x, y))
             return;
-        const float z = a.z + (b.z - a.z) * t;
-        if (!shade_first && !ds.Test(u32(x), u32(y), z))
-            return;
         // perspective-correct along the line
         const float pa = (1 - t) * a.inv_w, pb = t * b.inv_w, norm = 1.f / (pa + pb);
+        float z = 0;
+        if (ds.active &&
+            !ds.Value(a.z + (b.z - a.z) * t,
+                      ds.w_buffer ? float(1.0 / ((1.0 - t) / double(a.o[0][3]) + double(t) / double(b.o[0][3]))) : norm, offset, z))
+            return;
+        if (!shade_first && !ds.Test(u32(x), u32(y), z))
+            return;
         PixelInputs in;
         in.lod[0] = in.lod[1] = in.lod[2] = in.lod[3] = 0;
         for (int n = 0; n < used_count; n++)
@@ -1128,22 +1206,42 @@ struct Fragments
         WritePixel(cs, u32(x), u32(y), color, write_mask);
     }
 
-    // a line: a pixel a step along its longer axis, its last pixel left out (as GL draws them)
+    // A line, as the console draws it (nxdk_pgraph_tests' captures, Line width and W buffering): a
+    // rectangle SET_LINE_WIDTH / 8 pixels wide along it, ending square at its two ends, covering the
+    // pixels whose centres are inside (a width under 1 can cover none: the console's 0.x widths draw
+    // nothing). Half-open along it (the last end's pixels left out, as a strip's next line starts there)
+    // and across (one side's edge in, the other's out), so neighbouring lines don't overlap.
     void Line(const ScreenVertex& a, const ScreenVertex& b)
     {
-        const float dx = b.x - a.x, dy = b.y - a.y;
-        const int steps = int(std::ceil(std::max(std::fabs(dx), std::fabs(dy))));
-        for (int i = 0; i < std::max(steps, 1); i++)
-        {
-            const float t = steps ? float(i) / float(steps) : 0.f;
-            Pixel(int(std::floor(a.x + dx * t)), int(std::floor(a.y + dy * t)), a, b, t);
-        }
+        offset = DepthStencil::OffsetFor(0x334, 0);
+        u32 ax, ay;
+        AntiAliasing(ax, ay);
+        const float width = float(g_kelvin.Get(0x380) & 0x1ff) / 8.f * float(ax);
+        const double dx = double(b.x) - a.x, dy = double(b.y) - a.y, len = std::sqrt(dx * dx + dy * dy);
+        if (len == 0 || width <= 0)
+            return;
+        const double ux = dx / len, uy = dy / len, half = width / 2.0;
+        // the rectangle's corners bound the pixels to look at
+        const double nx = -uy * half, ny = ux * half;
+        const double xs[4] = {a.x + nx, a.x - nx, b.x + nx, b.x - nx}, ys[4] = {a.y + ny, a.y - ny, b.y + ny, b.y - ny};
+        const int px0 = int(std::floor(*std::min_element(xs, xs + 4))), px1 = int(std::ceil(*std::max_element(xs, xs + 4)));
+        const int py0 = int(std::floor(*std::min_element(ys, ys + 4))), py1 = int(std::ceil(*std::max_element(ys, ys + 4)));
+        for (int y = py0; y <= py1; y++)
+            for (int x = px0; x <= px1; x++)
+            {
+                const double rx = x + 0.5 - a.x, ry = y + 0.5 - a.y;
+                const double along = rx * ux + ry * uy, across = ry * ux - rx * uy;
+                if (along < 0 || along >= len || across < -half || across >= half)
+                    continue;
+                Pixel(x, y, a, b, float(along / len));
+            }
     }
 
     // a point: a square of its size (oPts; SET_POINT_SIZE when a program leaves it) around it; with
     // SET_POINT_SMOOTH_ENABLE a sprite, stage 3's coordinates going 0..1 across it
     void Point(const ScreenVertex& p)
     {
+        offset = DepthStencil::OffsetFor(0x330, 0);
         u32 ax, ay;
         AntiAliasing(ax, ay);
         const float base = p.o[6][0] > 0 ? p.o[6][0] : std::max(1.f, float(std::min<u32>(g_kelvin.Get(0x43c), 0x1ff)) / 8.f);

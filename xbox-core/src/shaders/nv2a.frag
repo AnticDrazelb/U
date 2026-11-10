@@ -30,6 +30,7 @@ layout(std140, binding = 0) uniform State
     vec4 bump[4];        // the bump environment matrices
     vec4 bumpLum[4];     // x scale, y offset
     uvec4 clipMode;      // x: SET_SHADER_CLIP_PLANE_MODE
+    vec4 depth;          // 1 / the depth's largest value, polygon offset bias and factor, 1 with the w-buffer
 } st;
 
 layout(binding = 1) uniform sampler2D tex2D[4];
@@ -266,6 +267,26 @@ bool compare(uint func, uint a, uint b)
 
 void main()
 {
+#ifdef XB_DEPTH
+    // The depth the console stores (as the software path's DepthStencil::Value): with the w-buffer the
+    // perspective-correct w (1 / the interpolated 1/w); the polygon offset's bias, and its factor times
+    // the steepest slope of z (of 1/w with the w-buffer, times w squared) across the primitive
+    {
+        float z;
+        if (st.depth.w != 0.0)
+        {
+            const float w = 1.0 / gl_FragCoord.w;
+            const float slope = max(abs(dFdx(gl_FragCoord.w)), abs(dFdy(gl_FragCoord.w)));
+            z = w > 0.0 ? w + st.depth.y + st.depth.z * slope * w * w : 3.4e38;
+        }
+        else
+        {
+            const float zu = gl_FragCoord.z / st.depth.x;
+            z = zu + st.depth.y + st.depth.z * max(abs(dFdx(zu)), abs(dFdy(zu)));
+        }
+        gl_FragDepth = clamp(z * st.depth.x, 0.0, 1.0);
+    }
+#endif
     vec4 color;
     if (st.control.x == 0u)
         color = vDiffuse;

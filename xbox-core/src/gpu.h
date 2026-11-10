@@ -40,6 +40,7 @@ struct Uniforms
     u32 program[4], enabled[4], stage_input[4], kind[4];
     float tex_scale[4][4], bump[4][4], bump_lum[4][4];
     u32 clip_mode[4];
+    float depth[4]; // 1 / the depth's largest value, polygon offset bias, factor, 1 with the w-buffer
 };
 // A texture stage's texture as the GPU path needs it
 struct TextureInfo

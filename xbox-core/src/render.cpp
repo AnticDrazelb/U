@@ -227,6 +227,10 @@ void Clear(u32 flags)
 void KelvinMethod(u32 method, u32 parameter)
 {
     KelvinState& k = g_kelvin;
+    // SET_LINE_WIDTH past its largest (63.875, in eighths) isn't taken: the console's captures of
+    // 64.0 to 64.7 and 0xffffffff draw lines as the width before (1 there)
+    if (method == 0x380 && parameter > 0x1ff)
+        return;
     if (method < 0x2000)
         k.regs[method / 4] = parameter;
     switch (method)
