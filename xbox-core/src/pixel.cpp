@@ -1106,6 +1106,7 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
         u.tex_scale[s][0] = u.tex_scale[s][1] = 1;
         u.tex_scale[s][2] = u.tex_scale[s][3] = 0;
         u.dot_map[s] = ps.dot_map[s];
+        u.signed_channels[s] = 0;
         switch (program)
         {
         case 0: case 4: case 5: case 10: case 17: continue; // no texture read (10, 17: the dot product only)
@@ -1119,8 +1120,7 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
         const bool wants_cube = program == 3 || program == 11 || program == 12 || program == 14 || program == 18;
         if (IsDepthFormat(t.format) || t.depth > 1 || wants_cube != t.cubemap)
             return false; // shadow maps, volumes: not yet
-        if (t.filter >> 28)
-            return false; // signed channels: the GPU's textures are unsigned 8-bit (in software for now)
+        u.signed_channels[s] = t.filter >> 28; // stored biased (DecodeStageTexture), unbiased in the shader
         if (t.border_texels)
             return false; // border texels stored with the texture: in software
         u.enabled[s] = 1;
@@ -1155,9 +1155,19 @@ void DecodeStageTexture(int stage, u32 face, u32 level, u32* argb)
     if (t.cubemap)
         t.address += face * t.face_size;
     const Texture lt = level ? Level(t, level) : t;
+    // signed channels (SET_TEXTURE_FILTER bits 28-31: A, R, G, B) stored as (s + 1) / 2, which filters
+    // as s does; the shader takes them back (2c - 1)
+    const u32 flags = t.filter >> 28;
+    static constexpr int kChannel[4] = {3, 0, 1, 2};
     for (u32 y = 0; y < lt.height; y++)
         for (u32 x = 0; x < lt.width; x++)
-            argb[y * lt.width + x] = Pack(Texel(lt, x, y));
+        {
+            V4 c = Texel(lt, x, y);
+            for (int b = 0; b < 4; b++)
+                if (flags & (1u << b))
+                    c[kChannel[b]] = (c[kChannel[b]] + 1) * 0.5f;
+            argb[y * lt.width + x] = Pack(c);
+        }
 }
 
 bool ShadePixel(const PixelInputs& in, const Surface& target, u32 x, u32 y, u32& out)

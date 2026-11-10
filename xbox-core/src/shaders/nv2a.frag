@@ -35,6 +35,7 @@ layout(std140, binding = 0) uniform State
     uvec4 keyMode;       // colour key mode (bits 0-1), alpha kill (bit 2), the key without alpha (bit 3)
     uvec4 dotMap;        // each stage's SET_DOT_RGBMAPPING conversion
     vec4 eye;            // SET_EYE_VECTOR
+    uvec4 signedChannels; // each stage's signed channels (bits 0-3: A, R, G, B), stored as (s + 1) / 2
 } st;
 
 layout(binding = 1) uniform sampler2D tex2D[4];
@@ -66,27 +67,42 @@ bool keyAndKill(int s, inout vec4 c)
 
 float clamp01(float v) { return clamp(v, 0.0, 1.0); }
 
+// a stage's signed channels back from their stored (s + 1) / 2
+vec4 unbias(int s, vec4 c)
+{
+    const uint m = st.signedChannels[s];
+    if ((m & 1u) != 0u) c.a = 2.0 * c.a - 1.0;
+    if ((m & 2u) != 0u) c.r = 2.0 * c.r - 1.0;
+    if ((m & 4u) != 0u) c.g = 2.0 * c.g - 1.0;
+    if ((m & 8u) != 0u) c.b = 2.0 * c.b - 1.0;
+    return c;
+}
+
 vec4 sampleStage(int s, vec2 uv)
 {
     uv = uv * st.texScale[s].xy + st.texScale[s].zw; // zw: nearest filtering's nudge past an edge
+    vec4 c;
     switch (s)
     {
-    case 0: return texture(tex2D[0], uv);
-    case 1: return texture(tex2D[1], uv);
-    case 2: return texture(tex2D[2], uv);
-    default: return texture(tex2D[3], uv);
+    case 0: c = texture(tex2D[0], uv); break;
+    case 1: c = texture(tex2D[1], uv); break;
+    case 2: c = texture(tex2D[2], uv); break;
+    default: c = texture(tex2D[3], uv); break;
     }
+    return unbias(s, c);
 }
 
 vec4 sampleCube(int s, vec3 d)
 {
+    vec4 c;
     switch (s)
     {
-    case 0: return texture(texCube[0], d);
-    case 1: return texture(texCube[1], d);
-    case 2: return texture(texCube[2], d);
-    default: return texture(texCube[3], d);
+    case 0: c = texture(texCube[0], d); break;
+    case 1: c = texture(texCube[1], d); break;
+    case 2: c = texture(texCube[2], d); break;
+    default: c = texture(texCube[3], d); break;
     }
+    return unbias(s, c);
 }
 
 // texture colours have their channels as the CPU's V4: r, g, b, a
@@ -168,7 +184,10 @@ bool textureStages(out vec4 tex[4])
         }
         else if (program == 6u || program == 7u)
         {
-            const float du = sign3(inp.b), dv = sign3(inp.g);
+            // an input already read as signed (its texture's B and G signed bits) is used as it is (as pixel.cpp)
+            const uint inStage = st.stageInput[s] < 4u ? st.stageInput[s] : 0u;
+            const uint inSigned = st.signedChannels[inStage];
+            const float du = (inSigned & 8u) != 0u ? inp.b : sign3(inp.b), dv = (inSigned & 4u) != 0u ? inp.g : sign3(inp.g);
             const vec4 m = st.bump[s];
             const vec2 uv = vec2(t.x + du * m.x + dv * m.z, t.y + du * m.y + dv * m.w);
             if (enabled)

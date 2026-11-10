@@ -45,6 +45,7 @@ struct Uniforms
     u32 key_mode[4]; // each stage's colour key mode (bits 0-1), alpha kill (bit 2), the key without alpha (bit 3)
     u32 dot_map[4];  // each stage's SET_DOT_RGBMAPPING conversion
     float eye[4];    // SET_EYE_VECTOR (dot reflect specular const)
+    u32 signed_channels[4]; // each stage's signed channels (SET_TEXTURE_FILTER bits 28-31: A, R, G, B)
 };
 // A texture stage's texture as the GPU path needs it
 struct TextureInfo

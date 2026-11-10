@@ -477,7 +477,7 @@ GpuTexture* UseTexture(int stage, const TextureInfo& t)
     for (auto& x : g_textures)
         if (x->info.address == t.address && x->info.format == t.format && x->info.width == t.width &&
             x->info.height == t.height && x->info.levels == t.levels && x->info.cube == t.cube && x->info.pitch == t.pitch &&
-            x->info.palette == t.palette)
+            x->info.palette == t.palette && (x->info.filter >> 28) == (t.filter >> 28))
         {
             g = x.get();
             break;
