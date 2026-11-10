@@ -654,8 +654,22 @@ std::atomic<bool> g_big_stacks{false};
 
 void UseBigSignalStacks(bool on) { g_big_stacks = on; }
 
+extern "C" void ps4_unwatch_thread(); // port/ps4_sampler.cpp
+
 void PrepareThread()
 {
+    // a thread that runs guest code is never sent the hang dump's signal: libthr's signal wrapper
+    // reads the thread through fs, which in guest code is the guest's KPCR, and the app ends (the
+    // watchdog's report took Halo down 10 s in, three runs running). Its state is in the guest
+    // part of the report.
+    {
+        thread_local bool unwatched = false;
+        if (!unwatched)
+        {
+            unwatched = true;
+            ps4_unwatch_thread();
+        }
+    }
     thread_local bool installed = false;
     if (installed || !g_big_stacks)
         return;

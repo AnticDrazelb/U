@@ -523,6 +523,18 @@ extern "C" void ps4_watch_thread(const char* name) {
 extern "C" int32_t sceKernelQueryMemoryProtection(void* address, void** start, void** end,
                                                   uint32_t* protection);
 
+// The calling thread is left out of hang dumps from now on (it is never signalled): xbox-core's
+// threads that run 32-bit guest code, where the signal wrapper's thread lookup through fs reads
+// the guest's data and the app ends.
+extern "C" void ps4_unwatch_thread() {
+    const pthread_t self = pthread_self();
+    for (int i = 0; i < std::min(g_watched_count.load(), kMaxWatched); i++)
+        if (g_watched[i].thread.load() == self) {
+            snprintf(g_watched[i].name, sizeof(g_watched[i].name), "%s", "(runs guest code)");
+            g_watched[i].thread.store(pthread_t{});
+        }
+}
+
 // Copies 16 bytes at `address` if they lie in readable memory (else leaves zeros).
 static void readIfMapped(uint64_t address, uint32_t (&words)[4]) {
     memset(words, 0, sizeof(words));
@@ -563,6 +575,8 @@ extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason) {
     for (int i = 0; i < count; i++) {
         WatchedThread& t = g_watched[i];
         t.done.store(0);
+        if (!t.thread.load())
+            continue;  // left out (ps4_unwatch_thread)
         if (pthread_kill(t.thread.load(), kSigDump) != 0) {
             snprintf(line, sizeof(line), "-- %s: signal failed (thread gone?)\n", t.name);
             writeLine(fd, line);
