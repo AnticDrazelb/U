@@ -115,14 +115,18 @@ size_t ModrmExtra(const u8* p)
 
 // Emulates one instruction at `code` that accessed device memory at `address`. Returns its length.
 // With `memory`, the access is to ordinary guest memory (a backpatched instruction that met RAM).
+bool IsDeviceAddress(u32 a);
 size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = false)
 {
     const u8* p = code;
     u32 size = 4;
+    bool rep = false;
     for (;; p++)
     {
         if (*p == 0x66)
             size = 2;
+        else if (*p == 0xf3 || *p == 0xf2)
+            rep = true;
         else if (*p == 0x2e || *p == 0x3e || *p == 0x26 || *p == 0x36 || *p == 0x64 || *p == 0x65 || *p == 0xf0)
             ;
         else
@@ -171,6 +175,49 @@ size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = f
         r.Flags(v, bytes, carry);
         return v;
     };
+    // movs, stos, lods (rep or not), either side device memory or RAM: DirectSound copies blocks of
+    // the APU's DSP memory with rep movsd. All the repeats are done here; stopped at an address
+    // that is neither (esi, edi and ecx then say how far it got, as a fault inside rep leaves them).
+    if ((op >= 0xa4 && op <= 0xa5) || (op >= 0xaa && op <= 0xad))
+    {
+        const u32 bytes = (op & 1) ? size : 1;
+        const u32 step = (*r.f.eflags & 0x400) ? u32(-s32(bytes)) : bytes;
+        auto valid = [&](u32 a) { return IsDeviceAddress(a) || GuestMapped(a, bytes); };
+        auto rd = [&](u32 a) {
+            u32 v = 0;
+            if (IsDeviceAddress(a))
+                DeviceRead(a, bytes, v);
+            else
+                std::memcpy(&v, Ptr(a), bytes);
+            return v;
+        };
+        auto wr = [&](u32 a, u32 v) {
+            if (IsDeviceAddress(a))
+                DeviceWrite(a, bytes, v);
+            else
+                std::memcpy(Ptr(a), &v, bytes);
+        };
+        const bool src = op != 0xaa && op != 0xab, dst = op != 0xac && op != 0xad;
+        for (u32 n = rep ? r.Get(1) : 1; n; n--)
+        {
+            const u32 si = r.Get(6), di = r.Get(7);
+            if ((src && !valid(si)) || (dst && !valid(di)))
+                return 0;
+            if (op <= 0xa5)
+                wr(di, rd(si));
+            else if (op <= 0xab)
+                wr(di, get_reg(0, bytes));
+            else
+                set_reg(0, bytes, rd(si));
+            if (src)
+                r.Set(6, si + step);
+            if (dst)
+                r.Set(7, di + step);
+            if (rep)
+                r.Set(1, n - 1);
+        }
+        return size_t(p - code);
+    }
     switch (op)
     {
     case 0x88: write(1, r.Get8(reg_of(p))); return end(p, 0);

@@ -1,0 +1,587 @@
+watchdog at 581.2 s (580 s into the program), xbox-core build 2026-11-10 10:36:43 UTC c64323: no frames, draws or picture changes for 10 s after they had started
+
+guest state at 581.208 s: 830 kernel calls, 0 frames, 0 draws, 0 GPU methods, 0 exceptions
+thread 1 (self-test), KPCR 0x8c001e80, stack 0xd0001000-0xd0011000: running guest code (or not started)
+    its last fault: signal 11 at 0x8c001d02, address 0; eax 0x8c001d00 ecx 0x8c000080 edx 0x8c001e80 ebx 0x19d16e00 esp 0xd0010fbc ebp 0x8c001d01 esi 0xd0010fc0 edi 0x8c001e80 eflags 0x10202
+    the stack at its last fault, esp 0xd0010fbc:
+      8c001e80 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+thread 2 (self-test 2), KPCR 0x8c002380, stack 0xd0021000-0xd0031000: running guest code (or not started)
+    its last fault: signal 11 at 0x8c001d02, address 0; eax 0x8c001d00 ecx 0x8c000080 edx 0x8c002380 ebx 0x8c001d00 esp 0xd0030fbc ebp 0x8c002380 esi 0xd0030fc0 edi 0x8c002380 eflags 0x10202
+    the stack at its last fault, esp 0xd0030fbc:
+      8c002380 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+thread 3 (interrupts), KPCR 0x8c002c00, stack 0xd0041000-0xd0051000: running guest code (or not started)
+    the stack at its last kernel call, esp 0xd0050f88:
+      8c002c00 00000000 d0050fb0 00000000 0001377b 00000000 00000023 00000000
+      8c00012a 00000000 8c0000f4 00000033 00000005 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+        0.390 InterlockedIncrement(0x2ae60, 0x8c002c00, 0xdd4f7e18, 0x8c0000de) from 0x1377b = 0x1
+        0.490 InterlockedIncrement(0x2ae60, 0x8c002c00, 0xdd4f7e18, 0x8c0000de) from 0x1377b = 0x2
+        0.590 InterlockedIncrement(0x2ae60, 0x8c002c00, 0xdd4f7e18, 0x8c0000de) from 0x1377b = 0x3
+        0.690 InterlockedIncrement(0x2ae60, 0x8c002c00, 0xdd4f7e18, 0x8c0000de) from 0x1377b = 0x4
+        0.790 InterlockedIncrement(0x2ae60, 0x8c002c00, 0xdd4f7e18, 0x8c0000de) from 0x1377b = 0x5
+thread 4 (startup), KPCR 0x8c003100, stack 0xd0061000-0xd0071120: running guest code (or not started)
+    the stack at its last kernel call, esp 0xd0070f50:
+      8c003100 00000000 d0070fb0 00000000 00000000 00022d85 00000000 00000023
+      00000000 00000000 00000001 d0070f8c 0001b974 00001018 00000001 d0070fa8
+      0001b5cc 00001018 8c00012a 00000000 8c0000f4 00000033 00000001 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 d0071010
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+      00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+        0.052 XcSHAInit(0x2c038, 0, 0, 0) from 0x1ba90 = 0
+        0.052 ExQueryNonVolatileSetting(0xffff, 0xd0070e3c, 0xd0070e44, 0x100) from 0x1bac6 = 0
+        0.052 XcSHAUpdate(0x2c038, 0xd0070e44, 0x100, 0x23) from 0x1bb22 = 0
+        0.052 XcSHAUpdate(0x2c038, 0xd0070e18, 0x8, 0) from 0x1bb74 = 0
+        0.052 NtWaitForSingleObject(0x1004, 0, 0, 0xd0070f4c) from 0x1a429 = 0
+        0.052 XcSHAUpdate(0x2c038, 0xd0070f40, 0x8, 0x23) from 0x1bb74 = 0
+        0.052 XcSHAFinal(0x2c038, 0xd0070f64, 0, 0) from 0x1bc16 = 0
+        0.052 XcSHAUpdate(0x2c038, 0xd0070f88, 0x4, 0) from 0x1bc3f = 0
+        0.052 NtReleaseMutant(0x1004, 0, 0, 0xd0070f7c) from 0x1a4f1 = 0
+        0.053 NtCreateMutant(0x2b384, 0, 0, 0x594ab1b8) from 0x1b64a = 0
+        0.053 NtCreateMutant(0x2ac74, 0, 0, 0) from 0x1b64a = 0
+        0.053 NtCreateMutant(0x2acb4, 0, 0, 0) from 0x1b64a = 0
+        0.053 NtCreateMutant(0x2acf4, 0, 0, 0) from 0x1b64a = 0
+        0.053 RtlInitializeCriticalSection(0x2b254, 0xd0070f80, 0x17eb2, 0x2b254) from 0x14983 = 0
+        0.053 HalReadWritePCISpace(0, 0x60, 0x6c, 0xd0070f64) from 0x22f9d = 0
+        0.053 InterlockedExchange(0x2c2a0, 0x1, 0x10282, 0) from 0x1c717 = 0
+        0.053 KeQuerySystemTime(0xd0070ea0, 0, 0x8c003100, 0) from 0x236db = 0
+        0.053 InterlockedExchange(0x2c2a0, 0, 0, 0x10000) from 0x1c7eb = 0x1
+        0.053 InterlockedExchange(0x2c284, 0x1, 0, 0x4) from 0x1c139 = 0
+        0.053 KeGetCurrentIrql(0, 0x23, 0, 0x3) from 0x23759 = 0
+        0.053 NtAllocateVirtualMemory(0xd0070e58, 0, 0xd0070e5c, 0x3000) from 0x237b8 = 0
+        0.053 InterlockedExchange(0x2c284, 0, 0x2c0c4, 0x10) from 0x1c6db = 0x1
+        0.053 PsCreateSystemThreadEx(0xd0070f4c, 0, 0x10000, 0x114) from 0x175e1 = 0
+        0.053 NtClose(0x1018, 0x1b910, 0x30008, 0xd0070f8c) from 0x22d85 = 0
+thread 5 (guest), KPCR 0x8c003800, stack 0xd0081000-0xd0091120: in the kernel call KeDelayExecutionThread for 0.2 s
+    the stack at its last kernel call, esp 0xd0090900:
+      0000103c 00000000 d0090a88 00000000 00000063 00000000 ffffffff 000159a6
+      00000001 00000000 d0090930 00000000 ff676980 ffffffff d0090948 0001594e
+      000003e8 00000000 d0090f50 0001369b 000003e8 00000000 00000001 00000023
+      00000000 00000000 00000023 00000000 00000000 ff000000 00000000 01010000
+      d0090aa4 d0090950 01010101 d0090950 01010000 d0090b90 d0090bc0 01000000
+      d0090d0c d0090cf8 d0090bf6 d0090bed d0090bc0 8c002824 01010000 d0090d5c
+      01000000 01010101 8c000440 8c00280c 00054047 01010000 01ff0101 01010101
+      8c0006e0 01010101 01010101 00000000 00001044 00000000 d00909fc 00000001
+      557.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      558.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      559.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      560.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      561.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      562.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      563.979 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      564.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      565.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      566.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      567.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      568.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      569.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      570.980 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      571.981 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      572.981 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      573.981 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      574.981 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      575.981 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      576.982 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      577.982 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      578.982 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      579.982 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+      580.982 KeDelayExecutionThread(0x1, 0, 0xd0090930, 0) from 0x159a6 = 0
+faults by instruction (the most frequent of 19; backpatched hardware accesses so far: 510 at 11 sites):
+           256  eip 0x1682c  address 0xfd6813c9  code a2 c9 13 68 fd 8b 45 f8
+             4  eip 0x8c001d00  address 0  code fa fb 64 a1 18 00 00 00
+             4  eip 0x8c001d01  address 0  code fb 64 a1 18 00 00 00 c3
+             1  eip 0x1683b  address 0xfd6813c9  code a2 c9 13 68 fd 8b 45 f8
+             1  eip 0x11957  address 0xfed0805c  code 8b 40 5c 83 e0 01 83 f8
+             1  eip 0x11884  address 0xfed08004  code c7 40 04 80 00 00 00 8b
+             1  eip 0x118b8  address 0xfed08008  code 8b 48 08 83 e1 01 31 c0
+             1  eip 0x11906  address 0xfed08044  code 8b 40 44 3d 28 06 00 00
+             1  eip 0x11892  address 0xfed08008  code c7 40 08 01 00 00 00 8b
+             1  eip 0x118a0  address 0xfed08004  code 8b 48 04 31 c0 83 f9 00
+             1  eip 0x1680b  address 0xfd6813c8  code c6 05 c8 13 68 fd 00 c7
+             1  eip 0x1193c  address 0xfed08054  code 8b 48 54 83 e1 01 31 c0
+             1  eip 0x23116  address 0  code 0f 32 89 54 24 24 89 44
+             1  eip 0x118eb  address 0xfed08034  code 8b 48 34 31 c0 81 f9 df
+             1  eip 0x11830  address 0xfed08000  code 8b 00 2c 10 0f 94 c0 0f
+             1  eip 0x1684a  address 0xfd6813c9  code a2 c9 13 68 fd 8b 45 f8
+device registers by reads (of 10; a thread waiting on hardware polls the first ones):
+             2 reads        1 writes  0xfed08018 (ohci1)  last 0
+             1 reads        0 writes  0xfed08000 (ohci1)  last 0x10
+             1 reads        1 writes  0xfed08008 (ohci1)  last 0
+             1 reads        0 writes  0xfed08054 (ohci1)  last 0x100
+             1 reads        1 writes  0xfed08004 (ohci1)  last 0
+             1 reads        0 writes  0xfed08044 (ohci1)  last 0x628
+             1 reads        0 writes  0xfed0805c (ohci1)  last 0x100
+             1 reads        0 writes  0xfed08034 (ohci1)  last 0x27782edf
+             0 reads        1 writes  0xfd6813c8 (nv2a)  last 0
+             0 reads      768 writes  0xfd6813c9 (nv2a)  last 0xff
+the latest 64 device register accesses (time, read/write, address, size, value):
+        0.000 write 0xfd6813c9/1 0xee
+        0.000 write 0xfd6813c9/1 0xef
+        0.000 write 0xfd6813c9/1 0xef
+        0.000 write 0xfd6813c9/1 0xef
+        0.000 write 0xfd6813c9/1 0xf0
+        0.000 write 0xfd6813c9/1 0xf0
+        0.000 write 0xfd6813c9/1 0xf0
+        0.000 write 0xfd6813c9/1 0xf1
+        0.000 write 0xfd6813c9/1 0xf1
+        0.000 write 0xfd6813c9/1 0xf1
+        0.000 write 0xfd6813c9/1 0xf2
+        0.000 write 0xfd6813c9/1 0xf2
+        0.000 write 0xfd6813c9/1 0xf2
+        0.000 write 0xfd6813c9/1 0xf3
+        0.000 write 0xfd6813c9/1 0xf3
+        0.000 write 0xfd6813c9/1 0xf3
+        0.000 write 0xfd6813c9/1 0xf4
+        0.000 write 0xfd6813c9/1 0xf4
+        0.000 write 0xfd6813c9/1 0xf4
+        0.000 write 0xfd6813c9/1 0xf5
+        0.000 write 0xfd6813c9/1 0xf5
+        0.000 write 0xfd6813c9/1 0xf5
+        0.000 write 0xfd6813c9/1 0xf6
+        0.000 write 0xfd6813c9/1 0xf6
+        0.000 write 0xfd6813c9/1 0xf6
+        0.000 write 0xfd6813c9/1 0xf7
+        0.000 write 0xfd6813c9/1 0xf7
+        0.000 write 0xfd6813c9/1 0xf7
+        0.000 write 0xfd6813c9/1 0xf8
+        0.000 write 0xfd6813c9/1 0xf8
+        0.000 write 0xfd6813c9/1 0xf8
+        0.000 write 0xfd6813c9/1 0xf9
+        0.000 write 0xfd6813c9/1 0xf9
+        0.000 write 0xfd6813c9/1 0xf9
+        0.000 write 0xfd6813c9/1 0xfa
+        0.000 write 0xfd6813c9/1 0xfa
+        0.000 write 0xfd6813c9/1 0xfa
+        0.000 write 0xfd6813c9/1 0xfb
+        0.000 write 0xfd6813c9/1 0xfb
+        0.000 write 0xfd6813c9/1 0xfb
+        0.000 write 0xfd6813c9/1 0xfc
+        0.000 write 0xfd6813c9/1 0xfc
+        0.000 write 0xfd6813c9/1 0xfc
+        0.000 write 0xfd6813c9/1 0xfd
+        0.000 write 0xfd6813c9/1 0xfd
+        0.000 write 0xfd6813c9/1 0xfd
+        0.000 write 0xfd6813c9/1 0xfe
+        0.000 write 0xfd6813c9/1 0xfe
+        0.000 write 0xfd6813c9/1 0xfe
+        0.000 write 0xfd6813c9/1 0xff
+        0.000 write 0xfd6813c9/1 0xff
+        0.000 write 0xfd6813c9/1 0xff
+        0.000 read  0xfed08000/4 0x10
+        0.000 write 0xfed08018/4 0x12345678
+        0.000 read  0xfed08018/4 0x12345600
+        0.000 write 0xfed08004/4 0x80
+        0.000 write 0xfed08008/4 0x1
+        0.000 read  0xfed08004/4 0
+        0.000 read  0xfed08008/4 0
+        0.000 read  0xfed08018/4 0
+        0.000 read  0xfed08034/4 0x27782edf
+        0.000 read  0xfed08044/4 0x628
+        0.000 read  0xfed08054/4 0x100
+        0.000 read  0xfed0805c/4 0x100
+faults in guest code: 280; the latest 128 (time, thread, signal, eip, address, what became of it, registers eax..edi, code at eip):
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 8c ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 8d ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 8e ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 8f ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 90 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 91 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 92 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 93 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 94 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 95 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 96 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 97 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 98 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 99 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 9a ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 9b ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 9c ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 9d ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 9e ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs 9f ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a0 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a1 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a2 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a3 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a4 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a5 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a6 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a7 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a8 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs a9 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs aa ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ab ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ac ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ad ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ae ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs af ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b0 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b1 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b2 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b3 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b4 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b5 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b6 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b7 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b8 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs b9 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ba ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs bb ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs bc ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs bd ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs be ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs bf ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c0 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c1 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c2 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c3 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c4 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c5 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c6 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c7 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c8 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs c9 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ca ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs cb ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs cc ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs cd ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ce ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs cf ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d0 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d1 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d2 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d3 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d4 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d5 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d6 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d7 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d8 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs d9 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs da ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs db ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs dc ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs dd ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs de ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs df ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e0 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e1 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e2 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e3 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e4 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e5 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e6 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e7 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e8 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs e9 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ea ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs eb ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ec ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ed ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ee ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ef ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f0 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f1 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f2 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f3 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f4 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f5 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f6 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f7 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f8 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs f9 ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs fa ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs fb ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs fc ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs fd ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs fe ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x1682c addr 0xfd6813c9 a hardware register, emulated
+      regs ff ffffffff 2b1a8 fd000000 d00905a8 d00905c0 300 0
+      code a2 c9 13 68 fd 8b 45 f8 8a 84 40 a9 ae 02 00 e9
+        0.000 t5 sig 11 eip 0x11830 addr 0xfed08000 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 00 2c 10 0f 94 c0 0f b6 c8 89 e0 89 48 04 c7
+        0.000 t5 sig 11 eip 0x11851 addr 0xfed08018 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code c7 40 18 78 56 34 12 8b 84 24 b8 04 00 00 8b 40
+        0.000 t5 sig 11 eip 0x1185f addr 0xfed08018 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 40 18 2d 00 56 34 12 0f 94 c0 0f b6 c8 89 e0
+        0.000 t5 sig 11 eip 0x11884 addr 0xfed08004 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code c7 40 04 80 00 00 00 8b 84 24 b8 04 00 00 c7 40
+        0.000 t5 sig 11 eip 0x11892 addr 0xfed08008 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code c7 40 08 01 00 00 00 8b 84 24 b8 04 00 00 8b 48
+        0.000 t5 sig 11 eip 0x118a0 addr 0xfed08004 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 48 04 31 c0 83 f9 00 88 84 24 94 00 00 00 75
+        0.000 t5 sig 11 eip 0x118b8 addr 0xfed08008 a hardware register, emulated
+      regs fed08000 0 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 48 08 83 e1 01 31 c0 83 f9 00 88 84 24 94 00
+        0.000 t5 sig 11 eip 0x118d3 addr 0xfed08018 a hardware register, emulated
+      regs fed08000 0 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 48 18 31 c0 83 f9 00 88 84 24 94 00 00 00 75
+        0.000 t5 sig 11 eip 0x118eb addr 0xfed08034 a hardware register, emulated
+      regs fed08000 0 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 48 34 31 c0 81 f9 df 2e 78 27 88 84 24 94 00
+        0.000 t5 sig 11 eip 0x11906 addr 0xfed08044 a hardware register, emulated
+      regs fed08000 27782edf 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 40 44 3d 28 06 00 00 0f 94 c0 88 84 24 94 00
+        0.000 t5 sig 11 eip 0x1193c addr 0xfed08054 a hardware register, emulated
+      regs fed08000 1ae 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 48 54 83 e1 01 31 c0 83 f9 00 88 84 24 8f 00
+        0.000 t5 sig 11 eip 0x11957 addr 0xfed0805c a hardware register, emulated
+      regs fed08000 0 7 c8000b90 d0090950 d0090f50 d0090fb0 8c003800
+      code 8b 40 5c 83 e0 01 83 f8 00 0f 94 c0 88 84 24 8f
+the GPU's latest 0 methods (class method = parameter):

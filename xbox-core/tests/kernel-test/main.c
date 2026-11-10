@@ -121,6 +121,26 @@ int main(void)
         check("USB 1: reset", usb1[0x04 / 4] == 0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
                                   usb1[0x34 / 4] == 0x27782edf && usb1[0x44 / 4] == 0x628);
         check("USB 1: nothing plugged in", (usb1[0x54 / 4] & 1) == 0 && (usb1[0x5c / 4] & 1) == 0);
+        // string copies to and from device memory (DirectSound copies the GP DSP's memory with rep
+        // movsd): rep stosd in, rep movsd out, then a backwards rep movsd in from RAM
+        {
+            ULONG out[4] = {0}, src[3] = {0x111111, 0x222222, 0x333333};
+            void *gp = (void *)0xfe830200, *dst = out;
+            ULONG n = 3, value = 0x5aa5a5; // 24-bit words, as the DSP keeps them
+            __asm__ volatile("cld; rep stosl" : "+D"(gp), "+c"(n) : "a"(value) : "memory");
+            gp = (void *)0xfe830200;
+            n = 3;
+            __asm__ volatile("rep movsl" : "+S"(gp), "+D"(dst), "+c"(n) : : "memory");
+            check("APU: rep stosd into the GP's memory, rep movsd out",
+                  out[0] == value && out[1] == value && out[2] == value && out[3] == 0 && n == 0 &&
+                      gp == (void *)0xfe83020c && dst == &out[3]);
+            void *from = &src[2];
+            gp = (void *)0xfe830208;
+            n = 3;
+            __asm__ volatile("std; rep movsl; cld" : "+S"(from), "+D"(gp), "+c"(n) : : "memory");
+            volatile ULONG *g = (volatile ULONG *)0xfe830200;
+            check("APU: a backwards rep movsd from RAM", g[0] == src[0] && g[1] == src[1] && g[2] == src[2]);
+        }
         // kernel queues: in order, at the head, a timeout when empty, a rundown of what is left
         static KQUEUE q;
         static LIST_ENTRY e1, e2, e3;
