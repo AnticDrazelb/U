@@ -144,6 +144,6 @@ library opens, every minute while a program runs, when it ends, stops on an erro
 
 ## Licence
 
-xbox-core is distributed under the GNU General Public License, version 2 or later (`COPYING`): it
-includes xemu's DSP56300 interpreter (`src/third_party/xemu-dsp`, GPL-2.0-or-later), which runs the
-audio processor's DSPs, and its APU glue follows xemu's.
+xbox-core is distributed under the GNU General Public License, version 2 or later (`COPYING`): its
+audio processor is xemu's (`src/third_party/xemu`, GPL-2.0-or-later and LGPL-2.1-or-later), with
+libsamplerate (`src/third_party/libsamplerate`, BSD-2-Clause).

@@ -1,0 +1,1 @@
+/* xbox-core: no snapshots */
