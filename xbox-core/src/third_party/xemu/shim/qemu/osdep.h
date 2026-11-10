@@ -11,6 +11,8 @@
 #include <assert.h>
 #include <math.h>
 #include <sys/types.h>
+#include <limits.h>
+#include <errno.h>
 
 typedef uint64_t hwaddr;
 #define HWADDR_PRIx PRIx64
@@ -27,18 +29,32 @@ typedef uint64_t hwaddr;
 #ifndef M_E
 #define M_E 2.7182818284590452354
 #endif
-#define g_new0(type, n) ((type *)calloc((n), sizeof(type)))
-#define g_new(type, n) ((type *)malloc((n) * sizeof(type)))
-#define g_malloc0(n) calloc(1, (n))
-#define g_free(p) free(p)
+
+
+
+
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define likely(x) __builtin_expect(!!(x), 1)
 #define QEMU_PACKED __attribute__((packed))
+#define ROUND_UP(n, d) (((n) + (d) - 1) & -(0 ? (n) : (d)))
+#define QEMU_ALIGN_UP(n, m) ((((n) + (m) - 1) / (m)) * (m))
+#define QEMU_ALIGN_DOWN(n, m) (((n) / (m)) * (m))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define QEMU_BUILD_BUG_MSG(x, msg) _Static_assert(!(x), msg)
+#define QEMU_BUILD_BUG_ON(x) _Static_assert(!(x), "not expecting: " #x)
+static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) { return (uint64_t)(((unsigned __int128)a * b) / c); }
+static inline uint64_t muldiv64_round_up(uint64_t a, uint32_t b, uint32_t c)
+{
+    return (uint64_t)(((unsigned __int128)a * b + c - 1) / c);
+}
+#define tostring(s) #s
+#define stringify(s) tostring(s)
+#define QEMU_UNINITIALIZED
 
 #define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
 static inline int ctz32(uint32_t v) { return v ? __builtin_ctz(v) : 32; }
 static inline int ctz64(uint64_t v) { return v ? __builtin_ctzll(v) : 64; }
-#define g_malloc0_n(n, size) calloc((n), (size))
+
 #define rcu_register_thread() ((void)0)
 #define rcu_unregister_thread() ((void)0)
 
@@ -76,4 +92,10 @@ void xb_phys_st8(uint64_t addr, uint32_t v);
 typedef struct Error { char message[256]; } Error;
 #define error_setg(errp, ...) do { if (errp && !*(errp)) { *(errp) = (Error *)calloc(1, sizeof(Error)); snprintf((*(errp))->message, 256, __VA_ARGS__); } } while (0)
 #define warn_reportf_err(err, ...) free(err)
+#include "glib.h"
+#include "qemu/bitmap.h"
+#include "qemu/units.h"
+#include "qemu/timer.h"
+#include "qemu/thread.h"
+#include "qemu/bswap.h"
 #endif

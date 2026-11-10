@@ -332,11 +332,16 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
 /* xbox-core: the device without QEMU's PCI device, reset and snapshot plumbing. The APU's
  * 0x80000-byte window dispatched by offset as QEMU's memory regions do (its registers, the VP's
  * method window at 0x20000, the GP's at 0x30000, the EP's at 0x50000). */
+uint64_t xb_ram_size(void);
 void xb_mcpx_apu_init(uint8_t *ram_ptr)
 {
     MCPXAPUState *d = calloc(1, sizeof(MCPXAPUState));
     g_state = d;
     d->ram_ptr = ram_ptr;
+    static MemoryRegion ram;
+    ram.ram = ram_ptr;
+    ram.size = xb_ram_size();
+    d->ram = &ram;
     d->parent_obj.irq = 5; /* xbox-core: IRQ 5 */
 
     d->set_irq = false;

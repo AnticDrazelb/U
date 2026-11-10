@@ -4,7 +4,15 @@
 #include "qemu/osdep.h"
 enum { QEMU_CLOCK_VIRTUAL = 1 };
 typedef void QEMUTimerCB(void *opaque);
-typedef struct QEMUTimer QEMUTimer;
+typedef struct QEMUTimer {
+    QEMUTimerCB *cb;
+    void *opaque;
+    int64_t scale;  /* ns per unit */
+    int64_t expire; /* ns, or -1 */
+    struct QEMUTimer *next;
+} QEMUTimer;
+void timer_init_ns(QEMUTimer *t, int clock, QEMUTimerCB *cb, void *opaque);
+void timer_init_ms(QEMUTimer *t, int clock, QEMUTimerCB *cb, void *opaque);
 QEMUTimer *timer_new_ms(int clock, QEMUTimerCB *cb, void *opaque);
 QEMUTimer *timer_new_ns(int clock, QEMUTimerCB *cb, void *opaque);
 void timer_mod(QEMUTimer *t, int64_t expire); /* in the timer's own unit (ms or ns) */

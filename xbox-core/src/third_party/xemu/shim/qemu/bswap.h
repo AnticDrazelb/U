@@ -14,4 +14,8 @@ static inline void stl_le_p(void *p, uint32_t v) { memcpy(p, &v, 4); }
 #define le32_to_cpu(x) ((uint32_t)(x))
 static inline uint32_t lduw_le_p(const void *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static inline void stw_le_p(void *p, uint16_t v) { memcpy(p, &v, 2); }
+static inline uint64_t ldq_le_p(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static inline void stq_le_p(void *p, uint64_t v) { memcpy(p, &v, 8); }
+static inline int ldub_p(const void *p) { return *(const uint8_t *)p; }
+static inline void stb_p(void *p, uint8_t v) { *(uint8_t *)p = v; }
 #endif

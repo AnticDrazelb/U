@@ -1,2 +1,5 @@
 /* xbox-core */
 #define TARGET_PAGE_SIZE 4096
+#define TARGET_PAGE_BITS 12
+#define TARGET_PAGE_MASK (~(TARGET_PAGE_SIZE - 1))
+#define TARGET_PAGE_ALIGN(addr) (((addr) + TARGET_PAGE_SIZE - 1) & TARGET_PAGE_MASK)

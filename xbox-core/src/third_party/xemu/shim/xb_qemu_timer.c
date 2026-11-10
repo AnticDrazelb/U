@@ -3,13 +3,6 @@
 #include "qemu/timer.h"
 #include <pthread.h>
 
-struct QEMUTimer {
-    QEMUTimerCB *cb;
-    void *opaque;
-    int64_t scale;   /* ns per unit */
-    int64_t expire;  /* ns, or -1 */
-    QEMUTimer *next;
-};
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
@@ -63,9 +56,8 @@ static void *timer_thread(void *arg)
     return NULL;
 }
 
-static QEMUTimer *timer_new(int64_t scale, QEMUTimerCB *cb, void *opaque)
+static void timer_add(QEMUTimer *t, int64_t scale, QEMUTimerCB *cb, void *opaque)
 {
-    QEMUTimer *t = calloc(1, sizeof(QEMUTimer));
     t->cb = cb;
     t->opaque = opaque;
     t->scale = scale;
@@ -78,8 +70,17 @@ static QEMUTimer *timer_new(int64_t scale, QEMUTimerCB *cb, void *opaque)
         pthread_create(&g_thread, NULL, timer_thread, NULL);
     }
     pthread_mutex_unlock(&g_lock);
+}
+
+static QEMUTimer *timer_new(int64_t scale, QEMUTimerCB *cb, void *opaque)
+{
+    QEMUTimer *t = calloc(1, sizeof(QEMUTimer));
+    timer_add(t, scale, cb, opaque);
     return t;
 }
+
+void timer_init_ns(QEMUTimer *t, int clock, QEMUTimerCB *cb, void *opaque) { (void)clock; timer_add(t, 1, cb, opaque); }
+void timer_init_ms(QEMUTimer *t, int clock, QEMUTimerCB *cb, void *opaque) { (void)clock; timer_add(t, 1000000, cb, opaque); }
 
 QEMUTimer *timer_new_ms(int clock, QEMUTimerCB *cb, void *opaque) { (void)clock; return timer_new(1000000, cb, opaque); }
 QEMUTimer *timer_new_ns(int clock, QEMUTimerCB *cb, void *opaque) { (void)clock; return timer_new(1, cb, opaque); }

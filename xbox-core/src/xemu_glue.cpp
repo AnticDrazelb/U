@@ -9,8 +9,13 @@
 extern "C" {
 #include "ui/xemu-settings.h"
 
-// xemu's audio settings at its defaults, but 2 voice workers (the PS4's cores are the program's too)
-struct XbXemuConfig g_config = {{false, false, true, 1.0f, {2}}};
+// xemu's settings at its defaults (audio: the DSP option off, HRTF on), but 2 voice workers (the
+// PS4's cores are the program's too); the Vulkan renderer at 1x, no shader cache on disk
+struct XbXemuConfig g_config = {
+    {false, false, true, 1.0f, {2}},
+    {CONFIG_DISPLAY_RENDERER_VULKAN, {1}, {false, false, false, nullptr}},
+    {false},
+};
 struct AddressSpace { int unused; } address_space_memory;
 }
 

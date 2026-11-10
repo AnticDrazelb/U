@@ -35,3 +35,38 @@ static inline void qemu_thread_create(QemuThread *t, const char *name, void *(*f
 }
 static inline void qemu_thread_join(QemuThread *t) { pthread_join(t->t, NULL); }
 #endif
+#ifndef XB_XEMU_EVENT
+#define XB_XEMU_EVENT
+/* QEMU's events: a flag with waiters */
+typedef struct QemuEvent { pthread_mutex_t m; pthread_cond_t c; bool set; } QemuEvent;
+static inline void qemu_event_init(QemuEvent *e, bool init)
+{
+    pthread_mutex_init(&e->m, NULL);
+    pthread_cond_init(&e->c, NULL);
+    e->set = init;
+}
+static inline void qemu_event_set(QemuEvent *e)
+{
+    pthread_mutex_lock(&e->m);
+    e->set = true;
+    pthread_cond_broadcast(&e->c);
+    pthread_mutex_unlock(&e->m);
+}
+static inline void qemu_event_reset(QemuEvent *e)
+{
+    pthread_mutex_lock(&e->m);
+    e->set = false;
+    pthread_mutex_unlock(&e->m);
+}
+static inline void qemu_event_wait(QemuEvent *e)
+{
+    pthread_mutex_lock(&e->m);
+    while (!e->set) {
+        pthread_cond_wait(&e->c, &e->m);
+    }
+    pthread_mutex_unlock(&e->m);
+}
+static inline void qemu_event_destroy(QemuEvent *e) { (void)e; }
+static inline void qemu_mutex_destroy(QemuMutex *m) { pthread_mutex_destroy(&m->m); }
+static inline void qemu_cond_destroy(QemuCond *c) { pthread_cond_destroy(&c->c); }
+#endif

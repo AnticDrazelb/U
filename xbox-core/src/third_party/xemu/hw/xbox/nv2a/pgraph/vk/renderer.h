@@ -41,7 +41,7 @@
 #include "constants.h"
 #include "glsl.h"
 
-#define HAVE_EXTERNAL_MEMORY 1
+#define HAVE_EXTERNAL_MEMORY 0 /* xbox-core: no GL interop (xemu shares the display image with its own GL UI) */
 
 typedef struct QueueFamilyIndices {
     int queue_family;
