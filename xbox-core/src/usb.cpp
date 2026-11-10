@@ -4,6 +4,9 @@
 // guest memory (periodic, control, bulk), completes transfers into the done queue and interrupts.
 // The gamepad's state comes from the frontend (SetPad).
 #include <chrono>
+#include <cstdlib>
+#include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -548,6 +551,7 @@ struct Ohci
                 const u32 keep_ports[kPorts] = {port[0], port[1], port[2], port[3]};
                 Reset();
                 std::memcpy(port, keep_ports, sizeof(port)); // the root hub isn't reset by HCR
+                R(HcControl) = 0xc0; // and the controller in USBSUSPEND (OHCI 1.0a 7.1.2)
             }
             R(HcCommandStatus) |= value & 0x0e; // CLF, BLF, OCR (ownership: already the driver's)
             return;
@@ -609,8 +613,77 @@ void GetRumble(u16& left, u16& right)
     right = g_rumble[1];
 }
 
+} // namespace xb
+
+// QEMU's USB (src/third_party/xemu/hw/usb: hcd-ohci, its core, bus and hub) with xemu's original Xbox
+// controller (hw/xbox/xid*): the default; XB_USB=own picks this file's own controllers. The pad's state
+// and rumble go through xemu's input hooks (ui/xemu-input.h), here.
+extern "C" {
+#include "ui/xemu-input.h"
+void xb_usb_init(void);
+uint64_t xb_ohci_read(int which, uint64_t addr, unsigned int size);
+void xb_ohci_write(int which, uint64_t addr, uint64_t val, unsigned int size);
+
+static ControllerState g_xemu_pad;
+
+ControllerState* xemu_input_get_bound(int index) { return index == 0 ? &g_xemu_pad : nullptr; }
+
+// xbox-core's pad as xemu's controller state: the analog buttons pressed past a quarter (xemu's XID
+// reports them all-or-nothing), the triggers' 0-255 as xemu's axes (it reports them >> 7)
+void xemu_input_update_controller(ControllerState* state)
+{
+    using namespace xb;
+    PadState pad;
+    {
+        std::lock_guard lock(g_pad_mutex);
+        pad = g_pad;
+    }
+    u16 b = 0;
+    const u16 kAnalog[6] = {CONTROLLER_BUTTON_A, CONTROLLER_BUTTON_B, CONTROLLER_BUTTON_X,
+                            CONTROLLER_BUTTON_Y, CONTROLLER_BUTTON_BLACK, CONTROLLER_BUTTON_WHITE};
+    for (int i = 0; i < 6; i++)
+        if (pad.analog[i] > 0x40)
+            b |= kAnalog[i];
+    const std::pair<u16, u16> kDigital[8] = {{0x01, CONTROLLER_BUTTON_DPAD_UP},    {0x02, CONTROLLER_BUTTON_DPAD_DOWN},
+                                             {0x04, CONTROLLER_BUTTON_DPAD_LEFT},  {0x08, CONTROLLER_BUTTON_DPAD_RIGHT},
+                                             {0x10, CONTROLLER_BUTTON_START},      {0x20, CONTROLLER_BUTTON_BACK},
+                                             {0x40, CONTROLLER_BUTTON_LSTICK},     {0x80, CONTROLLER_BUTTON_RSTICK}};
+    for (const auto& [ours, theirs] : kDigital)
+        if (pad.buttons & ours)
+            b |= theirs;
+    state->buttons = b;
+    state->axis[CONTROLLER_AXIS_LTRIG] = s16(pad.analog[6] << 7);
+    state->axis[CONTROLLER_AXIS_RTRIG] = s16(pad.analog[7] << 7);
+    state->axis[CONTROLLER_AXIS_LSTICK_X] = pad.lx;
+    state->axis[CONTROLLER_AXIS_LSTICK_Y] = pad.ly;
+    state->axis[CONTROLLER_AXIS_RSTICK_X] = pad.rx;
+    state->axis[CONTROLLER_AXIS_RSTICK_Y] = pad.ry;
+}
+
+void xemu_input_update_rumble(ControllerState* state)
+{
+    std::lock_guard lock(xb::g_pad_mutex);
+    xb::g_rumble[0] = state->rumble_l;
+    xb::g_rumble[1] = state->rumble_r;
+}
+}
+
+namespace xb {
+
 void InitUsb()
 {
+    const char* choice = std::getenv("XB_USB");
+    if (!(choice && std::string(choice) == "own"))
+    {
+        Log("usb: QEMU's OHCI controllers with xemu's Xbox controller (player 1: a hub in port 3, the pad in its port 1)");
+        xb_usb_init();
+        const u32 bases[2] = {0xfed00000, 0xfed08000};
+        for (int i = 0; i < 2; i++)
+            AddDevice({bases[i], kSize, i == 0 ? "ohci0" : "ohci1",
+                       [i](u32 o, u32 size) { return u32(xb_ohci_read(i, o, size)); },
+                       [i](u32 o, u32 size, u32 v) { xb_ohci_write(i, o, v, size); }});
+        return;
+    }
     // USB 0 (0xfed00000, IRQ 1): the gamepad on root port 3, the front panel's first port (player 1);
     // USB 1 (0xfed08000, IRQ 9): nothing plugged in
     const u32 bases[2] = {0xfed00000, 0xfed08000}, irqs[2] = {1, 9};

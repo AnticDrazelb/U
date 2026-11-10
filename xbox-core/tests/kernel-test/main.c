@@ -118,7 +118,9 @@ int main(void)
         check("USB 1: the HCCA's low bits read 0", usb1[0x18 / 4] == 0x12345600);
         usb1[0x04 / 4] = 0x80;
         usb1[0x08 / 4] = 1; // host controller reset
-        check("USB 1: reset", usb1[0x04 / 4] == 0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
+        // HCR: the controller's registers reset and it in USBSUSPEND (OHCI 1.0a 7.1.2: HcControl's
+        // HostControllerFunctionalState 3, 0xc0)
+        check("USB 1: reset", (usb1[0x04 / 4] & ~0x100u) == 0xc0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
                                   usb1[0x34 / 4] == 0x27782edf && usb1[0x44 / 4] == 0x628);
         check("USB 1: nothing plugged in", (usb1[0x54 / 4] & 1) == 0 && (usb1[0x5c / 4] & 1) == 0);
         // the AC'97's global status: the primary codec ready, its status bits read-only, the rest kept

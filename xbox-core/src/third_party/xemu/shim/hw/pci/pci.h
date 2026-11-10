@@ -3,7 +3,13 @@
 #define XB_XEMU_PCI_H
 #include "qemu/osdep.h"
 /* a memory region: RAM xbox-core gives (its pointer and size), or an I/O window (no RAM) */
-typedef struct MemoryRegion { uint8_t *ram; uint64_t size; } MemoryRegion;
+struct MemoryRegionOps;
+typedef struct MemoryRegion {
+    uint8_t *ram;
+    uint64_t size;
+    const struct MemoryRegionOps *ops; /* an I/O window: its handlers (memory_region_init_io) */
+    void *opaque;
+} MemoryRegion;
 enum { DIRTY_MEMORY_VGA, DIRTY_MEMORY_CODE, DIRTY_MEMORY_MIGRATION, DIRTY_MEMORY_NV2A, DIRTY_MEMORY_NV2A_TEX, DIRTY_MEMORY_NUM };
 static inline uint64_t memory_region_size(MemoryRegion *mr) { return mr->size; }
 static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) { return mr->ram; }
@@ -15,10 +21,22 @@ void memory_region_set_dirty(MemoryRegion *mr, uint64_t addr, uint64_t size);
 void memory_region_set_client_dirty(MemoryRegion *mr, uint64_t addr, uint64_t size, unsigned client);
 bool memory_region_test_and_clear_dirty(MemoryRegion *mr, uint64_t addr, uint64_t size, unsigned client);
 static inline bool tcg_enabled(void) { return false; } /* the CPU runs natively (as under KVM) */
+enum device_endian { DEVICE_NATIVE_ENDIAN, DEVICE_BIG_ENDIAN, DEVICE_LITTLE_ENDIAN };
 typedef struct MemoryRegionOps {
     uint64_t (*read)(void *opaque, hwaddr addr, unsigned int size);
     void (*write)(void *opaque, hwaddr addr, uint64_t val, unsigned int size);
+    enum device_endian endianness;
+    struct { unsigned min_access_size, max_access_size; bool unaligned; } valid, impl;
 } MemoryRegionOps;
+static inline void memory_region_init_io(MemoryRegion *mr, void *owner, const MemoryRegionOps *ops, void *opaque,
+                                         const char *name, uint64_t size)
+{
+    (void)owner; (void)name;
+    mr->ram = NULL;
+    mr->size = size;
+    mr->ops = ops;
+    mr->opaque = opaque;
+}
 typedef struct PCIDevice { int irq; uint8_t config[256]; } PCIDevice; /* xbox-core: the device's IRQ line */
 typedef struct PCIBus PCIBus;
 typedef void *qemu_irq;

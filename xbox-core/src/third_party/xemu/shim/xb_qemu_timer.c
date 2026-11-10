@@ -10,6 +10,9 @@ static QEMUTimer *g_timers;
 static pthread_t g_thread;
 static bool g_started;
 
+void xb_bql_lock(void);
+void xb_bql_unlock(void);
+
 static int64_t now_ns(void) { return qemu_clock_get_us(0) * 1000; }
 
 static void *timer_thread(void *arg)
@@ -34,7 +37,10 @@ static void *timer_thread(void *arg)
         if (due) {
             due->expire = -1;
             pthread_mutex_unlock(&g_lock);
+            /* as QEMU's main loop runs timers: with the big lock held */
+            xb_bql_lock();
             due->cb(due->opaque);
+            xb_bql_unlock();
             pthread_mutex_lock(&g_lock);
             continue;
         }

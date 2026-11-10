@@ -9,6 +9,8 @@ extern "C" {
 void xb_nvnet_init(const uint8_t mac[6]);
 uint64_t xb_nvnet_read(uint64_t addr, unsigned int size);
 void xb_nvnet_write(uint64_t addr, uint64_t val, unsigned int size);
+void xb_bql_lock(void);
+void xb_bql_unlock(void);
 
 void xb_nic_send(const uint8_t* buf, size_t size)
 {
@@ -24,8 +26,20 @@ namespace xb {
 namespace {
 constexpr u32 kBase = 0xfef00000, kSize = 0x400;
 
-u32 ReadReg(u32 offset, u32 size) { return u32(xb_nvnet_read(offset, size)); }
-void WriteReg(u32 offset, u32 size, u32 value) { xb_nvnet_write(offset, value, size); }
+// QEMU runs register accesses with its big lock held
+u32 ReadReg(u32 offset, u32 size)
+{
+    xb_bql_lock();
+    const u32 v = u32(xb_nvnet_read(offset, size));
+    xb_bql_unlock();
+    return v;
+}
+void WriteReg(u32 offset, u32 size, u32 value)
+{
+    xb_bql_lock();
+    xb_nvnet_write(offset, value, size);
+    xb_bql_unlock();
+}
 } // namespace
 
 void InitNic()

@@ -47,6 +47,16 @@ static inline uint64_t muldiv64_round_up(uint64_t a, uint32_t b, uint32_t c)
 {
     return (uint64_t)(((unsigned __int128)a * b + c - 1) / c);
 }
+#define DO_UPCAST(type, field, dev) container_of(dev, type, field)
+typedef struct Monitor Monitor;
+typedef struct QDict QDict;
+static inline void pstrcpy(char *buf, int buf_size, const char *str)
+{
+    if (buf_size <= 0) {
+        return;
+    }
+    snprintf(buf, buf_size, "%s", str ? str : "");
+}
 #define tostring(s) #s
 #define stringify(s) tostring(s)
 #define QEMU_UNINITIALIZED

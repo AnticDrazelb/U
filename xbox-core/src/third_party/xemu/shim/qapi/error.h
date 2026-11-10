@@ -3,6 +3,7 @@
 #define XB_XEMU_QAPI_ERROR_H
 #include "qemu/osdep.h"
 extern Error *error_fatal;
+extern Error *error_abort;
 static inline const char *error_get_pretty(const Error *e) { return e ? e->message : ""; }
 static inline void error_free(Error *e) { free(e); }
 static inline void error_propagate(Error **dst, Error *src)

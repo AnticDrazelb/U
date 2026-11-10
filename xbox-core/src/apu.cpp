@@ -11,6 +11,8 @@
 
 extern "C" {
 #include "hw/xbox/mcpx/apu/apu.h"
+void xb_bql_lock(void);
+void xb_bql_unlock(void);
 }
 
 namespace xb {
@@ -21,7 +23,14 @@ namespace {
 
 constexpr u32 kBase = 0xfe800000, kSize = 0x80000, kIrq = 5;
 
-u32 ReadReg(u32 offset, u32 size) { return u32(xb_mcpx_apu_read(offset, size)); }
+// QEMU runs register accesses with its big lock held
+u32 ReadReg(u32 offset, u32 size)
+{
+    xb_bql_lock();
+    const u32 v = u32(xb_mcpx_apu_read(offset, size));
+    xb_bql_unlock();
+    return v;
+}
 
 void WriteReg(u32 offset, u32 size, u32 value)
 {
@@ -31,7 +40,9 @@ void WriteReg(u32 offset, u32 size, u32 value)
         if (told++ < 8)
             Log("apu: the %s DSP is let run (its microcode bootstrapped from scratch memory)", offset == 0x3fffc ? "GP" : "EP");
     }
+    xb_bql_lock();
     xb_mcpx_apu_write(offset, value, size);
+    xb_bql_unlock();
 }
 
 } // namespace
