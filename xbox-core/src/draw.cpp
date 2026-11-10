@@ -59,6 +59,51 @@ u32 Field(u32 token, int start, int bits)
 
 // ---- the vertex program
 
+// The vertex unit's arithmetic, as nxdk_pgraph_tests' Vertex_shader_rounding captures and notes
+// measure it: a product is truncated toward zero; a sum (ADD, MAD's addition, DP3/DPH/DP4's
+// accumulation) aligns every term to the largest one's leading bit less 28 (each truncated toward
+// zero to that step, no sticky bit), adds them exactly, and truncates the result toward zero.
+float TruncToFloat(double d)
+{
+    float f = float(d);
+    if (std::isfinite(f) && std::fabs(double(f)) > std::fabs(d))
+        f = std::nextafter(f, 0.f);
+    return f;
+}
+
+float VMul(float a, float b)
+{
+    const float p = a * b;
+    if (!std::isfinite(p) || !std::isfinite(a) || !std::isfinite(b))
+        return p;
+    return TruncToFloat(double(a) * double(b)); // exact in double
+}
+
+float VSum(const float* t, int n)
+{
+    double largest = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (!std::isfinite(t[i]))
+        {
+            float s = 0;
+            for (int k = 0; k < n; k++)
+                s += t[k];
+            return s;
+        }
+        largest = std::max(largest, std::fabs(double(t[i])));
+    }
+    if (largest == 0)
+        return t[0] + (n > 1 ? t[1] : 0.f); // signed zeros as the FPU has them
+    int e;
+    std::frexp(largest, &e); // largest = m 2^e, m in [0.5, 1): its leading bit is 2^(e - 1)
+    const double step = std::ldexp(1.0, e - 1 - 28);
+    double sum = 0;
+    for (int i = 0; i < n; i++)
+        sum += std::trunc(double(t[i]) / step) * step; // exact: 30 bits and a few terms in a double
+    return TruncToFloat(sum);
+}
+
 // A position's w as the NV2A takes it: its magnitude between 2^-64 and 2^64, +0 as +2^-64 (as xemu
 // has it; the console's captures draw vertices with w 0 and infinity, nxdk_pgraph_tests' W param)
 float ClampW(float w)
@@ -116,23 +161,37 @@ Vec4 RunProgram(const Vec4 in[16], Vec4 out[16])
         const Vec4 C = input(Field(t[3], 28, 2), c_reg, Field(t[2], 10, 1), Field(t[2], 8, 2), Field(t[2], 6, 2),
                              Field(t[2], 4, 2), Field(t[2], 2, 2));
         Vec4 m{}, l{};
-        auto dot = [](const Vec4& a, const Vec4& b, int n) {
-            float s = 0;
-            for (int k = 0; k < n; k++)
-                s += a[k] * b[k];
-            return s;
-        };
         auto all = [](float x) { return Vec4{{x, x, x, x}}; };
         switch (mac)
         {
         case 1: m = A; break;
-        case 2: for (int k = 0; k < 4; k++) m[k] = A[k] * B[k]; break;
-        case 3: for (int k = 0; k < 4; k++) m[k] = A[k] + C[k]; break;
-        case 4: for (int k = 0; k < 4; k++) m[k] = A[k] * B[k] + C[k]; break;
-        case 5: m = all(dot(A, B, 3)); break;
-        case 6: m = all(dot(A, B, 3) + B[3]); break;
-        case 7: m = all(dot(A, B, 4)); break;
-        case 8: m = Vec4{{1, A[1] * B[1], A[2], B[3]}}; break;
+        case 2: for (int k = 0; k < 4; k++) m[k] = VMul(A[k], B[k]); break;
+        case 3:
+            for (int k = 0; k < 4; k++)
+            {
+                const float t[2] = {A[k], C[k]};
+                m[k] = VSum(t, 2);
+            }
+            break;
+        case 4:
+            for (int k = 0; k < 4; k++)
+            {
+                const float t[2] = {VMul(A[k], B[k]), C[k]};
+                m[k] = VSum(t, 2);
+            }
+            break;
+        case 5:
+        case 6:
+        case 7:
+        {
+            float t[4];
+            for (int k = 0; k < 3; k++)
+                t[k] = VMul(A[k], B[k]);
+            t[3] = mac == 7 ? VMul(A[3], B[3]) : B[3];
+            m = all(VSum(t, mac == 5 ? 3 : 4));
+            break;
+        }
+        case 8: m = Vec4{{1, VMul(A[1], B[1]), A[2], B[3]}}; break;
         case 9: for (int k = 0; k < 4; k++) m[k] = std::min(A[k], B[k]); break;
         case 10: for (int k = 0; k < 4; k++) m[k] = std::max(A[k], B[k]); break;
         case 11: for (int k = 0; k < 4; k++) m[k] = A[k] < B[k] ? 1.f : 0.f; break;
