@@ -133,6 +133,42 @@ set_source_files_properties(src/apu.cpp src/xemu_glue.cpp PROPERTIES INCLUDE_DIR
 if (NOT PS4)
     target_link_libraries(xbox-core PRIVATE ${CMAKE_DL_LIBS}) # libvulkan, opened at run time
 endif()
+
+# xemu's NV2A (GPL-2.0-or-later) with its Vulkan renderer, where xbox-core has Vulkan: its
+# dependencies at xemu's revisions (glslang compiles its generated shaders at run time; volk loads
+# Vulkan; VMA, SPIRV-Reflect, xxHash, nv2a_vsh_cpu). src/nv2a.cpp chooses it at start (XB_NV2A=own:
+# xbox-core's own).
+if (NOT PS4 OR XB_GPU_LINK)
+    set(TP ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
+    set(XEMU_NV2A_DIR ${TP}/xemu/hw/xbox/nv2a)
+    file(GLOB XEMU_NV2A_SOURCES ${XEMU_NV2A_DIR}/*.c ${XEMU_NV2A_DIR}/pgraph/*.c ${XEMU_NV2A_DIR}/pgraph/glsl/*.c
+         ${XEMU_NV2A_DIR}/pgraph/vk/*.c)
+    list(FILTER XEMU_NV2A_SOURCES EXCLUDE REGEX "debug_renderdoc\\.c$")
+    list(APPEND XEMU_NV2A_SOURCES ${TP}/xemu/shim/xb_vga.c ${TP}/xemu/shim/xb_memory.c ${TP}/xemu/shim/xb_bql.c ${TP}/xemu/shim/fast-hash.c
+         ${TP}/nv2a_vsh_cpu/nv2a_vsh_cpu.c ${TP}/nv2a_vsh_cpu/nv2a_vsh_disassembler.c ${TP}/nv2a_vsh_cpu/nv2a_vsh_emulator.c
+         ${TP}/nv2a_vsh_cpu/nv2a_vsh_emulator_execution_state.c ${TP}/volk/volk.c ${TP}/spirv-reflect/spirv_reflect.c
+         ${TP}/vma/vma_impl.cpp)
+    target_sources(xbox-core PRIVATE ${XEMU_NV2A_SOURCES})
+    set(XEMU_NV2A_INCLUDES "${TP}/xemu/shim;${TP}/xemu;${XEMU_NV2A_DIR};${TP}/xxhash;${TP}/volk;${TP}/vma;${TP}/spirv-reflect;${TP}/spirv-reflect/include;${TP}/glslang;${TP}/nv2a_vsh_cpu")
+    if (PS4)
+        set(XEMU_NV2A_INCLUDES "${XEMU_NV2A_INCLUDES};${PS4_MESA_SOURCE}/include")
+        set(XEMU_NV2A_DEFS "VK_NO_PROTOTYPES;XB_VK_ICD_LINKED")
+    else()
+        set(XEMU_NV2A_DEFS "VK_NO_PROTOTYPES")
+    endif()
+    set_source_files_properties(${XEMU_NV2A_SOURCES} PROPERTIES INCLUDE_DIRECTORIES "${XEMU_NV2A_INCLUDES}"
+        COMPILE_DEFINITIONS "${XEMU_NV2A_DEFS}" COMPILE_OPTIONS "-w")
+    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${TP}/glslang ${CMAKE_BINARY_DIR}/glslang EXCLUDE_FROM_ALL)
+    target_link_libraries(xbox-core PRIVATE glslang glslang-default-resource-limits)
+    target_compile_definitions(xbox-core PRIVATE XB_XEMU_NV2A)
+endif()
 target_compile_definitions(xbox-core PRIVATE XB_VERSION="${XB_VERSION}")
 set_source_files_properties(${CORE_SOURCES} src/platform_linux.cpp src/main.cpp ps4/platform_ps4.cpp ps4/main_ps4.cpp
     PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter")

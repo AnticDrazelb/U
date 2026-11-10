@@ -494,8 +494,40 @@ void WriteReg(u32 offset, u32 size, u32 value)
 
 } // namespace
 
+#ifdef XB_XEMU_NV2A
+// xemu's NV2A (src/third_party/xemu/hw/xbox/nv2a: PFIFO, PGRAPH and its Vulkan renderer, PTIMER,
+// PCRTC...), chosen at start: the default where it is built; XB_NV2A=own picks this file's
+extern "C" {
+void xb_nv2a_init(uint8_t* ram, uint64_t ram_size);
+uint64_t xb_nv2a_read(uint64_t addr, unsigned int size);
+void xb_nv2a_write(uint64_t addr, uint64_t val, unsigned int size);
+void xb_nv2a_vblank(void);
+uint32_t xb_nv2a_display_start(void);
+}
+namespace {
+bool g_xemu_nv2a = false;
+}
+#endif
+
 void InitNv2a()
 {
+#ifdef XB_XEMU_NV2A
+    const char* choice = std::getenv("XB_NV2A");
+    g_xemu_nv2a = !(choice && std::string(choice) == "own");
+    if (g_xemu_nv2a)
+    {
+        Log("nv2a: xemu's (PGRAPH on its Vulkan renderer)");
+        xb_nv2a_init(Ptr<u8>(kContiguousBase), kContiguousSize);
+        // what the console's BIOS leaves in the memory controller (xemu runs the BIOS; xbox-core's
+        // kernel stands in for it): the RAM configuration, which drivers read (pbkit sizes its
+        // memory from them); the console's values
+        xb_nv2a_write(0x100200, 0x03070103, 4); // PFB_CFG0
+        xb_nv2a_write(0x100204, 0x11448000, 4); // PFB_CFG1
+        AddDevice({kDeviceBase, kSize, "nv2a", [](u32 offset, u32 size) { return u32(xb_nv2a_read(offset, size)); },
+                   [](u32 offset, u32 size, u32 value) { xb_nv2a_write(offset, value, size); }});
+        return;
+    }
+#endif
     g_ramin = Ptr<u8>(kGpuInstanceMemory);
     R(PFIFO_CACHE1_STATUS) = 1u << 4; // empty
     // the clocks as the BIOS leaves them (16.667 MHz crystal): the core at 233 MHz (M 1, N 28,
@@ -534,6 +566,10 @@ void InitNv2a()
 
 void Nv2aVblank()
 {
+#ifdef XB_XEMU_NV2A
+    if (g_xemu_nv2a)
+        return xb_nv2a_vblank();
+#endif
     std::lock_guard lock(g_m);
     g_pcrtc_pending |= 1;
     UpdateIrq();
@@ -541,6 +577,10 @@ void Nv2aVblank()
 
 u32 Nv2aDisplayStart()
 {
+#ifdef XB_XEMU_NV2A
+    if (g_xemu_nv2a)
+        return xb_nv2a_display_start();
+#endif
     std::lock_guard lock(g_m);
     return R(PCRTC_START);
 }

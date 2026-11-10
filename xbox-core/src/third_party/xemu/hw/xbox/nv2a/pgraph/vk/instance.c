@@ -32,7 +32,9 @@ static char const *const validation_layers[] = {
 };
 
 static char const *const required_device_extensions[] = {
-#ifdef WIN32
+/* xbox-core: only the GL interop for xemu's own UI needs these (HAVE_EXTERNAL_MEMORY 0 here) */
+#if !HAVE_EXTERNAL_MEMORY
+#elif defined(WIN32)
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
 #else
@@ -157,7 +159,14 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
 
+#ifdef XB_VK_ICD_LINKED
+    /* xbox-core on the PS4: the driver is linked in (no loader); volk starts from its entry point */
+    extern PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance, const char *);
+    volkInitializeCustom((PFN_vkGetInstanceProcAddr)vk_icdGetInstanceProcAddr);
+    result = VK_SUCCESS;
+#else
     result = volkInitialize();
+#endif
     if (result != VK_SUCCESS) {
         error_setg(errp, "volkInitialize failed");
         return false;

@@ -1,6 +1,8 @@
 // What xemu's devices (src/third_party/xemu) call of xbox-core: guest physical memory (the DMA they
 // do), their interrupt lines, and the settings they read. Their shims (src/third_party/xemu/shim)
 // declare these.
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 #include "core.h"
@@ -63,5 +65,18 @@ void xb_phys_write(uint64_t addr, const void* buf, size_t len)
     }
 }
 uint64_t xb_ram_size(void) { return kContiguousSize; }
+
+// xemu's error reports and notifications, into the log
+void xb_xemu_log(const char* fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    Log("xemu: %s", line);
+}
+struct Error;
+Error* error_fatal = nullptr;
 void xb_pci_irq(int irq, int level) { SetIrq(u32(irq), level != 0); }
 }
