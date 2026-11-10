@@ -194,3 +194,13 @@ retail game is to need it. Each item says how it is checked without the game.
   Looked at and left: Front_face's fill-mode cases (the console colours one triangle of a quad
   with front colours and one with back: a facing rule per triangle to work out), the shadow
   comparator's raw values, bump mapping, the signed blend equations.
+
+- **The GPU path for what games need on the console** (eabc691, 1b7df1c, 8b34a4f, 83b4aee). On the
+  PS4 every draw the GPU path declines goes to the software renderer, many times slower, so: the
+  dot-product texture stages (bump/environment mapping: DOT_ST, the dot reflects, DOT_STR) and
+  signed-channel textures (games' bump maps) now run on the GPU, with the same results as software
+  on the suites that use them; exact border colours (VK_EXT_custom_border_color); a large texture
+  the CPU rewrites between draws is noticed (a sparse sample checked on every use). Every 10 s the
+  log says how many draws went to software and why ("stats: draws the GPU left to software"), so a
+  slow game on the console shows the reason. Still in software: volume textures, shadow maps, float
+  depth surfaces, border texels, linear interpolation. Packages rebuilt 07:06.
