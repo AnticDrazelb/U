@@ -180,6 +180,10 @@ struct GuestThread
     u32 sample_eip[kSamples] = {};
     u32 sample_regs[8] = {}; // the latest sample's eax..edi
     u8 sample_code[48] = {}; // the latest sample's code from eip - 16
+    // the Xbox's single processor (StopGuestThreads): 1 while it runs guest code (not the emulator's:
+    // a kernel call, a fault's handling), and 1 while it is held in the fault handler meanwhile
+    std::atomic<u8> running_guest{0};
+    std::atomic<u8> held{0};
 };
 GuestThread* CurrentThread(); // the calling host thread's guest thread, or nullptr
 const char* KernelExportName(u32 ordinal); // kernel.cpp: an export's name, or nullptr
@@ -193,6 +197,12 @@ u64 CallGuest(GuestThread* t, u32 fn, std::initializer_list<u32> args);
 u64 CallGuestNested(u32 fn, std::initializer_list<u32> args);
 // Starts a host thread that runs `body` as guest thread t.
 void StartHostThread(GuestThread* t, std::function<void()> body);
+// The Xbox's single processor: while an interrupt service routine or a DPC runs, no other code does
+// (it ran between two instructions of whatever thread it interrupted). The interrupt thread holds
+// every other guest thread that runs guest code where it is (at its next instruction, through the
+// sample signal), and the others before they go back into guest code, until ResumeGuestThreads.
+void StopGuestThreads(GuestThread* self);
+void ResumeGuestThreads();
 // The guest address of the stub that calls kernel export `ordinal`.
 u32 ExportStub(u32 ordinal);
 // kernel.cpp: an object body with its OBJECT_HEADER; `type` names the exported OBJECT_TYPE

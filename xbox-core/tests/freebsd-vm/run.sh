@@ -8,7 +8,7 @@
 #
 #   run.sh boot                       download the image (once) and start the VM; ssh on port 2222
 #   run.sh sync                       copy src/ in and build it there (~/xc-bsd/xbox-core in the VM)
-#   run.sh test                       the regression tests in the VM (kernel, SEH, disc, triangle)
+#   run.sh test                       the regression tests in the VM (kernel, APU trap, SEH, disc, triangle)
 #   run.sh run <file> [args]          copy a file in and run xbox-core on it there
 #   run.sh ssh [command]              a shell or command in the VM (root)
 #   run.sh stop
@@ -49,10 +49,10 @@ sync)
     ;;
 test)
     NXDK_DIR="${NXDK_DIR:-$HOME/emu/nxdk}"
-    tar czf "$VM/t.tgz" -C "$CORE/tests" kernel-test/bin seh-test/bin bigimage-test/bin disc-test/disc-test.iso -C "$NXDK_DIR/samples" triangle/bin
+    tar czf "$VM/t.tgz" -C "$CORE/tests" kernel-test/bin seh-test/bin bigimage-test/bin disc-test/disc-test.iso apu-trap-test/bin -C "$NXDK_DIR/samples" triangle/bin
     vcp "$VM/t.tgz" root@127.0.0.1:/root/
     vssh 'rm -rf /root/t && mkdir -p /root/t /root/run && tar xzf /root/t.tgz -C /root/t && cd /root/run && fail=0
-for x in /root/t/kernel-test/bin/default.xbe /root/t/seh-test/bin/default.xbe /root/t/disc-test/disc-test.iso /root/t/triangle/bin/default.xbe ${XB_VM_BIG:+/root/t/bigimage-test/bin/default.xbe}; do
+for x in /root/t/kernel-test/bin/default.xbe /root/t/apu-trap-test/bin/default.xbe /root/t/seh-test/bin/default.xbe /root/t/disc-test/disc-test.iso /root/t/triangle/bin/default.xbe ${XB_VM_BIG:+/root/t/bigimage-test/bin/default.xbe}; do
     XB_STRICT_SIGNAL=1 timeout 600 /root/xc-bsd/xbox-core "$x" --seconds 8 > out.txt 2>&1; rc=$?
     r=$(grep -E "test: [0-9]+ failures" out.txt | tail -1)
     p=$(grep -oE "backpatched hardware accesses so far: [0-9]+ at [0-9]+ sites" out.txt | tail -1)

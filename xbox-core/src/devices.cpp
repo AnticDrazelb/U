@@ -203,7 +203,9 @@ void RunDpcs(GuestThread* t)
         // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2), at dispatch level
         SetIrql(2);
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 1);
+        StopGuestThreads(t); // DPCs too run before any thread at normal level goes on
         CallGuest(t, Read<u32>(dpc + 12), {dpc, Read<u32>(dpc + 16), Read<u32>(dpc + 20), Read<u32>(dpc + 24)});
+        ResumeGuestThreads();
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 0);
         SetIrql(0);
     }
@@ -237,7 +239,9 @@ void RunInterrupts(GuestThread* t)
             g_device_level.Acquire();
             t_in_isr = true;
             Write<u8>(t->kpcr + kpcr::Irql, u8(std::max<u32>(3, Read<u8>(i + 0xc))));
+            StopGuestThreads(t); // between two instructions of every other thread, as on the console
             CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)});
+            ResumeGuestThreads();
             Write<u8>(t->kpcr + kpcr::Irql, 0);
             t_in_isr = false;
             g_device_level.Release();

@@ -283,6 +283,9 @@ GuestThread* ThreadByStack(u32 esp)
     return nullptr;
 }
 
+u32 ThreadCount() { return std::min<u32>(g_thread_count.load(std::memory_order_acquire), kMaxThreads); }
+GuestThread* ThreadAt(u32 i) { return i < ThreadCount() ? g_threads[i] : nullptr; }
+
 void RegisterThread(GuestThread* t)
 {
     const u32 i = g_thread_count.load();

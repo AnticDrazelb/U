@@ -38,6 +38,8 @@ void DeviceAccess(u32 address, u32 size, u32 value, bool write, u32 eip = 0);
 // a guest thread, kept for the reports (never freed, so a crash report can read them)
 void RegisterThread(GuestThread* t);
 GuestThread* ThreadByStack(u32 esp); // the guest thread whose stack holds esp (lock-free: the fault handler's)
+u32 ThreadCount();                   // the guest threads registered so far (lock-free)
+GuestThread* ThreadAt(u32 i);
 
 // The guest's state as text, without locks or allocation (a crash report's): each thread with
 // the kernel call it's in and its latest ones, the GPU's latest methods. To `fd` with write().

@@ -3,6 +3,7 @@
 // emulated instruction by instruction, privileged instructions skipped, anything else reported.
 // The host's side of it (memory, fs, signals) is in platform_*.cpp.
 #include <cctype>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -39,6 +40,42 @@ u32 g_switch = 0; // the switch's copy below 4 GiB
 u32 g_stubs = 0;
 u16 g_sel32 = 0, g_sel64 = 0, g_ds = 0;
 thread_local GuestThread* tl_thread = nullptr;
+
+// ---- the Xbox's single processor (StopGuestThreads): a generation, odd while the interrupt thread's
+// routine runs and the other guest threads are held
+std::atomic<u64> g_stop_gen{0};
+std::atomic<GuestThread*> g_stopper{nullptr};
+std::mutex g_park_mutex;
+std::condition_variable g_park_cv;
+std::atomic<u64> g_stop_late{0};
+const bool g_single_processor = [] {
+    const char* e = std::getenv("XB_UP");
+    return !(e && e[0] == '0');
+}();
+
+// Back into guest code; held first while the interrupt thread's routine runs.
+void EnterGuest(GuestThread* t)
+{
+    if (!t)
+        return;
+    for (;;)
+    {
+        t->running_guest.store(1, std::memory_order_seq_cst);
+        const u64 gen = g_stop_gen.load(std::memory_order_seq_cst);
+        if (!(gen & 1) || g_stopper.load(std::memory_order_relaxed) == t)
+            return;
+        t->running_guest.store(0, std::memory_order_seq_cst);
+        std::unique_lock lock(g_park_mutex);
+        g_park_cv.wait(lock, [gen] { return g_stop_gen.load() != gen; });
+    }
+}
+
+// Out of guest code into the emulator's (a kernel call, a fault's handling, a call's end).
+void LeaveGuest(GuestThread* t)
+{
+    if (t)
+        t->running_guest.store(0, std::memory_order_seq_cst);
+}
 std::atomic<u32> g_next_thread_id{1};
 
 u64 SwitchEntry(const unsigned char* symbol)
@@ -61,7 +98,9 @@ u64 HostFsBase()
 extern "C" void GateEntry(u32* frame, u64 kpcr)
 {
     auto* thread = reinterpret_cast<GuestThread*>(Read<u64>(u32(kpcr) + kpcr::HostThread));
+    LeaveGuest(thread);
     KernelCall(reinterpret_cast<GateFrame*>(frame), thread);
+    EnterGuest(thread);
 }
 
 // ---- the fault handler
@@ -1026,6 +1065,28 @@ bool OnFault(platform::Fault& f)
                 t->samples.store(n + 1, std::memory_order_release);
             }
         }
+        // held while the interrupt thread's routine runs (StopGuestThreads), where it is: in guest
+        // code, or between the emulator's code and the guest's (the switch: nothing held there)
+        const u64 gen = g_stop_gen.load(std::memory_order_acquire);
+        if (gen & 1)
+        {
+            GuestThread* t = nullptr;
+            const u64 fs = f.fs_base;
+            if (fs >= kKernelBase && fs + kpcr::Self + 8 <= u64(kKernelBase) + kKernelSize &&
+                Read<u32>(u32(fs) + kpcr::NtTibSelf) == fs)
+                t = reinterpret_cast<GuestThread*>(Read<u64>(u32(fs) + kpcr::HostThread));
+            else
+                for (u32 i = 0, n = diag::ThreadCount(); i < n && !t; i++)
+                    if (GuestThread* c = diag::ThreadAt(i); c && c->kpcr && fs && Read<u64>(c->kpcr + kpcr::HostFsBase) == fs)
+                        t = c;
+            if (t && t != g_stopper.load(std::memory_order_relaxed) && t->running_guest.load(std::memory_order_seq_cst))
+            {
+                t->held.store(1, std::memory_order_seq_cst);
+                while (g_stop_gen.load(std::memory_order_acquire) == gen)
+                    __builtin_ia32_pause();
+                t->held.store(0, std::memory_order_release);
+            }
+        }
         return true;
     }
     if (f.cs != g_sel32)
@@ -1069,6 +1130,8 @@ bool OnFault(platform::Fault& f)
 extern "C" u32 FaultResumed(u64 kpcr_address)
 {
     const u32 k = u32(kpcr_address);
+    auto* thread = reinterpret_cast<GuestThread*>(Read<u64>(k + kpcr::HostThread));
+    LeaveGuest(thread);
     platform::Trail(6, k, Read<u32>(k + kpcr::FaultEip), Read<u32>(k + kpcr::FaultSignal), Read<u32>(k + kpcr::FaultAddress));
     u64 gpr[8], rip = Read<u32>(k + kpcr::FaultEip), eflags = Read<u32>(k + kpcr::FaultEflags);
     for (int i = 0; i < 8; i++)
@@ -1089,6 +1152,8 @@ extern "C" u32 FaultResumed(u64 kpcr_address)
     Write<u32>(k + kpcr::FaultEip, u32(rip));
     Write<u32>(k + kpcr::FaultEflags, u32(eflags));
     platform::Trail(7, u32(result), rip, eflags, Read<u32>(k + kpcr::FaultRegs + 4 * 4));
+    if (result == 0)
+        EnterGuest(thread);
     return u32(result);
 }
 
@@ -1467,7 +1532,10 @@ u64 CallGuest(GuestThread* t, u32 fn, std::initializer_list<u32> args)
     for (u32 v : args)
         Write<u32>(a, v), a += 4;
     using Enter = u64 (*)(u32, u32, u64);
-    return reinterpret_cast<Enter>(SwitchEntry(xcs_enter64))(fn, esp, t->kpcr);
+    EnterGuest(t);
+    const u64 result = reinterpret_cast<Enter>(SwitchEntry(xcs_enter64))(fn, esp, t->kpcr);
+    LeaveGuest(t);
+    return result;
 }
 
 u64 CallGuestNested(u32 fn, std::initializer_list<u32> args)
@@ -1484,7 +1552,9 @@ u64 CallGuestNested(u32 fn, std::initializer_list<u32> args)
     Write<u64>(t->kpcr + kpcr::HostFsBase, HostFsBase());
     platform::PrepareKpcr(t->kpcr, HostFsBase());
     using Enter = u64 (*)(u32, u32, u64);
+    EnterGuest(t);
     const u64 result = reinterpret_cast<Enter>(SwitchEntry(xcs_enter64))(fn, esp, t->kpcr);
+    LeaveGuest(t);
     Write<u64>(t->kpcr + kpcr::GuestEsp, saved_esp);
     return result;
 }
@@ -1497,6 +1567,59 @@ void StartHostThread(GuestThread* t, std::function<void()> body)
         t->host = platform::CurrentHostThread();
         body();
     }).detach();
+}
+
+void StopGuestThreads(GuestThread* self)
+{
+    if (!g_single_processor)
+        return;
+    g_stopper.store(self, std::memory_order_relaxed);
+    g_stop_gen.fetch_add(1, std::memory_order_seq_cst); // odd: stopped
+    const auto start = std::chrono::steady_clock::now();
+    auto last_signal = start - std::chrono::seconds(1);
+    for (;;)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const bool signal = now - last_signal >= std::chrono::milliseconds(2);
+        bool all = true;
+        for (u32 i = 0, n = diag::ThreadCount(); i < n; i++)
+        {
+            GuestThread* t = diag::ThreadAt(i);
+            const u64 host = t ? t->host.load() : 0;
+            if (!t || t == self || !host)
+                continue;
+            if (t->running_guest.load(std::memory_order_seq_cst) && !t->held.load(std::memory_order_seq_cst))
+            {
+                all = false;
+                if (signal)
+                    platform::SendSample(host);
+            }
+        }
+        if (all)
+            return;
+        if (signal)
+            last_signal = now;
+        if (now - start > std::chrono::milliseconds(20))
+        {
+            // a thread that didn't stop in time runs on (a routine is never held up for long)
+            if (g_stop_late.fetch_add(1) < 10)
+                Log("cpu: a guest thread didn't stop for an interrupt routine within 20 ms: it ran alongside");
+            return;
+        }
+        std::this_thread::yield();
+    }
+}
+
+void ResumeGuestThreads()
+{
+    if (!g_single_processor)
+        return;
+    g_stopper.store(nullptr, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_park_mutex);
+        g_stop_gen.fetch_add(1, std::memory_order_seq_cst); // even: running
+    }
+    g_park_cv.notify_all();
 }
 
 } // namespace xb

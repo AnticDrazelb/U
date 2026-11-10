@@ -42,6 +42,25 @@ static int fp_kept_across_device_read(void)
     return x87_out > 3.14159 && x87_out < 3.1416;
 }
 
+// one processor: a DPC runs between two instructions of a thread that never makes a kernel call
+static volatile LONG spin_counter, spin_stop, up_delta = -1;
+static DWORD WINAPI spinner(LPVOID p)
+{
+    (void)p;
+    while (!spin_stop)
+        spin_counter++;
+    return 0;
+}
+static VOID NTAPI up_dpc(PKDPC dpc, PVOID context, PVOID a, PVOID b)
+{
+    (void)dpc; (void)context; (void)a; (void)b;
+    const LONG c0 = spin_counter;
+    const ULONG t0 = KeTickCount;
+    while (KeTickCount - t0 < 3)
+        ;
+    up_delta = spin_counter - c0;
+}
+
 static int apc_calls;
 static DWORD apc_error, apc_bytes;
 static VOID WINAPI on_read_done(DWORD error, DWORD bytes, LPOVERLAPPED overlapped)
@@ -386,6 +405,27 @@ int main(void)
         DbgPrint("  DPCs at dispatch level: %d, after: %d\n", (int)(at_lower - at_raise), (int)(dpc_count - at_lower));
         check("no DPC runs while a thread is at dispatch level", at_lower == at_raise);
         check("DPCs run once it lowers", dpc_count > at_lower);
+    }
+    {
+        HANDLE th = CreateThread(NULL, 0, spinner, NULL, 0, NULL);
+        LARGE_INTEGER w = {.QuadPart = ms(30)};
+        KeDelayExecutionThread(KernelMode, FALSE, &w);
+        const LONG before = spin_counter;
+        KDPC d2;
+        KTIMER t2;
+        KeInitializeDpc(&d2, up_dpc, NULL);
+        KeInitializeTimerEx(&t2, NotificationTimer);
+        LARGE_INTEGER due2 = {.QuadPart = ms(10)};
+        KeSetTimer(&t2, due2, &d2);
+        w.QuadPart = ms(60);
+        KeDelayExecutionThread(KernelMode, FALSE, &w);
+        const LONG after = spin_counter;
+        spin_stop = 1;
+        WaitForSingleObject(th, 1000);
+        CloseHandle(th);
+        DbgPrint("  a spinning thread counted %ld during a 3 ms DPC (%ld before it, %ld after)\n", (long)up_delta,
+                 (long)before, (long)(after - before));
+        check("a DPC runs with every other thread held (one processor)", up_delta == 0 && before > 0 && after > before);
     }
 
     // a user APC, run by an alertable wait
