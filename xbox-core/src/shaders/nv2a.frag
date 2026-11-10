@@ -31,12 +31,36 @@ layout(std140, binding = 0) uniform State
     vec4 bumpLum[4];     // x scale, y offset
     uvec4 clipMode;      // x: SET_SHADER_CLIP_PLANE_MODE
     vec4 depth;          // 1 / the depth's largest value, polygon offset bias and factor, 1 with the w-buffer
+    uvec4 key;           // each stage's SET_COLOR_KEY_COLOR
+    uvec4 keyMode;       // colour key mode (bits 0-1), alpha kill (bit 2), the key without alpha (bit 3)
 } st;
 
 layout(binding = 1) uniform sampler2D tex2D[4];
 layout(binding = 2) uniform samplerCube texCube[4];
 
 vec4 R[16];
+
+// a stage's texel through the alpha kill and colour key (pixel.cpp's KeyAndKill); false: discarded
+bool keyAndKill(int s, inout vec4 c)
+{
+    const uint m = st.keyMode[s];
+    if ((m & 4u) != 0u && c.a == 0.0)
+        return false;
+    if ((m & 3u) == 0u)
+        return true;
+    const uvec4 b = uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+    const uint argb = (b.a << 24) | (b.r << 16) | (b.g << 8) | b.b;
+    const uint mask = (m & 8u) != 0u ? 0x00ffffffu : 0xffffffffu;
+    if ((argb & mask) != (st.key[s] & mask))
+        return true;
+    if ((m & 3u) == 3u)
+        return false;
+    if ((m & 3u) == 1u)
+        c.a = 0.0;
+    else
+        c = vec4(0.0);
+    return true;
+}
 
 float clamp01(float v) { return clamp(v, 0.0, 1.0); }
 
@@ -130,6 +154,8 @@ bool textureStages(out vec4 tex[4])
             if (enabled)
                 tex[s] = sampleStage(s, vec2(inp.g, inp.b));
         }
+        if (enabled && program != 4u && program != 5u && program != 0u && !keyAndKill(s, tex[s]))
+            return false;
     }
     return true;
 }

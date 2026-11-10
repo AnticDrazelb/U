@@ -41,6 +41,8 @@ struct Uniforms
     float tex_scale[4][4], bump[4][4], bump_lum[4][4];
     u32 clip_mode[4];
     float depth[4]; // 1 / the depth's largest value, polygon offset bias, factor, 1 with the w-buffer
+    u32 key[4];      // each stage's SET_COLOR_KEY_COLOR
+    u32 key_mode[4]; // each stage's colour key mode (bits 0-1), alpha kill (bit 2), the key without alpha (bit 3)
 };
 // A texture stage's texture as the GPU path needs it
 struct TextureInfo

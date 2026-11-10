@@ -138,6 +138,7 @@ struct PixelState
     float eye[3] = {}; // SET_EYE_VECTOR: dot reflect specular const's eye
     float bump[4][4] = {}, bump_scale[4] = {}, bump_offset[4] = {};
     bool enabled[4] = {};
+    u32 control0[4] = {}, color_key[4] = {}; // SET_TEXTURE_CONTROL0 (colour key mode, alpha kill), SET_COLOR_KEY_COLOR
     Texture texture[4];
     bool alpha_test = false, blend = false;
     u32 alpha_func = 0, alpha_ref = 0, blend_sfactor = 0, blend_dfactor = 0, blend_equation = 0;
@@ -742,6 +743,33 @@ V4 DotMap(const V4& c, u32 map)
 
 float Dot3(const float* a, const V4& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
+// A stage's texel through SET_TEXTURE_CONTROL0's alpha kill (bit 2: alpha 0 discards the pixel) and
+// colour key (bits 0-1, against SET_COLOR_KEY_COLOR as ARGB, the X formats' alpha left out: 1 its
+// alpha to 0, 2 all of it to 0, 3 the pixel discarded), as xemu has them (nxdk_pgraph_tests' Color_key);
+// false: discarded
+bool KeyAndKill(int s, V4& c)
+{
+    const u32 control = g_ps.control0[s];
+    if ((control & 4) && c[3] == 0)
+        return false;
+    const u32 mode = control & 3;
+    if (!mode)
+        return true;
+    auto byte = [](float v) { return u32(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f); };
+    const u32 argb = byte(c[3]) << 24 | byte(c[0]) << 16 | byte(c[1]) << 8 | byte(c[2]);
+    const u32 f = g_ps.texture[s].format;
+    const u32 mask = f == 0x03 || f == 0x07 || f == 0x1c || f == 0x1e ? 0x00ffffffu : 0xffffffffu;
+    if ((argb & mask) != (g_ps.color_key[s] & mask))
+        return true;
+    if (mode == 3)
+        return false;
+    if (mode == 1)
+        c[3] = 0;
+    else
+        c = {0, 0, 0, 0};
+    return true;
+}
+
 // the texture stages' programs (SET_SHADER_STAGE_PROGRAM, 5 bits a stage); false: a clip plane
 // stage discards the pixel
 bool TextureStages(const PixelInputs& in, V4 tex[4])
@@ -867,6 +895,12 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
                 Log("nv2a: texture stage program %u isn't done yet", program);
         }
         }
+        // a texel sampled from this stage's texture: the alpha kill and colour key
+        const bool sampled = enabled && ((program >= 1 && program <= 3) || program == 6 || program == 7 || program == 15 ||
+                                         program == 16 || (program == 9 && s > 0) || (program == 11 && s >= 1 && s < 3) ||
+                                         (((program >= 12 && program <= 14) || program == 18) && s >= 2));
+        if (sampled && (g_ps.control0[s] & 7) && !KeyAndKill(s, tex[s]))
+            return false;
     }
     return true;
 }
@@ -967,6 +1001,7 @@ void PreparePixels()
     {
         ps.program[s] = (programs >> (5 * s)) & 0x1f;
         ps.enabled[s] = k.Get(0x1b0c + u32(s) * 64) & (1u << 30);
+        ps.control0[s] = k.Get(0x1b0c + u32(s) * 64), ps.color_key[s] = k.Get(0xae0 + u32(s) * 4);
         if (ps.combiners && ps.enabled[s] && ps.program[s])
             ps.texture[s] = StageTexture(s);
     }
@@ -1033,6 +1068,12 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
     }
     put(u.fog_color, ps.fog_color), put(u.final_c0, ps.final_c0), put(u.final_c1, ps.final_c1);
     u.clip_mode[0] = ps.clip_mode;
+    for (int s = 0; s < 4; s++)
+    {
+        const u32 f = ps.texture[s].format;
+        u.key[s] = ps.color_key[s];
+        u.key_mode[s] = (ps.control0[s] & 7) | (f == 0x03 || f == 0x07 || f == 0x1c || f == 0x1e ? 8u : 0u);
+    }
     for (int s = 0; s < 4; s++)
     {
         tex[s] = gpu::TextureInfo{};
