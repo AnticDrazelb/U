@@ -36,6 +36,7 @@ struct Texture
 {
     u32 address = 0, palette = 0, format = 0, width = 1, height = 1, pitch = 0, wrap = 0, filter = 0, border = 0;
     bool swizzled = false, compressed = false, cubemap = false;
+    bool border_texels = false; // SET_TEXTURE_FORMAT bit 3 clear: the border comes from the texture's own texels
     u32 face_size = 0; // a cube map face's bytes: its mipmap chain, 128-byte aligned
     u32 levels = 1;
     u32 depth = 1, slice = 0; // a volume texture's slices, and the one texels come from
@@ -93,6 +94,11 @@ Texture StageTexture(int stage)
     t.filter = k.Get(base + 0x14);
     t.border = k.Get(base + 0x24);
     t.cubemap = (format & 4) && !IsLinear(t.format);
+    // the border from the texture (bit 3 clear; Direct3D and pbkit set it): a swizzled 2D texture is
+    // stored twice its size (16 texels under 8; a volume in depth too) with the image at (4, 4) and its
+    // border texels around it (nxdk_pgraph_tests' Texture_border, as xemu has it); the base level
+    // only; linear and cube ones not yet
+    t.border_texels = !(format & 8) && t.swizzled && !t.cubemap;
     if (!IsLinear(t.format))
         t.levels = std::max<u32>(1, (format >> 16) & 0xf);
     // SET_TEXTURE_CONTROL0's level clamps and SET_TEXTURE_FILTER's bias: fixed point, 8 fraction bits
@@ -355,6 +361,31 @@ V4 Sample3D(const Texture& t, float u, float v, float r, float lod)
         linear = min != 1 && min != 3 && min != 5;
     }
     const u32 wrap_p = (t.wrap >> 16) & 0xf;
+    if (t.border_texels) // the base level, its slices as stored: 4 in, the border's around them
+    {
+        lt = t;
+        const int stored_depth = t.depth >= 8 ? int(t.depth) * 2 : 16;
+        auto stored_slice = [&](int c) {
+            const int s = Address(c, t.depth, wrap_p);
+            return u32(std::clamp((s < 0 ? c : s) + 4, 0, stored_depth - 1));
+        };
+        const float z = r * float(t.depth);
+        if (!linear)
+        {
+            lt.slice = stored_slice(int(std::floor(z)));
+            return SampleLevel(lt, u, v, false);
+        }
+        const float fz = z - 0.5f;
+        const int z0 = int(std::floor(fz));
+        const float a = fz - float(z0);
+        Texture t0 = lt, t1 = lt;
+        t0.slice = stored_slice(z0), t1.slice = stored_slice(z0 + 1);
+        const V4 c0 = SampleLevel(t0, u, v, true), c1 = SampleLevel(t1, u, v, true);
+        V4 c;
+        for (int i = 0; i < 4; i++)
+            c[i] = c0[i] + (c1[i] - c0[i]) * a;
+        return c;
+    }
     const float z = t.swizzled ? r * float(lt.depth) : r;
     if (!linear)
     {
@@ -386,8 +417,16 @@ V4 SampleLevel(const Texture& t, float u, float v, bool linear)
     if (t.swizzled || t.compressed)
         u *= float(t.width), v *= float(t.height);
     const u32 wrap_u = t.wrap & 0xf, wrap_v = (t.wrap >> 8) & 0xf;
+    Texture stored = t; // with border texels: the image as stored, the texture 4 texels in
+    if (t.border_texels)
+        stored.width = t.width >= 8 ? t.width * 2 : 16, stored.height = t.height >= 8 ? t.height * 2 : 16,
+        stored.pitch = stored.width * BytesPerTexel(t.format),
+        stored.depth = t.depth > 1 ? (t.depth >= 8 ? t.depth * 2 : 16) : 1; // (the slice: Sample3D's, stored)
     auto fetch = [&](int x, int y) {
         const int ax = Address(x, t.width, wrap_u), ay = Address(y, t.height, wrap_v);
+        if (t.border_texels) // outside the texture (border mode): the stored border, as far as it goes
+            return Texel(stored, u32(std::clamp(ax < 0 ? x + 4 : ax + 4, 0, int(stored.width) - 1)),
+                         u32(std::clamp(ay < 0 ? y + 4 : ay + 4, 0, int(stored.height) - 1)));
         if (ax < 0 || ay < 0)
             return Unpack(t.border);
         return Texel(t, u32(ax), u32(ay));
@@ -1018,6 +1057,8 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
             return false; // shadow maps, volumes: not yet
         if (t.filter >> 28)
             return false; // signed channels: the GPU's textures are unsigned 8-bit (in software for now)
+        if (t.border_texels)
+            return false; // border texels stored with the texture: in software
         u.enabled[s] = 1;
         u.kind[s] = t.cubemap ? 1 : 0;
         gpu::TextureInfo& i = tex[s];
