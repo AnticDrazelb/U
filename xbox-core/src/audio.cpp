@@ -147,17 +147,15 @@ u32 ReadReg(u32 offset, u32 size)
     std::lock_guard lock(g_m);
     if (offset == kGlobalStatus)
     {
-        // the primary codec is ready (bit 8), and each box's interrupt as its own bit: PCM in 5,
-        // PCM out 6 (a driver waiting on its buffers polls these)
+        // the primary codec is ready (bit 8), and each box's pending interrupt as its own bit: PCM
+        // in 0x20, PCM out 0x40, and on nForce/MCPX the S/PDIF box (bus master 0x70) 0x10 (Linux's
+        // intel8x0: ICH_NVSPINT). They show the box's status, whatever its interrupt enables (those
+        // gate the IRQ): DirectSound polls this with interrupts off, waiting on a buffer.
         u32 v = D(kGlobalStatus) | 0x100;
-        for (u32 i = 0; i < 2; i++)
-        {
-            const u32 box = kBoxes[i];
-            const u16 sr = W(box + 6);
-            const u8 cr = B(box + 0xb);
-            if (((sr & SR_BCIS) && (cr & CR_IOCE)) || ((sr & SR_LVBCI) && (cr & CR_LVBIE)))
-                v |= i == 0 ? 0x20 : 0x40;
-        }
+        constexpr u32 kBits[3] = {0x20, 0x40, 0x10};
+        for (u32 i = 0; i < 3; i++)
+            if (W(kBoxes[i] + 6) & (SR_LVBCI | SR_BCIS | SR_FIFOE))
+                v |= kBits[i];
         return v;
     }
     if (offset < 0x100 && size == 2 && offset == 0x26)
@@ -178,6 +176,13 @@ void WriteReg(u32 offset, u32 size, u32 value)
                 ResetBox(box);
             else
             {
+                static int told = 0;
+                if (((B(box + 0xb) ^ value) & CR_RUN) && told < 32)
+                {
+                    told++;
+                    Log("ac97: box %#x %s (descriptors at %#x, last valid %u, control %#x)", box,
+                        (value & CR_RUN) ? "runs" : "stops", D(box), B(box + 5), value);
+                }
                 B(box + 0xb) = u8(value);
                 if (value & CR_RUN)
                     SetW(box + 6, W(box + 6) & ~SR_DCH);
@@ -205,7 +210,7 @@ void WriteReg(u32 offset, u32 size, u32 value)
     if (offset == kGlobalStatus && size == 4)
     {
         // RCS, the resume bits and GSCI are cleared by writing 1; the status bits are read-only
-        constexpr u32 kWriteClear = 0x8000 | 0x800 | 0x400 | 1, kReadOnly = 0x7000 | 0x300 | 0xfe;
+        constexpr u32 kWriteClear = 0x8000 | 0x800 | 0x400 | 1, kReadOnly = 0x7000 | 0x300 | 0xfe | 0x10;
         constexpr u32 kWritable = 0x3ffff & ~(kWriteClear | kReadOnly);
         const u32 v = (D(kGlobalStatus) & ~(value & kWriteClear) & ~kWritable) | (value & kWritable);
         std::memcpy(&g_regs[offset], &v, 4);

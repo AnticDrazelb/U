@@ -131,6 +131,29 @@ int main(void)
             check("AC97: the global status", (before & 0x100) && (before & 0xe0) == 0 &&
                                                  after == (0x30000 | 0x100) && *glob_sta == 0x100);
         }
+        // a box run with its interrupts off, polled through the global status (DirectSound waits on
+        // the S/PDIF box this way, at raised IRQL): its bit (nForce's 0x10) comes when the buffer ends
+        {
+            ULONG *desc = MmAllocateContiguousMemory(4096);
+            short *samples = (short *)(desc + 16);
+            for (int i = 0; i < 256; i++)
+                samples[i] = 0;
+            desc[0] = MmGetPhysicalAddress(samples);
+            desc[1] = 0x80000000 | 256; // IOC, 256 samples
+            volatile UCHAR *ac97 = (volatile UCHAR *)0xfec00000;
+            volatile ULONG *glob_sta = (volatile ULONG *)0xfec00130;
+            *(volatile ULONG *)(ac97 + 0x170) = MmGetPhysicalAddress(desc);
+            ac97[0x175] = 0;   // last valid: the first
+            ac97[0x17b] = 1;   // run, no interrupt enables
+            const ULONG start = KeTickCount;
+            while (!(*glob_sta & 0x10) && KeTickCount - start < 500)
+                ;
+            check("AC97: a finished S/PDIF buffer shows in the global status (interrupts off)", (*glob_sta & 0x10) != 0);
+            ac97[0x17b] = 2;                              // reset the box
+            *(volatile USHORT *)(ac97 + 0x176) = 0x1c;    // its status bits cleared
+            check("AC97: and goes once the box's status is cleared", (*glob_sta & 0x10) == 0);
+            MmFreeContiguousMemory(desc);
+        }
         // string copies to and from device memory (DirectSound copies the GP DSP's memory with rep
         // movsd): rep stosd in, rep movsd out, then a backwards rep movsd in from RAM
         {
