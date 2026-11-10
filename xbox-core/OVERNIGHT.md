@@ -111,3 +111,10 @@ retail game is to need it. Each item says how it is checked without the game.
   (2 texels over ~165 pixels, tent filter, quincunx kernel): a filtering/addressing detail to
   chase next with XB_NV2A_SYNC and one test (tests/pgraph's config takes a single test).
 
+- **4 (continued): the signed blend equations, investigated, not fixed.** All 30 failing
+  Blend_tests use ADD_SIGNED (0xf006) or REVERSE_SUBTRACT_SIGNED (0xf005), mapped here (as in
+  xemu) to add / reverse subtract. The console's captures show the result doesn't depend on the
+  blend factors (every dfactor column alike, the source at full strength with sfactor 0); four
+  candidate rules (with/without factors, biased by 0.5 or two's complement) each gave 75/105, none
+  right: left as it was, to finish with the test's exact colours.
+
