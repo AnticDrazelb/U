@@ -99,3 +99,15 @@ retail game is to need it. Each item says how it is checked without the game.
   both, Stencil goes from 0/8 to 8/8, the same on repeated runs. Also: tests/pgraph's runner takes
   suite names as the menu shows them ("Stencil func").
 
+- **4 (continued): signed texture channels.** SET_TEXTURE_FILTER's signed bits (A 28, R 29, G 30, B
+  31), unimplemented here and in xemu, now read a channel's byte as two's complement over 127
+  before filtering; an unsigned combiner input clamps the negatives to 0 (worked out from the
+  console's captures of the suite's signed-component tests); a bump stage takes a signed input's
+  blue and green as they are. Draws with signed channels go to software (the GPU path's textures
+  are unsigned 8-bit). Texture_signed_component_tests: 1/19 to 17/19.
+  **Bump mapping (Bump_map 1/41, Bump_env_lum 1/42) investigated, not fixed:** the formula matches
+  xemu's; the test's bump texture is SDL RGBA8888 (0x007f4500 is G 0x7f, B 0x45), and our stage
+  reads it about 3% dark (G 0.484, B 0.258 for 0.498, 0.271) at the test's extreme magnification
+  (2 texels over ~165 pixels, tent filter, quincunx kernel): a filtering/addressing detail to
+  chase next with XB_NV2A_SYNC and one test (tests/pgraph's config takes a single test).
+

@@ -193,7 +193,30 @@ V4 DxtTexel(const Texture& t, u32 x, u32 y)
     return c;
 }
 
+V4 TexelRaw(const Texture& t, u32 x, u32 y);
+
+// SET_TEXTURE_FILTER's signed channels (A bit 28, R 29, G 30, B 31): the texel's byte read as two's
+// complement over 127 (0x7f is 1, 0x80 and 0xff negative), before filtering; an unsigned input
+// mapping then clamps the negatives to 0, as the console's captures show (nxdk_pgraph_tests'
+// texture signed component tests)
 V4 Texel(const Texture& t, u32 x, u32 y)
+{
+    V4 c = TexelRaw(t, x, y);
+    if (const u32 flags = t.filter >> 28)
+    {
+        static constexpr int kChannel[4] = {3, 0, 1, 2}; // A, R, G, B -> RGBA index
+        for (int b = 0; b < 4; b++)
+            if (flags & (1u << b))
+            {
+                float& v = c[kChannel[b]];
+                const int byte = int(std::lround(std::clamp(v, 0.f, 1.f) * 255.f));
+                v = std::max(-1.f, float(byte >= 128 ? byte - 256 : byte) / 127.f);
+            }
+    }
+    return c;
+}
+
+V4 TexelRaw(const Texture& t, u32 x, u32 y)
 {
     if (t.compressed)
         return DxtTexel(t, x, y);
@@ -728,7 +751,11 @@ bool TextureStages(const PixelInputs& in, V4 tex[4])
         case 6: // bump environment map: the input's blue and green, signed, through the 2x2 matrix
         case 7: // ... with luminance: its red scaling the result
         {
-            const float du = Sign3(input[2]), dv = Sign3(input[1]);
+            // a channel the input texture already reads as signed (SET_TEXTURE_FILTER) is used as it
+            // is; an unsigned one is converted (as xemu does both)
+            const u32 in_filter = g_ps.texture[g_ps.input[s] < 4 ? g_ps.input[s] : 0].filter;
+            const float du = (in_filter & (1u << 31)) ? input[2] : Sign3(input[2]);
+            const float dv = (in_filter & (1u << 30)) ? input[1] : Sign3(input[1]);
             const float* m = g_ps.bump[s];
             const float u = tc[0] + du * m[0] + dv * m[2], v = tc[1] + du * m[1] + dv * m[3];
             if (enabled)
@@ -988,6 +1015,8 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
             continue;
         if (IsDepthFormat(t.format) || t.depth > 1 || (program == 3) != t.cubemap)
             return false; // shadow maps, volumes: not yet
+        if (t.filter >> 28)
+            return false; // signed channels: the GPU's textures are unsigned 8-bit (in software for now)
         u.enabled[s] = 1;
         u.kind[s] = t.cubemap ? 1 : 0;
         gpu::TextureInfo& i = tex[s];
