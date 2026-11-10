@@ -88,3 +88,14 @@ retail game is to need it. Each item says how it is checked without the game.
   leaves all of them unimplemented. Checked: 11 new kernel-test checks; regression 13/13 in all three
   modes.
 
+- **4 (continued), the hardware comparison (nxdk_pgraph_tests against the console's captures).**
+  Fetched the suite and the 5816 captures again; a full run now matches 2290 of 3110 images (73.6%;
+  the earlier session's run matched 1340). Fixed from it so far: **SET_COLOR_MASK 0 wrote every
+  channel** (0 was taken as "not set"; the register now starts with all channels on, as pbkit and
+  Direct3D set it, and 0 writes no colour), in both renderers; and the suite's runs were timing-
+  dependent: the tests free each vertex buffer as they allocate the next, so the CPU rewrote
+  vertices our GPU thread hadn't read yet. XB_NV2A_SYNC=1 (which run.py sets) makes a PUT write wait
+  for the push buffer to be run up to it, as a GPU that keeps up; games keep their own pace. With
+  both, Stencil goes from 0/8 to 8/8, the same on repeated runs. Also: tests/pgraph's runner takes
+  suite names as the menu shows them ("Stencil func").
+

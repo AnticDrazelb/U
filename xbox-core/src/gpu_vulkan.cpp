@@ -1074,9 +1074,8 @@ bool DrawTriangles(const Vertex* vertices, u32 count)
         key.stencil_write = depth.stencil_write, key.op_fail = depth.op_fail, key.op_zfail = depth.op_zfail;
         key.op_zpass = depth.op_zpass;
     }
-    key.write_mask = m ? ((m & 0x00010000 ? VK_COLOR_COMPONENT_R_BIT : 0) | (m & 0x00000100 ? VK_COLOR_COMPONENT_G_BIT : 0) |
-                          (m & 0x00000001 ? VK_COLOR_COMPONENT_B_BIT : 0) | (m & 0x01000000 ? VK_COLOR_COMPONENT_A_BIT : 0))
-                       : 0xf;
+    key.write_mask = (m & 0x00010000 ? VK_COLOR_COMPONENT_R_BIT : 0) | (m & 0x00000100 ? VK_COLOR_COMPONENT_G_BIT : 0) |
+                     (m & 0x00000001 ? VK_COLOR_COMPONENT_B_BIT : 0) | (m & 0x01000000 ? VK_COLOR_COMPONENT_A_BIT : 0);
     const VkPipeline pipeline = Pipeline(key);
     if (!pipeline)
         return Declined(7);

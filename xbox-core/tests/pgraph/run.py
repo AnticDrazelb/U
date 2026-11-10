@@ -60,7 +60,10 @@ def main():
         log = open(os.path.join(work, "run.log"), "w")
         processes.append((work, subprocess.Popen(
             [args.core, os.path.abspath(args.iso), "--seconds", str(args.seconds)],
-            cwd=work, stdout=log, stderr=subprocess.STDOUT)))
+            cwd=work, stdout=log, stderr=subprocess.STDOUT,
+            # the push buffer run as it is written: the tests free each vertex buffer as they allocate
+            # the next, which the console's GPU has always read by then
+            env=dict(os.environ, XB_NV2A_SYNC=os.environ.get("XB_NV2A_SYNC", "1")))))
         print("job %d: %d suites" % (i, len(share)), flush=True)
     for work, process in processes:
         process.wait()

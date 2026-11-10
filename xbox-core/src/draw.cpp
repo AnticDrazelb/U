@@ -776,6 +776,11 @@ struct DepthStencil
         z_float = k.Get(0x290) & (1u << 12);
         z_max = z_float ? (zs.bytes == 2 ? 511.9375f : 3.4028235e38f) : zs.bytes == 2 ? 65535.f : 16777215.f;
         active = depth_test || depth_write || stencil;
+        static const bool debug_stencil = std::getenv("XB_DEBUG_STENCIL") != nullptr;
+        if (debug_stencil)
+            Log("debug: draw: depth test %u write %u func %#x; stencil %u func %#x ref %u mask %#x write %#x ops %#x %#x %#x; colour mask %#x",
+                depth_test, depth_write, depth_func, stencil, stencil_func, stencil_ref, stencil_mask, stencil_write, op_fail,
+                op_zfail, op_zpass, k.Get(0x358));
     }
 
     static u8 Op(u32 op, u8 s, u8 ref)
@@ -950,9 +955,9 @@ void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& 
     const WindowClip window;
     // with the alpha test on, a pixel it rejects must leave depth and stencil alone: shade first
     const bool shade_first = k.Get(0x300);
-    const u32 write_mask = k.Get(0x358) ? ((k.Get(0x358) & 0x01000000 ? 0xff000000u : 0) | (k.Get(0x358) & 0x00010000 ? 0x00ff0000u : 0) |
-                                           (k.Get(0x358) & 0x00000100 ? 0x0000ff00u : 0) | (k.Get(0x358) & 0x00000001 ? 0x000000ffu : 0))
-                                        : 0xffffffffu;
+    // SET_COLOR_MASK as written: 0 writes no colour (it starts with every channel on: KelvinState)
+    const u32 write_mask = (k.Get(0x358) & 0x01000000 ? 0xff000000u : 0) | (k.Get(0x358) & 0x00010000 ? 0x00ff0000u : 0) |
+                           (k.Get(0x358) & 0x00000100 ? 0x0000ff00u : 0) | (k.Get(0x358) & 0x00000001 ? 0x000000ffu : 0);
     // the outputs the pixel stage reads
     const u32 inputs = PixelInputMask();
     int used[16], used_count = 0;
@@ -1083,9 +1088,8 @@ struct Fragments
         cs = ColorSurface();
         shade_first = k.Get(0x300);
         const u32 m = k.Get(0x358);
-        if (m)
-            write_mask = (m & 0x01000000 ? 0xff000000u : 0) | (m & 0x00010000 ? 0x00ff0000u : 0) |
-                         (m & 0x00000100 ? 0x0000ff00u : 0) | (m & 0x00000001 ? 0x000000ffu : 0);
+        write_mask = (m & 0x01000000 ? 0xff000000u : 0) | (m & 0x00010000 ? 0x00ff0000u : 0) |
+                     (m & 0x00000100 ? 0x0000ff00u : 0) | (m & 0x00000001 ? 0x000000ffu : 0);
         const u32 inputs = PixelInputMask();
         for (int o = 0; o < 16; o++)
             if (inputs & (1u << o))

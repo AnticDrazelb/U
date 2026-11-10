@@ -55,6 +55,12 @@ std::vector<u32> g_regs(kPramin / 4);
 u8* g_ramin = nullptr;
 std::mutex g_m;
 std::condition_variable g_kick;
+// XB_NV2A_SYNC=1: a write of PUT waits until the GPU thread has run the push buffer up to it (or
+// can't go on: a wait for the CPU, the FIFO off), as a GPU that keeps up with the CPU. For tests
+// whose CPU reuses memory the GPU hasn't read yet (nxdk_pgraph_tests frees each vertex buffer as
+// it allocates the next); games keep the GPU's own pace.
+const bool g_sync_put = std::getenv("XB_NV2A_SYNC") != nullptr;
+std::condition_variable g_drained;
 u32 g_pgraph_pending = 0, g_pfifo_pending = 0, g_pcrtc_pending = 0;
 bool g_waiting_for_nop = false, g_waiting_for_context_switch = false, g_waiting_for_flip = false;
 const auto g_start = std::chrono::steady_clock::now();
@@ -341,6 +347,8 @@ void GpuThread()
     while (!g_quit)
     {
         RunPusher();
+        if (g_sync_put)
+            g_drained.notify_all();
         g_kick.wait_for(lock, std::chrono::milliseconds(5));
         // a push buffer that doesn't move: why (-v 2)
         const auto now = std::chrono::steady_clock::now();
@@ -492,8 +500,13 @@ void InitNv2a()
                    return ReadReg(offset, size);
                },
                [](u32 offset, u32 size, u32 value) {
-                   std::lock_guard lock(g_m);
+                   std::unique_lock lock(g_m);
                    WriteReg(offset, size, value);
+                   // XB_NV2A_SYNC: a PUT waits for the push buffer to be run up to it (g_sync_put)
+                   if (g_sync_put && offset >= kUser && (offset & 0xffff) == 0x40)
+                       g_drained.wait_for(lock, std::chrono::seconds(2), [] {
+                           return R(PFIFO_CACHE1_DMA_GET) == R(PFIFO_CACHE1_DMA_PUT) || PullerStalled() || g_quit;
+                       });
                }});
     std::thread(GpuThread).detach();
 }

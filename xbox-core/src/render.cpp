@@ -198,6 +198,9 @@ void Clear(u32 flags)
         if (z.address && z.pitch)
         {
             const u32 value = k.Get(0x1d8c);
+            static const bool debug_stencil = std::getenv("XB_DEBUG_STENCIL") != nullptr;
+            if (debug_stencil)
+                Log("debug: zeta clear flags %#x value %#x rect %u..%u x %u..%u", flags, value, x0, x1, y0, y1);
             const int parts = (y1 - y0 + 1) * (x1 - x0 + 1) > 16384 ? RasterThreads() : 1;
             RunParts(parts, [&](int part) {
             for (u32 y = y0 + u32(part); y <= y1 && y < z.height; y += u32(parts))
