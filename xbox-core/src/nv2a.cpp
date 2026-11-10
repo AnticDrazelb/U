@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -518,6 +519,8 @@ bool g_xemu_nv2a = false;
 
 namespace {
 bool g_own_chosen = false;
+std::string g_xemu_guard; // the step file while xemu's renderer's first frames are drawn
+u32 g_xemu_vblanks = 0;
 }
 
 void SetNv2aChoice(bool own) { g_own_chosen = own; }
@@ -542,7 +545,8 @@ void InitNv2a()
             if (same)
             {
                 g_xemu_nv2a = false;
-                Log("nv2a: the last start died in xemu's renderer's start-up: this one uses xbox-core's own NV2A");
+                Log("nv2a: the last start died in xemu's renderer (%s): this one uses xbox-core's own NV2A",
+                    std::string(step, std::strcspn(step, "\n")).c_str());
                 std::remove(guard.c_str());
             }
         }
@@ -557,7 +561,18 @@ void InitNv2a()
         Log("nv2a: xemu's (PGRAPH on its Vulkan renderer)");
         const bool ok = xb_nv2a_init(Ptr<u8>(kContiguousBase), kContiguousSize);
         if (!guard.empty())
+        {
             std::remove(guard.c_str());
+            // its first half minute of drawing is guarded too (a driver that takes the app down in
+            // the renderer's first frames): the step file stays until then (Nv2aVblank)
+            if (ok)
+                if (FILE* f = std::fopen(guard.c_str(), "w"))
+                {
+                    std::fprintf(f, "xemu renderer's first frames\n%s\n", kBuildId);
+                    std::fclose(f);
+                    g_xemu_guard = guard;
+                }
+        }
         if (!ok)
         {
             Log("nv2a: xemu's renderer didn't start (no usable Vulkan device): xbox-core's own NV2A");
@@ -616,7 +631,14 @@ void Nv2aVblank()
 {
 #ifdef XB_XEMU_NV2A
     if (g_xemu_nv2a)
+    {
+        if (!g_xemu_guard.empty() && ++g_xemu_vblanks == 30 * 60) // half a minute: it draws here
+        {
+            std::remove(g_xemu_guard.c_str());
+            g_xemu_guard.clear();
+        }
         return xb_nv2a_vblank();
+    }
 #endif
     std::lock_guard lock(g_m);
     g_pcrtc_pending |= 1;

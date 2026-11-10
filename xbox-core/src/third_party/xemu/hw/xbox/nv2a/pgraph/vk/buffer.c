@@ -92,7 +92,10 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        .buffer_size = sizeof(pg->inline_elements) * 100,
+        /* xbox-core: 8 batches of indices (the largest, NV2A_MAX_BATCH_LENGTH 32-bit indices, is
+         * 2 MiB); xemu's 100 (200 MiB, and as much again to stage them) is more than the PS4's
+         * driver gives. A full buffer ends the frame's commands and starts again (ensure_buffer_space). */
+        .buffer_size = sizeof(pg->inline_elements) * 8,
     };
 
     r->storage_buffers[BUFFER_INDEX_STAGING] = (StorageBuffer){
@@ -116,8 +119,11 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .alloc_info = device_alloc_create_info,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        /* xbox-core: room for the largest single draw (every attribute of a full inline batch,
+         * 128 MiB), not ten of them (1.3 GiB, and as much again to stage it: more than the PS4 has
+         * for the GPU). A full buffer ends the commands and starts again (ensure_buffer_space). */
         .buffer_size = NV2A_VERTEXSHADER_ATTRIBUTES * NV2A_MAX_BATCH_LENGTH *
-                       4 * sizeof(float) * 10,
+                       4 * sizeof(float),
     };
 
     r->storage_buffers[BUFFER_VERTEX_INLINE_STAGING] = (StorageBuffer){
