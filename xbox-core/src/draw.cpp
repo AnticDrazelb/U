@@ -1319,18 +1319,32 @@ struct Fragments
         offset = DepthStencil::OffsetFor(0x330, 0);
         u32 ax, ay;
         AntiAliasing(ax, ay);
-        const float base = p.o[6][0] > 0 ? p.o[6][0] : std::max(1.f, float(std::min<u32>(g_kelvin.Get(0x43c), 0x1ff)) / 8.f);
-        const float size = std::min(base, 512.f) * float(ax);
-        const int x0p = int(std::floor(p.x - size / 2 + 0.5f)), y0p = int(std::floor(p.y - size / 2 + 0.5f));
-        const int n = std::max(1, int(size + 0.5f));
+        // the size: oPts with SET_POINT_PARAMS_ENABLE (the fixed function's from the eye distance, or a
+        // program's), else SET_POINT_SIZE alone, whatever a program writes (Point_size's captures and notes)
+        const float base = g_kelvin.Get(0x318) ? p.o[6][0] : std::max(1.f, float(std::min<u32>(g_kelvin.Get(0x43c), 0x1ff)) / 8.f);
+        // the pixels whose centres are inside the square (at least the one under the vertex), in each
+        // axis's samples (as the console's captures: a size 2.25 point is 3 pixels where centres allow)
+        const double sx = double(std::min(base, 512.f)) * ax, sy = double(std::min(base, 512.f)) * ay;
+        if (!std::isfinite(p.x) || !std::isfinite(p.y))
+            return;
+        auto span = [](double c, double size, int& first, int& last) {
+            first = int(std::ceil(c - size / 2 - 0.5)), last = int(std::ceil(c + size / 2 - 0.5)) - 1;
+            if (last < first)
+                first = last = int(std::floor(c));
+        };
+        int x0p, x1p, y0p, y1p;
+        span(p.x, sx, x0p, x1p);
+        span(p.y, sy, y0p, y1p);
+        x0p = std::max(x0p, x0 - 1), y0p = std::max(y0p, y0 - 1);
+        x1p = std::min(x1p, int(cs.width)), y1p = std::min(y1p, int(cs.height));
         const bool sprites = g_kelvin.Get(0x31c);
         Vec4 coords{{0, 0, 1, 1}};
-        for (int y = y0p; y < y0p + n; y++)
-            for (int x = x0p; x < x0p + n; x++)
+        for (int y = y0p; y <= y1p; y++)
+            for (int x = x0p; x <= x1p; x++)
             {
                 if (sprites)
                 {
-                    coords[0] = (float(x - x0p) + 0.5f) / float(n), coords[1] = (float(y - y0p) + 0.5f) / float(n);
+                    coords[0] = float((x + 0.5 - (p.x - sx / 2)) / sx), coords[1] = float((y + 0.5 - (p.y - sy / 2)) / sy);
                     sprite = &coords;
                 }
                 Pixel(x, y, p, p, 0);
