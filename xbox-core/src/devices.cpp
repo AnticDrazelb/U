@@ -2,6 +2,7 @@
 // level-triggered interrupt lines whose connected service routines run on an "interrupt" guest
 // thread, DPCs, the vblank tick, KeTickCount, and the displayed picture (PNG on the desktop).
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -430,10 +431,41 @@ DisplayInfo GetDisplay()
     info.height = info.width >= 1920 ? 1080 : info.width >= 1280 ? 720 : 480;
     info.address = PhysToGuest(start ? start : d.framebuffer);
     info.valid = d.pitch != 0 && info.address != 0;
+    // the video overlay, as xemu reads it (pgraph/vk/display.c: get_pvideo_state)
+    DisplayInfo::Overlay& o = info.overlay;
+    const u32 size_in = Nv2aPvideo(0x928);
+    o.on = (Nv2aPvideo(0x700) & 1) && size_in != 0xffffffff && (Nv2aPvideo(0x958) >> 16 & 3) == 1;
+    if (o.on)
+    {
+        const u32 format = Nv2aPvideo(0x958), size_out = Nv2aPvideo(0x950), point_in = Nv2aPvideo(0x930),
+                  point_out = Nv2aPvideo(0x948), ds_dx = Nv2aPvideo(0x938), dt_dy = Nv2aPvideo(0x940);
+        o.address = PhysToGuest(Nv2aPvideo(0x900) + Nv2aPvideo(0x920));
+        o.pitch = format & 0x1fff;
+        o.in_w = int(size_in & 0x7ff), o.in_h = int((size_in >> 16) & 0x7ff);
+        o.out_w = int(size_out & 0xfff), o.out_h = int((size_out >> 16) & 0xfff);
+        o.out_x = int(point_out & 0xfff), o.out_y = int((point_out >> 16) & 0xfff);
+        o.in_x = float(point_in & 0x7fff) / 16.f, o.in_y = float(point_in >> 17) / 8.f;
+        auto scale = [](u32 din_dout, int out) {
+            if (din_dout == 0x100000 || out <= 0)
+                return 1.f;
+            const float in = std::floor(float(din_dout) * float(out - 1) / float(1 << 20) + 0.5f);
+            return (in + 1.f) / float(out);
+        };
+        o.scale_x = scale(ds_dx, o.out_w), o.scale_y = scale(dt_dy, o.out_h);
+        if (o.in_w > o.out_w)
+            o.in_w = int(std::floor(float(o.out_w) * o.scale_x + 0.5f));
+        if (o.in_h > o.out_h)
+            o.in_h = int(std::floor(float(o.out_h) * o.scale_y + 0.5f));
+        o.color_key = (format >> 20) & 1;
+        o.key = Nv2aPvideo(0xb00) & 0xffffff;
+        o.on = o.address && o.pitch && o.in_w > 0 && o.in_h > 0 && o.out_w > 0 && o.out_h > 0 &&
+               GuestMapped(o.address, o.pitch * u32(o.in_h));
+    }
     return info;
 }
 
-u32 DisplayPixel(const DisplayInfo& d, int x, int y)
+namespace {
+u32 FramebufferPixel(const DisplayInfo& d, int x, int y)
 {
     const u32 p = d.address + u32(y) * d.pitch + u32(x) * d.bpp;
     if (d.bpp == 4)
@@ -442,6 +474,29 @@ u32 DisplayPixel(const DisplayInfo& d, int x, int y)
     if (d.format == 0x11)
         return u32((v >> 11) << 3) << 16 | u32(((v >> 5) & 63) << 2) << 8 | u32((v & 31) << 3);
     return u32(((v >> 10) & 31) << 3) << 16 | u32(((v >> 5) & 31) << 3) << 8 | u32((v & 31) << 3);
+}
+} // namespace
+
+u32 DisplayPixel(const DisplayInfo& d, int x, int y)
+{
+    const u32 fb = FramebufferPixel(d, x, y);
+    const DisplayInfo::Overlay& o = d.overlay;
+    if (!o.on || x < o.out_x || y < o.out_y || x >= o.out_x + o.out_w || y >= o.out_y + o.out_h ||
+        (o.color_key && fb != o.key))
+        return fb;
+    // the overlay's texel (nearest), YUY2 to RGB as xemu converts it (BT.601, video range)
+    const int ix = std::clamp(int(o.in_x + float(x - o.out_x) * o.scale_x), 0, o.in_w - 1);
+    const int iy = std::clamp(int(o.in_y + float(y - o.out_y) * o.scale_y), 0, o.in_h - 1);
+    const u32 line = o.address + u32(iy) * o.pitch;
+    const int c = int(Read<u8>(line + u32(ix) * 2)) - 16;
+    int dd, e;
+    if (ix % 2)
+        dd = int(Read<u8>(line + u32(ix) * 2 - 1)) - 128, e = int(Read<u8>(line + u32(ix) * 2 + 1)) - 128;
+    else
+        dd = int(Read<u8>(line + u32(ix) * 2 + 1)) - 128, e = int(Read<u8>(line + u32(ix) * 2 + 3)) - 128;
+    auto clip = [](int v) { return u32(std::clamp(v, 0, 255)); };
+    return clip((298 * c + 409 * e + 128) >> 8) << 16 | clip((298 * c - 100 * dd - 208 * e + 128) >> 8) << 8 |
+           clip((298 * c + 516 * dd + 128) >> 8);
 }
 
 bool SaveFramebuffer(const std::string& path)

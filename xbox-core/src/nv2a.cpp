@@ -429,6 +429,13 @@ u32 ReadReg(u32 offset, u32 size)
 
 void WriteReg(u32 offset, u32 size, u32 value)
 {
+    // PVIDEO_STOP: the overlay is torn down when bit 0 is written (xemu's pvideo.c)
+    if (offset == 0x8704)
+    {
+        if (value & 1)
+            R(0x8700) = 0;
+        return;
+    }
     if (offset >= kUser)
     {
         if ((offset & 0xffff) == 0x40)
@@ -624,6 +631,16 @@ u32 Nv2aDisplayStart()
 #endif
     std::lock_guard lock(g_m);
     return R(PCRTC_START);
+}
+
+u32 Nv2aPvideo(u32 reg)
+{
+#ifdef XB_XEMU_NV2A
+    if (g_xemu_nv2a)
+        return u32(xb_nv2a_read(0x8000 + reg, 4));
+#endif
+    std::lock_guard lock(g_m);
+    return R(0x8000 + reg);
 }
 
 u32 Nv2aObjectClass(u32 instance)

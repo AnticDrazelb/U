@@ -240,7 +240,16 @@ struct DisplayInfo
     bool valid = false; // a mode has been set
     u32 address = 0, format = 0, pitch = 0, bpp = 4;
     int width = 640, height = 480;
+    // the video overlay (PVIDEO: what movies are shown through), over the picture where it is on
+    struct Overlay
+    {
+        bool on = false, color_key = false;
+        u32 address = 0, pitch = 0, key = 0; // its YUY2 (Cr8Yb8Cb8Ya8) frame, in guest memory
+        int in_w = 0, in_h = 0, out_x = 0, out_y = 0, out_w = 0, out_h = 0;
+        float in_x = 0, in_y = 0, scale_x = 1, scale_y = 1;
+    } overlay;
 };
+u32 Nv2aPvideo(u32 reg); // a PVIDEO register (offset within PVIDEO), whichever NV2A runs
 DisplayInfo GetDisplay();
 u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);

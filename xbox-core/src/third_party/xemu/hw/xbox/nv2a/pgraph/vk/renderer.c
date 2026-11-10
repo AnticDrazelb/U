@@ -52,6 +52,15 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
 
     pgraph_vk_init_command_buffers(pg);
     pgraph_vk_init_buffers(d);
+    /* xbox-core: a buffer the driver couldn't give (its memory) is a renderer that can't start, not
+     * a crash later: xbox-core's own NV2A is used instead */
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (!pg->vk_renderer_state->storage_buffers[i].allocation) {
+            error_setg(errp, "the GPU couldn't give buffer %d (%zu bytes)", i,
+                       (size_t)pg->vk_renderer_state->storage_buffers[i].buffer_size);
+            return;
+        }
+    }
     pgraph_vk_init_surfaces(pg);
     pgraph_vk_init_shaders(pg);
     pgraph_vk_init_pipelines(pg);
