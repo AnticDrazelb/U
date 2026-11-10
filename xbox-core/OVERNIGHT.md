@@ -27,7 +27,7 @@ retail game is to need it. Each item says how it is checked without the game.
    nothing must block a game's start-up.
 7. **Everything the logs can tell from a run with no frame:** a watchdog report that names the
    loop a thread spins in (the code around its eip, the device registers it reads).
-8. **HANDOFF.md** brought up to date with all of tonight.
+8. **(done) HANDOFF.md** brought up to date with all of tonight.
 9. **Morning summary** below, the final packages sent.
 10. **The GP DSP (a DSP56300 interpreter)**, if time allows: xemu runs the GP 1000 cycles a frame
     even with its DSP option off, so DirectSound may wait on GP microcode at start-up. Halo's next

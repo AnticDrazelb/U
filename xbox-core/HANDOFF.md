@@ -76,7 +76,12 @@ export NXDK_DIR=~/emu/nxdk PATH="$HOME/emu/nxdk/bin:/opt/llvm21/bin:$PATH"
 ```
 Run it from a scratch folder, because it creates `xbox-data/` there.
 
-**Regression set** (must stay at 0 failures): `tests/regression.sh` runs all of it on the desktop.
+**Regression set** (must stay at 0 failures): `tests/regression.sh` runs all of it on the desktop
+(13 entries now, with the report test). Run it three ways: as is, with `XB_TEST_FS_AS_PS4=1`, and
+with `XB_GPU=1 OUT=~/emu/reg-gpu`. **Hardware comparison:** `tests/pgraph/run.py` runs
+nxdk_pgraph_tests (the ISO from its releases) against the console captures
+(nxdk_pgraph_tests_golden_results, `results/`); it sets `XB_NV2A_SYNC=1` so runs are
+deterministic. Nov 10: 2307/3110 in software before the signed-texture fix.
 Run it a second time as `XB_TEST_FS_AS_PS4=1 tests/regression.sh`: the fault handler then behaves as
 the PS4's (the system reports the fs base as 0; the handler runs with fs on an unmapped page until it
 sets the host's from the KPCR the finder gives), so anything fs-relative in the handler's path (a
@@ -217,10 +222,45 @@ Findings in order, each from a console log:
    still handled in the handler, where `Log` drops its lines (`tl_in_signal_handler`). d7e5e65
    added that guard.
 
-**Status:** the package with these fixes has been sent but **not yet tested on the console**.
-Expected: the self-test's "fault log" step passes, and Halo gets past the cache-table read (its
-trace stopped at `call 5< NtReadFile = 0`, from `0x1581f`). Halo's next fault is unknown, and the
-fault ring will show it.
+4. **(Nov 9) Every build after Nov 8 evening died at the first guest fault.** Found with the
+   fault trail (below): the handler died between its stage 2 and OnFault's stage 4, where the one
+   new thing was a `thread_local` flag. On the PS4 the handler runs with the guest's KPCR as fs
+   (and the kernel reports the fs base as 0: stage 11 shows `amd64_get_fsbase` answering 0 and the
+   context's copy 0), so anything fs-relative there reads the KPCR. **Fix:** nothing fs-relative
+   in the handler's path (a lock-free table of signal-stack bounds instead of the thread_local; no
+   formatting, `clock_gettime` or locks before the host fs is back); the KPCR is found without fs
+   (`FindKpcr`: the kernel's answer or the context's copy when its self pointers check, else the
+   guest thread whose stack holds esp), the host fs set from it, and `xcs_fault64` takes the KPCR
+   in r12. Console-verified: every fault goes stage 1, 2, 11, 12, 4 (sent to xcs_fault64), 5, 6, 7.
+
+5. **Halo then:** a guest jump to 0 crashed the emulator's own code read (fixed: unmapped eip
+   decodes zeros, the program gets its access violation); `HalDiskCachePartitionCount` was 0, so
+   XAPI's cache table shift became a memmove of -12 bytes over the stack (fixed: 3, as retail, with
+   the other kernel data, EEPROM, SMBus and PCI audited against Cxbx-Reloaded and xemu); a GPU
+   interrupt routine and its DPC ran after `KeDisconnectInterrupt` (fixed: the interrupt thread
+   checks the connection, disconnect waits out a running routine and the DPCs queued before it);
+   the network adapter, which PCI now reports, wasn't emulated and Halo's XNet waited on it
+   forever (fixed: `nic.cpp`, no cable). The last console run (build a2a807) got to Direct3D,
+   interrupts 3, 1, 6 and 5, the Z: cache; the network adapter was the stop.
+
+**Status (Nov 10 morning):** packages with all of the above were built overnight and are **not yet
+tested on the console**; see OVERNIGHT.md for the night's list (USB hub and second controller,
+occlusion reports, far-plane depth, colour mask, signed textures, 30 kernel exports, ...).
+
+**The fault trail** (`platform::Trail`, `ReportFaultTrail`): every stage of the fault path writes a
+48-byte record into `/data/xbox-core/fault-trail-<variant>.bin` with the kernel's raw pwrite, so a
+run the console kills leaves how far it got; the next start decodes it to
+`fault-trail-<variant>-previous.txt` (in the log bundle). Stages: 1 handler entered, 2 context,
+11 the fs base's sources, 12 the signal stack, 3 the thread by its stack (no KPCR from fs), 4
+classified (0 not ours, 1 in the handler, 2 to xcs_fault64), 5 returning, 6 FaultResumed, 7 done,
+8/9 self-test step started/passed, 10 not ours (to the previous handler), 100 trail opened.
+**Desktop check of the PS4's conditions:** `XB_TEST_FS_AS_PS4=1 tests/regression.sh` (the
+handler told fs is 0, with fs on an unmapped page until it sets the host's: anything fs-relative
+in its path fails at once and names where).
+
+**Build IDs:** `kBuildId` (time and a random tag, new each build, from cmake/build-id.cmake) keys
+the self-test's and the GPU guard's memory of a step that killed a run, and heads the report; a
+source file's `__DATE__ __TIME__` only changed when that file was rebuilt.
 
 **The CPU self-test** (`InitCpu`, `cpu.cpp`) runs in named steps: `fault`, `fault log`, `signal
 stack`, `new thread`. Before each step it writes the step's name and the build date to
