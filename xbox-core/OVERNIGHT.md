@@ -181,3 +181,16 @@ retail game is to need it. Each item says how it is checked without the game.
   Tried and reverted: DOT_STR_3D with a cube map as a cube lookup (the console shows something
   else). Open: the combiner suite's background band (its drawing helper isn't in the suite's
   source checkout here).
+
+- **4 (continued): perspective, the edge nudge, Direct3D's registers** (3edfe50, 05cf6ac, 43ed678).
+  SET_CONTROL0 bit 20 clear interpolates linearly (Texture_perspective 4 -> 8/8 both renderers).
+  The nearest-filtering nudge was too big for magnified textures (W_buffering lost 10): now about
+  the float error, W_buffering 233 in both renderers. A channel's REF keeps CPU writes; PCRTC_RASTER
+  (the scan line, which Direct3D's raster queries read) moves with time instead of reading a
+  constant a program could spin on.
+  **Full software run: 2612 of 3110 (84.0%)**, from 2307 (74.2%) at the start of the night. The
+  GPU path matches or beats software on every suite but Texture_projective_2D (8-12 edge pixels an
+  image: Vulkan's coverage rule).
+  Looked at and left: Front_face's fill-mode cases (the console colours one triangle of a quad
+  with front colours and one with back: a facing rule per triangle to work out), the shadow
+  comparator's raw values, bump mapping, the signed blend equations.
