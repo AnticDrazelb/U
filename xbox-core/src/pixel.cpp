@@ -1004,6 +1004,7 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
             u.bump[s][j] = ps.bump[s][j];
         u.bump_lum[s][0] = ps.bump_scale[s], u.bump_lum[s][1] = ps.bump_offset[s];
         u.tex_scale[s][0] = u.tex_scale[s][1] = 1;
+        u.tex_scale[s][2] = u.tex_scale[s][3] = 0;
         switch (program)
         {
         case 0: case 4: case 5: continue; // no texture read
@@ -1028,6 +1029,14 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
         i.lod_bias = t.lod_bias, i.min_lod = t.min_lod, i.max_lod = t.max_lod;
         if (!i.normalized)
             u.tex_scale[s][0] = 1.f / float(t.width), u.tex_scale[s][1] = 1.f / float(t.height);
+        // nearest filtering (mag 1; min 1 or 3): a pixel exactly on a texel's edge takes the texel
+        // after it, as the software path's floor(u) does; the GPU's interpolated coordinate can come
+        // out a hair under the edge (an nxdk_pgraph_tests checkerboard a pixel off at every square's
+        // edge): moved on by 1/256 of a texel, past such rounding and short of any other texel
+        const u32 mag = (t.filter >> 24) & 0xf, min = (t.filter >> 16) & 0xff;
+        u.tex_scale[s][2] = u.tex_scale[s][3] = 0;
+        if (mag == 1 && (min == 1 || min == 3))
+            u.tex_scale[s][2] = 1.f / 256.f / float(t.width), u.tex_scale[s][3] = 1.f / 256.f / float(t.height);
     }
     blend.enabled = ps.blend;
     blend.sfactor = ps.blend_sfactor, blend.dfactor = ps.blend_dfactor, blend.equation = ps.blend_equation;

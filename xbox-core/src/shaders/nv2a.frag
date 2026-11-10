@@ -26,7 +26,7 @@ layout(std140, binding = 0) uniform State
     uvec4 enabled;       // a texture bound
     uvec4 stageInput;    // which stage's result is the input of stages 2, 3
     uvec4 kind;          // 0 2D, 1 cube
-    vec4 texScale[4];    // coordinates to [0, 1]: 1 for swizzled/compressed, 1/size for linear textures
+    vec4 texScale[4];    // xy: coordinates to [0, 1] (1 for swizzled/compressed, 1/size for linear textures); zw: added after
     vec4 bump[4];        // the bump environment matrices
     vec4 bumpLum[4];     // x scale, y offset
     uvec4 clipMode;      // x: SET_SHADER_CLIP_PLANE_MODE
@@ -42,7 +42,7 @@ float clamp01(float v) { return clamp(v, 0.0, 1.0); }
 
 vec4 sampleStage(int s, vec2 uv)
 {
-    uv *= st.texScale[s].xy;
+    uv = uv * st.texScale[s].xy + st.texScale[s].zw; // zw: nearest filtering's nudge past an edge
     switch (s)
     {
     case 0: return texture(tex2D[0], uv);

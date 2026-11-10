@@ -18,6 +18,7 @@
 #include "core.h"
 #include "diagnostics.h"
 #include "devices.h"
+#include "gpu.h"
 #include "nv2a.h"
 
 namespace xb {
@@ -496,8 +497,20 @@ void InitNv2a()
     R(0x680508) = 0x0003c20d; // VPLL_COEFF
     AddDevice({kDeviceBase, kSize, "nv2a",
                [](u32 offset, u32 size) {
-                   std::lock_guard lock(g_m);
-                   return ReadReg(offset, size);
+                   u32 v;
+                   bool idle;
+                   {
+                       std::lock_guard lock(g_m);
+                       v = ReadReg(offset, size);
+                       idle = offset == PGRAPH_STATUS && R(PFIFO_CACHE1_DMA_GET) == R(PFIFO_CACHE1_DMA_PUT);
+                   }
+                   // The program sees the GPU idle (pbkit's pb_busy: GET at PUT, then this register):
+                   // what the GPU path drew goes to memory now, as the console's would be there, so the
+                   // CPU reading a surface next reads it (nxdk_pgraph_tests saves its pictures so: on
+                   // the GPU path the last draws were missing until the next vblank's write-back)
+                   if (idle && gpu::Enabled())
+                       gpu::Sync();
+                   return v;
                },
                [](u32 offset, u32 size, u32 value) {
                    std::unique_lock lock(g_m);
