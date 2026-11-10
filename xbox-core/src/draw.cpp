@@ -473,8 +473,10 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
                     continue;
                 vp = Normalize3(vp);
                 const Vec4 att = Floats(l + 0x68, 3);
+                // a zero denominator: an infinitely strong light, saturating wherever it reaches (the
+                // console's captures, Lighting_spotlight's all-zero attenuation)
                 const float denominator = att[0] + att[1] * d + att[2] * d * d;
-                attenuation = denominator != 0 ? 1 / denominator : 1;
+                attenuation = denominator != 0 ? 1 / denominator : INFINITY;
                 const Vec4 h = Normalize3(Vec4{{vp[0] + eye_dir[0], vp[1] + eye_dir[1], vp[2] + eye_dir[2], 0}});
                 n_dot_vp = std::max(0.f, Dot3(n, vp));
                 n_dot_hv = std::max(0.f, Dot3(n, h));
@@ -486,16 +488,16 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
                         attenuation = 0;
                     else if (sv < 1)
                     {
-                        Vec4 falloff = Floats(l + 0x40, 3);
-                        if (falloff[0] == 0 && falloff[1] == 0 && falloff[2] == 0)
-                            falloff = Vec4{{0, -0.494592f, 1.494592f, 0}};
+                        const Vec4 falloff = Floats(l + 0x40, 3);
                         float factor = 0;
                         if (sv > -falloff[0])
                         {
+                            // (a zero denominator: infinite inside the cone, as the console's all-zero
+                            // falloff shows)
                             const float denom = falloff[1] * sv + falloff[2];
-                            factor = denom == 0 ? 1 : denom > 0 ? std::clamp((sv + falloff[0]) / denom, 0.f, 1.f) : 0;
+                            factor = denom == 0 ? INFINITY : denom > 0 ? std::clamp((sv + falloff[0]) / denom, 0.f, 1.f) : 0;
                         }
-                        attenuation *= factor;
+                        attenuation = factor == 0 ? 0.f : attenuation * factor; // 0 times infinity is 0
                     }
                 }
             }
@@ -508,13 +510,15 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
             const u32 colors = back ? 0xc00 + u32(i) * 0x40 : l;
             const Vec4 ambient = Floats(colors, 3), diffuse_color = Floats(colors + 0xc, 3),
                        specular_color = Floats(colors + 0x18, 3);
+            // products as the vertex unit does them: anything times 0 is 0 (an infinite attenuation too)
+            auto mul = [](float x, float y) { return x == 0 || y == 0 ? 0.f : x * y; };
             for (int c = 0; c < 3; c++)
             {
-                const float a = ambient[c] * attenuation, dl = diffuse_color[c] * attenuation * n_dot_vp;
-                const float sl = specular_color[c] * attenuation * pf;
-                d0[c] += ambient_src == 0 ? a : source(ambient_src)[c] * a;
-                d0[c] += diffuse_src == 0 ? dl : source(diffuse_src)[c] * dl;
-                d1[c] += specular_src == 0 ? sl : source(specular_src)[c] * sl;
+                const float a = mul(ambient[c], attenuation), dl = mul(mul(diffuse_color[c], attenuation), n_dot_vp);
+                const float sl = mul(mul(specular_color[c], attenuation), pf);
+                d0[c] += ambient_src == 0 ? a : mul(source(ambient_src)[c], a);
+                d0[c] += diffuse_src == 0 ? dl : mul(source(diffuse_src)[c], dl);
+                d1[c] += specular_src == 0 ? sl : mul(source(specular_src)[c], sl);
             }
         }
     }
