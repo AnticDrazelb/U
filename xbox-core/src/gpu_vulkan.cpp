@@ -14,12 +14,14 @@ bool DrawTriangles(const Vertex*, u32) { return false; }
 bool Clear(u32) { return false; }
 void Sync() {}
 void SyncRange(u32, u32) {}
+std::string DeclinedSince() { return {}; }
 } // namespace xb::gpu
 #else
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +75,7 @@ XB_VK_DEVICE_FUNCS(XB_DECLARE)
 #undef XB_DECLARE
 
 constexpr VkFormat kColorFormat = VK_FORMAT_B8G8R8A8_UNORM; // A8R8G8B8 in memory
+bool g_custom_border = false; // VK_EXT_custom_border_color enabled
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 constexpr VkDeviceSize kVertexRing = 32u << 20, kUniformRing = 8u << 20, kStagingRing = 64u << 20;
 
@@ -556,6 +559,18 @@ VkSampler Sampler(const TextureInfo& t)
     info.borderColor = (t.border >> 24) == 0 ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
                        : (t.border & 0xffffff) == 0xffffff ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
                                                             : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    VkSamplerCustomBorderColorCreateInfoEXT custom{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+    const bool standard = t.border == 0 || t.border == 0xff000000u || t.border == 0xffffffffu;
+    if (g_custom_border && !standard)
+    {
+        info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+        custom.customBorderColor.float32[0] = ((t.border >> 16) & 255) / 255.f;
+        custom.customBorderColor.float32[1] = ((t.border >> 8) & 255) / 255.f;
+        custom.customBorderColor.float32[2] = (t.border & 255) / 255.f;
+        custom.customBorderColor.float32[3] = (t.border >> 24) / 255.f;
+        custom.format = kColorFormat;
+        info.pNext = &custom;
+    }
     VkSampler s = VK_NULL_HANDLE;
     vkCreateSampler_(g_device, &info, nullptr, &s);
     g_samplers[key] = s;
@@ -813,11 +828,24 @@ bool Init(std::string& why)
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v13;
     features.features.depthClamp = VK_TRUE;
-    const char* extensions[] = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    // custom border colours, where the device has them (RADV and lavapipe do): a texture's border colour
+    // as it is, not the nearest of the three Vulkan has built in
+    u32 extension_count = 0;
+    vkEnumerateDeviceExtensionProperties_(g_physical, nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> available(extension_count);
+    vkEnumerateDeviceExtensionProperties_(g_physical, nullptr, &extension_count, available.data());
+    for (const auto& e : available)
+        if (std::strcmp(e.extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME) == 0)
+            g_custom_border = true;
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    custom_border.customBorderColors = VK_TRUE;
+    const char* extensions[] = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME};
+    if (g_custom_border)
+        v13.pNext = &custom_border;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &qi;
-    dci.enabledExtensionCount = 1, dci.ppEnabledExtensionNames = extensions;
+    dci.enabledExtensionCount = g_custom_border ? 2 : 1, dci.ppEnabledExtensionNames = extensions;
     if (vkCreateDevice_(g_physical, &dci, nullptr, &g_device) != VK_SUCCESS)
         return why = std::string("vkCreateDevice failed on ") + props.deviceName, false;
 #define XB_LOAD(name) name##_ = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr_(g_device, #name));
@@ -1044,8 +1072,12 @@ const char* Status()
     return g_status.c_str();
 }
 
+// draws left to software, by reason (for the stats: on the console software drawing is the slow path)
+std::atomic<u64> g_declined[9];
+
 bool Declined(int why)
 {
+    g_declined[why < 9 ? why : 0]++;
     static int logged = 0;
     if (std::getenv("XB_GPU_DEBUG") && logged++ < 20)
         Log("gpu: draw declined (%d)", why);
@@ -1235,6 +1267,23 @@ void Sync()
 {
     std::lock_guard lock(g_mutex);
     SyncLocked();
+}
+
+std::string DeclinedSince()
+{
+    static const char* const kWhy[9] = {"other", "surface", "float depth", "pixel setup (shader stage or texture)",
+                                        "texture", "surface image", "buffers full", "pipeline",
+                                        "linear interpolation"};
+    static u64 last[9] = {};
+    std::string out;
+    for (int i = 0; i < 9; i++)
+    {
+        const u64 now = g_declined[i].load();
+        if (now > last[i])
+            out += std::string(out.empty() ? "" : ", ") + kWhy[i] + " " + std::to_string(now - last[i]);
+        last[i] = now;
+    }
+    return out;
 }
 
 void SyncRange(u32 address, u32 size)

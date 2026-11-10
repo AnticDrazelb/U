@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "gpu.h"
 #include "devices.h"
 
 #include <algorithm>
@@ -519,6 +520,9 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                     top.empty() ? "none" : top.c_str(), double(methods - last_methods) / span,
                     double(faults - last_faults) / span, double(patched - last_patched) / span, g_thread_count.load(),
                     FreePages() * 4096 / (1024 * 1024));
+                if (gpu::Enabled())
+                    if (const std::string declined = gpu::DeclinedSince(); !declined.empty())
+                        Log("stats: draws the GPU left to software (slower), by reason: %s", declined.c_str());
                 last_raster = raster, last_faults = faults, last_patched = patched;
                 last_frames = frames, last_draws = draws, last_calls = calls, last_methods = methods;
                 last_stats = now;

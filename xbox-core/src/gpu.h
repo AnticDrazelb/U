@@ -67,6 +67,8 @@ bool Enabled();
 void SetWanted(bool on); // the PS4's setting, before the first draw
 void SetGuardFile(const std::string& path); // the console's step file (a start that dies is skipped next time)
 const char* Status();    // for the log and the diagnostics: the device, or why not
+// the draws left to software since the last call, by reason ("" if none): for the stats line
+std::string DeclinedSince();
 
 // Draws `count` triangles (3 vertices each, already clipped and culled) with the current NV2A state.
 // False: this state isn't done on the GPU yet; the caller draws them in software (after Sync).
