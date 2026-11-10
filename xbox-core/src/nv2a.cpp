@@ -509,11 +509,17 @@ bool g_xemu_nv2a = false;
 }
 #endif
 
+namespace {
+bool g_own_chosen = false;
+}
+
+void SetNv2aChoice(bool own) { g_own_chosen = own; }
+
 void InitNv2a()
 {
 #ifdef XB_XEMU_NV2A
     const char* choice = std::getenv("XB_NV2A");
-    g_xemu_nv2a = !(choice && std::string(choice) == "own");
+    g_xemu_nv2a = !(choice && std::string(choice) == "own") && !g_own_chosen;
     // a start that died in xemu's renderer's start-up (the console's step file, as the GPU path's)
     // is followed by one with xbox-core's own
     std::string guard = gpu::GuardFile();

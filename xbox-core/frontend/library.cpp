@@ -372,6 +372,7 @@ bool Settings::Load(const std::string& file)
         if (!std::strcmp(key, "show_log")) show_log = value != 0;
         else if (!std::strcmp(key, "picture")) picture = std::clamp(value, 0, 2);
         else if (!std::strcmp(key, "sort")) sort = std::clamp(value, 0, 1);
+        else if (!std::strcmp(key, "nv2a")) nv2a = std::clamp(value, 0, 1);
     }
     std::fclose(f);
     return true;
@@ -381,7 +382,7 @@ void Settings::Save(const std::string& file) const
 {
     if (FILE* f = std::fopen(file.c_str(), "w"))
     {
-        std::fprintf(f, "show_log %d\npicture %d\nsort %d\n", show_log ? 1 : 0, picture, sort);
+        std::fprintf(f, "show_log %d\npicture %d\nsort %d\nnv2a %d\n", show_log ? 1 : 0, picture, sort, nv2a);
         std::fclose(f);
     }
 }

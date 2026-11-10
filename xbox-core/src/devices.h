@@ -27,6 +27,7 @@ u32 PhysToGuest(u32 phys);
 
 // nv2a.cpp
 void InitNv2a();
+void SetNv2aChoice(bool own); // before InitDevices: xbox-core's own NV2A instead of xemu's (where built)
 void Nv2aVblank();        // from the interrupt thread, at 60 Hz
 u32 Nv2aDisplayStart();   // PCRTC_START: the physical address shown
 

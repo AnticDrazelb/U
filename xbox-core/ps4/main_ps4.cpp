@@ -887,6 +887,7 @@ int main()
         g_fault_trail_file = kFaultTrail;
         InitCpu();
         gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
+        SetNv2aChoice(g_settings.nv2a == 1); // Settings > Graphics
         LogSync("launch: devices");
         InitDevices();
         // drawing on the GPU (RADV), unless starting it killed the last run of this build

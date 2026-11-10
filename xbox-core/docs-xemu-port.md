@@ -35,6 +35,13 @@ neither fast enough on the PS4 nor available.
 - Idle: reading PGRAPH's status with the push buffer drained finishes the renderer's work first
   (reports written, surfaces downloaded), as the console's GPU would have.
 - BIOS state xbox-core supplies (xemu runs the BIOS): PFB_CFG0/1.
-- Verification: nxdk_pgraph_tests against the console's captures (tests/pgraph/run.py), compared
-  per suite with xbox-core's own renderer (2612/3110 in software, run-sw5).
+- Verification: nxdk_pgraph_tests against the console's captures (tests/pgraph/run.py), per suite
+  against xbox-core's own renderer. xemu's (Vulkan on lavapipe): about 2547/3110 (81.9%); xbox-core's
+  (software, run-sw5): 2612/3110 (84.0%). xemu's better on 17 suites (shadow comparator 288 vs 204,
+  W_param 83 vs 42, Depth_Clamp 40 vs 26, W_buffering 239 vs 233, cube-from-2D, combiners...), xbox-
+  core's on 31 (Blend_surface 32 vs 6, cubemaps 66 vs 37, signed textures 17 vs 1, stencil 8 vs 0,
+  fog, line width, front face, border texels...). xemu's renders Halo on PC; it is the default, and
+  Settings > Graphics (settings.txt: nv2a 1) or XB_NV2A=own picks xbox-core's.
+- One job of the comparison ended silently once (in Vertex_shader_swizzle_tests, which passes 29/29
+  alone): not reproduced; watch for it.
 

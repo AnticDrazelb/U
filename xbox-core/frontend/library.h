@@ -54,6 +54,7 @@ struct Settings
     bool show_log = true; // the log over the game's picture, its first seconds
     int picture = 0;      // 0 sharp (whole-number scale), 1 fit 4:3, 2 fill the screen
     int sort = 0;         // 0 by title, 1 recently played first
+    int nv2a = 0;         // the GPU's emulation: 0 xemu's NV2A, 1 xbox-core's own
     bool Load(const std::string& file);
     void Save(const std::string& file) const;
 };
