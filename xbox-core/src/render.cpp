@@ -326,6 +326,45 @@ struct ImageBlit
     u32 operation = 3, in_x = 0, in_y = 0, out_x = 0, out_y = 0;
     bool clipped = false; // bound to a clip rectangle object (class 0x19)
 } g_blit;
+// memory to memory format (0x39): a copy of line_count lines of line_length bytes from one DMA
+// object's memory to another's, each with its own pitch, started by BUFFER_NOTIFY
+struct MemoryToMemory
+{
+    u32 dma_notify = 0, dma_in = 0, dma_out = 0, offset_in = 0, offset_out = 0, pitch_in = 0, pitch_out = 0;
+    u32 line_length = 0, line_count = 0, format = 0x101;
+} g_m2m;
+
+void MemoryToMemoryCopy(u32 notify)
+{
+    if (gpu::Enabled())
+        gpu::Sync(); // the memory's current content, what the GPU drew included
+    const MemoryToMemory& m = g_m2m;
+    u32 in_limit = 0, out_limit = 0;
+    const u32 in = Nv2aDmaAddress(m.dma_in, &in_limit), out = Nv2aDmaAddress(m.dma_out, &out_limit);
+    const u32 in_inc = std::max<u32>(1, m.format & 0xff), out_inc = std::max<u32>(1, (m.format >> 8) & 0xff);
+    if (in && out && m.line_length && m.line_count)
+    {
+        if (g_verbose >= 2)
+            Log("nv2a: memory to memory: %u lines of %u bytes from %#x (pitch %u) to %#x (pitch %u)", m.line_count,
+                m.line_length, in + m.offset_in, m.pitch_in, out + m.offset_out, m.pitch_out);
+        for (u32 line = 0; line < m.line_count; line++)
+        {
+            const u32 from = in + m.offset_in + line * m.pitch_in, to = out + m.offset_out + line * m.pitch_out;
+            if (in_inc == 1 && out_inc == 1)
+                std::memmove(Ptr<u8>(to), Ptr<const u8>(from), m.line_length);
+            else
+                for (u32 b = 0; b < m.line_length; b++)
+                    Write<u8>(to + b * out_inc, Read<u8>(from + b * in_inc));
+        }
+    }
+    // the notifier: 16 bytes (a timestamp, info, status 0 when done) at the notify object's memory
+    (void)notify;
+    if (const u32 n = Nv2aDmaAddress(m.dma_notify))
+    {
+        Write<u32>(n, 0), Write<u32>(n + 4, 0), Write<u32>(n + 8, 0), Write<u32>(n + 12, 0);
+    }
+}
+
 // the clip rectangle object (0x19): SET_POINT, SET_SIZE
 u32 g_clip_x = 0, g_clip_y = 0, g_clip_w = 0x7fff, g_clip_h = 0x7fff;
 
@@ -408,6 +447,22 @@ void RenderOtherClass(u32 cls, u32 method, u32 parameter)
             g_beta = parameter & 0x80000000 ? 0 : parameter & 0x7f800000;
         if (method == 0x300 || method == 0)
             return;
+        break;
+    case 0x39: // memory to memory format
+        switch (method)
+        {
+        case 0x180: g_m2m.dma_notify = parameter; return;
+        case 0x184: g_m2m.dma_in = parameter; return;
+        case 0x188: g_m2m.dma_out = parameter; return;
+        case 0x30c: g_m2m.offset_in = parameter; return;
+        case 0x310: g_m2m.offset_out = parameter; return;
+        case 0x314: g_m2m.pitch_in = parameter; return;
+        case 0x318: g_m2m.pitch_out = parameter; return;
+        case 0x31c: g_m2m.line_length = parameter; return;
+        case 0x320: g_m2m.line_count = parameter; return;
+        case 0x324: g_m2m.format = parameter; return;
+        case 0x328: MemoryToMemoryCopy(parameter); return; // BUFFER_NOTIFY: the copy, then the notifier
+        }
         break;
     case 0x19: // clip rectangle
         if (method == 0x300)
