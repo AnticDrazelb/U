@@ -886,10 +886,10 @@ int main()
         g_selftest_file = "/data/xbox-core/selftest-step.txt";
         g_fault_trail_file = kFaultTrail;
         InitCpu();
+        gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
         LogSync("launch: devices");
         InitDevices();
         // drawing on the GPU (RADV), unless starting it killed the last run of this build
-        gpu::SetGuardFile("/data/xbox-core/gpu-step.txt");
         gpu::SetWanted(true);
         LogSync("launch: kernel");
         InitKernel();

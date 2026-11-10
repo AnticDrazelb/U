@@ -282,9 +282,19 @@ void xb_bql_lock(void);
 void xb_bql_unlock(void);
 
 static MemoryRegion g_vram;
+static QemuEvent g_renderer_started;
+static bool g_renderer_ok;
 
-void xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
+void xb_nv2a_renderer_started(bool ok)
 {
+    g_renderer_ok = ok;
+    qemu_event_set(&g_renderer_started);
+}
+
+/* true when the renderer started (else this device isn't to be used: xbox-core's own NV2A is) */
+bool xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
+{
+    qemu_event_init(&g_renderer_started, false);
     NV2AState *d = calloc(1, sizeof(NV2AState));
     PCIDevice *dev = PCI_DEVICE(d);
 
@@ -319,9 +329,16 @@ void xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
     xb_bql_lock();
     pgraph_init(d);
     qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread", pfifo_thread, d, QEMU_THREAD_JOINABLE);
+    xb_bql_unlock();
+    qemu_event_wait(&g_renderer_started);
+    if (!g_renderer_ok) {
+        return false;
+    }
+    xb_bql_lock();
     ptimer_init(d);
     nv2a_reset(d);
     xb_bql_unlock();
+    return true;
 }
 
 /* PGRAPH's status read with the push buffer drained (pbkit's pb_busy, Direct3D's idle checks): on the

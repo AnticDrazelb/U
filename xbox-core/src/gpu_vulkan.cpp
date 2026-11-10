@@ -9,6 +9,7 @@ namespace xb::gpu {
 bool Enabled() { return false; }
 void SetWanted(bool) {}
 void SetGuardFile(const std::string&) {}
+const std::string& GuardFile() { static const std::string none; return none; }
 const char* Status() { return "off: not in this build (the 1 GiB one has it)"; }
 bool DrawTriangles(const Vertex*, u32) { return false; }
 bool Clear(u32) { return false; }
@@ -1060,6 +1061,8 @@ DepthState ReadDepthState(const Surface& zs)
 }
 
 } // namespace
+
+const std::string& GuardFile() { return g_guard_file; }
 
 void SetGuardFile(const std::string& path)
 {

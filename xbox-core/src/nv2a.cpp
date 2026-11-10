@@ -498,7 +498,7 @@ void WriteReg(u32 offset, u32 size, u32 value)
 // xemu's NV2A (src/third_party/xemu/hw/xbox/nv2a: PFIFO, PGRAPH and its Vulkan renderer, PTIMER,
 // PCRTC...), chosen at start: the default where it is built; XB_NV2A=own picks this file's
 extern "C" {
-void xb_nv2a_init(uint8_t* ram, uint64_t ram_size);
+bool xb_nv2a_init(uint8_t* ram, uint64_t ram_size);
 uint64_t xb_nv2a_read(uint64_t addr, unsigned int size);
 void xb_nv2a_write(uint64_t addr, uint64_t val, unsigned int size);
 void xb_nv2a_vblank(void);
@@ -514,10 +514,45 @@ void InitNv2a()
 #ifdef XB_XEMU_NV2A
     const char* choice = std::getenv("XB_NV2A");
     g_xemu_nv2a = !(choice && std::string(choice) == "own");
+    // a start that died in xemu's renderer's start-up (the console's step file, as the GPU path's)
+    // is followed by one with xbox-core's own
+    std::string guard = gpu::GuardFile();
+    if (!guard.empty())
+        guard = guard.substr(0, guard.rfind('/') + 1) + "xemu-nv2a-step.txt";
+    if (g_xemu_nv2a && !guard.empty())
+        if (FILE* f = std::fopen(guard.c_str(), "r"))
+        {
+            char step[64] = {}, build[128] = {};
+            const bool same = std::fgets(step, sizeof(step), f) && std::fgets(build, sizeof(build), f) &&
+                              std::string(build).rfind(kBuildId, 0) == 0;
+            std::fclose(f);
+            if (same)
+            {
+                g_xemu_nv2a = false;
+                Log("nv2a: the last start died in xemu's renderer's start-up: this one uses xbox-core's own NV2A");
+                std::remove(guard.c_str());
+            }
+        }
     if (g_xemu_nv2a)
     {
+        if (!guard.empty())
+            if (FILE* f = std::fopen(guard.c_str(), "w"))
+            {
+                std::fprintf(f, "xemu renderer start-up\n%s\n", kBuildId);
+                std::fclose(f);
+            }
         Log("nv2a: xemu's (PGRAPH on its Vulkan renderer)");
-        xb_nv2a_init(Ptr<u8>(kContiguousBase), kContiguousSize);
+        const bool ok = xb_nv2a_init(Ptr<u8>(kContiguousBase), kContiguousSize);
+        if (!guard.empty())
+            std::remove(guard.c_str());
+        if (!ok)
+        {
+            Log("nv2a: xemu's renderer didn't start (no usable Vulkan device): xbox-core's own NV2A");
+            g_xemu_nv2a = false;
+        }
+    }
+    if (g_xemu_nv2a)
+    {
         // what the console's BIOS leaves in the memory controller (xemu runs the BIOS; xbox-core's
         // kernel stands in for it): the RAM configuration, which drivers read (pbkit sizes its
         // memory from them); the console's values

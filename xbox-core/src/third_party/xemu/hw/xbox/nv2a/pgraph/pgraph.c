@@ -22,6 +22,7 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include <unistd.h>
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
@@ -353,13 +354,22 @@ static void init_renderer(PGRAPHState *pg)
 
     // FIXME: Try others
 
-    fprintf(stderr, "Fatal error: cannot initialize renderer\n");
-    exit(1);
+    /* xbox-core: not fatal; xb_nv2a_init hears of it and xbox-core uses its own NV2A */
+    pg->renderer = NULL;
 }
+
+void xb_nv2a_renderer_started(bool ok); /* xbox-core (nv2a.c) */
 
 void pgraph_init_thread(NV2AState *d)
 {
     init_renderer(&d->pgraph);
+    xb_nv2a_renderer_started(d->pgraph.renderer != NULL);
+    if (!d->pgraph.renderer) {
+        /* xbox-core: no renderer; this device is not used (its PFIFO thread parks here) */
+        for (;;) {
+            pause();
+        }
+    }
 }
 
 void pgraph_destroy(PGRAPHState *pg)
