@@ -402,6 +402,12 @@ u32 ReadReg(u32 offset, u32 size)
     case PFIFO_CACHES: return R(PFIFO_CACHES) & ~0x10u;
     case kPfifo + 0x400: return 0x10; // RUNOUT_STATUS: the runout queue is empty
     case PFIFO_CACHE1_DMA_PUSH: return R(PFIFO_CACHE1_DMA_PUSH) & ~0x10u; // not busy
+    case kPcrtc + 0x808: // RASTER: the line being scanned out, from the time (525 lines a 1/59.94 s frame)
+    {
+        const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - g_start).count());
+        return u32((us % 16683) * 525 / 16683);
+    }
     case PTIMER_TIME_0:
     case PTIMER_TIME_1:
     {
