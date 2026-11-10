@@ -520,7 +520,7 @@ bool g_xemu_nv2a = false;
 namespace {
 bool g_own_chosen = false;
 std::string g_xemu_guard; // the step file while xemu's renderer's first frames are drawn
-u32 g_xemu_vblanks = 0;
+[[maybe_unused]] u32 g_xemu_vblanks = 0;
 }
 
 void SetNv2aChoice(bool own) { g_own_chosen = own; }

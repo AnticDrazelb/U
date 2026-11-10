@@ -3,6 +3,9 @@
 // played in real time at 48 kHz. PCM out's samples (16-bit stereo) go to the sound sink; S/PDIF is
 // consumed in step with it. (Games use the APU at 0xfe800000 through DirectSound; that is separate.)
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <string>
 #include <chrono>
 #include <thread>
 #include <utility>
@@ -23,12 +26,18 @@ std::mutex g_apu_mutex;
 std::vector<s16> g_apu_ring(48000 * 2 / 4); // a quarter second
 size_t g_apu_read = 0, g_apu_fill = 0;
 
+// for the stats line: the APU's frames come in, the mixer short of them, the loudest of each
+std::atomic<u64> g_apu_in{0}, g_mixer_short{0}, g_mixer_ticks{0}, g_sink_frames{0};
+std::atomic<int> g_apu_peak{0}, g_ac97_peak{0};
+
 // Takes up to `frames` APU frames, added into `pcm`; returns how many there were.
 size_t TakeApuSound(s16* pcm, size_t frames)
 {
     std::lock_guard lock(g_apu_mutex);
     const size_t capacity = g_apu_ring.size() / 2;
     const size_t n = std::min(frames, g_apu_fill);
+    if (n && n < frames)
+        g_mixer_short++;
     for (size_t i = 0; i < n; i++)
     {
         const size_t at = (g_apu_read + i) % capacity;
@@ -206,10 +215,19 @@ void Player()
             Play(0x170, spdif.data(), spdif.size());
             UpdateIrq();
         }
+        int ac97_peak = 0;
+        for (s16 v : pcm)
+            ac97_peak = std::max(ac97_peak, std::abs(int(v)));
+        if (ac97_peak > g_ac97_peak.load(std::memory_order_relaxed))
+            g_ac97_peak = ac97_peak;
         if (TakeApuSound(pcm.data(), kFrames))
             playing = true;
+        g_mixer_ticks++;
         if (g_audio_sink && playing)
+        {
             g_audio_sink(pcm.data(), kFrames);
+            g_sink_frames += kFrames;
+        }
         fed = playing;
     }
 }
@@ -314,6 +332,12 @@ int ApuQueuedBytes()
 
 void MixApuSound(const s16* samples, size_t frames)
 {
+    int peak = 0;
+    for (size_t i = 0; i < frames * 2; i++)
+        peak = std::max(peak, std::abs(int(samples[i])));
+    if (peak > g_apu_peak.load(std::memory_order_relaxed))
+        g_apu_peak = peak;
+    g_apu_in += frames;
     std::lock_guard lock(g_apu_mutex);
     const size_t capacity = g_apu_ring.size() / 2;
     for (size_t i = 0; i < frames; i++)
@@ -328,6 +352,33 @@ void MixApuSound(const s16* samples, size_t frames)
         g_apu_ring[at * 2 + 1] = samples[i * 2 + 1];
         g_apu_fill++;
     }
+}
+
+std::atomic<u64> g_audio_dry{0};
+
+std::string SoundStats(double seconds)
+{
+    static u64 last_in = 0, last_short = 0, last_ticks = 0, last_sink = 0, last_dry = 0;
+    const u64 in = g_apu_in, shorts = g_mixer_short, ticks = g_mixer_ticks, sink = g_sink_frames, dry = g_audio_dry;
+    size_t apu_queued;
+    {
+        std::lock_guard lock(g_apu_mutex);
+        apu_queued = g_apu_fill;
+    }
+    const size_t device = g_audio_queued ? g_audio_queued() : 0;
+    char out[400];
+    std::snprintf(out, sizeof(out),
+                  "the APU made %.0f%% of real time's sound (loudest %d%%), %.1f ms queued for the mixer, short of it "
+                  "%llu of %llu times; %.0f%% of real time to the output (the AC'97's loudest %d%%)%s",
+                  100.0 * double(in - last_in) / 48000.0 / seconds, g_apu_peak.exchange(0) * 100 / 32768,
+                  apu_queued / 48.0, (unsigned long long)(shorts - last_short), (unsigned long long)(ticks - last_ticks),
+                  100.0 * double(sink - last_sink) / 48000.0 / seconds, g_ac97_peak.exchange(0) * 100 / 32768,
+                  g_audio_queued ? (", " + std::to_string(int(device / 48.0)) + " ms in the device, which ran dry " +
+                                    std::to_string(dry - last_dry) + " times")
+                                       .c_str()
+                                 : "");
+    last_in = in, last_short = shorts, last_ticks = ticks, last_sink = sink, last_dry = dry;
+    return out;
 }
 
 void InitAudio()

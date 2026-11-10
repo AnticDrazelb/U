@@ -293,7 +293,7 @@ void StartAudio()
                 if (starved && have >= kPrebuffer)
                     starved = false;
                 if (!starved && have < 256)
-                    starved = true;
+                    starved = true, g_audio_dry++;
                 for (size_t i = 0; i < 256; i++)
                 {
                     const bool take = !starved && g_ring_read < g_ring_write;

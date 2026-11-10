@@ -1019,6 +1019,41 @@ int HandleGuestFault(platform::Fault& f)
         ebp = next;
     }
     Log("  called from:%s", chain.c_str());
+    // the code around it, and around each call it's in (return addresses on the stack, into the
+    // program's image): to read what it was doing (the frame pointer chain is often empty)
+    auto code_window = [](const char* what, u32 at, u32 before, u32 after) {
+        const u32 from = at - before;
+        if (!GuestMapped(from, before + after))
+            return;
+        std::string hex;
+        for (u32 a = from; a < at + after; a++)
+        {
+            char b[4];
+            std::snprintf(b, sizeof(b), a == at ? "|%02x" : " %02x", Read<u8>(a));
+            hex += b;
+        }
+        Log("  %s %#x (from %#x):%s", what, at, from, hex.c_str());
+    };
+    code_window("code at", u32(rip), 96, 32);
+    {
+        u32 shown = 0;
+        const u32 esp = r.Get(4);
+        for (u32 i = 0; i < 128 && shown < 10 && GuestMapped(esp + i * 4, 4); i++)
+        {
+            const u32 v = Read<u32>(esp + i * 4);
+            if (v < g_xbe.base + 8 || v >= g_xbe.base + g_xbe.image_size || !GuestMapped(v - 8, 8))
+                continue;
+            // a call before it: e8 rel32 (5 bytes) or ff /2 (2 to 7 bytes)
+            const bool call = Read<u8>(v - 5) == 0xe8 || Read<u8>(v - 2) == 0xff || Read<u8>(v - 3) == 0xff ||
+                              Read<u8>(v - 6) == 0xff || Read<u8>(v - 7) == 0xff;
+            if (!call)
+                continue;
+            char what[48];
+            std::snprintf(what, sizeof(what), "returns to (esp+%#x)", i * 4);
+            code_window(what, v, 64, 16);
+            shown++;
+        }
+    }
     diag::LogState("guest fault");
     return 1;
 }

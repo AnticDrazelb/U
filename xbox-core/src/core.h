@@ -285,6 +285,8 @@ void GetRumble(u16& left, u16& right);
 extern void (*g_audio_sink)(const s16* samples, size_t frames);
 // the frames the sink holds, not yet played (a sound device's queue); null: a sink with no queue
 extern size_t (*g_audio_queued)();
+extern std::atomic<u64> g_audio_dry; // times the sink's device ran out of sound (it counts them)
+std::string SoundStats(double seconds); // for the stats line
 void StartVblank();
 
 } // namespace xb

@@ -560,6 +560,13 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 if (gpu::Enabled())
                     if (const std::string declined = gpu::DeclinedSince(); !declined.empty())
                         Log("stats: draws the GPU left to software (slower), by reason: %s", declined.c_str());
+                Log("stats: sound: %s", SoundStats(span).c_str());
+                {
+                    const DisplayInfo d = GetDisplay();
+                    Log("stats: the picture: %s at %#x, %dx%d, format %#x, pitch %u%s", d.valid ? "shown" : "no mode set",
+                        d.address, d.width, d.height, d.format, d.pitch,
+                        d.overlay.on ? ", with the video overlay on" : "");
+                }
                 last_raster = raster, last_faults = faults, last_patched = patched;
                 last_frames = frames, last_draws = draws, last_calls = calls, last_methods = methods;
                 last_stats = now;
