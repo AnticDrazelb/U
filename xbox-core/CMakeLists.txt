@@ -25,7 +25,7 @@ set(XEMU_APU_SOURCES ${XEMU_DIR}/apu.c ${XEMU_DIR}/vp/vp.c ${XEMU_DIR}/monitor.c
     src/third_party/libsamplerate/samplerate.c src/third_party/libsamplerate/src_sinc.c
     src/third_party/libsamplerate/src_linear.c src/third_party/libsamplerate/src_zoh.c
     src/third_party/xemu/hw/xbox/mcpx/nvnet/nvnet.c src/third_party/xemu/shim/xb_qemu_timer.c
-    src/third_party/xemu/shim/xb_bql.c
+    src/third_party/xemu/shim/xb_bql.c src/third_party/xemu/shim/xb_memory.c
     src/third_party/xemu/hw/usb/core.c src/third_party/xemu/hw/usb/desc.c src/third_party/xemu/hw/usb/hcd-ohci.c
     src/third_party/xemu/hw/usb/dev-hub.c src/third_party/xemu/hw/usb/desc-msos.c src/third_party/xemu/hw/usb/xb_bus.c src/third_party/xemu/hw/usb/xb_usb.c
     src/third_party/xemu/hw/xbox/xid.c src/third_party/xemu/hw/xbox/xid-gamepad.c)
@@ -130,7 +130,7 @@ endif()
 target_include_directories(xbox-core PRIVATE src ${CMAKE_BINARY_DIR}/shaders)
 # xemu's code: its QEMU headers stood in for by shim/
 set_source_files_properties(${XEMU_APU_SOURCES} PROPERTIES
-    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp/interp;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/libsamplerate;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/hw/xbox/mcpx/nvnet;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/hw/usb"
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp;${CMAKE_CURRENT_SOURCE_DIR}/${XEMU_DIR}/dsp/interp;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/libsamplerate;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/hw/xbox/mcpx/nvnet;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/hw/usb;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xxhash"
     COMPILE_DEFINITIONS "HAVE_STDBOOL_H;PACKAGE=\"libsamplerate\";VERSION=\"0.2.2\";ENABLE_SINC_FAST_CONVERTER;CPU_CLIPS_POSITIVE=0;CPU_CLIPS_NEGATIVE=0"
     COMPILE_OPTIONS "-w")
 set_source_files_properties(src/apu.cpp src/xemu_glue.cpp src/usb.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu/shim;${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/xemu")
@@ -148,7 +148,7 @@ if (NOT PS4 OR XB_GPU_LINK)
     file(GLOB XEMU_NV2A_SOURCES ${XEMU_NV2A_DIR}/*.c ${XEMU_NV2A_DIR}/pgraph/*.c ${XEMU_NV2A_DIR}/pgraph/glsl/*.c
          ${XEMU_NV2A_DIR}/pgraph/vk/*.c)
     list(FILTER XEMU_NV2A_SOURCES EXCLUDE REGEX "debug_renderdoc\\.c$")
-    list(APPEND XEMU_NV2A_SOURCES ${TP}/xemu/shim/xb_vga.c ${TP}/xemu/shim/xb_memory.c ${TP}/xemu/shim/fast-hash.c
+    list(APPEND XEMU_NV2A_SOURCES ${TP}/xemu/shim/xb_vga.c ${TP}/xemu/shim/fast-hash.c
          ${TP}/nv2a_vsh_cpu/nv2a_vsh_cpu.c ${TP}/nv2a_vsh_cpu/nv2a_vsh_disassembler.c ${TP}/nv2a_vsh_cpu/nv2a_vsh_emulator.c
          ${TP}/nv2a_vsh_cpu/nv2a_vsh_emulator_execution_state.c ${TP}/volk/volk.c ${TP}/spirv-reflect/spirv_reflect.c
          ${TP}/vma/vma_impl.cpp)
