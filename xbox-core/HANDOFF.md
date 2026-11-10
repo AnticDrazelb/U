@@ -81,7 +81,23 @@ Run it from a scratch folder, because it creates `xbox-data/` there.
 with `XB_GPU=1 OUT=~/emu/reg-gpu`. **Hardware comparison:** `tests/pgraph/run.py` runs
 nxdk_pgraph_tests (the ISO from its releases) against the console captures
 (nxdk_pgraph_tests_golden_results, `results/`); it sets `XB_NV2A_SYNC=1` so runs are
-deterministic. Nov 10: 2307/3110 in software before the signed-texture fix.
+deterministic. Nov 10: 2307/3110 in software at the start of the night, **2612/3110 (84%)** by the
+morning; the GPU path matches software on every suite but Texture_projective_2D (Vulkan's edge
+coverage). Run one suite with `--suite "Name as the menu shows it"`; give the GPU path's full run
+`--seconds 3600` or more (its blend suite compiles a pipeline per combination on llvmpipe).
+**What the console does, as established from its captures** (each in the code with its test):
+integer depth truncated; SET_CONTROL0's Z_PERSPECTIVE_ENABLE stores w (pbkit turns it on); polygon
+offset and the clip range's clamp/cull per pixel; lines are rectangles SET_LINE_WIDTH/8 wide;
+points cover pixel centres in their square, SET_POINT_SIZE unless point params; w clamped to
+2^-64..2^64, only negative w clipped; TEXTURE_PERSPECTIVE_ENABLE clear interpolates linearly;
+vertex-program arithmetic truncates (products, a 28-bit adder window, x*0 = 0) and clamps colour
+outputs per vertex; oFog is the x written whatever the mask, and an unwritten oFog carries one of
+six round-robin values; EXP2 fogs infinite distances fully; SPECULAR_ENABLE off folds the lit
+specular into the diffuse; alpha kill and the colour key; textures with their own border texels;
+YUY2/UYVY/Y16; surfaces without alpha read alpha 1, X1A7R8G8B8's 7-bit alpha; clears stay in the
+surface clip; image blits honour a clip rectangle object. Open: bump mapping's sign/filter rule,
+the signed blend equations, the shadow comparator's raw values, Front_face's per-triangle facing
+in fill mode, ZMIN_MAX_CONTROL across two passes (Depth_Clamp's depth_equal).
 Run it a second time as `XB_TEST_FS_AS_PS4=1 tests/regression.sh`: the fault handler then behaves as
 the PS4's (the system reports the fs base as 0; the handler runs with fs on an unmapped page until it
 sets the host's from the KPCR the finder gives), so anything fs-relative in the handler's path (a
