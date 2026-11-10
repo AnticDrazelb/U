@@ -59,6 +59,18 @@ u32 Field(u32 token, int start, int bits)
 
 // ---- the vertex program
 
+// A position's w as the NV2A takes it: its magnitude between 2^-64 and 2^64, +0 as +2^-64 (as xemu
+// has it; the console's captures draw vertices with w 0 and infinity, nxdk_pgraph_tests' W param)
+float ClampW(float w)
+{
+    constexpr float kLo = 0x1p-64f, kHi = 0x1p64f;
+    if (std::isnan(w))
+        return w;
+    if (w > 0 || std::bit_cast<u32>(w) == 0)
+        return std::clamp(w, kLo, kHi);
+    return std::clamp(w, -kHi, -kLo);
+}
+
 // oFog's value before a program runs: a NaN with a payload no arithmetic makes, to tell an unwritten
 // oFog from a written one
 const float kUnwrittenFog = std::bit_cast<float>(0x7fc0f06du);
@@ -503,9 +515,7 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
     // the position: the composite matrix (the model-view one already in it, unless skinning), the
     // divide by w, the viewport's offset
     Vec4 pos = Transform(count == 0 ? position : eye_position, 0x680);
-    float w = pos[3];
-    if (std::fabs(w) < 1e-20f)
-        w = w < 0 ? -1e-20f : 1e-20f;
+    const float w = ClampW(pos[3]);
     const Vec4 offset = Floats(0xa20);
     out[0] = Vec4{{pos[0] / w + offset[0], pos[1] / w + offset[1], pos[2] / w, w}};
 }
@@ -557,6 +567,7 @@ void EmitVertex(const Vec4 in[16])
     if ((g_kelvin.Get(0x1e94) & 3) == 2) // SET_TRANSFORM_EXECUTION_MODE: a program
     {
         RunProgram(in, v.o);
+        v.o[0][3] = ClampW(v.o[0][3]);
         if (UnwrittenFog(v.o[5][0]))
             v.o[5] = g_carried_fog[g_fog_slot];
         // the specular outputs (oD1, oB1) as SET_SPECULAR_ENABLE and SET_LIGHT_CONTROL take them, as
@@ -1537,7 +1548,7 @@ void Flush()
     // outputs: each triangle is cut against the planes there (Sutherland-Hodgman) and divided again.
     std::vector<ScreenVertex> clipped_vertices;
     {
-        constexpr float kMinW = 1e-5f;
+        constexpr float kMinW = std::numeric_limits<float>::min(); // any positive w: the console draws w 5.4e-20
         const bool clip_z = !(g_kelvin.Get(0x1d78) & 0x10);
         const float zmin = std::bit_cast<float>(g_kelvin.Get(0x394)), zmax = std::bit_cast<float>(g_kelvin.Get(0x398));
         const bool z_range = clip_z && zmax > zmin;
