@@ -225,8 +225,10 @@ link, as before.
 What changed overnight, for Halo:
 - Both USB controllers exist, and the OHCI registers behave as the XDK's driver expects (items 1, 2).
 - DirectSound's start-up waits finish; XNet with no cable doesn't block start-up (items 3, 6).
-- Kernel exports audited; the stubs that mattered done properly, with kernel-test checks (item 5).
-- A watchdog names the loop a thread spins in when a run shows no frame (item 7).
+- Kernel exports: the 36 of 366 that had no implementation now done as NT does them, with
+  kernel-test checks (item 5).
+- A hang shows the device registers a game polls (most-read registers and the latest accesses,
+  in the end report and the watchdog's hang.log) (item 7).
 - NV2A: classes 0x39 and 0x9f's bindings, PCRTC_RASTER moving with time, the REF register.
 - The renderer against real-console captures (nxdk_pgraph_tests): 2307 -> 2612 of 3110 (74% -> 84%)
   in software at 06:33, more since (lighting, depth range). The GPU path runs the dot-product
@@ -235,7 +237,7 @@ What changed overnight, for Halo:
 
 What to look at in Halo's log on the next run:
 - the "stats: draws the GPU left to software" line (if Halo is slow, it names the reason);
-- the watchdog report if no frame appears (the loop and the registers it reads);
+- hang.log if no frame appears (the registers it keeps reading, and the values);
 - APU registers near the top of "device registers by reads" would mean item 10 (the GP DSP) is
   next.
 
