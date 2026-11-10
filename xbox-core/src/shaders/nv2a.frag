@@ -33,6 +33,8 @@ layout(std140, binding = 0) uniform State
     vec4 depth;          // 1 / the depth's largest value, polygon offset bias and factor, 1 with the w-buffer
     uvec4 key;           // each stage's SET_COLOR_KEY_COLOR
     uvec4 keyMode;       // colour key mode (bits 0-1), alpha kill (bit 2), the key without alpha (bit 3)
+    uvec4 dotMap;        // each stage's SET_DOT_RGBMAPPING conversion
+    vec4 eye;            // SET_EYE_VECTOR
 } st;
 
 layout(binding = 1) uniform sampler2D tex2D[4];
@@ -90,6 +92,35 @@ vec4 sampleCube(int s, vec3 d)
 // texture colours have their channels as the CPU's V4: r, g, b, a
 float sign3(float x) { x *= 255.0; return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0; }
 
+// SET_DOT_RGBMAPPING's conversions of an input texel to a vector (pixel.cpp's DotMap)
+float sign1(float x) { return (x * 255.0 - 128.0) / 127.0; }
+float sign2(float x) { x *= 255.0; return x >= 128.0 ? (x - 255.5) / 127.5 : (x + 0.5) / 127.5; }
+vec3 dotMap(vec4 c, uint map)
+{
+    if (map == 1u) return vec3(sign1(c.r), sign1(c.g), sign1(c.b));
+    if (map == 2u) return vec3(sign2(c.r), sign2(c.g), sign2(c.b));
+    if (map == 3u) return vec3(sign3(c.r), sign3(c.g), sign3(c.b));
+    if (map >= 4u)
+    {
+        const uvec4 b = uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+        const uint hi = (b.a << 8) | b.r, lo = (b.g << 8) | b.b;
+        if (map == 4u)
+            return vec3(float(hi) / 65535.0, float(lo) / 65535.0, 1.0);
+        float h, l;
+        if (map == 5u)
+            h = (float(hi) - 32768.0) / 32767.0, l = (float(lo) - 32768.0) / 32767.0;
+        else if (map == 6u)
+            h = hi >= 32768u ? (float(hi) - 65535.5) / 32767.5 : (float(hi) + 0.5) / 32767.5,
+            l = lo >= 32768u ? (float(lo) - 65535.5) / 32767.5 : (float(lo) + 0.5) / 32767.5;
+        else
+            h = hi >= 32768u ? (float(hi) - 65536.0) / 32767.0 : float(hi) / 32767.0,
+            l = lo >= 32768u ? (float(lo) - 65536.0) / 32767.0 : float(lo) / 32767.0;
+        return vec3(h, l, sqrt(max(0.0, 1.0 - h * h - l * l)));
+    }
+    return c.rgb;
+}
+
+
 vec4 tc(int s)
 {
     switch (s)
@@ -103,6 +134,7 @@ vec4 tc(int s)
 
 bool textureStages(out vec4 tex[4])
 {
+    float dotv[4] = float[4](0.0, 0.0, 0.0, 0.0); // each dot product stage's dot (pixel.cpp's dot[])
     for (int s = 0; s < 4; s++)
     {
         tex[s] = vec4(0.0);
@@ -154,7 +186,48 @@ bool textureStages(out vec4 tex[4])
             if (enabled)
                 tex[s] = sampleStage(s, vec2(inp.g, inp.b));
         }
-        if (enabled && program != 4u && program != 5u && program != 0u && !keyAndKill(s, tex[s]))
+        else if (program == 9u || program == 10u || program == 17u) // dot ST; dot ZW, dot product: the dot only
+        {
+            dotv[s] = dot(t.xyz, dotMap(inp, st.dotMap[s]));
+            if (program == 9u && enabled && s > 0)
+                tex[s] = sampleStage(s, vec2(dotv[s - 1], dotv[s]));
+        }
+        else if (program == 11u) // dot reflect diffuse: a normal from this stage, the one before and the next one
+        {
+            dotv[s] = dot(t.xyz, dotMap(inp, st.dotMap[s]));
+            if (s > 0 && s < 3 && enabled)
+            {
+                const vec4 nextInput = tex[int(st.stageInput[s + 1] & 3u)];
+                const float dn = dot(tc(s + 1).xyz, dotMap(nextInput, st.dotMap[s + 1]));
+                tex[s] = sampleCube(s, vec3(dotv[s - 1], dotv[s], dn));
+            }
+        }
+        else if (program == 12u || program == 13u || program == 14u || program == 18u)
+        {
+            // dot reflect specular (the eye in the coordinates' w, or SET_EYE_VECTOR), dot STR 2D/cube
+            dotv[s] = dot(t.xyz, dotMap(inp, st.dotMap[s]));
+            if (s >= 2 && enabled)
+            {
+                const vec3 n = vec3(dotv[s - 2], dotv[s - 1], dotv[s]);
+                if (program == 12u || program == 18u)
+                {
+                    const vec3 e = program == 18u ? st.eye.xyz : vec3(tc(s - 2).w, tc(s - 1).w, t.w);
+                    const float nn = dot(n, n);
+                    const float k = nn != 0.0 ? 2.0 * dot(n, e) / nn : 0.0;
+                    tex[s] = sampleCube(s, k * n - e);
+                }
+                else if (program == 14u)
+                    tex[s] = sampleCube(s, n);
+                else
+                    tex[s] = sampleStage(s, n.xy);
+            }
+        }
+        // a texel sampled from this stage's texture: the alpha kill and colour key (as pixel.cpp)
+        const bool sampled = enabled && ((program >= 1u && program <= 3u) || program == 6u || program == 7u ||
+                                         program == 15u || program == 16u || (program == 9u && s > 0) ||
+                                         (program == 11u && s >= 1 && s < 3) ||
+                                         (((program >= 12u && program <= 14u) || program == 18u) && s >= 2));
+        if (sampled && !keyAndKill(s, tex[s]))
             return false;
     }
     return true;

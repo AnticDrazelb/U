@@ -1087,6 +1087,7 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
     }
     put(u.fog_color, ps.fog_color), put(u.final_c0, ps.final_c0), put(u.final_c1, ps.final_c1);
     u.clip_mode[0] = ps.clip_mode;
+    u.eye[0] = ps.eye[0], u.eye[1] = ps.eye[1], u.eye[2] = ps.eye[2], u.eye[3] = 0;
     for (int s = 0; s < 4; s++)
     {
         const u32 f = ps.texture[s].format;
@@ -1104,16 +1105,19 @@ bool GpuPixelSetup(gpu::Uniforms& u, gpu::TextureInfo tex[4], gpu::BlendState& b
         u.bump_lum[s][0] = ps.bump_scale[s], u.bump_lum[s][1] = ps.bump_offset[s];
         u.tex_scale[s][0] = u.tex_scale[s][1] = 1;
         u.tex_scale[s][2] = u.tex_scale[s][3] = 0;
+        u.dot_map[s] = ps.dot_map[s];
         switch (program)
         {
-        case 0: case 4: case 5: continue; // no texture read
-        case 1: case 2: case 3: case 6: case 7: case 15: case 16: break;
-        default: return false; // dot products, BRDF: not on the GPU yet
+        case 0: case 4: case 5: case 10: case 17: continue; // no texture read (10, 17: the dot product only)
+        case 1: case 2: case 3: case 6: case 7: case 9: case 11: case 12: case 13: case 14: case 15: case 16: case 18:
+            break;
+        default: return false; // BRDF: not done anywhere yet
         }
         const Texture& t = ps.texture[s];
         if (!ps.enabled[s] || !t.address)
             continue;
-        if (IsDepthFormat(t.format) || t.depth > 1 || (program == 3) != t.cubemap)
+        const bool wants_cube = program == 3 || program == 11 || program == 12 || program == 14 || program == 18;
+        if (IsDepthFormat(t.format) || t.depth > 1 || wants_cube != t.cubemap)
             return false; // shadow maps, volumes: not yet
         if (t.filter >> 28)
             return false; // signed channels: the GPU's textures are unsigned 8-bit (in software for now)

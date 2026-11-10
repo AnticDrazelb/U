@@ -43,6 +43,8 @@ struct Uniforms
     float depth[4]; // 1 / the depth's largest value, polygon offset bias, factor, 1 with the w-buffer
     u32 key[4];      // each stage's SET_COLOR_KEY_COLOR
     u32 key_mode[4]; // each stage's colour key mode (bits 0-1), alpha kill (bit 2), the key without alpha (bit 3)
+    u32 dot_map[4];  // each stage's SET_DOT_RGBMAPPING conversion
+    float eye[4];    // SET_EYE_VECTOR (dot reflect specular const)
 };
 // A texture stage's texture as the GPU path needs it
 struct TextureInfo
