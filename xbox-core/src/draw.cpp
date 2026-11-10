@@ -901,8 +901,8 @@ struct DepthStencil
         {
             if (z_clamp)
                 v = std::clamp(v, clip_min, clip_max);
-            else if (!(v >= clip_min && v <= clip_max))
-                return false;
+            else if (!(w_buffer ? z >= clip_min && z <= clip_max : v >= clip_min && v <= clip_max))
+                return false; // culled by z, the w-buffer's too (ZMinMaxControl's WBuf_ZCULL captures)
         }
         out = v;
         return true;
@@ -1643,6 +1643,17 @@ void Flush()
         const bool clip_z = !(g_kelvin.Get(0x1d78) & 0x10);
         const float zmin = std::bit_cast<float>(g_kelvin.Get(0x394)), zmax = std::bit_cast<float>(g_kelvin.Get(0x398));
         const bool z_range = clip_z && zmax > zmin;
+        // CULL_NEAR_FAR (SET_ZMIN_MAX_CONTROL bit 0) with depths clamped: a primitive wholly in front of
+        // SET_CLIP_MIN or wholly behind SET_CLIP_MAX is dropped, the rest clamped per pixel (the
+        // console's captures, ZMinMaxControl's NEARFAR_ZCLAMP), judged on z, the w-buffer's too
+        if (!clip_z && (g_kelvin.Get(0x1d78) & 1) && zmax > zmin)
+        {
+            auto depth = [&](u32 v) { return (*source)[v].o[0][2]; };
+            std::erase_if(tris, [&](const Tri& t) {
+                const float a = depth(t.v[0]), b = depth(t.v[1]), c = depth(t.v[2]);
+                return (a < zmin && b < zmin && c < zmin) || (a > zmax && b > zmax && c > zmax);
+            });
+        }
         auto distances = [&](const ScreenVertex& v, float d[3]) {
             const float w = v.o[0][3], hz = v.o[0][2] * w;
             d[0] = w - kMinW;
