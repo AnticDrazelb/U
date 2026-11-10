@@ -73,6 +73,8 @@ float TruncToFloat(double d)
 
 float VMul(float a, float b)
 {
+    if (a == 0 || b == 0) // anything times 0 is 0, infinities and NaN too (Attrib_float's captures; as xemu)
+        return 0;
     const float p = a * b;
     if (!std::isfinite(p) || !std::isfinite(a) || !std::isfinite(b))
         return p;
@@ -627,6 +629,11 @@ void EmitVertex(const Vec4 in[16])
     {
         RunProgram(in, v.o);
         v.o[0][3] = ClampW(v.o[0][3]);
+        // the colour outputs clamped to 0..1 per vertex, before they're interpolated, a NaN as 1
+        // (Attrib_float's captures: an infinite colour interpolates as 1; as xemu)
+        for (int o : {3, 4, 7, 8})
+            for (int c = 0; c < 4; c++)
+                v.o[o][c] = std::isnan(v.o[o][c]) ? 1.f : std::clamp(v.o[o][c], 0.f, 1.f);
         if (UnwrittenFog(v.o[5][0]))
             v.o[5] = g_carried_fog[g_fog_slot];
         // the specular outputs (oD1, oB1) as SET_SPECULAR_ENABLE and SET_LIGHT_CONTROL take them, as
