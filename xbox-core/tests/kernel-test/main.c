@@ -453,6 +453,21 @@ int main(void)
         check("a read's event is set when it ends", (st == 0 || st == STATUS_PENDING) &&
                                                        NtWaitForSingleObject(ev, FALSE, &zero) == 0 &&
                                                        iosb.Information == 64 && buf[0] == 'X' && buf[1] == 'B');
+        // a file handle can be waited on (its I/O done: signaled), alone or with other objects; so
+        // can a directory's (always signaled)
+        {
+            HANDLE pair[2] = {ev, f};
+            NtClearEvent(ev);
+            const NTSTATUS one = NtWaitForSingleObject(f, FALSE, &zero);
+            const NTSTATUS any = NtWaitForMultipleObjectsEx(2, pair, WaitAny, UserMode, FALSE, &zero);
+            HANDLE dir = open_path("\\Device\\CdRom0\\", FILE_LIST_DIRECTORY, FILE_OPEN);
+            const NTSTATUS on_dir = dir ? NtWaitForSingleObject(dir, FALSE, &zero) : -1;
+            if (dir)
+                NtClose(dir);
+            DbgPrint("  waits: on a file %#x, on an event and a file %#x, on a directory %#x\n", (unsigned)one,
+                     (unsigned)any, (unsigned)on_dir);
+            check("a wait on a file handle", one == 0 && any == 1 && on_dir == 0);
+        }
         OVERLAPPED ov;
         memset(&ov, 0, sizeof(ov));
         st = NtReadFile(f, NULL, (PIO_APC_ROUTINE)NtUserIoApcDispatcher, (PVOID)on_read_done, (PIO_STATUS_BLOCK)&ov, buf,

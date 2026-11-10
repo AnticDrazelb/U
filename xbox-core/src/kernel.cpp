@@ -569,6 +569,68 @@ u32 ObjectOf(u32 handle)
     return it == g_handles.end() || it->second.kind != 0 ? 0 : it->second.object;
 }
 
+// The object a wait on a handle waits for (the Xbox's object types' DefaultObject): a dispatcher
+// object itself; a file's Event (FILE_OBJECT + 0x3c, signaled when its I/O completes); for any other
+// object (a directory, a symbolic link, a device) one notification event that is always signaled.
+// 0: not a handle.
+u32 WaitableOf(u32 handle)
+{
+    if (handle == 0xfffffffe)
+        return CurrentThread() ? CurrentThread()->ethread : 0;
+    HandleEntry e;
+    {
+        std::lock_guard lock(g_handles_mutex);
+        auto it = g_handles.find(handle);
+        if (it == g_handles.end())
+            return 0;
+        e = it->second;
+    }
+    if (e.kind == 0)
+        return e.object;
+    if ((e.kind == 1 || e.kind == 2) && e.object)
+        return e.object + 0x3c;
+    if (e.kind == 5 && e.object)
+    {
+        const u32 type = HeaderType(e.object);
+        for (const char* name : {"ExEventObjectType", "ExMutantObjectType", "ExSemaphoreObjectType",
+                                 "ExTimerObjectType", "PsThreadObjectType", "IoCompletionObjectType"})
+            if (type == ObjectTypeAddress(name))
+                return e.object;
+    }
+    static const u32 always = [] {
+        const u32 o = NewObject(0x10, "ExEventObjectType");
+        InitHeader(o, kNotificationEvent, 4, 1);
+        return o;
+    }();
+    return always;
+}
+
+// for the log: what each of a wait's handles is
+std::string DescribeHandles(u32 count, u32 handles)
+{
+    std::string out;
+    for (u32 i = 0; i < count && i < 64; i++)
+    {
+        const u32 h = Read<u32>(handles + i * 4);
+        char buf[64];
+        int kind = -1;
+        u32 object = 0;
+        {
+            std::lock_guard lock(g_handles_mutex);
+            auto it = g_handles.find(h);
+            if (it != g_handles.end())
+                kind = it->second.kind, object = it->second.object;
+        }
+        if (kind < 0)
+            std::snprintf(buf, sizeof(buf), " %#x (not open)", h);
+        else
+            std::snprintf(buf, sizeof(buf), " %#x (kind %d, object %#x type %u)", h, kind, object,
+                          object ? unsigned(Read<u8>(object)) : 0u);
+        out += buf;
+    }
+    return out;
+}
+
 struct Completion
 {
     u32 key, apc_context, status, information;
@@ -1164,9 +1226,13 @@ u32 NewHostHandle(int kind, void* host)
     u32 body = 0;
     if (kind == 1 || kind == 2)
     {
+        // the Xbox's FILE_OBJECT: Type 5 (no Size field: access bits at 2, Flags at 3), its Lock (a
+        // synchronization event, free) at 0x2c and its Event at 0x3c: what a wait on the file waits
+        // for, signaled once an I/O completes (here every I/O completes before its call returns)
         body = NewObject(0x50, "IoFileObjectType");
         Write<u16>(body, 5);
-        Write<u16>(body + 2, 0x50);
+        InitHeader(body + 0x2c, kSynchronizationEvent, 4, 1);
+        InitHeader(body + 0x3c, kNotificationEvent, 4, 1);
     }
     else if (kind == 3)
         body = NewObject(0x20, "ObDirectoryObjectType");
@@ -1473,16 +1539,21 @@ void InitKernel()
     } END;
 
     // ---- waits
-    K(NtWaitForSingleObject) { const u32 o = ObjectOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(2)) : STATUS_INVALID_HANDLE; } END;
-    K(NtWaitForSingleObjectEx) { const u32 o = ObjectOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(3), c.Arg(2) & 0xff) : STATUS_INVALID_HANDLE; } END;
+    K(NtWaitForSingleObject) { const u32 o = WaitableOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(2)) : STATUS_INVALID_HANDLE; } END;
+    K(NtWaitForSingleObjectEx) { const u32 o = WaitableOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(3), c.Arg(2) & 0xff) : STATUS_INVALID_HANDLE; } END;
     K(NtWaitForMultipleObjectsEx)
     {
         std::vector<u32> objects;
         for (u32 i = 0; i < c.Arg(0); i++)
         {
-            const u32 o = ObjectOf(Read<u32>(c.Arg(1) + i * 4));
+            const u32 o = WaitableOf(Read<u32>(c.Arg(1) + i * 4));
             if (!o)
+            {
+                static int told = 0;
+                if (told++ < 16)
+                    Log("kernel: a wait on a handle that isn't open:%s", DescribeHandles(c.Arg(0), c.Arg(1)).c_str());
                 return STATUS_INVALID_HANDLE;
+            }
             objects.push_back(o);
         }
         return WaitObjects(objects, c.Arg(2) == 0, c.Arg(5), c.Arg(4) & 0xff);
@@ -1614,7 +1685,7 @@ void InitKernel()
     } END;
     K(NtSignalAndWaitForSingleObjectEx) // signal handle, wait handle, mode, alertable, timeout*
     {
-        const u32 signal = ObjectOf(c.Arg(0)), wait = ObjectOf(c.Arg(1));
+        const u32 signal = ObjectOf(c.Arg(0)), wait = WaitableOf(c.Arg(1));
         if (!signal || !wait)
             return STATUS_INVALID_HANDLE;
         {
