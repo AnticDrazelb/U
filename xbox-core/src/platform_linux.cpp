@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <atomic>
 #include <csignal>
+#include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -241,9 +242,16 @@ void InstallFaultHandler(FaultHandler handler)
     action.sa_sigaction = OnSignal;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&action.sa_mask);
+    sigaddset(&action.sa_mask, SIGUSR2); // a sample waits for a fault's handling to end
     for (int i = 0; i < 5; i++)
         sigaction(kSignals[i], &action, &g_old[i]);
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGUSR2, &action, nullptr);
 }
+
+int SampleSignal() { return SIGUSR2; }
+uint64_t CurrentHostThread() { return uint64_t(pthread_self()); }
+bool SendSample(uint64_t host_thread) { return host_thread && pthread_kill(pthread_t(host_thread), SIGUSR2) == 0; }
 
 std::string WrapSignal(int) { return ""; }
 std::string CheckFaultHandler() { return ""; }

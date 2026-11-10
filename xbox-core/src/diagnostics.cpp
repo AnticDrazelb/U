@@ -1,6 +1,7 @@
 #include "diagnostics.h"
 #include "gpu.h"
 #include "devices.h"
+#include "platform.h"
 
 #include <algorithm>
 #include <chrono>
@@ -332,6 +333,35 @@ void WriteState(Out fd)
                 Read<u32>(t->kpcr + kpcr::FaultEflags));
             dump_stack("the stack at its last fault", Read<u32>(t->kpcr + kpcr::FaultRegs + 16));
         }
+        // where it was when sampled (the watchdog's samples of a thread running guest code): each
+        // eip and how often, the latest sample's registers and code, and memory at its registers
+        if (const u32 sn = std::min<u32>(t->samples.load(std::memory_order_acquire), GuestThread::kSamples))
+        {
+            std::map<u32, u32> at;
+            for (u32 k = 0; k < sn; k++)
+                at[t->sample_eip[k]]++;
+            Put(fd, "    sampled %u times in guest code, at (eip x times):", sn);
+            for (const auto& [eip, times] : at)
+                Put(fd, " %#x x%u", eip, times);
+            const u32* g = t->sample_regs;
+            Put(fd, "\n    the latest sample: eax %#x ecx %#x edx %#x ebx %#x esp %#x ebp %#x esi %#x edi %#x\n"
+                    "    its code from eip - 16:",
+                g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+            for (u32 b = 0; b < 48; b++)
+                Put(fd, "%s%02x", b == 16 ? " | " : " ", t->sample_code[b]);
+            Put(fd, "\n");
+            static const char* const kNames[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
+            for (int r = 0; r < 8; r++)
+            {
+                const u32 a = g[r] & ~3u;
+                if (a < 0x10000 || !GuestMapped(a, 32))
+                    continue;
+                Put(fd, "      [%s %#x]:", kNames[r], a);
+                for (u32 w = 0; w < 8; w++)
+                    Put(fd, " %08x", Read<u32>(a + w * 4));
+                Put(fd, "\n");
+            }
+        }
         const u32 n = t->calls_next.load();
         const u32 shown = std::min<u32>(n, GuestThread::kCallRecords);
         for (u32 k = 0; k < shown; k++)
@@ -545,6 +575,21 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                                                   : "no frame, draw or picture yet";
                 Log("watchdog: %s (%.0f s into the program): every thread's state in %s and below", reason, now - run_start,
                     hang_file.c_str());
+                // where each thread running guest code is: 32 samples apiece, 2 ms apart (the fault
+                // handler takes them: safe in guest code)
+                {
+                    const u32 count = std::min(g_thread_count.load(), kMaxThreads);
+                    for (u32 i = 0; i < count; i++)
+                        if (GuestThread* t = g_threads[i]; t && t->host.load())
+                            t->samples.store(0);
+                    for (int k = 0; k < 32; k++)
+                    {
+                        for (u32 i = 0; i < count; i++)
+                            if (GuestThread* t = g_threads[i]; t && t->host.load() && !t->in_call.load())
+                                platform::SendSample(t->host.load());
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                }
                 const int fd = open(hang_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd >= 0)
                 {

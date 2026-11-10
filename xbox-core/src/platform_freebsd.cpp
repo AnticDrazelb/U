@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <atomic>
 #include <csignal>
+#include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -258,10 +259,19 @@ void SetCs(Fault& fault, uint16_t cs)
 void InstallFaultHandler(FaultHandler handler)
 {
     g_handler = handler;
-    const struct sigaction a = Action(OnSignal);
+    struct sigaction a = Action(OnSignal);
+    sigaddset(&a.sa_mask, SIGUSR2); // a sample waits for a fault's handling to end
     for (int sig : kSignals)
         if (SetSignal(sig, &a, &g_previous[sig]) == 0)
             g_have_previous[sig] = true;
+    SetSignal(SIGUSR2, &a, nullptr);
+}
+
+int SampleSignal() { return SIGUSR2; }
+uint64_t CurrentHostThread() { return reinterpret_cast<uint64_t>(pthread_self()); }
+bool SendSample(uint64_t host_thread)
+{
+    return host_thread && pthread_kill(reinterpret_cast<pthread_t>(host_thread), SIGUSR2) == 0;
 }
 
 std::string WrapSignal(int sig)

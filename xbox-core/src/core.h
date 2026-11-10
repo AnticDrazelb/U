@@ -173,6 +173,13 @@ struct GuestThread
     u32 tls_area = 0; // the TLS block below the stack's top (0: none); the stack proper is below it
     u32 id = 0;
     std::string name;
+    // where it runs, sampled (the watchdog's, through the fault handler: platform::SendSample)
+    std::atomic<u64> host{0}; // its host thread (platform::CurrentHostThread), 0 before it starts
+    static constexpr u32 kSamples = 64;
+    std::atomic<u32> samples{0};
+    u32 sample_eip[kSamples] = {};
+    u32 sample_regs[8] = {}; // the latest sample's eax..edi
+    u8 sample_code[48] = {}; // the latest sample's code from eip - 16
 };
 GuestThread* CurrentThread(); // the calling host thread's guest thread, or nullptr
 const char* KernelExportName(u32 ordinal); // kernel.cpp: an export's name, or nullptr

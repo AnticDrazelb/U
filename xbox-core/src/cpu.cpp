@@ -1006,6 +1006,28 @@ uint64_t FindKpcr(uint64_t kernel_value, uint64_t context_value, uint64_t rsp, u
 
 bool OnFault(platform::Fault& f)
 {
+    if (f.signal == platform::SampleSignal())
+    {
+        // a sample of where a thread is: in guest code, its eip, registers and code are noted on its
+        // GuestThread (plain stores, nothing fs-relative); anywhere else nothing. It resumes as it was.
+        if (f.cs == g_sel32)
+        {
+            const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
+            GuestThread* t = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread))
+                                      : diag::ThreadByStack(u32(*f.gpr[4]));
+            if (t)
+            {
+                const u32 eip = u32(*f.rip), n = t->samples.load(std::memory_order_relaxed);
+                t->sample_eip[n % GuestThread::kSamples] = eip;
+                for (int i = 0; i < 8; i++)
+                    t->sample_regs[i] = u32(*f.gpr[i]);
+                if (GuestMapped(eip - 16, 48))
+                    std::memcpy(t->sample_code, Ptr<u8>(eip - 16), 48);
+                t->samples.store(n + 1, std::memory_order_release);
+            }
+        }
+        return true;
+    }
     if (f.cs != g_sel32)
     {
         platform::Trail(4, 0, *f.rip, f.fs_base, f.address);
@@ -1472,6 +1494,7 @@ void StartHostThread(GuestThread* t, std::function<void()> body)
     std::thread([t, body = std::move(body)] {
         platform::PrepareThread();
         tl_thread = t;
+        t->host = platform::CurrentHostThread();
         body();
     }).detach();
 }

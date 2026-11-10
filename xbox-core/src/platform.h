@@ -53,6 +53,11 @@ using KpcrFinder = uint64_t (*)(uint64_t kernel_value, uint64_t context_value, u
 void SetKpcrFinder(KpcrFinder finder);
 using FaultHandler = bool (*)(Fault& fault);
 void InstallFaultHandler(FaultHandler handler);
+// Where a thread is, sampled: a signal the fault handler takes too (it notes eip and resumes), so it
+// is as safe in guest code as a fault is. The watchdog sends it to threads running guest code.
+int SampleSignal();
+uint64_t CurrentHostThread();
+bool SendSample(uint64_t host_thread);
 // A signal someone else handles (the stack dump's, SIGSYS) made safe to arrive in guest code: the
 // app's own state (fs) back before its handler runs. "" when done, else why not. The PS4's.
 std::string WrapSignal(int sig);

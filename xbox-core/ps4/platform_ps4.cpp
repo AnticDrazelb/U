@@ -10,6 +10,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include "../src/platform.h"
@@ -525,18 +526,29 @@ void SetCs(Fault& fault, uint16_t cs)
     fault.cs = cs;
 }
 
+constexpr int kSigSample = 31; // SIGUSR2
+
 void InstallFaultHandler(FaultHandler handler)
 {
     g_handler = handler;
     BsdSigaction action{};
     action.handler = xb_signal_entry;
     action.flags = kSaSiginfo | kSaOnstack;
+    action.mask[0] = 1u << (kSigSample - 1); // a sample waits for a fault's handling to end
     for (int i = 0; i < 5; i++)
     {
         const int sig = kSignals[i];
         if (RawSigaction(sig, &action, &g_previous[sig]) == 0)
             g_have_previous[sig] = true;
     }
+    RawSigaction(kSigSample, &action, nullptr);
+}
+
+int SampleSignal() { return kSigSample; }
+uint64_t CurrentHostThread() { return reinterpret_cast<uint64_t>(pthread_self()); }
+bool SendSample(uint64_t host_thread)
+{
+    return host_thread && pthread_kill(reinterpret_cast<pthread_t>(host_thread), kSigSample) == 0;
 }
 
 uint64_t LastSignalStack() { return ::xb_signal_rsp; }
