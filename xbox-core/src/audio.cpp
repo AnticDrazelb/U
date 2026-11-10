@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core.h"
@@ -66,54 +67,107 @@ void UpdateIrq()
     SetIrq(kIrq, level);
 }
 
-void ResetBox(u32 box)
+// A box's state beyond its registers: the descriptor being played (QEMU's bd: address, control and
+// length), loaded when the box starts, advances or is restarted.
+struct Descriptor
 {
-    B(box + 4) = B(box + 5) = B(box + 0xa) = 0;
-    SetW(box + 8, 0);
-    SetW(box + 6, SR_DCH);
-    B(box + 0xb) &= ~(CR_RUN | CR_RESET);
+    u32 address = 0, ctl_len = 0;
+    bool valid = false;
+};
+Descriptor g_bd[3];
+int BoxIndex(u32 box) { return box == 0x100 ? 0 : box == 0x110 ? 1 : 2; }
+
+// QEMU's fetch_bd: the descriptor at CIV, PICB its length (samples)
+void FetchDescriptor(u32 box)
+{
+    Descriptor& bd = g_bd[BoxIndex(box)];
+    const u32 at = PhysToGuest(D(box)) + B(box + 4) * 8u;
+    bd.address = at >= 8 ? PhysToGuest(Read<u32>(at)) : 0;
+    bd.ctl_len = at >= 8 ? Read<u32>(at + 4) : 0;
+    bd.valid = true;
+    SetW(box + 8, u16(bd.ctl_len & 0xffff));
 }
 
-// Plays `samples` 16-bit samples of a box; returns how many came from guest memory (the rest is
-// silence, when it ran dry). Under g_m.
+// QEMU's next descriptor: CIV takes PIV, PIV moves on
+void NextDescriptor(u32 box)
+{
+    B(box + 4) = B(box + 0xa);
+    B(box + 0xa) = u8((B(box + 0xa) + 1) % 32);
+    FetchDescriptor(box);
+}
+
+// QEMU's reset_bm_regs: everything cleared but the interrupt enables, halted
+void ResetBox(u32 box)
+{
+    std::memset(&g_regs[box], 0, 4);         // BDBAR
+    B(box + 4) = B(box + 5) = B(box + 0xa) = 0; // CIV, LVI, PIV
+    SetW(box + 8, 0);                         // PICB
+    SetW(box + 6, SR_DCH);
+    B(box + 0xb) &= CR_IOCE | CR_FEIE | CR_LVBIE;
+    g_bd[BoxIndex(box)] = {};
+}
+
+// Plays `samples` 16-bit samples of a box (QEMU's transfer_audio for an output box); returns how many
+// came from guest memory (the rest is silence, when it ran dry). Under g_m.
 size_t Play(u32 box, s16* out, size_t samples)
 {
     size_t done = 0;
-    u8& civ = B(box + 4);
-    while (done < samples && (B(box + 0xb) & CR_RUN) && !(W(box + 6) & SR_DCH))
+    Descriptor& bd = g_bd[BoxIndex(box)];
+    if (!(B(box + 0xb) & CR_RUN) || (W(box + 6) & SR_DCH))
+        return 0;
+    while (done < samples)
     {
-        const u32 descriptor = PhysToGuest(D(box)) + civ * 8u;
-        if (descriptor < 8)
+        if (!bd.valid)
+            FetchDescriptor(box);
+        u16 picb = W(box + 8);
+        if (!picb)
+        {
+            // a fresh descriptor that is empty
+            if (B(box + 4) == B(box + 5))
+            {
+                SetW(box + 6, W(box + 6) | SR_DCH);
+                break;
+            }
+            SetW(box + 6, W(box + 6) & ~SR_CELV);
+            NextDescriptor(box);
             break;
-        const u32 address = PhysToGuest(Read<u32>(descriptor));
-        const u16 length = Read<u16>(descriptor + 4), control = Read<u16>(descriptor + 6);
-        u16 left = W(box + 8); // PICB: samples left in the current buffer
-        if (left == 0)
-            left = length;
-        const size_t n = std::min<size_t>(left, samples - done);
-        const u32 at = address + u32(length - left) * 2;
+        }
+        const size_t n = std::min<size_t>(picb, samples - done);
         for (size_t i = 0; i < n; i++)
-            out[done + i] = address ? Read<s16>(at + u32(i) * 2) : 0;
+            out[done + i] = bd.address ? Read<s16>(bd.address + u32(i) * 2) : 0;
+        bd.address += u32(n) * 2;
         done += n;
-        left = u16(left - n);
-        SetW(box + 8, left);
-        if (left)
+        picb = u16(picb - n);
+        SetW(box + 8, picb);
+        if (picb)
             continue;
         // the buffer is done
-        u16 sr = W(box + 6);
-        if (control & 0x8000) // IOC
+        u16 sr = u16(W(box + 6) & ~SR_CELV);
+        if (bd.ctl_len & 0x80000000u) // IOC
             sr |= SR_BCIS;
-        if (civ == B(box + 5)) // it was the last valid one: halt
+        if (B(box + 4) == B(box + 5)) // it was the last valid one: halt
         {
             sr |= SR_LVBCI | SR_DCH | SR_CELV;
             SetW(box + 6, sr);
             break;
         }
-        civ = u8((civ + 1) & 31);
-        B(box + 0xa) = u8((civ + 1) & 31);
+        NextDescriptor(box);
         SetW(box + 6, sr);
     }
     return done;
+}
+
+// The codec's registers at reset (QEMU's mixer_reset: a SigmaTel STAC9700; 48 kHz everywhere, master
+// muted, PCM out and record gain at their reset volumes, every section ready)
+void ResetMixer()
+{
+    std::memset(g_regs, 0, 0x80);
+    const std::pair<u32, u16> kReset[] = {{0x26, 0x000f}, {0x7c, 0x8384}, {0x7e, 0x7600}, {0x28, 0x0809},
+                                          {0x2a, 0x0009}, {0x2c, 0xbb80}, {0x2e, 0xbb80}, {0x30, 0xbb80},
+                                          {0x32, 0xbb80}, {0x34, 0xbb80}, {0x02, 0x8000}, {0x18, 0x8808},
+                                          {0x1c, 0x8808}};
+    for (const auto& [reg, value] : kReset)
+        SetW(reg, value);
 }
 
 void Player()
@@ -159,7 +213,7 @@ u32 ReadReg(u32 offset, u32 size)
         return v;
     }
     if (offset < 0x100 && size == 2 && offset == 0x26)
-        return 0x000f; // the codec's powerdown status: everything ready
+        return (W(0x26) & ~0xfu) | 0x000f; // the codec's powerdown status: every section ready
     u32 v = 0;
     std::memcpy(&v, &g_regs[offset], std::min<u32>(size, kSize - offset));
     return v;
@@ -170,7 +224,7 @@ void WriteReg(u32 offset, u32 size, u32 value)
     std::lock_guard lock(g_m);
     for (u32 box : kBoxes)
     {
-        if (offset == box + 0xb && size == 1) // CR
+        if (offset == box + 0xb && size == 1) // CR (QEMU's)
         {
             if (value & CR_RESET)
                 ResetBox(box);
@@ -183,29 +237,41 @@ void WriteReg(u32 offset, u32 size, u32 value)
                     Log("ac97: box %#x %s (descriptors at %#x, last valid %u, control %#x)", box,
                         (value & CR_RUN) ? "runs" : "stops", D(box), B(box + 5), value);
                 }
-                B(box + 0xb) = u8(value);
-                if (value & CR_RUN)
+                B(box + 0xb) = u8(value & 0x1f);
+                if (!(value & CR_RUN))
+                    SetW(box + 6, W(box + 6) | SR_DCH);
+                else
+                {
+                    NextDescriptor(box);
                     SetW(box + 6, W(box + 6) & ~SR_DCH);
+                }
             }
             UpdateIrq();
             return;
         }
-        if (offset == box + 6 && size <= 2) // SR: the interrupt bits are cleared by writing 1
+        if (offset == box + 6 && size <= 2) // SR: the interrupt bits are cleared by writing 1; DCH, CELV read-only
         {
-            SetW(box + 6, u16(W(box + 6) & ~(value & (SR_LVBCI | SR_BCIS | SR_FIFOE))));
+            const u16 wclear = SR_LVBCI | SR_BCIS | SR_FIFOE, ro = SR_DCH | SR_CELV;
+            u16 sr = u16(W(box + 6) | (value & ~(ro | wclear) & 0x1f));
+            SetW(box + 6, u16(sr & ~(value & wclear)));
             UpdateIrq();
             return;
         }
-        if (offset == box + 5 && size == 1) // LVI: a new last buffer restarts a halted box
+        if (offset == box + 5 && size == 1) // LVI: a new last buffer restarts a halted, running box (QEMU's)
         {
-            B(box + 5) = u8(value & 31);
             if ((B(box + 0xb) & CR_RUN) && (W(box + 6) & SR_DCH))
             {
                 SetW(box + 6, W(box + 6) & ~(SR_DCH | SR_CELV));
-                B(box + 4) = u8((B(box + 4) + (W(box + 8) == 0 && B(box + 4) != B(box + 5) ? 1 : 0)) & 31);
+                NextDescriptor(box);
             }
+            B(box + 5) = u8(value % 32);
             return;
         }
+    }
+    if (offset == 0x00 && size == 2) // the codec's reset register: the mixer back to its reset values
+    {
+        ResetMixer();
+        return;
     }
     if (offset == kGlobalStatus && size == 4)
     {
@@ -241,6 +307,7 @@ void MixApuSound(const s16* samples, size_t frames)
 
 void InitAudio()
 {
+    ResetMixer();
     for (u32 box : kBoxes)
         ResetBox(box);
     AddDevice({kBase, kSize, "ac97", ReadReg, WriteReg});
