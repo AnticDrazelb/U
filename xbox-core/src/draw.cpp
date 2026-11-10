@@ -59,6 +59,11 @@ u32 Field(u32 token, int start, int bits)
 
 // ---- the vertex program
 
+// oFog's value before a program runs: a NaN with a payload no arithmetic makes, to tell an unwritten
+// oFog from a written one
+const float kUnwrittenFog = std::bit_cast<float>(0x7fc0f06du);
+bool UnwrittenFog(float f) { return std::bit_cast<u32>(f) == 0x7fc0f06du; }
+
 Vec4 RunProgram(const Vec4 in[16], Vec4 out[16])
 {
     Vec4 r[13] = {}; // R0-R11, R12 (= oPos)
@@ -66,6 +71,7 @@ Vec4 RunProgram(const Vec4 in[16], Vec4 out[16])
     for (int i = 0; i < 16; i++)
         out[i] = Vec4{};
     out[3] = out[4] = Vec4{{0, 0, 0, 1}};
+    out[5][0] = kUnwrittenFog; // oFog left unwritten: the carried value (EmitVertex)
     u32 pc = g_kelvin.Get(0x1ea0) & 0xff; // SET_TRANSFORM_PROGRAM_START
     for (int guard = 0; guard < 136 && pc < 136; guard++, pc++)
     {
@@ -165,7 +171,12 @@ Vec4 RunProgram(const Vec4 in[16], Vec4 out[16])
         if (o_mask && Field(t[3], 11, 1)) // to an output register (not a constant)
         {
             const int o = int(Field(t[3], 3, 8) & 0xf);
-            write(out[o], Field(t[3], 2, 1) ? l : m, o_mask);
+            const Vec4& v = Field(t[3], 2, 1) ? l : m;
+            if (o == 5) // oFog is one value: the x of what's written, whatever the mask (Fog_coord_vec4's
+                        // captures: "mov oFog.yw, c.yw" is swizzle ywww, and its fog is c.y)
+                out[5] = Vec4{{v[0], v[0], v[0], v[0]}};
+            else
+                write(out[o], v, o_mask);
         }
         if (Field(t[3], 0, 1)) // FINAL
             break;
@@ -523,12 +534,22 @@ void FogFactor(Vec4 out[16])
         f = x + std::exp2(-d * d * y * y * 32.f) - 1.5f;
     else // linear
         f = x + d * y - 1.f;
+    // an infinite or NaN distance: full fog in EXP2 and the EXP/EXP2 abs modes, none in EXP and
+    // LINEAR (the console's captures, Fog_exceptional_value)
+    const bool full_fog = mode == 0x801 || mode == 0x802 || mode == 0x803;
     if (std::isinf(d))
-        f = mode == 0x802 || mode == 0x803 ? 0.f : 1.f;
+        f = full_fog ? 0.f : 1.f;
     else if (std::isnan(f))
-        f = mode == 0x802 || mode == 0x803 ? 0.f : 1.f;
+        f = full_fog ? 0.f : 1.f;
     out[5] = Vec4{{f, f, f, f}};
 }
+
+// The fog coordinate a vertex carries over: six values, a vertex's slot the next round robin across
+// vertices and draws (even draws that write nothing). A program that leaves oFog unwritten gets its
+// slot's value; a vertex with a fog coordinate leaves it there (the console's captures and notes,
+// nxdk_pgraph_tests' Fog_carryover: points 5 and 11 of a batch after a marker carry its fog)
+Vec4 g_carried_fog[6] = {};
+u32 g_fog_slot = 0;
 
 void EmitVertex(const Vec4 in[16])
 {
@@ -536,6 +557,8 @@ void EmitVertex(const Vec4 in[16])
     if ((g_kelvin.Get(0x1e94) & 3) == 2) // SET_TRANSFORM_EXECUTION_MODE: a program
     {
         RunProgram(in, v.o);
+        if (UnwrittenFog(v.o[5][0]))
+            v.o[5] = g_carried_fog[g_fog_slot];
         // the specular outputs (oD1, oB1) as SET_SPECULAR_ENABLE and SET_LIGHT_CONTROL take them, as
         // for the fixed function's: off, black and opaque; on, opaque unless bit 17 (alpha from the
         // specular) is set (the console's captures, Lighting_control's VS tests)
@@ -546,6 +569,8 @@ void EmitVertex(const Vec4 in[16])
     }
     else
         FixedFunction(in, v.o);
+    g_carried_fog[g_fog_slot] = v.o[5];
+    g_fog_slot = (g_fog_slot + 1) % 6;
     FogFactor(v.o);
     g_vertices.push_back(v);
 }
