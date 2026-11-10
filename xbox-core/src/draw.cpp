@@ -1226,26 +1226,30 @@ struct Fragments
         offset = DepthStencil::OffsetFor(0x334, 0);
         u32 ax, ay;
         AntiAliasing(ax, ay);
-        const float width = float(g_kelvin.Get(0x380) & 0x1ff) / 8.f * float(ax);
+        // in the picture's pixels: with antialiasing the surface has ax by ay samples a pixel, and each
+        // sample is tested against the rectangle as the picture has it (a 1-pixel line stays 1 pixel)
+        const double sx = ax, sy = ay;
+        const double width = double(g_kelvin.Get(0x380) & 0x1ff) / 8.0;
         if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(b.x) || !std::isfinite(b.y))
             return;
-        const double dx = double(b.x) - a.x, dy = double(b.y) - a.y, len = std::sqrt(dx * dx + dy * dy);
+        const double ax0 = a.x / sx, ay0 = a.y / sy;
+        const double dx = double(b.x) / sx - ax0, dy = double(b.y) / sy - ay0, len = std::sqrt(dx * dx + dy * dy);
         if (len == 0 || width <= 0)
             return;
         const double ux = dx / len, uy = dy / len, half = width / 2.0;
-        // the rows the rectangle's corners span, within the surface
-        const double nx = -uy * half, ny = ux * half;
-        const double ys[4] = {a.y + ny, a.y - ny, b.y + ny, b.y - ny};
-        const int py0 = int(std::max(std::floor(*std::min_element(ys, ys + 4)), double(y0)));
-        const int py1 = int(std::min(std::ceil(*std::max_element(ys, ys + 4)), double(cs.height) - 1));
+        // the sample rows the rectangle's corners span, within the surface
+        const double ny = ux * half;
+        const double ys[4] = {ay0 + ny, ay0 - ny, ay0 + dy + ny, ay0 + dy - ny};
+        const int py0 = int(std::max(std::floor(*std::min_element(ys, ys + 4) * sy), double(y0)));
+        const int py1 = int(std::min(std::ceil(*std::max_element(ys, ys + 4) * sy), double(cs.height) - 1));
         for (int y = py0; y <= py1; y++)
         {
-            // along = (px - a.x) ux + ry uy in [0, len), across = ry ux - (px - a.x) uy in [-half, half),
-            // px the pixel centre: each a range of px on this row (a pixel wider each side; the test
-            // below is exact)
-            const double ry = y + 0.5 - a.y;
+            // along = (px - a) ux + ry uy in [0, len), across = ry ux - (px - a) uy in [-half, half),
+            // px the sample's centre in pixels: each a range of px on this row (a sample wider each
+            // side; the test below is exact)
+            const double ry = (y + 0.5) / sy - ay0;
             double lo = -1e300, hi = 1e300;
-            auto range = [&](double k, double c, double from, double to) { // from <= k * (px - a.x) + c < to
+            auto range = [&](double k, double c, double from, double to) { // from <= k * (px - a) + c < to
                 if (k == 0)
                 {
                     if (c < from || c >= to)
@@ -1259,11 +1263,11 @@ struct Fragments
             range(-uy, ry * ux, -half, half);
             if (lo > hi)
                 continue;
-            const int xs = int(std::max(std::floor(a.x + lo - 0.5) - 1, double(x0)));
-            const int xe = int(std::min(std::ceil(a.x + hi - 0.5) + 1, double(cs.width) - 1));
+            const int xs = int(std::max(std::floor((ax0 + lo) * sx - 0.5) - 1, double(x0)));
+            const int xe = int(std::min(std::ceil((ax0 + hi) * sx - 0.5) + 1, double(cs.width) - 1));
             for (int x = xs; x <= xe; x++)
             {
-                const double rx = x + 0.5 - a.x;
+                const double rx = (x + 0.5) / sx - ax0;
                 const double along = rx * ux + ry * uy, across = ry * ux - rx * uy;
                 if (along < 0 || along >= len || across < -half || across >= half)
                     continue;
