@@ -169,3 +169,15 @@ retail game is to need it. Each item says how it is checked without the game.
   vertex positions to the 1/16 grid instead of truncating (Blend_surface 24 -> 9).
 - **05:20: the session's machine restarted** (the queued hourly check-ins arrived at once); the
   GPU path's full run and the FreeBSD VM were restarted; nothing committed was lost.
+
+- **4 (continued): vertex arithmetic, surfaces, YUV, blits** (1e223dc, eb52fcb, 465fb02, a62c3ea,
+  e769a54, 0d2809a). Vertex programs now compute as the NV2A does (products truncated, the adder's
+  28-bit window, anything times 0 is 0, colour outputs clamped per vertex; Vertex_shader_rounding
+  49 -> 59/62, Attrib_float 2 -> 8/12). Clears stay inside the surface clip (Surface_clip 36 -> 47/47
+  both renderers); G8B8 surfaces. YUY2/UYVY textures (games' video frames) and Y16 (Texture_format
+  46 -> 50/52, Texture_render_target 37 -> 41/42). Image blits clipped by a clip rectangle object
+  (Image_blit 34 -> 40/41). Software nearest filtering at texel edges as the GPU path's (Blend_surface
+  32/32 both renderers). FreeBSD VM tests pass (05:47); packages rebuilt 05:57.
+  Tried and reverted: DOT_STR_3D with a cube map as a cube lookup (the console shows something
+  else). Open: the combiner suite's background band (its drawing helper isn't in the suite's
+  source checkout here).
