@@ -124,3 +124,24 @@ retail game is to need it. Each item says how it is checked without the game.
   in the adapter's model blocks a program's start-up (124 adapter accesses, no fault unhandled).
   Halo's XNet is Microsoft's own stack; its next log lists the adapter's first 300 accesses
   ("nic:" lines) and the registers it reads most, if it waits on anything else.
+
+- **4 (continued): depth and lines as the console draws them** (68e13b0). The suite's depth tests
+  print the depth they read back, so the console's captures give exact values: integer depth is
+  truncated (0xff8691 where rounding gave 0xff8692); SET_CONTROL0's Z_PERSPECTIVE_ENABLE stores the
+  perspective-correct w in place of z (0xf5 for w 245.5) and **pbkit turns it on at start-up**
+  (0x00110001), so every pbkit program draws with it on the console; polygon offset (bias, factor
+  times the steepest slope) and the clip range's clamp or cull per pixel. Lines are rectangles
+  SET_LINE_WIDTH/8 pixels wide. The GPU path does the w-buffer and polygon offset in a second
+  fragment shader, used only by draws that need it. W_buffering 163 -> 233/265 (GPU 142 -> 202),
+  Line_width 24 -> 40/61. ClassiCube's world checked in both renderers.
+
+- **The GPU path leaked memory** (68e13b0): its pipelines were never freed; the blend suite grew it
+  by 85 MB a second until the kernel killed it (taking a quarter of the GPU run's suites with it).
+  Measured with gdb on the large allocations, then the cache's size; now bounded (128, the least
+  recently used destroyed after a submit), and memory levels off.
+
+- **GPU path: drawing in memory when the program sees the GPU idle; texel edges** (d11bbdb). A
+  PGRAPH_STATUS read with the push buffer drained writes the GPU's drawing back, so the CPU reading
+  a surface next has it; nearest filtering takes the texel after an edge as software does.
+  Material_color_source 0 -> 28/28, Lighting_range 0 -> 3/3, Lighting_accumulation 0 -> 9/10,
+  Specular 3 -> 18/22, Specular_back 0 -> 11/17, Blend_surface 6 -> 22/32 on the GPU path.
