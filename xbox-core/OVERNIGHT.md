@@ -23,7 +23,7 @@ retail game is to need it. Each item says how it is checked without the game.
    (Halo's log already shows class 0x39 method 0x180), PFIFO/PTIMER/PCRTC registers D3D reads.
 5. **Kernel exports audit:** every one of the 366 against Cxbx-Reloaded's semantics; the ones that
    are stubs or simplified get done properly, each with a kernel-test check.
-6. **XNet with no cable:** what the network stack does after the adapter (DHCP timeouts, timers);
+6. **(checked) XNet with no cable:** what the network stack does after the adapter (DHCP timeouts, timers);
    nothing must block a game's start-up.
 7. **Everything the logs can tell from a run with no frame:** a watchdog report that names the
    loop a thread spins in (the code around its eip, the device registers it reads).
@@ -118,3 +118,9 @@ retail game is to need it. Each item says how it is checked without the game.
   candidate rules (with/without factors, biased by 0.5 or two's complement) each gave 75/105, none
   right: left as it was, to finish with the test's exact colours.
 
+- **6, no cable.** nxdk's httpd sample (lwIP over its nvnet driver, which sets the adapter up as
+  Microsoft's does: MDIO, the PHY's link bits, the engine's idle bit, IRQ mask/status) runs to its
+  DHCP wait, gets no answer, gives up after its 10 s and prints 0.0.0.0 for its addresses: nothing
+  in the adapter's model blocks a program's start-up (124 adapter accesses, no fault unhandled).
+  Halo's XNet is Microsoft's own stack; its next log lists the adapter's first 300 accesses
+  ("nic:" lines) and the registers it reads most, if it waits on anything else.
