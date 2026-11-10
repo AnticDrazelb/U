@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <deque>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 
@@ -38,6 +39,65 @@ std::deque<u32> g_dpcs;
 u64 g_dpcs_queued = 0, g_dpcs_done = 0;
 std::atomic<u32> g_tick_count_variable{0};
 std::atomic<u64> g_vblanks{0};
+
+// The single processor's exclusion (see SetIrql). Owned by a guest thread, recursively; a wait longer
+// than kExclusionWait (a guest bug, or a wait the console would not have made at that level) goes on
+// without it, logged, instead of hanging.
+class Exclusion
+{
+public:
+    explicit Exclusion(const char* name) : name_(name) {}
+    void Acquire()
+    {
+        GuestThread* me = CurrentThread();
+        std::unique_lock lock(m_);
+        if (owner_ == me)
+        {
+            count_++;
+            return;
+        }
+        if (!cv_.wait_for(lock, kExclusionWait, [&] { return owner_ == nullptr; }))
+        {
+            if (timeouts_++ < 20)
+                Log("devices: %s held too long by another thread: going on without it", name_);
+            unowned_[me]++;
+            return;
+        }
+        owner_ = me;
+        count_ = 1;
+    }
+    void Release()
+    {
+        GuestThread* me = CurrentThread();
+        std::unique_lock lock(m_);
+        if (owner_ != me)
+        {
+            auto it = unowned_.find(me);
+            if (it != unowned_.end() && --it->second == 0)
+                unowned_.erase(it);
+            return;
+        }
+        if (--count_ == 0)
+        {
+            owner_ = nullptr;
+            lock.unlock();
+            cv_.notify_all();
+        }
+    }
+
+private:
+    static constexpr auto kExclusionWait = std::chrono::milliseconds(250);
+    const char* name_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    GuestThread* owner_ = nullptr;
+    u32 count_ = 0;
+    std::unordered_map<GuestThread*, u32> unowned_;
+    u32 timeouts_ = 0;
+};
+Exclusion g_dispatch_level("dispatch level"); // DPCs and threads at dispatch level
+Exclusion g_device_level("device level");     // interrupt service routines and what holds them off
+thread_local bool t_in_isr = false;            // in a service routine: its level is held already
 
 struct Display
 {
@@ -141,11 +201,11 @@ void RunDpcs(GuestThread* t)
             }
         } done;
         // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2), at dispatch level
-        Write<u8>(t->kpcr + kpcr::Irql, 2);
+        SetIrql(2);
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 1);
         CallGuest(t, Read<u32>(dpc + 12), {dpc, Read<u32>(dpc + 16), Read<u32>(dpc + 20), Read<u32>(dpc + 24)});
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 0);
-        Write<u8>(t->kpcr + kpcr::Irql, 0);
+        SetIrql(0);
     }
 }
 
@@ -173,9 +233,14 @@ void RunInterrupts(GuestThread* t)
                     continue;
                 g_isr_running = i;
             }
+            // above dispatch level: not held off by threads at dispatch level, as on the console
+            g_device_level.Acquire();
+            t_in_isr = true;
             Write<u8>(t->kpcr + kpcr::Irql, u8(std::max<u32>(3, Read<u8>(i + 0xc))));
             CallGuest(t, Read<u32>(i), {i, Read<u32>(i + 4)});
             Write<u8>(t->kpcr + kpcr::Irql, 0);
+            t_in_isr = false;
+            g_device_level.Release();
             {
                 std::lock_guard lock(g_irq_mutex);
                 g_isr_running = 0;
@@ -187,6 +252,33 @@ void RunInterrupts(GuestThread* t)
 }
 
 } // namespace
+
+void SetIrql(u8 irql)
+{
+    GuestThread* t = CurrentThread();
+    const u8 old = Read<u8>(t->kpcr + kpcr::Irql);
+    if (!t_in_isr)
+    {
+        if (old < 2 && irql >= 2)
+            g_dispatch_level.Acquire();
+        if (old < 3 && irql >= 3)
+            g_device_level.Acquire();
+        if (old >= 3 && irql < 3)
+            g_device_level.Release();
+        if (old >= 2 && irql < 2)
+            g_dispatch_level.Release();
+    }
+    Write<u8>(t->kpcr + kpcr::Irql, irql);
+}
+
+u32 SynchronizeWithInterrupt(u32 kinterrupt, u32 routine, u32 context)
+{
+    const u8 old = Read<u8>(CurrentThread()->kpcr + kpcr::Irql);
+    SetIrql(u8(std::max<u32>({3u, old, Read<u8>(kinterrupt + 0xc)})));
+    const u32 r = u32(CallGuestNested(routine, {context}));
+    SetIrql(old);
+    return r;
+}
 
 void AddDevice(const Device& d)
 {

@@ -863,12 +863,12 @@ void RunPendingDpcs()
         }
         Write<u8>(d + 2, 0);
         const u8 irql = Read<u8>(kpcr + kpcr::Irql);
-        Write<u8>(kpcr + kpcr::Irql, 2);
+        SetIrql(2);
         Write<u32>(kpcr + kpcr::DpcRoutineActive, 1);
         // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2)
         CallGuestNested(Read<u32>(d + 12), {d, Read<u32>(d + 16), Read<u32>(d + 20), Read<u32>(d + 24)});
         Write<u32>(kpcr + kpcr::DpcRoutineActive, 0);
-        Write<u8>(kpcr + kpcr::Irql, irql);
+        SetIrql(irql);
     }
     Write<u32>(kpcr + kpcr::DpcInterruptRequested, 0);
 }
@@ -2113,28 +2113,27 @@ void InitKernel()
     {
         const u32 kpcr = CurrentThread()->kpcr;
         const u8 old = Read<u8>(kpcr + kpcr::Irql);
-        Write<u8>(kpcr + kpcr::Irql, u8(c.Arg(0)));
+        SetIrql(u8(c.Arg(0)));
         return old;
     } END;
     K(KeRaiseIrqlToDpcLevel)
     {
         const u32 kpcr = CurrentThread()->kpcr;
         const u8 old = Read<u8>(kpcr + kpcr::Irql);
-        Write<u8>(kpcr + kpcr::Irql, 2);
+        SetIrql(2);
         return old;
     } END;
     K(KeRaiseIrqlToSynchLevel)
     {
         const u32 kpcr = CurrentThread()->kpcr;
         const u8 old = Read<u8>(kpcr + kpcr::Irql);
-        Write<u8>(kpcr + kpcr::Irql, 0x1c);
+        SetIrql(0x1c);
         return old;
     } END;
     K(KfLowerIrql) // fastcall: the new level; pending DPCs run below dispatch level
     {
-        const u32 kpcr = CurrentThread()->kpcr;
-        Write<u8>(kpcr + kpcr::Irql, u8(c.Arg(0)));
-        if (c.Arg(0) < 2)
+        SetIrql(u8(c.Arg(0)));
+        if (u8(c.Arg(0)) < 2)
             RunPendingDpcs();
         return 0;
     } END;
@@ -2147,7 +2146,7 @@ void InitKernel()
     } END;
     K(KeSynchronizeExecution) // interrupt, routine, context: the routine's result
     {
-        return u32(CallGuestNested(c.Arg(1), {c.Arg(2)}));
+        return SynchronizeWithInterrupt(c.Arg(0), c.Arg(1), c.Arg(2));
     } END;
     K(RtlMapGenericMask) // access mask*, GENERIC_MAPPING* { read, write, execute, all }
     {

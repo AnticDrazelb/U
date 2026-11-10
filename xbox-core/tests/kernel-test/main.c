@@ -334,6 +334,27 @@ int main(void)
     DbgPrint("  periodic timer: %d DPCs\n", (int)dpc_count);
     check("KeSetTimerEx periodic DPCs", dpc_count >= 4 && dpc_count <= 6);
 
+    // one processor: a thread at dispatch level holds DPCs off until it lowers its level
+    {
+        due.QuadPart = ms(20);
+        KeSetTimerEx(&timer, due, 20, &dpc);
+        wait.QuadPart = ms(60);
+        KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        const KIRQL old = KeRaiseIrqlToDpcLevel();
+        const LONG at_raise = dpc_count;
+        const ULONG start2 = KeTickCount;
+        while (KeTickCount - start2 < 150)
+            ;
+        const LONG at_lower = dpc_count;
+        KfLowerIrql(old);
+        wait.QuadPart = ms(60);
+        KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        KeCancelTimer(&timer);
+        DbgPrint("  DPCs at dispatch level: %d, after: %d\n", (int)(at_lower - at_raise), (int)(dpc_count - at_lower));
+        check("no DPC runs while a thread is at dispatch level", at_lower == at_raise);
+        check("DPCs run once it lowers", dpc_count > at_lower);
+    }
+
     // a user APC, run by an alertable wait
     NtQueueApcThread(NtCurrentThread(), apc_routine, (PVOID)0x1234, NULL, NULL);
     check("APC not run before an alertable wait", apc_count == 0);

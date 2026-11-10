@@ -234,6 +234,12 @@ bool DeviceWrite(u32 address, u32 size, u32 value, u32 eip = 0);
 // Interrupts: the vblank thread calls the connected service routines.
 void ConnectInterrupt(u32 vector, u32 kinterrupt);
 void DisconnectInterrupt(u32 kinterrupt);
+// The current thread's IRQL, with the Xbox's single processor's exclusion: at dispatch level (2) and
+// above no DPC runs (nor does another thread at dispatch level), above it (a device's level) no
+// interrupt service routine runs either. Every IRQL change goes through here.
+void SetIrql(u8 irql);
+// KeSynchronizeExecution: the routine with the interrupt's service routine held off
+u32 SynchronizeWithInterrupt(u32 kinterrupt, u32 routine, u32 context);
 // The picture the guest shows: where it is and how to read it.
 struct DisplayInfo
 {
