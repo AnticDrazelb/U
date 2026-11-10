@@ -96,8 +96,7 @@ six round-robin values; EXP2 fogs infinite distances fully; SPECULAR_ENABLE off 
 specular into the diffuse; alpha kill and the colour key; textures with their own border texels;
 YUY2/UYVY/Y16; surfaces without alpha read alpha 1, X1A7R8G8B8's 7-bit alpha; clears stay in the
 surface clip; image blits honour a clip rectangle object. Open: bump mapping's sign/filter rule,
-the signed blend equations, the shadow comparator's raw values, Front_face's fill-mode quads (their
-vertices have w 0 and infinity: W_param's territory), ZMIN_MAX_CONTROL across two passes (Depth_Clamp's depth_equal).
+the signed blend equations, the shadow comparator's raw values, ZMIN_MAX_CONTROL across two passes (Depth_Clamp's depth_equal).
 Run it a second time as `XB_TEST_FS_AS_PS4=1 tests/regression.sh`: the fault handler then behaves as
 the PS4's (the system reports the fs base as 0; the handler runs with fs on an unmapped page until it
 sets the host's from the KPCR the finder gives), so anything fs-relative in the handler's path (a
