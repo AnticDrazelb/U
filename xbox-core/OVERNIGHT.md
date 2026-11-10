@@ -145,3 +145,15 @@ retail game is to need it. Each item says how it is checked without the game.
   a surface next has it; nearest filtering takes the texel after an edge as software does.
   Material_color_source 0 -> 28/28, Lighting_range 0 -> 3/3, Lighting_accumulation 0 -> 9/10,
   Specular 3 -> 18/22, Specular_back 0 -> 11/17, Blend_surface 6 -> 22/32 on the GPU path.
+
+- **4 (continued): lighting, fog, lines with antialiasing** (3aa0d6a, c48629a, 7046753, b0fde41).
+  Lighting: with SET_SPECULAR_ENABLE off the lit specular still goes into the diffuse (SEPARATE_
+  SPECULAR ignored); a vertex program's oD1/oB1 get the same specular-enable and alpha rules
+  (Lighting_control 13 -> 27/32). Fog: EXP2 fogs infinite/NaN distances fully; oFog is the x of
+  what's written whatever the mask; an unwritten oFog carries one of six round-robin values
+  (Fog_coord_vec4 23 -> 41/41, Fog_carryover 1 -> 13/14, Fog_exceptional_value 56 -> 68/96). Lines:
+  an end near infinity looped the rectangle code for good (a hung job in a full run): rows now
+  clamped and solved; with a supersampled surface the rectangle is in the picture's pixels.
+  Full software run: 2307 -> 2425 of 3110 (78.0%) before the fog and antialiasing fixes (about
+  +45 more). Open: the shadow comparator's raw-value tests (the console compares in units these
+  tests don't make plain), bump mapping, the signed blend equations.
