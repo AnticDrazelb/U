@@ -1193,8 +1193,12 @@ bool Clear(u32 flags)
     u32 ax, ay;
     AntiAliasing(ax, ay);
     const u32 h = k.Get(0x1d98), v = k.Get(0x1d9c);
-    const u32 x0 = (h & 0xffff) * ax, x1 = std::min(((h >> 16) + 1) * ax, cs.width);
-    const u32 y0 = (v & 0xffff) * ay, y1 = std::min(((v >> 16) + 1) * ay, cs.height);
+    // within the surface clip, as the software path's clear (render.cpp)
+    const u32 cx = k.Get(0x200), cy = k.Get(0x204);
+    const u32 x0 = std::max((h & 0xffff) * ax, (cx & 0xffff) * ax);
+    const u32 x1 = std::min({((h >> 16) + 1) * ax, ((cx & 0xffff) + (cx >> 16)) * ax, cs.width});
+    const u32 y0 = std::max((v & 0xffff) * ay, (cy & 0xffff) * ay);
+    const u32 y1 = std::min({((v >> 16) + 1) * ay, ((cy & 0xffff) + (cy >> 16)) * ay, cs.height});
     if (x1 <= x0 || y1 <= y0)
         return true;
     BeginRendering(color, zbuf);
@@ -1202,7 +1206,8 @@ bool Clear(u32 flags)
     u32 n = 0;
     if (color_part)
     {
-        const u32 c = FixedBits(cs.format, k.Get(0x1d90));
+        // (X1A7R8G8B8: the 8-bit alpha as given; writing back packs its 7 bits and the X bit)
+        const u32 c = cs.format == 0x6 || cs.format == 0x7 ? k.Get(0x1d90) : FixedBits(cs.format, k.Get(0x1d90));
         att[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         att[n].clearValue.color = {{((c >> 16) & 255) / 255.f, ((c >> 8) & 255) / 255.f, (c & 255) / 255.f, (c >> 24) / 255.f}};
         n++;

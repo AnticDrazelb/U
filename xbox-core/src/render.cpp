@@ -120,6 +120,11 @@ void WritePixel(const Surface& s, u32 x, u32 y, u32 argb, u32 mask)
     }
     else if (s.format == 0x3) // R5G6B5
         Write<u16>(p, u16(((argb >> 8) & 0xf800) | ((argb >> 5) & 0x07e0) | ((argb >> 3) & 0x001f)));
+    else if (s.format == 0xa) // G8B8: green high, blue low
+    {
+        const u16 old = Read<u16>(p), m = u16(((mask >> 8) & 0xff00) | (mask & 0xff));
+        Write<u16>(p, u16((old & ~m) | ((((argb >> 8) & 0xff) << 8 | (argb & 0xff)) & m)));
+    }
     else if (s.bytes == 2)
         Write<u16>(p, u16(FixedBits(s.format, ((argb >> 9) & 0x7c00) | ((argb >> 6) & 0x03e0) | ((argb >> 3) & 0x001f))));
     else
@@ -143,6 +148,11 @@ u32 ReadPixel(const Surface& s, u32 x, u32 y)
         }
         return v;
     }
+    if (s.format == 0xa) // G8B8
+    {
+        const u16 v = Read<u16>(p);
+        return 0xff000000u | u32(v >> 8) << 8 | u32(v & 0xff);
+    }
     if (s.format == 0x3)
     {
         const u16 v = Read<u16>(p);
@@ -164,7 +174,14 @@ void Clear(u32 flags)
     const u32 h = k.Get(0x1d98), v = k.Get(0x1d9c);
     u32 ax, ay;
     AntiAliasing(ax, ay);
-    const u32 x0 = (h & 0xffff) * ax, x1 = ((h >> 16) + 1) * ax - 1, y0 = (v & 0xffff) * ay, y1 = ((v >> 16) + 1) * ay - 1;
+    // the clear's rectangle, within the surface clip (SET_SURFACE_CLIP_HORIZONTAL/VERTICAL: nothing
+    // outside it is touched, as nxdk_pgraph_tests' Surface_clip captures show)
+    const u32 cx = k.Get(0x200), cy = k.Get(0x204);
+    const u32 x0 = std::max((h & 0xffff) * ax, (cx & 0xffff) * ax), y0 = std::max((v & 0xffff) * ay, (cy & 0xffff) * ay);
+    const u32 x1 = std::min(((h >> 16) + 1) * ax, ((cx & 0xffff) + (cx >> 16)) * ax) - 1;
+    const u32 y1 = std::min(((v >> 16) + 1) * ay, ((cy & 0xffff) + (cy >> 16)) * ay) - 1;
+    if (int(x1) < int(x0) || int(y1) < int(y0))
+        return;
     if (g_verbose >= 2)
     {
         const Surface s = ColorSurface();
@@ -186,7 +203,12 @@ void Clear(u32 flags)
             const int parts = rows * (x1 - x0 + 1) > 16384 ? RasterThreads() : 1;
             // a 16-bit surface takes the clear value's low half as it is (its own R, G, B fields)
             u16 mask16 = 0;
-            if (s.bytes == 2)
+            if (s.format == 0xa) // G8B8: green the high byte, blue the low
+            {
+                if (flags & 0x20) mask16 |= 0xff00;
+                if (flags & 0x40) mask16 |= 0x00ff;
+            }
+            else if (s.bytes == 2)
             {
                 const bool r565 = s.format == 0x3;
                 if (flags & 0x10) mask16 |= r565 ? 0xf800 : 0x7c00;
