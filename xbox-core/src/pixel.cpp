@@ -445,8 +445,10 @@ V4 SampleLevel(const Texture& t, float u, float v, bool linear)
             return Unpack(t.border);
         return Texel(t, u32(ax), u32(ay));
     };
+    // nearest: a pixel exactly on a texel's edge takes the texel after it; the interpolated coordinate
+    // can come out a hair under the edge, so it's moved on by 1/256 of a texel (as the GPU path does)
     if (!linear)
-        return fetch(int(std::floor(u)), int(std::floor(v)));
+        return fetch(int(std::floor(u + 1.f / 256.f)), int(std::floor(v + 1.f / 256.f)));
     // bilinear
     const float fu = u - 0.5f, fv = v - 0.5f;
     const int x0 = int(std::floor(fu)), y0 = int(std::floor(fv));
