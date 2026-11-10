@@ -126,11 +126,16 @@ xcs_fault64:
     call *slot_fs_host(%rip) // on the guest's stack, below its esp: a few bytes
     mov 0x310(%r12), %rsp   // the emulator's stack
     and $-16, %rsp
+    // the guest's x87, MMX and SSE state, as the fault left it: the emulator's code may use any of
+    // them (the guest's compiler kept values there across the faulting instruction)
+    sub $512, %rsp
+    fxsave64 (%rsp)
     mov %r12, %rdi
     call *slot_fault(%rip)
     mov %eax, %r13d
     mov %r12, %rdi
     call *slot_fs_guest(%rip)
+    fxrstor64 (%rsp)
     test %r13d, %r13d
     jnz 8f
     // back into the guest: eflags, eip and its code selector below its esp, the registers from the
@@ -189,11 +194,17 @@ gate64:
     call *slot_fs_host(%rip)
     mov 0x310(%r12), %rsp
     and $-16, %rsp
+    // the guest's x87, MMX and SSE state kept across the handler: a backpatched device access comes
+    // through here from the middle of guest code, and the x87 and SSE control words are kept across
+    // any call
+    sub $512, %rsp
+    fxsave64 (%rsp)
     mov %r13, %rdi
     mov %r12, %rsi
     call *slot_handler(%rip)
     mov %r12, %rdi
     call *slot_fs_guest(%rip)
+    fxrstor64 (%rsp)
     mov %r13, %rsp
     pop %rdi
     pop %rsi

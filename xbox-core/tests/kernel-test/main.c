@@ -15,6 +15,33 @@ static void check(const char *what, int ok)
         failures++;
 }
 
+// A device register read (USB 1's revision) between loading xmm0-7 and an x87 value and storing them
+// back: the guest's floating-point state as it was, whether the read faults or (once patched) goes
+// through the kernel-call gate.
+static int fp_kept_across_device_read(void)
+{
+    static float in[32] __attribute__((aligned(16))), out[32] __attribute__((aligned(16)));
+    static double x87_out;
+    for (int i = 0; i < 32; i++)
+        in[i] = 1.5f * (float)i + 0.25f, out[i] = 0;
+    volatile ULONG *reg = (volatile ULONG *)0xfed08000;
+    __asm__ volatile(
+        "movaps 0(%0), %%xmm0\n movaps 16(%0), %%xmm1\n movaps 32(%0), %%xmm2\n movaps 48(%0), %%xmm3\n"
+        "movaps 64(%0), %%xmm4\n movaps 80(%0), %%xmm5\n movaps 96(%0), %%xmm6\n movaps 112(%0), %%xmm7\n"
+        "fldpi\n"
+        "mov (%2), %%eax\n"
+        "fstpl (%3)\n"
+        "movaps %%xmm0, 0(%1)\n movaps %%xmm1, 16(%1)\n movaps %%xmm2, 32(%1)\n movaps %%xmm3, 48(%1)\n"
+        "movaps %%xmm4, 64(%1)\n movaps %%xmm5, 80(%1)\n movaps %%xmm6, 96(%1)\n movaps %%xmm7, 112(%1)\n"
+        :
+        : "r"(in), "r"(out), "r"(reg), "r"(&x87_out)
+        : "eax", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "memory", "st");
+    for (int i = 0; i < 32; i++)
+        if (out[i] != in[i])
+            return 0;
+    return x87_out > 3.14159 && x87_out < 3.1416;
+}
+
 static int apc_calls;
 static DWORD apc_error, apc_bytes;
 static VOID WINAPI on_read_done(DWORD error, DWORD bytes, LPOVERLAPPED overlapped)
@@ -123,6 +150,12 @@ int main(void)
         check("USB 1: reset", (usb1[0x04 / 4] & ~0x100u) == 0xc0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
                                   usb1[0x34 / 4] == 0x27782edf && usb1[0x44 / 4] == 0x628);
         check("USB 1: nothing plugged in", (usb1[0x54 / 4] & 1) == 0 && (usb1[0x5c / 4] & 1) == 0);
+        {
+            int kept = 1;
+            for (int i = 0; i < 40; i++) // the first reads fault; then the site is patched
+                kept &= fp_kept_across_device_read();
+            check("x87 and SSE registers kept across device register reads", kept);
+        }
         // the AC'97's global status: the primary codec ready, its status bits read-only, the rest kept
         {
             volatile ULONG *glob_sta = (volatile ULONG *)0xfec00130;
