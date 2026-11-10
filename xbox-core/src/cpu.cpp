@@ -116,7 +116,7 @@ size_t ModrmExtra(const u8* p)
 // Emulates one instruction at `code` that accessed device memory at `address`. Returns its length.
 // With `memory`, the access is to ordinary guest memory (a backpatched instruction that met RAM).
 bool IsDeviceAddress(u32 a);
-size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = false)
+size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = false, u32 eip = 0)
 {
     const u8* p = code;
     u32 size = 4;
@@ -137,7 +137,7 @@ size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = f
         u32 v = 0;
         if (memory)
             std::memcpy(&v, Ptr(address), bytes);
-        else if (!DeviceRead(address, bytes, v))
+        else if (!DeviceRead(address, bytes, v, eip))
             v = 0;
         return v;
     };
@@ -145,7 +145,7 @@ size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = f
         if (memory)
             std::memcpy(Ptr(address), &v, bytes);
         else
-            DeviceWrite(address, bytes, v);
+            DeviceWrite(address, bytes, v, eip);
     };
     auto reg_of = [&](const u8* m) { return (m[0] >> 3) & 7; };
     auto end = [&](const u8* m, size_t imm) { return size_t(m + 1 + ModrmExtra(m) + imm - code); };
@@ -186,14 +186,14 @@ size_t EmulateDeviceAccess(const u8* code, u32 address, Regs& r, bool memory = f
         auto rd = [&](u32 a) {
             u32 v = 0;
             if (IsDeviceAddress(a))
-                DeviceRead(a, bytes, v);
+                DeviceRead(a, bytes, v, eip);
             else
                 std::memcpy(&v, Ptr(a), bytes);
             return v;
         };
         auto wr = [&](u32 a, u32 v) {
             if (IsDeviceAddress(a))
-                DeviceWrite(a, bytes, v);
+                DeviceWrite(a, bytes, v, eip);
             else
                 std::memcpy(Ptr(a), &v, bytes);
         };
@@ -920,7 +920,7 @@ int HandleGuestFault(platform::Fault& f)
     }
     const bool device = f.signal == 11 && IsDeviceAddress(f.address);
     if (device)
-        length = EmulateDeviceAccess(code, f.address, r);
+        length = EmulateDeviceAccess(code, f.address, r, false, u32(rip));
     if (device && length)
     {
         record("a hardware register, emulated");
@@ -1112,7 +1112,7 @@ void BackpatchedAccess(GateFrame* frame)
     // (about 1 us), and drivers wait by counting reads, which mustn't run out before the device changes
     static const double min_us = std::getenv("XB_ACCESS_US") ? std::atof(std::getenv("XB_ACCESS_US")) : 1.0;
     const auto start = std::chrono::steady_clock::now();
-    EmulateDeviceAccess(ps.code, ea, r, !IsDeviceAddress(ea));
+    EmulateDeviceAccess(ps.code, ea, r, !IsDeviceAddress(ea), ps.eip);
     if (IsDeviceAddress(ea))
         while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() < min_us)
             __builtin_ia32_pause();

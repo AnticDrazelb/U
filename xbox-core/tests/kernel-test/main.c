@@ -121,6 +121,16 @@ int main(void)
         check("USB 1: reset", usb1[0x04 / 4] == 0 && (usb1[0x08 / 4] & 1) == 0 && usb1[0x18 / 4] == 0 &&
                                   usb1[0x34 / 4] == 0x27782edf && usb1[0x44 / 4] == 0x628);
         check("USB 1: nothing plugged in", (usb1[0x54 / 4] & 1) == 0 && (usb1[0x5c / 4] & 1) == 0);
+        // the AC'97's global status: the primary codec ready, its status bits read-only, the rest kept
+        {
+            volatile ULONG *glob_sta = (volatile ULONG *)0xfec00130;
+            const ULONG before = *glob_sta;
+            *glob_sta = 0x000300fe;
+            const ULONG after = *glob_sta;
+            *glob_sta = 0;
+            check("AC97: the global status", (before & 0x100) && (before & 0xe0) == 0 &&
+                                                 after == (0x30000 | 0x100) && *glob_sta == 0x100);
+        }
         // string copies to and from device memory (DirectSound copies the GP DSP's memory with rep
         // movsd): rep stosd in, rep movsd out, then a backwards rep movsd in from RAM
         {

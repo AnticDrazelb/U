@@ -221,8 +221,8 @@ void WakeAll();
 
 void InitDevices();
 // An access to device memory, from the fault handler: returns false if not emulated.
-bool DeviceRead(u32 address, u32 size, u32& value);
-bool DeviceWrite(u32 address, u32 size, u32 value);
+bool DeviceRead(u32 address, u32 size, u32& value, u32 eip = 0); // eip: the guest instruction, for the reports
+bool DeviceWrite(u32 address, u32 size, u32 value, u32 eip = 0);
 // Interrupts: the vblank thread calls the connected service routines.
 void ConnectInterrupt(u32 vector, u32 kinterrupt);
 void DisconnectInterrupt(u32 kinterrupt);

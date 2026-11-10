@@ -233,22 +233,22 @@ struct DeviceRegister
 {
     std::atomic<u32> address{0};
     std::atomic<u64> reads{0}, writes{0};
-    std::atomic<u32> last{0};
+    std::atomic<u32> last{0}, eip{0};
 };
-constexpr u32 kDeviceRegisters = 1024, kDeviceRing = 64;
+constexpr u32 kDeviceRegisters = 16384, kDeviceRing = 64;
 DeviceRegister g_device_registers[kDeviceRegisters];
 struct DeviceRecord
 {
     float at;
-    u32 address, value;
+    u32 address, value, eip;
     u8 size, write;
 };
 DeviceRecord g_device_ring[kDeviceRing];
 std::atomic<u32> g_device_next{0};
 
-void DeviceAccess(u32 address, u32 size, u32 value, bool write)
+void DeviceAccess(u32 address, u32 size, u32 value, bool write, u32 eip)
 {
-    for (u32 i = 0, h = (address * 2654435761u) % kDeviceRegisters; i < 16; i++, h = (h + 1) % kDeviceRegisters)
+    for (u32 i = 0, h = (address * 2654435761u) % kDeviceRegisters; i < 64; i++, h = (h + 1) % kDeviceRegisters)
     {
         DeviceRegister& r = g_device_registers[h];
         u32 cur = r.address.load(std::memory_order_relaxed);
@@ -258,12 +258,13 @@ void DeviceAccess(u32 address, u32 size, u32 value, bool write)
         {
             (write ? r.writes : r.reads).fetch_add(1, std::memory_order_relaxed);
             r.last.store(value, std::memory_order_relaxed);
+            r.eip.store(eip, std::memory_order_relaxed);
             break;
         }
     }
     DeviceRecord& d = g_device_ring[g_device_next.fetch_add(1) % kDeviceRing];
     d.at = TscSeconds(Tsc());
-    d.address = address, d.value = value, d.size = u8(size), d.write = write;
+    d.address = address, d.value = value, d.eip = eip, d.size = u8(size), d.write = write;
 }
 
 void Method(u32 cls, u32 method, u32 parameter)
@@ -359,7 +360,8 @@ void WriteState(Out fd)
     }
     {
         // the device registers read most (a program waiting on hardware polls one), and the latest accesses
-        u32 order[kDeviceRegisters], used = 0;
+        static u32 order[kDeviceRegisters];
+        u32 used = 0;
         for (u32 i = 0; i < kDeviceRegisters; i++)
             if (g_device_registers[i].address.load())
                 order[used++] = i;
@@ -370,15 +372,17 @@ void WriteState(Out fd)
         for (u32 k = 0; k < used && k < 16; k++)
         {
             const DeviceRegister& r = g_device_registers[order[k]];
-            Put(fd, "    %10llu reads %8llu writes  %#010x (%s)  last %#x\n", (unsigned long long)r.reads.load(),
-                (unsigned long long)r.writes.load(), r.address.load(), DeviceName(r.address.load()), r.last.load());
+            Put(fd, "    %10llu reads %8llu writes  %#010x (%s)  last %#x, by eip %#x\n", (unsigned long long)r.reads.load(),
+                (unsigned long long)r.writes.load(), r.address.load(), DeviceName(r.address.load()), r.last.load(),
+                r.eip.load());
         }
         const u32 dn = g_device_next.load(), dshown = std::min(dn, kDeviceRing);
-        Put(fd, "the latest %u device register accesses (time, read/write, address, size, value):\n", dshown);
+        Put(fd, "the latest %u device register accesses (time, read/write, address, size, value, eip):\n", dshown);
         for (u32 k = 0; k < dshown; k++)
         {
             const DeviceRecord& r = g_device_ring[(dn - dshown + k) % kDeviceRing];
-            Put(fd, "    %9.3f %s %#010x/%u %#x\n", double(r.at), r.write ? "write" : "read ", r.address, r.size, r.value);
+            Put(fd, "    %9.3f %s %#010x/%u %#x  eip %#x\n", double(r.at), r.write ? "write" : "read ", r.address, r.size,
+                r.value, r.eip);
         }
     }
     const u32 fn = g_fault_next.load();

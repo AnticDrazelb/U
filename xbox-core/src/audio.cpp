@@ -146,7 +146,20 @@ u32 ReadReg(u32 offset, u32 size)
 {
     std::lock_guard lock(g_m);
     if (offset == kGlobalStatus)
-        return D(kGlobalStatus) | 0x100; // the primary codec is ready
+    {
+        // the primary codec is ready (bit 8), and each box's interrupt as its own bit: PCM in 5,
+        // PCM out 6 (a driver waiting on its buffers polls these)
+        u32 v = D(kGlobalStatus) | 0x100;
+        for (u32 i = 0; i < 2; i++)
+        {
+            const u32 box = kBoxes[i];
+            const u16 sr = W(box + 6);
+            const u8 cr = B(box + 0xb);
+            if (((sr & SR_BCIS) && (cr & CR_IOCE)) || ((sr & SR_LVBCI) && (cr & CR_LVBIE)))
+                v |= i == 0 ? 0x20 : 0x40;
+        }
+        return v;
+    }
     if (offset < 0x100 && size == 2 && offset == 0x26)
         return 0x000f; // the codec's powerdown status: everything ready
     u32 v = 0;
@@ -188,6 +201,15 @@ void WriteReg(u32 offset, u32 size, u32 value)
             }
             return;
         }
+    }
+    if (offset == kGlobalStatus && size == 4)
+    {
+        // RCS, the resume bits and GSCI are cleared by writing 1; the status bits are read-only
+        constexpr u32 kWriteClear = 0x8000 | 0x800 | 0x400 | 1, kReadOnly = 0x7000 | 0x300 | 0xfe;
+        constexpr u32 kWritable = 0x3ffff & ~(kWriteClear | kReadOnly);
+        const u32 v = (D(kGlobalStatus) & ~(value & kWriteClear) & ~kWritable) | (value & kWritable);
+        std::memcpy(&g_regs[offset], &v, 4);
+        return;
     }
     std::memcpy(&g_regs[offset], &value, std::min<u32>(size, kSize - offset));
 }

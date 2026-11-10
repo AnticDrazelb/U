@@ -34,7 +34,7 @@ void RecordFault(u32 thread, int signal, u32 eip, u32 address, const u8* code, c
 void Method(u32 cls, u32 method, u32 parameter);
 // a device register access (devices.cpp): counted per register and kept in a ring, so a report
 // shows what a program polls when it waits on hardware (lock-free)
-void DeviceAccess(u32 address, u32 size, u32 value, bool write);
+void DeviceAccess(u32 address, u32 size, u32 value, bool write, u32 eip = 0);
 // a guest thread, kept for the reports (never freed, so a crash report can read them)
 void RegisterThread(GuestThread* t);
 GuestThread* ThreadByStack(u32 esp); // the guest thread whose stack holds esp (lock-free: the fault handler's)

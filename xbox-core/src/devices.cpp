@@ -250,7 +250,7 @@ const char* DeviceName(u32 address)
     return d ? d->name : "no device";
 }
 
-bool DeviceRead(u32 address, u32 size, u32& value)
+bool DeviceRead(u32 address, u32 size, u32& value, u32 eip)
 {
     value = 0;
     if (const Device* d = Find(address))
@@ -261,17 +261,17 @@ bool DeviceRead(u32 address, u32 size, u32& value)
         std::snprintf(what, sizeof(what), "read at %#x", address & ~0xfffu);
         diag::Note("device register (no device)", what);
     }
-    diag::DeviceAccess(address, size, value, false);
+    diag::DeviceAccess(address, size, value, false, eip);
     if (g_verbose >= 3)
         Log("dev read  %#010x/%u = %#x", address, size, value);
     return true; // what nothing answers reads as 0
 }
 
-bool DeviceWrite(u32 address, u32 size, u32 value)
+bool DeviceWrite(u32 address, u32 size, u32 value, u32 eip)
 {
     if (g_verbose >= 3)
         Log("dev write %#010x/%u = %#x", address, size, value);
-    diag::DeviceAccess(address, size, value, true);
+    diag::DeviceAccess(address, size, value, true, eip);
     if (const Device* d = Find(address))
         d->write(address - d->base, size, value);
     else
