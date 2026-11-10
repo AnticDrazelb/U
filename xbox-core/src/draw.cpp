@@ -434,9 +434,10 @@ void FixedFunction(const Vec4 in[16], Vec4 out[16])
             }
         }
     }
-    // without SEPARATE_SPECULAR the lit specular goes into the diffuse colour (even with the specular
-    // output off) and the vertex's specular passes through
-    if (!separate_specular && lighting)
+    // without SEPARATE_SPECULAR the lit specular goes into the diffuse colour and the vertex's specular
+    // passes through; with SET_SPECULAR_ENABLE off SEPARATE_SPECULAR is ignored: the lit specular goes
+    // into the diffuse all the same (the console's captures, Lighting_control's NoSpec tests)
+    if ((!separate_specular || !specular_enable) && lighting)
         for (int c = 0; c < 3; c++)
             d0[c] += d1[c];
     if (!specular_enable)
@@ -533,7 +534,16 @@ void EmitVertex(const Vec4 in[16])
 {
     Vertex v;
     if ((g_kelvin.Get(0x1e94) & 3) == 2) // SET_TRANSFORM_EXECUTION_MODE: a program
+    {
         RunProgram(in, v.o);
+        // the specular outputs (oD1, oB1) as SET_SPECULAR_ENABLE and SET_LIGHT_CONTROL take them, as
+        // for the fixed function's: off, black and opaque; on, opaque unless bit 17 (alpha from the
+        // specular) is set (the console's captures, Lighting_control's VS tests)
+        if (!g_kelvin.Get(0x3b8))
+            v.o[4] = v.o[8] = Vec4{{0, 0, 0, 1}};
+        else if (!(g_kelvin.Get(0x294) & (1u << 17)))
+            v.o[4][3] = v.o[8][3] = 1;
+    }
     else
         FixedFunction(in, v.o);
     FogFactor(v.o);
