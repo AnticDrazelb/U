@@ -45,3 +45,14 @@ neither fast enough on the PS4 nor available.
 - One job of the comparison ended silently once (in Vertex_shader_swizzle_tests, which passes 29/29
   alone): not reproduced; watch for it.
 
+
+## Verified before shipping (2026-11-10, commit 6ab6dee)
+- Regression 13/13 normally, with XB_TEST_FS_AS_PS4=1, and with XB_USB=own / XB_NV2A=own.
+- FreeBSD VM (the PS4's OS family): kernel, SEH and disc tests 0 failures, triangle runs; built
+  with xemu's APU, NIC and USB (its build has no Vulkan: xbox-core's NV2A there).
+- nxdk_pgraph_tests on xemu's NV2A: about 81.9% of the console's captures (xbox-core's 84.0%).
+- All three PS4 packages build; the 1 GiB GPU one has xemu's NV2A (default, Settings > Graphics to
+  switch), the others xbox-core's NV2A with xemu's APU, NIC and USB.
+- Not testable here: xemu's renderer on the PS4's RADV and its memory there (on lavapipe it uses about
+  240 MiB more than xbox-core's GPU path); a start that dies inside its start-up is followed by one
+  with xbox-core's NV2A.
