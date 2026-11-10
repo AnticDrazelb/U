@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "texture.h"
+void xb_xemu_log(const char *fmt, ...);
 #include "util.h"
 
 const BasicColorFormatInfo kelvin_color_format_info_map[66] = {
@@ -403,4 +404,20 @@ uint8_t *pgraph_convert_texture_data(const TextureShape s, const uint8_t *data,
         *converted_size = size;
     }
     return converted_data;
+}
+
+/* xbox-core: whether xemu implements a texture format; the first use of one it doesn't is logged */
+bool xb_texture_format_supported(unsigned int color_format)
+{
+    static uint8_t told[ARRAY_SIZE(kelvin_color_format_info_map)];
+    if (color_format < ARRAY_SIZE(kelvin_color_format_info_map) &&
+        kelvin_color_format_info_map[color_format].bytes_per_pixel) {
+        return true;
+    }
+    if (color_format < ARRAY_SIZE(told) && !told[color_format]) {
+        told[color_format] = 1;
+        xb_xemu_log("nv2a: texture format 0x%x isn't implemented (xemu's): the stage draws as if disabled",
+                    color_format);
+    }
+    return false;
 }

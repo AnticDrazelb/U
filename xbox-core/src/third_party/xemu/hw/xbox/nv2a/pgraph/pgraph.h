@@ -337,11 +337,16 @@ static inline bool pgraph_is_texture_stage_active(PGRAPHState *pg, unsigned int 
     return mode != 0 && mode != 4;// && mode != 0x11 && mode != 0x0a && mode != 0x09 && mode != 5;
 }
 
+bool xb_texture_format_supported(unsigned int color_format); /* xbox-core: pgraph/texture.c */
+
 static inline bool pgraph_is_texture_enabled(PGRAPHState *pg, int texture_idx)
 {
     uint32_t ctl_0 = pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + texture_idx*4);
+    /* xbox-core: a format xemu doesn't implement makes the stage behave as disabled (xemu aborts) */
+    uint32_t fmt = pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + texture_idx*4);
     return // pgraph_is_texture_stage_active(pg, texture_idx) &&
-                       GET_MASK(ctl_0, NV_PGRAPH_TEXCTL0_0_ENABLE);
+                       GET_MASK(ctl_0, NV_PGRAPH_TEXCTL0_0_ENABLE) &&
+                       xb_texture_format_supported(GET_MASK(fmt, NV_PGRAPH_TEXFMT0_COLOR));
 }
 
 static inline bool pgraph_is_texture_format_compressed(PGRAPHState *pg, int color_format)
