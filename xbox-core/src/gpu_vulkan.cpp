@@ -442,7 +442,7 @@ struct GpuTexture
 {
     TextureInfo info;
     Image img;
-    u64 hash = 0, checked_epoch = 0;
+    u64 hash = 0, checked_epoch = 0, sparse = 0;
 };
 std::vector<std::unique_ptr<GpuTexture>> g_textures;
 std::map<std::tuple<u32, u32, u32, u32, u32, u32>, VkSampler> g_samplers;
@@ -483,12 +483,28 @@ GpuTexture* UseTexture(int stage, const TextureInfo& t)
             break;
         }
     const bool small = t.bytes <= 64 * 1024;
+    // a large texture: hashed in full once a submit; between, a sparse sample of it (64 runs of 64
+    // bytes) catches the CPU rewriting it between draws (nxdk_pgraph_tests' signed-component
+    // gradients rewrite theirs in place)
+    auto sparse = [&] {
+        u64 h = 0x9e3779b97f4a7c15ull;
+        const u32 step = std::max<u32>(64, t.bytes / 64);
+        for (u32 at = 0; at + 64 <= t.bytes; at += step)
+            h = h * 31 + Hash(t.address + at, 64);
+        return h;
+    };
     if (g && g->checked_epoch == g_epoch && !small)
-        return g;
+    {
+        if (sparse() == g->sparse)
+            return g;
+        g->checked_epoch = 0; // changed: hashed in full again below
+    }
     const u64 h = TextureHash(t);
     if (g && g->hash == h)
     {
         g->checked_epoch = g_epoch;
+        if (!small)
+            g->sparse = sparse();
         return g;
     }
     if (!g)
@@ -499,6 +515,8 @@ GpuTexture* UseTexture(int stage, const TextureInfo& t)
     else
         g_trash.push_back(g->img), g->img = Image{};
     g->info = t, g->hash = h, g->checked_epoch = g_epoch;
+    if (!small)
+        g->sparse = sparse();
     const u32 levels = std::max<u32>(1, t.levels), faces = t.cube ? 6 : 1;
     if (!MakeImage(g->img, kColorFormat, t.width, t.height, levels, t.cube,
                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
