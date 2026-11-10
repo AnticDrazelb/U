@@ -203,3 +203,42 @@ retail game is to need it. Each item says how it is checked without the game.
   log says how many draws went to software and why ("stats: draws the GPU left to software"), so a
   slow game on the console shows the reason. Still in software: volume textures, shadow maps, float
   depth surfaces, border texels, linear interpolation. Packages rebuilt 07:06.
+
+- **4 (continued): M2MF, blit bindings, lighting, depth range** (01d46a6, f7806bb, 6ee2b31,
+  864a16b). The memory-to-memory copy class (0x39), which Halo's log showed Direct3D setting up,
+  now copies and writes its notifier; the image blit's other context-object bindings are accepted
+  (no longer reported as not emulated). A zero attenuation or falloff denominator is an infinitely
+  strong light, as the console shows (Lighting_spotlight 22 -> 23/24). With CULL_NEAR_FAR, a primitive
+  wholly outside the clip range is dropped, and the range is judged on z (ZMinMaxControl 18 -> 24/32).
+  Tried and reverted (no change): fixed-function transform with the vertex unit's arithmetic.
+  Regression 13/13 normally, on the GPU path and with `XB_TEST_FS_AS_PS4=1` (07:55). Packages
+  rebuilt 07:48 from 864a16b.
+- **The session's machine restarted again at about 08:00**; the owner asked at 10:20 to wrap up
+  and get the package.
+
+## Morning summary (10:20 UTC)
+
+**The package to install: `out/xbox-core-1g.pkg`** (GPU path, 1 GB image base, title XBCR00002),
+built from 864a16b. `xbox-core.pkg` and `xbox-core-1g-nogpu.pkg` are the same code without the GPU
+link, as before.
+
+What changed overnight, for Halo:
+- Both USB controllers exist, and the OHCI registers behave as the XDK's driver expects (items 1, 2).
+- DirectSound's start-up waits finish; XNet with no cable doesn't block start-up (items 3, 6).
+- Kernel exports audited; the stubs that mattered done properly, with kernel-test checks (item 5).
+- A watchdog names the loop a thread spins in when a run shows no frame (item 7).
+- NV2A: classes 0x39 and 0x9f's bindings, PCRTC_RASTER moving with time, the REF register.
+- The renderer against real-console captures (nxdk_pgraph_tests): 2307 -> 2612 of 3110 (74% -> 84%)
+  in software at 06:33, more since (lighting, depth range). The GPU path runs the dot-product
+  (bump/environment) stages and signed textures, so fewer draws fall back to slow software, and
+  the log says every 10 s which draws went to software and why.
+
+What to look at in Halo's log on the next run:
+- the "stats: draws the GPU left to software" line (if Halo is slow, it names the reason);
+- the watchdog report if no frame appears (the loop and the registers it reads);
+- APU registers near the top of "device registers by reads" would mean item 10 (the GP DSP) is
+  next.
+
+Not done: item 10 (the GP DSP interpreter), left until a log shows it's needed. The FreeBSD VM tests
+last ran at 05:47 (pass); the commits since are renderer and NV2A changes covered by the regression
+set, and they weren't rerun after the 08:00 restart.
