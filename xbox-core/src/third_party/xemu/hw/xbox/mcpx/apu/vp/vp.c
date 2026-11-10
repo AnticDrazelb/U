@@ -563,10 +563,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
             DPRINTF("idle voice %d\n", argument);
+            /* xbox-core: the trap's interrupt status is latched here, once, not re-derived from
+             * FECTL while the front end stays trapped: DirectSound's service routine acknowledges
+             * ISTS before it resumes the front end (and leaves the reason at REQUESTED), and a
+             * status that came back after its acknowledgement made the next delivery replay this
+             * trap's method and voice, by then released (a null voice object: Halo at 0x1958d2). */
+            qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
             d->set_irq = true;
-        } else {
-            assert(!"SE2FE_IDLE_VOICE called but NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE not enabled");
         }
+        /* xbox-core: with the trap not forced the console skips the idle voice (xemu asserted) */
         break;
     default:
         DPRINTF("Unrecognized method: 0x%08x\n", method);
@@ -575,16 +580,63 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 }
 
+/* xbox-core: the front end runs methods only while free-running; the guest's methods and the
+ * idle-voice trap all happen under the big lock. */
+bool xb_fe_running(MCPXAPUState *d)
+{
+    return (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE) ==
+           NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
+}
+
+/* The methods queued while the front end was stopped, in order (it runs again). */
+void xb_fe_drain(MCPXAPUState *d)
+{
+    int n = 0;
+    while (n < d->fe_queued) {
+        fe_method(d, d->fe_queue[n].method, d->fe_queue[n].argument);
+        n++;
+    }
+    d->fe_queued = 0;
+    d->fe_busy_since_us = 0;
+}
+
+/* After a frame: the trap on the idle voice it found, if the front end runs and the trap is forced. */
+void xb_fe_apply_idle_trap(MCPXAPUState *d)
+{
+    int v = d->pending_idle_voice;
+    d->pending_idle_voice = -1;
+    if (v < 0 || !xb_fe_running(d) || d->fe_queued ||
+        !(d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE)) {
+        return; /* still idle next frame: found again then */
+    }
+    d->last_idle_voice = v;
+    fe_method(d, SE2FE_IDLE_VOICE, v);
+}
+
 static uint64_t vp_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    MCPXAPUState *d = opaque;
     DPRINTF("mcpx apu VP: read [0x%" HWADDR_PRIx "] (%s)\n", addr,
             get_method_str(addr));
 
     switch (addr) {
-    case NV1BA0_PIO_FREE:
-        /* we don't simulate the queue for now,
-         * pretend to always be empty */
-        return 0x80;
+    case NV1BA0_PIO_FREE: {
+        /* xbox-core: the free bytes of the 32-entry FIFO (0x80 empty): the methods waiting for a
+         * stopped front end fill it. One stopped 50 ms or more reads empty again (a guest waiting
+         * for room would wait forever on a front end it stopped itself). */
+        int queued = d->fe_queued;
+        if (!queued) {
+            return 0x80;
+        }
+        int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (!d->fe_busy_since_us) {
+            d->fe_busy_since_us = now;
+        }
+        if (now - d->fe_busy_since_us > 50000) {
+            return 0x80;
+        }
+        return queued >= 0x20 ? 0 : 0x80 - queued * 4;
+    }
     default:
         break;
     }
@@ -644,8 +696,19 @@ static void vp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     case NV1BA0_PIO_SET_HRTF_HEADROOM:
     case NV1BA0_PIO_SET_SUBMIX_HEADROOM ...
          NV1BA0_PIO_SET_SUBMIX_HEADROOM+4*(NUM_MIXBINS-1):
-        /* TODO: these should instead be queueing up fe commands */
-        fe_method(d, addr, val);
+        /* xbox-core: queued while the front end is trapped or halted (or methods wait before
+         * it), as in the console's FIFO: a method run at once could overwrite FEDECMETH/
+         * FEDECPARAM or relink voices while the service routine unlinks an idle one. */
+        if (xb_fe_running(d) && !d->fe_queued) {
+            fe_method(d, addr, val);
+        } else if (d->fe_queued < XB_FE_QUEUE_LEN) {
+            d->fe_queue[d->fe_queued].method = addr;
+            d->fe_queue[d->fe_queued].argument = val;
+            d->fe_queued++;
+        } else {
+            xb_fe_drain(d);
+            fe_method(d, addr, val);
+        }
         break;
 
     case NV1BA0_PIO_GET_VOICE_POSITION:
@@ -1809,6 +1872,7 @@ static void voice_work_finalize(MCPXAPUState *d)
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    d->idle_first = d->idle_second = -1;
 
     /* Process all voices, mixing each into the affected MIXBINs */
     for (int list = 0; list < 3; list++) {
@@ -1832,7 +1896,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* xbox-core: one idle voice trapped on at a time, once the frame is done (a
+                 * second trap in the same frame overwrote FEDECMETH/FEDECPARAM before the
+                 * service routine read the first). Noted here; xb_fe_apply_idle_trap traps. */
+                if (d->idle_first < 0) {
+                    d->idle_first = v;
+                } else if (d->idle_second < 0 && v != d->idle_first) {
+                    d->idle_second = v;
+                }
             } else {
                 voice_work_enqueue(d, v, list);
             }
@@ -1840,6 +1911,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
         }
     }
     voice_work_dispatch(d, mixbins);
+
+    /* xbox-core: the idle voice to trap on. One the service routine declined last time (it stays
+     * idle where it was in its list) gives way to the next, or no other would ever be reported. */
+    if (d->idle_first >= 0) {
+        d->pending_idle_voice =
+            (d->idle_first == d->last_idle_voice && d->idle_second >= 0) ? d->idle_second
+                                                                          : d->idle_first;
+    }
 
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         /* Mix all voices together to hear any audible voice */
@@ -1869,6 +1948,11 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d)
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)
 {
+    d->fe_queued = 0;
+    d->fe_busy_since_us = 0;
+    d->idle_first = d->idle_second = -1;
+    d->pending_idle_voice = -1;
+    d->last_idle_voice = -1;
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));

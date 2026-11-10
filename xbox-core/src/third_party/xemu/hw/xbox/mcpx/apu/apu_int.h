@@ -94,6 +94,20 @@ typedef struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
+    /* xbox-core: the front end's method queue (the PIO FIFO): methods written while the front end
+     * is trapped or halted wait there, in order, until it runs again, as on the console; and the
+     * idle voice a frame found, to trap on once the frame is done (under the big lock, where the
+     * guest's methods run, so a trap and a method never interleave). */
+#define XB_FE_QUEUE_LEN 4096
+    struct {
+        uint32_t method, argument;
+    } fe_queue[XB_FE_QUEUE_LEN];
+    int fe_queued;
+    int64_t fe_busy_since_us;
+    int idle_first, idle_second; /* this frame's first two idle voices, -1 none */
+    int pending_idle_voice;      /* to trap on after the frame, -1 none */
+    int last_idle_voice;         /* the last one trapped on */
+
     int ep_frame_div;
     int frame_work_acc_us;
     int frame_count;
@@ -128,6 +142,10 @@ extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
 
 void mcpx_debug_begin_frame(void);
+/* xbox-core: the front end's method queue and idle-voice trap (vp.c) */
+void xb_fe_apply_idle_trap(MCPXAPUState *d);
+void xb_fe_drain(MCPXAPUState *d);
+bool xb_fe_running(MCPXAPUState *d);
 void mcpx_debug_end_frame(void);
 
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp);

@@ -25,9 +25,8 @@ MCPXAPUState *g_state; // Used via debug handlers
 
 static void update_irq(MCPXAPUState *d)
 {
-    if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
-        qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
-    }
+    /* xbox-core: FETINTSTS is latched where the front end traps (fe_method), not ORed back in
+     * from FECTL here: see SE2FE_IDLE_VOICE in vp.c. */
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
@@ -78,6 +77,13 @@ static void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FECTL:
+        /* xbox-core: a front end let run again first runs the methods that waited for it */
+        if ((val & NV_PAPU_FECTL_FEMETHMODE) == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING) {
+            xb_fe_drain(d);
+        }
+        qatomic_set(&d->regs[addr], val);
+        qemu_cond_broadcast(&d->cond);
+        break;
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], val);
         qemu_cond_broadcast(&d->cond);
@@ -297,6 +303,17 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         throttle(d);
         se_frame(d);
+
+        /* xbox-core: the idle voice the frame found is trapped on now, under the big lock (where
+         * the guest's methods run), and its interrupt raised */
+        if (d->pending_idle_voice >= 0) {
+            qemu_mutex_unlock(&d->lock);
+            bql_lock();
+            xb_fe_apply_idle_trap(d);
+            update_irq(d);
+            bql_unlock();
+            qemu_mutex_lock(&d->lock);
+        }
     }
     qemu_mutex_unlock(&d->lock);
     return NULL;
@@ -343,6 +360,9 @@ void xb_mcpx_apu_init(uint8_t *ram_ptr)
     ram.size = xb_ram_size();
     d->ram = &ram;
     d->parent_obj.irq = 5; /* xbox-core: IRQ 5 */
+    d->idle_first = d->idle_second = -1; /* xbox-core: no idle voice found or trapped on yet */
+    d->pending_idle_voice = -1;
+    d->last_idle_voice = -1;
 
     d->set_irq = false;
     d->exiting = false;
