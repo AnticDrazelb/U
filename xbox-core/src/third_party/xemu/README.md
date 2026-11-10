@@ -1,4 +1,4 @@
-# xemu's MCPX audio processing unit
+# xemu's devices in xbox-core
 
 xbox-core's APU is xemu's (https://github.com/xemu-project/xemu, `hw/xbox/mcpx/apu/`), whole: `apu.c`
 (registers, frame thread, pacing), `vp/` (the voice processor: voices, ADPCM, filters, HRTF, the
@@ -19,3 +19,13 @@ Changes for xbox-core:
 - `shim/`: what the code uses of QEMU, glib and SDL: threads on pthreads, atomics, the clock, guest
   physical memory and the interrupt line through xbox-core (`src/apu.cpp`), trace points compiled out.
 - Settings: xemu's defaults (its DSP option off, HRTF on), two voice workers.
+
+## Also taken whole since (see docs-xemu-port.md)
+- `hw/xbox/mcpx/nvnet`: the network adapter (link down: no network behind it).
+- `hw/xbox/nv2a`: the GPU, with its Vulkan renderer (not its OpenGL one, nor the GL interop with
+  xemu's UI), linked with glslang, volk, VMA, SPIRV-Reflect, xxHash, nv2a_vsh_cpu
+  (`src/third_party/*`, each with its licence). xbox-core additions are marked `xbox-core:` in the
+  sources (device glue in nv2a.c, the idle sync, the renderer's start-up result, unimplemented texture
+  formats, volk from a linked driver).
+- `hw/usb` (QEMU's OHCI, core, descriptors, hub; bus.c's parts in xb_bus.c) and `hw/xbox/xid*`
+  (xemu's Xbox controller); xb_usb.c builds the controllers and player 1's hub and pad.
