@@ -347,6 +347,24 @@ static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
         code = NULL;
     }
 
+    /* xbox-core: XB_VK_SHADERS=folder: each shader's GLSL, as made, into that folder */
+    static const char *dump_to = (const char *)1;
+    if (dump_to == (const char *)1) {
+        dump_to = getenv("XB_VK_SHADERS");
+    }
+    if (dump_to && code) {
+        static int dumped;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%03d.%s", dump_to, dumped++,
+                 module->key.kind == VK_SHADER_STAGE_VERTEX_BIT ? "vert" :
+                 module->key.kind == VK_SHADER_STAGE_GEOMETRY_BIT ? "geom" : "frag");
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fputs(mstring_get_str(code), f);
+            fclose(f);
+        }
+    }
+
     module->module_info = pgraph_vk_create_shader_module_from_glsl(
         r, module->key.kind, mstring_get_str(code));
     pgraph_vk_ref_shader_module(module->module_info);

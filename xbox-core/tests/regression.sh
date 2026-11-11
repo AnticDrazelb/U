@@ -42,6 +42,19 @@ if [ -f "$HERE/apu-test/bin/default.xbe" ]; then
         echo "FAIL apu-sound $(tail -1 apu-sound.txt 2>/dev/null)"; fail=1
     fi
 fi
+# Halo's text and screen-space draws replayed (its D3D's vertex program and state): each quad at its
+# pixels, on this renderer and on xbox-core's own
+for renderer in default own; do
+    if [ -f "$HERE/halo-text-test/bin/default.xbe" ]; then
+        if XB_NV2A=$([ $renderer = own ] && echo own || echo xemu) timeout 120 "$CORE" "$HERE/halo-text-test/bin/default.xbe" \
+            --seconds 3 --png "halo-text-$renderer.png" > "halo-text-$renderer.log" 2>&1 &&
+            python3 "$HERE/halo-text-test/check.py" "halo-text-$renderer.png" > "halo-text-$renderer.txt"; then
+            echo "ok   halo-text ($renderer) $(tail -1 "halo-text-$renderer.txt")"
+        else
+            echo "FAIL halo-text ($renderer) $(tail -1 "halo-text-$renderer.txt" 2>/dev/null)"; fail=1
+        fi
+    fi
+done
 for s in triangle mesh xaudio sdl usb sdl_gamecontroller; do
     run "$s" "$NXDK_DIR/samples/$s/bin/default.xbe" 5
 done

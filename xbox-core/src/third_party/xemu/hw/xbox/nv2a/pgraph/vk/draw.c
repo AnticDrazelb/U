@@ -2119,6 +2119,22 @@ void pgraph_vk_flush_draw(NV2AState *d)
         size_t offset = 0;
 
         pgraph_vk_bind_vertex_attributes_inline(d);
+        /* xbox-core: XB_VK_DRAWS=1: each inline buffer draw, its attributes and first vertex */
+        static int show_draws = -1;
+        if (show_draws < 0) {
+            show_draws = getenv("XB_VK_DRAWS") != NULL;
+        }
+        if (show_draws) {
+            fprintf(stderr, "vk draw: inline buffer, %d vertices, primitive %d, %d attributes:",
+                    (int)pg->inline_buffer_length, (int)pg->primitive_mode,
+                    r->num_active_vertex_attribute_descriptions);
+            for (int i = 0; i < r->num_active_vertex_attribute_descriptions; i++) {
+                int a = r->vertex_attribute_descriptions[i].location;
+                const float *v = pg->vertex_attributes[a].inline_buffer;
+                fprintf(stderr, " v%d=(%g %g %g %g)", a, v[0], v[1], v[2], v[3]);
+            }
+            fprintf(stderr, "\n");
+        }
         for (int i = 0; i < r->num_active_vertex_attribute_descriptions; i++) {
             int attr_index = r->vertex_attribute_descriptions[i].location;
 
