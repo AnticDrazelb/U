@@ -214,10 +214,31 @@ struct RangeAllocator
         free.clear(), allocated.clear();
         free[b] = e - b;
     }
-    u32 Alloc(u32 size, u32 alignment, u32 lowest = 0, u32 highest = 0xffffffff)
+    // highest: the last byte the allocation may use. From the top: the highest place that fits.
+    u32 Alloc(u32 size, u32 alignment, u32 lowest = 0, u32 highest = 0xffffffff, bool from_top = false)
     {
         size = (size + kPage - 1) & ~(kPage - 1);
         alignment = std::max(alignment, kPage);
+        if (size == 0)
+            return 0;
+        if (from_top)
+        {
+            for (auto it = free.end(); it != free.begin();)
+            {
+                --it;
+                const u64 range_start = std::max<u64>(it->first, lowest);
+                const u64 range_end = std::min<u64>(u64(it->first) + it->second, u64(highest) + 1);
+                if (range_end < range_start + size)
+                    continue;
+                const u64 start = (range_end - size) & ~u64(alignment - 1);
+                if (start < range_start)
+                    continue;
+                Take(it, u32(start), size);
+                allocated[u32(start)] = size;
+                return u32(start);
+            }
+            return 0;
+        }
         for (auto it = free.begin(); it != free.end(); ++it)
         {
             u64 start = std::max<u64>(it->first, lowest);
@@ -359,6 +380,8 @@ void InitMemory()
         if (start >= kRamBase && start < kRamEnd)
             g_virtual.AllocAt(start, size);
     g_contiguous.AllocAt(kGpuInstanceMemory, 0x100000);
+    // physical page 0 is never handed out (a physical address of 0 reads as "none")
+    g_contiguous.AllocAt(kContiguousBase, kPage);
 }
 
 u32 AllocVirtual(u32 size, u32 at)
@@ -381,11 +404,28 @@ bool FreeVirtual(u32 base)
 u32 AllocContiguous(u32 size, u32 alignment, u32 lowest, u32 highest)
 {
     std::lock_guard lock(g_mem);
-    // lowest/highest are physical addresses
+    // lowest/highest are physical addresses. The kernel takes contiguous memory from the top of
+    // the range down, as the Xbox kernel does: what programs ask for without a limit goes high, and
+    // the low pages stay free for the requests that need them. Games count on it: Halo pins its
+    // own blocks at fixed low addresses (its tags at physical 0x3a6000), and D3D's visibility tests
+    // take each page of 256 results from below 16 MB (EndVisibilityTest asks (0x1000, 0, 0xffffff);
+    // refused, it returns E_OUTOFMEMORY and GetVisibilityTestResult reads through a null page).
+    if (lowest >= kContiguousSize || (highest < kContiguousSize && highest < lowest))
+        return 0;
     const u32 p = g_contiguous.Alloc(size, alignment ? alignment : kPage, kContiguousBase + lowest,
-                                     highest >= kContiguousSize ? 0xffffffff : kContiguousBase + highest);
+                                     highest >= kContiguousSize ? kContiguousBase + kContiguousSize - 1
+                                                                : kContiguousBase + highest,
+                                     true);
     if (p)
         std::memset(Ptr(p), 0, size);
+    else
+    {
+        static int refused = 0;
+        if (refused++ < 8)
+            Log("memory: contiguous request refused: %#x bytes (alignment %#x) between %#x and %#x; %#x bytes "
+                "free",
+                size, alignment, lowest, highest, g_contiguous.FreeBytes());
+    }
     return p;
 }
 

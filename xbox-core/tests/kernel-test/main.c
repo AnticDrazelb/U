@@ -138,6 +138,49 @@ int main(void)
     // the pool
     PVOID p = ExAllocatePoolWithTag(100, 'tset');
     check("ExAllocatePoolWithTag", p != NULL);
+    {
+        // Contiguous memory comes from the top of the range down, as from the Xbox kernel. Halo
+        // pins its blocks at fixed low addresses and takes most of the rest; D3D's visibility tests
+        // then take each page of results from below 16 MB (EndVisibilityTest: (0x1000, 0, 0xffffff)).
+        PVOID high = MmAllocateContiguousMemory(0x10000);
+        check("contiguous memory: a request without limits is placed high",
+              high && MmGetPhysicalAddress(high) >= 0x03000000);
+        PVOID a = MmAllocateContiguousMemoryEx(0x345000, 0x61000, 0x3a5fff, 0, PAGE_READWRITE);
+        PVOID b = MmAllocateContiguousMemoryEx(0x1600000, 0x3a6000, 0x19a5fff, 0, PAGE_READWRITE);
+        check("contiguous memory: Halo's blocks at their fixed addresses", a == (PVOID)0x80061000 && b == (PVOID)0x803a6000);
+        PVOID c = MmAllocateContiguousMemoryEx(0x1600000, 0, 0xffffffff, 0, PAGE_READWRITE);
+        PVOID d = MmAllocateContiguousMemoryEx(0x400000, 0, 0xffffffff, 0, PAGE_READWRITE);
+        PVOID e[6]; // D3D's push buffer, frame buffers, textures
+        const ULONG sizes[6] = {0xc2000, 0x258000, 0x12c000, 0x4b000, 0x15400, 0x8000};
+        for (int i = 0; i < 6; i++)
+            e[i] = MmAllocateContiguousMemoryEx(sizes[i], 0, 0x3ffb000, i < 3 ? 0x4000 : 0x80, PAGE_READWRITE);
+        PVOID pool[64];
+        for (int i = 0; i < 64; i++)
+            pool[i] = ExAllocatePoolWithTag(0x1000 + i * 0x100, 'tset');
+        int low = c && d && e[0] && e[5];
+        PVOID pages[8];
+        for (int i = 0; i < 8; i++)
+        {
+            pages[i] = MmAllocateContiguousMemoryEx(0x1000, 0, 0xffffff, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+            low = low && pages[i] && MmGetPhysicalAddress(pages[i]) + 0x1000 <= 0x1000000;
+        }
+        check("contiguous memory: D3D's visibility pages below 16 MB once Halo's and D3D's blocks are placed", low);
+        check("contiguous memory: physical page 0 isn't handed out",
+              MmAllocateContiguousMemoryEx(0x1000, 0, 0xfff, 0, PAGE_READWRITE) == NULL);
+        for (int i = 0; i < 8; i++)
+            if (pages[i])
+                MmFreeContiguousMemory(pages[i]);
+        for (int i = 0; i < 64; i++)
+            if (pool[i])
+                ExFreePool(pool[i]);
+        for (int i = 0; i < 6; i++)
+            if (e[i])
+                MmFreeContiguousMemory(e[i]);
+        PVOID all[5] = {high, a, b, c, d};
+        for (int i = 0; i < 5; i++)
+            if (all[i])
+                MmFreeContiguousMemory(all[i]);
+    }
     // the retail kernel's data: three cache partitions (XAPI's utility drive divides by them), no
     // debugger, a disk with a model number
     check("HalDiskCachePartitionCount is 3", HalDiskCachePartitionCount == 3);
