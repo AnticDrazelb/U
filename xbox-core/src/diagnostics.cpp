@@ -565,6 +565,7 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                     if (const std::string declined = gpu::DeclinedSince(); !declined.empty())
                         Log("stats: draws the GPU left to software (slower), by reason: %s", declined.c_str());
                 Log("stats: sound: %s", SoundStats(span).c_str());
+                Log("stats: one processor: %s", SingleProcessorStats(span).c_str());
                 {
                     const DisplayInfo d = GetDisplay();
                     // how much of it isn't black (one pixel in 64)

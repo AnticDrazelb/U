@@ -620,10 +620,15 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
     }
 
     if (dsp->cur_inst < 0x100000) {
-        const OpcodeEntry *op = dsp->pram_opcache[dsp->pc];
+        /* xbox-core: the opcode cache covers the program RAM only: a pc past it (a program that
+         * runs off its end) read and wrote past the cache (asserts are compiled out here) */
+        const OpcodeEntry *op =
+            dsp->pc < DSP_PRAM_SIZE ? dsp->pram_opcache[dsp->pc] : NULL;
         if (op == NULL) {
             op = lookup_opcode(dsp->cur_inst);
-            dsp->pram_opcache[dsp->pc] = op;
+            if (dsp->pc < DSP_PRAM_SIZE) {
+                dsp->pram_opcache[dsp->pc] = op;
+            }
         }
         if (op->emu_func) {
             op->emu_func(dsp);

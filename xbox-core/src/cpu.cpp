@@ -51,6 +51,7 @@ std::atomic<GuestThread*> g_stopper{nullptr};
 std::mutex g_park_mutex;
 std::condition_variable g_park_cv;
 std::atomic<u64> g_stop_late{0};
+std::atomic<u64> g_stops{0}, g_stop_wait_ns{0}, g_stop_signals{0}; // for the stats line
 const bool g_single_processor = [] {
     const char* e = std::getenv("XB_UP");
     return !(e && e[0] == '0');
@@ -1614,6 +1615,16 @@ void StopGuestThreads(GuestThread* self)
     g_stopper.store(self, std::memory_order_relaxed);
     g_stop_gen.fetch_add(1, std::memory_order_seq_cst); // odd: stopped
     const auto start = std::chrono::steady_clock::now();
+    g_stops++;
+    struct Waited
+    {
+        std::chrono::steady_clock::time_point from;
+        ~Waited()
+        {
+            g_stop_wait_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - from).count());
+        }
+    } waited{start};
     auto last_signal = start - std::chrono::seconds(1);
     for (;;)
     {
@@ -1630,7 +1641,7 @@ void StopGuestThreads(GuestThread* self)
             {
                 all = false;
                 if (signal)
-                    platform::SendSample(host);
+                    platform::SendSample(host), g_stop_signals++;
             }
         }
         if (all)
@@ -1646,6 +1657,21 @@ void StopGuestThreads(GuestThread* self)
         }
         std::this_thread::yield();
     }
+}
+
+std::string SingleProcessorStats(double seconds)
+{
+    static u64 last_stops = 0, last_wait = 0, last_signals = 0, last_late = 0;
+    const u64 stops = g_stops, wait = g_stop_wait_ns, signals = g_stop_signals, late = g_stop_late;
+    char out[200];
+    std::snprintf(out, sizeof(out),
+                  "%.0f interrupt routines and DPCs a second held the other threads (%.0f signals a second; "
+                  "%.1f us on average to stop them; %llu not in time)",
+                  double(stops - last_stops) / seconds, double(signals - last_signals) / seconds,
+                  stops > last_stops ? double(wait - last_wait) / 1000.0 / double(stops - last_stops) : 0.0,
+                  (unsigned long long)(late - last_late));
+    last_stops = stops, last_wait = wait, last_signals = signals, last_late = late;
+    return out;
 }
 
 void ResumeGuestThreads()

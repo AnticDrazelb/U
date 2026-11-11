@@ -37,9 +37,13 @@ for s in $SOURCES; do
     fi
 done
 cc $FLAGS -c "$HERE/src/switch.S" -o "$OUT/obj/switch.o"
+# xemu's C files too when any header under third_party changed (a structure's layout: an object built
+# against the old one reads the wrong fields)
+tp_headers_changed=0
+find "$TP" -name '*.h' | sort | xargs cat | cmp -s - "$OUT/obj/tp-headers.built" || tp_headers_changed=1
 for c in $XEMU_C; do
     o="$OUT/obj/x_$(echo "$c" | tr '/.' '__').o"
-    if [ ! -f "$o" ] || ! cmp -s "$TP/$c" "$o.src"; then
+    if [ ! -f "$o" ] || ! cmp -s "$TP/$c" "$o.src" || [ "$tp_headers_changed" = 1 ]; then
         (cc -std=gnu11 $XEMU_FLAGS -c "$TP/$c" -o "$o" && cp "$TP/$c" "$o.src") &
         pids="$pids $!"
     fi
@@ -48,5 +52,6 @@ fail=0
 for p in $pids; do wait "$p" || fail=1; done
 [ "$fail" = 0 ] || { echo "compile failed" >&2; exit 1; }
 cat "$HERE"/src/*.h "$HERE"/src/*.inc 2>/dev/null > "$OUT/obj/headers.built"
+find "$TP" -name '*.h' | sort | xargs cat > "$OUT/obj/tp-headers.built"
 c++ -no-pie -Wl,--image-base="${XB_IMAGE_BASE:-0x400000}" -o "$OUT/xbox-core" "$OUT"/obj/*.o -lpthread -lutil -lm
 echo "$OUT/xbox-core"

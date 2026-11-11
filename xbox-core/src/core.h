@@ -204,6 +204,7 @@ void StartHostThread(GuestThread* t, std::function<void()> body);
 void StopGuestThreads(GuestThread* self);
 extern std::atomic<int> g_sampling; // the watchdog samples where threads are (the sample signal notes it)
 void ResumeGuestThreads();
+std::string SingleProcessorStats(double seconds); // for the stats line
 // The guest address of the stub that calls kernel export `ordinal`.
 u32 ExportStub(u32 ordinal);
 // kernel.cpp: an object body with its OBJECT_HEADER; `type` names the exported OBJECT_TYPE
