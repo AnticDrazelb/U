@@ -20,6 +20,8 @@
 #ifndef HW_XBOX_NV2A_PGRAPH_VK_RENDERER_H
 #define HW_XBOX_NV2A_PGRAPH_VK_RENDERER_H
 
+/* xbox-core: the renderer's start-up step, in the step file and the log (nv2a.cpp) */
+void xb_nv2a_step(const char *step);
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "qemu/queue.h"

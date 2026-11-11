@@ -1508,6 +1508,15 @@ static void voice_process(MCPXAPUState *d,
         return;
     }
 
+    /* xbox-core: for the stats: the loudest sample read (silence in the data, or in the volumes?) */
+    {
+        float peak = 0;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            peak = fmaxf(peak, fmaxf(fabsf(samples[i][0]), fabsf(samples[i][1])));
+        }
+        dbg->xb_peak = peak;
+    }
+
     int bin[8];
     bin[0] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN,
                             NV_PAVS_VOICE_CFG_VBIN_V0BIN);

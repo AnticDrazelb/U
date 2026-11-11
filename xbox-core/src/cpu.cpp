@@ -856,6 +856,18 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
             std::snprintf(b, sizeof(b), "%s%08x", i % 8 ? " " : (i ? "\n    " : "    "), Read<u32>(esp + i * 4));
             stack += b;
         }
+        // with no frame chain (code built without frame pointers, as Halo's), the return addresses
+        // on the stack: values in the program's image just after a call instruction
+        if (returns.empty())
+            for (u32 i = 0; i < 128 && on_stack(esp + i * 4) && returns.size() < 6; i++)
+            {
+                const u32 v = Read<u32>(esp + i * 4);
+                if (v < g_xbe.base + 8 || v >= g_xbe.base + g_xbe.image_size || !GuestMapped(v - 8, 8))
+                    continue;
+                if (Read<u8>(v - 5) == 0xe8 || Read<u8>(v - 2) == 0xff || Read<u8>(v - 3) == 0xff ||
+                    Read<u8>(v - 6) == 0xff || Read<u8>(v - 7) == 0xff)
+                    returns.push_back(v);
+            }
         for (u32 rec = chain, n = 0; n < 8 && on_stack(rec) && on_stack(rec + 4); n++)
         {
             std::snprintf(b, sizeof(b), " %#x->%#x", rec, Read<u32>(rec + 4));
@@ -875,9 +887,28 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
             }
             Log("  code around eip (16 before, [eip]):%s", around.c_str());
         }
+        // the whole routine around it, as far as 384 bytes before and 64 after, and the code before
+        // each return address below (the first four such exceptions: software-raised ones don't count)
+        static int windows = 0;
+        const bool with_code = windows++ < 4;
+        if (with_code && eip > 384 && GuestMapped(eip - 384, 384 + 64))
+        {
+            std::string bytes;
+            for (u32 a = eip - 384; a < eip + 64; a++)
+            {
+                if ((a - (eip - 384)) % 32 == 0)
+                {
+                    std::snprintf(b, sizeof(b), "\n    %08x:", a);
+                    bytes += b;
+                }
+                std::snprintf(b, sizeof(b), " %02x", Read<u8>(a));
+                bytes += b;
+            }
+            Log("  code before and after eip %#x:%s", eip, bytes.c_str());
+        }
         // the code that made each call in the chain: 384 bytes before each return address (to read
         // what the program was doing there; the first few exceptions only)
-        if (diag::g_exceptions <= 4)
+        if (with_code)
             for (size_t k = 0; k < returns.size() && k < 4; k++)
             {
                 const u32 ret = returns[k], from = ret > 384 ? ret - 384 : 0;

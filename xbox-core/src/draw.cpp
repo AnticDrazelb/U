@@ -628,6 +628,9 @@ void FogFactor(Vec4 out[16])
 Vec4 g_carried_fog[6] = {};
 u32 g_fog_slot = 0;
 
+// the first vertex of the draw being built, before and after the transform (for the stats' note)
+Vec4 g_note_in{}, g_note_out{};
+
 void EmitVertex(const Vec4 in[16])
 {
     Vertex v;
@@ -655,6 +658,8 @@ void EmitVertex(const Vec4 in[16])
     g_carried_fog[g_fog_slot] = v.o[5];
     g_fog_slot = (g_fog_slot + 1) % 6;
     FogFactor(v.o);
+    if (g_vertices.empty())
+        g_note_in = in[0], g_note_out = v.o[0];
     g_vertices.push_back(v);
 }
 
@@ -1515,6 +1520,10 @@ struct DrawNoteData
     u32 tris = 0, offscreen = 0, color = 0, tex_address = 0, tex_format = 0, tex_size = 0;
     bool textured = false;
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    u32 mode = 0, start = 0;   // SET_TRANSFORM_EXECUTION_MODE, SET_TRANSFORM_PROGRAM_START
+    Vec4 in{}, out{};          // the first vertex's position before and after the transform
+    float composite[4] = {};   // the composite matrix's diagonal
+    float scale[2] = {}, offset[2] = {}; // the viewport's
 };
 std::mutex g_notes_mutex;
 DrawNoteData g_notes[3];
@@ -1538,6 +1547,18 @@ void NoteDraw(const std::vector<ScreenVertex>& sv, const Tris& tris)
                 n.offscreen++;
         }
     n.color = g_kelvin.Get(0x210);
+    n.mode = g_kelvin.Get(0x1e94), n.start = g_kelvin.Get(0x1ea0);
+    n.in = g_note_in, n.out = g_note_out;
+    for (int i = 0; i < 4; i++)
+    {
+        const u32 bits = g_kelvin.Get(0x680 + u32(i) * 20); // SET_COMPOSITE_MATRIX: [i][i]
+        std::memcpy(&n.composite[i], &bits, 4);
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        const u32 s = g_kelvin.Get(0xaf0 + u32(i) * 4), o = g_kelvin.Get(0xa20 + u32(i) * 4);
+        std::memcpy(&n.scale[i], &s, 4), std::memcpy(&n.offset[i], &o, 4);
+    }
     n.textured = (g_kelvin.Get(0x1b0c) >> 30) & 1;
     n.tex_address = g_kelvin.Get(0x1b00), n.tex_format = g_kelvin.Get(0x1b04), n.tex_size = g_kelvin.Get(0x1b1c);
     std::lock_guard lock(g_notes_mutex);
@@ -1966,7 +1987,7 @@ std::string LastDrawsNote()
     for (u32 k = 0; k < 3 && k < g_notes_next; k++)
     {
         const DrawNoteData& n = g_notes[(g_notes_next - 1 - k) % 3];
-        char b[220];
+        char b[400];
         std::snprintf(b, sizeof(b), "%s%u triangles over (%.0f,%.0f)-(%.0f,%.0f)%s into %#x%s", k ? "; " : "", n.tris, n.x0,
                       n.y0, n.x1, n.y1, n.offscreen ? " (some far off or not numbers)" : "", n.color,
                       n.textured ? "" : ", untextured");
@@ -1977,6 +1998,13 @@ std::string LastDrawsNote()
                           (n.tex_format >> 8) & 0xff, n.tex_size >> 16, n.tex_size & 0xffff);
             out += b;
         }
+        std::snprintf(b, sizeof(b),
+                      " [transform %s (mode %#x, start %u); vertex (%g %g %g %g) -> (%g %g %g %g); composite diagonal "
+                      "%g %g %g %g; viewport scale %g %g offset %g %g]",
+                      (n.mode & 3) == 2 ? "program" : "fixed", n.mode, n.start, n.in[0], n.in[1], n.in[2], n.in[3],
+                      n.out[0], n.out[1], n.out[2], n.out[3], n.composite[0], n.composite[1], n.composite[2],
+                      n.composite[3], n.scale[0], n.scale[1], n.offset[0], n.offset[1]);
+        out += b;
     }
     return out.empty() ? "none" : out;
 }

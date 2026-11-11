@@ -45,12 +45,15 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
 
     pgraph_vk_debug_init();
 
+    xb_nv2a_step("Vulkan instance and device");
     pgraph_vk_init_instance(pg, errp);
     if (*errp) {
         return;
     }
 
+    xb_nv2a_step("command buffers");
     pgraph_vk_init_command_buffers(pg);
+    xb_nv2a_step("buffers");
     pgraph_vk_init_buffers(d);
     /* xbox-core: a buffer the driver couldn't give (its memory) is a renderer that can't start, not
      * a crash later: xbox-core's own NV2A is used instead */
@@ -61,18 +64,29 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
             return;
         }
     }
+    /* xbox-core: each step named in the step file and the log: a start-up that dies says where */
+    xb_nv2a_step("surfaces");
     pgraph_vk_init_surfaces(pg);
+    xb_nv2a_step("shaders");
     pgraph_vk_init_shaders(pg);
+    xb_nv2a_step("pipelines");
     pgraph_vk_init_pipelines(pg);
+    xb_nv2a_step("textures");
     pgraph_vk_init_textures(pg);
+    xb_nv2a_step("reports");
     pgraph_vk_init_reports(pg);
+    xb_nv2a_step("compute pipelines");
     pgraph_vk_init_compute(pg);
+    xb_nv2a_step("display");
     pgraph_vk_init_display(pg);
 
+    xb_nv2a_step("the RAM's vertex buffer");
     pgraph_vk_update_vertex_ram_buffer(&d->pgraph, 0, d->vram_ptr,
                                    memory_region_size(d->vram));
 
+    xb_nv2a_step("the GPU's properties (test draws)");
     pgraph_vk_determine_gpu_properties(d);
+    xb_nv2a_step("started");
 }
 
 static void pgraph_vk_finalize(NV2AState *d)

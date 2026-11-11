@@ -35,6 +35,7 @@ typedef enum McpxApuDebugMonitorPoint {
 
 struct McpxApuDebugVoice
 {
+    float xb_peak; /* xbox-core: the loudest sample the voice read this frame, before its volumes */
     bool active;
     bool paused;
     bool stereo;

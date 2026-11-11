@@ -683,10 +683,11 @@ static bool init_allocator(PGRAPHState *pg, Error **errp)
 
 void pgraph_vk_init_instance(PGRAPHState *pg, Error **errp)
 {
-    if (create_instance(pg, errp) &&
-        select_physical_device(pg, errp) &&
-        create_logical_device(pg, errp) &&
-        init_allocator(pg, errp)) {
+    /* xbox-core: each step named (xb_nv2a_step) */
+    if ((xb_nv2a_step("Vulkan instance"), create_instance(pg, errp)) &&
+        (xb_nv2a_step("Vulkan physical device"), select_physical_device(pg, errp)) &&
+        (xb_nv2a_step("Vulkan logical device"), create_logical_device(pg, errp)) &&
+        (xb_nv2a_step("memory allocator"), init_allocator(pg, errp))) {
         return;
     }
 

@@ -147,6 +147,19 @@ void pgraph_vk_init_buffers(NV2AState *d)
 
     for (int i = 0; i < BUFFER_COUNT; i++) {
         create_buffer(pg, &r->storage_buffers[i]);
+        /* xbox-core: what the driver gave, for the log (a start-up that fails says where) */
+        xb_xemu_log("vulkan: buffer %d, %zu MiB (%s): %s", i,
+                    (size_t)r->storage_buffers[i].buffer_size >> 20,
+                    r->storage_buffers[i].alloc_info.usage == VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+                        ? "the GPU's" : "the CPU's too",
+                    r->storage_buffers[i].allocation ? "given" : "NOT GIVEN");
+    }
+    /* xbox-core: one the driver couldn't give is not mapped (that crashed in vmaMapMemory):
+     * pgraph_vk_init sees it and the renderer doesn't start (xbox-core's own NV2A then) */
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (!r->storage_buffers[i].allocation) {
+            return;
+        }
     }
 
     // FIXME: Add fallback path for device using host mapped memory

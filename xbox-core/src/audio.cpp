@@ -359,6 +359,7 @@ std::atomic<u64> g_audio_dry{0};
 extern "C" float xb_apu_utilization(void);
 extern "C" int xb_apu_voices(void);
 extern "C" int xb_apu_dsp_on(void);
+extern "C" int xb_apu_voice_info(char* out, int size);
 extern "C" int xb_apu_gp_cycles(void);
 namespace xb {
 
@@ -388,6 +389,10 @@ std::string SoundStats(double seconds)
                                        .c_str()
                                  : "");
     last_in = in, last_short = shorts, last_ticks = ticks, last_sink = sink, last_dry = dry;
+    // the voices of the last frame: what each reads and how loud (silent data, or silent volumes?)
+    char voices[1200];
+    if (xb_apu_voice_info(voices, sizeof(voices)))
+        return std::string(out) + "\n    the voices: " + voices;
     return out;
 }
 

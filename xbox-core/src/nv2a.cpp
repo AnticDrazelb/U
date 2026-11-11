@@ -520,6 +520,7 @@ bool g_xemu_nv2a = false;
 namespace {
 bool g_own_chosen = false;
 std::string g_xemu_guard; // the step file while xemu's renderer's first frames are drawn
+std::string g_xemu_step_file; // the step file during its start-up (xb_nv2a_step writes it)
 [[maybe_unused]] u32 g_xemu_vblanks = 0;
 }
 
@@ -538,7 +539,7 @@ void InitNv2a()
     if (g_xemu_nv2a && !guard.empty())
         if (FILE* f = std::fopen(guard.c_str(), "r"))
         {
-            char step[64] = {}, build[128] = {};
+            char step[160] = {}, build[128] = {};
             const bool same = std::fgets(step, sizeof(step), f) && std::fgets(build, sizeof(build), f) &&
                               std::string(build).rfind(kBuildId, 0) == 0;
             std::fclose(f);
@@ -559,7 +560,9 @@ void InitNv2a()
                 std::fclose(f);
             }
         Log("nv2a: xemu's (PGRAPH on its Vulkan renderer)");
+        g_xemu_step_file = guard;
         const bool ok = xb_nv2a_init(Ptr<u8>(kContiguousBase), kContiguousSize);
+        g_xemu_step_file.clear();
         if (!guard.empty())
         {
             std::remove(guard.c_str());
@@ -679,3 +682,17 @@ u32 Nv2aDmaAddress(u32 instance, u32* limit)
 }
 
 } // namespace xb
+
+// xemu's renderer's start-up, step by step: in the step file (a start that dies there is followed by
+// one with xbox-core's NV2A, and its log says which step) and in the log, written through at once
+extern "C" void xb_nv2a_step(const char* step)
+{
+    using namespace xb;
+    if (!g_xemu_step_file.empty())
+        if (FILE* f = std::fopen(g_xemu_step_file.c_str(), "w"))
+        {
+            std::fprintf(f, "xemu renderer start-up: %s\n%s\n", step, kBuildId);
+            std::fclose(f);
+        }
+    LogSync("nv2a: xemu's renderer: %s", step);
+}

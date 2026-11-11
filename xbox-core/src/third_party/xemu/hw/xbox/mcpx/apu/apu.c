@@ -406,6 +406,35 @@ void xb_mcpx_apu_init(uint8_t *ram_ptr)
  * frames over the last second (xemu's utilization: at 1 it can't keep up) and the voices it mixed */
 float xb_apu_utilization(void) { return g_dbg.utilization; }
 int xb_apu_dsp_on(void) { return g_config.audio.use_dsp; }
+/* the voices of the last frame (up to 6): what each reads, how loud, its volumes, where it is */
+int xb_apu_voice_info(char *out, int size)
+{
+    int n = 0, shown = 0, active = 0;
+    out[0] = 0;
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        const struct McpxApuDebugVoice *x = &g_dbg_cache.vp.v[v];
+        if (!x->active) {
+            continue;
+        }
+        active++;
+        if (shown++ >= 6 || n >= size - 1) {
+            continue;
+        }
+        n += snprintf(out + n, size - n,
+                      "%svoice %d: %s%s%s%ssample size %d, container %d, rate %.3f, peak %.3f, volumes %03x %03x, "
+                      "at %u (loop %u, end %u)",
+                      n ? "; " : "", v, x->paused ? "paused, " : "", x->stream ? "stream, " : "",
+                      x->stereo ? "stereo, " : "mono, ", x->multipass ? "multipass, " : "", x->sample_size,
+                      x->container_size, x->rate, x->xb_peak, x->vol[0], x->vol[1], x->cbo, x->lbo, x->ebo);
+        if (n > size - 1) {
+            n = size - 1;
+        }
+    }
+    if (active > 6 && n < size - 1) {
+        n += snprintf(out + n, size - n, "; %d more", active - 6);
+    }
+    return active;
+}
 int xb_apu_gp_cycles(void) { return g_dbg.gp.cycles; }
 int xb_apu_voices(void)
 {
