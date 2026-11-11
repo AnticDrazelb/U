@@ -563,9 +563,19 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 Log("stats: sound: %s", SoundStats(span).c_str());
                 {
                     const DisplayInfo d = GetDisplay();
-                    Log("stats: the picture: %s at %#x, %dx%d, format %#x, pitch %u%s", d.valid ? "shown" : "no mode set",
-                        d.address, d.width, d.height, d.format, d.pitch,
-                        d.overlay.on ? ", with the video overlay on" : "");
+                    // how much of it isn't black (one pixel in 64)
+                    u32 lit = 0, seen = 0;
+                    if (d.valid && GuestMapped(d.address, d.pitch * u32(d.height)))
+                        for (int y = 0; y < d.height; y += 8)
+                            for (int x = 0; x < d.width; x += 8, seen++)
+                            {
+                                const u32 at = d.address + u32(y) * d.pitch + u32(x) * d.bpp;
+                                lit += (d.bpp == 4 ? (Read<u32>(at) & 0xffffff) : Read<u16>(at)) != 0;
+                            }
+                    Log("stats: the picture: %s at %#x, %dx%d, format %#x, pitch %u, %u%% of it not black%s",
+                        d.valid ? "shown" : "no mode set", d.address, d.width, d.height, d.format, d.pitch,
+                        seen ? lit * 100 / seen : 0, d.overlay.on ? ", with the video overlay on" : "");
+                    Log("stats: the last draws: %s", LastDrawsNote().c_str());
                 }
                 last_raster = raster, last_faults = faults, last_patched = patched;
                 last_frames = frames, last_draws = draws, last_calls = calls, last_methods = methods;

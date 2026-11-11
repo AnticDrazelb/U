@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
+#include <string>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -1507,6 +1509,41 @@ void RunParts(int parts, const std::function<void(int)>& fn)
     g_pool_done.wait(lock, [] { return g_pool_pending == 0; });
     g_pool_job = nullptr;
 }
+// The last few draws, for the stats line (what lands where: a picture that stays black says why)
+struct DrawNoteData
+{
+    u32 tris = 0, offscreen = 0, color = 0, tex_address = 0, tex_format = 0, tex_size = 0;
+    bool textured = false;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+};
+std::mutex g_notes_mutex;
+DrawNoteData g_notes[3];
+u32 g_notes_next = 0;
+
+template <class Tris> // the drawing function's own triangles
+void NoteDraw(const std::vector<ScreenVertex>& sv, const Tris& tris)
+{
+    DrawNoteData n;
+    n.tris = u32(tris.size());
+    bool first = true;
+    for (const auto& t : tris)
+        for (u32 v : t.v)
+        {
+            const ScreenVertex& x = sv[v];
+            if (first)
+                n.x0 = n.x1 = x.x, n.y0 = n.y1 = x.y, first = false;
+            n.x0 = std::min(n.x0, x.x), n.x1 = std::max(n.x1, x.x);
+            n.y0 = std::min(n.y0, x.y), n.y1 = std::max(n.y1, x.y);
+            if (!(x.x >= -4096 && x.x <= 8192 && x.y >= -4096 && x.y <= 8192)) // NaN too
+                n.offscreen++;
+        }
+    n.color = g_kelvin.Get(0x210);
+    n.textured = (g_kelvin.Get(0x1b0c) >> 30) & 1;
+    n.tex_address = g_kelvin.Get(0x1b00), n.tex_format = g_kelvin.Get(0x1b04), n.tex_size = g_kelvin.Get(0x1b1c);
+    std::lock_guard lock(g_notes_mutex);
+    g_notes[g_notes_next++ % 3] = n;
+}
+
 
 namespace {
 
@@ -1725,6 +1762,7 @@ void Flush()
         }
     }
     const std::vector<ScreenVertex>& sv = *source;
+    NoteDraw(sv, tris);
     PreparePixels();
     // On the GPU when it's on and does this state: the triangles the rasterizer would draw (culled
     // and zero-area ones left out as Triangle leaves them), as screen-space vertices. (Not while
@@ -1919,6 +1957,28 @@ void DrawMethod(u32 method, u32 parameter)
         return;
     }
     (void)k;
+}
+
+std::string LastDrawsNote()
+{
+    std::lock_guard lock(g_notes_mutex);
+    std::string out;
+    for (u32 k = 0; k < 3 && k < g_notes_next; k++)
+    {
+        const DrawNoteData& n = g_notes[(g_notes_next - 1 - k) % 3];
+        char b[220];
+        std::snprintf(b, sizeof(b), "%s%u triangles over (%.0f,%.0f)-(%.0f,%.0f)%s into %#x%s", k ? "; " : "", n.tris, n.x0,
+                      n.y0, n.x1, n.y1, n.offscreen ? " (some far off or not numbers)" : "", n.color,
+                      n.textured ? "" : ", untextured");
+        out += b;
+        if (n.textured)
+        {
+            std::snprintf(b, sizeof(b), ", texture 0 at %#x format %#x (colour %#x) %ux%u", n.tex_address, n.tex_format,
+                          (n.tex_format >> 8) & 0xff, n.tex_size >> 16, n.tex_size & 0xffff);
+            out += b;
+        }
+    }
+    return out.empty() ? "none" : out;
 }
 
 } // namespace xb

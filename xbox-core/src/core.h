@@ -267,6 +267,7 @@ struct DisplayInfo
 };
 u32 Nv2aPvideo(u32 reg); // a PVIDEO register (offset within PVIDEO), whichever NV2A runs
 DisplayInfo GetDisplay();
+std::string LastDrawsNote(); // draw.cpp: the last draws of xbox-core's NV2A (where they land), for the log
 u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);
 // Input: the Xbox controller on USB port 1 (usb.cpp). Buttons (digital): 0x01 up, 0x02 down,
