@@ -61,6 +61,29 @@ static VOID NTAPI up_dpc(PKDPC dpc, PVOID context, PVOID a, PVOID b)
     up_delta = spin_counter - c0;
 }
 
+// interrupts at dispatch level: the AC'97's PCM out box, an interrupt at each 10 ms buffer, whose
+// routine counts it and queues a DPC (which can't run while the test is at dispatch level)
+static volatile LONG ac97_isrs;
+static KDPC ac97_dpc;
+static VOID NTAPI ac97_dpc_routine(PKDPC dpc, PVOID context, PVOID a, PVOID b)
+{
+    (void)dpc; (void)context; (void)a; (void)b;
+}
+static BOOLEAN NTAPI ac97_isr(PKINTERRUPT interrupt, PVOID context)
+{
+    (void)interrupt; (void)context;
+    volatile USHORT *sr = (volatile USHORT *)0xfec00116;
+    volatile UCHAR *civ = (volatile UCHAR *)0xfec00114, *lvi = (volatile UCHAR *)0xfec00115;
+    const USHORT status = *sr;
+    if (!(status & 0x1c))
+        return FALSE;
+    *sr = status & 0x1c;
+    *lvi = (UCHAR)((*civ + 30) & 31); // keep it running
+    ac97_isrs++;
+    KeInsertQueueDpc(&ac97_dpc, NULL, NULL);
+    return TRUE;
+}
+
 static int apc_calls;
 static DWORD apc_error, apc_bytes;
 static VOID WINAPI on_read_done(DWORD error, DWORD bytes, LPOVERLAPPED overlapped)
@@ -426,6 +449,38 @@ int main(void)
         DbgPrint("  a spinning thread counted %ld during a 3 ms DPC (%ld before it, %ld after)\n", (long)up_delta,
                  (long)before, (long)(after - before));
         check("a DPC runs with every other thread held (one processor)", up_delta == 0 && before > 0 && after > before);
+    }
+    {
+        // a box of 32 buffers of 480 silent frames (960 samples), each with an interrupt
+        ULONG *bd = MmAllocateContiguousMemoryEx(32 * 8, 0, 0x3ffffff, 4096, PAGE_READWRITE);
+        short *pcm = MmAllocateContiguousMemoryEx(960 * 2, 0, 0x3ffffff, 4096, PAGE_READWRITE);
+        memset(pcm, 0, 960 * 2);
+        for (int i = 0; i < 32; i++)
+            bd[i * 2] = MmGetPhysicalAddress(pcm), bd[i * 2 + 1] = 0x80000000u | 960;
+        KeInitializeDpc(&ac97_dpc, ac97_dpc_routine, NULL);
+        KIRQL irql;
+        const ULONG vector = HalGetInterruptVector(6, &irql);
+        static KINTERRUPT ac97_interrupt;
+        KeInitializeInterrupt(&ac97_interrupt, ac97_isr, NULL, vector, irql, LevelSensitive, TRUE);
+        KeConnectInterrupt(&ac97_interrupt);
+        volatile UCHAR *cr = (volatile UCHAR *)0xfec0011b;
+        *cr = 2; // reset
+        *(volatile ULONG *)0xfec00110 = MmGetPhysicalAddress(bd);
+        *(volatile UCHAR *)0xfec00115 = 31;
+        *cr = 0x11; // run, an interrupt at each buffer's end
+        LARGE_INTEGER w = {.QuadPart = ms(50)};
+        KeDelayExecutionThread(KernelMode, FALSE, &w);
+        const LONG c0 = ac97_isrs;
+        const KIRQL old = KeRaiseIrqlToDpcLevel();
+        const ULONG t0 = KeTickCount;
+        while (KeTickCount - t0 < 150)
+            ;
+        const LONG during = ac97_isrs - c0;
+        KfLowerIrql(old);
+        *cr = 0;
+        KeDisconnectInterrupt(&ac97_interrupt);
+        DbgPrint("  AC'97 interrupts: %ld before, %ld in 150 ms at dispatch level\n", (long)c0, (long)during);
+        check("interrupt routines run while a thread is at dispatch level (its DPCs wait)", c0 > 0 && during >= 8);
     }
 
     // a user APC, run by an alertable wait

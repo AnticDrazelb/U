@@ -66,6 +66,32 @@ public:
         owner_ = me;
         count_ = 1;
     }
+    // without waiting: false if another thread holds it
+    bool TryAcquire()
+    {
+        GuestThread* me = CurrentThread();
+        std::lock_guard lock(m_);
+        if (owner_ != me && owner_ != nullptr)
+            return false;
+        owner_ = me;
+        count_++;
+        return true;
+    }
+    // taken without its owner letting go (held off too long): logged, as Acquire's timeout
+    void Override()
+    {
+        GuestThread* me = CurrentThread();
+        std::lock_guard lock(m_);
+        if (owner_ == me || owner_ == nullptr)
+        {
+            owner_ = me;
+            count_++;
+            return;
+        }
+        if (timeouts_++ < 20)
+            Log("devices: %s held too long by another thread: going on without it", name_);
+        unowned_[me]++;
+    }
     void Release()
     {
         GuestThread* me = CurrentThread();
@@ -176,8 +202,35 @@ const Device* Find(u32 address)
     return nullptr;
 }
 
+// DPCs queued while another thread is at dispatch level wait for it to lower its level, as on the
+// console (where interrupt routines still run meanwhile: the interrupt thread goes on with them);
+// since when they have waited (none: zero), and past 250 ms they run anyway (logged)
+std::chrono::steady_clock::time_point g_dpcs_held_since{};
+
 void RunDpcs(GuestThread* t)
 {
+    {
+        std::lock_guard lock(g_irq_mutex);
+        if (g_dpcs.empty())
+        {
+            g_dpcs_held_since = {};
+            return;
+        }
+    }
+    if (!g_dispatch_level.TryAcquire())
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_dpcs_held_since == std::chrono::steady_clock::time_point{})
+            g_dpcs_held_since = now;
+        if (now - g_dpcs_held_since < std::chrono::milliseconds(250))
+            return; // left queued
+        g_dispatch_level.Override();
+    }
+    g_dpcs_held_since = {};
+    struct Held
+    {
+        ~Held() { g_dispatch_level.Release(); }
+    } held;
     for (;;)
     {
         u32 dpc;
@@ -201,13 +254,14 @@ void RunDpcs(GuestThread* t)
             }
         } done;
         // DeferredRoutine(Dpc, DeferredContext, SystemArgument1, SystemArgument2), at dispatch level
-        SetIrql(2);
+        // (held above)
+        Write<u8>(t->kpcr + kpcr::Irql, 2);
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 1);
         StopGuestThreads(t); // DPCs too run before any thread at normal level goes on
         CallGuest(t, Read<u32>(dpc + 12), {dpc, Read<u32>(dpc + 16), Read<u32>(dpc + 20), Read<u32>(dpc + 24)});
         ResumeGuestThreads();
         Write<u32>(t->kpcr + kpcr::DpcRoutineActive, 0);
-        SetIrql(0);
+        Write<u8>(t->kpcr + kpcr::Irql, 0);
     }
 }
 
@@ -487,8 +541,12 @@ void StartVblank()
         {
             {
                 std::unique_lock lock(g_irq_mutex);
-                g_irq_cv.wait_until(lock, next, [] {
-                    if (!g_dpcs.empty() || g_quit)
+                // DPCs held off by a thread at dispatch level: looked at again each millisecond
+                const bool held = g_dpcs_held_since != std::chrono::steady_clock::time_point{};
+                const auto until = held ? std::min(next, std::chrono::steady_clock::now() + std::chrono::milliseconds(1))
+                                        : next;
+                g_irq_cv.wait_until(lock, until, [held] {
+                    if ((!g_dpcs.empty() && !held) || g_quit)
                         return true;
                     for (u32 i : g_interrupts)
                         if (g_lines & (1u << (Read<u32>(i + 8) & 31)))
