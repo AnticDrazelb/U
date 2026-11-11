@@ -355,6 +355,10 @@ void MixApuSound(const s16* samples, size_t frames)
 }
 
 std::atomic<u64> g_audio_dry{0};
+} // namespace xb
+extern "C" float xb_apu_utilization(void);
+extern "C" int xb_apu_voices(void);
+namespace xb {
 
 std::string SoundStats(double seconds)
 {
@@ -366,11 +370,13 @@ std::string SoundStats(double seconds)
         apu_queued = g_apu_fill;
     }
     const size_t device = g_audio_queued ? g_audio_queued() : 0;
-    char out[400];
+    char out[480];
     std::snprintf(out, sizeof(out),
-                  "the APU made %.0f%% of real time's sound (loudest %d%%), %.1f ms queued for the mixer, short of it "
+                  "the APU made %.0f%% of real time's sound (busy %.0f%% of the time, %d voices; loudest %d%%), %.1f ms "
+                  "queued for the mixer, short of it "
                   "%llu of %llu times; %.0f%% of real time to the output (the AC'97's loudest %d%%)%s",
-                  100.0 * double(in - last_in) / 48000.0 / seconds, g_apu_peak.exchange(0) * 100 / 32768,
+                  100.0 * double(in - last_in) / 48000.0 / seconds, 100.0 * xb_apu_utilization(), xb_apu_voices(),
+                  g_apu_peak.exchange(0) * 100 / 32768,
                   apu_queued / 48.0, (unsigned long long)(shorts - last_short), (unsigned long long)(ticks - last_ticks),
                   100.0 * double(sink - last_sink) / 48000.0 / seconds, g_ac97_peak.exchange(0) * 100 / 32768,
                   g_audio_queued ? (", " + std::to_string(int(device / 48.0)) + " ms in the device, which ran dry " +

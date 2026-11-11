@@ -389,6 +389,18 @@ void xb_mcpx_apu_init(uint8_t *ram_ptr)
     qemu_mutex_unlock(&d->lock);
 }
 
+/* xbox-core: for xbox-core's stats line: the share of real time the frame thread spent making
+ * frames over the last second (xemu's utilization: at 1 it can't keep up) and the voices it mixed */
+float xb_apu_utilization(void) { return g_dbg.utilization; }
+int xb_apu_voices(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_dbg.vp.num_workers && i < MAX_VOICE_WORKERS; i++) {
+        n += g_dbg.vp.workers[i].num_voices;
+    }
+    return n;
+}
+
 uint64_t xb_mcpx_apu_read(hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = g_state;

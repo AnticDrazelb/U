@@ -59,6 +59,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
+    d->vp.filters[v].lag_primed = false; /* xbox-core: the Lagrange interpolator's too */
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -1217,11 +1218,96 @@ static long voice_resample_callback(void *cb_data, float **data)
     return sample_count;
 }
 
+/* xbox-core: an 8-point Lagrange interpolator in place of libsamplerate's sinc converter. The sinc
+ * was most of the voice processor's time (half of a fast desktop core for 48 voices; more than the
+ * PS4's cores have); this is a few dozen operations a sample. xemu's PR #3105 reports the console's
+ * own resampling as 8-point Lagrange (measured on hardware). The input comes from
+ * voice_resample_callback, as libsamplerate's did; `rate` is libsamplerate's output/input ratio. */
+static int voice_resample_lagrange(MCPXAPUVoiceFilter *filter, float samples[][2],
+                                   int requested_num, float rate)
+{
+    float (*buf)[2] = filter->lag_buf;
+    const int cap = (int)(sizeof(filter->lag_buf) / sizeof(filter->lag_buf[0]));
+    if (!filter->lag_primed) {
+        /* three frames of silence before the first: the first output is the first input */
+        memset(filter->lag_buf, 0, sizeof(filter->lag_buf));
+        filter->lag_len = 3;
+        filter->lag_pos = 3.0;
+        filter->lag_primed = true;
+    }
+    const double step = rate > 0 ? 1.0 / rate : 1.0;
+    /* the nodes -3..4 around the position, and 1 / prod_{j != k} (x_k - x_j) */
+    static const float inv_den[8] = {
+        -1.0f / 5040.0f, 1.0f / 720.0f, -1.0f / 240.0f, 1.0f / 144.0f,
+        -1.0f / 144.0f, 1.0f / 240.0f, -1.0f / 720.0f, 1.0f / 5040.0f,
+    };
+    for (int n = 0; n < requested_num; n++) {
+        int i0 = (int)filter->lag_pos;
+        while (i0 + 4 >= filter->lag_len) {
+            /* more input: the frames before i0 - 3 aren't needed any more (with a step beyond
+             * what is held, up to 256 frames at 8 octaves up, all of it: the input is skipped) */
+            int drop = i0 - 3;
+            if (drop > filter->lag_len) {
+                drop = filter->lag_len;
+            }
+            if (drop > 0) {
+                memmove(buf, buf + drop, (size_t)(filter->lag_len - drop) * sizeof(buf[0]));
+                filter->lag_len -= drop;
+                filter->lag_pos -= drop;
+                i0 -= drop;
+            }
+            float *in = NULL;
+            long got = voice_resample_callback(filter, &in);
+            if (got <= 0 || !in) {
+                return n ? n : -1;
+            }
+            if (got > cap - filter->lag_len) {
+                got = cap - filter->lag_len;
+            }
+            memcpy(buf + filter->lag_len, in, (size_t)got * sizeof(buf[0]));
+            filter->lag_len += (int)got;
+        }
+        const float t = (float)(filter->lag_pos - i0);
+        float pre[8], suf[8];
+        float acc = 1.0f;
+        for (int k = 0; k < 8; k++) {
+            pre[k] = acc;
+            acc *= t - (float)(k - 3);
+        }
+        acc = 1.0f;
+        for (int k = 7; k >= 0; k--) {
+            suf[k] = acc;
+            acc *= t - (float)(k - 3);
+        }
+        float l = 0, r = 0;
+        for (int k = 0; k < 8; k++) {
+            const float w = pre[k] * suf[k] * inv_den[k];
+            l += w * buf[i0 - 3 + k][0];
+            r += w * buf[i0 - 3 + k][1];
+        }
+        samples[n][0] = l;
+        samples[n][1] = r;
+        filter->lag_pos += step;
+    }
+    return requested_num;
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+
+    /* xbox-core: the Lagrange interpolator (XB_APU_SINC=1: libsamplerate's sinc, as xemu) */
+    static int use_sinc = -1;
+    if (use_sinc < 0) {
+        const char *e = getenv("XB_APU_SINC");
+        use_sinc = e && e[0] == '1';
+    }
+    if (!use_sinc) {
+        filter->voice = v;
+        return voice_resample_lagrange(filter, samples, requested_num, rate);
+    }
 
     if (filter->resampler == NULL) {
         filter->voice = v;
@@ -1803,7 +1889,40 @@ voice_work_dispatch(MCPXAPUState *d,
 
     qemu_mutex_lock(&vwd->lock);
 
-    if (vwd->queue_len) {
+    /* xbox-core: a frame of few voices is mixed here, in list order (the order multipass voices
+     * need), not handed to the workers: waking them and waiting for them, 1500 times a second, cost
+     * more than the mixing (48 voices: 28% of a desktop core with them, 16% here; the PS4's are
+     * slower). XB_APU_INLINE: how few (64). */
+    static int inline_voices = -1;
+    if (inline_voices < 0) {
+        const char *e = getenv("XB_APU_INLINE");
+        inline_voices = e ? atoi(e) : 64;
+    }
+    if (vwd->queue_len && (vwd->queue_len <= inline_voices || vwd->num_workers <= 1)) {
+        static float inline_sample_buf[NUM_SAMPLES_PER_FRAME][2];
+        memset(vwd->mixbins, 0, sizeof(vwd->mixbins));
+        memset(inline_sample_buf, 0, sizeof(inline_sample_buf));
+        for (int i = 0; i < vwd->queue_len; i++) {
+            voice_process(d, vwd->mixbins, inline_sample_buf, vwd->queue[i].voice,
+                          vwd->queue[i].list);
+        }
+        g_dbg.vp.workers[0].num_voices = vwd->queue_len;
+        for (int i = 1; i < vwd->num_workers; i++) {
+            g_dbg.vp.workers[i].num_voices = 0;
+        }
+        vwd->queue_len = 0;
+        for (int b = 0; b < NUM_MIXBINS; b++) {
+            for (int s = 0; s < NUM_SAMPLES_PER_FRAME; s++) {
+                mixbins[b][s] += vwd->mixbins[b][s];
+            }
+        }
+        if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                d->vp.sample_buf[i][0] += inline_sample_buf[i][0];
+                d->vp.sample_buf[i][1] += inline_sample_buf[i][1];
+            }
+        }
+    } else if (vwd->queue_len) {
         memset(vwd->mixbins, 0, sizeof(vwd->mixbins));
 
         // Signal workers and wait for completion

@@ -35,7 +35,10 @@
 typedef struct {
     int buf_pos;
     struct {
-        float buf[HRTF_BUFLEN];
+        /* xbox-core: the ring twice over (each sample stored at p and p + HRTF_BUFLEN), so a tap
+         * reads buf[p + HRTF_BUFLEN - delay] with no modulo: the same samples, without the two
+         * divisions a tap took (the voice processor's most expensive loop) */
+        float buf[2 * HRTF_BUFLEN];
         float hrir_coeff_cur[HRTF_NUM_TAPS];
         float hrir_coeff_tar[HRTF_NUM_TAPS];
     } ch[2];
@@ -111,6 +114,7 @@ static inline void hrtf_filter_process(HrtfFilter *f,
 
             // Push new sample
             buf[f->buf_pos] = in[n][ch];
+            buf[f->buf_pos + HRTF_BUFLEN] = in[n][ch];
 
             // Interaural time difference (channel delay)
             float d = f->itd_cur * (ch == 0 ? +1.0f : -1.0f);
@@ -122,16 +126,20 @@ static inline void hrtf_filter_process(HrtfFilter *f,
 
             // HRIR Convolution
             float acc = 0.0f;
-            for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
-                float s = buf[idx1];
-
-                // Linear interpolation for fractional part
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
-                    s = s * (1 - dfrac) + buf[idx2] * dfrac;
+            /* xbox-core: idx1 = buf_pos + BUFLEN - di - k is in [1, 2 * BUFLEN) (di <= 42, k <= 30),
+             * the mirror of (buf_pos - di - k) mod BUFLEN; idx1 - 1 that of idx2 */
+            const float *base = buf + f->buf_pos + HRTF_BUFLEN - di;
+            if (dfrac > 0.0f) {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float s = base[-k];
+                    // Linear interpolation for fractional part
+                    s = s * (1 - dfrac) + base[-k - 1] * dfrac;
+                    acc += coeff[k] * s;
                 }
-                acc += coeff[k] * s;
+            } else {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    acc += coeff[k] * base[-k];
+                }
             }
 
             out[n][ch] = acc;

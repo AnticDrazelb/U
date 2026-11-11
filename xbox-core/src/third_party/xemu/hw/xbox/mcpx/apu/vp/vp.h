@@ -44,6 +44,12 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    /* xbox-core: the 8-point Lagrange interpolator that stands in for libsamplerate's sinc (see
+     * voice_resample): the voice's input frames from 3 before the position to those after it */
+    float lag_buf[NUM_SAMPLES_PER_FRAME + 16][2];
+    int lag_len;
+    double lag_pos;
+    bool lag_primed;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;

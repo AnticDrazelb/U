@@ -27,6 +27,11 @@ using namespace xb;
 
 u32 Phys(u64 address, u32 bytes)
 {
+    // the contiguous memory (all of the RAM, physically from 0) is always mapped: no lookup (the
+    // APU reads every sample of every voice through here)
+    const u32 p = u32(address) & 0x0fffffff;
+    if (p < kContiguousSize && p + bytes <= kContiguousSize)
+        return kContiguousBase + p;
     const u32 g = PhysToGuest(u32(address));
     return g && GuestMapped(g, bytes) ? g : 0;
 }
