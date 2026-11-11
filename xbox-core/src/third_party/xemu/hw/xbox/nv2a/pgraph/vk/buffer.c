@@ -145,7 +145,15 @@ void pgraph_vk_init_buffers(NV2AState *d)
         .buffer_size = r->storage_buffers[BUFFER_UNIFORM].buffer_size,
     };
 
+    /* xbox-core: XB_VK_FAIL_BUFFER=n makes buffer n's allocation fail (tests the fallback) */
+    const char *fail = getenv("XB_VK_FAIL_BUFFER");
     for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (fail && atoi(fail) == i) {
+            r->storage_buffers[i].allocation = VK_NULL_HANDLE;
+            r->storage_buffers[i].buffer = VK_NULL_HANDLE;
+            xb_xemu_log("vulkan: buffer %d made to fail (XB_VK_FAIL_BUFFER)", i);
+            continue;
+        }
         create_buffer(pg, &r->storage_buffers[i]);
         /* xbox-core: what the driver gave, for the log (a start-up that fails says where) */
         xb_xemu_log("vulkan: buffer %d, %zu MiB (%s): %s", i,

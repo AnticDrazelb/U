@@ -1906,9 +1906,44 @@ void Flush()
 
 } // namespace
 
+// The fixed function's state is in the transform engine's context, the same 192 rows a vertex program
+// reads as constants (the NV2A's XF context, as xemu has it: NV_IGRAPH_XF_XFCTX_*): the matrices, the
+// texgen planes, the fog plane, the eye position, the viewport's scale and offset. A program reads
+// them there: Direct3D ends every vertex shader with the viewport (c[-38], c[-37]: VPSCL and VPOFF).
+void MirrorToContext(u32 method, u32 parameter)
+{
+    int row = -1, column = 0;
+    auto matrices = [&](u32 base, u32 count, int first_row, int rows_apart) {
+        if (method < base || method >= base + count * 64)
+            return false;
+        const u32 slot = (method - base) / 4, matrix = slot / 16, entry = slot % 16;
+        row = first_row + int(matrix) * rows_apart + int(entry / 4), column = int(entry % 4);
+        return true;
+    };
+    auto vector = [&](u32 base, int to_row) {
+        if (method < base || method >= base + 16)
+            return false;
+        row = to_row, column = int((method - base) / 4);
+        return true;
+    };
+    if (matrices(0x440, 1, 0x04, 0) ||       // SET_PROJECTION_MATRIX: PMAT0
+        matrices(0x480, 4, 0x08, 8) ||       // SET_MODEL_VIEW_MATRIX: MMAT0..3
+        matrices(0x580, 4, 0x0c, 8) ||       // SET_INVERSE_MODEL_VIEW_MATRIX: IMMAT0..3
+        matrices(0x680, 1, 0x00, 0) ||       // SET_COMPOSITE_MATRIX: CMAT0
+        matrices(0x6c0, 4, 0x44, 8) ||       // SET_TEXTURE_MATRIX: T0MAT..
+        matrices(0x840, 4, 0x40, 8) ||       // SET_TEXGEN_PLANE_S..Q: TG0MAT..
+        vector(0x9d0, 0x39) ||               // SET_FOG_PLANE: FOG
+        vector(0xa20, 0x3b) ||               // SET_VIEWPORT_OFFSET: VPOFF
+        vector(0xa50, 0x38) ||               // SET_EYE_POSITION: EYEP
+        vector(0xaf0, 0x3a))                 // SET_VIEWPORT_SCALE: VPSCL
+        std::memcpy(&g_constants[row][column], &parameter, 4);
+}
+
 void DrawMethod(u32 method, u32 parameter)
 {
     KelvinState& k = g_kelvin;
+    if (method >= 0x440 && method < 0xb00)
+        MirrorToContext(method, parameter);
     if (method >= 0xb00 && method < 0xb80) // SET_TRANSFORM_PROGRAM: the cursor's instruction, word by word
     {
         const u32 word = (method - 0xb00) / 4 % 4;

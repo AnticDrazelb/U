@@ -578,7 +578,7 @@ void InitNv2a()
         }
         if (!ok)
         {
-            Log("nv2a: xemu's renderer didn't start (no usable Vulkan device): xbox-core's own NV2A");
+            Log("nv2a: xemu's renderer didn't start (why: the xemu line before): xbox-core's own NV2A");
             g_xemu_nv2a = false;
         }
     }
