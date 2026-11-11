@@ -1084,8 +1084,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     hwaddr addr = segment_offset + linear_addr;
                     int max_seg_byte = (seg_len >> 6) * block_size;
                     assert(linear_addr + block_size <= max_seg_byte);
-                    memcpy(adpcm_block, &d->ram_ptr[addr],
-                           block_size); // FIXME: Use idiomatic DMA function
+                    /* xbox-core: through the bus, as the other reads: a packet need not be in the
+                     * contiguous memory (the RAM the program's image and heap are in has its own
+                     * physical addresses here), and what isn't memory reads as 0 */
+                    xb_phys_read(addr, adpcm_block, block_size);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;

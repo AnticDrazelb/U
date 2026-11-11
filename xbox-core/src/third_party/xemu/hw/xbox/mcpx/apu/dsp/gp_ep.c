@@ -70,24 +70,13 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
             bytes_to_copy = len;
         }
 
-        assert(paddr + bytes_to_copy < memory_region_size(d->ram));
-        if (paddr + bytes_to_copy > memory_region_size(d->ram)) { /* xbox-core: checked */
-            if (!dir) {
-                memset(ptr, 0, bytes_to_copy);
-            }
-            ptr += bytes_to_copy;
-            len -= bytes_to_copy;
-            page_entry += 1;
-            bytes_to_copy = TARGET_PAGE_SIZE;
-            offset_in_page = 0;
-            continue;
-        }
-
+        /* xbox-core: through the bus: any of the RAM (the contiguous memory, or the RAM the
+         * program's image and heap are in, which has its own physical addresses here); what
+         * isn't memory reads as 0 and takes no writes */
         if (dir) {
-            memcpy(&d->ram_ptr[paddr], ptr, bytes_to_copy);
-            memory_region_set_dirty(d->ram, paddr, bytes_to_copy);
+            xb_phys_write(paddr, ptr, bytes_to_copy);
         } else {
-            memcpy(ptr, &d->ram_ptr[paddr], bytes_to_copy);
+            xb_phys_read(paddr, ptr, bytes_to_copy);
         }
 
         ptr += bytes_to_copy;

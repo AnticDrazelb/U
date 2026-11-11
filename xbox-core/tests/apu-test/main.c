@@ -4,6 +4,7 @@
 //   voice 101: the same buffer an octave down (pitch -4096: 500 Hz) at -6 dB (amplitude 0.25)
 //   voice 103: a 2 kHz sine (amplitude 0.25) in IMA ADPCM, encoded here, looped
 //   voice 104: a 3 kHz sine (amplitude 0.25) streamed: two segments in each of SSL A and B
+//   voice 105: a 4 kHz sine (amplitude 0.25) streamed in ADPCM from the program's own memory
 // Checked here (DbgPrint PASS/FAIL): the global sample count runs at 48 kHz; voice 102, a short
 // buffer that doesn't loop, ends and writes its notifier.
 #include <hal/debug.h>
@@ -165,6 +166,34 @@ int main(void)
     METHOD(0x35c, 0x42 << 8 | 2);               // SSL B: entries 0x42, 0x43
     METHOD(0x120, 1 << 16);
     METHOD(0x124, 104);
+
+    // voice 105: an ADPCM stream whose packets are in the program's own memory (its image, not
+    // the contiguous memory), as DirectSound's clients hand it packets from their heaps: 603 cycles
+    // of a sine (4002 Hz) in a segment of 113 blocks (7232 samples, 4068 bytes: one page), in each
+    // of the four segments
+    {
+        static unsigned char packet[4096] __attribute__((aligned(4096)));
+        static short wave[113 * 64 + 1];
+        sine_table(wave, 113 * 64 + 1, 603.0f * 48000.0f / (113 * 64), 0.25f);
+        encode_adpcm(wave, 113, packet);
+        METHOD(0x190, 0x44); // SET_CURRENT_SSL: entries from 0x44
+        for (int i = 0; i < 4; i++)
+        {
+            METHOD(0x600 + i * 8, MmGetPhysicalAddress(packet));
+            METHOD(0x604 + i * 8, 113 * 64 | 2 << 16); // length, ADPCM, mono
+        }
+        METHOD(0x2f8, 105);
+        METHOD(0x300, 0 | 1 << 5 | 31 << 10 | 31 << 16 | 31 << 21 | 31 << 26);
+        METHOD(0x304, 1u << 28 | 2u << 30 | 1u << 24 | 1u << 23 | 31 | 31 << 5); // ADPCM, stream, persist
+        METHOD(0x360, 0x000f000f);
+        METHOD(0x364, 0xffffffff);
+        METHOD(0x368, 0xffffffff);
+        METHOD(0x37c, 0);
+        METHOD(0x320, 0x44 << 8 | 2); // SSL A: entries 0x44, 0x45
+        METHOD(0x35c, 0x46 << 8 | 2); // SSL B: entries 0x46, 0x47
+        METHOD(0x120, 1 << 16);
+        METHOD(0x124, 105);
+    }
 
     Sleep(400);
     // voice 102's notifier: the first of its four, 16 bytes each after two
