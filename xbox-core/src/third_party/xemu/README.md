@@ -19,6 +19,16 @@ Changes for xbox-core:
 - `shim/`: what the code uses of QEMU, glib and SDL: threads on pthreads, atomics, the clock, guest
   physical memory and the interrupt line through xbox-core (`src/apu.cpp`), trace points compiled out.
 - Settings: xemu's defaults (its DSP option off, HRTF on), two voice workers.
+- The front end's trap (`apu.c`, `vp/vp.c`; 2026-11-11): FETINTSTS latched once where the idle-voice
+  trap is taken (xemu re-derived it from FECTL, so DirectSound's acknowledgement before resuming the
+  front end brought it back and the next delivery replayed a released voice); one idle voice trapped
+  on at a time, after the frame, under the big lock, a declined one giving way to the next; methods
+  written while the front end is trapped or halted queued until it runs (PIO_FREE reports the room);
+  an idle voice with the trap not forced skipped (xemu asserted).
+- `monitor.c`: the frame thread paced by what xbox-core's mixer holds of its sound (xemu's throttle()
+  with its SDL stream), 4 to 6 EP frames ahead.
+- `nv2a/pgraph/vk/buffer.c`: buffers for the largest single draw (inline vertices 128 MiB, indices
+  16 MiB), not xemu's ten and hundred of them (the PS4's GPU memory).
 
 ## Also taken whole since (see docs-xemu-port.md)
 - `hw/xbox/mcpx/nvnet`: the network adapter (link down: no network behind it).
