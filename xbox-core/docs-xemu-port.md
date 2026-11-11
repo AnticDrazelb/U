@@ -20,6 +20,25 @@ neither fast enough on the PS4 nor available.
   thread, the big lock, memory regions with page-hash dirty tracking, VGA registers, DMA, iovecs),
   `src/xemu_glue.cpp` (guest physical memory, block DMA, IRQ lines, settings, the log).
 
+## Changed in xemu's APU for the console's behaviour (2026-11-11)
+Halo died in DirectSound's interrupt routine (ISTS 0x11, a null voice object at 0x1958d2): xemu ORs
+FETINTSTS back into ISTS while FECTL reads trapped, and DirectSound acknowledges ISTS before it lets
+the front end run, so the next delivery replayed a trap whose voice was gone. Now (marked xbox-core:
+in apu.c, vp/vp.c, monitor.c; the same findings as other projects running the XDK's DirectSound):
+- FETINTSTS latched once where the idle-voice trap is taken; one idle voice trapped on at a time,
+  after the frame, under the big lock; a voice the routine declined gives way to the next.
+- Front-end methods written while it is trapped or halted wait in a FIFO and run when it runs again;
+  PIO_FREE reports the room left. An idle voice with the trap not forced is skipped (xemu asserted).
+- The frame thread paced by what the mixer has queued (xemu's throttle() with its SDL stream).
+Tests: tests/apu-trap-test (16 replays before, none now), the APU test's sound through a simulated
+console device (XB_WAV_DEVICE=1), both in the regression set.
+
+## The Xbox's single processor (2026-11-11)
+Interrupt routines and DPCs run with every other guest thread held (StopGuestThreads: the sample
+signal holds a thread in guest code where it is; others are held before they go back into guest
+code). IRQL holds DPCs off at dispatch level and routines above it; KeSynchronizeExecution runs its
+routine at the interrupt's level. DirectSound's voice lists depend on both.
+
 ## Kept, and why
 - AC97: xemu's (QEMU's ac97.c) never transfers the S/PDIF box (index 7) and has no nForce bit 4
   (NVSPINT, 0x10) in GLOB_STA: exactly what got Halo past DirectSound's 11.8M-read wait (a51ebcb).
@@ -45,6 +64,11 @@ neither fast enough on the PS4 nor available.
 - One job of the comparison ended silently once (in Vertex_shader_swizzle_tests, which passes 29/29
   alone): not reproduced; watch for it.
 
+
+## xemu's renderer on the PS4 (2026-11-11)
+Its buffers were sized for a PC (about 4.6 GiB: ten largest inline batches staged twice, 100 index
+batches): now the largest single draw (128 MiB inline, 16 MiB of indices, 128 MiB compute), about
+0.75 GiB. The step file covers its start-up and its first half minute of drawing.
 
 ## Verified before shipping (2026-11-10, commit 6ab6dee)
 - Regression 13/13 normally, with XB_TEST_FS_AS_PS4=1, and with XB_USB=own / XB_NV2A=own.
