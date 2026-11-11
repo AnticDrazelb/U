@@ -359,6 +359,10 @@ void WriteState(Out fd)
                 const u32 a = g[r] & ~3u;
                 if (a < 0x10000 || !GuestMapped(a, 32))
                     continue;
+                // in the stacks' area only within a thread's stack (between them: guard pages)
+                if (a >= kStackBase && a < kStackBase + kStackAreaSize &&
+                    (!ThreadByStack(a) || ThreadByStack(a) != ThreadByStack(a + 31)))
+                    continue;
                 Put(fd, "      [%s %#x]:", kNames[r], a);
                 for (u32 w = 0; w < 8; w++)
                     Put(fd, " %08x", Read<u32>(a + w * 4));
@@ -602,6 +606,7 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                     for (u32 i = 0; i < count; i++)
                         if (GuestThread* t = g_threads[i]; t && t->host.load())
                             t->samples.store(0);
+                    g_sampling = 1; // the handler notes where each signalled thread is (not for holds)
                     for (int k = 0; k < 32; k++)
                     {
                         for (u32 i = 0; i < count; i++)
@@ -609,6 +614,7 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                                 platform::SendSample(t->host.load());
                         std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     }
+                    g_sampling = 0;
                 }
                 const int fd = open(hang_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd >= 0)

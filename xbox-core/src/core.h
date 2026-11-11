@@ -202,6 +202,7 @@ void StartHostThread(GuestThread* t, std::function<void()> body);
 // every other guest thread that runs guest code where it is (at its next instruction, through the
 // sample signal), and the others before they go back into guest code, until ResumeGuestThreads.
 void StopGuestThreads(GuestThread* self);
+extern std::atomic<int> g_sampling; // the watchdog samples where threads are (the sample signal notes it)
 void ResumeGuestThreads();
 // The guest address of the stub that calls kernel export `ordinal`.
 u32 ExportStub(u32 ordinal);

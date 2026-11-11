@@ -40,6 +40,9 @@ u32 g_switch = 0; // the switch's copy below 4 GiB
 u32 g_stubs = 0;
 u16 g_sel32 = 0, g_sel64 = 0, g_ds = 0;
 thread_local GuestThread* tl_thread = nullptr;
+}
+std::atomic<int> g_sampling{0};
+namespace {
 
 // ---- the Xbox's single processor (StopGuestThreads): a generation, odd while the interrupt thread's
 // routine runs and the other guest threads are held
@@ -1084,7 +1087,7 @@ bool OnFault(platform::Fault& f)
     {
         // a sample of where a thread is: in guest code, its eip, registers and code are noted on its
         // GuestThread (plain stores, nothing fs-relative); anywhere else nothing. It resumes as it was.
-        if (f.cs == g_sel32)
+        if (f.cs == g_sel32 && g_sampling.load(std::memory_order_relaxed))
         {
             const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
             GuestThread* t = guest_fs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread))
