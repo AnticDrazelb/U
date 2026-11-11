@@ -1939,6 +1939,35 @@ void MirrorToContext(u32 method, u32 parameter)
         std::memcpy(&g_constants[row][column], &parameter, 4);
 }
 
+// The other way: a constant written into one of those rows is the fixed function's from then on (the
+// fixed function here reads the methods' copies): the method whose value that word is.
+void MirrorFromContext(u32 row, u32 column, u32 value)
+{
+    u32 method = 0;
+    auto matrix = [&](u32 first_row, u32 count, u32 rows_apart, u32 base) {
+        for (u32 m = 0; m < count; m++)
+            if (row >= first_row + m * rows_apart && row < first_row + m * rows_apart + 4)
+            {
+                method = base + m * 64 + ((row - first_row - m * rows_apart) * 4 + column) * 4;
+                return true;
+            }
+        return false;
+    };
+    if (matrix(0x00, 1, 0, 0x680) || matrix(0x04, 1, 0, 0x440) || matrix(0x08, 4, 8, 0x480) ||
+        matrix(0x0c, 4, 8, 0x580) || matrix(0x40, 4, 8, 0x840) || matrix(0x44, 4, 8, 0x6c0))
+        ;
+    else if (row == 0x39)
+        method = 0x9d0 + column * 4;
+    else if (row == 0x3b)
+        method = 0xa20 + column * 4;
+    else if (row == 0x38)
+        method = 0xa50 + column * 4;
+    else if (row == 0x3a)
+        method = 0xaf0 + column * 4;
+    if (method)
+        g_kelvin.regs[method / 4] = value;
+}
+
 void DrawMethod(u32 method, u32 parameter)
 {
     KelvinState& k = g_kelvin;
@@ -1956,7 +1985,10 @@ void DrawMethod(u32 method, u32 parameter)
     if (method >= 0xb80 && method < 0xc00) // SET_TRANSFORM_CONSTANT
     {
         if (g_constant_cursor < 192)
+        {
             std::memcpy(&g_constants[g_constant_cursor][g_constant_word], &parameter, 4);
+            MirrorFromContext(g_constant_cursor, g_constant_word, parameter);
+        }
         if (++g_constant_word == 4)
             g_constant_word = 0, g_constant_cursor++;
         return;
