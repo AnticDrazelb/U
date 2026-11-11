@@ -1539,6 +1539,34 @@ void InitKernel()
     } END;
 
     // ---- waits
+    // The calls a failing wait was made from: the return addresses on the guest's stack (values in the
+    // program's image just after a call), with the code before each (what set up its handles).
+    static auto log_callers = [](const Call& c) {
+        // from the call's own return address (just below its arguments) up
+        const u32 sp = u32(reinterpret_cast<uintptr_t>(&c.frame->args[0])) - 4;
+        int shown = 0;
+        for (u32 i = 0; i < 1024 && shown < 5; i++)
+        {
+            const u32 at = sp + i * 4;
+            if (!GuestMapped(at, 4))
+                break;
+            const u32 v = i == 0 ? c.frame->ret : Read<u32>(at);
+            if (v < g_xbe.base + 96 || v >= g_xbe.base + g_xbe.image_size || !GuestMapped(v - 96, 112))
+                continue;
+            if (!(Read<u8>(v - 5) == 0xe8 || Read<u8>(v - 2) == 0xff || Read<u8>(v - 3) == 0xff ||
+                  Read<u8>(v - 6) == 0xff || Read<u8>(v - 7) == 0xff))
+                continue;
+            std::string hex;
+            for (u32 a = v - 96; a < v + 16; a++)
+            {
+                char b[5];
+                std::snprintf(b, sizeof(b), a == v ? "|%02x" : " %02x", Read<u8>(a));
+                hex += b;
+            }
+            Log("  called from %#x (stack +%#x), the code before it:%s", v, i * 4, hex.c_str());
+            shown++;
+        }
+    };
     K(NtWaitForSingleObject) { const u32 o = WaitableOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(2)) : STATUS_INVALID_HANDLE; } END;
     K(NtWaitForSingleObjectEx) { const u32 o = WaitableOf(c.Arg(0)); return o ? WaitObjects({o}, false, c.Arg(3), c.Arg(2) & 0xff) : STATUS_INVALID_HANDLE; } END;
     K(NtWaitForMultipleObjectsEx)
@@ -1552,6 +1580,8 @@ void InitKernel()
                 static int told = 0;
                 if (told++ < 16)
                     Log("kernel: a wait on a handle that isn't open:%s", DescribeHandles(c.Arg(0), c.Arg(1)).c_str());
+                if (told <= 2)
+                    log_callers(c);
                 return STATUS_INVALID_HANDLE;
             }
             objects.push_back(o);

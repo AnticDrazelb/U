@@ -176,6 +176,26 @@ void CallEnded(GuestThread* t, u32 result)
         r.result = result;
         if (g_traced < kTraceCalls)
             Log("call %u< %s = %#x", t->id, Name(r.ordinal), result);
+        else if (result == 0)
+        {
+            // past the trace, the objects made all the same (the first 400), with their handles:
+            // which handle a later wait or close names, and who made it
+            static std::atomic<int> made{0};
+            const char* name = Name(r.ordinal);
+            static const char* const makers[] = {"NtCreateEvent", "NtCreateMutant", "NtCreateSemaphore", "NtCreateTimer",
+                                                 "NtCreateIoCompletion", "PsCreateSystemThreadEx", "NtDuplicateObject",
+                                                 "NtOpenSymbolicLinkObject", "ObOpenObjectByName"};
+            for (const char* m : makers)
+                if (std::strcmp(name, m) == 0)
+                {
+                    // the new handle: the first argument's (NtDuplicateObject: the second's)
+                    const u32 out = std::strcmp(name, "NtDuplicateObject") == 0 ? r.a1 : r.a0;
+                    if (made++ < 400 && GuestMapped(out, 4))
+                        Log("kernel: %s(%#x, %#x, %#x, %#x) from %#x made handle %#x (thread %u)", name, r.a0, r.a1, r.a2,
+                            r.a3, r.eip, Read<u32>(out), t->id);
+                    break;
+                }
+        }
         // an NTSTATUS error (nothing of the guest's is at 0xc0000000: no pointer looks like one)
         if (result >= 0xC0000000u && result < 0xC0010000u && g_failures_logged++ < 3000)
             Log("kernel: %s(%#x, %#x, %#x, %#x) from %#x failed: %#x", Name(r.ordinal), r.a0, r.a1, r.a2, r.a3, r.eip,

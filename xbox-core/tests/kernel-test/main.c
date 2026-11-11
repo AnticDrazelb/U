@@ -605,6 +605,10 @@ int main(void)
             DbgPrint("  waits: on a file %#x, on an event and a file %#x, on a directory %#x\n", (unsigned)one,
                      (unsigned)any, (unsigned)on_dir);
             check("a wait on a file handle", one == 0 && any == 1 && on_dir == 0);
+            // a handle that isn't open (0) among them: the whole wait fails, as the kernel's does
+            HANDLE with_null[2] = {ev, NULL};
+            const NTSTATUS bad = NtWaitForMultipleObjectsEx(2, with_null, WaitAny, UserMode, FALSE, &zero);
+            check("a wait with a handle that isn't open fails (STATUS_INVALID_HANDLE)", bad == (NTSTATUS)0xC0000008);
         }
         OVERLAPPED ov;
         memset(&ov, 0, sizeof(ov));
