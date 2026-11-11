@@ -245,7 +245,9 @@ void InstallFaultHandler(FaultHandler handler)
     sigaddset(&action.sa_mask, SIGUSR2); // a sample waits for a fault's handling to end
     for (int i = 0; i < 5; i++)
         sigaction(kSignals[i], &action, &g_old[i]);
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    // the sample signal also holds a thread while an interrupt routine runs (StopGuestThreads): one
+    // that has just gone into a system call has it restarted, not failed with EINTR
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     sigaction(SIGUSR2, &action, nullptr);
 }
 

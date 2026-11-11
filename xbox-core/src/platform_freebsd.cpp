@@ -264,6 +264,9 @@ void InstallFaultHandler(FaultHandler handler)
     for (int sig : kSignals)
         if (SetSignal(sig, &a, &g_previous[sig]) == 0)
             g_have_previous[sig] = true;
+    // the sample signal also holds a thread while an interrupt routine runs (StopGuestThreads): one
+    // that has just gone into a system call has it restarted, not failed with EINTR
+    a.sa_flags |= SA_RESTART;
     SetSignal(SIGUSR2, &a, nullptr);
 }
 

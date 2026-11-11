@@ -541,6 +541,9 @@ void InstallFaultHandler(FaultHandler handler)
         if (RawSigaction(sig, &action, &g_previous[sig]) == 0)
             g_have_previous[sig] = true;
     }
+    // the sample signal also holds a thread while an interrupt routine runs (StopGuestThreads): one
+    // that has just gone into a system call has it restarted, not failed with EINTR (SA_RESTART 2)
+    action.flags |= 0x2;
     RawSigaction(kSigSample, &action, nullptr);
 }
 
