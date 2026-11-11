@@ -642,6 +642,39 @@ int main(void)
         NtClose(f);
     }
     {
+        // A folder must be there for what is opened or made in it, as the kernel's file systems
+        // have it: nothing is made on the way. XCreateSaveGame opens <save>\SaveMeta.xbx before
+        // the save's folder exists and takes "path not found" for a new save.
+        {
+            ANSI_STRING name;
+            OBJECT_ATTRIBUTES attributes;
+            IO_STATUS_BLOCK iosb;
+            HANDLE h = NULL;
+            RtlInitAnsiString(&name, "\\Device\\Harddisk0\\Partition1\\xc-missing\\SaveMeta.xbx");
+            InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            const NTSTATUS open_if = NtCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &attributes, &iosb, NULL,
+                                                  FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN_IF,
+                                                  FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE);
+            const NTSTATUS open = NtCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &attributes, &iosb, NULL,
+                                               FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+                                               FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE);
+            RtlInitAnsiString(&name, "\\Device\\Harddisk0\\Partition1\\xc-missing\\inner");
+            const NTSTATUS inner = NtCreateFile(&h, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attributes, &iosb, NULL,
+                                                FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE,
+                                                FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE);
+            RtlInitAnsiString(&name, "\\Device\\Harddisk0\\Partition1\\xc-missing");
+            HANDLE folder = NULL;
+            const NTSTATUS was_made = NtCreateFile(&folder, FILE_LIST_DIRECTORY | SYNCHRONIZE, &attributes, &iosb,
+                                                   NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+                                                   FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE);
+            if (was_made == 0)
+                NtClose(folder);
+            DbgPrint("  in a folder that isn't there: open-if %#x, open %#x, a folder in it %#x; the folder %#x\n",
+                     (unsigned)open_if, (unsigned)open, (unsigned)inner, (unsigned)was_made);
+            check("opening or making something in a folder that isn't there: path not found, nothing made",
+                  open_if == (NTSTATUS)0xC000003A && open == (NTSTATUS)0xC000003A && inner == (NTSTATUS)0xC000003A &&
+                      was_made == (NTSTATUS)0xC0000034);
+        }
         HANDLE f = open_path("\\Device\\Harddisk0\\Partition1\\xc-rename-a.txt", GENERIC_WRITE | DELETE, FILE_OVERWRITE_IF);
         IO_STATUS_BLOCK iosb;
         char rename_buf[sizeof(FILE_RENAME_INFORMATION) + 64];

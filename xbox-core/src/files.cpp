@@ -334,11 +334,56 @@ void RemoveContents(const std::string& dir)
     closedir(d);
 }
 
-void MakeDirs(const std::string& path)
+// Save folders that builds before 2026-11-11 left half made (see OpenFile: a folder made for a
+// SaveMeta.xbx opened before the save existed, the file empty and alone in it): XAPI can't read such a
+// save nor make one again in its place. A save XAPI made always has its name in SaveMeta.xbx, so a
+// folder holding only an empty one is removed, and said in the log.
+void RemoveHalfMadeSaves(const std::string& udata)
 {
-    for (size_t i = 1; i < path.size(); i++)
-        if (path[i] == '/')
-            mkdir(path.substr(0, i).c_str(), 0755);
+    DIR* titles = opendir(udata.c_str());
+    if (!titles)
+        return;
+    while (dirent* t = readdir(titles))
+    {
+        if (t->d_name[0] == '.')
+            continue;
+        const std::string title = udata + "/" + t->d_name;
+        DIR* saves = opendir(title.c_str());
+        if (!saves)
+            continue;
+        while (dirent* s = readdir(saves))
+        {
+            if (s->d_name[0] == '.')
+                continue;
+            const std::string save = title + "/" + s->d_name;
+            DIR* in = opendir(save.c_str());
+            if (!in)
+                continue;
+            int entries = 0;
+            bool only_empty_meta = true;
+            while (dirent* e = readdir(in))
+            {
+                if (std::strcmp(e->d_name, ".") == 0 || std::strcmp(e->d_name, "..") == 0)
+                    continue;
+                entries++;
+                struct stat st;
+                if (std::strcmp(e->d_name, "SaveMeta.xbx") != 0 || stat((save + "/" + e->d_name).c_str(), &st) != 0 ||
+                    st.st_size != 0)
+                    only_empty_meta = false;
+            }
+            closedir(in);
+            if (entries == 1 && only_empty_meta)
+            {
+                unlink((save + "/SaveMeta.xbx").c_str());
+                rmdir(save.c_str());
+                Log("files: removed a save folder an earlier build left half made (an empty SaveMeta.xbx alone): "
+                    "%s",
+                    save.c_str());
+            }
+        }
+        closedir(saves);
+    }
+    closedir(titles);
 }
 
 u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 disposition, u32 options, u32 access);
@@ -423,6 +468,24 @@ u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 dispositi
     struct stat st;
     const bool exists = stat(host.c_str(), &st) == 0;
     const bool want_dir = options & 1; // FILE_DIRECTORY_FILE
+    // The folder it's in must be there, as the kernel's file systems have it: nothing is made on
+    // the way (no folder appears for a file opened in it). XAPI's save games count on it:
+    // XCreateSaveGame opens <save>\SaveMeta.xbx before the save's folder exists, and takes "path
+    // not found" for "a new save" (a folder made here instead, with an empty SaveMeta.xbx in it, was
+    // a save it couldn't read nor make again: Halo's "Unable to create new player profile").
+    if (!exists)
+    {
+        std::string parent = host;
+        while (parent.size() > 1 && parent.back() == '/')
+            parent.pop_back();
+        parent = parent.substr(0, parent.find_last_of('/'));
+        struct stat pst;
+        if (!parent.empty() && (stat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode)))
+        {
+            SetIo(io_status, STATUS_OBJECT_PATH_NOT_FOUND, 0);
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        }
+    }
     // FILE_SUPERSEDE 0, OPEN 1, CREATE 2, OPEN_IF 3, OVERWRITE 4, OVERWRITE_IF 5
     if (!exists && (disposition == 1 || disposition == 4))
     {
@@ -441,7 +504,12 @@ u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 dispositi
     {
         if (!exists)
         {
-            MakeDirs(host + "/");
+            if (mkdir(host.c_str(), 0755) != 0 && errno != EEXIST)
+            {
+                delete f;
+                SetIo(io_status, STATUS_ACCESS_DENIED, 0);
+                return STATUS_ACCESS_DENIED;
+            }
             information = 2; // FILE_CREATED
         }
         else if (!S_ISDIR(st.st_mode))
@@ -456,7 +524,7 @@ u32 OpenFile(u32 handle_ptr, u32 object_attributes, u32 io_status, u32 dispositi
         const bool write = access & (0x40000000 | 0x2 | 0x4 | 0x10000000); // GENERIC_WRITE, FILE_WRITE_DATA...
         int flags = write ? O_RDWR : O_RDONLY;
         if (!exists)
-            flags |= O_CREAT, information = 2, MakeDirs(host);
+            flags |= O_CREAT, information = 2;
         if (exists && (disposition == 0 || disposition == 4 || disposition == 5))
             flags |= O_TRUNC, information = 3; // FILE_OVERWRITTEN
         f->fd = open(host.c_str(), flags | O_CLOEXEC, 0644);
@@ -535,6 +603,7 @@ void SetDataDirectory(const std::string& dir)
     // the hard disk's partitions, so that listing them works before a program writes there
     for (const char* p : {"", "/c", "/e", "/t", "/u", "/x", "/y", "/z"})
         mkdir((dir + p).c_str(), 0755);
+    RemoveHalfMadeSaves(dir + "/e/UDATA");
     // the raw disk (partition 0: its config sectors), empty until a program writes them
     if (FILE* f = std::fopen((dir + "/partition0.img").c_str(), "ab"))
     {
