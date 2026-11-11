@@ -157,6 +157,8 @@ int main(int argc, char** argv)
         g_fault_trail_file = trail; // the fault path's forensic trail (the PS4 always keeps one)
     }
     InitCpu();
+    if (const char* e = std::getenv("XB_APU_DSP"); e && e[0] == '1')
+        SetApuDsp(true);
     InitDevices();
     InitKernel();
     std::string error;

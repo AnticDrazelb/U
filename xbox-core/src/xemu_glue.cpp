@@ -22,6 +22,11 @@ struct XbXemuConfig g_config = {
 struct AddressSpace { int unused; } address_space_memory;
 }
 
+namespace xb {
+// the APU's DSPs (Settings, or XB_APU_DSP=1): xemu's use_dsp, before the APU starts
+void SetApuDsp(bool on) { g_config.audio.use_dsp = on; }
+}
+
 namespace {
 using namespace xb;
 

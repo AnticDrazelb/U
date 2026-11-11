@@ -902,6 +902,7 @@ int main()
         InitCpu();
         gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
         SetNv2aChoice(g_settings.nv2a == 1); // Settings > Graphics
+        SetApuDsp(g_settings.dsp == 1);      // Settings > Sound effects
         LogSync("launch: devices");
         InitDevices();
         // drawing on the GPU (RADV), unless starting it killed the last run of this build

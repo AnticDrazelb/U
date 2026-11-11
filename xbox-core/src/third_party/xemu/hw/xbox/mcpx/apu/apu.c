@@ -20,6 +20,7 @@
  */
 
 #include "apu_int.h"
+#include "qemu/error-report.h" /* xbox-core: xb_xemu_log */
 
 MCPXAPUState *g_state; // Used via debug handlers
 
@@ -238,6 +239,18 @@ static void se_frame(MCPXAPUState *d)
          * <1: thread is able to complete work on time
          */
         g_dbg.utilization = (double)d->frame_work_acc_us / (double)elapsed_us;
+        /* xbox-core: the DSPs on (Settings) but the frames not made in real time for 3 s running:
+         * off again (the voices mixed directly, as with them off), said in the log */
+        static int dsp_behind;
+        if (g_config.audio.use_dsp && g_dbg.utilization > 0.95) {
+            if (++dsp_behind >= 3) {
+                g_config.audio.use_dsp = false;
+                xb_xemu_log("apu: the DSPs can't keep up (%.0f%% of real time spent making frames): "
+                            "sound effects off, the voices mixed directly", 100.0 * g_dbg.utilization);
+            }
+        } else {
+            dsp_behind = 0;
+        }
         g_dbg.frames_processed = (int)(d->frame_count * 1000000.0 / elapsed_us + 0.5);
         throttle_publish_debug(d);
 
@@ -392,6 +405,8 @@ void xb_mcpx_apu_init(uint8_t *ram_ptr)
 /* xbox-core: for xbox-core's stats line: the share of real time the frame thread spent making
  * frames over the last second (xemu's utilization: at 1 it can't keep up) and the voices it mixed */
 float xb_apu_utilization(void) { return g_dbg.utilization; }
+int xb_apu_dsp_on(void) { return g_config.audio.use_dsp; }
+int xb_apu_gp_cycles(void) { return g_dbg.gp.cycles; }
 int xb_apu_voices(void)
 {
     int n = 0;

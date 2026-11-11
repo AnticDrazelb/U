@@ -39,6 +39,15 @@ a second, the HRTF's modulo indexing): a busy scene on the PS4's slower cores co
 real time. Lagrange resampling, voices mixed in place and the mirrored HRTF line make it 16%. The
 stats line shows the frame thread's busy share and its voices (tests/apu-load-test to measure).
 
+## The APU's DSPs (2026-11-11)
+xemu's default leaves the GP and EP DSPs out of the sound (its DSP option off: they get 1000 cycles a
+frame and the voices are mixed directly; no reverb or other effects of DirectSound's DSP image).
+Settings > Sound effects (XB_APU_DSP=1) turns them on: each runs until its frame halts, at most
+twice a frame's cycles (a program that never halts can't hold the frame thread), and if the frames
+take more than 95% of real time for 3 s they go off again (logged). The interpreter does about 580
+million DSP cycles a second on a desktop core; untested with DirectSound's own image (only a game
+has it).
+
 ## The Xbox's single processor (2026-11-11)
 Interrupt routines and DPCs run with every other guest thread held (StopGuestThreads: the sample
 signal holds a thread in guest code where it is; others are held before they go back into guest

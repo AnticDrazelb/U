@@ -376,6 +376,7 @@ bool Settings::Load(const std::string& file)
         // choice made while it couldn't start ("nv2a", before) is asked again (it starts as xemu's,
         // and a start that dies in its start-up is followed by one with xbox-core's)
         else if (!std::strcmp(key, "renderer")) nv2a = std::clamp(value, 0, 1);
+        else if (!std::strcmp(key, "dsp")) dsp = std::clamp(value, 0, 1);
     }
     std::fclose(f);
     return true;
@@ -385,7 +386,8 @@ void Settings::Save(const std::string& file) const
 {
     if (FILE* f = std::fopen(file.c_str(), "w"))
     {
-        std::fprintf(f, "show_log %d\npicture %d\nsort %d\nrenderer %d\n", show_log ? 1 : 0, picture, sort, nv2a);
+        std::fprintf(f, "show_log %d\npicture %d\nsort %d\nrenderer %d\ndsp %d\n", show_log ? 1 : 0, picture, sort,
+                     nv2a, dsp);
         std::fclose(f);
     }
 }

@@ -252,8 +252,8 @@ const Game* LibraryUi::Update(const Input& in)
     }
     case kSettings:
     {
-        if (in.up) setting = (setting + 3) % 4;
-        if (in.down) setting = (setting + 1) % 4;
+        if (in.up) setting = (setting + 4) % 5;
+        if (in.down) setting = (setting + 1) % 5;
         const int step = in.right || in.cross ? 1 : in.left ? -1 : 0;
         if (step)
         {
@@ -261,6 +261,7 @@ const Game* LibraryUi::Update(const Input& in)
             if (setting == 1) settings.picture = (settings.picture + 3 + step) % 3;
             if (setting == 2) settings.sort ^= 1, Sort();
             if (setting == 3) settings.nv2a ^= 1;
+            if (setting == 4) settings.dsp ^= 1;
             settings.Save(paths.settings);
         }
         return nullptr;
@@ -657,18 +658,20 @@ void LibraryUi::DrawOptions(Canvas& c)
 void LibraryUi::DrawSettings(Canvas& c)
 {
     static const char* kPicture[3] = {"Sharp (whole-number scale)", "Fit 4:3", "Fill the screen"};
-    const std::pair<std::string, std::string> rows[4] = {
+    const std::pair<std::string, std::string> rows[5] = {
         {"Show the log while a game starts", settings.show_log ? "On" : "Off"},
         {"Picture", kPicture[settings.picture]},
         {"Library order", settings.sort ? "Recently played" : "Title"},
-        {"Graphics", settings.nv2a ? "xbox-core's NV2A" : "xemu's NV2A"}};
-    static const char* kHelp[4] = {"The first seconds of the log over the game's picture (L3 + R3 toggles it in a game).",
+        {"Graphics", settings.nv2a ? "xbox-core's NV2A" : "xemu's NV2A"},
+        {"Sound effects (the APU's DSPs)", settings.dsp ? "On (experimental)" : "Off"}};
+    static const char* kHelp[5] = {"The first seconds of the log over the game's picture (L3 + R3 toggles it in a game).",
                                    "How the game's picture is scaled to the TV.",
                                    "Your games come first, then the samples.",
-                                   "The GPU's emulation: xemu's (its Vulkan renderer) or xbox-core's own. From the next game."};
+                                   "The GPU's emulation: xemu's (its Vulkan renderer) or xbox-core's own. From the next game.",
+                                   "Reverb and the console's other DSP effects. Heavy: off again by itself if it can't keep up."};
     bold.Draw(c, 62, 200, "Settings", 40, kText);
     int y = 270;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
     {
         const bool on = setting == i;
         c.RoundRect(62, y, 1796, 104, 14, on ? kRaised : kPanel);

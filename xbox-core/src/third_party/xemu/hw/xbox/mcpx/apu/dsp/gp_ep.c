@@ -471,9 +471,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         dsp_start_frame(d->gp.dsp);
         dsp_set_halt_requested(d->gp.dsp, false);
         dsp_set_cycle_count(d->gp.dsp, 0);
+        /* xbox-core: at most twice a frame's worth of the GP's cycles (160 MHz / 1500 frames): a
+         * program that doesn't halt its frame can't hold the frame thread forever */
         do {
             dsp_run(d->gp.dsp, 1000);
-        } while (!dsp_get_halt_requested(d->gp.dsp) && d->gp.realtime);
+        } while (!dsp_get_halt_requested(d->gp.dsp) && d->gp.realtime &&
+                 dsp_get_cycle_count(d->gp.dsp) < 2 * 160000000 / 1500);
         g_dbg.gp.cycles = dsp_get_cycle_count(d->gp.dsp);
 
         if ((d->monitor.point == MCPX_APU_DEBUG_MON_GP) ||
@@ -496,9 +499,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
             dsp_start_frame(d->ep.dsp);
             dsp_set_halt_requested(d->ep.dsp, false);
             dsp_set_cycle_count(d->ep.dsp, 0);
+            /* xbox-core: as the GP's, for the EP's frame (every 8th) */
             do {
                 dsp_run(d->ep.dsp, 1000);
-            } while (!dsp_get_halt_requested(d->ep.dsp) && d->ep.realtime);
+            } while (!dsp_get_halt_requested(d->ep.dsp) && d->ep.realtime &&
+                     dsp_get_cycle_count(d->ep.dsp) < 2 * 160000000 / 1500 * 8);
             g_dbg.ep.cycles = dsp_get_cycle_count(d->ep.dsp);
         }
     }

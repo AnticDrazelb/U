@@ -240,6 +240,7 @@ void WakeAll();
 
 void InitDevices();
 void SetNv2aChoice(bool own); // before InitDevices: xbox-core's own NV2A instead of xemu's (where built)
+void SetApuDsp(bool on);      // before InitDevices: the APU's DSPs run (effects), not just its voices
 // An access to device memory, from the fault handler: returns false if not emulated.
 bool DeviceRead(u32 address, u32 size, u32& value, u32 eip = 0); // eip: the guest instruction, for the reports
 bool DeviceWrite(u32 address, u32 size, u32 value, u32 eip = 0);
