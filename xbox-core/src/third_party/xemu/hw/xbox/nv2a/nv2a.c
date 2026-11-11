@@ -291,9 +291,12 @@ void xb_nv2a_renderer_started(bool ok)
     qemu_event_set(&g_renderer_started);
 }
 
+void xb_nv2a_step(const char *step); /* xbox-core: the start-up's step file (nv2a.cpp) */
+
 /* true when the renderer started (else this device isn't to be used: xbox-core's own NV2A is) */
 bool xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
 {
+    xb_nv2a_step("the device's state");
     qemu_event_init(&g_renderer_started, false);
     NV2AState *d = calloc(1, sizeof(NV2AState));
     PCIDevice *dev = PCI_DEVICE(d);
@@ -327,10 +330,20 @@ bool xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
     d->vga.vram_size_mb = ram_size / MiB;
 
     xb_bql_lock();
+    xb_nv2a_step("PGRAPH's state");
     pgraph_init(d);
+    xb_nv2a_step("the PFIFO thread (it starts the renderer)");
     qemu_thread_create(&d->pfifo.thread, "nv2a.pfifo_thread", pfifo_thread, d, QEMU_THREAD_JOINABLE);
     xb_bql_unlock();
-    qemu_event_wait(&g_renderer_started);
+    /* xbox-core: a renderer that hasn't started in a minute (a driver call that never returns)
+     * isn't waited for: xbox-core's own NV2A draws instead, and the log says at which step */
+    const char *wait_ms = getenv("XB_NV2A_START_MS"); /* (a test's shorter wait) */
+    const int wait = wait_ms ? atoi(wait_ms) : 60000;
+    if (!xb_qemu_event_timedwait(&g_renderer_started, wait)) {
+        xb_xemu_log("nv2a: xemu's renderer hasn't started in %d s (the step above): it is left "
+                    "where it is, and isn't used", wait / 1000);
+        return false;
+    }
     if (!g_renderer_ok) {
         return false;
     }

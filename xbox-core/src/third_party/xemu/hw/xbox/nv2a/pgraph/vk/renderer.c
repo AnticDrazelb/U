@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <unistd.h>
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
 
@@ -37,6 +38,12 @@ static void pgraph_vk_init(NV2AState *d, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
 
+    xb_nv2a_step("the renderer's state");
+    if (getenv("XB_VK_HANG")) { /* xbox-core: a test's renderer that never starts */
+        for (;;) {
+            sleep(1);
+        }
+    }
     pg->vk_renderer_state = (PGRAPHVkState *)g_malloc0(sizeof(PGRAPHVkState));
 
 #if HAVE_EXTERNAL_MEMORY

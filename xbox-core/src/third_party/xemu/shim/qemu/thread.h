@@ -3,6 +3,7 @@
 #define XB_XEMU_THREAD_H
 #include <pthread.h>
 #include <errno.h>
+#include <time.h>
 #include "qemu/osdep.h"
 typedef struct QemuMutex { pthread_mutex_t m; } QemuMutex;
 typedef struct QemuCond { pthread_cond_t c; } QemuCond;
@@ -65,6 +66,26 @@ static inline void qemu_event_wait(QemuEvent *e)
         pthread_cond_wait(&e->c, &e->m);
     }
     pthread_mutex_unlock(&e->m);
+}
+/* xbox-core: as qemu_event_wait, for at most `ms` milliseconds: whether the event was set */
+static inline bool xb_qemu_event_timedwait(QemuEvent *e, int ms)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += ms / 1000;
+    until.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec++, until.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&e->m);
+    while (!e->set) {
+        if (pthread_cond_timedwait(&e->c, &e->m, &until) != 0 && !e->set) {
+            break;
+        }
+    }
+    const bool set = e->set;
+    pthread_mutex_unlock(&e->m);
+    return set;
 }
 static inline void qemu_event_destroy(QemuEvent *e) { (void)e; }
 static inline void qemu_mutex_destroy(QemuMutex *m) { pthread_mutex_destroy(&m->m); }
