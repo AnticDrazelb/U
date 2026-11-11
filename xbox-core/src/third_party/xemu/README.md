@@ -25,6 +25,10 @@ Changes for xbox-core:
   on at a time, after the frame, under the big lock, a declined one giving way to the next; methods
   written while the front end is trapped or halted queued until it runs (PIO_FREE reports the room);
   an idle voice with the trap not forced skipped (xemu asserted).
+- Speed (`vp/vp.c`, `vp/hrtf.h`): an 8-point Lagrange interpolator in place of libsamplerate's sinc
+  converter (XB_APU_SINC=1 for the sinc); up to 64 voices mixed on the frame thread in list order
+  rather than on the two workers; the HRTF delay line stored twice over so its taps read without a
+  modulo (the same output). 48 voices: 67-95% of a desktop core before, 16% after.
 - `monitor.c`: the frame thread paced by what xbox-core's mixer holds of its sound (xemu's throttle()
   with its SDL stream), 4 to 6 EP frames ahead.
 - `nv2a/pgraph/vk/buffer.c`: buffers for the largest single draw (inline vertices 128 MiB, indices

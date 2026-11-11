@@ -33,6 +33,12 @@ in apu.c, vp/vp.c, monitor.c; the same findings as other projects running the XD
 Tests: tests/apu-trap-test (16 replays before, none now), the APU test's sound through a simulated
 console device (XB_WAV_DEVICE=1), both in the regression set.
 
+## The APU's speed (2026-11-11)
+48 voices took 67-95% of a fast desktop core (sinc resampling half of it, worker handoffs 1500 times
+a second, the HRTF's modulo indexing): a busy scene on the PS4's slower cores couldn't keep up with
+real time. Lagrange resampling, voices mixed in place and the mirrored HRTF line make it 16%. The
+stats line shows the frame thread's busy share and its voices (tests/apu-load-test to measure).
+
 ## The Xbox's single processor (2026-11-11)
 Interrupt routines and DPCs run with every other guest thread held (StopGuestThreads: the sample
 signal holds a thread in guest code where it is; others are held before they go back into guest
