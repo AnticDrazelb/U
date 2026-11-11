@@ -85,6 +85,22 @@ Its buffers were sized for a PC (about 4.6 GiB: ten largest inline batches stage
 batches): now the largest single draw (128 MiB inline, 16 MiB of indices, 128 MiB compute), about
 0.75 GiB. The step file covers its start-up and its first half minute of drawing.
 
+## The device's memory as a bus (2026-11-11)
+xbox-core's guest RAM is two blocks: the contiguous memory (physical 0-64 MiB, at 0x80000000) and the
+RAM a program's image and heap are in (its own physical addresses, above 64 MiB). xemu's devices
+reach both through xb_phys_read/write and the ld*/st*_phys shims; two of xemu's APU paths indexed
+its RAM pointer directly, which covers the contiguous memory only: an ADPCM stream's packets (a
+DirectSound client's packet from its heap crashed the emulator) and the GP's and EP's scratch and
+FIFO memory. Both go through the bus now (the APU test's voice 105 covers the first).
+
+## xemu's renderer: its start-up steps and a hang (2026-11-11)
+The step file (xemu-nv2a-step.txt) names each step from the device's state through PGRAPH's, the
+PFIFO thread and the renderer's state to the Vulkan instance, buffers, shaders, pipelines and test
+draws. A renderer that hasn't started in a minute (a driver call that never returns) is left where
+it is and xbox-core's own NV2A draws (XB_VK_HANG=1 and XB_NV2A_START_MS make one for a test).
+For looking into its drawing: XB_VK_SHADERS=folder writes each shader's GLSL there, XB_VK_DRAWS=1
+logs each inline-buffer draw (attributes, first vertex), XB_VK_FAIL_BUFFER=n refuses buffer n.
+
 ## Verified before shipping (2026-11-10, commit 6ab6dee)
 - Regression 13/13 normally, with XB_TEST_FS_AS_PS4=1, and with XB_USB=own / XB_NV2A=own.
 - FreeBSD VM (the PS4's OS family): kernel, SEH and disc tests 0 failures, triangle runs; built

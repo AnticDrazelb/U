@@ -376,3 +376,5 @@ again. So a step that kills the app costs one launch.
 - Don't call `Log`, `malloc` or anything else from libc on a path the signal handler runs. Test with `XB_STRICT_SIGNAL=1`.
 - `out/xbox-core.pkg` is a build output and isn't committed. Rebuild it with `xbox-core/build.sh ps4`.
 - Declare any `extern thread_local` variable `constinit` (and define it that way). Otherwise clang emits a weak reference to its thread-local init function (`_ZTH…`), and `create-fself` stops the PS4 build with "missing module for symbol".
+- Contiguous memory is handed out from the top of the requested range down, as the Xbox kernel does (`src/memory.cpp`). Games depend on that. Halo pins its own blocks at fixed low physical addresses (tags at 0x3a6000). D3D's EndVisibilityTest needs a page below 16 MB for each 256 results. Filling from the bottom up crashed Halo at 0x18110f (`GetVisibilityTestResult`). The kernel test replays both.
+- XbSymbolDatabase (`git clone https://github.com/Cxbx-Reloaded/XbSymbolDatabase`) has byte signatures of the XDK's libraries. Matching the bytes around a crash against them names the library function.
