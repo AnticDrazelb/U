@@ -23,6 +23,12 @@
 /* xbox-core: the renderer's start-up step, in the step file and the log (nv2a.cpp) */
 void xb_nv2a_step(const char *step);
 void xb_nv2a_picture_ready(void); /* xbox-core: the surfaces are back in RAM (nv2a.cpp) */
+#include <stdint.h>
+/* xbox-core: the contiguous memory's dirty log (dirty.cpp): a range the renderer writes itself */
+void xb_dirty_unprotect(uint64_t offset, uint64_t size);
+void xb_dirty_protect(uint64_t offset, uint64_t size);
+struct NV2AState;
+void pgraph_vk_xb_request_display_download(struct NV2AState *d, uint32_t addr);
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "qemu/queue.h"
@@ -394,6 +400,10 @@ typedef struct PGRAPHVkState {
     QemuEvent downloads_complete;
     bool download_dirty_surfaces_pending;
     QemuEvent dirty_surfaces_download_complete; // common
+    /* xbox-core: a vblank's: the surface at the display's start back in RAM (where the picture is
+     * read from), the others left on the GPU until a full download */
+    bool xb_display_download_pending;
+    uint32_t xb_display_download_addr;
 
     Lru texture_cache;
     TextureBinding *texture_cache_entries;

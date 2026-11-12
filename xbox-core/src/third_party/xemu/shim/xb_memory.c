@@ -8,6 +8,18 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+/* the contiguous memory's dirty log (dirty.cpp), where the CPU's self-test switched it on: the
+ * pages written since a reader last looked, from write faults, without reading them */
+bool xb_dirty_on(void);
+bool xb_dirty_test_and_clear(uint64_t offset, uint64_t size, unsigned reader);
+void xb_dirty_mark(uint64_t offset, uint64_t size, unsigned reader_mask);
+#define XB_CONTIGUOUS ((uint8_t *)(uintptr_t)0x80000000u)
+
+static bool logged(MemoryRegion *mr)
+{
+    return mr->ram == XB_CONTIGUOUS && xb_dirty_on();
+}
+
 #define PAGE 4096
 #define CLIENTS DIRTY_MEMORY_NUM
 
@@ -54,6 +66,10 @@ static void range(Tracked *t, uint64_t addr, uint64_t size, uint64_t *first, uin
 
 void memory_region_set_client_dirty(MemoryRegion *mr, uint64_t addr, uint64_t size, unsigned client)
 {
+    if (logged(mr)) {
+        xb_dirty_mark(addr, size, 1u << client);
+        return;
+    }
     pthread_mutex_lock(&g_lock);
     Tracked *t = tracked(mr);
     if (t && client < CLIENTS) {
@@ -75,6 +91,9 @@ void memory_region_set_dirty(MemoryRegion *mr, uint64_t addr, uint64_t size)
 
 bool memory_region_test_and_clear_dirty(MemoryRegion *mr, uint64_t addr, uint64_t size, unsigned client)
 {
+    if (logged(mr)) {
+        return xb_dirty_test_and_clear(addr, size, client);
+    }
     bool dirty = false;
     pthread_mutex_lock(&g_lock);
     Tracked *t = tracked(mr);

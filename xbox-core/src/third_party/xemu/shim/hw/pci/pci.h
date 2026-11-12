@@ -10,7 +10,10 @@ typedef struct MemoryRegion {
     const struct MemoryRegionOps *ops; /* an I/O window: its handlers (memory_region_init_io) */
     void *opaque;
 } MemoryRegion;
-enum { DIRTY_MEMORY_VGA, DIRTY_MEMORY_CODE, DIRTY_MEMORY_MIGRATION, DIRTY_MEMORY_NV2A, DIRTY_MEMORY_NV2A_TEX, DIRTY_MEMORY_NUM };
+/* xbox-core: XB_DIRTY_MEMORY_SURFACE, the renderer's surfaces' reader of their own (a surface it
+ * wrote back to RAM itself isn't new to it, unlike to the vertex reader, DIRTY_MEMORY_NV2A) */
+enum { DIRTY_MEMORY_VGA, DIRTY_MEMORY_CODE, DIRTY_MEMORY_MIGRATION, DIRTY_MEMORY_NV2A, DIRTY_MEMORY_NV2A_TEX,
+       XB_DIRTY_MEMORY_SURFACE, DIRTY_MEMORY_NUM };
 static inline uint64_t memory_region_size(MemoryRegion *mr) { return mr->size; }
 static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) { return mr->ram; }
 static inline void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client) { (void)mr; (void)log; (void)client; }

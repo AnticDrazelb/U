@@ -29,7 +29,7 @@ set(XEMU_APU_SOURCES ${XEMU_DIR}/apu.c ${XEMU_DIR}/vp/vp.c ${XEMU_DIR}/monitor.c
     src/third_party/xemu/hw/usb/core.c src/third_party/xemu/hw/usb/desc.c src/third_party/xemu/hw/usb/hcd-ohci.c
     src/third_party/xemu/hw/usb/dev-hub.c src/third_party/xemu/hw/usb/desc-msos.c src/third_party/xemu/hw/usb/xb_bus.c src/third_party/xemu/hw/usb/xb_usb.c
     src/third_party/xemu/hw/xbox/xid.c src/third_party/xemu/hw/xbox/xid-gamepad.c)
-set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/xemu_glue.cpp ${XEMU_APU_SOURCES} src/nic.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
+set(CORE_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/build_id.cpp src/memory.cpp src/dirty.cpp src/xbe.cpp src/cpu.cpp src/switch.S src/kernel.cpp src/kernel_rtl.cpp src/kernel_crypto.cpp src/files.cpp src/xiso.cpp src/devices.cpp src/nv2a.cpp src/render.cpp src/draw.cpp src/pixel.cpp src/usb.cpp src/audio.cpp src/apu.cpp src/xemu_glue.cpp ${XEMU_APU_SOURCES} src/nic.cpp src/diagnostics.cpp src/gpu_vulkan.cpp)
 # The GPU path's shaders: SPIR-V made at build time (nothing is compiled at run time, which the PS4
 # couldn't do), as C arrays the code includes
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)

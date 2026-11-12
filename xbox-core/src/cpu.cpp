@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <cstdlib>
 #include <atomic>
+#include <csignal>
 #include <chrono>
 #include <thread>
 
@@ -1159,6 +1160,10 @@ bool OnFault(platform::Fault& f)
         }
         return true;
     }
+    // a write to a page the dirty log protects (dirty.cpp), the guest's or the emulator's own: marked,
+    // made writable, and made again on return
+    if ((f.signal == SIGSEGV || f.signal == SIGBUS) && DirtyFault(f.address))
+        return true;
     if (f.cs != g_sel32)
     {
         platform::Trail(4, 0, *f.rip, f.fs_base, f.address);
@@ -1516,6 +1521,40 @@ void InitCpu()
         Log("cpu self-test: faults on a new thread are handled too");
         platform::Trail(9, step_number);
     }
+    // The dirty log (dirty.cpp): writes to a page it protects, from the emulator's code and from the
+    // guest's, each marked and let through. Off (xemu's hashing instead) unless both pass.
+    StartDirtyLog();
+    bool dirty_log = false;
+    if (!std::getenv("XB_NO_DIRTY_LOG")) // (xemu's hashing instead: a comparison's)
+    {
+        // a page of the contiguous memory nothing has been given yet (the guest hasn't started)
+        const u32 page = kContiguousBase + kContiguousSize / 2;
+        if (step("dirty log", "a write by the emulator to a page the dirty log protects"))
+        {
+            DirtyProtectForTest(page);
+            *reinterpret_cast<volatile u32*>(Ptr<u32>(page)) = 0x5a5aa5a5;
+            dirty_log = DirtyWrittenForTest(page) && Read<u32>(page) == 0x5a5aa5a5;
+            Log("cpu self-test: the emulator's write %s", dirty_log ? "marked the page and went through" : "wasn't seen");
+            platform::Trail(9, step_number);
+        }
+        if (dirty_log && step("dirty log guest", "a write by guest code to a page the dirty log protects"))
+        {
+            DirtyProtectForTest(page);
+            // mov dword [page + 4], 0x12345678; mov eax, fs:[0x18]; ret
+            u8 store[] = {0xc7, 0x05, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12, 0x64, 0xa1, 0x18, 0x00, 0x00, 0x00, 0xc3};
+            const u32 at = page + 4;
+            std::memcpy(store + 2, &at, 4);
+            std::memcpy(Ptr(code), store, sizeof(store));
+            const u32 got = u32(CallGuest(t, code, {}));
+            dirty_log = got == t->kpcr && DirtyWrittenForTest(page) && Read<u32>(at) == 0x12345678;
+            Log("cpu self-test: the guest's write %s", dirty_log ? "marked the page and went through" : "wasn't seen");
+            platform::Trail(9, step_number);
+        } else
+            dirty_log = false;
+        Write<u32>(page, 0), Write<u32>(page + 4, 0);
+    }
+    if (!dirty_log)
+        StopDirtyLog();
     // a step that killed a run stays left out in the runs after (a new build tries every step again)
     if (!g_selftest_file.empty())
     {
@@ -1527,8 +1566,8 @@ void InitCpu()
             std::fclose(f);
         }
     }
-    LogSync("cpu self-test: done (fault logging %s, bigger signal stacks %s)", g_fault_log ? "on" : "off",
-            big_stacks ? "on" : "off");
+    LogSync("cpu self-test: done (fault logging %s, bigger signal stacks %s, the dirty log %s)",
+            g_fault_log ? "on" : "off", big_stacks ? "on" : "off", dirty_log ? "on" : "off (xemu's hashing)");
 }
 
 u16 GuestCodeSelector() { return g_sel32; }

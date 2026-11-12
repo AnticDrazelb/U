@@ -417,7 +417,10 @@ u32 AllocContiguous(u32 size, u32 alignment, u32 lowest, u32 highest)
                                                                 : kContiguousBase + highest,
                                      true);
     if (p)
+    {
+        PrepareGuestWrite(p, size); // (a fault a page otherwise, where the dirty log protects it)
         std::memset(Ptr(p), 0, size);
+    }
     else
     {
         static int refused = 0;

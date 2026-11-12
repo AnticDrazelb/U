@@ -499,7 +499,15 @@ static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
 
     // FIXME: Respect write enable at last TOU?
 
+    /* xbox-core: written without a fault a page (the dirty log's), protected again after (a write
+     * by the CPU after this shows to every reader) */
+    xb_dirty_unprotect(surface->vram_addr, surface->pitch * surface->height);
     download_surface_to_buffer(d, surface, d->vram_ptr + surface->vram_addr);
+    xb_dirty_protect(surface->vram_addr, surface->pitch * surface->height);
+    /* ... and not new to the surfaces' reader: what is in RAM is what the surface holds (without
+     * this the next draw on it uploaded it again: a round trip a vblank) */
+    memory_region_test_and_clear_dirty(d->vram, surface->vram_addr, surface->pitch * surface->height,
+                                       XB_DIRTY_MEMORY_SURFACE);
 
     memory_region_set_client_dirty(d->vram, surface->vram_addr,
                                    surface->pitch * surface->height,
@@ -1429,9 +1437,12 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 
     Surface *pg_surface = color ? &pg->surface_color : &pg->surface_zeta;
 
+    /* xbox-core: the surfaces' own reader: what the CPU wrote there since the last draw, not the
+     * renderer's own write-backs (download_surface), which the vertex reader (DIRTY_MEMORY_NV2A)
+     * still sees */
     bool mem_dirty = !tcg_enabled() && memory_region_test_and_clear_dirty(
                                            d->vram, target.vram_addr,
-                                           target.size, DIRTY_MEMORY_NV2A);
+                                           target.size, XB_DIRTY_MEMORY_SURFACE);
 
     SurfaceBinding *current_binding = color ? r->color_binding
                                             : r->zeta_binding;

@@ -292,6 +292,7 @@ void xb_nv2a_renderer_started(bool ok)
 }
 
 void xb_nv2a_step(const char *step); /* xbox-core: the start-up's step file (nv2a.cpp) */
+void pgraph_vk_xb_request_display_download(NV2AState *d, uint32_t addr); /* (vk/renderer.c) */
 
 /* true when the renderer started (else this device isn't to be used: xbox-core's own NV2A is) */
 bool xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
@@ -428,9 +429,21 @@ void xb_nv2a_vblank(void)
     nv2a_update_irq(d);
     xb_bql_unlock();
 
+    /* xbox-core: each vblank the surface the display starts in back in RAM (the picture); every
+     * half second every surface drawn (what the CPU might read of them; a wait for the GPU to be
+     * idle writes them all back too). XB_DOWNLOAD_ALL=1: every surface each vblank, as before. */
+    static int all_every = -1;
+    static unsigned vblanks;
+    if (all_every < 0) {
+        all_every = getenv("XB_DOWNLOAD_ALL") ? 1 : 30;
+    }
     qemu_mutex_lock(&d->pfifo.lock);
     if (d->pgraph.renderer && d->pgraph.renderer->ops.pre_savevm_trigger) {
-        d->pgraph.renderer->ops.pre_savevm_trigger(d);
+        if (++vblanks % (unsigned)all_every == 0) {
+            d->pgraph.renderer->ops.pre_savevm_trigger(d);
+        } else {
+            pgraph_vk_xb_request_display_download(d, (uint32_t)d->pcrtc.start);
+        }
     }
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);

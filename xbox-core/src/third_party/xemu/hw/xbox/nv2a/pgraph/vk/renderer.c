@@ -149,6 +149,7 @@ static void pgraph_vk_process_pending(NV2AState *d)
 
     if (qatomic_read(&r->downloads_pending) ||
         qatomic_read(&r->download_dirty_surfaces_pending) ||
+        qatomic_read(&r->xb_display_download_pending) ||
         qatomic_read(&d->pgraph.sync_pending) ||
         qatomic_read(&d->pgraph.flush_pending) ||
         qatomic_read(&d->pgraph.xb_idle_sync_pending)
@@ -159,8 +160,16 @@ static void pgraph_vk_process_pending(NV2AState *d)
             pgraph_vk_process_pending_downloads(d);
         }
         if (qatomic_read(&r->download_dirty_surfaces_pending)) {
+            qatomic_set(&r->xb_display_download_pending, false);
             pgraph_vk_download_dirty_surfaces(d);
             /* xbox-core: the picture shown is copied now, whole (its presenter reads RAM) */
+            xb_nv2a_picture_ready();
+        } else if (qatomic_read(&r->xb_display_download_pending)) {
+            /* xbox-core: the surface the display starts in, alone (the one being drawn, the depth
+             * buffer and the rest stay on the GPU: no write-back of a frame half drawn) */
+            qatomic_set(&r->xb_display_download_pending, false);
+            pgraph_vk_download_surfaces_in_range_if_dirty(
+                &d->pgraph, qatomic_read(&r->xb_display_download_addr), 1);
             xb_nv2a_picture_ready();
         }
         if (qatomic_read(&d->pgraph.sync_pending)) {
@@ -185,6 +194,17 @@ static void pgraph_vk_flip_stall(NV2AState *d)
 {
     pgraph_vk_finish(&d->pgraph, VK_FINISH_REASON_FLIP_STALL);
     pgraph_vk_debug_frame_terminator();
+}
+
+/* xbox-core: a vblank's write-back of the displayed surface (see xb_display_download_pending) */
+void pgraph_vk_xb_request_display_download(NV2AState *d, uint32_t addr)
+{
+    PGRAPHVkState *r = d->pgraph.vk_renderer_state;
+    if (!r) {
+        return;
+    }
+    qatomic_set(&r->xb_display_download_addr, addr);
+    qatomic_set(&r->xb_display_download_pending, true);
 }
 
 static void pgraph_vk_pre_savevm_trigger(NV2AState *d)

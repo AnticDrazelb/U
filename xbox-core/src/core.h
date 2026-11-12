@@ -103,6 +103,16 @@ void InitMemory();
 u32 AllocVirtual(u32 size, u32 at = 0);
 bool FreeVirtual(u32 base);
 u32 AllocContiguous(u32 size, u32 alignment, u32 lowest, u32 highest);
+// The contiguous memory's dirty log (dirty.cpp): which pages were written since a reader (xemu's
+// renderer) last looked, from write faults on the pages it has looked at.
+bool DirtyLogOn();
+bool DirtyFault(u64 address);                  // the fault handler's: a write to a page the log protects
+void PrepareGuestWrite(u32 address, u32 size); // before a system call writes the guest's memory
+std::string DirtyLogStats();                   // for the stats line (and counts since the last call)
+void StartDirtyLog();
+void StopDirtyLog();
+void DirtyProtectForTest(u32 address);
+bool DirtyWrittenForTest(u32 address);
 bool FreeContiguous(u32 base);
 u32 AllocKernel(u32 size, u32 alignment = 16); // never freed
 u32 AllocStack(u32 size);                      // returns the top

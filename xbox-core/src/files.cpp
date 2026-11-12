@@ -717,6 +717,7 @@ void RegisterFileExports(RegisterFn reg)
             const u64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? u64(Read<s64>(c.Arg(7))) : u64(lseek(f->fd, 0, SEEK_CUR));
             const u32 length = at >= f->raw_size ? 0 : u32(std::min<u64>(c.Arg(6), f->raw_size - at));
             u8* out = static_cast<u8*>(Ptr(c.Arg(5)));
+            PrepareGuestWrite(c.Arg(5), length); // (a system call: a write-protected page would fail it)
             ssize_t got = length ? pread(f->fd, out, length, off_t(at)) : 0;
             if (got < 0)
                 got = 0;
@@ -730,6 +731,7 @@ void RegisterFileExports(RegisterFn reg)
                 WakeAll();
             return status;
         }
+        PrepareGuestWrite(c.Arg(5), c.Arg(6)); // (the reads below are system calls into the guest's memory)
         if (f->iso)
         {
             const s64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? Read<s64>(c.Arg(7)) : f->position;
@@ -1031,6 +1033,8 @@ void RegisterFileExports(RegisterFn reg)
         for (u32 i = 0; done < c.Arg(6); i++)
         {
             const u32 page = Read<u32>(c.Arg(5) + i * 4), n = std::min<u32>(4096, c.Arg(6) - done);
+            if (!write)
+                PrepareGuestWrite(page, n);
             ssize_t got;
             if (f->iso)
                 got = ssize_t(IsoRead(*f->iso, u64(at), n, Ptr(page)));
