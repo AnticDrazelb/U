@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#include "hw/xbox/nv2a/xb_profile.h"
 
 #include "gloffscreen.h"
 
@@ -163,14 +164,14 @@ static void pgraph_vk_process_pending(NV2AState *d)
             qatomic_set(&r->xb_display_download_pending, false);
             pgraph_vk_download_dirty_surfaces(d);
             /* xbox-core: the picture shown is copied now, whole (its presenter reads RAM) */
-            xb_nv2a_picture_ready();
+            xb_nv2a_picture_ready(__atomic_load_n(&xb_surface_writebacks, __ATOMIC_RELAXED));
         } else if (qatomic_read(&r->xb_display_download_pending)) {
             /* xbox-core: the surface the display starts in, alone (the one being drawn, the depth
              * buffer and the rest stay on the GPU: no write-back of a frame half drawn) */
             qatomic_set(&r->xb_display_download_pending, false);
             pgraph_vk_download_surfaces_in_range_if_dirty(
                 &d->pgraph, qatomic_read(&r->xb_display_download_addr), 1);
-            xb_nv2a_picture_ready();
+            xb_nv2a_picture_ready(__atomic_load_n(&xb_surface_writebacks, __ATOMIC_RELAXED));
         }
         if (qatomic_read(&d->pgraph.sync_pending)) {
             pgraph_vk_sync(d);

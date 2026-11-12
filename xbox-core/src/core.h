@@ -274,6 +274,7 @@ struct DisplayInfo
     // them): taken once that has happened, so what is shown is never a frame half drawn nor RAM
     // being written. Null: the RAM at `address` is read.
     std::shared_ptr<const std::vector<u8>> pixels;
+    u64 generation = 0; // the copy's: a new one each time it changes (a presenter needn't hash it)
     const u8* Bytes() const; // the picture's first byte (the copy's, else the RAM's)
     // the video overlay (PVIDEO: what movies are shown through), over the picture where it is on
     struct Overlay
@@ -288,7 +289,7 @@ u32 Nv2aPvideo(u32 reg); // a PVIDEO register (offset within PVIDEO), whichever 
 DisplayInfo GetDisplay();
 // The surfaces drawn are back in RAM (xemu's renderer, after a vblank's download): the picture shown
 // is copied then (GetDisplay's `pixels`).
-void TakePicture();
+void TakePicture(u64 writebacks = ~0ull); // (the same count as last time, and start: nothing new)
 bool PictureIsCopied(); // xemu's NV2A draws (nv2a.cpp): the picture comes from TakePicture's copy
 std::string DataDirectory();             // files.cpp: where the hard disk's folders are
 std::string Nv2aWorkStats(double seconds); // nv2a.cpp: xemu's renderer thread's work, for the stats

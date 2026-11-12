@@ -639,7 +639,9 @@ void PresentLoop()
         // Nothing new to show (the same picture, layout and no log over it): the screen keeps the last
         // flip, and the CPU time (a 1080p frame is 8 MiB to write) stays the game's.
         u64 hash = 0xcbf29ce484222325ull ^ (u64(d.address) << 32) ^ u64(d.width) << 16 ^ u64(d.height) ^ u64(g_settings.picture) << 60;
-        if (d.valid)
+        if (d.valid && d.pixels)
+            hash = (hash ^ d.generation) * 0x100000001b3ull; // a copy: new only when its generation is
+        else if (d.valid)
         {
             const u32 bytes = u32(d.height) * d.pitch;
             const u64* p = reinterpret_cast<const u64*>(d.Bytes());

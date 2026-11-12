@@ -512,7 +512,7 @@ uint64_t xb_nv2a_read(uint64_t addr, unsigned int size);
 void xb_nv2a_write(uint64_t addr, uint64_t val, unsigned int size);
 void xb_nv2a_vblank(void);
 // xemu's renderer: the surfaces drawn are back in RAM (a vblank's download): the picture is copied
-void xb_nv2a_picture_ready(void) { xb::TakePicture(); }
+void xb_nv2a_picture_ready(uint64_t writebacks) { xb::TakePicture(writebacks); }
 int xb_nv2a_profile(char* out, int size, double seconds);
 // the folder xemu's renderer keeps the shaders and pipelines it made in, from one run to the next
 // (XB_NO_SHADER_CACHE=1: none)

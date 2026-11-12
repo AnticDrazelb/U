@@ -581,6 +581,7 @@ namespace {
 std::mutex g_picture_mutex;
 std::shared_ptr<const std::vector<u8>> g_picture;
 u32 g_picture_address = 0;
+u64 g_picture_generation = 0;
 } // namespace
 
 const u8* DisplayInfo::Bytes() const
@@ -588,7 +589,7 @@ const u8* DisplayInfo::Bytes() const
     return pixels ? pixels->data() : Ptr<const u8>(address);
 }
 
-void TakePicture()
+void TakePicture(u64 writebacks)
 {
     Display d;
     {
@@ -599,11 +600,21 @@ void TakePicture()
     const size_t bytes = size_t(info.pitch) * info.height;
     if (!info.valid || !GuestMapped(info.address, u32(bytes)))
         return;
+    // nothing written back since the last copy, and the same buffer shown: the picture is as it was
+    static u64 last_writebacks = ~0ull;
+    if (writebacks != ~0ull && writebacks == last_writebacks)
+    {
+        std::lock_guard lock(g_picture_mutex);
+        if (g_picture && g_picture_address == info.address && g_picture->size() == bytes)
+            return;
+    }
+    last_writebacks = writebacks;
     auto copy = std::make_shared<std::vector<u8>>(bytes);
     std::memcpy(copy->data(), Ptr<const u8>(info.address), bytes);
     std::lock_guard lock(g_picture_mutex);
     g_picture = std::move(copy);
     g_picture_address = info.address;
+    g_picture_generation++;
 }
 
 // XB_PICTURE_PROBE=x,y,rrggbb: a test's eye on the picture as a presenter reads it: every 2 ms the
@@ -660,7 +671,7 @@ DisplayInfo GetDisplay()
         // one before it, complete, is shown)
         std::lock_guard lock(g_picture_mutex);
         if (g_picture && g_picture->size() == size_t(info.pitch) * info.height)
-            info.pixels = g_picture, info.address = g_picture_address;
+            info.pixels = g_picture, info.address = g_picture_address, info.generation = g_picture_generation;
     }
     return info;
 }

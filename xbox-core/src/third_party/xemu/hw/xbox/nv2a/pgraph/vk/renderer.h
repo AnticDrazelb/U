@@ -20,9 +20,12 @@
 #ifndef HW_XBOX_NV2A_PGRAPH_VK_RENDERER_H
 #define HW_XBOX_NV2A_PGRAPH_VK_RENDERER_H
 
+#include <stdint.h>
 /* xbox-core: the renderer's start-up step, in the step file and the log (nv2a.cpp) */
 void xb_nv2a_step(const char *step);
-void xb_nv2a_picture_ready(void); /* xbox-core: the surfaces are back in RAM (nv2a.cpp) */
+/* xbox-core: the surfaces are back in RAM (nv2a.cpp); `writebacks`, how many so far (none new and
+ * the same display start: the picture is as it was) */
+void xb_nv2a_picture_ready(uint64_t writebacks);
 #include <stdint.h>
 /* xbox-core: the contiguous memory's dirty log (dirty.cpp): a range the renderer writes itself */
 void xb_dirty_unprotect(uint64_t offset, uint64_t size);

@@ -20,6 +20,8 @@ enum {
 };
 
 extern uint64_t xb_prof_n[XB_PROF_COUNT], xb_prof_ns[XB_PROF_COUNT];
+/* surfaces written back to RAM so far (the picture is copied again only after one) */
+extern uint64_t xb_surface_writebacks;
 
 static inline uint64_t xb_prof_now(void)
 {

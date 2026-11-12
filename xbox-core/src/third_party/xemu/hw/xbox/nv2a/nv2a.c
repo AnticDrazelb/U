@@ -297,6 +297,7 @@ void pgraph_vk_xb_request_display_download(NV2AState *d, uint32_t addr); /* (vk/
 
 /* xbox-core: the renderer thread's work, counted (xb_profile.h) */
 uint64_t xb_prof_n[XB_PROF_COUNT], xb_prof_ns[XB_PROF_COUNT];
+uint64_t xb_surface_writebacks;
 
 int xb_nv2a_profile(char *out, int size, double seconds)
 {

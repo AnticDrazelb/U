@@ -503,6 +503,7 @@ static void xb_download_surface_body(NV2AState *d, SurfaceBinding *surface, bool
     /* xbox-core: written without a fault a page (the dirty log's), protected again after (a write
      * by the CPU after this shows to every reader) */
     xb_dirty_unprotect(surface->vram_addr, surface->pitch * surface->height);
+    __atomic_add_fetch(&xb_surface_writebacks, 1, __ATOMIC_RELAXED);
     download_surface_to_buffer(d, surface, d->vram_ptr + surface->vram_addr);
     xb_dirty_protect(surface->vram_addr, surface->pitch * surface->height);
     /* ... and not new to the surfaces' reader: what is in RAM is what the surface holds (without
