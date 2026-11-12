@@ -9,7 +9,7 @@ OUT="${1:-$HOME/xc-bsd}"
 mkdir -p "$OUT/obj"
 VERSION="$(head -1 "$HERE/VERSION")"
 FLAGS="-O2 -g -march=btver2 -Wall -Wextra -Wno-unused-parameter -I$HERE/src -DXB_NO_VULKAN -DXB_VERSION=\"$VERSION\""
-SOURCES="memory xbe cpu kernel kernel_rtl kernel_crypto files xiso devices nv2a render draw pixel usb audio apu nic xemu_glue diagnostics gpu_vulkan platform_freebsd main"
+SOURCES="memory dirty xbe cpu kernel kernel_rtl kernel_crypto files xiso devices nv2a render draw pixel usb audio apu nic xemu_glue diagnostics gpu_vulkan platform_freebsd main"
 # xemu's devices (src/third_party; the NV2A not: no Vulkan here), C, with their shims
 TP="$HERE/src/third_party"
 XEMU_C="xemu/hw/xbox/mcpx/apu/apu.c xemu/hw/xbox/mcpx/apu/vp/vp.c xemu/hw/xbox/mcpx/apu/monitor.c xemu/hw/xbox/mcpx/apu/debug.c
