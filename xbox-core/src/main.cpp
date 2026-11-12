@@ -159,12 +159,12 @@ int main(int argc, char** argv)
     InitCpu();
     if (const char* e = std::getenv("XB_APU_DSP"); e && e[0] == '1')
         SetApuDsp(true);
+    SetDataDirectory("xbox-data"); // before the devices: xemu's renderer keeps its shader cache there
     InitDevices();
     InitKernel();
     std::string error;
     if (!LoadGame(xbe, error))
         Fatal("%s: %s", xbe.c_str(), error.c_str());
-    SetDataDirectory("xbox-data");
     diag::StartMonitor("hang.log", nullptr, nullptr);
     ResolveThunks();
     StartVblank();

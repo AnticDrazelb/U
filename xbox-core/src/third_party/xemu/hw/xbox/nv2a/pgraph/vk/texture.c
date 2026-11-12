@@ -29,6 +29,7 @@
 #include "qemu/fast-hash.h"
 #include "qemu/lru.h"
 #include "renderer.h"
+#include "hw/xbox/nv2a/xb_profile.h"
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
 
@@ -475,7 +476,7 @@ static bool check_texture_possibly_dirty(NV2AState *d,
 
 // FIXME: Make sure we update sampler when data matches. Should we add filtering
 // options to the textureshape?
-static void upload_texture_image(PGRAPHState *pg, int texture_idx,
+static void xb_upload_texture_body(PGRAPHState *pg, int texture_idx,
                                  TextureBinding *binding)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -592,6 +593,15 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
             g_free(layer->levels[level_idx].decoded_data);
         }
     }
+}
+
+/* xbox-core: timed (xb_profile.h) */
+static void upload_texture_image(PGRAPHState *pg, int texture_idx,
+                                 TextureBinding *binding)
+{
+    const uint64_t xb_t0 = xb_prof_now();
+    xb_upload_texture_body(pg, texture_idx, binding);
+    xb_prof_add(XB_PROF_TEX_UPLOAD, xb_t0);
 }
 
 static void copy_zeta_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surface,

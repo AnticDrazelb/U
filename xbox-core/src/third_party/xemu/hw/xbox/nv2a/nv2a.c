@@ -20,6 +20,7 @@
  */
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/nv2a/xb_profile.h"
 #include "qemu/main-loop.h"
 
 void nv2a_update_irq(NV2AState *d)
@@ -293,6 +294,30 @@ void xb_nv2a_renderer_started(bool ok)
 
 void xb_nv2a_step(const char *step); /* xbox-core: the start-up's step file (nv2a.cpp) */
 void pgraph_vk_xb_request_display_download(NV2AState *d, uint32_t addr); /* (vk/renderer.c) */
+
+/* xbox-core: the renderer thread's work, counted (xb_profile.h) */
+uint64_t xb_prof_n[XB_PROF_COUNT], xb_prof_ns[XB_PROF_COUNT];
+
+int xb_nv2a_profile(char *out, int size, double seconds)
+{
+    static const char *const names[XB_PROF_COUNT] = {
+        "busy", "draws", "shaders made", "shaders from the cache", "pipelines made",
+        "waits for the GPU", "surfaces written back", "surfaces uploaded", "textures uploaded",
+    };
+    int n = 0;
+    out[0] = 0;
+    for (int i = 0; i < XB_PROF_COUNT && n < size - 1; i++) {
+        const uint64_t count = __atomic_exchange_n(&xb_prof_n[i], 0, __ATOMIC_RELAXED);
+        const uint64_t ns = __atomic_exchange_n(&xb_prof_ns[i], 0, __ATOMIC_RELAXED);
+        const double share = seconds > 0 ? 100.0 * (double)ns / 1e9 / seconds : 0;
+        if (i == XB_PROF_BUSY) {
+            n += snprintf(out + n, size - n, "busy %.0f%% of the time", share);
+        } else if (count) {
+            n += snprintf(out + n, size - n, "; %s %.0f/s (%.1f%%)", names[i], (double)count / seconds, share);
+        }
+    }
+    return n;
+}
 
 /* true when the renderer started (else this device isn't to be used: xbox-core's own NV2A is) */
 bool xb_nv2a_init(uint8_t *ram, uint64_t ram_size)

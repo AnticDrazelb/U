@@ -587,6 +587,8 @@ void StartMonitor(const std::string& hang_file, void (*host_stacks)(const char*,
                 Log("stats: sound: %s", SoundStats(span).c_str());
                 Log("stats: one processor: %s", SingleProcessorStats(span).c_str());
                 Log("stats: the dirty log: %s", DirtyLogStats().c_str());
+                if (const std::string work = Nv2aWorkStats(span); !work.empty())
+                    Log("stats: the GPU's work (xemu's renderer thread): %s", work.c_str());
                 {
                     const DisplayInfo d = GetDisplay();
                     // how much of it isn't black (one pixel in 64)

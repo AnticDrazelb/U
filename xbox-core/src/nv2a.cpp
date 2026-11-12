@@ -9,6 +9,7 @@
 //    the renderer (render.cpp), which draws into guest memory
 // Register semantics follow the hardware as xemu documents it (hw/xbox/nv2a); the code is this
 // project's own.
+#include <sys/stat.h>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -512,6 +513,20 @@ void xb_nv2a_write(uint64_t addr, uint64_t val, unsigned int size);
 void xb_nv2a_vblank(void);
 // xemu's renderer: the surfaces drawn are back in RAM (a vblank's download): the picture is copied
 void xb_nv2a_picture_ready(void) { xb::TakePicture(); }
+int xb_nv2a_profile(char* out, int size, double seconds);
+// the folder xemu's renderer keeps the shaders and pipelines it made in, from one run to the next
+// (XB_NO_SHADER_CACHE=1: none)
+const char* xb_shader_cache_dir(void)
+{
+    static const std::string dir = [] {
+        if (std::getenv("XB_NO_SHADER_CACHE"))
+            return std::string();
+        const std::string d = xb::DataDirectory() + "/shader-cache";
+        mkdir(d.c_str(), 0755);
+        return d;
+    }();
+    return dir.empty() ? nullptr : dir.c_str();
+}
 uint32_t xb_nv2a_display_start(void);
 }
 namespace {
@@ -648,6 +663,20 @@ void Nv2aVblank()
     std::lock_guard lock(g_m);
     g_pcrtc_pending |= 1;
     UpdateIrq();
+}
+
+std::string Nv2aWorkStats(double seconds)
+{
+#ifdef XB_XEMU_NV2A
+    if (g_xemu_nv2a)
+    {
+        char out[700];
+        xb_nv2a_profile(out, sizeof(out), seconds);
+        return out;
+    }
+#endif
+    (void)seconds;
+    return "";
 }
 
 bool PictureIsCopied()

@@ -19,6 +19,9 @@
 
 #include "ui/xemu-settings.h"
 #include "renderer.h"
+#include "hw/xbox/nv2a/xb_profile.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 
 #include <assert.h>
 #include <glslang/Include/glslang_c_interface.h>
@@ -388,14 +391,79 @@ static glslang_stage_t vk_shader_stage_to_glslang_stage(VkShaderStageFlagBits st
     }
 }
 
+/* xbox-core: the shaders made, kept on the disk by their GLSL (and stage): a game's shaders are made
+ * once, not each time it runs (glslang on the PS4's cores takes tens of milliseconds a shader). The
+ * folder from xbox-core (nv2a.cpp); NULL: none. */
+const char *xb_shader_cache_dir(void);
+
+static GByteArray *xb_spv_from_cache(int stage, const char *glsl, char *path, size_t path_size)
+{
+    path[0] = 0;
+    const char *dir = xb_shader_cache_dir();
+    if (!dir) {
+        return NULL;
+    }
+    const XXH128_hash_t h = XXH3_128bits(glsl, strlen(glsl));
+    snprintf(path, path_size, "%s/%016llx%016llx-%d.spv", dir, (unsigned long long)h.high64,
+             (unsigned long long)h.low64, stage);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    GByteArray *spv = NULL;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        const long size = ftell(f);
+        if (size >= 20 && size % 4 == 0 && fseek(f, 0, SEEK_SET) == 0) {
+            uint8_t *data = malloc((size_t)size);
+            uint32_t magic = 0;
+            if (data && fread(data, 1, (size_t)size, f) == (size_t)size &&
+                (memcpy(&magic, data, 4), magic == 0x07230203u)) {
+                spv = g_byte_array_new_take(data, (gsize)size);
+            } else {
+                free(data);
+            }
+        }
+    }
+    fclose(f);
+    return spv;
+}
+
+static void xb_spv_to_cache(const char *path, const GByteArray *spv)
+{
+    if (!path[0] || !spv) {
+        return;
+    }
+    char part[600];
+    snprintf(part, sizeof(part), "%s.part", path);
+    FILE *f = fopen(part, "wb");
+    if (!f) {
+        return;
+    }
+    const bool ok = fwrite(spv->data, 1, spv->len, f) == spv->len;
+    if (fclose(f) == 0 && ok) {
+        rename(part, path);
+    } else {
+        remove(part);
+    }
+}
+
 ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
     PGRAPHVkState *r, VkShaderStageFlagBits stage, const char *glsl)
 {
     ShaderModuleInfo *info = g_malloc0(sizeof(*info));
     info->refcnt = 0;
     info->glsl = strdup(glsl);
-    info->spirv = pgraph_vk_compile_glsl_to_spv(
-        r, vk_shader_stage_to_glslang_stage(stage), glsl);
+    const uint64_t xb_t0 = xb_prof_now();
+    char cache_path[512];
+    info->spirv = xb_spv_from_cache((int)stage, glsl, cache_path, sizeof(cache_path));
+    if (info->spirv) {
+        xb_prof_add(XB_PROF_SPV_CACHED, xb_t0);
+    } else {
+        info->spirv = pgraph_vk_compile_glsl_to_spv(
+            r, vk_shader_stage_to_glslang_stage(stage), glsl);
+        xb_prof_add(XB_PROF_GLSL, xb_t0);
+        xb_spv_to_cache(cache_path, info->spirv);
+    }
     info->module = pgraph_vk_create_shader_module_from_spv(r, info->spirv);
     init_layout_from_spv(info);
     return info;

@@ -597,6 +597,11 @@ bool LoadGame(const std::string& path, std::string& error)
     return true;
 }
 
+std::string DataDirectory()
+{
+    return g_data_dir;
+}
+
 void SetDataDirectory(const std::string& dir)
 {
     g_data_dir = dir;

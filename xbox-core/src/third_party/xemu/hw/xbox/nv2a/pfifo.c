@@ -20,6 +20,7 @@
  */
 
 #include "nv2a_int.h"
+#include "xb_profile.h"
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -463,6 +464,7 @@ void *pfifo_thread(void *arg)
 
     qemu_mutex_lock(&d->pfifo.lock);
     while (true) {
+        const uint64_t xb_busy_since = xb_prof_now(); /* xbox-core: the thread's busy time */
         d->pfifo.fifo_kick = false;
 
         pgraph_process_pending(d);
@@ -472,6 +474,7 @@ void *pfifo_thread(void *arg)
         }
 
         pgraph_process_pending_reports(d);
+        xb_prof_add(XB_PROF_BUSY, xb_busy_since);
 
         if (!d->pfifo.fifo_kick) {
             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);

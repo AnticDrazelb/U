@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "renderer.h"
+#include "hw/xbox/nv2a/xb_profile.h"
 #include <math.h>
 
 void pgraph_vk_draw_begin(NV2AState *d)
@@ -121,19 +122,95 @@ static bool pipeline_cache_entry_compare(Lru *lru, LruNode *node,
     return memcmp(&snode->key, key, sizeof(PipelineKey));
 }
 
+/* xbox-core: the driver's pipeline cache kept on the disk (beside the shaders: glsl.c), so that a
+ * pipeline made once isn't compiled again in the next run; the driver checks the data is its own.
+ * Saved from the renderer's thread at most every 30 s while new pipelines are made (the app is
+ * usually closed by being killed: nothing at its end is sure to run). */
+const char *xb_shader_cache_dir(void);
+static uint64_t xb_pipelines_saved_at, xb_pipelines_unsaved;
+
+static void xb_pipeline_cache_path(char *path, size_t size)
+{
+    const char *dir = xb_shader_cache_dir();
+    if (dir) {
+        snprintf(path, size, "%s/pipelines.bin", dir);
+    } else {
+        path[0] = 0;
+    }
+}
+
+static void xb_pipeline_cache_save(PGRAPHVkState *r)
+{
+    char path[512], part[520];
+    xb_pipeline_cache_path(path, sizeof(path));
+    size_t size = 0;
+    if (!path[0] || vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, NULL) != VK_SUCCESS ||
+        !size) {
+        return;
+    }
+    void *data = malloc(size);
+    if (data && vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, data) == VK_SUCCESS) {
+        snprintf(part, sizeof(part), "%s.part", path);
+        FILE *f = fopen(part, "wb");
+        if (f) {
+            const bool ok = fwrite(data, 1, size, f) == size;
+            if (fclose(f) == 0 && ok) {
+                rename(part, path);
+            } else {
+                remove(part);
+            }
+        }
+    }
+    free(data);
+    xb_pipelines_unsaved = 0;
+    xb_pipelines_saved_at = xb_prof_now();
+}
+
+static void xb_pipeline_made(PGRAPHVkState *r)
+{
+    xb_pipelines_unsaved++;
+    if (xb_prof_now() - xb_pipelines_saved_at > 30000000000ull) {
+        xb_pipeline_cache_save(r);
+    }
+}
+
 static void init_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    char path[512];
+    xb_pipeline_cache_path(path, sizeof(path));
+    void *initial = NULL;
+    size_t initial_size = 0;
+    FILE *f = path[0] ? fopen(path, "rb") : NULL;
+    if (f) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            const long size = ftell(f);
+            if (size > 0 && size < (256l << 20) && fseek(f, 0, SEEK_SET) == 0 &&
+                (initial = malloc((size_t)size)) != NULL) {
+                if (fread(initial, 1, (size_t)size, f) == (size_t)size) {
+                    initial_size = (size_t)size;
+                } else {
+                    free(initial);
+                    initial = NULL;
+                }
+            }
+        }
+        fclose(f);
+    }
     VkPipelineCacheCreateInfo cache_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
         .flags = 0,
-        .initialDataSize = 0,
-        .pInitialData = NULL,
+        .initialDataSize = initial_size,
+        .pInitialData = initial,
         .pNext = NULL,
     };
-    VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
-                                   &r->vk_pipeline_cache));
+    if (vkCreatePipelineCache(r->device, &cache_info, NULL, &r->vk_pipeline_cache) != VK_SUCCESS) {
+        cache_info.initialDataSize = 0, cache_info.pInitialData = NULL; /* (data it won't take) */
+        VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL, &r->vk_pipeline_cache));
+    }
+    free(initial);
+    xb_pipelines_saved_at = xb_prof_now();
 
     const size_t pipeline_cache_size = 2048;
     lru_init(&r->pipeline_cache);
@@ -153,6 +230,9 @@ static void finalize_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    if (xb_pipelines_unsaved) {
+        xb_pipeline_cache_save(r);
+    }
     lru_flush(&r->pipeline_cache);
     g_free(r->pipeline_cache_entries);
     r->pipeline_cache_entries = NULL;
@@ -1005,8 +1085,11 @@ static void create_pipeline(PGRAPHState *pg)
         .basePipelineHandle = VK_NULL_HANDLE,
     };
     VkPipeline pipeline;
+    const uint64_t xb_t0 = xb_prof_now(); /* xbox-core: timed (xb_profile.h) */
     VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
                                        &pipeline_create_info, NULL, &pipeline));
+    xb_prof_add(XB_PROF_PIPELINE, xb_t0);
+    xb_pipeline_made(r);
 
     snode->pipeline = pipeline;
     snode->layout = layout;
@@ -1210,7 +1293,7 @@ const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_STALLED] = NV2A_PROF_FINISH_STALLED,
 };
 
-void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
+static void xb_finish_body(PGRAPHState *pg, FinishReason finish_reason)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
@@ -1293,6 +1376,14 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
     pgraph_vk_process_pending_reports_internal(d);
 
     pgraph_vk_compute_finish_complete(r);
+}
+
+/* xbox-core: timed (xb_profile.h) */
+void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
+{
+    const uint64_t xb_t0 = xb_prof_now();
+    xb_finish_body(pg, finish_reason);
+    xb_prof_add(XB_PROF_FINISH, xb_t0);
 }
 
 void pgraph_vk_begin_command_buffer(PGRAPHState *pg)
@@ -2019,7 +2110,7 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
     buffer->buffer_offset += remap.buffer_space_required;
 }
 
-void pgraph_vk_flush_draw(NV2AState *d)
+static void xb_flush_draw_body(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -2207,4 +2298,12 @@ void pgraph_vk_flush_draw(NV2AState *d)
     } else {
         NV2A_VK_DPRINTF("EMPTY NV097_SET_BEGIN_END");
     }
+}
+
+/* xbox-core: timed (xb_profile.h) */
+void pgraph_vk_flush_draw(NV2AState *d)
+{
+    const uint64_t xb_t0 = xb_prof_now();
+    xb_flush_draw_body(d);
+    xb_prof_add(XB_PROF_DRAW, xb_t0);
 }

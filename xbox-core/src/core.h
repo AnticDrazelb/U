@@ -290,6 +290,8 @@ DisplayInfo GetDisplay();
 // is copied then (GetDisplay's `pixels`).
 void TakePicture();
 bool PictureIsCopied(); // xemu's NV2A draws (nv2a.cpp): the picture comes from TakePicture's copy
+std::string DataDirectory();             // files.cpp: where the hard disk's folders are
+std::string Nv2aWorkStats(double seconds); // nv2a.cpp: xemu's renderer thread's work, for the stats
 std::string LastDrawsNote(); // draw.cpp: the last draws of xbox-core's NV2A (where they land), for the log
 u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);

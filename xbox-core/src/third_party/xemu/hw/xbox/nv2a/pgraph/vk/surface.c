@@ -28,6 +28,7 @@
 #include "qemu/compiler.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
+#include "hw/xbox/nv2a/xb_profile.h"
 
 const int num_invalid_surfaces_to_keep = 10;  // FIXME: Make automatic
 const int max_surface_frame_time_delta = 5;
@@ -490,7 +491,7 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
     }
 }
 
-static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
+static void xb_download_surface_body(NV2AState *d, SurfaceBinding *surface, bool force)
 {
     if (!(surface->download_pending || force) || !surface->width ||
         !surface->height) {
@@ -521,6 +522,14 @@ static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
 
     surface->download_pending = false;
     surface->draw_dirty = false;
+}
+
+/* xbox-core: timed (xb_profile.h) */
+static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
+{
+    const uint64_t xb_t0 = xb_prof_now();
+    xb_download_surface_body(d, surface, force);
+    xb_prof_add(XB_PROF_DOWNLOAD, xb_t0);
 }
 
 void pgraph_vk_wait_for_surface_download(SurfaceBinding *surface)
@@ -973,7 +982,7 @@ void pgraph_vk_surface_download_if_dirty(NV2AState *d, SurfaceBinding *surface)
     }
 }
 
-void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
+static void xb_upload_surface_body(NV2AState *d, SurfaceBinding *surface,
                                    bool force)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -1300,6 +1309,15 @@ void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
     pgraph_vk_end_single_time_commands(pg, cmd);
 
     surface->initialized = true;
+}
+
+/* xbox-core: timed (xb_profile.h) */
+void pgraph_vk_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
+                                   bool force)
+{
+    const uint64_t xb_t0 = xb_prof_now();
+    xb_upload_surface_body(d, surface, force);
+    xb_prof_add(XB_PROF_SURF_UPLOAD, xb_t0);
 }
 
 static void compare_surfaces(SurfaceBinding const *a, SurfaceBinding const *b)

@@ -914,6 +914,9 @@ int main()
         gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
         SetNv2aChoice(g_settings.nv2a == 1); // Settings > Graphics
         SetApuDsp(g_settings.dsp == 1);      // Settings > Sound effects
+        // the hard disk's folders before the devices (xemu's renderer keeps its shader cache there)
+        SeedHardDisk("/app0/hdd-seed", "/data/xbox-core/hdd");
+        SetDataDirectory("/data/xbox-core/hdd");
         LogSync("launch: devices");
         InitDevices();
         // drawing on the GPU (RADV), unless starting it killed the last run of this build
@@ -924,8 +927,6 @@ int main()
         std::string error;
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
-        SeedHardDisk("/app0/hdd-seed", "/data/xbox-core/hdd");
-        SetDataDirectory("/data/xbox-core/hdd");
         diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks, [] { WriteLogBundle({}); });
         // the logs onto the USB drives every 15 s while it runs: a console that freezes hard
         // (nothing runs to write them), or an app closed from the home screen, still leaves them
