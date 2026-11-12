@@ -515,6 +515,8 @@ void WriteSystemTime(u32 at, s64 value)
 }
 } // namespace
 
+void StartPictureProbe();
+
 void StartVblank()
 {
     // KeTickCount: milliseconds since start
@@ -532,6 +534,7 @@ void StartVblank()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }).detach();
+    StartPictureProbe();
     // the interrupt thread: vblank at 60 Hz, service routines of asserted lines, DPCs
     GuestThread* t = NewGuestThread(0x10000, 0, "interrupts");
     g_interrupt_thread = t;
@@ -569,6 +572,79 @@ void StartVblank()
     });
 }
 
+// The picture's geometry from the display mode and start address; with the overlay's (PVIDEO's
+// registers, read through the device: not from the renderer's thread, which holds PGRAPH's lock
+// while the device's big lock waits for it) if asked
+DisplayInfo DisplayOf(const Display& d, u32 start, bool overlay);
+namespace {
+// the latest whole picture (TakePicture), where the renderer draws apart from RAM
+std::mutex g_picture_mutex;
+std::shared_ptr<const std::vector<u8>> g_picture;
+u32 g_picture_address = 0;
+} // namespace
+
+const u8* DisplayInfo::Bytes() const
+{
+    return pixels ? pixels->data() : Ptr<const u8>(address);
+}
+
+void TakePicture()
+{
+    Display d;
+    {
+        std::lock_guard lock(g_irq_mutex);
+        d = g_display;
+    }
+    const DisplayInfo info = DisplayOf(d, Nv2aDisplayStart(), false);
+    const size_t bytes = size_t(info.pitch) * info.height;
+    if (!info.valid || !GuestMapped(info.address, u32(bytes)))
+        return;
+    auto copy = std::make_shared<std::vector<u8>>(bytes);
+    std::memcpy(copy->data(), Ptr<const u8>(info.address), bytes);
+    std::lock_guard lock(g_picture_mutex);
+    g_picture = std::move(copy);
+    g_picture_address = info.address;
+}
+
+// XB_PICTURE_PROBE=x,y,rrggbb: a test's eye on the picture as a presenter reads it: every 2 ms the
+// pixel at (x, y) of what GetDisplay gives, once it first shows rrggbb, counted when it doesn't (a
+// frame half drawn shown); logged each second
+void StartPictureProbe()
+{
+    const char* probe = std::getenv("XB_PICTURE_PROBE");
+    int x = 0, y = 0;
+    unsigned rgb = 0;
+    if (!probe || std::sscanf(probe, "%d,%d,%x", &x, &y, &rgb) != 3)
+        return;
+    std::thread([x, y, rgb] {
+        u64 samples = 0, wrong = 0;
+        bool seen = false;
+        auto next_log = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!g_quit)
+        {
+            const DisplayInfo d = GetDisplay();
+            if (d.valid && x < d.width && y < d.height && GuestMapped(d.address, d.pitch * u32(d.height)))
+            {
+                const u32 v = DisplayPixel(d, x, y);
+                seen = seen || v == rgb;
+                if (seen)
+                {
+                    samples++;
+                    if (v != rgb)
+                        wrong++;
+                }
+            }
+            if (std::chrono::steady_clock::now() >= next_log)
+            {
+                next_log += std::chrono::seconds(1);
+                Log("picture probe: %llu samples, %llu not %06x at (%d, %d)", (unsigned long long)samples,
+                    (unsigned long long)wrong, rgb, x, y);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }).detach();
+}
+
 DisplayInfo GetDisplay()
 {
     Display d;
@@ -577,6 +653,20 @@ DisplayInfo GetDisplay()
         d = g_display;
     }
     const u32 start = Nv2aDisplayStart();
+    DisplayInfo info = DisplayOf(d, start, true);
+    if (PictureIsCopied())
+    {
+        // the latest whole picture (its own address: until the frame flipped to is back in RAM, the
+        // one before it, complete, is shown)
+        std::lock_guard lock(g_picture_mutex);
+        if (g_picture && g_picture->size() == size_t(info.pitch) * info.height)
+            info.pixels = g_picture, info.address = g_picture_address;
+    }
+    return info;
+}
+
+DisplayInfo DisplayOf(const Display& d, u32 start, bool overlay)
+{
     DisplayInfo info;
     info.format = d.format;
     info.bpp = d.format == 0x12 ? 4 : d.format == 0x11 || d.format == 0x10 ? 2 : 4;
@@ -585,6 +675,8 @@ DisplayInfo GetDisplay()
     info.height = info.width >= 1920 ? 1080 : info.width >= 1280 ? 720 : 480;
     info.address = PhysToGuest(start ? start : d.framebuffer);
     info.valid = d.pitch != 0 && info.address != 0;
+    if (!overlay)
+        return info;
     // the video overlay, as xemu reads it (pgraph/vk/display.c: get_pvideo_state)
     DisplayInfo::Overlay& o = info.overlay;
     const u32 size_in = Nv2aPvideo(0x928);
@@ -621,10 +713,15 @@ DisplayInfo GetDisplay()
 namespace {
 u32 FramebufferPixel(const DisplayInfo& d, int x, int y)
 {
-    const u32 p = d.address + u32(y) * d.pitch + u32(x) * d.bpp;
+    const u8* p = d.Bytes() + size_t(y) * d.pitch + size_t(x) * d.bpp;
     if (d.bpp == 4)
-        return Read<u32>(p) & 0xffffff;
-    const u16 v = Read<u16>(p);
+    {
+        u32 v;
+        std::memcpy(&v, p, 4);
+        return v & 0xffffff;
+    }
+    u16 v;
+    std::memcpy(&v, p, 2);
     if (d.format == 0x11)
         return u32((v >> 11) << 3) << 16 | u32(((v >> 5) & 63) << 2) << 8 | u32((v & 31) << 3);
     return u32(((v >> 10) & 31) << 3) << 16 | u32(((v >> 5) & 31) << 3) << 8 | u32((v & 31) << 3);
@@ -657,6 +754,11 @@ bool SaveFramebuffer(const std::string& path)
 {
     if (gpu::Enabled())
         gpu::Sync();
+    return SaveShownPicture(path);
+}
+
+bool SaveShownPicture(const std::string& path)
+{
     const DisplayInfo d = GetDisplay();
     if (!d.valid)
     {

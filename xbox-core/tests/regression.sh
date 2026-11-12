@@ -55,6 +55,18 @@ for renderer in default own; do
         fi
     fi
 done
+# frames drawn in pieces and flipped at vblank: the shown picture always whole (the probe, as a
+# presenter reads it, never without the red square drawn last), and the frames keep coming
+if [ -f "$HERE/flip-test/bin/default.xbe" ]; then
+    XB_PICTURE_PROBE=600,460,ff0000 timeout 120 "$CORE" "$HERE/flip-test/bin/default.xbe" --seconds 8 > flip.log 2>&1
+    probe=$(grep -a "picture probe" flip.log | tail -1)
+    frames=$(grep -a -o "[0-9]* frames" flip.log | tail -1 | grep -o "[0-9]*")
+    if [[ "$probe" == *" 0 not "* ]] && [ "${frames:-0}" -ge 20 ]; then
+        echo "ok   flip ${frames} frames, ${probe#*picture probe: }"
+    else
+        echo "FAIL flip ${frames:-0} frames, ${probe#*picture probe: }"; fail=1
+    fi
+fi
 for s in triangle mesh xaudio sdl usb sdl_gamecontroller; do
     run "$s" "$NXDK_DIR/samples/$s/bin/default.xbe" 5
 done

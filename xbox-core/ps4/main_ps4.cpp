@@ -624,6 +624,17 @@ void PresentLoop()
             FeedGuestPad(pad);
         const DisplayInfo d = GetDisplay();
         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        // the picture as shown, every 10 s, the last three kept: the log bundle carries them (what a
+        // report says is on the screen, seen)
+        static double next_picture = 10;
+        if (d.valid && now >= next_picture)
+        {
+            next_picture = now + 10;
+            const std::string dir = kDataDir;
+            std::rename((dir + "/picture-2.png").c_str(), (dir + "/picture-3.png").c_str());
+            std::rename((dir + "/picture-1.png").c_str(), (dir + "/picture-2.png").c_str());
+            SaveShownPicture(dir + "/picture-1.png");
+        }
         const bool log_on = show_log && (now < 15 || !d.valid);
         // Nothing new to show (the same picture, layout and no log over it): the screen keeps the last
         // flip, and the CPU time (a 1080p frame is 8 MiB to write) stays the game's.
@@ -631,7 +642,7 @@ void PresentLoop()
         if (d.valid)
         {
             const u32 bytes = u32(d.height) * d.pitch;
-            const u64* p = Ptr<const u64>(d.address);
+            const u64* p = reinterpret_cast<const u64*>(d.Bytes());
             for (u32 i = 0; i < bytes / 8; i++)
                 hash = (hash ^ p[i]) * 0x100000001b3ull;
         }

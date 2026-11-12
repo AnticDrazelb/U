@@ -470,6 +470,62 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
             closedir(d);
         }
         std::sort(names.begin(), names.end());
+        // the pictures shown (picture-N.png: the app saves one every 10 s while a game runs), as
+        // base64, so that the one text file carries them
+        std::vector<std::string> pictures;
+        if (DIR* d = opendir(in.data_dir.c_str()))
+        {
+            while (dirent* e = readdir(d))
+            {
+                const std::string n = e->d_name;
+                if (n.size() > 4 && strcasecmp(n.c_str() + n.size() - 4, ".png") == 0)
+                    pictures.push_back(n);
+            }
+            closedir(d);
+        }
+        std::sort(pictures.begin(), pictures.end());
+        for (const std::string& n : pictures)
+        {
+            std::string bytes;
+            if (FILE* f = std::fopen((in.data_dir + "/" + n).c_str(), "rb"))
+            {
+                char buf[65536];
+                size_t got;
+                while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0 && bytes.size() < (size_t(4) << 20))
+                    bytes.append(buf, got);
+                std::fclose(f);
+            }
+            std::string when;
+            struct stat st;
+            if (stat((in.data_dir + "/" + n).c_str(), &st) == 0)
+            {
+                char b[40];
+                const time_t t = st.st_mtime;
+                std::strftime(b, sizeof(b), ", written %Y-%m-%d %H:%M:%S", std::localtime(&t));
+                when = b;
+            }
+            line("");
+            line("===== " + n + " (" + std::to_string(bytes.size()) + " bytes, base64" + when + ") =====");
+            static const char* const kB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            for (size_t i = 0; i < bytes.size(); i += 3)
+            {
+                const uint32_t v = uint32_t(uint8_t(bytes[i])) << 16 |
+                                   (i + 1 < bytes.size() ? uint32_t(uint8_t(bytes[i + 1])) << 8 : 0) |
+                                   (i + 2 < bytes.size() ? uint32_t(uint8_t(bytes[i + 2])) : 0);
+                out += kB64[v >> 18 & 63];
+                out += kB64[v >> 12 & 63];
+                out += i + 1 < bytes.size() ? kB64[v >> 6 & 63] : '=';
+                out += i + 2 < bytes.size() ? kB64[v & 63] : '=';
+                if (out.size() >= 76)
+                {
+                    line(out);
+                    out.clear();
+                }
+            }
+            if (!out.empty())
+                line(out);
+        }
         constexpr size_t kLimit = size_t(8) << 20;
         for (const std::string& n : names)
         {

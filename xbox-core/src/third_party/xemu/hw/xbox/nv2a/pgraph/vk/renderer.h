@@ -22,6 +22,7 @@
 
 /* xbox-core: the renderer's start-up step, in the step file and the log (nv2a.cpp) */
 void xb_nv2a_step(const char *step);
+void xb_nv2a_picture_ready(void); /* xbox-core: the surfaces are back in RAM (nv2a.cpp) */
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "qemu/queue.h"

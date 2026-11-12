@@ -259,6 +259,12 @@ struct DisplayInfo
     bool valid = false; // a mode has been set
     u32 address = 0, format = 0, pitch = 0, bpp = 4;
     int width = 640, height = 480;
+    // A whole picture's copy (pitch * height bytes from `address`), where the renderer draws apart
+    // from RAM (xemu's: its surfaces come back to RAM at each vblank, a frame being drawn among
+    // them): taken once that has happened, so what is shown is never a frame half drawn nor RAM
+    // being written. Null: the RAM at `address` is read.
+    std::shared_ptr<const std::vector<u8>> pixels;
+    const u8* Bytes() const; // the picture's first byte (the copy's, else the RAM's)
     // the video overlay (PVIDEO: what movies are shown through), over the picture where it is on
     struct Overlay
     {
@@ -270,9 +276,15 @@ struct DisplayInfo
 };
 u32 Nv2aPvideo(u32 reg); // a PVIDEO register (offset within PVIDEO), whichever NV2A runs
 DisplayInfo GetDisplay();
+// The surfaces drawn are back in RAM (xemu's renderer, after a vblank's download): the picture shown
+// is copied then (GetDisplay's `pixels`).
+void TakePicture();
+bool PictureIsCopied(); // xemu's NV2A draws (nv2a.cpp): the picture comes from TakePicture's copy
 std::string LastDrawsNote(); // draw.cpp: the last draws of xbox-core's NV2A (where they land), for the log
 u32 DisplayPixel(const DisplayInfo& d, int x, int y); // 0xRRGGBB
 bool SaveFramebuffer(const std::string& path);
+// the picture as shown now (GetDisplay), as a PNG; from any thread (it doesn't wait for a renderer)
+bool SaveShownPicture(const std::string& path);
 // Input: the Xbox controller on USB port 1 (usb.cpp). Buttons (digital): 0x01 up, 0x02 down,
 // 0x04 left, 0x08 right, 0x10 start, 0x20 back, 0x40 left stick, 0x80 right stick. Analog buttons
 // (0-255): A, B, X, Y, black, white, left trigger, right trigger.

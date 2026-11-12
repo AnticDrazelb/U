@@ -510,6 +510,8 @@ bool xb_nv2a_init(uint8_t* ram, uint64_t ram_size);
 uint64_t xb_nv2a_read(uint64_t addr, unsigned int size);
 void xb_nv2a_write(uint64_t addr, uint64_t val, unsigned int size);
 void xb_nv2a_vblank(void);
+// xemu's renderer: the surfaces drawn are back in RAM (a vblank's download): the picture is copied
+void xb_nv2a_picture_ready(void) { xb::TakePicture(); }
 uint32_t xb_nv2a_display_start(void);
 }
 namespace {
@@ -646,6 +648,16 @@ void Nv2aVblank()
     std::lock_guard lock(g_m);
     g_pcrtc_pending |= 1;
     UpdateIrq();
+}
+
+bool PictureIsCopied()
+{
+#ifdef XB_XEMU_NV2A
+    static const bool from_ram = std::getenv("XB_PICTURE_RAM") != nullptr; // (a test's "before")
+    return g_xemu_nv2a && !from_ram;
+#else
+    return false;
+#endif
 }
 
 u32 Nv2aDisplayStart()

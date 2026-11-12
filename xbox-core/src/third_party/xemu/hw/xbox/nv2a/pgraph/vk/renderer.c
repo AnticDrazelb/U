@@ -160,6 +160,8 @@ static void pgraph_vk_process_pending(NV2AState *d)
         }
         if (qatomic_read(&r->download_dirty_surfaces_pending)) {
             pgraph_vk_download_dirty_surfaces(d);
+            /* xbox-core: the picture shown is copied now, whole (its presenter reads RAM) */
+            xb_nv2a_picture_ready();
         }
         if (qatomic_read(&d->pgraph.sync_pending)) {
             pgraph_vk_sync(d);
