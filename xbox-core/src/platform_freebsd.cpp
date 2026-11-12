@@ -281,8 +281,13 @@ bool ThreadStack(uint64_t& low, uint64_t& high)
     pthread_attr_t a;
     void* addr = nullptr;
     size_t size = 0;
-    if (pthread_attr_get_np(pthread_self(), &a) != 0)
+    if (pthread_attr_init(&a) != 0) // FreeBSD's pthread_attr_get_np fills an initialised one
         return false;
+    if (pthread_attr_get_np(pthread_self(), &a) != 0)
+    {
+        pthread_attr_destroy(&a);
+        return false;
+    }
     const bool ok = pthread_attr_getstack(&a, &addr, &size) == 0 && addr && size;
     pthread_attr_destroy(&a);
     if (!ok)
