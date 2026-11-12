@@ -101,6 +101,24 @@ it is and xbox-core's own NV2A draws (XB_VK_HANG=1 and XB_NV2A_START_MS make one
 For looking into its drawing: XB_VK_SHADERS=folder writes each shader's GLSL there, XB_VK_DRAWS=1
 logs each inline-buffer draw (attributes, first vertex), XB_VK_FAIL_BUFFER=n refuses buffer n.
 
+## Speed: what QEMU knew for free (2026-11-12)
+Halo ran at 4-16 frames a second on the console with xemu's renderer. QEMU tells xemu which pages
+the CPU wrote from its translator; this port hashed the range instead, at every check: the colour
+and depth surfaces and each texture, every draw (gigabytes a second at Halo's thousand draws).
+- src/dirty.cpp, a dirty log as a hypervisor keeps one: a page a reader has looked at is write-
+  protected, the first write to it (the guest's or the emulator's) faults once and marks it for
+  every reader; system calls that write the guest's memory unprotect first. Two self-test steps
+  check it (a write by the emulator, one by guest code); else the hashing (XB_NO_DIRTY_LOG=1).
+- Surfaces have a reader of their own (XB_DIRTY_MEMORY_SURFACE): a write-back isn't news to it
+  (before, every write-back made the next draw upload the surface again).
+- A vblank writes back the surface the display starts in only (every surface every half second;
+  a wait for the GPU to be idle still writes back all; XB_DOWNLOAD_ALL=1: all each vblank).
+- Shaders (SPIR-V by GLSL and stage) and the driver's pipeline cache kept in <data>/shader-cache
+  (XB_NO_SHADER_CACHE=1: none).
+- The picture's copy taken only after a write-back; the PS4 presenter compares its generation.
+- The stats line "the GPU's work (xemu's renderer thread)": busy share, draws, shaders made and
+  from the cache, pipelines, waits for the GPU, write-backs and uploads.
+
 ## Verified before shipping (2026-11-10, commit 6ab6dee)
 - Regression 13/13 normally, with XB_TEST_FS_AS_PS4=1, and with XB_USB=own / XB_NV2A=own.
 - FreeBSD VM (the PS4's OS family): kernel, SEH and disc tests 0 failures, triangle runs; built
