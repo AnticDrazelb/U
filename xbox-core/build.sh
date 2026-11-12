@@ -13,6 +13,9 @@ case "${1:-}" in
 host)
     cmake -S "$HERE" -B "$HOME/xc-host" -G Ninja -DCMAKE_C_COMPILER="${CC:-clang}" -DCMAKE_CXX_COMPILER="${CXX:-clang++}"
     ninja -C "$HOME/xc-host"
+    # the profiler's names (profile: lines): functions by address, as the PS4 build's symbols.txt
+    nm="$(command -v /opt/llvm21/bin/llvm-nm || command -v llvm-nm || command -v nm)"
+    "$nm" -n -S -C --defined-only "$HOME/xc-host/xbox-core" | awk 'NF >= 4 && ($3 == "t" || $3 == "T" || $3 == "w" || $3 == "W") { name = $4; for (i = 5; i <= NF; i++) name = name " " $i; print $1, $2, name }' | sed 's/^0*\([0-9a-f]\)/\1/' > "$HOME/xc-host/symbols.txt"
     ;;
 ps4)
     # Variants (each its own app, so they install side by side), as xbox-bench 01.04's:

@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "profiler.h"
 #include "core.h"
 #include "diagnostics.h"
 #include "devices.h"
@@ -344,6 +345,7 @@ bool Method(u32 subchannel, u32 method, u32 parameter)
 
 void GpuThread()
 {
+    prof::RegisterThread("NV2A (xbox-core's)");
     std::unique_lock lock(g_m);
     u32 last_get = ~0u;
     auto last_report = std::chrono::steady_clock::now();

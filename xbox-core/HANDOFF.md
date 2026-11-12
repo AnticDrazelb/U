@@ -367,6 +367,23 @@ again. So a step that kills the app costs one launch.
    (10b258a), backpatched register accesses (02d6e4a); the PS4 present loop no longer rewrites an
    unchanged 1080p frame.
 
+## 5b. The profiler (New Eden's way, 2026-11-12)
+
+`src/profiler.cpp`: a thread sends the sample signal (the fault handler's, console-proven) to every
+registered thread 200 times a second (`XB_PROFILE=0` off, `XB_PROFILE_HZ` the rate); the handler
+notes the guest's eip (Xbox code) or the host's rip (plain stores: nothing fs-relative, checked
+with `XB_TEST_FS_AS_PS4=1`). Every 10 s the log has a `profile: <thread>: CPU n%, ...` line per busy
+thread with its busiest functions (named from `symbols.txt`: `/app0/symbols.txt` on the PS4, beside
+the program on the desktop, which `build.sh host` now writes), Xbox addresses with their XBE section,
+and system libraries by module (a thread blocked in a system call shows there; its CPU share says
+it's waiting). `/data/xbox-core/profile.txt` (in the bundle) has the whole run's top 40 per thread.
+Registered: every guest thread's host thread, xemu's threads (the shim's `qemu_thread_create`:
+`nv2a.pfifo_thread` runs PGRAPH and the Vulkan renderer, `mcpx.apu_thread`, the voice workers),
+xemu's timers, the AC'97 player, the kernel's timers, the PS4's presenter, launcher and audio out.
+**Reading a console profile:** the thread at or near 100% CPU is the bottleneck; its top functions
+say what to speed up. The fault trail now stops after its first 50,000 records (each was a system
+call on every fault).
+
 ## 6. Things to know
 
 - `build.sh ps4` copies `frontend/assets` into the package. It also makes `stage/symbols.txt` with llvm-nm and Python, which the log bundle uses to name crash addresses.

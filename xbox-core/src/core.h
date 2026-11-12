@@ -185,6 +185,7 @@ struct GuestThread
     std::string name;
     // where it runs, sampled (the watchdog's, through the fault handler: platform::SendSample)
     std::atomic<u64> host{0}; // its host thread (platform::CurrentHostThread), 0 before it starts
+    int prof_slot = -1; // its host thread's in the profiler (profiler.h)
     static constexpr u32 kSamples = 64;
     std::atomic<u32> samples{0};
     u32 sample_eip[kSamples] = {};

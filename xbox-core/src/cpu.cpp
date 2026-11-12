@@ -23,6 +23,7 @@
 #include "core.h"
 #include "diagnostics.h"
 #include "platform.h"
+#include "profiler.h"
 
 extern "C" {
 extern const unsigned char xcs_begin[], xcs_end[], xcs_enter64[], xcs_gate32[], xcs_bail64[], xcs_back64[],
@@ -1118,6 +1119,20 @@ bool OnFault(platform::Fault& f)
 {
     if (f.signal == platform::SampleSignal())
     {
+        // the profiler's (profiler.h): where it was, the guest's eip or the host's rip
+        if (prof::Active())
+        {
+            if (f.cs == g_sel32)
+            {
+                const bool gfs = f.fs_base && f.fs_base < 0x100000000ull;
+                const GuestThread* pt = gfs ? reinterpret_cast<GuestThread*>(Read<u64>(u32(f.fs_base) + kpcr::HostThread))
+                                            : diag::ThreadByStack(u32(*f.gpr[4]));
+                if (pt)
+                    prof::NoteGuest(pt->prof_slot, u32(*f.rip));
+            }
+            else
+                prof::NoteHost(*f.rip, *f.gpr[4]);
+        }
         // a sample of where a thread is: in guest code, its eip, registers and code are noted on its
         // GuestThread (plain stores, nothing fs-relative); anywhere else nothing. It resumes as it was.
         if (f.cs == g_sel32 && g_sampling.load(std::memory_order_relaxed))
@@ -1674,7 +1689,13 @@ void StartHostThread(GuestThread* t, std::function<void()> body)
         platform::PrepareThread();
         tl_thread = t;
         t->host = platform::CurrentHostThread();
+        char name[40];
+        std::snprintf(name, sizeof(name), "thread %u (%s)", t->id, t->name.c_str());
+        t->prof_slot = prof::RegisterThread(name);
         body();
+        const int slot = t->prof_slot;
+        t->prof_slot = -1;
+        prof::UnregisterThread(slot);
     }).detach();
 }
 

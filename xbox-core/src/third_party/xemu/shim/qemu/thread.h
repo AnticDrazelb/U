@@ -28,11 +28,29 @@ static inline bool qemu_cond_timedwait(QemuCond *c, QemuMutex *m, int ms)
     }
     return pthread_cond_timedwait(&c->c, &m->m, &ts) != ETIMEDOUT;
 }
+/* xbox-core's profiler (profiler.h): each of xemu's threads registered by its name */
+int xb_prof_register_thread(const char *name);
+void xb_prof_unregister_thread(int slot);
+typedef struct XbThreadStart { void *(*fn)(void *); void *arg; const char *name; } XbThreadStart;
+static inline void *xb_thread_start(void *p)
+{
+    XbThreadStart s = *(XbThreadStart *)p;
+    free(p);
+    const int slot = xb_prof_register_thread(s.name);
+    void *r = s.fn(s.arg);
+    xb_prof_unregister_thread(slot);
+    return r;
+}
 static inline void qemu_thread_create(QemuThread *t, const char *name, void *(*fn)(void *), void *arg, int mode)
 {
-    (void)name;
     (void)mode;
-    pthread_create(&t->t, NULL, fn, arg);
+    XbThreadStart *s = (XbThreadStart *)malloc(sizeof(XbThreadStart));
+    if (!s) {
+        pthread_create(&t->t, NULL, fn, arg);
+        return;
+    }
+    s->fn = fn, s->arg = arg, s->name = name ? name : "xemu";
+    pthread_create(&t->t, NULL, xb_thread_start, s);
 }
 static inline void qemu_thread_join(QemuThread *t) { pthread_join(t->t, NULL); }
 #endif

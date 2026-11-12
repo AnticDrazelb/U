@@ -7,10 +7,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <fcntl.h>
 #include <signal.h>
 #include <pthread.h>
+#include <ctime>
 #include <unistd.h>
 
 #include "../src/platform.h"
@@ -50,6 +52,8 @@ int32_t sceKernelGetModuleInfo(int32_t handle, ModuleInfo* info);
 int32_t sceKernelQueryMemoryProtection(void* address, void** start, void** end, uint32_t* protection);
 int32_t sceKernelDlsym(int32_t handle, const char* symbol, void** address);
 }
+
+extern "C" char __text_start[]; // the OpenOrbis link script: the start of .text (symbols.txt is relative to it)
 
 namespace xb {
 int EnterSignalHandler(uint64_t lo, uint64_t hi); // core.h: the handler's threads, without thread-local storage
@@ -549,6 +553,75 @@ void InstallFaultHandler(FaultHandler handler)
 
 int SampleSignal() { return kSigSample; }
 uint64_t CurrentHostThread() { return reinterpret_cast<uint64_t>(pthread_self()); }
+
+bool ThreadStack(uint64_t& low, uint64_t& high)
+{
+    // libthr's pthread_attr_get_np and pthread_attr_getstack, looked up (not imported)
+    using GetNp = int (*)(pthread_t, pthread_attr_t*);
+    using GetStack = int (*)(const pthread_attr_t*, void**, size_t*);
+    static const auto get_np = reinterpret_cast<GetNp>(Lookup("pthread_attr_get_np"));
+    static const auto get_stack = reinterpret_cast<GetStack>(Lookup("pthread_attr_getstack"));
+    if (!get_np || !get_stack)
+        return false;
+    pthread_attr_t a;
+    if (pthread_attr_init(&a) != 0)
+        return false;
+    void* addr = nullptr;
+    size_t size = 0;
+    const bool ok = get_np(pthread_self(), &a) == 0 && get_stack(&a, &addr, &size) == 0 && addr && size;
+    pthread_attr_destroy(&a);
+    if (!ok)
+        return false;
+    low = reinterpret_cast<uint64_t>(addr);
+    high = low + size;
+    return true;
+}
+
+uint64_t CodeBase() { return reinterpret_cast<uint64_t>(__text_start); }
+
+std::string ModuleName(uint64_t address)
+{
+    // the system's modules and their code segments, listed once
+    struct Range
+    {
+        uint64_t start, end;
+        std::string name;
+    };
+    static std::vector<Range> ranges = [] {
+        std::vector<Range> r;
+        int32_t handles[256];
+        size_t count = 0;
+        if (sceKernelGetModuleList(handles, 256, &count) != 0)
+            return r;
+        for (size_t m = 0; m < count && m < 256; m++)
+        {
+            ModuleInfo info;
+            std::memset(&info, 0, sizeof(info));
+            info.size = sizeof(info);
+            if (sceKernelGetModuleInfo(handles[m], &info) != 0)
+                continue;
+            for (uint32_t g = 0; g < info.segment_count && g < 4; g++)
+            {
+                const uint64_t a = reinterpret_cast<uint64_t>(info.segments[g].address);
+                r.push_back({a, a + info.segments[g].size, info.name});
+            }
+        }
+        return r;
+    }();
+    for (const Range& r : ranges)
+        if (address >= r.start && address < r.end)
+            return r.name;
+    return "";
+}
+
+uint64_t ThreadCpuNs(uint64_t host_thread)
+{
+    clockid_t clock;
+    timespec t{};
+    if (pthread_getcpuclockid(reinterpret_cast<pthread_t>(host_thread), &clock) != 0 || clock_gettime(clock, &t) != 0)
+        return 0;
+    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+}
 bool SendSample(uint64_t host_thread)
 {
     return host_thread && pthread_kill(reinterpret_cast<pthread_t>(host_thread), kSigSample) == 0;
@@ -580,9 +653,15 @@ bool OpenFaultTrail(const std::string& path, std::string& how)
     return true;
 }
 
+constexpr uint64_t kTrailLimit = 50000;
+
 void Trail(uint32_t stage, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 {
     if (g_trail_fd < 0 || !g_raw_pwrite)
+        return;
+    // each record is a system call; past the first 50,000 (the first minute or so of a game: the
+    // fault path is proven by then) they cost the frame rate more than they tell
+    if (g_trail_seq.load(std::memory_order_relaxed) >= kTrailLimit)
         return;
     TrailRecord r;
     r.magic = 0x52544258; // "XBTR"

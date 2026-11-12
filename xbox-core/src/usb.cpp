@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "profiler.h"
 #include "core.h"
 #include "devices.h"
 
@@ -698,6 +699,7 @@ void InitUsb()
                    [&c](u32 o, u32, u32 v) { c.WriteReg(o, v); }});
     }
     std::thread([] {
+        prof::RegisterThread("USB (xbox-core's)");
         auto next = std::chrono::steady_clock::now();
         while (!g_quit)
         {

@@ -15,9 +15,11 @@ void xb_bql_unlock(void);
 
 static int64_t now_ns(void) { return qemu_clock_get_us(0) * 1000; }
 
+int xb_prof_register_thread(const char *name);
 static void *timer_thread(void *arg)
 {
     (void)arg;
+    xb_prof_register_thread("xemu timers");
     pthread_mutex_lock(&g_lock);
     for (;;) {
         int64_t now = now_ns(), soonest = -1;

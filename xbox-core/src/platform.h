@@ -58,6 +58,13 @@ void InstallFaultHandler(FaultHandler handler);
 int SampleSignal();
 uint64_t CurrentHostThread();
 bool SendSample(uint64_t host_thread);
+// For the profiler: the calling thread's stack (false if not known), where the app's code was
+// loaded (what symbols.txt's addresses are relative to), a thread's CPU time so far (ns, 0 unknown)
+bool ThreadStack(uint64_t& low, uint64_t& high);
+uint64_t CodeBase();
+uint64_t ThreadCpuNs(uint64_t host_thread);
+// The system library (module) an address is in, "" not known (not for the fault handler)
+std::string ModuleName(uint64_t address);
 // A signal someone else handles (the stack dump's, SIGSYS) made safe to arrive in guest code: the
 // app's own state (fs) back before its handler runs. "" when done, else why not. The PS4's.
 std::string WrapSignal(int sig);

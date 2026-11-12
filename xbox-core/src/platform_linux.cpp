@@ -4,9 +4,12 @@
 #include <atomic>
 #include <csignal>
 #include <pthread.h>
+#include <dlfcn.h>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <sys/auxv.h>
 #include <sys/syscall.h>
@@ -253,6 +256,48 @@ void InstallFaultHandler(FaultHandler handler)
 
 int SampleSignal() { return SIGUSR2; }
 uint64_t CurrentHostThread() { return uint64_t(pthread_self()); }
+
+bool ThreadStack(uint64_t& low, uint64_t& high)
+{
+    pthread_attr_t a;
+    void* addr = nullptr;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &a) != 0)
+        return false;
+    const bool ok = pthread_attr_getstack(&a, &addr, &size) == 0 && addr && size;
+    pthread_attr_destroy(&a);
+    if (!ok)
+        return false;
+    low = reinterpret_cast<uint64_t>(addr);
+    high = low + size;
+    return true;
+}
+
+uint64_t CodeBase()
+{
+    Dl_info info{};
+    return dladdr(reinterpret_cast<void*>(&CodeBase), &info) ? reinterpret_cast<uint64_t>(info.dli_fbase) : 0;
+}
+
+std::string ModuleName(uint64_t address)
+{
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(address), &info) || !info.dli_fname)
+        return "";
+    std::string name = info.dli_fname;
+    const size_t slash = name.rfind('/');
+    return slash == std::string::npos ? name : name.substr(slash + 1);
+}
+
+uint64_t ThreadCpuNs(uint64_t host_thread)
+{
+    clockid_t clock;
+    timespec t{};
+    if (pthread_getcpuclockid(reinterpret_cast<pthread_t>(host_thread), &clock) != 0 || clock_gettime(clock, &t) != 0)
+        return 0;
+    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+}
+
 bool SendSample(uint64_t host_thread) { return host_thread && pthread_kill(pthread_t(host_thread), SIGUSR2) == 0; }
 
 std::string WrapSignal(int) { return ""; }

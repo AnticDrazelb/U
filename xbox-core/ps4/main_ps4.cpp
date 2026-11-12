@@ -34,6 +34,7 @@
 #include "../src/core.h"
 #include "../src/kernel.h"
 #include "../src/platform.h"
+#include "../src/profiler.h"
 
 extern "C" {
 size_t sceKernelGetDirectMemorySize(void);
@@ -277,6 +278,7 @@ void StartAudio()
         return size_t(g_ring_write - g_ring_read);
     };
     std::thread([port] {
+        prof::RegisterThread("audio out");
         std::vector<int16_t> grain(256 * 2);
         // a little held before playing (and again after the ring ran dry): one short silence where
         // the producer falls behind, not a grain of silence at every hiccup
@@ -913,6 +915,11 @@ int main()
         g_selftest_file = "/data/xbox-core/selftest-step.txt";
         g_fault_trail_file = kFaultTrail;
         InitCpu();
+        // the profiler (New Eden's way, on the sample signal the fault handler takes): every thread's
+        // busiest functions in the log every 10 s and in profile.txt; after InitCpu, whose handler
+        // takes the signal
+        prof::Start("/app0/symbols.txt", "/data/xbox-core/profile.txt");
+        prof::RegisterThread("launcher");
         gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
         SetNv2aChoice(g_settings.nv2a == 1); // Settings > Graphics
         SetApuDsp(g_settings.dsp == 1);      // Settings > Sound effects
@@ -958,6 +965,7 @@ int main()
         WriteLogBundle({});
         Log("the program ended; close the app (PS button) to choose another");
     }).detach();
+    prof::RegisterThread("presenter (main)");
     PresentLoop();
 }
 

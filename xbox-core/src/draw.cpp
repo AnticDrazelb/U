@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "profiler.h"
 #include "core.h"
 #include "diagnostics.h"
 #include "gpu.h"
@@ -1464,6 +1465,7 @@ namespace {
 
 void PoolWorker()
 {
+    prof::RegisterThread("drawing worker");
     u64 seen = 0;
     for (;;)
     {

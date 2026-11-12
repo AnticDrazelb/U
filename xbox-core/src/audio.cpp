@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "profiler.h"
 #include "core.h"
 #include "devices.h"
 
@@ -182,6 +183,7 @@ void ResetMixer()
 
 void Player()
 {
+    prof::RegisterThread("AC'97 player");
     // 10 ms at a time: 480 stereo frames, on the clock; where the sink says what it holds (the
     // console's sound device, which plays on its own clock) a little faster or slower to keep about
     // 40 ms there: the two clocks never quite agree, and a sink that ran dry or over would be heard

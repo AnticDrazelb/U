@@ -18,6 +18,7 @@
 
 #include <sched.h>
 
+#include "profiler.h"
 #include "core.h"
 #include "diagnostics.h"
 #include "kernel.h"
@@ -1001,6 +1002,7 @@ Clock::time_point DueTime(s64 t)
 
 void TimerThread()
 {
+    prof::RegisterThread("kernel timers");
     std::unique_lock lock(g_timer_mutex);
     while (!g_quit)
     {

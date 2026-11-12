@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "core.h"
+#include "profiler.h"
 #include "diagnostics.h"
 #include "kernel.h"
 
@@ -157,6 +158,13 @@ int main(int argc, char** argv)
         g_fault_trail_file = trail; // the fault path's forensic trail (the PS4 always keeps one)
     }
     InitCpu();
+    {
+        // the profiler: symbols.txt beside the program (build.sh host writes it)
+        std::string exe = argv[0];
+        const size_t slash = exe.rfind('/');
+        prof::Start(slash == std::string::npos ? "symbols.txt" : exe.substr(0, slash) + "/symbols.txt", "profile.txt");
+        prof::RegisterThread("main");
+    }
     if (const char* e = std::getenv("XB_APU_DSP"); e && e[0] == '1')
         SetApuDsp(true);
     SetDataDirectory("xbox-data"); // before the devices: xemu's renderer keeps its shader cache there
