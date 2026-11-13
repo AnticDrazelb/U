@@ -61,7 +61,16 @@ struct Title
     std::string remove_detail;
     Art art = Art::None;   // the samples' art
     Image icon;            // its cover made square, when there is one (else its art, else a cover)
+    bool imported_art = false; // its cover is a picture the player imported (Box Art)
     Image picture;         // the last picture it showed (its last run), or none
+};
+
+// A picture Box Art offers for a game: a file on a USB drive, and a small copy of it to show
+struct BoxArtChoice
+{
+    std::string path, name, where; // the file, its name, the folder it's in
+    Image thumbnail;               // at most 240 x 320 pixels, its proportions kept
+    bool match = false;            // its name has the game's (shown first)
 };
 
 // A nickname's longest
@@ -93,12 +102,15 @@ struct MenuAction
 {
     enum class Kind
     {
-        None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4, Autostart, Diagnostics, Delete, Hide, ShowHidden
+        None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4, Autostart, Diagnostics, Delete, Hide, ShowHidden,
+        BoxArt, SetBoxArt, RemoveBoxArt
     } kind = Kind::None;
     // Boot: what to boot; CopyToPs4: the game on a USB drive to copy to the PS4; Autostart: the title
     // the app starts without the menu ("" none); Delete: the title to delete (confirmed); Hide: the
-    // title to take off the list (confirmed); ShowHidden: every title taken off the list back
-    std::string path;
+    // title to take off the list (confirmed); ShowHidden: every title taken off the list back.
+    // BoxArt: the title whose pictures to look for (ShowBoxArt when found); SetBoxArt: the title, and
+    // in `picture` the file to import as its box art; RemoveBoxArt: the title whose imported one goes
+    std::string path, picture;
 };
 
 class HomeMenu
@@ -126,10 +138,20 @@ public:
     void ShowMessage(std::string title, std::string text);
     // Changes the message on top (a copy's progress, then its result); false if none is open
     bool UpdateMessage(std::string title, std::string text);
+    // The message on top closed (one that only said to wait)
+    void CloseMessage()
+    {
+        if (!dialogs.empty() && dialogs.back().kind == DialogKind::Message)
+            dialogs.pop_back();
+    }
     // The selection kept on this title (after the titles are read again)
     void Select(const std::string& path);
     // How many titles are off the list (System's Hidden Titles)
     void SetHiddenCount(int count) { hidden_count = count; }
+    // Box Art's screen for this title: the pictures found (the matching ones first), to choose from
+    void ShowBoxArt(const std::string& path, std::vector<BoxArtChoice> choices);
+    // Box Art's screen closed (after an import), back where it was opened
+    void CloseBoxArt() { sub = Sub::None; box_choices.clear(); }
 
     // Buttons held when the menu comes back (from a game) don't count as pressed
     void SetHeld(uint32_t held) { held_before = held; }
@@ -141,7 +163,7 @@ private:
     enum class Tab { Games, Library, Usb, Settings };
     static constexpr int kTabCount = 4;
     // a full screen over the tabs: the nickname's keyboard, the icon's choice
-    enum class Sub { None, Keyboard, Icon };
+    enum class Sub { None, Keyboard, Icon, BoxArt };
     enum class DialogKind { Message, Quit, TitleInfo, ConfirmRemove };
     struct Dialog
     {
@@ -193,6 +215,7 @@ private:
     void DrawDialog(Canvas& c, double now);
     void DrawIconPicker(Canvas& c, double now);
     void DrawKeyboard(Canvas& c, double now);
+    void DrawBoxArt(Canvas& c, double now);
     void DrawSubHeader(Canvas& c, const std::string& text);
     MenuAction KeyboardPress(uint32_t pressed, uint32_t moves);
     // the user's icon, size x size units, round (made once for each size and colour)
@@ -238,6 +261,11 @@ private:
     int key_row = 1, key_column = 0;
     bool key_shift = true;
     std::map<std::tuple<int, int, int>, Image> avatars;
+    // Box Art: the title (its path), the pictures, the one selected and the grid's scroll
+    std::string box_path;
+    std::vector<BoxArtChoice> box_choices;
+    size_t box_index = 0;
+    float box_scroll = 0, box_scroll_target = 0;
     // Buttons held before, and when a held direction repeats
     uint32_t held_before = 0;
     double repeat_at = 0, last_draw = 0;

@@ -37,6 +37,9 @@ struct LibraryPaths
 };
 
 std::vector<Game> ScanLibrary(const LibraryPaths& paths);
+// The name a picture imported for the game has in <covers>/imported/ (and an extension): its title ID
+// (8 hex digits), or its file's name for homebrew (nxdk's title ID is every homebrew's)
+std::string CoverKey(const Game& game);
 // a disc image's name: .iso or .xiso
 bool IsDiscImageName(const std::string& name);
 // USB drive i (0-7) where the app sees it: /mnt/usbN, or /usbN where a console shows an app its

@@ -60,7 +60,7 @@ int main(int argc, char** argv)
     }
     const std::string lib = argv[1];
     g_out = argv[2];
-    static fe::Settings keep[4]; // (each Home keeps a reference)
+    static fe::Settings keep[5]; // (each Home keeps a reference)
     const auto home_with = [&](int index, int theme) {
         keep[index].theme = theme;
         fe::HomePaths paths;
@@ -196,6 +196,53 @@ int main(int argc, char** argv)
     Shot(*home, "settings-hidden");
     Press(*home, kCross);
     std::printf("show hidden: %s\n", has("mesh") ? "done" : "NOT DONE");
+
+    // Box Art: OPTIONS on Neon Drift, Box Art (the pictures on the drive, the matching one first), the
+    // picture used; then the imported one removed
+    {
+        auto art = home_with(4, 0);
+        const auto cover_of = [&](const char* title) {
+            for (const fe::Game& g : art->Games())
+                if (g.title == title)
+                    return g.cover;
+            return std::string();
+        };
+        for (const fe::Game& g : art->Games())
+            if (g.title == "Neon Drift")
+                art->Menu().Select(g.path);
+        Press(*art, kOptions);
+        Shot(*art, "dialog-options-box-art");
+        for (int i = 0; i < 3; i++) // Start, Delete, Start at Launch: Box Art
+            Press(*art, kLeft);
+        Press(*art, kCross);
+        for (int i = 0; i < 200; i++) // the drive looked through on a thread of its own
+        {
+            Press(*art, 0);
+            struct timespec ts{0, 10 * 1000 * 1000};
+            nanosleep(&ts, nullptr);
+        }
+        Shot(*art, "box-art");
+        Press(*art, kCross);
+        Shot(*art, "box-art-imported");
+        const std::string imported = cover_of("Neon Drift");
+        std::printf("box art import: %s (%s)\n", imported.find("/imported/") != std::string::npos ? "done" : "NOT DONE",
+                    imported.c_str());
+        Press(*art, kCross); // (the message)
+        Press(*art, kOptions);
+        for (int i = 0; i < 3; i++)
+            Press(*art, kLeft);
+        Press(*art, kCross);
+        for (int i = 0; i < 200; i++)
+        {
+            Press(*art, 0);
+            struct timespec ts{0, 10 * 1000 * 1000};
+            nanosleep(&ts, nullptr);
+        }
+        Press(*art, kSquare);
+        const std::string after = cover_of("Neon Drift");
+        std::printf("box art removed: %s (%s)\n", after.find("/imported/") == std::string::npos ? "done" : "NOT DONE",
+                    after.c_str());
+    }
 
     auto light = home_with(1, 1);
     Press(*light, kRight);

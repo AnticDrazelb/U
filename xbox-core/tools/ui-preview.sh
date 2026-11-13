@@ -38,6 +38,19 @@ for name, seed in (("Neon Drift", 3), ("Crystal Caverns", 7), ("Moonlit Manor", 
     d.rectangle([0, 0, w, 70], fill=(18, 120, 40))
     img.save(f"{lib}/games/{name}/cover.jpg", quality=90)
 PY
+# pictures on the drive for Box Art: one named after a game (Neon Drift), one not
+mkdir -p "$LIB/usb0/covers"
+python3 - "$LIB/usb0/covers" <<'PY'
+import sys
+from PIL import Image, ImageDraw
+d = sys.argv[1]
+for name, colour in (("Neon Drift (USA).png", (240, 60, 160)), ("holiday photo.jpg", (60, 160, 90))):
+    img = Image.new("RGB", (500, 700), colour)
+    dr = ImageDraw.Draw(img)
+    for i in range(0, 700, 40):
+        dr.line([(0, i), (500, i + 200)], fill=(255, 255, 255), width=6)
+    img.save(d + "/" + name)
+PY
 now=$(date +%s)
 {
     printf '%s\t7\t%s\tShowed its picture\n' "$LIB/games/Crystal Caverns/default.xbe" "$((now - 1800))"

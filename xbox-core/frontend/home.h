@@ -62,6 +62,11 @@ private:
     std::string DeleteTarget(const Game& game) const;
     std::vector<std::string> Hidden() const;
     void Delete(const std::string& path);
+    // Box Art: the pictures on the USB drives for this game, looked for on a thread of its own; one
+    // imported (copied to <covers>/imported/<CoverKey>.<ext>), or the imported one removed
+    void FindBoxArt(const std::string& path);
+    void ImportBoxArt(const std::string& path, const std::string& picture);
+    void RemoveBoxArt(const std::string& path);
 
     Settings& settings;
     HomePaths paths;
@@ -82,6 +87,10 @@ private:
     std::thread delete_thread;
     std::atomic<bool> delete_done{false};
     std::string delete_name, delete_error;
+    std::thread box_thread;
+    std::atomic<bool> box_done{false};
+    std::string box_for;
+    std::vector<Ui::BoxArtChoice> box_found;
 };
 
 // The menu's settings from the app's, and back

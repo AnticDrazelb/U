@@ -127,11 +127,34 @@ std::vector<uint8_t> IsoXbeHead(const std::string& path)
     return out;
 }
 
+} // namespace
+
+std::string CoverKey(const Game& g)
+{
+    // its title ID, unless it's nxdk's (every homebrew's: FFFF0002) or none: then its file's name
+    if (g.title_id && g.title_id != 0xFFFF0002u)
+    {
+        char id[16];
+        std::snprintf(id, sizeof(id), "%08X", g.title_id);
+        return id;
+    }
+    std::string key;
+    for (char c : g.file_name)
+        key += (c == '/' || c == '\\' || c == ':') ? '_' : c;
+    return key;
+}
+
+namespace {
+
 // cover art: beside the game (cover.jpg in its folder, <image>.jpg beside an image) or in the
 // covers folder by title ID (8 hex digits) or file name
 std::string FindCover(const Game& g, const std::string& folder, const std::string& stem, const std::string& covers)
 {
     std::vector<std::string> candidates;
+    // first, a picture the player imported for it (the menu's Box Art): theirs over any other
+    if (!covers.empty())
+        for (const char* ext : {".jpg", ".png", ".jpeg"})
+            candidates.push_back(covers + "/imported/" + CoverKey(g) + ext);
     for (const char* ext : {".jpg", ".png", ".jpeg"})
     {
         if (!folder.empty())

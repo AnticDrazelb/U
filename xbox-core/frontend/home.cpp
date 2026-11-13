@@ -274,6 +274,213 @@ Home::~Home()
         logs_thread.join();
     if (delete_thread.joinable())
         delete_thread.join();
+    if (box_thread.joinable())
+        box_thread.join();
+}
+
+namespace {
+
+// a name's letters and digits, lower case: what two names are compared by
+std::string Plain(const std::string& name)
+{
+    std::string out;
+    for (char c : name)
+        if (std::isalnum(static_cast<unsigned char>(c)))
+            out += char(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+std::vector<std::string> Words(const std::string& name)
+{
+    std::vector<std::string> out;
+    std::string word;
+    for (char c : name + " ")
+    {
+        if (std::isalnum(static_cast<unsigned char>(c)))
+            word += char(std::tolower(static_cast<unsigned char>(c)));
+        else if (!word.empty())
+        {
+            if (word.size() > 1)
+                out.push_back(word);
+            word.clear();
+        }
+    }
+    return out;
+}
+
+bool IsPictureName(const std::string& name)
+{
+    std::string lower;
+    for (char c : name)
+        lower += char(std::tolower(static_cast<unsigned char>(c)));
+    for (const char* ext : {".jpg", ".jpeg", ".png"})
+        if (lower.size() > std::strlen(ext) && lower.compare(lower.size() - std::strlen(ext), std::string::npos, ext) == 0)
+            return true;
+    return false;
+}
+
+} // namespace
+
+void Home::FindBoxArt(const std::string& path)
+{
+    const auto it = std::find_if(games.begin(), games.end(), [&](const Game& g) { return g.path == path; });
+    if (it == games.end() || box_thread.joinable())
+        return;
+    const std::vector<std::string> roots = UsbRoots(paths.usb);
+    menu.ShowMessage("Box Art", roots.empty() ? "Looking for pictures... (no USB drive is in)"
+                                              : "Looking for pictures on the USB drives...");
+    box_for = path;
+    char id[16];
+    std::snprintf(id, sizeof(id), "%08x", it->title_id);
+    const std::string title = it->title, file = it->file_name, title_id = it->title_id ? id : "";
+    box_thread = std::thread([this, roots, title, file, title_id] {
+        // the pictures in each drive's top folder and the folders under it, two deep
+        struct Found
+        {
+            std::string path, name, where;
+            int score = 0;
+            bool match = false;
+        };
+        std::vector<Found> found;
+        const std::string plain_title = Plain(title), plain_file = Plain(file);
+        const std::vector<std::string> title_words = Words(title);
+        std::vector<std::pair<std::string, int>> pending;
+        for (const std::string& root : roots)
+            pending.push_back({root, 0});
+        while (!pending.empty() && found.size() < 600)
+        {
+            const auto [folder, depth] = pending.back();
+            pending.pop_back();
+            DIR* d = opendir(folder.c_str());
+            if (!d)
+                continue;
+            int seen = 0;
+            while (const dirent* e = readdir(d))
+            {
+                if (++seen > 4000)
+                    break;
+                const std::string name = e->d_name;
+                if (name.empty() || name[0] == '.' || name == "System Volume Information")
+                    continue;
+                const std::string full = folder + "/" + name;
+                // a game's folder has thousands of files: only a picture (or what the folder doesn't
+                // say the kind of) is looked at more closely
+                if (e->d_type == DT_DIR)
+                {
+                    if (depth < 2)
+                        pending.push_back({full, depth + 1});
+                    continue;
+                }
+                if (!IsPictureName(name) && e->d_type != DT_UNKNOWN)
+                    continue;
+                struct stat st;
+                if (stat(full.c_str(), &st) != 0)
+                    continue;
+                if (S_ISDIR(st.st_mode))
+                {
+                    if (depth < 2)
+                        pending.push_back({full, depth + 1});
+                    continue;
+                }
+                if (!IsPictureName(name) || st.st_size <= 0 || st.st_size > (32 << 20))
+                    continue;
+                // how well its name (and its folder's) says the game: the title in it, its title ID, the
+                // game's file name, or many of the title's words
+                Found f;
+                f.path = full, f.name = name;
+                f.where = folder.substr(folder.find_last_of('/') + 1);
+                const std::string stem = Plain(name.substr(0, name.find_last_of('.'))), here = Plain(f.where);
+                if (!plain_title.empty() && (stem.find(plain_title) != std::string::npos || here.find(plain_title) != std::string::npos))
+                    f.score += 100;
+                if (!title_id.empty() && (stem.find(title_id) != std::string::npos))
+                    f.score += 100;
+                if (!plain_file.empty() && (stem.find(plain_file) != std::string::npos || here == plain_file))
+                    f.score += 80;
+                const std::vector<std::string> words = Words(name.substr(0, name.find_last_of('.')) + " " + f.where);
+                int common = 0;
+                for (const std::string& w : title_words)
+                    common += std::find(words.begin(), words.end(), w) != words.end();
+                f.score += common * 10;
+                f.match = f.score >= 80 || (!title_words.empty() && common * 2 >= int(title_words.size()) && common > 0);
+                found.push_back(std::move(f));
+            }
+            closedir(d);
+        }
+        std::stable_sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
+            if (a.score != b.score)
+                return a.score > b.score;
+            return a.name < b.name;
+        });
+        // each one's small copy (decoded: those that aren't pictures after all are left out)
+        std::vector<Ui::BoxArtChoice> choices;
+        for (const Found& f : found)
+        {
+            if (choices.size() >= 60)
+                break;
+            const std::vector<unsigned char> data = ReadFile(f.path, 32u << 20);
+            Ui::Image image = data.empty() ? Ui::Image{} : Ui::DecodeImage(data.data(), data.size());
+            if (image.Empty())
+                continue;
+            const float fit = std::min(240.0f / float(image.width), 320.0f / float(image.height));
+            const int w = std::max(1, int(float(image.width) * std::min(fit, 1.0f)));
+            const int h = std::max(1, int(float(image.height) * std::min(fit, 1.0f)));
+            Ui::BoxArtChoice choice;
+            choice.path = f.path, choice.name = f.name, choice.where = f.where, choice.match = f.match;
+            choice.thumbnail = Ui::ResizeImage(image, w, h);
+            choices.push_back(std::move(choice));
+        }
+        box_found = std::move(choices);
+        box_done = true;
+    });
+}
+
+void Home::ImportBoxArt(const std::string& path, const std::string& picture)
+{
+    const auto it = std::find_if(games.begin(), games.end(), [&](const Game& g) { return g.path == path; });
+    if (it == games.end())
+        return;
+    const std::vector<unsigned char> data = ReadFile(picture, 32u << 20);
+    std::string ext = picture.substr(picture.find_last_of('.'));
+    for (char& c : ext)
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (ext == ".jpeg")
+        ext = ".jpg";
+    const std::string dir = paths.library.covers + "/imported", key = CoverKey(*it);
+    mkdir(paths.library.covers.c_str(), 0777);
+    mkdir(dir.c_str(), 0777);
+    bool ok = !data.empty();
+    if (ok)
+    {
+        for (const char* old : {".jpg", ".png", ".jpeg"}) // (one picture a game)
+            std::remove((dir + "/" + key + old).c_str());
+        const std::string out = dir + "/" + key + ext, part = out + ".part";
+        FILE* f = std::fopen(part.c_str(), "wb");
+        ok = f && std::fwrite(data.data(), 1, data.size(), f) == data.size();
+        if (f && std::fclose(f) != 0)
+            ok = false;
+        ok = ok && std::rename(part.c_str(), out.c_str()) == 0;
+        if (!ok)
+            std::remove(part.c_str());
+    }
+    const std::string name = it->title;
+    menu.CloseBoxArt();
+    Rescan();
+    menu.Select(path);
+    menu.ShowMessage("Box Art", ok ? name + " has its new box art." : "The picture couldn't be copied (" + picture + ").");
+}
+
+void Home::RemoveBoxArt(const std::string& path)
+{
+    const auto it = std::find_if(games.begin(), games.end(), [&](const Game& g) { return g.path == path; });
+    if (it == games.end())
+        return;
+    const std::string dir = paths.library.covers + "/imported", key = CoverKey(*it), name = it->title;
+    for (const char* ext : {".jpg", ".png", ".jpeg"})
+        std::remove((dir + "/" + key + ext).c_str());
+    menu.CloseBoxArt();
+    Rescan();
+    menu.Select(path);
+    menu.ShowMessage("Box Art", "The imported box art of " + name + " is gone: its own cover is back, or the drawn one.");
 }
 
 std::string Home::DeleteTarget(const Game& g) const
@@ -408,6 +615,8 @@ void Home::Sort()
         }
         t.art = g.sample ? SampleArt(g) : Ui::Art::None;
         t.icon = covers[i];
+        t.imported_art = !g.cover.empty() && g.cover.compare(0, paths.library.covers.size() + 10,
+                                                              paths.library.covers + "/imported/") == 0;
         titles.push_back(std::move(t));
     }
     menu.SetTitles(std::move(titles));
@@ -576,6 +785,14 @@ Home::Result Home::Update(uint32_t held, double now)
             menu.ShowMessage("Delete", report);
     }
 
+    if (box_done.exchange(false))
+    {
+        box_thread.join();
+        menu.CloseMessage();
+        menu.ShowBoxArt(box_for, std::move(box_found));
+        box_found.clear();
+    }
+
     const Ui::MenuAction action = menu.Update(held, now);
     using Kind = Ui::MenuAction::Kind;
     switch (action.kind)
@@ -666,6 +883,15 @@ Home::Result Home::Update(uint32_t held, double now)
         std::remove(paths.hidden.c_str());
         Rescan();
         menu.ShowMessage("Hidden Titles", "Every title taken off the list is back.");
+        break;
+    case Kind::BoxArt:
+        FindBoxArt(action.path);
+        break;
+    case Kind::SetBoxArt:
+        ImportBoxArt(action.path, action.picture);
+        break;
+    case Kind::RemoveBoxArt:
+        RemoveBoxArt(action.path);
         break;
     case Kind::None:
         break;

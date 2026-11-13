@@ -144,6 +144,15 @@ void HomeMenu::Select(const std::string& path)
     }
 }
 
+void HomeMenu::ShowBoxArt(const std::string& path, std::vector<BoxArtChoice> choices)
+{
+    box_path = path;
+    box_choices = std::move(choices);
+    box_index = 0;
+    box_scroll = box_scroll_target = 0;
+    sub = Sub::BoxArt;
+}
+
 void HomeMenu::SetGamesStatus(std::vector<StatusRow> rows, std::string help)
 {
     games_status = std::move(rows);
@@ -224,6 +233,8 @@ MenuAction HomeMenu::ChooseDialog(int button)
         const std::string& label = dialog.buttons[size_t(button)];
         if (label == "Start")
             return Start(dialog.title_index);
+        if (label == "Box Art")
+            return {MenuAction::Kind::BoxArt, title.path};
         if (label == "Copy to the PS4")
             return {MenuAction::Kind::CopyToPs4, title.path};
         if (label == "Start at Launch" || label == "Menu at Launch")
@@ -272,7 +283,7 @@ void HomeMenu::OpenTitleInfo(size_t index)
     // a game on a USB drive can be copied to the PS4's own storage; any other can start at launch
     dialog.offers_copy = index < titles.size() && titles[index].on_usb;
     const bool autostart = index < titles.size() && titles[index].autostart;
-    dialog.buttons = {"Close", dialog.offers_copy ? "Copy to the PS4" : autostart ? "Menu at Launch" : "Start at Launch"};
+    dialog.buttons = {"Close", "Box Art", dialog.offers_copy ? "Copy to the PS4" : autostart ? "Menu at Launch" : "Start at Launch"};
     if (index < titles.size() && titles[index].removal != Title::Removal::None)
         dialog.buttons.push_back(titles[index].removal == Title::Removal::Delete ? "Delete" : "Remove");
     dialog.buttons.push_back("Start");
@@ -341,6 +352,38 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
 
     if (sub == Sub::Keyboard)
         return KeyboardPress(pressed, moves);
+    if (sub == Sub::BoxArt)
+    {
+        // the pictures in a grid: Cross uses the one selected, Square removes the imported one
+        constexpr size_t kColumns = 5;
+        const size_t count = box_choices.size();
+        if (pressed & kCircle)
+        {
+            CloseBoxArt();
+            return {};
+        }
+        if (count)
+        {
+            if ((moves & kLeft) && box_index % kColumns > 0)
+                box_index--;
+            if ((moves & kRight) && box_index % kColumns < kColumns - 1 && box_index + 1 < count)
+                box_index++;
+            if ((moves & kUp) && box_index >= kColumns)
+                box_index -= kColumns;
+            if ((moves & kDown) && box_index / kColumns < (count - 1) / kColumns)
+                box_index = std::min(count - 1, box_index + kColumns);
+            if (pressed & kCross)
+            {
+                MenuAction action{MenuAction::Kind::SetBoxArt, box_path, box_choices[box_index].path};
+                return action;
+            }
+        }
+        if (pressed & kSquare)
+            for (const Title& title : titles)
+                if (title.path == box_path && title.imported_art)
+                    return {MenuAction::Kind::RemoveBoxArt, box_path};
+        return {};
+    }
     if (sub == Sub::Icon)
     {
         if (icon_step == 0)
@@ -610,6 +653,8 @@ void HomeMenu::Draw(Canvas& c, double now)
         DrawKeyboard(c, now);
     else if (sub == Sub::Icon)
         DrawIconPicker(c, now);
+    else if (sub == Sub::BoxArt)
+        DrawBoxArt(c, now);
     else
     {
         DrawTop(c, now);
@@ -1218,6 +1263,100 @@ void HomeMenu::DrawDialog(Canvas& c, double now)
             c.RoundRectOutline(bx + 8, by + 8, bw - 16, buttons_h - 16, 8, 3.5f, Cursor(now));
         c.Text(bx + bw / 2, by + 46, dialog.buttons[i], 21, Weight::SemiBold, selected ? t.text : t.dim, Align::Center);
     }
+}
+
+// Box Art: the game's tile now, and the pictures found on the USB drives to choose from
+void HomeMenu::DrawBoxArt(Canvas& c, double now)
+{
+    const Theme& t = CurrentTheme();
+    const uint32_t cursor = Cursor(now);
+    size_t index = titles.size();
+    for (size_t i = 0; i < titles.size(); i++)
+        if (titles[i].path == box_path)
+            index = i;
+    const std::string name = index < titles.size() ? titles[index].name : std::string();
+    c.Text(40, kTopBaseline, "MIDWAY", 26, Weight::SemiBold, t.text);
+    c.Text(40, 112, "Box Art", 34, Weight::SemiBold, t.text);
+    c.Text(40 + c.TextWidth("Box Art", 34, Weight::SemiBold) + 16, 112, name, 24, Weight::Regular, t.dim, Align::Left, 1000);
+
+    // now: its tile, and where it's from
+    constexpr float kNowX = 60, kNowY = 190, kNow = 256;
+    c.Text(kNowX, kNowY - 18, "Now", 20, Weight::SemiBold, t.text);
+    bool imported = false;
+    if (index < titles.size())
+    {
+        imported = titles[index].imported_art;
+        c.DrawImage(kNowX, kNowY, kNow, kNow, Tile(index, int(std::lround(kNow * c.Scale()))));
+        const char* from = imported                       ? "Imported from a USB drive"
+                           : !titles[index].icon.Empty()  ? "The game's own cover"
+                                                          : "Drawn by Midway (no cover)";
+        c.Text(kNowX, kNowY + kNow + 32, from, 17, Weight::Regular, t.dim, Align::Left, kNow + 40);
+    }
+    c.Line(360, kContentTop, 360, kBottomLine - 12, 1.2f, t.line);
+
+    // the pictures: 5 a row, each fitted into a case's 3:4, its name under it
+    constexpr size_t kColumns = 5;
+    constexpr float kLeft = 404, kCellW = 150, kCellH = 200, kGap = 18, kRow = 262, kTop = 166;
+    if (box_choices.empty())
+    {
+        float y = 230;
+        for (const std::string& line :
+             c.Wrap("No pictures on the USB drives. Put a .jpg or .png of the box art on a USB drive (its top folder, "
+                    "or a folder there such as covers or boxart), then choose Box Art again. A picture named after "
+                    "the game, or its title ID, comes first.",
+                    20, Weight::Regular, 800))
+        {
+            c.Text(kLeft, y, line, 20, Weight::Regular, t.dim);
+            y += 30;
+        }
+    }
+    else
+    {
+        const float row_y = float(box_index / kColumns) * kRow, view = kBottomLine - kTop - 10;
+        if (row_y - box_scroll_target < 0)
+            box_scroll_target = row_y;
+        if (row_y + kRow - box_scroll_target > view)
+            box_scroll_target = row_y + kRow - view;
+        box_scroll += (box_scroll_target - box_scroll) * 0.35f;
+        if (std::fabs(box_scroll - box_scroll_target) < 0.5f)
+            box_scroll = box_scroll_target;
+        c.Clip(kLeft - 12, kContentTop, 1280 - kLeft, kBottomLine - kContentTop - 1);
+        for (size_t i = 0; i < box_choices.size(); i++)
+        {
+            const BoxArtChoice& choice = box_choices[i];
+            const float x = kLeft + float(i % kColumns) * (kCellW + kGap);
+            const float y = kTop + float(i / kColumns) * kRow - box_scroll;
+            if (y > kBottomLine || y + kRow < kContentTop)
+                continue;
+            c.RoundRect(x, y, kCellW, kCellH, 6, t.panel);
+            if (!choice.thumbnail.Empty())
+            {
+                float w = kCellW, h = kCellW * choice.thumbnail.height / std::max(1, choice.thumbnail.width);
+                if (h > kCellH)
+                    h = kCellH, w = kCellH * choice.thumbnail.width / std::max(1, choice.thumbnail.height);
+                c.DrawImage(x + (kCellW - w) / 2, y + (kCellH - h) / 2, w, h, choice.thumbnail);
+            }
+            if (choice.match)
+            {
+                c.RoundRect(x + 6, y + 6, 58, 22, 11, Fade(t.bg_bottom, 0.85f));
+                c.Text(x + 35, y + 22, "Match", 13, Weight::SemiBold, t.text, Align::Center);
+            }
+            const bool selected = i == box_index;
+            if (selected)
+                c.RoundRectOutline(x - 7, y - 7, kCellW + 14, kCellH + 14, 8, 3.5f, cursor);
+            c.Text(x + kCellW / 2, y + kCellH + 24, choice.name, 14, selected ? Weight::SemiBold : Weight::Regular,
+                   selected ? t.text : t.dim, Align::Center, kCellW + 14);
+            c.Text(x + kCellW / 2, y + kCellH + 43, choice.where, 12, Weight::Regular, Fade(t.dim, 0.8f), Align::Center,
+                   kCellW + 14);
+        }
+        c.ResetClip();
+    }
+    std::vector<std::pair<Glyph, std::string>> hints{{Glyph::Circle, "Back"}};
+    if (imported)
+        hints.push_back({Glyph::Square, "Remove the Imported One"});
+    if (!box_choices.empty())
+        hints.push_back({Glyph::Cross, "Use This Picture"});
+    DrawBottomBar(c, hints);
 }
 
 // The user's icon, round, size units across (made once for each size and colour)

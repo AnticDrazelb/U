@@ -136,6 +136,12 @@ image, or `/data/xbox-core/covers/<title ID>.jpg`. A cover is made a square tile
 on a blurred copy of itself. Without one, a tile is drawn from the title.
 
 OPTIONS on a game opens its details and these choices:
+- **Box Art** imports a picture as the game's cover. It lists the `.jpg` and `.png` pictures on
+  the USB drives (at a drive's top and in the folders under it, two deep, such as `covers/` or
+  `boxart/`), those whose name has the game's title, title ID or file name first, marked
+  **Match**. Cross copies the chosen one to `/data/xbox-core/covers/imported/` (named by the
+  title ID), where it comes before any other cover, so the drive can go afterwards. Square
+  removes the imported one, and the game's own cover comes back.
 - **Copy to the PS4**, for a game on a USB drive. The copy runs in the background, with its
   progress shown.
 - **Start at Launch**, for any other game. Hold L1 while the app opens to get the menu back.
