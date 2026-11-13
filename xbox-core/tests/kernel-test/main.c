@@ -642,6 +642,43 @@ int main(void)
         NtClose(f);
     }
     {
+        // A cache partition formatted by the game (XAPI's XMountUtilityDrive: the FATX header written to
+        // the partition itself, with the game's cluster size), then asked its size: the clusters must be
+        // the header's. XAPI formats again when they aren't, and after that calls the drive
+        // unrecognized (Halo 2: 32 KiB clusters, back to the dashboard with "invalid hard disk").
+        static unsigned char header[4096];
+        HANDLE raw = open_path("\\Device\\Harddisk0\\Partition4", GENERIC_READ | GENERIC_WRITE, FILE_OPEN);
+        ULONG sectors = 0, bytes = 0;
+        if (raw)
+        {
+            IO_STATUS_BLOCK iosb;
+            LARGE_INTEGER at;
+            at.QuadPart = 0;
+            memset(header, 0, sizeof(header));
+            memcpy(header, "FATX", 4);
+            *(ULONG *)(header + 4) = 0x12345678; // the volume's serial number
+            *(ULONG *)(header + 8) = 64;         // sectors per cluster: 32 KiB clusters
+            *(ULONG *)(header + 12) = 1;         // the root folder's first cluster
+            NtWriteFile(raw, NULL, NULL, NULL, &iosb, header, sizeof(header), &at);
+            NtClose(raw);
+            HANDLE root = open_path("\\Device\\Harddisk0\\Partition4\\", FILE_LIST_DIRECTORY, FILE_OPEN);
+            FILE_FS_SIZE_INFORMATION size;
+            if (root && NtQueryVolumeInformationFile(root, &iosb, &size, sizeof(size), FileFsSizeInformation) == 0)
+                sectors = size.SectorsPerAllocationUnit, bytes = size.BytesPerSector;
+            if (root)
+                NtClose(root);
+            // back to the 16 KiB clusters of before (the Y: of other titles)
+            raw = open_path("\\Device\\Harddisk0\\Partition4", GENERIC_READ | GENERIC_WRITE, FILE_OPEN);
+            *(ULONG *)(header + 8) = 32;
+            if (raw)
+            {
+                NtWriteFile(raw, NULL, NULL, NULL, &iosb, header, sizeof(header), &at);
+                NtClose(raw);
+            }
+        }
+        check("a cache partition's clusters are those it was formatted with", sectors == 64 && bytes == 512);
+    }
+    {
         // A folder must be there for what is opened or made in it, as the kernel's file systems
         // have it: nothing is made on the way. XCreateSaveGame opens <save>\SaveMeta.xbx before
         // the save's folder exists and takes "path not found" for a new save.
