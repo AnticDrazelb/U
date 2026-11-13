@@ -38,7 +38,7 @@ const char* const kCategories[] = {"Themes", "Graphics", "Sound", "System", "Use
 constexpr int kCategoryCount = 8;
 constexpr int kUserCategory = 4, kControlsCategory = 5, kNewsCategory = 6, kAboutCategory = 7;
 
-// The icon's choice: the characters in a grid, then the shades in a row
+// The icon's choice: the characters in a grid, then the colours in a row
 constexpr int kIconColumns = 10;
 constexpr float kIconCell = 96, kIconGapX = 18, kIconRow = 136, kIconTop = 140;
 constexpr float kSwatchRadius = 30, kSwatchGap = 22, kSwatchY = 548;
@@ -75,19 +75,6 @@ float Smooth(float current, float target, float dt)
     const float k = 1 - std::exp(-dt * 14);
     const float next = current + (target - current) * k;
     return std::fabs(next - target) < 0.25f ? target : next;
-}
-
-uint32_t GreyOf(uint32_t p)
-{
-    const uint32_t l = ((p & 0xFF) * 77 + (p >> 8 & 0xFF) * 150 + (p >> 16 & 0xFF) * 29) >> 8;
-    return (p & 0xFF000000u) | l << 16 | l << 8 | l;
-}
-
-// The image in grey (its alpha kept)
-void Grey(Image& image)
-{
-    for (uint32_t& p : image.pixels)
-        p = GreyOf(p);
 }
 
 // A USB stick, about 24 units tall
@@ -197,12 +184,9 @@ const Image& HomeMenu::Tile(size_t index, int pixels)
     {
         const Title& title = titles[index];
         if (!title.icon.Empty())
-            tile = ResizeImage(title.icon, pixels, pixels); // a cover keeps its colours
+            tile = ResizeImage(title.icon, pixels, pixels);
         else
-        {
             tile = title.art != Art::None ? MakeTileArt(title.art, pixels) : MakeCover(title.name, title.kind, pixels);
-            Grey(tile);
-        }
     }
     return tile;
 }
@@ -233,20 +217,46 @@ MenuAction HomeMenu::ChooseDialog(int button)
         if (button == 1)
             return {MenuAction::Kind::Quit, {}};
         break;
-    case DialogKind::TitleInfo:
-        if (dialog.title_index >= titles.size())
+    case DialogKind::TitleInfo: {
+        if (dialog.title_index >= titles.size() || button < 0 || button >= int(dialog.buttons.size()))
             break;
-        if (button == 1)
-        {
-            // the middle button: a copy to the PS4, or the title started at launch (or not any more)
-            const Title& title = titles[dialog.title_index];
-            MenuAction action;
-            action.kind = dialog.offers_copy ? MenuAction::Kind::CopyToPs4 : MenuAction::Kind::Autostart;
-            action.path = dialog.offers_copy || !title.autostart ? title.path : std::string();
-            return action;
-        }
-        if (button == 2)
+        const Title& title = titles[dialog.title_index];
+        const std::string& label = dialog.buttons[size_t(button)];
+        if (label == "Start")
             return Start(dialog.title_index);
+        if (label == "Copy to the PS4")
+            return {MenuAction::Kind::CopyToPs4, title.path};
+        if (label == "Start at Launch" || label == "Menu at Launch")
+            return {MenuAction::Kind::Autostart, title.autostart ? std::string() : title.path};
+        if (label == "Delete" || label == "Remove")
+        {
+            // asked first: Cancel is where the cursor starts
+            Dialog confirm;
+            confirm.kind = DialogKind::ConfirmRemove;
+            confirm.path = title.path;
+            confirm.removal = title.removal;
+            if (title.removal == Title::Removal::Delete)
+            {
+                confirm.title = "Delete " + title.name + "?";
+                confirm.text = title.remove_detail + "\nThis can't be undone. The game's saves on Midway's Xbox hard disk stay.";
+                confirm.buttons = {"Cancel", "Delete"};
+            }
+            else
+            {
+                confirm.title = "Remove " + title.name + " from the list?";
+                confirm.text = "It's part of Midway's package, so it isn't deleted: System Settings, System, Hidden "
+                               "Titles brings it back.";
+                confirm.buttons = {"Cancel", "Remove"};
+            }
+            confirm.selected = 0;
+            OpenDialog(std::move(confirm));
+        }
+        break;
+    }
+    case DialogKind::ConfirmRemove:
+        if (button == 1)
+            return {dialog.removal == Title::Removal::Delete ? MenuAction::Kind::Delete : MenuAction::Kind::Hide,
+                    dialog.path};
         break;
     case DialogKind::Message:
         break;
@@ -262,8 +272,10 @@ void HomeMenu::OpenTitleInfo(size_t index)
     // a game on a USB drive can be copied to the PS4's own storage; any other can start at launch
     dialog.offers_copy = index < titles.size() && titles[index].on_usb;
     const bool autostart = index < titles.size() && titles[index].autostart;
-    dialog.buttons = {"Close", dialog.offers_copy ? "Copy to the PS4" : autostart ? "Menu at Launch" : "Start at Launch",
-                      "Start"};
+    dialog.buttons = {"Close", dialog.offers_copy ? "Copy to the PS4" : autostart ? "Menu at Launch" : "Start at Launch"};
+    if (index < titles.size() && titles[index].removal != Title::Removal::None)
+        dialog.buttons.push_back(titles[index].removal == Title::Removal::Delete ? "Delete" : "Remove");
+    dialog.buttons.push_back("Start");
     dialog.selected = int(dialog.buttons.size()) - 1;
     OpenDialog(std::move(dialog));
 }
@@ -538,6 +550,10 @@ MenuAction HomeMenu::Navigate(uint32_t pressed, uint32_t moves)
             case SettingItem::Does::Close:
                 OpenClose();
                 return {};
+            case SettingItem::Does::ShowHidden:
+                if (hidden_count > 0)
+                    return {MenuAction::Kind::ShowHidden, {}};
+                return {};
             }
         }
         return {};
@@ -730,7 +746,7 @@ void HomeMenu::DrawGames(Canvas& c, double now)
     {
         hx += 42;
         DrawGlyph(c, Glyph::Options, hx, y + 30, t.dim, t.bg_bottom);
-        c.Text(hx + 24, y + 38, "Details", 24, Weight::Regular, t.dim);
+        c.Text(hx + 24, y + 38, "Options", 24, Weight::Regular, t.dim);
     }
 
     if (!all)
@@ -862,7 +878,7 @@ void HomeMenu::DrawLibrary(Canvas& c, double now)
     c.ResetClip();
     c.Text(1236, kTabBaseline, std::to_string(titles.size()) + (titles.size() == 1 ? " title" : " titles"), 19,
            Weight::Regular, t.dim, Align::Right);
-    DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Options, "Details"}, {Glyph::Cross, "Start"}});
+    DrawBottomBar(c, {{Glyph::Circle, "Back"}, {Glyph::Options, "Options"}, {Glyph::Cross, "Start"}});
 }
 
 void HomeMenu::DrawUsb(Canvas& c)
@@ -913,8 +929,8 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
     {
     case 0:
         return {{Does::Change, "Theme", settings.white_theme ? "Light" : "Dark",
-                 "Dark: white on black. Light: black on white. Only your covers have colour. The loading screen "
-                 "follows it.",
+                 "The menu's own colours: Dark, white on black; Light, black on white. Covers, the games' art and "
+                 "your icon keep theirs. The loading screen follows it.",
                  [](MenuSettings& s) { s.white_theme = !s.white_theme; }}};
     case 1:
         return {
@@ -948,6 +964,8 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "The order of the Games row and the Library: by name, or the games played last first. Your games "
              "come before the samples in the package.",
              [](MenuSettings& s) { s.sort ^= 1; }},
+            {Does::ShowHidden, "Hidden Titles", hidden_count ? std::to_string(hidden_count) + " Hidden" : "None",
+             "Samples taken off the list (OPTIONS on one, Remove): X puts every one back.", nullptr},
             {Does::Close, "Close Midway", "",
              "Back to the PS4's home screen. (While a game runs, the PS button and Close Application end it; "
              "Midway opens on this menu the next time.)",
@@ -957,7 +975,7 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
         return {
             {Does::Keyboard, "Nickname", settings.nickname, "Your name at the top right.", nullptr},
             {Does::Icon, "Icon", AvatarName(std::clamp(settings.avatar, 0, AvatarCount() - 1)),
-             "Your icon at the top right: a character, on a shade of your choosing.", nullptr},
+             "Your icon at the top right: a character, on a colour of your choosing.", nullptr},
         };
     default:
         return {};
@@ -1157,7 +1175,7 @@ void HomeMenu::DrawDialog(Canvas& c, double now)
                "\n" + (info.details.empty() ? "" : info.details + "\n") + info.path +
                (info.autostart ? "\nStarts when Midway opens (hold L1 as it opens for this menu)." : "");
     }
-    const float w = 720, text_width = 640;
+    const float w = std::max(720.0f, 196.0f * float(dialog.buttons.size())), text_width = w - 80;
     const std::vector<std::string> title_lines = title.empty() ? std::vector<std::string>{}
                                                                : c.Wrap(title, 24, Weight::SemiBold, text_width);
     const std::vector<std::string> lines = text.empty() ? std::vector<std::string>{}
@@ -1196,7 +1214,7 @@ void HomeMenu::DrawDialog(Canvas& c, double now)
     }
 }
 
-// The user's icon, round, size units across, in grey (made once for each size and shade)
+// The user's icon, round, size units across (made once for each size and colour)
 const Image& HomeMenu::Avatar(int character, int color, float size, float scale)
 {
     const int pixels = std::max(1, int(std::lround(size * scale)));
@@ -1206,19 +1224,17 @@ const Image& HomeMenu::Avatar(int character, int color, float size, float scale)
     {
         if (avatars.size() > 160)
             avatars.clear(); // (each is used as soon as it's returned)
-        Image image = MakeAvatar(character, color, pixels, true);
-        Grey(image);
-        it = avatars.emplace(key, std::move(image)).first;
+        it = avatars.emplace(key, MakeAvatar(character, color, pixels, true)).first;
     }
     return it->second;
 }
 
-// The icon's choice: a character from the grid, then its shade
+// The icon's choice: a character from the grid, then its colour
 void HomeMenu::DrawIconPicker(Canvas& c, double now)
 {
     const Theme& t = CurrentTheme();
     const uint32_t cursor = Cursor(now);
-    DrawSubHeader(c, icon_step == 0 ? "Choose a Character" : "Choose a Shade");
+    DrawSubHeader(c, icon_step == 0 ? "Choose a Character" : "Choose a Colour");
     if (icon_step == 0)
     {
         const float left = (1280 - (kIconColumns * kIconCell + (kIconColumns - 1) * kIconGapX)) / 2;
@@ -1244,7 +1260,7 @@ void HomeMenu::DrawIconPicker(Canvas& c, double now)
     for (int i = 0; i < count; i++)
     {
         const float cx = 640 - total / 2 + kSwatchRadius + float(i) * (kSwatchRadius * 2 + kSwatchGap);
-        c.Circle(cx, kSwatchY, kSwatchRadius, GreyOf(AvatarColor(i)));
+        c.Circle(cx, kSwatchY, kSwatchRadius, AvatarColor(i));
         c.Ring(cx, kSwatchY, kSwatchRadius, 1.5f, Fade(t.text, 0.25f));
         if (i == icon_color)
             c.Ring(cx, kSwatchY, kSwatchRadius + 9, 4, cursor);

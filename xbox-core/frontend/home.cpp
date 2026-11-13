@@ -4,9 +4,12 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace fe {
 
@@ -48,6 +51,43 @@ std::vector<unsigned char> ReadFile(const std::string& file, size_t limit)
     return out;
 }
 
+// `path` and everything in it deleted (not following links); false and why at the first failure
+bool RemoveTree(const std::string& path, std::string& error)
+{
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+    {
+        error = path + ": " + std::strerror(errno);
+        return false;
+    }
+    if (S_ISDIR(st.st_mode))
+    {
+        std::vector<std::string> names;
+        if (DIR* d = opendir(path.c_str()))
+        {
+            while (dirent* e = readdir(d))
+                if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0)
+                    names.push_back(e->d_name);
+            closedir(d);
+        }
+        for (const std::string& name : names)
+            if (!RemoveTree(path + "/" + name, error))
+                return false;
+        if (rmdir(path.c_str()) != 0)
+        {
+            error = path + ": " + std::strerror(errno);
+            return false;
+        }
+        return true;
+    }
+    if (unlink(path.c_str()) != 0)
+    {
+        error = path + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
 // "30 mins ago", "Yesterday", or the date
 std::string Ago(int64_t when)
 {
@@ -68,15 +108,6 @@ std::string Ago(int64_t when)
     if (s < 30 * 86400)
         return count(s / 86400, "day", "days");
     return FormatDate(when);
-}
-
-void Grey(Ui::Image& image)
-{
-    for (uint32_t& p : image.pixels)
-    {
-        const uint32_t l = ((p & 0xFF) * 77 + (p >> 8 & 0xFF) * 150 + (p >> 16 & 0xFF) * 29) >> 8;
-        p = (p & 0xFF000000u) | l << 16 | l << 8 | l;
-    }
 }
 
 // the package's samples: art for the ones it has a picture for (by file name), else a cover
@@ -214,7 +245,7 @@ Home::Home(Settings& settings_, HomePaths paths_, std::string user) : settings(s
          "with a kernel of Midway's own; the Xbox's GPU, sound chip, USB and network are xemu's, its GPU drawn by "
          "the PS4's through Vulkan."},
         {"A new HOME menu",
-         "In black and white (Settings, Themes: Dark or Light), with tabs: Games, Library, USB and Settings, L1 and "
+         "In black and white (Settings, Themes: Dark or Light; the covers, art and your icon in colour), with tabs: Games, Library, USB and Settings, L1 and "
          "R1 between them. Games: the selected game stands larger, with when you last played it, how often, how its "
          "last run went and the last picture it showed. OPTIONS on a game: its details, a copy from a USB drive to "
          "the PS4, or starting it as soon as Midway opens."},
@@ -239,6 +270,82 @@ Home::~Home()
 {
     if (logs_thread.joinable())
         logs_thread.join();
+    if (delete_thread.joinable())
+        delete_thread.join();
+}
+
+std::string Home::DeleteTarget(const Game& g) const
+{
+    if (g.sample)
+        return "";
+    const std::string target = g.folder.empty() ? g.path : g.folder;
+    if (target.find("/../") != std::string::npos || target.find("/./") != std::string::npos)
+        return "";
+    std::vector<std::string> roots = paths.library.usb_drives; // (the drives found at the last scan)
+    roots.push_back(paths.library.games);
+    for (const std::string& root : roots)
+        if (!root.empty() && target.size() > root.size() + 1 && target.compare(0, root.size() + 1, root + "/") == 0)
+            return target;
+    return "";
+}
+
+std::vector<std::string> Home::Hidden() const
+{
+    std::vector<std::string> out;
+    if (FILE* f = std::fopen(paths.hidden.c_str(), "r"))
+    {
+        char line[1024];
+        while (std::fgets(line, sizeof(line), f))
+        {
+            std::string path = line;
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
+                path.pop_back();
+            if (!path.empty())
+                out.push_back(path);
+        }
+        std::fclose(f);
+    }
+    return out;
+}
+
+void Home::Delete(const std::string& path)
+{
+    const auto it = std::find_if(games.begin(), games.end(), [&](const Game& g) { return g.path == path; });
+    const std::string target = it == games.end() ? "" : DeleteTarget(*it);
+    if (target.empty())
+    {
+        menu.ShowMessage("Delete", "That game can't be deleted from here.");
+        return;
+    }
+    if (copier.Poll().busy || delete_thread.joinable())
+    {
+        menu.ShowMessage("Delete", "Wait for the copy (or the delete) going on to finish first.");
+        return;
+    }
+    // what goes with it: the start at launch, a cover beside an image (<name>.jpg)
+    if (autostart == it->path)
+    {
+        std::remove(paths.autostart.c_str());
+        autostart.clear();
+    }
+    std::vector<std::string> extra;
+    if (it->folder.empty() && !it->cover.empty())
+    {
+        const size_t slash = it->path.find_last_of('/');
+        if (slash != std::string::npos && it->cover.compare(0, slash + 1, it->path, 0, slash + 1) == 0)
+            extra.push_back(it->cover);
+    }
+    delete_name = it->title;
+    delete_error.clear();
+    menu.ShowMessage("Delete", "Deleting " + delete_name + "...");
+    delete_thread = std::thread([this, target, extra] {
+        std::string error;
+        if (RemoveTree(target, error))
+            for (const std::string& file : extra)
+                std::remove(file.c_str());
+        delete_error = error;
+        delete_done = true;
+    });
 }
 
 void Home::Sort()
@@ -289,6 +396,14 @@ void Home::Sort()
             t.picture = picture;
         t.on_usb = !g.usb.empty();
         t.autostart = !autostart.empty() && autostart == g.path;
+        if (g.sample)
+            t.removal = Ui::Title::Removal::Hide;
+        else if (const std::string target = DeleteTarget(g); !target.empty())
+        {
+            t.removal = Ui::Title::Removal::Delete;
+            t.remove_detail = (g.folder.empty() ? "The disc image " + target : "The folder " + target + " and all that's in it") +
+                              (g.usb.empty() ? " is deleted from the PS4's storage." : " is deleted from the USB drive.");
+        }
         t.art = g.sample ? SampleArt(g) : Ui::Art::None;
         t.icon = covers[i];
         titles.push_back(std::move(t));
@@ -310,6 +425,13 @@ void Home::Rescan()
                                    });
                                }),
                 games.end());
+    // the samples taken off the list
+    const std::vector<std::string> hidden = Hidden();
+    const size_t listed = games.size();
+    games.erase(std::remove_if(games.begin(), games.end(),
+                               [&](const Game& g) { return std::find(hidden.begin(), hidden.end(), g.path) != hidden.end(); }),
+                games.end());
+    menu.SetHiddenCount(int(listed - games.size()));
     covers.assign(games.size(), Ui::Image{});
     // the last picture shown (picture-1.png, every 10 s of a run) is the last played game's, when it was
     // written after that game started
@@ -442,11 +564,26 @@ Home::Result Home::Update(uint32_t held, double now)
                                                     : "Every log, in one file:" + where);
     }
 
+    if (delete_done.exchange(false))
+    {
+        delete_thread.join();
+        Rescan();
+        const std::string report = delete_error.empty() ? delete_name + " is deleted."
+                                                        : delete_name + " wasn't deleted in full: " + delete_error;
+        if (!menu.UpdateMessage("Delete", report))
+            menu.ShowMessage("Delete", report);
+    }
+
     const Ui::MenuAction action = menu.Update(held, now);
     using Kind = Ui::MenuAction::Kind;
     switch (action.kind)
     {
     case Kind::Boot:
+        if (delete_thread.joinable())
+        {
+            menu.ShowMessage("Delete", "Still deleting: start it once that's done.");
+            break;
+        }
         if (copy.busy)
         {
             menu.ShowMessage("Copy from USB", "Still copying: start it once the copy is done.");
@@ -512,6 +649,22 @@ Home::Result Home::Update(uint32_t held, double now)
             });
         }
         break;
+    case Kind::Delete:
+        Delete(action.path);
+        break;
+    case Kind::Hide:
+        if (FILE* f = std::fopen(paths.hidden.c_str(), "a"))
+        {
+            std::fprintf(f, "%s\n", action.path.c_str());
+            std::fclose(f);
+        }
+        Rescan();
+        break;
+    case Kind::ShowHidden:
+        std::remove(paths.hidden.c_str());
+        Rescan();
+        menu.ShowMessage("Hidden Titles", "Every title taken off the list is back.");
+        break;
     case Kind::None:
         break;
     }
@@ -540,7 +693,6 @@ Ui::LoadingScreen Home::Loading() const
         {
             const Ui::Art art = games[i].sample ? SampleArt(games[i]) : Ui::Art::None;
             screen.icon = art != Ui::Art::None ? Ui::MakeTileArt(art, 384) : Ui::MakeCover(games[i].title, games[i].kind, 384);
-            Grey(screen.icon); // as the menu shows it
         }
     }
     if (screen.name.empty())

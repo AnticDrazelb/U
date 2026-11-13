@@ -102,7 +102,7 @@ Xbox's addresses below it. The real console could (xbox-bench).
 ## The PS4 HOME menu
 
 The app opens on a dashboard in black and white: Dark (white on black) or Light (black on white).
-Only your covers are in colour.
+The theme is only the menu's own colours: covers, the games' art and your icon keep theirs.
 
 Along the top are Midway's name, the time, a USB stick when a drive is plugged in, your name and
 your icon. Under them are the tabs **Games**, **Library**, **USB** and **Settings**; L1/R1 move
@@ -134,10 +134,16 @@ Cover art is yours to add: `cover.jpg`/`cover.png` in a game's folder, `<name>.j
 image, or `/data/xbox-core/covers/<title ID>.jpg`. A cover is made a square tile: the whole cover
 on a blurred copy of itself. Without one, a tile is drawn from the title.
 
-OPTIONS on a game opens its details and two choices:
+OPTIONS on a game opens its details and these choices:
 - **Copy to the PS4**, for a game on a USB drive. The copy runs in the background, with its
   progress shown.
 - **Start at Launch**, for any other game. Hold L1 while the app opens to get the menu back.
+- **Delete**, for your games, on the PS4 or on a USB drive. It asks first and says what goes: the
+  game's folder and all that's in it, or its disc image (and a cover beside it). It only deletes
+  inside `/data/xbox-core/games` or on a USB drive, and the game's saves on Midway's Xbox hard
+  disk stay.
+- **Remove**, for the samples in Midway's package, which can't be deleted: it takes them off the
+  list (`/data/xbox-core/hidden.txt`). Settings, System, Hidden Titles puts them back.
 
 On the **USB** tab, Square copies every USB game that isn't on the PS4 yet, and Triangle writes
 every log to `xbox-core-logs.txt` on the drives.

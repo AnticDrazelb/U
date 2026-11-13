@@ -557,6 +557,7 @@ std::string Library(const std::vector<std::string>& system)
     paths.settings = kSettingsFile;
     paths.autostart = kAutostartFile;
     paths.picture = "/data/xbox-core/picture-1.png";
+    paths.hidden = "/data/xbox-core/hidden.txt";
     paths.version = XB_VERSION;
     paths.system = system.size() > 2 ? system[2] + "; " + system[1] : system.empty() ? "" : system.back();
     paths.write_logs = [](const std::vector<fe::Game>& games) { return WriteLogBundle(games); };

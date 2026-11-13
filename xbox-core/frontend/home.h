@@ -30,6 +30,7 @@ struct HomePaths
     std::string version;           // "00.01"
     std::string system;            // About: a line on where it runs
     std::string picture;           // the last picture shown (picture-1.png): the last played game's
+    std::string hidden;            // hidden.txt: the samples taken off the list, a path a line
     // every log onto the USB drives (the USB tab, Triangle); returns where it was written
     std::function<std::vector<std::string>(const std::vector<Game>&)> write_logs;
 };
@@ -56,6 +57,11 @@ private:
     void SetStatus();
     void CopyAll();
     void Queue(const UsbGame& game);
+    // What deleting a game deletes: its folder, else its image; "" when it isn't in the games folder
+    // or on a USB drive (the package's samples, anything else)
+    std::string DeleteTarget(const Game& game) const;
+    std::vector<std::string> Hidden() const;
+    void Delete(const std::string& path);
 
     Settings& settings;
     HomePaths paths;
@@ -72,6 +78,10 @@ private:
     std::thread logs_thread;
     std::atomic<bool> logs_done{false};
     std::vector<std::string> logs_written;
+    // a game being deleted (on a thread of its own: a game's folder has thousands of files)
+    std::thread delete_thread;
+    std::atomic<bool> delete_done{false};
+    std::string delete_name, delete_error;
 };
 
 // The menu's settings from the app's, and back

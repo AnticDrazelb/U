@@ -1,4 +1,5 @@
-// Midway's HOME menu, a dashboard in black and white (or white and black): Midway's name, the time,
+// Midway's HOME menu, a dashboard in black and white (or white and black; the covers, the games' art
+// and the user's icon in their own colours): Midway's name, the time,
 // the drives and the user along the top; under them the tabs, Games, Library, USB and Settings (L1
 // and R1 move between them). Games is a row of covers where the selected one stands larger, its name
 // and how to start it beside it, and a panel under the row with what Midway knows of it: when it was
@@ -54,6 +55,10 @@ struct Title
     std::string last_result; // how its last run ended ("Showed its picture"), or ""
     bool on_usb = false;   // on a USB drive: "Copy to the PS4" offered
     bool autostart = false; // the app starts it without the menu
+    // how it can go: deleted (a game on the PS4's storage or a drive), or taken off the list (a sample
+    // in Midway's package, which can't be deleted); and what deleting it deletes, for the question
+    enum class Removal { None, Delete, Hide } removal = Removal::None;
+    std::string remove_detail;
     Art art = Art::None;   // the samples' art
     Image icon;            // its cover made square, when there is one (else its art, else a cover)
     Image picture;         // the last picture it showed (its last run), or none
@@ -71,7 +76,7 @@ struct MenuSettings
     int dsp = 0;              // the APU's DSPs (sound effects): 0 off, 1 on
     int sort = 0;             // the titles: 0 by name, 1 recently played first
     // the user at the top right: the nickname (at most kNicknameLength characters) and the icon, a
-    // character on a shade (ui/avatars.h, drawn in grey)
+    // character on a background colour (ui/avatars.h)
     std::string nickname = "Player";
     int avatar = 0, avatar_color = 0;
 };
@@ -85,9 +90,13 @@ struct StatusRow
 
 struct MenuAction
 {
-    enum class Kind { None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4, Autostart, Diagnostics } kind = Kind::None;
+    enum class Kind
+    {
+        None, Boot, Quit, SettingsChanged, ImportUsb, CopyToPs4, Autostart, Diagnostics, Delete, Hide, ShowHidden
+    } kind = Kind::None;
     // Boot: what to boot; CopyToPs4: the game on a USB drive to copy to the PS4; Autostart: the title
-    // the app starts without the menu ("" none)
+    // the app starts without the menu ("" none); Delete: the title to delete (confirmed); Hide: the
+    // title to take off the list (confirmed); ShowHidden: every title taken off the list back
     std::string path;
 };
 
@@ -118,6 +127,8 @@ public:
     bool UpdateMessage(std::string title, std::string text);
     // The selection kept on this title (after the titles are read again)
     void Select(const std::string& path);
+    // How many titles are off the list (System's Hidden Titles)
+    void SetHiddenCount(int count) { hidden_count = count; }
 
     // Buttons held when the menu comes back (from a game) don't count as pressed
     void SetHeld(uint32_t held) { held_before = held; }
@@ -130,7 +141,7 @@ private:
     static constexpr int kTabCount = 4;
     // a full screen over the tabs: the nickname's keyboard, the icon's choice
     enum class Sub { None, Keyboard, Icon };
-    enum class DialogKind { Message, Quit, TitleInfo };
+    enum class DialogKind { Message, Quit, TitleInfo, ConfirmRemove };
     struct Dialog
     {
         DialogKind kind = DialogKind::Message;
@@ -141,6 +152,8 @@ private:
         // TitleInfo: its middle button, "Copy to the PS4" for a game on a USB drive, else "Start at
         // Launch" (or "Menu at Launch")
         bool offers_copy = false;
+        std::string path; // ConfirmRemove: the title (the titles may be read again meanwhile)
+        Title::Removal removal = Title::Removal::None;
         double opened = 0;
     };
     struct Theme;
@@ -148,7 +161,7 @@ private:
     // the Close dialog)
     struct SettingItem
     {
-        enum class Does { Change, Keyboard, Icon, Close } does = Does::Change;
+        enum class Does { Change, Keyboard, Icon, Close, ShowHidden } does = Does::Change;
         std::string label, value, description;
         void (*change)(MenuSettings&) = nullptr;
     };
@@ -181,7 +194,7 @@ private:
     void DrawKeyboard(Canvas& c, double now);
     void DrawSubHeader(Canvas& c, const std::string& text);
     MenuAction KeyboardPress(uint32_t pressed, uint32_t moves);
-    // the user's icon, size x size units, round, in grey (made once for each size and shade)
+    // the user's icon, size x size units, round (made once for each size and colour)
     const Image& Avatar(int character, int color, float size, float scale);
     void DrawBottomBar(Canvas& c, const std::vector<std::pair<Glyph, std::string>>& hints);
     uint32_t Cursor(double now) const;
@@ -193,6 +206,7 @@ private:
     MenuSettings settings;
     std::string version, system_line, clock = "0:00", games_help;
     bool controller = true, usb_present = false, usb_new = false;
+    int hidden_count = 0;
     std::vector<std::pair<std::string, std::string>> news;
     std::vector<StatusRow> games_status;
 
@@ -216,7 +230,7 @@ private:
     float settings_scroll = 0, settings_scroll_target = 0;
     // USB, What's New: scrolled this far
     float page_scroll = 0;
-    // the icon's choice: its step (0 the character, 1 the shade) and what's chosen so far; the
+    // the icon's choice: its step (0 the character, 1 the colour) and what's chosen so far; the
     // keyboard: the text, the key (row, column), whether the next letter is a capital
     int icon_step = 0, icon_character = 0, icon_color = 0;
     std::string keyboard_text;

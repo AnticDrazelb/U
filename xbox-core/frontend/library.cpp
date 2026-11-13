@@ -159,7 +159,7 @@ Game Describe(const std::string& path, const std::string& file_name, const std::
               const std::string& covers)
 {
     Game g;
-    g.path = path, g.file_name = file_name, g.title = file_name, g.kind = kind;
+    g.path = path, g.file_name = file_name, g.title = file_name, g.kind = kind, g.folder = folder;
     g.size = FileSize(path);
     if (IsDiscImageName(path))
         ParseXbe(IsoXbeHead(path), g);

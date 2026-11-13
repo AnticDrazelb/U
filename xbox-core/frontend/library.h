@@ -20,6 +20,7 @@ struct Game
     std::string cover;     // a picture's path, or ""
     bool sample = false;
     std::string usb;       // the USB drive it's on ("" on the hard drive)
+    std::string folder;    // its own folder (a folder game, or a folder holding its image), or ""
     // history
     int plays = 0;
     int64_t last_played = 0; // seconds since 1970

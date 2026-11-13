@@ -69,6 +69,7 @@ int main(int argc, char** argv)
         paths.settings = lib + "/settings.txt";
         paths.autostart = lib + "/autostart.txt";
         paths.picture = lib + "/picture-1.png";
+        paths.hidden = lib + "/hidden.txt";
         paths.version = "00.01";
         paths.system = "PS4 firmware 13.52, its code clear of the Xbox's addresses";
         paths.write_logs = [lib](const std::vector<fe::Game>&) { return std::vector<std::string>{lib + "/usb0/xbox-core-logs.txt"}; };
@@ -130,6 +131,7 @@ int main(int argc, char** argv)
     Shot(*home, "dialog-info-usb");
     // its copy to the PS4: the message's progress, then its result, and the library read again
     Press(*home, kLeft);
+    Press(*home, kLeft); // (past Delete)
     Press(*home, kCross);
     bool copied = false;
     for (int i = 0; i < 200 && !copied; i++)
@@ -142,6 +144,57 @@ int main(int argc, char** argv)
     }
     Shot(*home, "copy-done");
     std::printf("copy to the PS4: %s (%zu titles)\n", copied ? "done" : "NOT DONE", home->Games().size());
+
+    // OPTIONS on a game on the PS4: Delete, asked first; then a sample taken off the list, and back
+    const auto has = [&](const char* title) {
+        for (const fe::Game& g : home->Games())
+            if (g.title == title)
+                return true;
+        return false;
+    };
+    Press(*home, kCross); // (the copy's message closed)
+    for (int i = 0; i < 16; i++)
+        Press(*home, kLeft);
+    Press(*home, kRight);
+    Press(*home, kRight); // Harbor Kart Rally
+    Press(*home, kOptions);
+    Shot(*home, "dialog-options-delete");
+    Press(*home, kLeft); // Delete
+    Press(*home, kCross);
+    Shot(*home, "dialog-confirm-delete");
+    Press(*home, kRight);
+    Press(*home, kCross);
+    for (int i = 0; i < 100 && has("Harbor Kart Rally"); i++)
+    {
+        Press(*home, 0);
+        struct timespec ts{0, 20 * 1000 * 1000};
+        nanosleep(&ts, nullptr);
+    }
+    Shot(*home, "deleted");
+    std::printf("delete: %s\n", has("Harbor Kart Rally") ? "NOT DONE" : "done");
+    Press(*home, kCross);
+    for (int i = 0; i < 6; i++) // a sample (mesh)
+        Press(*home, kRight);
+    Press(*home, kOptions);
+    Press(*home, kLeft);
+    Press(*home, kCross); // Remove, asked first
+    Shot(*home, "dialog-confirm-remove");
+    Press(*home, kRight);
+    Press(*home, kCross);
+    std::printf("hide: %s\n", has("mesh") ? "NOT DONE" : "done");
+    Press(*home, kR1);
+    Press(*home, kR1);
+    Press(*home, kR1); // Settings, its System category
+    for (int i = 0; i < 8; i++)
+        Press(*home, kUp);
+    Press(*home, kDown);
+    for (int i = 0; i < 3; i++)
+        Press(*home, kDown);
+    Press(*home, kRight);
+    Press(*home, kDown);
+    Shot(*home, "settings-hidden");
+    Press(*home, kCross);
+    std::printf("show hidden: %s\n", has("mesh") ? "done" : "NOT DONE");
 
     auto light = home_with(1, 1);
     Press(*light, kRight);
