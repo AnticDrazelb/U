@@ -119,6 +119,21 @@ and depth surfaces and each texture, every draw (gigabytes a second at Halo's th
 - The stats line "the GPU's work (xemu's renderer thread)": busy share, draws, shaders made and
   from the cache, pipelines, waits for the GPU, write-backs and uploads.
 
+## Speed: surfaces held on the GPU (2026-11-13)
+The console's profile (src/profiler.cpp) of Halo in play, after the dirty log: about 30 frames a
+second; xemu's renderer thread 72-88% busy, 40-58% of it writing surfaces back (275-473 a second,
+each waiting for the GPU, then a whole-surface copy): the non-TCG path's "FIXME: Cannot monitor for
+reads/writes; flush now". Now a surface whose drawing ends is held: the dirty log makes its pages
+inaccessible, and guest code touching them faults into FaultResumed, which calls xemu's own
+surface_access_callback (written back, then the access made again), as xemu's TCG access callbacks
+do. The emulator's own access releases a page as it is; system calls on guest memory and new
+contiguous allocations write held surfaces back first. CPU self-test steps "held page" and "held
+page guest"; XB_EAGER_SURFACES=1: as before. Desktop, ClassiCube: 31 -> 57 frames a second.
+- The dirty log's marks are per 4 KiB (xemu checks each vertex buffer's range on its own; per 16 KiB
+  PS4 page one buffer's check cleared another's mark: stale vertices, warped models).
+  XB_DIRTY_PAGE=16384 tests the PS4's page size on a desktop.
+- The PS4 presenter no longer reads the screen's (uncached) buffer back to repeat rows.
+
 ## Verified before shipping (2026-11-10, commit 6ab6dee)
 - Regression 13/13 normally, with XB_TEST_FS_AS_PS4=1, and with XB_USB=own / XB_NV2A=own.
 - FreeBSD VM (the PS4's OS family): kernel, SEH and disc tests 0 failures, triangle runs; built
