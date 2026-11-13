@@ -675,6 +675,10 @@ void PresentLoop()
             saw_picture = true;
             std::thread([] { RecordResult("Showed its picture", false); }).detach();
         }
+        // Rows built in the CPU's memory and only written to the screen's: the screen's buffer is the
+        // GPU's (uncached), where reading a row back to copy it (as this did for each repeated row)
+        // stalls on every load and took most of this thread's time on the console.
+        static std::vector<uint32_t> line, out;
         if (d.valid && g_settings.picture != 0)
         {
             // fit 4:3 (the full height) or fill the screen, nearest texel
@@ -684,39 +688,38 @@ void PresentLoop()
             columns.resize(size_t(ow));
             for (int x = 0; x < ow; x++)
                 columns[size_t(x)] = x * d.width / ow;
-            std::vector<uint32_t> line(size_t(d.width));
+            line.resize(size_t(d.width));
+            out.resize(size_t(ow));
             int last = -1;
             for (int y = 0; y < oh; y++)
             {
                 const int sy = y * d.height / oh;
-                uint32_t* row = fb + size_t(y) * Screen::kWidth + x0;
-                if (sy == last)
+                if (sy != last)
                 {
-                    std::memcpy(row, row - Screen::kWidth, size_t(ow) * 4);
-                    continue;
+                    last = sy;
+                    for (int x = 0; x < d.width; x++)
+                        line[size_t(x)] = Screen::Native(DisplayPixel(d, x, sy));
+                    for (int x = 0; x < ow; x++)
+                        out[size_t(x)] = line[size_t(columns[size_t(x)])];
                 }
-                last = sy;
-                for (int x = 0; x < d.width; x++)
-                    line[size_t(x)] = Screen::Native(DisplayPixel(d, x, sy));
-                for (int x = 0; x < ow; x++)
-                    row[x] = line[size_t(columns[size_t(x)])];
+                std::memcpy(fb + size_t(y) * Screen::kWidth + x0, out.data(), size_t(ow) * 4);
             }
         }
         else if (d.valid)
         {
             const int scale = std::max(1, std::min(Screen::kWidth / d.width, Screen::kHeight / d.height));
             const int x0 = (Screen::kWidth - d.width * scale) / 2, y0 = (Screen::kHeight - d.height * scale) / 2;
+            out.resize(size_t(d.width) * size_t(scale));
             for (int y = 0; y < d.height; y++)
             {
-                uint32_t* row = fb + size_t(y0 + y * scale) * Screen::kWidth + x0;
                 for (int x = 0; x < d.width; x++)
                 {
                     const uint32_t c = Screen::Native(DisplayPixel(d, x, y));
                     for (int s = 0; s < scale; s++)
-                        row[x * scale + s] = c;
+                        out[size_t(x * scale + s)] = c;
                 }
-                for (int s = 1; s < scale; s++)
-                    std::memcpy(row + size_t(s) * Screen::kWidth, row, size_t(d.width) * scale * 4);
+                for (int s = 0; s < scale; s++)
+                    std::memcpy(fb + size_t(y0 + y * scale + s) * Screen::kWidth + x0, out.data(), out.size() * 4);
             }
         }
         if (log_on)

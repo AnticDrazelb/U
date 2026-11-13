@@ -43,7 +43,18 @@ u32 g_page = 0x1000; // the protection's unit (16 KiB on the PS4)
 u32 g_pages = 0;
 // per page: written since each reader last looked (a bit per reader); whether the log protects it;
 // a lock held while either changes with the page's protection
+// written-since bits per 4 KiB unit (QEMU's page, which xemu's checks assume): the protection is per
+// system page (16 KiB on the PS4), so a write fault marks all of its units, but a reader's check
+// clears only the units its range covers. (Per 16 KiB, a check of one vertex buffer cleared the
+// mark of another sharing its page, which then went unnoticed: stale vertices, warped models.)
+constexpr u32 kUnit = 0x1000;
+u32 g_units = 1; // units a page
 std::unique_ptr<std::atomic<u32>[]> g_written;
+void MarkPage(u32 p, u32 mask)
+{
+    for (u32 u = p * g_units; u < (p + 1) * g_units; u++)
+        g_written[u].fetch_or(mask, std::memory_order_acq_rel);
+}
 std::unique_ptr<std::atomic<u8>[]> g_protected;
 std::unique_ptr<std::atomic_flag[]> g_lock;
 std::unique_ptr<std::atomic<u8>[]> g_held; // no access until written back (a surface on the GPU)
@@ -111,7 +122,7 @@ int DirtyFault(u64 address, bool can_defer)
         g_hold_released.fetch_add(1, std::memory_order_relaxed);
         return 1;
     }
-    g_written[p].store(~0u, std::memory_order_release);
+    MarkPage(p, ~0u);
     if (g_protected[p].load(std::memory_order_relaxed))
     {
         platform::Protect(PageAddress(p), g_page, platform::Read | platform::Write);
@@ -205,7 +216,7 @@ void PrepareGuestWrite(u32 address, u32 size)
     for (u32 p = first; p < end; p++)
     {
         PageLock lock(p);
-        g_written[p].store(~0u, std::memory_order_release);
+        MarkPage(p, ~0u);
         const bool held = g_held[p].exchange(0, std::memory_order_relaxed);
         if (g_protected[p].load(std::memory_order_relaxed) || held)
         {
@@ -264,14 +275,20 @@ std::string DirtyLogStats()
 void StartDirtyLog()
 {
     g_page = std::max<u32>(platform::PageSize(), 0x1000);
+    // XB_DIRTY_PAGE=16384: the PS4's page size on a desktop (its granularity tested here)
+    if (const char* e = std::getenv("XB_DIRTY_PAGE"))
+        if (const u32 v = u32(std::strtoul(e, nullptr, 0)); v >= g_page && (v & (v - 1)) == 0)
+            g_page = v;
     g_pages = kContiguousSize / g_page;
-    g_written.reset(new std::atomic<u32>[g_pages]);
+    g_units = std::max<u32>(g_page / kUnit, 1);
+    g_written.reset(new std::atomic<u32>[size_t(g_pages) * g_units]);
+    for (u32 u = 0; u < g_pages * g_units; u++)
+        g_written[u].store(~0u); // all written before anyone has looked
     g_protected.reset(new std::atomic<u8>[g_pages]);
     g_lock.reset(new std::atomic_flag[g_pages]);
     g_held.reset(new std::atomic<u8>[g_pages]);
     for (u32 p = 0; p < g_pages; p++)
     {
-        g_written[p].store(~0u); // all written before anyone has looked
         g_protected[p].store(0);
         g_held[p].store(0);
         g_lock[p].clear();
@@ -295,7 +312,8 @@ void DirtyProtectForTest(u32 address)
 {
     const u32 p = (address - kContiguousBase) / g_page;
     PageLock lock(p);
-    g_written[p].store(0);
+    for (u32 u = p * g_units; u < (p + 1) * g_units; u++)
+        g_written[u].store(0);
     platform::Protect(PageAddress(p), g_page, platform::Read);
     g_protected[p].store(1);
 }
@@ -303,7 +321,7 @@ void DirtyProtectForTest(u32 address)
 bool DirtyWrittenForTest(u32 address)
 {
     const u32 p = (address - kContiguousBase) / g_page;
-    return g_written[p].load() != 0 && !g_protected[p].load();
+    return g_written[p * g_units].load() != 0 && !g_protected[p].load();
 }
 
 } // namespace xb
@@ -320,14 +338,20 @@ bool xb_dirty_test_and_clear(uint64_t offset, uint64_t size, unsigned reader)
     u32 first, end;
     if (!Pages(offset, size, first, end))
         return false;
+    // the 4 KiB units the range covers (the bits cleared: those only)
+    const u32 ufirst = u32(offset / kUnit);
+    const u32 uend = u32((std::min<u64>(offset + (size ? size : 1), kContiguousSize) + kUnit - 1) / kUnit);
     const u32 bit = 1u << (reader & 31);
     bool written = false;
     for (u32 p = first; p < end; p++)
     {
-        // protected before its bit is read: a write after this faults and shows next time; one
-        // before it is in the bit
-        if (!g_protected[p].load(std::memory_order_acquire) ||
-            (g_written[p].load(std::memory_order_relaxed) & bit))
+        const u32 a = std::max(ufirst, p * g_units), b = std::min(uend, (p + 1) * g_units);
+        bool any = false;
+        for (u32 u = a; u < b && !any; u++)
+            any = (g_written[u].load(std::memory_order_relaxed) & bit) != 0;
+        // protected before its bits are read: a write after this faults and shows next time; one
+        // before it is in the bits
+        if (!g_protected[p].load(std::memory_order_acquire) || any)
         {
             PageLock lock(p);
             if (!g_protected[p].load(std::memory_order_relaxed))
@@ -337,7 +361,8 @@ bool xb_dirty_test_and_clear(uint64_t offset, uint64_t size, unsigned reader)
                     platform::Protect(PageAddress(p), g_page, platform::Read);
                 g_protects.fetch_add(1, std::memory_order_relaxed);
             }
-            written |= (g_written[p].fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+            for (u32 u = a; u < b; u++)
+                written |= (g_written[u].fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
         }
     }
     return written;
@@ -348,8 +373,10 @@ void xb_dirty_mark(uint64_t offset, uint64_t size, unsigned reader_mask)
     u32 first, end;
     if (!Pages(offset, size, first, end))
         return;
-    for (u32 p = first; p < end; p++)
-        g_written[p].fetch_or(reader_mask, std::memory_order_acq_rel);
+    const u32 ufirst = u32(offset / kUnit);
+    const u32 uend = u32((std::min<u64>(offset + (size ? size : 1), kContiguousSize) + kUnit - 1) / kUnit);
+    for (u32 u = ufirst; u < uend; u++)
+        g_written[u].fetch_or(reader_mask, std::memory_order_acq_rel);
 }
 
 // Pages [first, end) set to one protection in one system call (their locks held, in order, so the

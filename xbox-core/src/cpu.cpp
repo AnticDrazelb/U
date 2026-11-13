@@ -30,6 +30,8 @@ extern const unsigned char xcs_begin[], xcs_end[], xcs_enter64[], xcs_gate32[], 
     xcs_raise32[], xcs_fault32[], xcs_fault64[];
 }
 
+extern "C" bool xb_dirty_test_and_clear(uint64_t offset, uint64_t size, unsigned reader); // (dirty.cpp)
+
 namespace xb {
 
 namespace {
@@ -1580,6 +1582,17 @@ void InitCpu()
             *reinterpret_cast<volatile u32*>(Ptr<u32>(page)) = 0x5a5aa5a5;
             dirty_log = DirtyWrittenForTest(page) && Read<u32>(page) == 0x5a5aa5a5;
             Log("cpu self-test: the emulator's write %s", dirty_log ? "marked the page and went through" : "wasn't seen");
+            // two readers' ranges in one system page (8 KiB apart: one PS4 page, two of xemu's): a
+            // check of the first must not clear the second's mark (stale vertex buffers otherwise)
+            if (dirty_log)
+            {
+                const u64 off = page - kContiguousBase;
+                const bool first = xb_dirty_test_and_clear(off, 16, 7), second = xb_dirty_test_and_clear(off + 0x2000, 16, 7);
+                Log("cpu self-test: a write seen by two ranges of one page: %s, %s", first ? "first yes" : "first NO",
+                    second ? "second yes" : "second NO (the page's mark was cleared by the first)");
+                if (!second)
+                    Log("cpu self-test: stale data possible for ranges sharing a page");
+            }
             platform::Trail(9, step_number);
         }
         if (dirty_log && step("dirty log guest", "a write by guest code to a page the dirty log protects"))
