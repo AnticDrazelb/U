@@ -642,6 +642,39 @@ int main(void)
         NtClose(f);
     }
     {
+        // Reads into contiguous memory (textures' and surfaces', which the dirty log protects again
+        // whenever the GPU's side checks them: XB_DIRTY_STRESS does it all the time) land whole: a
+        // system call writing a page protected meanwhile failed, and the game got "end of file" for a
+        // read well inside its file (Halo 2's map cache)
+        static unsigned char pattern[262144];
+        for (unsigned i = 0; i < sizeof(pattern); i++)
+            pattern[i] = (unsigned char)(i * 7 + 3);
+        HANDLE f = open_path("\\Device\\Harddisk0\\Partition1\\xc-into-contiguous.bin", GENERIC_READ | GENERIC_WRITE,
+                             FILE_OVERWRITE_IF);
+        unsigned char *memory = MmAllocateContiguousMemory(sizeof(pattern));
+        int good = 0, rounds = 2000;
+        if (f && memory)
+        {
+            IO_STATUS_BLOCK iosb;
+            LARGE_INTEGER at;
+            at.QuadPart = 0;
+            NtWriteFile(f, NULL, NULL, NULL, &iosb, pattern, sizeof(pattern), &at);
+            for (int r = 0; r < rounds; r++)
+            {
+                memset(memory, 0, sizeof(pattern));
+                at.QuadPart = 0;
+                if (NtReadFile(f, NULL, NULL, NULL, &iosb, memory, sizeof(pattern), &at) == 0 &&
+                    iosb.Information == sizeof(pattern) && memcmp(memory, pattern, sizeof(pattern)) == 0)
+                    good++;
+            }
+        }
+        if (f)
+            NtClose(f);
+        if (memory)
+            MmFreeContiguousMemory(memory);
+        check("reads into contiguous memory land whole, every time", good == rounds);
+    }
+    {
         // A read at "the file's position" (ByteOffset FILE_USE_FILE_POINTER_POSITION, -2) reads there, as
         // one without an offset does (it read at offset -2 before: nothing, "end of file")
         HANDLE f = open_path("\\Device\\Harddisk0\\Partition1\\xc-position.txt", GENERIC_READ | GENERIC_WRITE,

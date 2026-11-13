@@ -23,6 +23,7 @@
 // xemu's devices read RAM on a PC. Off (every surface written back as its drawing ends, as
 // before) unless the self-test's two steps pass; XB_EAGER_SURFACES=1 keeps it off.
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "core.h"
@@ -271,6 +273,8 @@ std::string DirtyLogStats()
     return s;
 }
 
+extern "C" bool xb_dirty_test_and_clear(uint64_t offset, uint64_t size, unsigned reader);
+
 // The start-up's: the page size, and the log on
 void StartDirtyLog()
 {
@@ -294,6 +298,17 @@ void StartDirtyLog()
         g_lock[p].clear();
     }
     g_on = true;
+    // XB_DIRTY_STRESS=1: every page protected again all the time (a reader of its own asking about
+    // all of them, as xemu's renderer does about textures' and surfaces' memory in a busy game): what
+    // writes the guest's memory without faulting through the emulator must still get through
+    if (std::getenv("XB_DIRTY_STRESS"))
+        std::thread([] {
+            for (;;)
+            {
+                xb_dirty_test_and_clear(0, kContiguousSize, 31);
+                std::this_thread::yield();
+            }
+        }).detach();
 }
 
 void StopDirtyLog()

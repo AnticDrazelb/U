@@ -87,6 +87,58 @@ int RawPartitionOf(const std::string& xbox_path)
 }
 
 // The raw disk's reads and writes, logged (they're few: the config sectors, a cache partition's format)
+// The guest's memory isn't a system call's buffer: its pages can be write-protected at any moment by
+// another thread (the dirty log: xemu's renderer, checking a texture or surface for changes, protects
+// its pages again; with thousands of draws a second, often), and a system call writing into such a
+// page fails (EFAULT) where a write of the emulator's own is caught and let through (the dirty log's
+// fault). Halo 2 read its map cache into textures' memory and got "end of file" for reads well inside
+// its files, then used what wasn't there. So a read lands in a buffer of the host's (a MiB at a time)
+// and is copied in; a write is copied out first. `read`/`write`: (buffer, bytes, done before) -> bytes
+// or -1.
+template <typename Read>
+ssize_t IntoGuest(u32 guest, size_t n, Read read)
+{
+    thread_local std::vector<u8> buffer;
+    constexpr size_t kChunk = size_t(1) << 20;
+    size_t done = 0;
+    while (done < n)
+    {
+        const size_t want = std::min(n - done, kChunk);
+        if (buffer.size() < want)
+            buffer.resize(want);
+        const ssize_t got = read(buffer.data(), want, done);
+        if (got < 0)
+            return done ? ssize_t(done) : -1;
+        std::memcpy(Ptr(guest + u32(done)), buffer.data(), size_t(got));
+        done += size_t(got);
+        if (size_t(got) < want)
+            break;
+    }
+    return ssize_t(done);
+}
+
+template <typename Write>
+ssize_t FromGuest(u32 guest, size_t n, Write write)
+{
+    thread_local std::vector<u8> buffer;
+    constexpr size_t kChunk = size_t(1) << 20;
+    size_t done = 0;
+    while (done < n)
+    {
+        const size_t want = std::min(n - done, kChunk);
+        if (buffer.size() < want)
+            buffer.resize(want);
+        std::memcpy(buffer.data(), Ptr(guest + u32(done)), want);
+        const ssize_t put = write(buffer.data(), want, done);
+        if (put < 0)
+            return done ? ssize_t(done) : -1;
+        done += size_t(put);
+        if (size_t(put) < want)
+            break;
+    }
+    return ssize_t(done);
+}
+
 void LogRaw(const HostFile* f, const char* what, u64 at, u32 length, u32 status)
 {
     static std::atomic<u32> logged{0};
@@ -723,7 +775,9 @@ void RegisterFileExports(RegisterFn reg)
             const u32 length = at >= f->raw_size ? 0 : u32(std::min<u64>(c.Arg(6), f->raw_size - at));
             u8* out = static_cast<u8*>(Ptr(c.Arg(5)));
             PrepareGuestWrite(c.Arg(5), length); // (a system call: a write-protected page would fail it)
-            ssize_t got = length ? pread(f->fd, out, length, off_t(at)) : 0;
+            ssize_t got = length ? IntoGuest(c.Arg(5), length, [&](void* b, size_t k, size_t d) {
+                return pread(f->fd, b, k, off_t(at + d));
+            }) : 0;
             if (got < 0)
                 got = 0;
             std::memset(out + got, 0, length - size_t(got));
@@ -740,13 +794,19 @@ void RegisterFileExports(RegisterFn reg)
         if (f->iso)
         {
             const s64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? Read<s64>(c.Arg(7)) : f->position;
-            n = ssize_t(IsoRead(*f->iso, u64(at), c.Arg(6), Ptr(c.Arg(5))));
+            n = IntoGuest(c.Arg(5), c.Arg(6), [&](void* b, size_t k, size_t d) {
+                return ssize_t(IsoRead(*f->iso, u64(at) + d, k, b));
+            });
             f->position = at + n;
         }
         else if (c.Arg(7) && Read<s64>(c.Arg(7)) >= 0) // (negative: the special offsets, the file's position)
-            n = pread(f->fd, Ptr(c.Arg(5)), c.Arg(6), off_t(Read<s64>(c.Arg(7))));
+        {
+            const s64 at = Read<s64>(c.Arg(7));
+            n = IntoGuest(c.Arg(5), c.Arg(6), [&](void* b, size_t k, size_t d) { return pread(f->fd, b, k, off_t(at + s64(d))); });
+        }
         else
-            n = read(f->fd, Ptr(c.Arg(5)), c.Arg(6));
+            n = IntoGuest(c.Arg(5), c.Arg(6), [&](void* b, size_t k, size_t) { return read(f->fd, b, k); });
+        const int error = n < 0 ? errno : 0;
         if (n < 0)
             n = 0;
         const u32 status = n == 0 && c.Arg(6) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
@@ -757,9 +817,9 @@ void RegisterFileExports(RegisterFn reg)
             static std::atomic<u32> logged{0};
             struct stat st;
             if (logged++ < 60 && fstat(f->fd, &st) == 0)
-                Log("files: a read of %s at %lld, %u bytes: past its end (%lld bytes)", f->path.c_str(),
+                Log("files: a read of %s at %lld, %u bytes, into %#x: nothing (%s; the file is %lld bytes)", f->path.c_str(),
                     (long long)(c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? Read<s64>(c.Arg(7)) : s64(lseek(f->fd, 0, SEEK_CUR))),
-                    c.Arg(6), (long long)st.st_size);
+                    c.Arg(6), c.Arg(5), error ? std::strerror(error) : "at its end", (long long)st.st_size);
         }
         SetIo(c.Arg(4), status, u32(n));
         if (c.Arg(1))
@@ -778,7 +838,9 @@ void RegisterFileExports(RegisterFn reg)
         {
             const u64 at = c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? u64(Read<s64>(c.Arg(7))) : u64(lseek(f->fd, 0, SEEK_CUR));
             const u32 length = at >= f->raw_size ? 0 : u32(std::min<u64>(c.Arg(6), f->raw_size - at));
-            const ssize_t put = length ? pwrite(f->fd, Ptr(c.Arg(5)), length, off_t(at)) : 0;
+            const ssize_t put = length ? FromGuest(c.Arg(5), length, [&](const void* b, size_t k, size_t d) {
+                return pwrite(f->fd, b, k, off_t(at + d));
+            }) : 0;
             const u32 status = put == ssize_t(length) && length == c.Arg(6) ? STATUS_SUCCESS : 0xC0000185; // IO_DEVICE_ERROR
             LogRaw(f, "write", at, c.Arg(6), status);
             // a cache partition (X:, Y:, Z:) given a new file system: what was in it is gone
@@ -795,9 +857,12 @@ void RegisterFileExports(RegisterFn reg)
             return status;
         }
         if (c.Arg(7) && Read<s64>(c.Arg(7)) >= 0)
-            n = pwrite(f->fd, Ptr(c.Arg(5)), c.Arg(6), off_t(Read<s64>(c.Arg(7))));
+        {
+            const s64 at = Read<s64>(c.Arg(7));
+            n = FromGuest(c.Arg(5), c.Arg(6), [&](const void* b, size_t k, size_t d) { return pwrite(f->fd, b, k, off_t(at + s64(d))); });
+        }
         else
-            n = write(f->fd, Ptr(c.Arg(5)), c.Arg(6));
+            n = FromGuest(c.Arg(5), c.Arg(6), [&](const void* b, size_t k, size_t) { return write(f->fd, b, k); });
         SetIo(c.Arg(4), STATUS_SUCCESS, n < 0 ? 0 : u32(n));
         return STATUS_SUCCESS;
     });
@@ -1146,9 +1211,11 @@ void RegisterFileExports(RegisterFn reg)
                 PrepareGuestRead(page, n);
             ssize_t got;
             if (f->iso)
-                got = ssize_t(IsoRead(*f->iso, u64(at), n, Ptr(page)));
+                got = IntoGuest(page, n, [&](void* b, size_t k, size_t d) { return ssize_t(IsoRead(*f->iso, u64(at) + d, k, b)); });
+            else if (write)
+                got = FromGuest(page, n, [&](const void* b, size_t k, size_t d) { return pwrite(f->fd, b, k, off_t(at + s64(d))); });
             else
-                got = write ? pwrite(f->fd, Ptr(page), n, off_t(at)) : pread(f->fd, Ptr(page), n, off_t(at));
+                got = IntoGuest(page, n, [&](void* b, size_t k, size_t d) { return pread(f->fd, b, k, off_t(at + s64(d))); });
             if (got <= 0)
                 break;
             done += u32(got), at += got;

@@ -131,7 +131,11 @@ contiguous allocations write held surfaces back first. CPU self-test steps "held
 page guest"; XB_EAGER_SURFACES=1: as before. Desktop, ClassiCube: 31 -> 57 frames a second.
 - The dirty log's marks are per 4 KiB (xemu checks each vertex buffer's range on its own; per 16 KiB
   PS4 page one buffer's check cleared another's mark: stale vertices, warped models).
-  XB_DIRTY_PAGE=16384 tests the PS4's page size on a desktop.
+  XB_DIRTY_PAGE=16384 tests the PS4's page size on a desktop. XB_DIRTY_STRESS=1 protects every page
+  again all the time (a reader of its own, as the renderer does textures' memory in a busy game): the
+  emulator's system calls never read or write the guest's memory directly (a page protected meanwhile
+  fails them with EFAULT: Halo 2's map cache reads came back "end of file"), they go through a host
+  buffer (files.cpp's IntoGuest/FromGuest), and the regression set runs the kernel test with it.
 - The PS4 presenter no longer reads the screen's (uncached) buffer back to repeat rows.
 
 ## Verified before shipping (2026-11-10, commit 6ab6dee)

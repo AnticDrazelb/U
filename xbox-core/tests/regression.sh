@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The regression set (HANDOFF §2) on the desktop build: the kernel, SEH, disc, report and APU trap tests (0 failures),
+# The regression set (HANDOFF §2) on the desktop build: the kernel (also with XB_DIRTY_STRESS), SEH, disc,
+# report and APU trap tests (0 failures),
 # nxdk's samples (each runs and draws: PNGs in the output folder to compare with tests/*.png) and
 # NevolutionX (reaches its language menu), all with XB_STRICT_SIGNAL=1. Exit status 1 if any fails.
 #   tests/regression.sh [build dir, default ~/xc-host]
@@ -27,6 +28,11 @@ run() { # name, file, seconds, extra args
     fi
 }
 run kernel "$HERE/kernel-test/bin/default.xbe" 6
+# the kernel test again with every GPU-side page protected again all the time (XB_DIRTY_STRESS): file
+# reads into textures' memory must land whole (Halo 2's map cache got "end of file" mid-file)
+export XB_DIRTY_STRESS=1
+run kernel-dirty-stress "$HERE/kernel-test/bin/default.xbe" 40
+unset XB_DIRTY_STRESS
 run seh "$HERE/seh-test/bin/default.xbe" 4
 run bigimage "$HERE/bigimage-test/bin/default.xbe" 3
 run disc-folder "$HERE/disc-test/bin/default.xbe" 4
