@@ -68,6 +68,26 @@ extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason);  /
 // the system's (ps4_runtime.cpp wraps pthread_create with an allocation; a crash may hold the heap)
 extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 
+extern "C" int32_t sceKernelQueryMemoryProtection(void* address, void** start, void** end, uint32_t* protection);
+
+// How many of the `words` 8-byte words from `from` up the stack can be read: those within the
+// memory `from` is in. A thread's stack can end close above the frame doing the reading: a
+// std::thread has few frames above its function (xbox-core's picture saver, a thread of its own,
+// crashed opening its file: the open's caller scan read 400 words up, past its stack's end). A
+// query that fails leaves the rest of the page.
+static int readableWords(const uint64_t* from, int words) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(from);
+    uintptr_t end = (at | 0xFFF) + 1;
+    void* start = nullptr;
+    void* region_end = nullptr;
+    uint32_t protection = 0;
+    if (sceKernelQueryMemoryProtection(const_cast<uint64_t*>(from), &start, &region_end, &protection) == 0 &&
+        (protection & 1) && reinterpret_cast<uintptr_t>(region_end) > at)
+        end = reinterpret_cast<uintptr_t>(region_end);
+    const uintptr_t room = (end - at) / sizeof(uint64_t);
+    return room < static_cast<uintptr_t>(words) ? static_cast<int>(room) : words;
+}
+
 namespace {
 
 // FreeBSD values (the PS4 kernel's); the OpenOrbis musl headers may carry Linux ones.
@@ -249,7 +269,8 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         writeAll(fd, "\ncode addresses on the stack (elf):\n");
         const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
         int found = 0;
-        for (int i = 0; i < 2048 && found < 48; i++) {
+        const int words = readableWords(stack, 2048);
+        for (int i = 0; i < words && found < 48; i++) {
             if (isCode(stack[i])) {
                 writeFormat(fd, "  [rsp+0x%x] 0x%llx\n", i * 8, static_cast<unsigned long long>(toElf(stack[i])));
                 found++;
@@ -340,7 +361,8 @@ extern "C" __attribute__((noinline)) void ps4_trace_callers(const char* what) {
     char line[320];
     int len = snprintf(line, sizeof(line), "%s: callers", what);
     int found = 0;
-    for (int i = 0; i < 512 && found < 10 && len < 280; i++) {
+    const int words = readableWords(stack, 512);
+    for (int i = 0; i < words && found < 10 && len < 280; i++) {
         if (isCode(stack[i])) {
             len += snprintf(line + len, sizeof(line) - len, " 0x%llx",
                             static_cast<unsigned long long>(toElf(stack[i])));
@@ -430,7 +452,8 @@ extern "C" __attribute__((noinline)) int __wrap_open(const char* path, int flags
         const char* tail = length >= sizeof(record.path) ? path + length - (sizeof(record.path) - 1) : path;
         memset(record.callers, 0, sizeof(record.callers));
         const auto* stack = static_cast<const uint64_t*>(__builtin_frame_address(0));
-        for (int i = 0, found = 0; i < 400 && found < 5; i++) {
+        const int words = readableWords(stack, 400); // (not past the end of this thread's stack)
+        for (int i = 0, found = 0; i < words && found < 5; i++) {
             if (isCode(stack[i])) {
                 record.callers[found++] = static_cast<uint32_t>(toElf(stack[i]));
             }

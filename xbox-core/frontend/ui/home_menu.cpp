@@ -918,12 +918,6 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
                  [](MenuSettings& s) { s.white_theme = !s.white_theme; }}};
     case 1:
         return {
-            {Does::Change, "GPU Emulation", settings.nv2a == 1 ? "Midway's Own" : "xemu's NV2A",
-             "xemu's NV2A: the Xbox's GPU as xemu emulates it, drawn by the PS4's GPU through Vulkan (RADV): "
-             "the most complete, and the fast one. Midway's own: a simpler NV2A of Midway's, which covers far "
-             "less (for comparing when a game draws wrongly). If xemu's didn't get started on this console the "
-             "last time, Midway's own takes over by itself. From the next game.",
-             [](MenuSettings& s) { s.nv2a ^= 1; }},
             {Does::Change, "Picture", settings.picture == 2 ? "Fill the Screen" : settings.picture == 1 ? "Fit 4:3" : "Sharp",
              "Sharp: the game's picture scaled by a whole number (2x for 640x480), centred: every pixel the "
              "same size. Fit 4:3: the full height of the screen, at the Xbox's 4:3. Fill the Screen: stretched "
@@ -933,6 +927,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "What Midway is doing, in a few lines under the loading screen and over the game's first 15 "
              "seconds. L3 + R3 in a game shows or hides it. Every line is in the log files either way.",
              [](MenuSettings& s) { s.show_log = !s.show_log; }},
+            {Does::Change, "GPU Emulation", settings.nv2a == 1 ? "Midway's Own (Less Complete)" : "xemu's NV2A",
+             "xemu's NV2A: the Xbox's GPU as xemu emulates it, drawn by the PS4's GPU through Vulkan (RADV): "
+             "the most complete, and the fast one. Midway's own: a simpler NV2A of Midway's, which covers far "
+             "less (for comparing when a game draws wrongly). If xemu's didn't get started on this console the "
+             "last time, Midway's own takes over by itself. From the next game.",
+             [](MenuSettings& s) { s.nv2a ^= 1; }},
         };
     case 2:
         return {

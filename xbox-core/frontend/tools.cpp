@@ -425,7 +425,9 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
         static const char* kPicture[3] = {"sharp", "fit 4:3", "fill"};
         line("== settings");
         line(std::string("show log: ") + (in.settings->show_log ? "on" : "off") + ", picture: " + kPicture[in.settings->picture] +
-             ", order: " + (in.settings->sort ? "recently played" : "title"));
+             ", order: " + (in.settings->sort ? "recently played" : "title") + ", GPU emulation: " +
+             (in.settings->nv2a ? "Midway's own" : "xemu's") + ", sound effects: " + (in.settings->dsp ? "on" : "off") +
+             ", theme: " + (in.settings->theme == 1 ? "light" : "dark"));
         line("");
     }
     line("== library (" + std::to_string(in.games.size()) + " entries)");

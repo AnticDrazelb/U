@@ -385,10 +385,12 @@ bool Settings::Load(const std::string& file)
         if (key == "show_log") show_log = value != 0;
         else if (key == "picture") picture = std::clamp(value, 0, 2);
         else if (key == "sort") sort = std::clamp(value, 0, 1);
-        // the GPU's emulation under its own key since xemu's renderer fits the PS4's GPU memory: a
-        // choice made while it couldn't start ("nv2a", before) is asked again (it starts as xemu's,
-        // and a start that dies in its start-up is followed by one with xbox-core's)
-        else if (key == "renderer") nv2a = std::clamp(value, 0, 1);
+        // the GPU's emulation, under a key of its own each time a choice of before shouldn't hold:
+        // "nv2a" before xemu's renderer fit the PS4's GPU memory; "renderer" before the HOME menu
+        // put it out of the way (it was the first item of Graphics, where a second press of Cross
+        // changes it unseen: Midway's own NV2A chosen by accident). Unset, it's xemu's, and a start
+        // that dies in its start-up is followed by one with Midway's own.
+        else if (key == "gpu") nv2a = std::clamp(value, 0, 1);
         else if (key == "dsp") dsp = std::clamp(value, 0, 1);
         else if (key == "theme") theme = std::clamp(value, 0, 2);
         else if (key == "nickname") nickname = word.substr(0, 40);
@@ -403,7 +405,7 @@ void Settings::Save(const std::string& file) const
 {
     if (FILE* f = std::fopen(file.c_str(), "w"))
     {
-        std::fprintf(f, "show_log %d\npicture %d\nsort %d\nrenderer %d\ndsp %d\ntheme %d\navatar %d\navatar_color %d\n",
+        std::fprintf(f, "show_log %d\npicture %d\nsort %d\ngpu %d\ndsp %d\ntheme %d\navatar %d\navatar_color %d\n",
                      show_log ? 1 : 0, picture, sort, nv2a, dsp, theme, avatar, avatar_color);
         if (!nickname.empty())
             std::fprintf(f, "nickname %s\n", nickname.c_str());
