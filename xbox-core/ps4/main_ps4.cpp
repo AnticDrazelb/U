@@ -632,10 +632,16 @@ void PresentLoop()
         if (d.valid && now >= next_picture)
         {
             next_picture = now + 10;
-            const std::string dir = kDataDir;
-            std::rename((dir + "/picture-2.png").c_str(), (dir + "/picture-3.png").c_str());
-            std::rename((dir + "/picture-1.png").c_str(), (dir + "/picture-2.png").c_str());
-            SaveShownPicture(dir + "/picture-1.png");
+            // on a thread of its own: encoding the PNG here held the screen for a moment every 10 s
+            static std::atomic<bool> saving{false};
+            if (!saving.exchange(true))
+                std::thread([] {
+                    const std::string dir = kDataDir;
+                    std::rename((dir + "/picture-2.png").c_str(), (dir + "/picture-3.png").c_str());
+                    std::rename((dir + "/picture-1.png").c_str(), (dir + "/picture-2.png").c_str());
+                    SaveShownPicture(dir + "/picture-1.png");
+                    saving = false;
+                }).detach();
         }
         const bool log_on = show_log && (now < 15 || !d.valid);
         // Nothing new to show (the same picture, layout and no log over it): the screen keeps the last
@@ -940,12 +946,15 @@ int main()
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
         diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks, [] { WriteLogBundle({}); });
-        // the logs onto the USB drives every 15 s while it runs: a console that freezes hard
-        // (nothing runs to write them), or an app closed from the home screen, still leaves them
+        // the logs onto the USB drives every minute while it runs: a console that freezes hard
+        // (nothing runs to write them), or an app closed from the home screen, still leaves them.
+        // (Every 15 s, the bundle's tens of MiB read, named and written twice were a stutter; the
+        // live log streams to the drive line by line meanwhile, and a crash, a hang or the program's
+        // end writes it at once.)
         std::thread([] {
             for (;;)
             {
-                std::this_thread::sleep_for(std::chrono::seconds(15));
+                std::this_thread::sleep_for(std::chrono::seconds(60));
                 WriteLogBundle({});
             }
         }).detach();

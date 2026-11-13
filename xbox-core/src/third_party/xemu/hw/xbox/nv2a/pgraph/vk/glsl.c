@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <pthread.h>
 #include "ui/xemu-settings.h"
 #include "renderer.h"
 #include "hw/xbox/nv2a/xb_profile.h"
@@ -396,21 +397,144 @@ static glslang_stage_t vk_shader_stage_to_glslang_stage(VkShaderStageFlagBits st
  * folder from xbox-core (nv2a.cpp); NULL: none. */
 const char *xb_shader_cache_dir(void);
 
-static GByteArray *xb_spv_from_cache(int stage, const char *glsl, char *path, size_t path_size)
+/* All of them in one file (shaders.pack: "XBSPV1\0\0", then records: the key's two halves, the stage,
+ * the size, the SPIR-V), read once at the first lookup and appended to as shaders are made. The PS4's
+ * drive is a hard disk: a file a shader cost a seek each (about 28 ms, a hitch whenever a scene first
+ * showed an effect). Single .spv files from before are read once and moved into the pack. */
+typedef struct XbSpvEntry {
+    uint64_t high, low;
+    int stage;
+    GByteArray *spv;
+    struct XbSpvEntry *next;
+} XbSpvEntry;
+static XbSpvEntry *xb_spv_table[4096];
+static pthread_mutex_t xb_spv_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool xb_spv_loaded;
+static FILE *xb_spv_pack;
+
+static GByteArray *xb_spv_copy(const GByteArray *a)
 {
-    path[0] = 0;
+    uint8_t *data = malloc(a->len);
+    if (!data) {
+        return NULL;
+    }
+    memcpy(data, a->data, a->len);
+    return g_byte_array_new_take(data, a->len);
+}
+
+static void xb_spv_insert(uint64_t high, uint64_t low, int stage, GByteArray *spv)
+{
+    XbSpvEntry *e = g_malloc(sizeof(*e));
+    e->high = high, e->low = low, e->stage = stage, e->spv = spv;
+    const unsigned slot = (unsigned)(low ^ (uint64_t)stage) & 4095;
+    e->next = xb_spv_table[slot];
+    xb_spv_table[slot] = e;
+}
+
+static XbSpvEntry *xb_spv_find(uint64_t high, uint64_t low, int stage)
+{
+    for (XbSpvEntry *e = xb_spv_table[(unsigned)(low ^ (uint64_t)stage) & 4095]; e; e = e->next) {
+        if (e->high == high && e->low == low && e->stage == stage) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void xb_spv_load_pack(const char *dir)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/shaders.pack", dir);
+    FILE *f = fopen(path, "rb");
+    long good_end = 8;
+    int count = 0;
+    if (f) {
+        char magic[8];
+        if (fread(magic, 1, 8, f) == 8 && memcmp(magic, "XBSPV1\0\0", 8) == 0) {
+            for (;;) {
+                uint64_t key[2];
+                int32_t stage;
+                uint32_t size;
+                if (fread(key, 8, 2, f) != 2 || fread(&stage, 4, 1, f) != 1 || fread(&size, 4, 1, f) != 1 ||
+                    size < 20 || size > (64u << 20) || size % 4) {
+                    break;
+                }
+                uint8_t *data = malloc(size);
+                if (!data || fread(data, 1, size, f) != size) {
+                    free(data);
+                    break; /* a record cut short (the app ended while writing it): dropped */
+                }
+                xb_spv_insert(key[0], key[1], stage, g_byte_array_new_take(data, size));
+                good_end = ftell(f);
+                count++;
+            }
+        } else {
+            good_end = 0;
+        }
+        fclose(f);
+    } else {
+        good_end = 0;
+    }
+    /* appended to from where the good records end (a cut-short one overwritten) */
+    xb_spv_pack = fopen(path, good_end ? "r+b" : "wb");
+    if (xb_spv_pack) {
+        if (good_end) {
+            fseek(xb_spv_pack, good_end, SEEK_SET);
+        } else {
+            fwrite("XBSPV1\0\0", 1, 8, xb_spv_pack);
+            fflush(xb_spv_pack);
+        }
+    }
+    fprintf(stderr, "xemu: shader cache: %d shaders from %s\n", count, path);
+}
+
+static void xb_spv_append(uint64_t high, uint64_t low, int stage, const GByteArray *spv)
+{
+    if (!xb_spv_pack || !spv) {
+        return;
+    }
+    const uint64_t key[2] = {high, low};
+    const int32_t st = stage;
+    const uint32_t size = spv->len;
+    fwrite(key, 8, 2, xb_spv_pack);
+    fwrite(&st, 4, 1, xb_spv_pack);
+    fwrite(&size, 4, 1, xb_spv_pack);
+    fwrite(spv->data, 1, size, xb_spv_pack);
+    fflush(xb_spv_pack);
+}
+
+/* the SPIR-V for this GLSL and stage, or NULL (*key set for xb_spv_to_cache) */
+static GByteArray *xb_spv_from_cache(int stage, const char *glsl, uint64_t key[2])
+{
     const char *dir = xb_shader_cache_dir();
+    key[0] = key[1] = 0;
     if (!dir) {
         return NULL;
     }
     const XXH128_hash_t h = XXH3_128bits(glsl, strlen(glsl));
-    snprintf(path, path_size, "%s/%016llx%016llx-%d.spv", dir, (unsigned long long)h.high64,
+    key[0] = h.high64, key[1] = h.low64;
+    pthread_mutex_lock(&xb_spv_lock);
+    if (!xb_spv_loaded) {
+        xb_spv_loaded = true;
+        xb_spv_load_pack(dir);
+    }
+    XbSpvEntry *e = xb_spv_find(h.high64, h.low64, stage);
+    GByteArray *spv = NULL;
+    if (e) {
+        spv = xb_spv_copy(e->spv);
+    }
+    pthread_mutex_unlock(&xb_spv_lock);
+    if (spv) {
+        return spv;
+    }
+    /* a single file from before the pack: read once, moved into it */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%016llx%016llx-%d.spv", dir, (unsigned long long)h.high64,
              (unsigned long long)h.low64, stage);
     FILE *f = fopen(path, "rb");
     if (!f) {
         return NULL;
     }
-    GByteArray *spv = NULL;
     if (fseek(f, 0, SEEK_END) == 0) {
         const long size = ftell(f);
         if (size >= 20 && size % 4 == 0 && fseek(f, 0, SEEK_SET) == 0) {
@@ -425,26 +549,33 @@ static GByteArray *xb_spv_from_cache(int stage, const char *glsl, char *path, si
         }
     }
     fclose(f);
+    if (spv) {
+        pthread_mutex_lock(&xb_spv_lock);
+        GByteArray *copy = xb_spv_copy(spv);
+        if (copy) {
+            xb_spv_insert(h.high64, h.low64, stage, copy);
+        }
+        xb_spv_append(h.high64, h.low64, stage, spv);
+        pthread_mutex_unlock(&xb_spv_lock);
+        remove(path);
+    }
     return spv;
 }
 
-static void xb_spv_to_cache(const char *path, const GByteArray *spv)
+static void xb_spv_to_cache(const uint64_t key[2], int stage, const GByteArray *spv)
 {
-    if (!path[0] || !spv) {
+    if ((!key[0] && !key[1]) || !spv) {
         return;
     }
-    char part[600];
-    snprintf(part, sizeof(part), "%s.part", path);
-    FILE *f = fopen(part, "wb");
-    if (!f) {
-        return;
+    pthread_mutex_lock(&xb_spv_lock);
+    if (!xb_spv_find(key[0], key[1], stage)) {
+        GByteArray *copy = xb_spv_copy(spv);
+        if (copy) {
+            xb_spv_insert(key[0], key[1], stage, copy);
+        }
+        xb_spv_append(key[0], key[1], stage, spv);
     }
-    const bool ok = fwrite(spv->data, 1, spv->len, f) == spv->len;
-    if (fclose(f) == 0 && ok) {
-        rename(part, path);
-    } else {
-        remove(part);
-    }
+    pthread_mutex_unlock(&xb_spv_lock);
 }
 
 ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
@@ -454,15 +585,15 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
     info->refcnt = 0;
     info->glsl = strdup(glsl);
     const uint64_t xb_t0 = xb_prof_now();
-    char cache_path[512];
-    info->spirv = xb_spv_from_cache((int)stage, glsl, cache_path, sizeof(cache_path));
+    uint64_t cache_key[2];
+    info->spirv = xb_spv_from_cache((int)stage, glsl, cache_key);
     if (info->spirv) {
         xb_prof_add(XB_PROF_SPV_CACHED, xb_t0);
     } else {
         info->spirv = pgraph_vk_compile_glsl_to_spv(
             r, vk_shader_stage_to_glslang_stage(stage), glsl);
         xb_prof_add(XB_PROF_GLSL, xb_t0);
-        xb_spv_to_cache(cache_path, info->spirv);
+        xb_spv_to_cache(cache_key, (int)stage, info->spirv);
     }
     info->module = pgraph_vk_create_shader_module_from_spv(r, info->spirv);
     init_layout_from_spv(info);

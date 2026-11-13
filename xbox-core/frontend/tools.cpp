@@ -1,6 +1,8 @@
 #include "tools.h"
 
 #include <algorithm>
+#include <mutex>
+#include <map>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -450,10 +452,37 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
     }
     if (in.all_logs)
     {
-        // every log in the data folder, as New Eden bundles them
-        Symbols symbols;
-        if (!in.symbols.empty())
-            symbols.Load(in.symbols);
+        // every log in the data folder, as New Eden bundles them. What a file gave last time is kept
+        // until the file changes (its size or time): written every minute while a game runs, the
+        // bundle reads and names again only what is new (the old sessions' logs are tens of MiB)
+        struct Cached
+        {
+            uint64_t size = 0;
+            int64_t mtime = 0;
+            std::string text;
+        };
+        static std::mutex cache_mutex;
+        std::lock_guard cache_lock(cache_mutex);
+        static std::map<std::string, Cached> cache;
+        auto unchanged = [](const std::string& path, Cached& c) {
+            struct stat st;
+            if (stat(path.c_str(), &st) != 0)
+                return false;
+            const int64_t mtime = int64_t(st.st_mtime);
+            if (!c.text.empty() && c.size == uint64_t(st.st_size) && c.mtime == mtime)
+                return true;
+            c.size = uint64_t(st.st_size), c.mtime = mtime;
+            return false;
+        };
+        static Symbols symbols;
+        static std::string symbols_from;
+        if (symbols_from != in.symbols)
+        {
+            symbols = Symbols();
+            if (!in.symbols.empty())
+                symbols.Load(in.symbols);
+            symbols_from = in.symbols;
+        }
         if (symbols.entries.empty())
             line("(no symbols in this build: code addresses without names)");
         std::vector<std::string> names;
@@ -486,6 +515,13 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
         std::sort(pictures.begin(), pictures.end());
         for (const std::string& n : pictures)
         {
+            Cached& c = cache[in.data_dir + "/" + n];
+            if (unchanged(in.data_dir + "/" + n, c))
+            {
+                r += c.text;
+                continue;
+            }
+            const size_t from = r.size();
             std::string bytes;
             if (FILE* f = std::fopen((in.data_dir + "/" + n).c_str(), "rb"))
             {
@@ -525,10 +561,18 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
             }
             if (!out.empty())
                 line(out);
+            c.text = r.substr(from);
         }
         constexpr size_t kLimit = size_t(8) << 20;
         for (const std::string& n : names)
         {
+            Cached& c = cache[in.data_dir + "/" + n];
+            if (unchanged(in.data_dir + "/" + n, c))
+            {
+                r += c.text;
+                continue;
+            }
+            const size_t from = r.size();
             uint64_t size = 0;
             const std::string text = ReadEnd(in.data_dir + "/" + n, kLimit, size);
             line("");
@@ -545,6 +589,7 @@ std::vector<std::string> WriteDiagnostics(const DiagnosticsInput& in, const std:
             r += Symbolize(text, symbols);
             if (!r.empty() && r.back() != '\n')
                 r += '\n';
+            c.text = r.substr(from);
         }
     }
     for (const auto& [file, n] : in.all_logs ? std::vector<std::pair<std::string, size_t>>{} : in.logs)
