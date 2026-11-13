@@ -33,8 +33,10 @@ ps4)
         -DXB_IMAGE_BASE="${XB_IMAGE_BASE:-}" ${XB_GPU_LINK:+-DXB_GPU_LINK=$XB_GPU_LINK}
     ninja -C "$build"
     stage="$build/stage"
-    rm -rf "$stage" && mkdir -p "$stage/sce_sys" "$stage/samples" "$stage/ui"
-    cp "$HERE"/frontend/assets/* "$stage/ui/" # the library's fonts (and their licence)
+    rm -rf "$stage" && mkdir -p "$stage/sce_sys" "$stage/samples" "$stage/licenses"
+    # the HOME menu's fonts are in the program: their licences beside it
+    cp "$HERE"/frontend/ui/fonts/OFL.txt "$stage/licenses/Inter-OFL.txt"
+    cp "$HERE"/frontend/ui/fonts/PixelifySans-OFL.txt "$stage/licenses/PixelifySans-OFL.txt"
     # the app's functions by address (relative to .text, as crash.log gives them), so the log bundle
     # names the code a crash report points at
     nm="$(command -v /opt/llvm21/bin/llvm-nm || command -v llvm-nm)"

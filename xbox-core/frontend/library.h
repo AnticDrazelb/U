@@ -56,6 +56,10 @@ struct Settings
     int sort = 0;         // 0 by title, 1 recently played first
     int nv2a = 0;         // the GPU's emulation: 0 xemu's NV2A, 1 xbox-core's own
     int dsp = 0;          // the APU's DSPs (effects): 0 off (the voices mixed directly), 1 on
+    // the HOME menu's: its theme (0 Basic Black, 1 Basic White, 2 Retro), the user's nickname and icon
+    int theme = 0;
+    std::string nickname;  // "" the PS4 user's name
+    int avatar = 0, avatar_color = 0;
     bool Load(const std::string& file);
     void Save(const std::string& file) const;
 };

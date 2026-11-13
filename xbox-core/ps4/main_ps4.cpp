@@ -1,8 +1,9 @@
-// xbox-core on the PS4: the library (frontend/: the samples in the package and the player's games in
-// /data/xbox-core/games, with covers, details and history), then the chosen one running natively,
-// its screen scaled up on VideoOut, the log on top for a while (L3+R3 together toggle it). The log
-// also goes to /data/xbox-core/log.txt. One program per start of the app: to run another, close it
-// (PS button) and open it again.
+// Midway (xbox-core) on the PS4: the HOME menu (frontend/home.h, New Eden's: the samples in the
+// package and the player's games in /data/xbox-core/games and on USB drives, with covers, details and
+// history), then the chosen one running natively behind a loading screen, its screen scaled up on
+// VideoOut, the log on top for a while (L3+R3 together toggle it). The log also goes to
+// /data/xbox-core/log.txt. One program per start of the app: to run another, close it (PS button)
+// and open it again.
 #include <algorithm>
 #include <atomic>
 #include <ctime>
@@ -24,11 +25,12 @@
 
 #include <orbis/AudioOut.h>
 #include <orbis/Pad.h>
+#include <orbis/SystemService.h>
 #include <orbis/UserService.h>
 #include <orbis/VideoOut.h>
 #include <stb/stb_easy_font.h>
 
-#include "../frontend/ui.h"
+#include "../frontend/home.h"
 #include "../src/diagnostics.h"
 #include "../src/gpu.h"
 #include "../src/core.h"
@@ -66,6 +68,11 @@ constexpr const char* kAutostartFile = "/data/xbox-core/autostart.txt";
 
 fe::Settings g_settings;
 std::string g_running;            // the game running, for its history
+// the loading screen, until the game's first picture: what it shows, and its stage (1 loading, 3
+// starting); g_failed: the run stopped with an error (the log is shown in full instead)
+Ui::LoadingScreen g_loading;
+std::atomic<int> g_loading_stage{1};
+std::atomic<bool> g_failed{false};
 std::atomic<bool> g_result_recorded{false};
 
 // how the run went: the history's "last run". A final result (how it stopped) is written once;
@@ -224,7 +231,10 @@ void LogSink(const char* line)
     g_log_lines.push_back(line);
     const std::string l = line;
     if (l.find("] FATAL: ") != std::string::npos || l.find("guest fault") != std::string::npos || l.find("guest halted") != std::string::npos)
+    {
+        g_failed = true;
         std::thread([l] { RecordResult("Stopped: " + l.substr(0, 160)); }).detach();
+    }
     while (g_log_lines.size() > 18)
         g_log_lines.pop_front();
 }
@@ -531,38 +541,37 @@ std::string Menu(const std::vector<Entry>& xbes)
     }
 }
 
-// The library: the front end's screen, the pad's presses (held directions repeat; the left stick
-// steers too), until a game is chosen. "" when the screen can't be drawn that way (fonts missing).
+// The HOME menu (frontend/home.h): its screen 30 times a second, the pad's buttons (the left stick
+// steers too), until a game is chosen. Closing it from Power ends the app.
 std::vector<std::string> UsbDrives();
-void WriteLogBundle(const std::vector<fe::Game>& games);
+std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games);
 
 std::string Library(const std::vector<std::string>& system)
 {
-    fe::LibraryPaths paths{{"/app0/samples"}, "/data/xbox-core/games", UsbDrives(), "/data/xbox-core/covers", kHistoryFile};
-    fe::UiPaths ui_paths{"/app0/ui", kSettingsFile, kAutostartFile,
-                         {"Games: /data/xbox-core/games/<name>/default.xbe (with its files), or <name>.iso",
-                          "(Tools copies them there from a USB drive.) Covers: cover.jpg or cover.png beside a game",
-                          "(or <name>.jpg beside an .iso), or /data/xbox-core/covers/<title ID>.jpg."},
-                         paths,
-                         UsbDrives(),
-                         system,
-                         {{"/data/xbox-core/log-1.txt", 400}, {"/data/xbox-core/crash.log", 200},
-                          {"/data/xbox-core/boot-trace.log", 60}, {kLogFile, 60}},
-                         "/data/xbox-core/diagnostics.txt",
-                         kDataDir};
-    std::vector<fe::Game> games = fe::ScanLibrary(paths);
-    WriteLogBundle(games);
-    fe::LibraryUi ui(std::move(games), g_settings, ui_paths, XB_VERSION);
-    if (!ui.Ready())
-        return "";
-    std::string user = "Player";
+    fe::HomePaths paths;
+    paths.library = {{"/app0/samples"}, "/data/xbox-core/games", {}, "/data/xbox-core/covers", kHistoryFile};
+    for (int i = 0; i < 8; i++)
+        paths.usb.push_back("/mnt/usb" + std::to_string(i));
+    for (int i = 0; i < 8; i++)
+        paths.usb.push_back("/usb" + std::to_string(i)); // where some consoles show an app its drives
+    paths.settings = kSettingsFile;
+    paths.autostart = kAutostartFile;
+    paths.version = XB_VERSION;
+    paths.system = system.size() > 2 ? system[2] + "; " + system[1] : system.empty() ? "" : system.back();
+    paths.write_logs = [](const std::vector<fe::Game>& games) { return WriteLogBundle(games); };
+    std::string user;
     int32_t id = -1;
     char name[32] = {};
     if (sceUserServiceGetInitialUser(&id) == 0 && sceUserServiceGetUserName(id, name, sizeof(name)) == 0 && name[0])
         user = name;
+    Trace("menu: reading the library");
+    fe::Home home(g_settings, paths, user);
+    WriteLogBundle(home.Games());
+    Log("menu: %zu titles", home.Games().size());
+    Ui::Canvas canvas(Screen::kWidth, Screen::kHeight, Screen::kWidth / 1280.0f);
     const auto start = std::chrono::steady_clock::now();
-    uint32_t previous = PadButtons();
-    double held_since = 0, last_repeat = 0;
+    // buttons held as the menu opens (L1 to skip autostart) don't count as pressed
+    home.Menu().SetHeld(~0u);
     for (;;)
     {
         OrbisPadData pad{};
@@ -575,35 +584,46 @@ std::string Library(const std::vector<std::string>& system)
             if (pad.leftStick.y < 50) buttons |= ORBIS_PAD_BUTTON_UP;
             if (pad.leftStick.y > 205) buttons |= ORBIS_PAD_BUTTON_DOWN;
         }
-        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        constexpr uint32_t kDirections = ORBIS_PAD_BUTTON_UP | ORBIS_PAD_BUTTON_DOWN | ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT;
-        uint32_t pressed = buttons & ~previous;
-        if ((buttons & kDirections) && (buttons & kDirections) == (previous & kDirections))
+        uint32_t held = 0;
+        const std::pair<uint32_t, uint32_t> map[] = {
+            {ORBIS_PAD_BUTTON_UP, Ui::kUp},         {ORBIS_PAD_BUTTON_DOWN, Ui::kDown},
+            {ORBIS_PAD_BUTTON_LEFT, Ui::kLeft},     {ORBIS_PAD_BUTTON_RIGHT, Ui::kRight},
+            {ORBIS_PAD_BUTTON_CROSS, Ui::kCross},   {ORBIS_PAD_BUTTON_CIRCLE, Ui::kCircle},
+            {ORBIS_PAD_BUTTON_TRIANGLE, Ui::kTriangle}, {ORBIS_PAD_BUTTON_SQUARE, Ui::kSquare},
+            {ORBIS_PAD_BUTTON_OPTIONS, Ui::kOptions}, {ORBIS_PAD_BUTTON_L1, Ui::kL1},
+            {ORBIS_PAD_BUTTON_R1, Ui::kR1},
+        };
+        for (const auto& [from, to] : map)
+            if (buttons & from)
+                held |= to;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const fe::Home::Result result = home.Update(held, now);
+        if (result == fe::Home::Result::Boot)
         {
-            if (t - held_since > 0.4 && t - last_repeat > 0.11) // held: repeat
-                pressed |= buttons & kDirections, last_repeat = t;
+            g_loading = home.Loading();
+            Log("menu: starting %s", home.Chosen().c_str());
+            return home.Chosen();
         }
-        else
-            held_since = t;
-        previous = buttons;
-        fe::Input in;
-        in.up = pressed & ORBIS_PAD_BUTTON_UP, in.down = pressed & ORBIS_PAD_BUTTON_DOWN;
-        in.left = pressed & ORBIS_PAD_BUTTON_LEFT, in.right = pressed & ORBIS_PAD_BUTTON_RIGHT;
-        in.cross = pressed & ORBIS_PAD_BUTTON_CROSS, in.circle = pressed & ORBIS_PAD_BUTTON_CIRCLE;
-        in.square = pressed & ORBIS_PAD_BUTTON_SQUARE, in.triangle = pressed & ORBIS_PAD_BUTTON_TRIANGLE;
-        in.l1 = pressed & ORBIS_PAD_BUTTON_L1, in.r1 = pressed & ORBIS_PAD_BUTTON_R1;
-        if (const fe::Game* g = ui.Update(in))
-            return g->path;
+        if (result == fe::Home::Result::Quit)
+        {
+            Log("menu: closing the app");
+            SyncLogs();
+            sceSystemServiceLoadExec("exit", nullptr);
+            _exit(0);
+        }
+        const time_t wall = time(nullptr);
+        char clock[16];
+        std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&wall));
+        home.Draw(canvas, now, clock, connected);
         if (uint32_t* fb = g_screen.Begin())
         {
-            const time_t now = time(nullptr);
-            char clock[16];
-            std::strftime(clock, sizeof(clock), "%H:%M", std::localtime(&now));
-            fe::Canvas canvas(fb, Screen::kWidth, Screen::kHeight, Screen::kWidth);
-            ui.Draw(canvas, t, clock, user);
+            // the canvas's bytes are the screen's (R, G, B, A)
+            std::memcpy(fb, canvas.Pixels(), size_t(Screen::kWidth) * Screen::kHeight * 4);
             g_screen.End();
         }
-        usleep(8 * 1000);
+        const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() - now;
+        if (spent < 1.0 / 30)
+            usleep(useconds_t((1.0 / 30 - spent) * 1e6));
     }
 }
 
@@ -642,6 +662,33 @@ void PresentLoop()
                     SaveShownPicture(dir + "/picture-1.png");
                     saving = false;
                 }).detach();
+        }
+        // the loading screen until the game's first picture (unless it stopped with an error: then the
+        // log, in full), about 20 times a second, the log's last lines under it when it's on
+        if (!saw_picture && !d.valid && !g_failed)
+        {
+            static Ui::Canvas* canvas = new Ui::Canvas(Screen::kWidth, Screen::kHeight, Screen::kWidth / 1280.0f);
+            static double next_frame = 0;
+            if (now < next_frame)
+            {
+                usleep(4 * 1000);
+                continue;
+            }
+            next_frame = now + 1.0 / 20;
+            g_loading.lines.clear();
+            if (show_log)
+            {
+                std::lock_guard lock(g_log_mutex);
+                for (size_t i = g_log_lines.size() > 3 ? g_log_lines.size() - 3 : 0; i < g_log_lines.size(); i++)
+                    g_loading.lines.push_back(g_log_lines[i].substr(0, 200));
+            }
+            Ui::DrawLoadingScreen(*canvas, g_loading, g_loading_stage.load(), 0, 0, now);
+            if (uint32_t* fb = g_screen.Begin())
+            {
+                std::memcpy(fb, canvas->Pixels(), size_t(Screen::kWidth) * Screen::kHeight * 4);
+                g_screen.End();
+            }
+            continue;
         }
         const bool log_on = show_log && (now < 15 || !d.valid);
         // Nothing new to show (the same picture, layout and no log over it): the screen keeps the last
@@ -754,7 +801,7 @@ std::vector<std::string> UsbDrives()
 // each package (where it is linked, RADV in it or not) its own trail, so they can't overwrite each other's
 const char* const kFaultTrail = "/data/xbox-core/fault-trail-" XB_VARIANT ".bin";
 std::vector<std::string> g_system; // the report's first lines: the app and the console
-void WriteLogBundle(const std::vector<fe::Game>& games)
+std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games)
 {
     fe::DiagnosticsInput d;
     d.system = g_system;
@@ -767,8 +814,10 @@ void WriteLogBundle(const std::vector<fe::Game>& games)
     std::vector<std::string> outputs{"/data/xbox-core/diagnostics.txt"};
     for (const std::string& drive : d.usb_roots)
         outputs.push_back(drive + "/xbox-core-logs.txt");
-    for (const std::string& w : fe::WriteDiagnostics(d, outputs))
+    const std::vector<std::string> written = fe::WriteDiagnostics(d, outputs);
+    for (const std::string& w : written)
         Log("logs written: %s", w.c_str());
+    return written;
 }
 
 // SIGSYS: the console refusing a system call (the crash log doesn't take that signal). Where it
@@ -914,6 +963,15 @@ int main()
         xbe = Library(system);
     if (xbe.empty())
         xbe = Menu(xbes);
+    if (g_loading.name.empty()) // started without the menu (autostart): the file's name
+    {
+        const size_t slash = xbe.find_last_of('/');
+        g_loading.name = xbe.substr(slash + 1);
+        if (g_loading.name == "default.xbe" && slash != std::string::npos && slash > 0)
+            g_loading.name = xbe.substr(xbe.find_last_of('/', slash - 1) + 1, slash - xbe.find_last_of('/', slash - 1) - 1);
+        g_loading.white_theme = g_settings.theme == 1;
+        g_loading.retro_theme = g_settings.theme == 2;
+    }
     Log("starting %s", xbe.c_str());
     g_running = xbe;
     fe::RecordRun(kHistoryFile, xbe, "");
@@ -972,6 +1030,7 @@ int main()
         if (const std::string handler = platform::CheckFaultHandler(); !handler.empty())
             Log("launch: %s", handler.c_str());
         LogSync("launch: running the program");
+        g_loading_stage = 3;
         RunXbe();
         RecordResult("Ended by itself");
         WriteLogBundle({});

@@ -99,28 +99,49 @@ Xbox's addresses below it. The real console could (xbox-bench).
    kernel's I/O calls.
 4. **Drawing on the PS4's GPU** instead of the CPU, once games show what they need.
 
-## The PS4 library
+## The PS4 HOME menu
 
-The app opens on your collection: a carousel of covers (left and right move, up and down a page at
-a time, the chosen game raised with its facts underneath), a dock of the four places (Collection,
-Settings, Tools, About; L1/R1 move between them) and the buttons' hints in the corners, on a light
-mint background. The collection is the samples the app carries and your games in
-`/data/xbox-core/games` (a folder with `default.xbe` and its files, or a disc image `<name>.iso`).
-Each shows its own title, title ID and region (read from its XBE), its size, and when it last ran
-and how that ended. Cover art is yours to add: `cover.jpg`/`cover.png` in a game's folder,
-`<name>.jpg` beside an image, or `/data/xbox-core/covers/<title ID>.jpg`; without one a cover is
-drawn from the title. Settings has the log while a game starts, the picture's scaling and the
-library's order. Triangle on a game can make it start with the app; hold L1 while the
-app opens to get back to the library. The screen is drawn in software (`frontend/`, fonts: Inter,
-SIL OFL); `ui-preview` (desktop build) renders it to PNG files.
+The app opens on a HOME menu laid out as the Switch's: New Eden's (its `eden-ps4/src/ui`), made
+Midway's. Along the top are your icon and the time. Below that is a row of your games (the selected
+one framed, its name above it) ending in **All Software**. Under the row sit the round buttons:
+**News**, **Games and USB**, **Controllers**, **System Settings** and **Power**. The bottom line
+shows the buttons' hints. There are three themes: Basic Black, Basic White, and Retro (a pixel font
+and a starry night).
 
-**Tools.** *Copy games from USB to the hard drive* lists the disc images and game folders on USB
-drives (at a drive's top, or in `games/`, `xbox/` or `xbox-core/games/`) and copies the ones you pick
-into `/data/xbox-core/games`, one after another in the background, checking the free space first
-(Square cancels). *Write a diagnostics report* writes `/data/xbox-core/diagnostics.txt`, and
-`xbox-core-diagnostics.txt` on each USB drive: the app and console, the settings, every game's
-facts and last result, and the ends of the last session's log (`log-previous.txt`: the game you
-just ran) and the crash logs.
+The games are the samples the app carries, your games in `/data/xbox-core/games` (a folder with
+`default.xbe` and its files, or a disc image `<name>.iso`), and the games on USB drives (at a
+drive's top, or in `games/`, `xbox/` or `xbox-core/games/`). Each shows its own title, title ID
+and region (read from its XBE), its size, and when it last ran and how that ended.
+
+Cover art is yours to add: `cover.jpg`/`cover.png` in a game's folder, `<name>.jpg` beside an
+image, or `/data/xbox-core/covers/<title ID>.jpg`. A cover is made a square tile: the whole cover
+on a blurred copy of itself. Without one, a tile is drawn from the title.
+
+OPTIONS on a game opens its details and two choices:
+- **Copy to the PS4**, for a game on a USB drive. The copy runs in the background, with its
+  progress shown.
+- **Start at Launch**, for any other game. Hold L1 while the app opens to get the menu back.
+
+**Games and USB** says what was found. Square there copies every USB game that isn't on the PS4
+yet. Triangle writes every log to `xbox-core-logs.txt` on the drives.
+
+**System Settings** has the following:
+- the theme;
+- the GPU's emulation (xemu's or Midway's own);
+- the picture's scaling;
+- the loading log;
+- the sound effects (the APU's DSPs);
+- the title order.
+
+Your nickname and icon are on the User Page (the icon at the top left).
+
+When you choose a game, a loading screen shows its tile until its first picture, with the log's
+last lines under it. If it stops with an error, the whole log is shown instead.
+
+The screen is drawn in software (`frontend/home.cpp`, `frontend/ui/`). The fonts are Inter and
+Pixelify Sans, both under the SIL OFL; they are built into the program, and their licences are in
+the package's `licenses/`. `tools/ui-preview.sh` (after `build.sh host`) draws every screen to PNG
+files from a made-up library.
 
 ## Logs and diagnostics
 

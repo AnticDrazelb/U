@@ -50,7 +50,17 @@ add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/shaders/nv2a_frag_depth.h
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/nv2a.frag)
 list(APPEND SHADER_HEADERS ${CMAKE_BINARY_DIR}/shaders/nv2a_frag_depth.h)
 set_source_files_properties(src/gpu_vulkan.cpp PROPERTIES OBJECT_DEPENDS "${SHADER_HEADERS}")
-set(FRONTEND_SOURCES frontend/canvas.cpp frontend/library.cpp frontend/tools.cpp frontend/ui.cpp)
+# the front end: the library, its tools, and New Eden's HOME menu (frontend/ui: its fonts and the user
+# icons' art in the program, Inter and Pixelify Sans under the SIL OFL)
+set(FRONTEND_SOURCES frontend/library.cpp frontend/tools.cpp frontend/home.cpp frontend/ui/art.cpp frontend/ui/avatars.cpp
+    frontend/ui/canvas.cpp frontend/ui/fonts.cpp frontend/ui/home_menu.cpp frontend/ui/loading_screen.cpp)
+set_source_files_properties(${FRONTEND_SOURCES} PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/frontend"
+    COMPILE_DEFINITIONS "XB_UI_FONTS=\"${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/fonts\";XB_UI_ART=\"${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/art\"")
+set_property(SOURCE frontend/ui/fonts.cpp APPEND PROPERTY OBJECT_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/fonts/Inter-Regular.otf ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/fonts/Inter-SemiBold.otf
+    ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/fonts/PixelifySans-Regular.ttf ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/fonts/PixelifySans-SemiBold.ttf)
+set_property(SOURCE frontend/ui/avatars.cpp APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/art/avatars.png)
 if (PS4)
     add_executable(xbox-core ${CORE_SOURCES} ${FRONTEND_SOURCES} ps4/platform_ps4.cpp ps4/main_ps4.cpp)
     add_dependencies(xbox-core build_id)
@@ -76,6 +86,7 @@ if (PS4)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../switch-bench/src/ps4_stubs.cpp)
     target_sources(xbox-core PRIVATE ${RUNTIME_SOURCES} ${CMAKE_BINARY_DIR}/runtime/ps4_stubs.cpp)
     target_include_directories(xbox-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../port)
+    set_property(SOURCE ps4/main_ps4.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/frontend) # ui/...
     target_link_libraries(xbox-core PRIVATE SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet
         ${PS4_SYSROOT}/lib/libsmb2.a ${PS4_SYSROOT}/lib/libnfs.a)
     target_link_options(xbox-core PRIVATE --undefined=gethostbyname)
@@ -124,8 +135,10 @@ else()
     add_dependencies(xbox-core build_id)
     find_package(Threads REQUIRED)
     target_link_libraries(xbox-core PRIVATE Threads::Threads)
-    # the PS4 front end's screen, drawn to PNG files
+    # the PS4 front end's HOME menu, drawn to PNG files (tools/ui-preview.sh)
     add_executable(ui-preview ${FRONTEND_SOURCES} tools/ui-preview.cpp)
+    target_include_directories(ui-preview PRIVATE frontend)
+    target_link_libraries(ui-preview PRIVATE Threads::Threads)
 endif()
 target_include_directories(xbox-core PRIVATE src ${CMAKE_BINARY_DIR}/shaders)
 # xemu's code: its QEMU headers stood in for by shim/

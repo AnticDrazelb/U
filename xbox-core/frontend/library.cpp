@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <map>
@@ -265,6 +266,10 @@ std::vector<Game> ScanLibrary(const LibraryPaths& paths)
             const std::string name = e->d_name, full = dir + "/" + name;
             if (name[0] == '.')
                 continue;
+            // a drive's games folders are scanned themselves, not taken for a game holding a disc image
+            if (!usb.empty() && dir == usb &&
+                (name == "games" || name == "xbox" || name == "Xbox" || name == "xbox-core"))
+                continue;
             Game g;
             if (IsDiscImageName(name))
                 g = Describe(full, name.substr(0, name.find_last_of('.')), "", "Disc image", paths.covers);
@@ -365,18 +370,30 @@ bool Settings::Load(const std::string& file)
     FILE* f = std::fopen(file.c_str(), "r");
     if (!f)
         return false;
-    char key[64];
-    int value;
-    while (std::fscanf(f, "%63s %d", key, &value) == 2)
+    // "key value" lines; the value runs to the end of the line (a nickname can have spaces)
+    char line[256];
+    while (std::fgets(line, sizeof(line), f))
     {
-        if (!std::strcmp(key, "show_log")) show_log = value != 0;
-        else if (!std::strcmp(key, "picture")) picture = std::clamp(value, 0, 2);
-        else if (!std::strcmp(key, "sort")) sort = std::clamp(value, 0, 1);
+        std::string text = line;
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+            text.pop_back();
+        const size_t space = text.find(' ');
+        if (space == std::string::npos)
+            continue;
+        const std::string key = text.substr(0, space), word = text.substr(space + 1);
+        const int value = std::atoi(word.c_str());
+        if (key == "show_log") show_log = value != 0;
+        else if (key == "picture") picture = std::clamp(value, 0, 2);
+        else if (key == "sort") sort = std::clamp(value, 0, 1);
         // the GPU's emulation under its own key since xemu's renderer fits the PS4's GPU memory: a
         // choice made while it couldn't start ("nv2a", before) is asked again (it starts as xemu's,
         // and a start that dies in its start-up is followed by one with xbox-core's)
-        else if (!std::strcmp(key, "renderer")) nv2a = std::clamp(value, 0, 1);
-        else if (!std::strcmp(key, "dsp")) dsp = std::clamp(value, 0, 1);
+        else if (key == "renderer") nv2a = std::clamp(value, 0, 1);
+        else if (key == "dsp") dsp = std::clamp(value, 0, 1);
+        else if (key == "theme") theme = std::clamp(value, 0, 2);
+        else if (key == "nickname") nickname = word.substr(0, 40);
+        else if (key == "avatar") avatar = std::max(0, value);
+        else if (key == "avatar_color") avatar_color = std::max(0, value);
     }
     std::fclose(f);
     return true;
@@ -386,8 +403,10 @@ void Settings::Save(const std::string& file) const
 {
     if (FILE* f = std::fopen(file.c_str(), "w"))
     {
-        std::fprintf(f, "show_log %d\npicture %d\nsort %d\nrenderer %d\ndsp %d\n", show_log ? 1 : 0, picture, sort,
-                     nv2a, dsp);
+        std::fprintf(f, "show_log %d\npicture %d\nsort %d\nrenderer %d\ndsp %d\ntheme %d\navatar %d\navatar_color %d\n",
+                     show_log ? 1 : 0, picture, sort, nv2a, dsp, theme, avatar, avatar_color);
+        if (!nickname.empty())
+            std::fprintf(f, "nickname %s\n", nickname.c_str());
         std::fclose(f);
     }
 }

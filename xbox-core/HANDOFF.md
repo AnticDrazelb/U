@@ -47,7 +47,7 @@ capture everything.
 
 | what | where |
 |---|---|
-| the emulator | `xbox-core/` (`src/` core, `ps4/` PS4 main and platform, `frontend/` library UI, `tests/`) |
+| the emulator | `xbox-core/` (`src/` core, `ps4/` PS4 main and platform, `frontend/` library and HOME menu (New Eden's, `frontend/ui/`), `tests/`) |
 | build script | `xbox-core/build.sh host` (desktop, into `~/xc-host`) and `xbox-core/build.sh ps4` (`out/xbox-core.pkg`, build in `~/xc-ps4`) |
 | how it works | `xbox-core/README.md` (component table) |
 | PS4 toolchain setup | `docs/BUILDING.md` (OpenOrbis SDK at `/opt/pacbrew/ps4/openorbis`, sysroot in `~/cemups4-build`) |
@@ -386,7 +386,7 @@ call on every fault).
 
 ## 6. Things to know
 
-- `build.sh ps4` copies `frontend/assets` into the package. It also makes `stage/symbols.txt` with llvm-nm and Python, which the log bundle uses to name crash addresses.
+- `build.sh ps4` copies the HOME menu fonts' licences into the package's `licenses/` (the fonts and the user icons are built into the program with `.incbin`: `frontend/ui/fonts.cpp`, `avatars.cpp`). It also makes `stage/symbols.txt` with llvm-nm and Python, which the log bundle uses to name crash addresses.
 - The library scans the games folder `/data/xbox-core/games` and USB drives (`/mnt/usbN` or `/usbN`: their top level, `games/`, `xbox/`, `Xbox/`, `xbox-core/games/`). Images are recognised by content, so `.iso` and `.xiso` both work.
 - Hold L1 while the app opens to skip `autostart.txt`.
 - Raw-disk images live in `/data/xbox-core/hdd/` (`partition0.img`, `partitionN.img`), and the partitions' file systems are folders there (`e/`, `c/`, `x/`, `y/`, `z/`).
