@@ -194,6 +194,12 @@ void Report(double seconds)
             s.run_counts[k] += c, s.total += c;
         if ((got < 5 && share < 0.05) || std::strcmp(s.name, "profiler") == 0)
             continue; // idle, or the profiler itself: not worth a line
+        // how busy, from the samples: those not in a system library (where a waiting thread sits)
+        uint32_t own = 0;
+        for (auto& [k, c] : counts)
+            if ((k & kGuestTag) || (k & (1ull << 62)) || (k >= g_code_base && k - g_code_base < 0x40000000ull))
+                own += c;
+        const double busy = got ? double(own) / got : 0;
         std::vector<std::pair<uint32_t, uint64_t>> top;
         for (auto& [k, c] : counts)
             top.push_back({c, k});
@@ -206,9 +212,9 @@ void Report(double seconds)
             line += b + Describe(top[k].second);
         }
         if (share >= 0)
-            Log("profile: %s: CPU %.0f%%, %u samples: %s", s.name, 100 * share, got, line.c_str());
+            Log("profile: %s: CPU %.0f%%, busy %.0f%% (%u samples): %s", s.name, 100 * share, 100 * busy, got, line.c_str());
         else
-            Log("profile: %s: %u samples: %s", s.name, got, line.c_str());
+            Log("profile: %s: busy %.0f%% (%u samples): %s", s.name, 100 * busy, got, line.c_str());
     }
     // the whole run so far, per thread: the top 40
     if (g_out.empty())

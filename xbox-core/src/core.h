@@ -106,7 +106,17 @@ u32 AllocContiguous(u32 size, u32 alignment, u32 lowest, u32 highest);
 // The contiguous memory's dirty log (dirty.cpp): which pages were written since a reader (xemu's
 // renderer) last looked, from write faults on the pages it has looked at.
 bool DirtyLogOn();
-bool DirtyFault(u64 address);                  // the fault handler's: a write to a page the log protects
+// the fault handler's: a write to a page the log protects, or any access to a held page (a surface on
+// the GPU): 0 not the log's, 1 handled (made again on return), 2 a held page guest code touched,
+// for FaultResumed (can_defer: the fault goes there) to resolve with DirtyResolveHeld
+int DirtyFault(u64 address, bool can_defer);
+bool DirtyHeld(u64 address);
+void DirtyNoteRelease(u64 rip); // (the handler's: where the emulator touched a held page)
+void DirtyResolveHeld(u64 address);
+bool LazySurfaces();
+void SetLazySurfaces(bool on);
+void DirtyHoldForTest(u32 address);
+void PrepareGuestRead(u32 address, u32 size);  // before a system call reads the guest's memory
 void PrepareGuestWrite(u32 address, u32 size); // before a system call writes the guest's memory
 std::string DirtyLogStats();                   // for the stats line (and counts since the last call)
 void StartDirtyLog();

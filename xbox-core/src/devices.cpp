@@ -609,6 +609,10 @@ void TakePicture(u64 writebacks)
             return;
     }
     last_writebacks = writebacks;
+    static const bool debug = std::getenv("XB_DEBUG_HOLDS") != nullptr;
+    static int logged = 0;
+    if (debug && logged++ < 20)
+        Log("picture: copied from %#x, %#zx bytes (write-backs %llu)", info.address, bytes, (unsigned long long)writebacks);
     auto copy = std::make_shared<std::vector<u8>>(bytes);
     std::memcpy(copy->data(), Ptr<const u8>(info.address), bytes);
     std::lock_guard lock(g_picture_mutex);

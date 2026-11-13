@@ -761,6 +761,7 @@ void RegisterFileExports(RegisterFn reg)
             return STATUS_ACCESS_DENIED;
         if (!f || f->fd < 0)
             return STATUS_INVALID_HANDLE;
+        PrepareGuestRead(c.Arg(5), c.Arg(6)); // (the writes below are system calls reading the guest's memory)
         ssize_t n;
         if (f->raw >= 0)
         {
@@ -1040,6 +1041,8 @@ void RegisterFileExports(RegisterFn reg)
             const u32 page = Read<u32>(c.Arg(5) + i * 4), n = std::min<u32>(4096, c.Arg(6) - done);
             if (!write)
                 PrepareGuestWrite(page, n);
+            else
+                PrepareGuestRead(page, n);
             ssize_t got;
             if (f->iso)
                 got = ssize_t(IsoRead(*f->iso, u64(at), n, Ptr(page)));

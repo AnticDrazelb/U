@@ -13,10 +13,24 @@
 // (every page stays read-write to it), so a write fault in this memory can only be the log's.
 //
 // Off (xemu's hashing instead) where the self-test in the CPU's start-up didn't pass.
+//
+// Held pages (xemu's CPU access callbacks, which its translator gave it): a surface drawn on the GPU
+// and not written back to RAM yet has its pages made inaccessible instead of written back at once
+// (which cost xemu's renderer half its time on the PS4: ten whole surfaces a frame, each waiting
+// for the GPU). Guest code touching one faults; outside the signal handler (FaultResumed) the
+// surfaces there are written back (the renderer's own callback) and the access is made again. The
+// emulator's own access (the presenter, a device) releases the page without a write-back, as
+// xemu's devices read RAM on a PC. Off (every surface written back as its drawing ends, as
+// before) unless the self-test's two steps pass; XB_EAGER_SURFACES=1 keeps it off.
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cstdio>
+#include <map>
 #include <memory>
+#include <vector>
 
 #include "core.h"
 #include "platform.h"
@@ -32,7 +46,15 @@ u32 g_pages = 0;
 std::unique_ptr<std::atomic<u32>[]> g_written;
 std::unique_ptr<std::atomic<u8>[]> g_protected;
 std::unique_ptr<std::atomic_flag[]> g_lock;
-std::atomic<u64> g_faults{0}, g_protects{0};
+std::unique_ptr<std::atomic<u8>[]> g_held; // no access until written back (a surface on the GPU)
+std::atomic<bool> g_holds{false};
+std::atomic<u64> g_faults{0}, g_protects{0}, g_held_pages{0}, g_hold_released{0}, g_hold_resolved{0};
+void (*g_surface_access)(uint64_t offset, uint64_t size) = nullptr; // xemu's renderer's (surface.c)
+// where the emulator's own code touched held pages (rip), the latest 256: the stats name the most
+constexpr u32 kReleaseRing = 256;
+std::atomic<u64> g_release_rip[kReleaseRing];
+std::atomic<u32> g_release_next{0};
+
 
 struct PageLock
 {
@@ -64,13 +86,31 @@ bool DirtyLogOn() { return g_on.load(std::memory_order_relaxed); }
 
 // From the fault handler (any thread, guest or emulator code): a write to a page the log protects.
 // The page is marked written for every reader and made writable; the write is made again on return.
-bool DirtyFault(u64 address)
+void DirtyNoteRelease(u64 rip)
+{
+    g_release_rip[g_release_next.fetch_add(1, std::memory_order_relaxed) % kReleaseRing].store(rip, std::memory_order_relaxed);
+}
+
+int DirtyFault(u64 address, bool can_defer)
 {
     if (!g_on.load(std::memory_order_relaxed) || address < kContiguousBase ||
         address >= u64(kContiguousBase) + kContiguousSize)
-        return false;
+        return 0;
     const u32 p = u32((address - kContiguousBase) / g_page);
     PageLock lock(p);
+    if (g_held[p].load(std::memory_order_relaxed))
+    {
+        // a held page: guest code's access waits for the surfaces' write-back (outside the handler:
+        // DirtyResolveHeld); the emulator's own releases it as it is (read-only: a write faults
+        // again and is marked as any write is)
+        if (can_defer)
+            return 2;
+        g_held[p].store(0, std::memory_order_relaxed);
+        g_protected[p].store(1, std::memory_order_relaxed);
+        platform::Protect(PageAddress(p), g_page, platform::Read);
+        g_hold_released.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
     g_written[p].store(~0u, std::memory_order_release);
     if (g_protected[p].load(std::memory_order_relaxed))
     {
@@ -78,7 +118,79 @@ bool DirtyFault(u64 address)
         g_protected[p].store(0, std::memory_order_release);
     }
     g_faults.fetch_add(1, std::memory_order_relaxed);
-    return true; // (a page another thread made writable already: the write just goes again)
+    return 1; // (a page another thread made writable already: the write just goes again)
+}
+
+bool DirtyHeld(u64 address)
+{
+    if (!g_held || !g_on.load(std::memory_order_relaxed) || address < kContiguousBase ||
+        address >= u64(kContiguousBase) + kContiguousSize)
+        return false;
+    return g_held[u32((address - kContiguousBase) / g_page)].load(std::memory_order_acquire) != 0;
+}
+
+// Guest code's access to a held page, outside the signal handler: the surfaces drawn there written
+// back (xemu's renderer waits for its GPU), then the page released if that didn't already
+void DirtyResolveHeld(u64 address)
+{
+    const u32 p = u32((address - kContiguousBase) / g_page);
+    if (g_surface_access)
+        g_surface_access(u64(p) * g_page, g_page);
+    PageLock lock(p);
+    if (g_held[p].exchange(0, std::memory_order_acq_rel))
+    {
+        g_protected[p].store(1, std::memory_order_relaxed);
+        platform::Protect(PageAddress(p), g_page, platform::Read);
+    }
+    g_hold_resolved.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool LazySurfaces() { return g_holds.load(std::memory_order_relaxed) && g_on.load(std::memory_order_relaxed); }
+void SetLazySurfaces(bool on) { g_holds = on && g_on.load() && !std::getenv("XB_EAGER_SURFACES"); }
+
+// for the self-test: a page held as a surface's are
+void DirtyHoldForTest(u32 address)
+{
+    const u32 p = (address - kContiguousBase) / g_page;
+    PageLock lock(p);
+    g_held[p].store(1);
+    platform::Protect(PageAddress(p), g_page, 0);
+}
+
+// Held pages in [first, end) written back (the surfaces drawn there) and released: before a system
+// call reads or writes them (it would fail on them), or the emulator's code rewrites them (a later
+// write-back of the surface would otherwise land over what it wrote). Not from xemu's renderer
+// thread (it would wait for itself): the guest's threads, in kernel calls.
+static void ResolveRange(u32 first, u32 end)
+{
+    if (!g_holds.load(std::memory_order_relaxed))
+        return;
+    bool any = false;
+    for (u32 p = first; p < end && !any; p++)
+        any = g_held[p].load(std::memory_order_acquire) != 0;
+    if (!any)
+        return;
+    if (g_surface_access)
+        g_surface_access(u64(first) * g_page, u64(end - first) * g_page);
+    for (u32 p = first; p < end; p++)
+    {
+        PageLock lock(p);
+        if (g_held[p].exchange(0, std::memory_order_acq_rel))
+        {
+            g_protected[p].store(1, std::memory_order_relaxed);
+            platform::Protect(PageAddress(p), g_page, platform::Read);
+        }
+    }
+    g_hold_resolved.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Before a system call reads the guest's memory (a file written from it)
+void PrepareGuestRead(u32 address, u32 size)
+{
+    u32 first, end;
+    if (g_on.load(std::memory_order_relaxed) && address >= kContiguousBase &&
+        Pages(address - kContiguousBase, size, first, end))
+        ResolveRange(first, end);
 }
 
 // Before something that writes the guest's memory without faulting (a system call): its pages
@@ -89,11 +201,13 @@ void PrepareGuestWrite(u32 address, u32 size)
     if (!g_on.load(std::memory_order_relaxed) || address < kContiguousBase ||
         !Pages(address - kContiguousBase, size, first, end))
         return;
+    ResolveRange(first, end);
     for (u32 p = first; p < end; p++)
     {
         PageLock lock(p);
         g_written[p].store(~0u, std::memory_order_release);
-        if (g_protected[p].load(std::memory_order_relaxed))
+        const bool held = g_held[p].exchange(0, std::memory_order_relaxed);
+        if (g_protected[p].load(std::memory_order_relaxed) || held)
         {
             platform::Protect(PageAddress(p), g_page, platform::Read | platform::Write);
             g_protected[p].store(0, std::memory_order_release);
@@ -105,8 +219,45 @@ std::string DirtyLogStats()
 {
     if (!g_on)
         return "off (xemu's hashing)";
-    return std::to_string(g_faults.exchange(0)) + " write faults, " + std::to_string(g_protects.exchange(0)) +
-           " pages protected again";
+    std::string s = std::to_string(g_faults.exchange(0)) + " write faults, " + std::to_string(g_protects.exchange(0)) +
+                    " pages protected again";
+    if (g_holds)
+    {
+        const u64 released = g_hold_released.exchange(0);
+        s += "; surfaces held on the GPU: " + std::to_string(g_held_pages.exchange(0)) + " pages held, " +
+             std::to_string(g_hold_resolved.exchange(0)) + " written back on the game's access, " +
+             std::to_string(released) + " released by the emulator";
+        if (released)
+        {
+            // where (the most frequent of the latest 256; elf: the app's code, named in the log bundle)
+            std::map<u64, u32> counts;
+            for (u32 i = 0; i < kReleaseRing; i++)
+                if (const u64 r = g_release_rip[i].exchange(0, std::memory_order_relaxed))
+                    counts[r]++;
+            std::vector<std::pair<u32, u64>> top;
+            for (auto& [r, c] : counts)
+                top.push_back({c, r});
+            std::sort(top.rbegin(), top.rend());
+            const u64 base = platform::CodeBase();
+            for (size_t i = 0; i < top.size() && i < 3; i++)
+            {
+                char b[160];
+                const u64 r = top[i].second;
+                const std::string module = r >= base && r - base < 0x40000000ull ? "" : platform::ModuleName(r);
+                if (module.empty())
+                    std::snprintf(b, sizeof(b), "%s%u at elf 0x%llx", i ? ", " : " (", top[i].first,
+                                  (unsigned long long)(r - base));
+                else
+                    std::snprintf(b, sizeof(b), "%s%u in %s at %#llx", i ? ", " : " (", top[i].first, module.c_str(),
+                                  (unsigned long long)r);
+                s += b;
+            }
+            s += ")";
+        }
+    }
+    else
+        s += "; surfaces written back as their drawing ends";
+    return s;
 }
 
 // The start-up's: the page size, and the log on
@@ -117,10 +268,12 @@ void StartDirtyLog()
     g_written.reset(new std::atomic<u32>[g_pages]);
     g_protected.reset(new std::atomic<u8>[g_pages]);
     g_lock.reset(new std::atomic_flag[g_pages]);
+    g_held.reset(new std::atomic<u8>[g_pages]);
     for (u32 p = 0; p < g_pages; p++)
     {
         g_written[p].store(~0u); // all written before anyone has looked
         g_protected[p].store(0);
+        g_held[p].store(0);
         g_lock[p].clear();
     }
     g_on = true;
@@ -129,10 +282,11 @@ void StartDirtyLog()
 void StopDirtyLog()
 {
     g_on = false;
+    g_holds = false;
     if (!g_pages)
         return;
     for (u32 p = 0; p < g_pages; p++)
-        if (g_protected[p].exchange(0))
+        if ((g_protected[p].exchange(0) | g_held[p].exchange(0)) != 0)
             platform::Protect(PageAddress(p), g_page, platform::Read | platform::Write);
 }
 
@@ -178,8 +332,9 @@ bool xb_dirty_test_and_clear(uint64_t offset, uint64_t size, unsigned reader)
             PageLock lock(p);
             if (!g_protected[p].load(std::memory_order_relaxed))
             {
-                platform::Protect(PageAddress(p), g_page, platform::Read);
                 g_protected[p].store(1, std::memory_order_release);
+                if (!g_held[p].load(std::memory_order_relaxed)) // (a held page stays inaccessible)
+                    platform::Protect(PageAddress(p), g_page, platform::Read);
                 g_protects.fetch_add(1, std::memory_order_relaxed);
             }
             written |= (g_written[p].fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
@@ -209,6 +364,7 @@ static void SetRange(u32 first, u32 end, bool protect)
     for (u32 p = first; p < end; p++)
     {
         g_protected[p].store(protect ? 1 : 0, std::memory_order_release);
+        g_held[p].store(0, std::memory_order_release);
         g_lock[p].clear(std::memory_order_release);
     }
     if (protect)
@@ -231,4 +387,32 @@ void xb_dirty_protect(uint64_t offset, uint64_t size)
     if (g_on.load(std::memory_order_relaxed) && Pages(offset, size, first, end))
         SetRange(first, end, true);
 }
+
+// xemu's renderer: a surface drawn and left on the GPU (not written back): its pages held, so that
+// guest code touching them gets the write-back first (DirtyFault, DirtyResolveHeld)
+bool xb_lazy_surfaces(void) { return LazySurfaces(); }
+
+void xb_dirty_hold(uint64_t offset, uint64_t size)
+{
+    u32 first, end;
+    if (!LazySurfaces() || !Pages(offset, size, first, end))
+        return;
+    static const bool debug = std::getenv("XB_DEBUG_HOLDS") != nullptr;
+    static std::atomic<int> logged{0};
+    if (debug && logged++ < 40)
+        Log("hold: %#llx, %#llx bytes", (unsigned long long)offset, (unsigned long long)size);
+    for (u32 p = first; p < end; p++)
+        while (g_lock[p].test_and_set(std::memory_order_acquire))
+            __builtin_ia32_pause();
+    platform::Protect(PageAddress(first), (end - first) * g_page, 0);
+    for (u32 p = first; p < end; p++)
+    {
+        if (!g_held[p].exchange(1, std::memory_order_acq_rel))
+            g_held_pages.fetch_add(1, std::memory_order_relaxed);
+        g_lock[p].clear(std::memory_order_release);
+    }
+}
+
+// the renderer's callback for guest code's access to held pages (offset, size within the memory)
+void xb_set_surface_access_hook(void (*hook)(uint64_t offset, uint64_t size)) { g_surface_access = hook; }
 }

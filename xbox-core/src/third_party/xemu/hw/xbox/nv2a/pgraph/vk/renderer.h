@@ -30,6 +30,11 @@ void xb_nv2a_picture_ready(uint64_t writebacks);
 /* xbox-core: the contiguous memory's dirty log (dirty.cpp): a range the renderer writes itself */
 void xb_dirty_unprotect(uint64_t offset, uint64_t size);
 void xb_dirty_protect(uint64_t offset, uint64_t size);
+#include <stdbool.h>
+/* xbox-core (dirty.cpp): surfaces left on the GPU, their pages held until something reads them */
+bool xb_lazy_surfaces(void);
+void xb_dirty_hold(uint64_t offset, uint64_t size);
+void xb_set_surface_access_hook(void (*hook)(uint64_t offset, uint64_t size));
 struct NV2AState;
 void pgraph_vk_xb_request_display_download(struct NV2AState *d, uint32_t addr);
 #include "qemu/osdep.h"

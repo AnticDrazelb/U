@@ -294,6 +294,8 @@ void xb_nv2a_renderer_started(bool ok)
 
 void xb_nv2a_step(const char *step); /* xbox-core: the start-up's step file (nv2a.cpp) */
 void pgraph_vk_xb_request_display_download(NV2AState *d, uint32_t addr); /* (vk/renderer.c) */
+bool xb_lazy_surfaces(void); /* (dirty.cpp) */
+static inline bool xb_lazy_surfaces_c(void) { return xb_lazy_surfaces(); }
 
 /* xbox-core: the renderer thread's work, counted (xb_profile.h) */
 uint64_t xb_prof_n[XB_PROF_COUNT], xb_prof_ns[XB_PROF_COUNT];
@@ -465,7 +467,8 @@ void xb_nv2a_vblank(void)
     }
     qemu_mutex_lock(&d->pfifo.lock);
     if (d->pgraph.renderer && d->pgraph.renderer->ops.pre_savevm_trigger) {
-        if (++vblanks % (unsigned)all_every == 0) {
+        /* (surfaces held on the GPU are written back when something reads them: no sweep) */
+        if (++vblanks % (unsigned)all_every == 0 && !xb_lazy_surfaces_c()) {
             d->pgraph.renderer->ops.pre_savevm_trigger(d);
         } else {
             pgraph_vk_xb_request_display_download(d, (uint32_t)d->pcrtc.start);

@@ -951,12 +951,23 @@ bool DeliverException(platform::Fault& f, Regs& r, GuestThread* t)
 }
 
 std::atomic<bool> g_fault_log{false}; // the first faults logged and synced from the handler (the self-test's step)
+u64 g_code_base = 0;                  // platform::CodeBase(), read at start-up (not in the handler)
 
 // A fault in guest code, handled: 0 when the guest resumes (*f.rip and the registers updated), 1
 // when it can't (the call into it bails). Outside the signal handler (FaultResumed), except for the
 // rare fault OnFault can't send there.
 int HandleGuestFault(platform::Fault& f)
 {
+    // a held page (a surface on the GPU, dirty.cpp): its write-back, then the access made again
+    // (the contiguous memory is always the guest's to use: a fault there is the log's; if another
+    // thread released the page meanwhile, the access just goes again)
+    if ((f.signal == SIGSEGV || f.signal == SIGBUS) && DirtyLogOn() && f.address >= kContiguousBase &&
+        f.address - kContiguousBase < kContiguousSize)
+    {
+        if (DirtyHeld(f.address))
+            DirtyResolveHeld(f.address);
+        return 0;
+    }
     const u64 rip = *f.rip;
     const bool guest_fs = f.fs_base && f.fs_base < 0x100000000ull;
     Regs r{f};
@@ -1177,8 +1188,26 @@ bool OnFault(platform::Fault& f)
     }
     // a write to a page the dirty log protects (dirty.cpp), the guest's or the emulator's own: marked,
     // made writable, and made again on return
-    if ((f.signal == SIGSEGV || f.signal == SIGBUS) && DirtyFault(f.address))
-        return true;
+    if (f.signal == SIGSEGV || f.signal == SIGBUS)
+    {
+        // guest code whose fault goes on to FaultResumed (outside the handler) can wait there for a
+        // held page's write-back
+        const u32 at = u32(*f.rip);
+        const bool can_defer = f.cs == g_sel32 && f.fs_base && f.fs_base < 0x100000000ull &&
+                               !(at >= g_switch && at < g_switch + u32(xcs_end - xcs_begin));
+        if (!can_defer && DirtyHeld(f.address))
+        {
+            // where: the app's code, or for a library function (memcpy) its caller's return address
+            // at the top of the stack (a leaf: nothing pushed)
+            u64 where = *f.rip;
+            const u64 base = g_code_base; // (cached: dladdr in the handler would be fs-relative)
+            if ((where < base || where - base >= 0x40000000ull) && f.cs != g_sel32)
+                where = *reinterpret_cast<const u64*>(*f.gpr[4]);
+            DirtyNoteRelease(where);
+        }
+        if (DirtyFault(f.address, can_defer) == 1)
+            return true;
+    }
     if (f.cs != g_sel32)
     {
         platform::Trail(4, 0, *f.rip, f.fs_base, f.address);
@@ -1378,6 +1407,7 @@ void ReportFaultTrail(const std::string& path)
 
 void InitCpu()
 {
+    g_code_base = platform::CodeBase();
     Log("cpu: looking up the platform's functions");
     const std::string problem = platform::Init();
     if (!problem.empty())
@@ -1566,7 +1596,36 @@ void InitCpu()
             platform::Trail(9, step_number);
         } else
             dirty_log = false;
-        Write<u32>(page, 0), Write<u32>(page + 4, 0);
+        // held pages (a surface left on the GPU): any access faults; the emulator's releases the page,
+        // guest code's is resolved outside the handler (the surfaces' write-back) and made again
+        bool held = false;
+        const bool eager = std::getenv("XB_EAGER_SURFACES") != nullptr; // (every surface written back at once)
+        if (dirty_log && !eager && step("held page", "a read by the emulator of a page held for a surface"))
+        {
+            Write<u32>(page + 8, 0x0badcafe);
+            SetLazySurfaces(true);
+            DirtyHoldForTest(page);
+            const u32 v = *reinterpret_cast<volatile u32*>(Ptr<u32>(page + 8));
+            held = v == 0x0badcafe && !DirtyHeld(page);
+            Log("cpu self-test: the emulator's read of a held page %s", held ? "released it and read right" : "went wrong");
+            platform::Trail(9, step_number);
+        }
+        if (held && step("held page guest", "a read by guest code of a page held for a surface"))
+        {
+            DirtyHoldForTest(page);
+            // mov eax, [page + 8]; ret
+            u8 load[] = {0xa1, 0, 0, 0, 0, 0xc3};
+            const u32 at = page + 8;
+            std::memcpy(load + 1, &at, 4);
+            std::memcpy(Ptr(code), load, sizeof(load));
+            const u32 got = u32(CallGuest(t, code, {}));
+            held = got == 0x0badcafe && !DirtyHeld(page);
+            Log("cpu self-test: guest code's read of a held page %s", held ? "waited for it and read right" : "went wrong");
+            platform::Trail(9, step_number);
+        } else
+            held = false;
+        SetLazySurfaces(held);
+        Write<u32>(page, 0), Write<u32>(page + 4, 0), Write<u32>(page + 8, 0);
     }
     if (!dirty_log)
         StopDirtyLog();
@@ -1581,8 +1640,9 @@ void InitCpu()
             std::fclose(f);
         }
     }
-    LogSync("cpu self-test: done (fault logging %s, bigger signal stacks %s, the dirty log %s)",
-            g_fault_log ? "on" : "off", big_stacks ? "on" : "off", dirty_log ? "on" : "off (xemu's hashing)");
+    LogSync("cpu self-test: done (fault logging %s, bigger signal stacks %s, the dirty log %s, surfaces %s)",
+            g_fault_log ? "on" : "off", big_stacks ? "on" : "off", dirty_log ? "on" : "off (xemu's hashing)",
+            LazySurfaces() ? "held on the GPU until something reads them" : "written back as their drawing ends");
 }
 
 u16 GuestCodeSelector() { return g_sel32; }

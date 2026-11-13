@@ -616,6 +616,10 @@ std::string ModuleName(uint64_t address)
 
 uint64_t ThreadCpuNs(uint64_t host_thread)
 {
+    // (the console's pthread_getcpuclockid gives every thread the same figure: not a thread's own
+    // time; the profiler's "busy" share from its samples instead)
+    if (host_thread != reinterpret_cast<uint64_t>(pthread_self()))
+        return 0;
     clockid_t clock;
     timespec t{};
     if (pthread_getcpuclockid(reinterpret_cast<pthread_t>(host_thread), &clock) != 0 || clock_gettime(clock, &t) != 0)

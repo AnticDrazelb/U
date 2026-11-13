@@ -1616,9 +1616,18 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 
     if (!upload && pg_surface->draw_dirty) {
         if (!tcg_enabled()) {
-            // FIXME: Cannot monitor for reads/writes; flush now
-            download_surface(d, color ? r->color_binding : r->zeta_binding,
-                             true);
+            SurfaceBinding *xb_s = color ? r->color_binding : r->zeta_binding;
+            if (xb_lazy_surfaces() && xb_s && !xb_s->draw_dirty) {
+                /* (already written back, by a vblank's or a reader's write-back: nothing to hold) */
+            } else if (xb_lazy_surfaces() && xb_s && xb_s->width && xb_s->height) {
+                /* xbox-core: left on the GPU (its draw_dirty stays set), its pages held: guest code
+                 * touching them gets the write-back first (surface_access_callback, through the
+                 * fault handler), as xemu's CPU access callbacks do under TCG */
+                xb_dirty_hold(xb_s->vram_addr, xb_s->pitch * xb_s->height);
+            } else {
+                // FIXME: Cannot monitor for reads/writes; flush now
+                download_surface(d, xb_s, true);
+            }
         }
 
         pg_surface->write_enabled_cache = false;
@@ -1743,8 +1752,20 @@ static bool check_surface_internal_formats_supported(
     return all_supported;
 }
 
+/* xbox-core: guest code touched held pages (dirty.cpp, from the fault path outside the signal
+ * handler): the surfaces drawn there written back, as xemu's CPU access callback does */
+static void xb_surface_access(uint64_t offset, uint64_t size)
+{
+    NV2AState *d = g_nv2a;
+    if (!d || !d->pgraph.vk_renderer_state) {
+        return;
+    }
+    surface_access_callback(d, d->vram, offset, size, false);
+}
+
 void pgraph_vk_init_surfaces(PGRAPHState *pg)
 {
+    xb_set_surface_access_hook(xb_surface_access);
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     // Check if the device supports preferred VK_FORMAT_D24_UNORM_S8_UINT

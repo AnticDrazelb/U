@@ -144,6 +144,8 @@ static void pgraph_vk_sync(NV2AState *d)
     qemu_event_set(&d->pgraph.sync_complete);
 }
 
+uint32_t xb_nv2a_display_start(void); /* (nv2a.c) */
+
 static void pgraph_vk_process_pending(NV2AState *d)
 {
     PGRAPHVkState *r = d->pgraph.vk_renderer_state;
@@ -169,8 +171,14 @@ static void pgraph_vk_process_pending(NV2AState *d)
             /* xbox-core: the surface the display starts in, alone (the one being drawn, the depth
              * buffer and the rest stay on the GPU: no write-back of a frame half drawn) */
             qatomic_set(&r->xb_display_download_pending, false);
-            pgraph_vk_download_surfaces_in_range_if_dirty(
-                &d->pgraph, qatomic_read(&r->xb_display_download_addr), 1);
+            const uint32_t xb_asked = qatomic_read(&r->xb_display_download_addr);
+            pgraph_vk_download_surfaces_in_range_if_dirty(&d->pgraph, xb_asked, 1);
+            /* ... and the one shown now, if the game flipped since the vblank asked: the picture is
+             * copied from it next (held on the GPU, it would be read as RAM had it: a stale frame) */
+            const uint32_t xb_now = xb_nv2a_display_start();
+            if (xb_now != xb_asked) {
+                pgraph_vk_download_surfaces_in_range_if_dirty(&d->pgraph, xb_now, 1);
+            }
             xb_nv2a_picture_ready(__atomic_load_n(&xb_surface_writebacks, __ATOMIC_RELAXED));
         }
         if (qatomic_read(&d->pgraph.sync_pending)) {
@@ -182,7 +190,9 @@ static void pgraph_vk_process_pending(NV2AState *d)
         if (qatomic_read(&d->pgraph.xb_idle_sync_pending)) {
             /* xbox-core: the work so far done (reports written), the surfaces drawn in RAM */
             pgraph_vk_finish(&d->pgraph, VK_FINISH_REASON_STALLED);
-            pgraph_vk_download_dirty_surfaces(d);
+            if (!xb_lazy_surfaces()) { /* (held surfaces are written back when something reads them) */
+                pgraph_vk_download_dirty_surfaces(d);
+            }
             qatomic_set(&d->pgraph.xb_idle_sync_pending, false);
             qemu_event_set(&d->pgraph.xb_idle_sync_complete);
         }
