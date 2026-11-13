@@ -544,7 +544,7 @@ std::string Menu(const std::vector<Entry>& xbes)
 // The HOME menu (frontend/home.h): its screen 30 times a second, the pad's buttons (the left stick
 // steers too), until a game is chosen. Closing it from Power ends the app.
 std::vector<std::string> UsbDrives();
-std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games);
+std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games, bool drives_only = false);
 
 std::string Library(const std::vector<std::string>& system)
 {
@@ -803,7 +803,7 @@ std::vector<std::string> UsbDrives()
 // each package (where it is linked, RADV in it or not) its own trail, so they can't overwrite each other's
 const char* const kFaultTrail = "/data/xbox-core/fault-trail-" XB_VARIANT ".bin";
 std::vector<std::string> g_system; // the report's first lines: the app and the console
-std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games)
+std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games, bool drives_only)
 {
     fe::DiagnosticsInput d;
     d.system = g_system;
@@ -813,7 +813,9 @@ std::vector<std::string> WriteLogBundle(const std::vector<fe::Game>& games)
     d.data_dir = kDataDir;
     d.all_logs = true; // every log in the data folder, code addresses named
     d.symbols = "/app0/symbols.txt";
-    std::vector<std::string> outputs{"/data/xbox-core/diagnostics.txt"};
+    std::vector<std::string> outputs;
+    if (!drives_only || d.usb_roots.empty())
+        outputs.push_back("/data/xbox-core/diagnostics.txt");
     for (const std::string& drive : d.usb_roots)
         outputs.push_back(drive + "/xbox-core-logs.txt");
     const std::vector<std::string> written = fe::WriteDiagnostics(d, outputs);
@@ -1005,16 +1007,17 @@ int main()
         if (!LoadGame(xbe, error))
             Fatal("%s: %s", xbe.c_str(), error.c_str());
         diag::StartMonitor("/data/xbox-core/hang.log", ps4_dump_thread_stacks, [] { WriteLogBundle({}); });
-        // the logs onto the USB drives every minute while it runs: a console that freezes hard
+        // the logs onto the USB drives every 5 minutes while it runs: a console that freezes hard
         // (nothing runs to write them), or an app closed from the home screen, still leaves them.
-        // (Every 15 s, the bundle's tens of MiB read, named and written twice were a stutter; the
-        // live log streams to the drive line by line meanwhile, and a crash, a hang or the program's
-        // end writes it at once.)
+        // Only to the drives: the bundle is tens of MiB, and the PS4's own disk is where the game's
+        // disc image and its sound and levels are read from. (Every 15 s, then every minute, it was a
+        // stutter; the live log streams to the drive line by line meanwhile, and a crash, a hang or
+        // the program's end writes the bundle at once.)
         std::thread([] {
             for (;;)
             {
-                std::this_thread::sleep_for(std::chrono::seconds(60));
-                WriteLogBundle({});
+                std::this_thread::sleep_for(std::chrono::minutes(5));
+                WriteLogBundle({}, true);
             }
         }).detach();
         LogSync("launch: kernel imports");

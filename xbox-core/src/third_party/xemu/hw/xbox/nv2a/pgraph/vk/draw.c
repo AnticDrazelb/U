@@ -22,6 +22,8 @@
 #include "renderer.h"
 #include "hw/xbox/nv2a/xb_profile.h"
 #include <math.h>
+#include <pthread.h>
+#include <unistd.h>
 
 void pgraph_vk_draw_begin(NV2AState *d)
 {
@@ -124,10 +126,16 @@ static bool pipeline_cache_entry_compare(Lru *lru, LruNode *node,
 
 /* xbox-core: the driver's pipeline cache kept on the disk (beside the shaders: glsl.c), so that a
  * pipeline made once isn't compiled again in the next run; the driver checks the data is its own.
- * Saved from the renderer's thread at most every 30 s while new pipelines are made (the app is
- * usually closed by being killed: nothing at its end is sure to run). */
+ * Saved while new pipelines are made, at most every 60 s, and only when the driver's cache has
+ * grown (a run that makes again the pipelines a run before saved adds nothing to it: before, all of
+ * it was written again every 30 s). The data is taken on the renderer's thread; the file is written
+ * on a thread of its own (tens of MiB after a long game: on the renderer's thread, a hitch in the
+ * picture and the sound each time). The app is usually closed by being killed: nothing at its end
+ * is sure to run. */
 const char *xb_shader_cache_dir(void);
 static uint64_t xb_pipelines_saved_at, xb_pipelines_unsaved;
+static size_t xb_pipelines_saved_size;
+static int xb_pipelines_writing; /* a write in progress (atomic) */
 
 static void xb_pipeline_cache_path(char *path, size_t size)
 {
@@ -139,38 +147,91 @@ static void xb_pipeline_cache_path(char *path, size_t size)
     }
 }
 
-static void xb_pipeline_cache_save(PGRAPHVkState *r)
+typedef struct XbPipelineWrite {
+    char path[512];
+    void *data;
+    size_t size;
+} XbPipelineWrite;
+
+static void xb_pipeline_cache_write(XbPipelineWrite *w)
 {
-    char path[512], part[520];
-    xb_pipeline_cache_path(path, sizeof(path));
-    size_t size = 0;
-    if (!path[0] || vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, NULL) != VK_SUCCESS ||
-        !size) {
-        return;
-    }
-    void *data = malloc(size);
-    if (data && vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, data) == VK_SUCCESS) {
-        snprintf(part, sizeof(part), "%s.part", path);
-        FILE *f = fopen(part, "wb");
-        if (f) {
-            const bool ok = fwrite(data, 1, size, f) == size;
-            if (fclose(f) == 0 && ok) {
-                rename(part, path);
-            } else {
-                remove(part);
-            }
+    char part[520];
+    snprintf(part, sizeof(part), "%s.part", w->path);
+    FILE *f = fopen(part, "wb");
+    if (f) {
+        const bool ok = fwrite(w->data, 1, w->size, f) == w->size;
+        if (fclose(f) == 0 && ok) {
+            rename(part, w->path);
+        } else {
+            remove(part);
         }
     }
-    free(data);
+    free(w->data);
+    free(w);
+}
+
+static void *xb_pipeline_cache_writer(void *arg)
+{
+    xb_pipeline_cache_write((XbPipelineWrite *)arg);
+    __atomic_store_n(&xb_pipelines_writing, 0, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* now: on the calling thread (the renderer's end) */
+static void xb_pipeline_cache_save(PGRAPHVkState *r, bool now)
+{
+    XbPipelineWrite *w = calloc(1, sizeof(*w));
+    if (!w) {
+        return;
+    }
+    xb_pipeline_cache_path(w->path, sizeof(w->path));
+    size_t size = 0;
+    if (!w->path[0] || vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, NULL) != VK_SUCCESS ||
+        !size || !(w->data = malloc(size)) ||
+        vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, w->data) != VK_SUCCESS) {
+        free(w->data);
+        free(w);
+        return;
+    }
+    w->size = size;
+    xb_xemu_log("vulkan: the pipeline cache saved, %zu KiB", size >> 10);
     xb_pipelines_unsaved = 0;
     xb_pipelines_saved_at = xb_prof_now();
+    xb_pipelines_saved_size = size;
+    if (now) {
+        while (__atomic_load_n(&xb_pipelines_writing, __ATOMIC_ACQUIRE)) {
+            usleep(1000); /* (a write of before finishing first) */
+        }
+        xb_pipeline_cache_write(w);
+        return;
+    }
+    if (__atomic_exchange_n(&xb_pipelines_writing, 1, __ATOMIC_ACQ_REL)) {
+        free(w->data); /* (one still being written: the next save has this too) */
+        free(w);
+        return;
+    }
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, xb_pipeline_cache_writer, w) != 0) {
+        xb_pipeline_cache_writer(w);
+    }
+    pthread_attr_destroy(&attr);
 }
 
 static void xb_pipeline_made(PGRAPHVkState *r)
 {
     xb_pipelines_unsaved++;
-    if (xb_prof_now() - xb_pipelines_saved_at > 30000000000ull) {
-        xb_pipeline_cache_save(r);
+    if (xb_prof_now() - xb_pipelines_saved_at < 60000000000ull) {
+        return;
+    }
+    /* only when the driver's cache has grown (by 64 KiB or more) */
+    size_t size = 0;
+    xb_pipelines_saved_at = xb_prof_now();
+    if (vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size, NULL) == VK_SUCCESS &&
+        size >= xb_pipelines_saved_size + (64u << 10)) {
+        xb_pipeline_cache_save(r, false);
     }
 }
 
@@ -211,6 +272,7 @@ static void init_pipeline_cache(PGRAPHState *pg)
     }
     free(initial);
     xb_pipelines_saved_at = xb_prof_now();
+    xb_pipelines_saved_size = initial_size;
 
     const size_t pipeline_cache_size = 2048;
     lru_init(&r->pipeline_cache);
@@ -231,7 +293,7 @@ static void finalize_pipeline_cache(PGRAPHState *pg)
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     if (xb_pipelines_unsaved) {
-        xb_pipeline_cache_save(r);
+        xb_pipeline_cache_save(r, true);
     }
     lru_flush(&r->pipeline_cache);
     g_free(r->pipeline_cache_entries);

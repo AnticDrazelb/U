@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -118,6 +119,39 @@ void Log(const char* fmt, ...)
     std::vsnprintf(line + stamp, sizeof(line) - size_t(stamp), fmt, ap);
     va_end(ap);
     std::lock_guard lock(m);
+    // A flood of lines (a game repeating something the emulator notes, many times a second) would
+    // keep the disks busy, the log file and the USB drive's live log, under the game's own reads (its
+    // sound and levels stream from the disk): after the first minute, at most 2000 lines at once and
+    // 50 a second over time; what's left out is counted in the next line written. The stats, the
+    // profile and anything fatal always go.
+    static double tokens = 2000, last = 0;
+    static u64 left_out = 0;
+    const double now = diag::Seconds();
+    tokens = std::min(2000.0, tokens + (now - last) * 50);
+    last = now;
+    const char* text = line + stamp;
+    const bool always = std::strncmp(text, "stats:", 6) == 0 || std::strncmp(text, "profile:", 8) == 0 ||
+                        std::strstr(text, "FATAL") != nullptr;
+    if (now > 60 && !always)
+    {
+        if (tokens < 1)
+        {
+            left_out++;
+            return;
+        }
+        tokens -= 1;
+    }
+    if (left_out)
+    {
+        char note[128];
+        std::snprintf(note, sizeof(note), "[%9.3f] log: %llu lines left out (more than 50 a second)", now,
+                      (unsigned long long)left_out);
+        left_out = 0;
+        std::fputs(note, stdout);
+        std::fputc('\n', stdout);
+        if (g_log_sink)
+            g_log_sink(note);
+    }
     std::fputs(line, stdout);
     std::fputc('\n', stdout);
     std::fflush(stdout);
