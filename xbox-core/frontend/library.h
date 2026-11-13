@@ -59,6 +59,7 @@ struct Settings
     int dsp = 0;          // the APU's DSPs (effects): 0 off (the voices mixed directly), 1 on
     // the HOME menu's: its theme (0 Basic Black, 1 Basic White, 2 Retro), the user's nickname and icon
     int theme = 0;
+    bool logs = true;      // logging while a game runs (the log files, the profiler, the pictures)
     std::string nickname;  // "" the PS4 user's name
     int avatar = 0, avatar_color = 0;
     bool Load(const std::string& file);

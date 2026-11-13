@@ -75,6 +75,7 @@ struct MenuSettings
     bool show_log = true;     // the log while a game loads and its first seconds
     int dsp = 0;              // the APU's DSPs (sound effects): 0 off, 1 on
     int sort = 0;             // the titles: 0 by name, 1 recently played first
+    bool logs = true;         // logging while a game runs
     // the user at the top right: the nickname (at most kNicknameLength characters) and the icon, a
     // character on a background colour (ui/avatars.h)
     std::string nickname = "Player";

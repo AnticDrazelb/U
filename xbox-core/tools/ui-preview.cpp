@@ -192,6 +192,7 @@ int main(int argc, char** argv)
         Press(*home, kDown);
     Press(*home, kRight);
     Press(*home, kDown);
+    Press(*home, kDown); // (past Logs)
     Shot(*home, "settings-hidden");
     Press(*home, kCross);
     std::printf("show hidden: %s\n", has("mesh") ? "done" : "NOT DONE");

@@ -651,7 +651,7 @@ void PresentLoop()
         // the picture as shown, every 10 s, the last three kept: the log bundle carries them (what a
         // report says is on the screen, seen)
         static double next_picture = 10;
-        if (d.valid && now >= next_picture)
+        if (d.valid && now >= next_picture && g_settings.logs)
         {
             next_picture = now + 10;
             // on a thread of its own: encoding the PNG here held the screen for a moment every 10 s
@@ -987,8 +987,10 @@ int main()
         InitCpu();
         // the profiler (New Eden's way, on the sample signal the fault handler takes): every thread's
         // busiest functions in the log every 10 s and in profile.txt; after InitCpu, whose handler
-        // takes the signal
-        prof::Start("/app0/symbols.txt", "/data/xbox-core/profile.txt");
+        // takes the signal. Not with Settings, System, Logs off (it stops every thread 200 times a
+        // second)
+        if (g_settings.logs)
+            prof::Start("/app0/symbols.txt", "/data/xbox-core/profile.txt");
         prof::RegisterThread("launcher");
         gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
         SetNv2aChoice(g_settings.nv2a == 1); // Settings > Graphics
@@ -1013,13 +1015,14 @@ int main()
         // disc image and its sound and levels are read from. (Every 15 s, then every minute, it was a
         // stutter; the live log streams to the drive line by line meanwhile, and a crash, a hang or
         // the program's end writes the bundle at once.)
-        std::thread([] {
-            for (;;)
-            {
-                std::this_thread::sleep_for(std::chrono::minutes(5));
-                WriteLogBundle({}, true);
-            }
-        }).detach();
+        if (g_settings.logs)
+            std::thread([] {
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::minutes(5));
+                    WriteLogBundle({}, true);
+                }
+            }).detach();
         LogSync("launch: kernel imports");
         ResolveThunks();
         StartVblank();
@@ -1035,6 +1038,19 @@ int main()
             Log("launch: %s", handler.c_str());
         LogSync("launch: running the program");
         g_loading_stage = 3;
+        if (!g_settings.logs)
+        {
+            // Settings, System, Logs off: the start-up is in the log (where a start that fails stops),
+            // the game's time isn't: no line written from here (the screen's last lines still kept)
+            LogSync("logs: off from here (Settings, System, Logs); crashes are still recorded");
+            std::lock_guard lock(g_log_mutex);
+            for (FILE** f : {&g_log_file, &g_usb_log})
+                if (*f)
+                {
+                    std::fclose(*f);
+                    *f = nullptr;
+                }
+        }
         RunXbe();
         RecordResult("Ended by itself");
         WriteLogBundle({});

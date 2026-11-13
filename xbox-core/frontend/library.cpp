@@ -393,6 +393,7 @@ bool Settings::Load(const std::string& file)
         else if (key == "gpu") nv2a = std::clamp(value, 0, 1);
         else if (key == "dsp") dsp = std::clamp(value, 0, 1);
         else if (key == "theme") theme = std::clamp(value, 0, 2);
+        else if (key == "logs") logs = value != 0;
         else if (key == "nickname") nickname = word.substr(0, 40);
         else if (key == "avatar") avatar = std::max(0, value);
         else if (key == "avatar_color") avatar_color = std::max(0, value);
@@ -405,8 +406,8 @@ void Settings::Save(const std::string& file) const
 {
     if (FILE* f = std::fopen(file.c_str(), "w"))
     {
-        std::fprintf(f, "show_log %d\npicture %d\nsort %d\ngpu %d\ndsp %d\ntheme %d\navatar %d\navatar_color %d\n",
-                     show_log ? 1 : 0, picture, sort, nv2a, dsp, theme, avatar, avatar_color);
+        std::fprintf(f, "show_log %d\npicture %d\nsort %d\ngpu %d\ndsp %d\ntheme %d\nlogs %d\navatar %d\navatar_color %d\n",
+                     show_log ? 1 : 0, picture, sort, nv2a, dsp, theme, logs ? 1 : 0, avatar, avatar_color);
         if (!nickname.empty())
             std::fprintf(f, "nickname %s\n", nickname.c_str());
         std::fclose(f);

@@ -540,6 +540,12 @@ namespace {
 bool g_own_chosen = false;
 std::string g_xemu_guard; // the step file while xemu's renderer's first frames are drawn
 std::string g_xemu_step_file; // the step file during its start-up (xb_nv2a_step writes it)
+// the ends in its start-up or first frames in a row, this run's included should it end there too
+// (closing the app then, with the PS button, looks the same as the console stopping it: only 3 in
+// a row mean the renderer, and then Midway's own NV2A is used once; before, one did, and a game
+// closed while it started made the next run use Midway's own, at 3 frames a second)
+int g_xemu_strikes = 1;
+constexpr int kXemuStrikes = 3;
 [[maybe_unused]] u32 g_xemu_vblanks = 0;
 }
 
@@ -558,16 +564,24 @@ void InitNv2a()
     if (g_xemu_nv2a && !guard.empty())
         if (FILE* f = std::fopen(guard.c_str(), "r"))
         {
-            char step[160] = {}, build[128] = {};
+            char step[160] = {}, build[128] = {}, count[32] = {};
             const bool same = std::fgets(step, sizeof(step), f) && std::fgets(build, sizeof(build), f) &&
                               std::string(build).rfind(kBuildId, 0) == 0;
+            const int strikes = same ? (std::fgets(count, sizeof(count), f) ? std::max(1, std::atoi(count)) : 1) : 0;
             std::fclose(f);
-            if (same)
+            const std::string where(step, std::strcspn(step, "\n"));
+            if (same && strikes >= kXemuStrikes)
             {
                 g_xemu_nv2a = false;
-                Log("nv2a: the last start died in xemu's renderer (%s): this one uses xbox-core's own NV2A",
-                    std::string(step, std::strcspn(step, "\n")).c_str());
+                Log("nv2a: the last %d starts ended in xemu's renderer (%s): this one uses Midway's own NV2A (the "
+                    "next tries xemu's again)", strikes, where.c_str());
                 std::remove(guard.c_str());
+            }
+            else if (same)
+            {
+                g_xemu_strikes = strikes + 1;
+                Log("nv2a: the last start ended in xemu's renderer (%s): closed then, or the console stopped it (%d in "
+                    "a row; after %d, Midway's own NV2A once)", where.c_str(), strikes, kXemuStrikes);
             }
         }
     if (g_xemu_nv2a)
@@ -575,7 +589,7 @@ void InitNv2a()
         if (!guard.empty())
             if (FILE* f = std::fopen(guard.c_str(), "w"))
             {
-                std::fprintf(f, "xemu renderer start-up\n%s\n", kBuildId);
+                std::fprintf(f, "xemu renderer start-up\n%s\n%d\n", kBuildId, g_xemu_strikes);
                 std::fclose(f);
             }
         Log("nv2a: xemu's (PGRAPH on its Vulkan renderer)");
@@ -590,7 +604,7 @@ void InitNv2a()
             if (ok)
                 if (FILE* f = std::fopen(guard.c_str(), "w"))
                 {
-                    std::fprintf(f, "xemu renderer's first frames\n%s\n", kBuildId);
+                    std::fprintf(f, "xemu renderer's first frames\n%s\n%d\n", kBuildId, g_xemu_strikes);
                     std::fclose(f);
                     g_xemu_guard = guard;
                 }
@@ -734,7 +748,7 @@ extern "C" void xb_nv2a_step(const char* step)
     if (!g_xemu_step_file.empty())
         if (FILE* f = std::fopen(g_xemu_step_file.c_str(), "w"))
         {
-            std::fprintf(f, "xemu renderer start-up: %s\n%s\n", step, kBuildId);
+            std::fprintf(f, "xemu renderer start-up: %s\n%s\n%d\n", step, kBuildId, g_xemu_strikes);
             std::fclose(f);
         }
     LogSync("nv2a: xemu's renderer: %s", step);

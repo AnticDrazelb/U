@@ -119,7 +119,8 @@ aren't on the PS4 yet.
   - the theme;
   - graphics (the GPU's emulation, the picture's scaling, the loading log);
   - sound effects;
-  - the title order, and Close Midway;
+  - the title order, the logs (Off: nothing written while a game runs, no profiler, no
+    pictures; crashes are still recorded), hidden titles, and Close Midway;
   - your nickname and icon;
   - the controls;
   - what's new;

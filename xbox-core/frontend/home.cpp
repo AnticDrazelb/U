@@ -212,6 +212,7 @@ Ui::MenuSettings ToMenu(const Settings& s)
     m.show_log = s.show_log;
     m.dsp = s.dsp;
     m.sort = s.sort;
+    m.logs = s.logs;
     if (!s.nickname.empty())
         m.nickname = s.nickname;
     m.avatar = s.avatar;
@@ -227,6 +228,7 @@ void FromMenu(const Ui::MenuSettings& m, Settings& s)
     s.show_log = m.show_log;
     s.dsp = m.dsp;
     s.sort = m.sort;
+    s.logs = m.logs;
     s.nickname = m.nickname;
     s.avatar = m.avatar;
     s.avatar_color = m.avatar_color;

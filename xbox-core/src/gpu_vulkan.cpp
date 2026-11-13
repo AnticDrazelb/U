@@ -84,9 +84,14 @@ std::recursive_mutex g_mutex;
 bool g_wanted = false, g_tried = false, g_ok = false;
 std::string g_status = "off";
 // Where the console notes the step it's in while the GPU starts (as the CPU self-test does): a run
-// that dies there leaves it, and the next run of the same build keeps the GPU off.
+// that dies there leaves it. Closing the app then (the PS button) looks the same, so one such end
+// changes nothing: after 3 in a row (the step file counts them, a run that gets through deletes it)
+// the next run draws in software, once. (Before, one end kept the GPU off for good: a game closed
+// while it started, and every later run of the build drew in software, at 3 frames a second.)
 std::string g_guard_file;
 bool g_guard_pending = false;
+int g_guard_strikes = 1; // the ends there in a row, this run's included should it end there too
+constexpr int kGuardStrikes = 3;
 const char* const kBuild = kBuildId; // this build (not this file's compile time)
 
 void Guard(const char* step)
@@ -101,26 +106,28 @@ void Guard(const char* step)
     }
     if (FILE* f = std::fopen(g_guard_file.c_str(), "w"))
     {
-        std::fprintf(f, "%s\n%s\n", step, kBuild);
+        std::fprintf(f, "%s\n%s\n%d\n", step, kBuild, g_guard_strikes);
         std::fclose(f);
     }
     g_guard_pending = true;
 }
 
-// the step the last run of this build died in, or ""
-std::string GuardedDeath()
+// the step the last run of this build ended in ("" none), and how many runs in a row did
+std::string GuardedDeath(int& strikes)
 {
     std::string step;
+    strikes = 0;
     if (g_guard_file.empty())
         return step;
     if (FILE* f = std::fopen(g_guard_file.c_str(), "r"))
     {
-        char a[128] = {}, b[128] = {};
+        char a[128] = {}, b[128] = {}, c[32] = {};
         if (std::fgets(a, sizeof(a), f) && std::fgets(b, sizeof(b), f) && std::string(b).rfind(kBuild, 0) == 0)
         {
             step = a;
             while (!step.empty() && (step.back() == '\n' || step.back() == '\r'))
                 step.pop_back();
+            strikes = std::fgets(c, sizeof(c), f) ? std::max(1, std::atoi(c)) : 1;
         }
         std::fclose(f);
     }
@@ -921,11 +928,21 @@ bool Ready()
     if (!g_tried)
     {
         g_tried = true;
-        if (const std::string died = GuardedDeath(); !died.empty())
+        int strikes = 0;
+        if (const std::string died = GuardedDeath(strikes); !died.empty())
         {
-            g_status = "off: the last run of this build died at \"" + died + "\": software drawing this time";
-            Log("gpu: %s", g_status.c_str());
-            return false;
+            if (strikes >= kGuardStrikes)
+            {
+                g_status = "off: the last " + std::to_string(strikes) + " runs of this build ended at \"" + died +
+                           "\": software drawing this time (the next run tries the GPU again)";
+                Log("gpu: %s", g_status.c_str());
+                std::remove(g_guard_file.c_str());
+                return false;
+            }
+            g_guard_strikes = strikes + 1;
+            Log("gpu: the last run of this build ended at \"%s\" (closed then, or the console stopped it; %d in a "
+                "row): the GPU again (after %d in a row, software drawing once)",
+                died.c_str(), strikes, kGuardStrikes);
         }
         Guard("starting Vulkan (RADV)");
         LogSync("gpu: starting Vulkan (if the app dies here, the next start draws in software)");

@@ -964,6 +964,12 @@ std::vector<HomeMenu::SettingItem> HomeMenu::SettingItems(int category) const
              "The order of the Games row and the Library: by name, or the games played last first. Your games "
              "come before the samples in the package.",
              [](MenuSettings& s) { s.sort ^= 1; }},
+            {Does::Change, "Logs", settings.logs ? "On" : "Off",
+             "On: while a game runs, Midway writes what it's doing to its log files (and live to a USB drive), "
+             "samples where its time goes (the profiler) and keeps a picture of the screen every 10 s: what to "
+             "send when something goes wrong. Off: none of that during a game, a little faster and no disk "
+             "work at all. Crashes are still recorded either way, and the menu's logs too.",
+             [](MenuSettings& s) { s.logs = !s.logs; }},
             {Does::ShowHidden, "Hidden Titles", hidden_count ? std::to_string(hidden_count) + " Hidden" : "None",
              "Samples taken off the list (OPTIONS on one, Remove): X puts every one back.", nullptr},
             {Does::Close, "Close Midway", "",

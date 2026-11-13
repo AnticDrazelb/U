@@ -19,6 +19,7 @@
 #include "profiler.h"
 #include "diagnostics.h"
 #include "kernel.h"
+#include "gpu.h"
 
 namespace {
 using namespace xb;
@@ -168,6 +169,10 @@ int main(int argc, char** argv)
     if (const char* e = std::getenv("XB_APU_DSP"); e && e[0] == '1')
         SetApuDsp(true);
     SetDataDirectory("xbox-data"); // before the devices: xemu's renderer keeps its shader cache there
+    // the GPU's start-up guard files (as the PS4's: ps4/main_ps4.cpp), for testing them here:
+    // XB_GPU_GUARD=<folder>/gpu-step.txt (xemu's renderer's is beside it)
+    if (const char* guard = std::getenv("XB_GPU_GUARD"); guard && *guard)
+        gpu::SetGuardFile(guard);
     InitDevices();
     InitKernel();
     std::string error;
