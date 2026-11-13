@@ -642,6 +642,28 @@ int main(void)
         NtClose(f);
     }
     {
+        // A read at "the file's position" (ByteOffset FILE_USE_FILE_POINTER_POSITION, -2) reads there, as
+        // one without an offset does (it read at offset -2 before: nothing, "end of file")
+        HANDLE f = open_path("\\Device\\Harddisk0\\Partition1\\xc-position.txt", GENERIC_READ | GENERIC_WRITE,
+                             FILE_OVERWRITE_IF);
+        char got[4] = {0};
+        NTSTATUS st = -1;
+        if (f)
+        {
+            IO_STATUS_BLOCK iosb;
+            LARGE_INTEGER at;
+            at.QuadPart = 0;
+            NtWriteFile(f, NULL, NULL, NULL, &iosb, "abcdefgh", 8, &at);
+            FILE_POSITION_INFORMATION pos;
+            pos.CurrentByteOffset.QuadPart = 2;
+            NtSetInformationFile(f, &iosb, &pos, sizeof(pos), FilePositionInformation);
+            at.QuadPart = -2;
+            st = NtReadFile(f, NULL, NULL, NULL, &iosb, got, 3, &at);
+            NtClose(f);
+        }
+        check("a read at the file's position (offset -2)", st == 0 && memcmp(got, "cde", 3) == 0);
+    }
+    {
         // A cache partition formatted by the game (XAPI's XMountUtilityDrive: the FATX header written to
         // the partition itself, with the game's cluster size), then asked its size: the clusters must be
         // the header's. XAPI formats again when they aren't, and after that calls the drive
@@ -649,6 +671,7 @@ int main(void)
         static unsigned char header[4096];
         HANDLE raw = open_path("\\Device\\Harddisk0\\Partition4", GENERIC_READ | GENERIC_WRITE, FILE_OPEN);
         ULONG sectors = 0, bytes = 0;
+        LONGLONG total = 0, free_units = -1;
         if (raw)
         {
             IO_STATUS_BLOCK iosb;
@@ -664,7 +687,8 @@ int main(void)
             HANDLE root = open_path("\\Device\\Harddisk0\\Partition4\\", FILE_LIST_DIRECTORY, FILE_OPEN);
             FILE_FS_SIZE_INFORMATION size;
             if (root && NtQueryVolumeInformationFile(root, &iosb, &size, sizeof(size), FileFsSizeInformation) == 0)
-                sectors = size.SectorsPerAllocationUnit, bytes = size.BytesPerSector;
+                sectors = size.SectorsPerAllocationUnit, bytes = size.BytesPerSector,
+                total = size.TotalAllocationUnits.QuadPart, free_units = size.AvailableAllocationUnits.QuadPart;
             if (root)
                 NtClose(root);
             // back to the 16 KiB clusters of before (the Y: of other titles)
@@ -677,6 +701,10 @@ int main(void)
             }
         }
         check("a cache partition's clusters are those it was formatted with", sectors == 64 && bytes == 512);
+        // and its size the console's 750 MiB (less its header and table), free what its files leave
+        check("a cache partition is 750 MiB, mostly free", total > 0 && total * 32768 <= 0x2EE00000LL &&
+                                                                total * 32768 > 0x2E000000LL && free_units > total - 64 &&
+                                                                free_units <= total);
     }
     {
         // A folder must be there for what is opened or made in it, as the kernel's file systems

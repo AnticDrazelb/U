@@ -743,13 +743,24 @@ void RegisterFileExports(RegisterFn reg)
             n = ssize_t(IsoRead(*f->iso, u64(at), c.Arg(6), Ptr(c.Arg(5))));
             f->position = at + n;
         }
-        else if (c.Arg(7))
+        else if (c.Arg(7) && Read<s64>(c.Arg(7)) >= 0) // (negative: the special offsets, the file's position)
             n = pread(f->fd, Ptr(c.Arg(5)), c.Arg(6), off_t(Read<s64>(c.Arg(7))));
         else
             n = read(f->fd, Ptr(c.Arg(5)), c.Arg(6));
         if (n < 0)
             n = 0;
         const u32 status = n == 0 && c.Arg(6) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
+        if (status == STATUS_END_OF_FILE && !f->iso)
+        {
+            // where, and the file's size then: what a game read that wasn't there (a cache it thought
+            // it had filled)
+            static std::atomic<u32> logged{0};
+            struct stat st;
+            if (logged++ < 60 && fstat(f->fd, &st) == 0)
+                Log("files: a read of %s at %lld, %u bytes: past its end (%lld bytes)", f->path.c_str(),
+                    (long long)(c.Arg(7) && Read<s64>(c.Arg(7)) >= 0 ? Read<s64>(c.Arg(7)) : s64(lseek(f->fd, 0, SEEK_CUR))),
+                    c.Arg(6), (long long)st.st_size);
+        }
         SetIo(c.Arg(4), status, u32(n));
         if (c.Arg(1))
             WakeAll();
@@ -851,10 +862,16 @@ void RegisterFileExports(RegisterFn reg)
             return STATUS_SUCCESS;
         case 19: // FileAllocationInformation
         case 20: // FileEndOfFileInformation
+        {
+            static std::atomic<u32> logged{0};
+            if (logged++ < 100)
+                Log("files: %s of %s set to %lld bytes", c.Arg(4) == 19 ? "allocation" : "end", f->path.c_str(),
+                    (long long)Read<s64>(in));
             if (f->fd >= 0 && ftruncate(f->fd, off_t(Read<s64>(in))) != 0)
                 return STATUS_ACCESS_DENIED;
             SetIo(c.Arg(1), 0, 0);
             return STATUS_SUCCESS;
+        }
         case 13: // FileDispositionInformation
             if (Read<u8>(in))
                 (f->directory ? rmdir : unlink)(f->path.c_str());
@@ -897,14 +914,26 @@ void RegisterFileExports(RegisterFn reg)
         NetworkOpenInfo(info, c.Arg(1));
         return STATUS_SUCCESS;
     });
-    // A volume's clusters, in 512-byte sectors: for a cache partition (X:, Y:, Z:) those its FATX header
-    // says, as the game wrote it formatting the partition (XAPI's XMountUtilityDrive, with the game's
-    // cluster size; the header stays in the partition's image file); else 32 (16 KiB). XAPI formats a
-    // cache partition again when its clusters aren't the game's, then calls it unrecognized when they
-    // still aren't: Halo 2 went back to the dashboard with "invalid hard disk".
-    auto sectors_per_cluster = [](u32 handle) -> u32 {
+    // A volume as the size queries give it: its clusters (512-byte sectors), and its size and free
+    // space in them. A cache partition (X:, Y:, Z:) is the console's: 750 MiB (less its FATX header and
+    // table), its clusters those its FATX header says, as the game wrote it formatting the partition
+    // (XAPI's XMountUtilityDrive, with the game's cluster size; the header stays in the partition's
+    // image file), its free space what its files leave. XAPI formats a cache partition again when its
+    // clusters aren't the game's, then calls it unrecognized when they still aren't (Halo 2 went back
+    // to the dashboard with "invalid hard disk"); and a game sizes its cache from the free space (the
+    // 4 GiB said before is more clusters than such a game's 16-bit counts hold). Other volumes: 8 GiB,
+    // 4 GiB free, 16 KiB clusters, as before.
+    struct Volume
+    {
+        int partition = -1;
+        u32 sectors = 32;
+        s64 total = 8ll * 1024 * 1024 * 1024 / 16384, free = 4ll * 1024 * 1024 * 1024 / 16384;
+    };
+    auto volume_of = [](u32 handle) -> Volume {
+        Volume v;
         const HostFile* f = FileOf(handle);
         int partition = f ? f->raw : -1;
+        std::string dir;
         if (f && partition < 0 && f->path.size() > g_data_dir.size() + 1 && f->path.compare(0, g_data_dir.size() + 1, g_data_dir + "/") == 0)
         {
             const char letter = char(std::tolower(static_cast<unsigned char>(f->path[g_data_dir.size() + 1])));
@@ -913,29 +942,70 @@ void RegisterFileExports(RegisterFn reg)
                 partition = 3 + (letter - 'x');
         }
         if (partition < 3 || partition > 5)
-            return 32;
+        {
+            const s64 cluster = s64(v.sectors) * 512;
+            v.total = 8ll * 1024 * 1024 * 1024 / cluster, v.free = 4ll * 1024 * 1024 * 1024 / cluster;
+            return v;
+        }
+        v.partition = partition;
         u32 header[4] = {};
         const std::string image = g_data_dir + "/partition" + char('0' + partition) + ".img";
-        const int fd = open(image.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-            return 32;
-        const bool got = pread(fd, header, sizeof(header), 0) == ssize_t(sizeof(header));
-        close(fd);
-        const u32 sectors = header[2];
-        if (!got || std::memcmp(header, "FATX", 4) != 0 || sectors == 0 || sectors > 1024 || (sectors & (sectors - 1)))
-            return 32;
-        return sectors;
+        if (const int fd = open(image.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0)
+        {
+            const bool got = pread(fd, header, sizeof(header), 0) == ssize_t(sizeof(header));
+            close(fd);
+            const u32 sectors = header[2];
+            if (got && std::memcmp(header, "FATX", 4) == 0 && sectors && sectors <= 1024 && !(sectors & (sectors - 1)))
+                v.sectors = sectors;
+        }
+        // its clusters: the partition less the 4 KiB header and the table (2 bytes a cluster below
+        // 0xfff0 of them, else 4; in whole 4 KiB)
+        const s64 cluster = s64(v.sectors) * 512, size = s64(kPartitions[partition].size) - 0x1000;
+        const s64 estimate = size / cluster;
+        const s64 table = ((estimate * (estimate < 0xfff0 ? 2 : 4)) + 0xfff) & ~s64(0xfff);
+        v.total = (size - table) / cluster;
+        // what its files take, each in whole clusters (a folder one)
+        s64 used = 0;
+        std::vector<std::string> pending{g_data_dir + "/" + char('x' + (partition - 3))};
+        while (!pending.empty())
+        {
+            const std::string folder = pending.back();
+            pending.pop_back();
+            DIR* d = opendir(folder.c_str());
+            if (!d)
+                continue;
+            while (const dirent* e = readdir(d))
+            {
+                if (!std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, ".."))
+                    continue;
+                const std::string full = folder + "/" + e->d_name;
+                struct stat st;
+                if (stat(full.c_str(), &st) != 0)
+                    continue;
+                if (S_ISDIR(st.st_mode))
+                    used += 1, pending.push_back(full);
+                else
+                    used += (s64(st.st_size) + cluster - 1) / cluster;
+            }
+            closedir(d);
+        }
+        v.free = std::max<s64>(0, v.total - used);
+        static std::atomic<u32> logged{0};
+        if (logged++ < 40)
+            Log("files: partition %d's size asked: %lld clusters of %lld bytes, %lld free", partition,
+                (long long)v.total, (long long)cluster, (long long)v.free);
+        return v;
     };
-    reg("NtQueryVolumeInformationFile", [sectors_per_cluster](Call& c) -> u64 {
+    reg("NtQueryVolumeInformationFile", [volume_of](Call& c) -> u64 {
         // FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass
         const u32 out = c.Arg(2);
-        const u32 sectors = sectors_per_cluster(c.Arg(0));
-        const s64 cluster = s64(sectors) * 512;
-        if (c.Arg(4) == 3) // FileFsSizeInformation: 8 GiB, 4 GiB free, the volume's clusters (16 KiB)
+        const bool sizes = c.Arg(4) == 3 || c.Arg(4) == 7;
+        const Volume v = sizes ? volume_of(c.Arg(0)) : Volume{};
+        if (c.Arg(4) == 3) // FileFsSizeInformation: total and free clusters, sectors in one, sector size
         {
-            Write<s64>(out, 8ll * 1024 * 1024 * 1024 / cluster);
-            Write<s64>(out + 8, 4ll * 1024 * 1024 * 1024 / cluster);
-            Write<u32>(out + 16, sectors);
+            Write<s64>(out, v.total);
+            Write<s64>(out + 8, v.free);
+            Write<u32>(out + 16, v.sectors);
             Write<u32>(out + 20, 512);
             SetIo(c.Arg(1), 0, 24);
             return STATUS_SUCCESS;
@@ -969,10 +1039,10 @@ void RegisterFileExports(RegisterFn reg)
         case 7: // FileFsFullSizeInformation: total, caller's free, free; sectors per cluster, sector size
             if (length < 32)
                 return 0xC0000004;
-            Write<s64>(out, 8ll * 1024 * 1024 * 1024 / cluster);
-            Write<s64>(out + 8, 4ll * 1024 * 1024 * 1024 / cluster);
-            Write<s64>(out + 16, 4ll * 1024 * 1024 * 1024 / cluster);
-            Write<u32>(out + 24, sectors);
+            Write<s64>(out, v.total);
+            Write<s64>(out + 8, v.free);
+            Write<s64>(out + 16, v.free);
+            Write<u32>(out + 24, v.sectors);
             Write<u32>(out + 28, 512);
             SetIo(c.Arg(1), 0, 32);
             return STATUS_SUCCESS;
