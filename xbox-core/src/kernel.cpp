@@ -1310,6 +1310,17 @@ u32 Call::Arg(int i) const
     return frame->args[i];
 }
 
+namespace {
+std::mutex g_end_mutex;
+std::string g_end_reason; // why the program ended ("" by itself), under g_end_mutex
+} // namespace
+
+const std::string& ProgramEndReason()
+{
+    std::lock_guard lock(g_end_mutex);
+    return g_end_reason; // (set once, before the program's end is seen)
+}
+
 void InitKernel()
 {
     for (const Export& e : kExports)
@@ -1323,11 +1334,23 @@ void InitKernel()
     RegisterCryptoExports(Register);
     K(KeBugCheckEx) // the program's end, with its reason (an unhandled exception: 0x8e, code, address)
     {
+        char reason[96];
         if (c.Arg(0) == 0x8e)
+        {
             Log("kernel: unhandled exception %#x at %#x: the program ends", c.Arg(1), c.Arg(2));
+            std::snprintf(reason, sizeof(reason), "an error it didn't handle (exception %#x at %#x)", c.Arg(1), c.Arg(2));
+        }
         else
+        {
             Log("kernel: KeBugCheckEx %#x (%#x, %#x, %#x, %#x): the program ends", c.Arg(0), c.Arg(1), c.Arg(2), c.Arg(3),
                 c.Arg(4));
+            std::snprintf(reason, sizeof(reason), "a stop it asked for (bug check %#x)", c.Arg(0));
+        }
+        {
+            std::lock_guard lock(g_end_mutex);
+            if (g_end_reason.empty())
+                g_end_reason = reason;
+        }
         g_quit = true;
         WakeAll();
         ExitThread();
@@ -2355,13 +2378,38 @@ void InitKernel()
     K(MmFreeSystemMemory) { return FreeSystem(c.Arg(0)); } END; // base, size: the pages freed
     K(NtAllocateVirtualMemory)
     {
-        // BaseAddress*, ZeroBits, RegionSize*, AllocationType, Protect
+        // BaseAddress*, ZeroBits, RegionSize*, AllocationType, Protect. What's written back is what
+        // the kernel's is, the pages the request touches: the base rounded down to a page, the size
+        // up to cover [base, base + size), a commit inside a reservation included. XAPI's heap counts
+        // on it: growing by a segment, it commits its block's size and a page (not a whole number of
+        // pages) and puts the segment's uncommitted rest at the base plus the size written back.
+        // Without the rounding that rest started 0xa00 into a page and its last whole page ended
+        // 0x600 short of the segment's end, where the heap, filling it, then looked for a block that
+        // wasn't there: an access violation in RtlAllocateHeap (Jet Set Radio Future, on SEGA's logo)
         const u32 base_ptr = c.Arg(0), size_ptr = c.Arg(2);
         const u32 want = Read<u32>(base_ptr), size = Read<u32>(size_ptr);
-        u32 start, existing;
-        if (want && QueryAllocation(want, start, existing))
-            return STATUS_SUCCESS; // committing what is reserved: already there
-        const u32 p = AllocVirtual(size, want);
+        if (want)
+        {
+            const u32 first = want & ~0xfffu;
+            const u64 end = (u64(want) + size + 0xfff) & ~u64(0xfff);
+            if (end > 0xffffffffull)
+                return STATUS_NO_MEMORY;
+            u32 start, existing;
+            if (QueryAllocation(want, start, existing))
+            {
+                // committing what is reserved: already there
+                Write<u32>(base_ptr, first);
+                Write<u32>(size_ptr, u32(end - first));
+                return STATUS_SUCCESS;
+            }
+            const u32 p = AllocVirtual(u32(end - first), first);
+            if (!p)
+                return STATUS_NO_MEMORY;
+            Write<u32>(base_ptr, p);
+            Write<u32>(size_ptr, u32(end - first));
+            return STATUS_SUCCESS;
+        }
+        const u32 p = AllocVirtual(size, 0);
         if (!p)
             return STATUS_NO_MEMORY;
         Write<u32>(base_ptr, p);
@@ -2370,9 +2418,33 @@ void InitKernel()
     } END;
     K(NtFreeVirtualMemory)
     {
-        const u32 base = Read<u32>(c.Arg(0));
-        if (c.Arg(2) & 0x8000) // MEM_RELEASE
-            FreeVirtual(base);
+        // BaseAddress*, RegionSize*, FreeType: as the kernel, what was freed written back (the pages,
+        // as NtAllocateVirtualMemory's), and decommitted pages read as zeros when committed again
+        const u32 base_ptr = c.Arg(0), size_ptr = c.Arg(1);
+        const u32 base = Read<u32>(base_ptr), size = Read<u32>(size_ptr);
+        u32 start, existing;
+        const bool known = QueryAllocation(base, start, existing);
+        if (c.Arg(2) & 0x8000) // MEM_RELEASE: the whole allocation, from its base
+        {
+            if (known && start == base)
+            {
+                Write<u32>(size_ptr, existing);
+                FreeVirtual(base);
+            }
+            return STATUS_SUCCESS;
+        }
+        if ((c.Arg(2) & 0x4000) && known) // MEM_DECOMMIT: the pages (size 0: to the allocation's end)
+        {
+            const u32 first = base & ~0xfffu;
+            const u64 limit = u64(start) + existing;
+            const u64 end = size ? std::min<u64>((u64(base) + size + 0xfff) & ~u64(0xfff), limit) : limit;
+            if (end > first)
+            {
+                DecommitVirtual(first, u32(end - first));
+                Write<u32>(base_ptr, first);
+                Write<u32>(size_ptr, u32(end - first));
+            }
+        }
         return STATUS_SUCCESS;
     } END;
     K(NtQueryVirtualMemory)
@@ -3031,6 +3103,7 @@ int RunXbe()
     u32 handle;
     CreateThread(0x10000, tls, g_xbe.entry, 0, false, 0, "startup", &handle);
     const auto start = Clock::now();
+    int limited = 0;
     while (!g_quit)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -3043,6 +3116,7 @@ int RunXbe()
             std::chrono::duration<double>(Clock::now() - start).count() >= g_time_limit)
         {
             Log("kernel: time limit (%.1f s) reached", g_time_limit);
+            limited = 1;
             break;
         }
     }
@@ -3052,7 +3126,7 @@ int RunXbe()
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     diag::LogState("the program's end");
     diag::SetRunning(false);
-    return 0;
+    return limited;
 }
 
 } // namespace xb

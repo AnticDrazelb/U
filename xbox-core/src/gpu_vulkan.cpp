@@ -8,8 +8,10 @@
 namespace xb::gpu {
 bool Enabled() { return false; }
 void SetWanted(bool) {}
-void SetGuardFile(const std::string&) {}
+void SetGuardFile(const std::string&, const std::string&) {}
 const std::string& GuardFile() { static const std::string none; return none; }
+const std::string& GuardGame() { static const std::string none; return none; }
+void ClearGuard() {}
 const char* Status() { return "off: not in this build (the 1 GiB one has it)"; }
 bool DrawTriangles(const Vertex*, u32) { return false; }
 bool Clear(u32) { return false; }
@@ -88,8 +90,11 @@ std::string g_status = "off";
 // changes nothing: after 3 in a row (the step file counts them, a run that gets through deletes it)
 // the next run draws in software, once. (Before, one end kept the GPU off for good: a game closed
 // while it started, and every later run of the build drew in software, at 3 frames a second.)
-std::string g_guard_file;
-bool g_guard_pending = false;
+// The ends are counted for one game: the step file names it, and another game's start ignores it.
+// (They were the build's: Jet Set Radio Future, crashing on its SEGA logo and closed three times, made
+// the next start of Halo 2 draw in software.)
+std::string g_guard_file, g_guard_game;
+std::atomic<bool> g_guard_pending{false};
 int g_guard_strikes = 1; // the ends there in a row, this run's included should it end there too
 constexpr int kGuardStrikes = 3;
 const char* const kBuild = kBuildId; // this build (not this file's compile time)
@@ -106,13 +111,13 @@ void Guard(const char* step)
     }
     if (FILE* f = std::fopen(g_guard_file.c_str(), "w"))
     {
-        std::fprintf(f, "%s\n%s\n%d\n", step, kBuild, g_guard_strikes);
+        std::fprintf(f, "%s\n%s\n%d\n%s\n", step, kBuild, g_guard_strikes, g_guard_game.c_str());
         std::fclose(f);
     }
     g_guard_pending = true;
 }
 
-// the step the last run of this build ended in ("" none), and how many runs in a row did
+// the step the last run of this build and game ended in ("" none), and how many runs in a row did
 std::string GuardedDeath(int& strikes)
 {
     std::string step;
@@ -121,13 +126,19 @@ std::string GuardedDeath(int& strikes)
         return step;
     if (FILE* f = std::fopen(g_guard_file.c_str(), "r"))
     {
-        char a[128] = {}, b[128] = {}, c[32] = {};
+        char a[128] = {}, b[128] = {}, c[32] = {}, d[1024] = {};
         if (std::fgets(a, sizeof(a), f) && std::fgets(b, sizeof(b), f) && std::string(b).rfind(kBuild, 0) == 0)
         {
-            step = a;
-            while (!step.empty() && (step.back() == '\n' || step.back() == '\r'))
-                step.pop_back();
-            strikes = std::fgets(c, sizeof(c), f) ? std::max(1, std::atoi(c)) : 1;
+            const bool counted = std::fgets(c, sizeof(c), f) != nullptr;
+            std::fgets(d, sizeof(d), f);
+            const std::string game(d, std::strcspn(d, "\r\n"));
+            if (game == g_guard_game)
+            {
+                step = a;
+                while (!step.empty() && (step.back() == '\n' || step.back() == '\r'))
+                    step.pop_back();
+                strikes = counted ? std::max(1, std::atoi(c)) : 1;
+            }
         }
         std::fclose(f);
     }
@@ -1080,11 +1091,20 @@ DepthState ReadDepthState(const Surface& zs)
 } // namespace
 
 const std::string& GuardFile() { return g_guard_file; }
+const std::string& GuardGame() { return g_guard_game; }
 
-void SetGuardFile(const std::string& path)
+void SetGuardFile(const std::string& path, const std::string& game)
 {
     std::lock_guard lock(g_mutex);
     g_guard_file = path;
+    g_guard_game = game;
+}
+
+void ClearGuard()
+{
+    // (not under the lock: the GPU's thread may hold it for long, and this only takes a file away)
+    if (g_guard_pending.exchange(false) && !g_guard_file.empty())
+        std::remove(g_guard_file.c_str());
 }
 
 void SetWanted(bool on)

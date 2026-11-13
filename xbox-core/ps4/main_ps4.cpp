@@ -73,6 +73,9 @@ std::string g_running;            // the game running, for its history
 Ui::LoadingScreen g_loading;
 std::atomic<int> g_loading_stage{1};
 std::atomic<bool> g_failed{false};
+// the program's end, as the screen says it ("" while it runs)
+std::mutex g_ended_mutex;
+std::string g_ended;
 std::atomic<bool> g_result_recorded{false};
 
 // how the run went: the history's "last run". A final result (how it stopped) is written once;
@@ -692,7 +695,15 @@ void PresentLoop()
             }
             continue;
         }
-        const bool log_on = show_log && (now < 15 || !d.valid);
+        // the program ended: a line saying so over its last picture (which otherwise stays as it was,
+        // and looks like a freeze: Jet Set Radio Future's crash was "it stops on SEGA's logo"), and
+        // the log's last lines under it
+        std::string ended;
+        {
+            std::lock_guard lock(g_ended_mutex);
+            ended = g_ended;
+        }
+        const bool log_on = !ended.empty() || (show_log && (now < 15 || !d.valid));
         // Nothing new to show (the same picture, layout and no log over it): the screen keeps the last
         // flip, and the CPU time (a 1080p frame is 8 MiB to write) stays the game's.
         u64 hash = 0xcbf29ce484222325ull ^ (u64(d.address) << 32) ^ u64(d.width) << 16 ^ u64(d.height) ^ u64(g_settings.picture) << 60;
@@ -779,6 +790,12 @@ void PresentLoop()
         }
         if (log_on)
             DrawLog(fb, Screen::kHeight - 20 * 18 - 24);
+        if (!ended.empty())
+        {
+            Screen::Fill(fb, 0, 0, Screen::kWidth, 112, 0x000000);
+            Screen::Text(fb, 32, 24, ended, 0xFFFFFF, 2.0f);
+            Screen::Text(fb, 32, 66, "To play something else: the PS button, close Midway, and open it again.", 0xC8C8C8, 1.5f);
+        }
         g_screen.End();
     }
 }
@@ -992,7 +1009,8 @@ int main()
         if (g_settings.logs)
             prof::Start("/app0/symbols.txt", "/data/xbox-core/profile.txt");
         prof::RegisterThread("launcher");
-        gpu::SetGuardFile("/data/xbox-core/gpu-step.txt"); // before the devices: the NV2A's choice reads it
+        // before the devices: the NV2A's choice reads it; its count is this game's alone
+        gpu::SetGuardFile("/data/xbox-core/gpu-step.txt", xbe);
         SetNv2aChoice(g_settings.nv2a == 1); // Settings > Graphics
         SetApuDsp(g_settings.dsp == 1);      // Settings > Sound effects
         // the hard disk's folders before the devices (xemu's renderer keeps its shader cache there)
@@ -1052,9 +1070,14 @@ int main()
                 }
         }
         RunXbe();
-        RecordResult("Ended by itself");
+        // the renderers got through (a close from the home screen now isn't counted as theirs)
+        ClearStartGuards();
+        const std::string why = ProgramEndReason();
+        RecordResult(why.empty() ? "Ended by itself" : "Stopped with an error");
         WriteLogBundle({});
-        Log("the program ended; close the app (PS button) to choose another");
+        Log("the program ended%s%s; close the app (PS button) to choose another", why.empty() ? "" : ": ", why.c_str());
+        std::lock_guard lock(g_ended_mutex);
+        g_ended = why.empty() ? "The game ended." : "The game stopped: " + why + ".";
     }).detach();
     prof::RegisterThread("presenter (main)");
     PresentLoop();

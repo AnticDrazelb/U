@@ -543,7 +543,9 @@ std::atomic<bool> g_xemu_ready{false};
 
 namespace {
 bool g_own_chosen = false;
-std::string g_xemu_guard; // the step file while xemu's renderer's first frames are drawn
+std::mutex g_guard_mutex;
+std::string g_xemu_guard; // the step file while xemu's renderer's first frames are drawn (under g_guard_mutex)
+std::atomic<bool> g_xemu_guarded{false}; // g_xemu_guard is set (looked at each vblank)
 std::string g_xemu_step_file; // the step file during its start-up (xb_nv2a_step writes it)
 // the ends in its start-up or first frames in a row, this run's included should it end there too
 // (closing the app then, with the PS button, looks the same as the console stopping it: only 3 in
@@ -556,6 +558,29 @@ constexpr int kXemuStrikes = 3;
 
 void SetNv2aChoice(bool own) { g_own_chosen = own; }
 
+namespace {
+// xemu's renderer's first half minute drawn (Nv2aVblank), or the program ended (ClearStartGuards)
+void ClearXemuGuard()
+{
+    std::string guard;
+    {
+        std::lock_guard lock(g_guard_mutex);
+        guard.swap(g_xemu_guard);
+        g_xemu_guarded = false;
+    }
+    if (!guard.empty())
+        std::remove(guard.c_str());
+}
+} // namespace
+
+void ClearStartGuards()
+{
+    // the vblanks stop with the program, so a game that ended in xemu's renderer's first half minute
+    // kept its guard, and a close then (the PS button) counted as the renderer's
+    gpu::ClearGuard();
+    ClearXemuGuard();
+}
+
 void InitNv2a()
 {
 #ifdef XB_XEMU_NV2A
@@ -566,13 +591,23 @@ void InitNv2a()
     std::string guard = gpu::GuardFile();
     if (!guard.empty())
         guard = guard.substr(0, guard.rfind('/') + 1) + "xemu-nv2a-step.txt";
+    // (counted for one game: the file names it, and another game's start ignores it; they were the
+    // build's, and Jet Set Radio Future, crashing on SEGA's logo and closed three times, made the next
+    // start of Halo 2 use Midway's own NV2A, at a few frames a second)
+    const std::string& game = gpu::GuardGame();
     if (g_xemu_nv2a && !guard.empty())
         if (FILE* f = std::fopen(guard.c_str(), "r"))
         {
-            char step[160] = {}, build[128] = {}, count[32] = {};
-            const bool same = std::fgets(step, sizeof(step), f) && std::fgets(build, sizeof(build), f) &&
-                              std::string(build).rfind(kBuildId, 0) == 0;
-            const int strikes = same ? (std::fgets(count, sizeof(count), f) ? std::max(1, std::atoi(count)) : 1) : 0;
+            char step[160] = {}, build[128] = {}, count[32] = {}, of[1024] = {};
+            bool same = std::fgets(step, sizeof(step), f) && std::fgets(build, sizeof(build), f) &&
+                        std::string(build).rfind(kBuildId, 0) == 0;
+            const bool counted = same && std::fgets(count, sizeof(count), f);
+            if (same)
+            {
+                std::fgets(of, sizeof(of), f);
+                same = std::string(of, std::strcspn(of, "\r\n")) == game;
+            }
+            const int strikes = same ? (counted ? std::max(1, std::atoi(count)) : 1) : 0;
             std::fclose(f);
             const std::string where(step, std::strcspn(step, "\n"));
             if (same && strikes >= kXemuStrikes)
@@ -594,7 +629,7 @@ void InitNv2a()
         if (!guard.empty())
             if (FILE* f = std::fopen(guard.c_str(), "w"))
             {
-                std::fprintf(f, "xemu renderer start-up\n%s\n%d\n", kBuildId, g_xemu_strikes);
+                std::fprintf(f, "xemu renderer start-up\n%s\n%d\n%s\n", kBuildId, g_xemu_strikes, game.c_str());
                 std::fclose(f);
             }
         Log("nv2a: xemu's (PGRAPH on its Vulkan renderer)");
@@ -609,9 +644,11 @@ void InitNv2a()
             if (ok)
                 if (FILE* f = std::fopen(guard.c_str(), "w"))
                 {
-                    std::fprintf(f, "xemu renderer's first frames\n%s\n%d\n", kBuildId, g_xemu_strikes);
+                    std::fprintf(f, "xemu renderer's first frames\n%s\n%d\n%s\n", kBuildId, g_xemu_strikes, game.c_str());
                     std::fclose(f);
+                    std::lock_guard lock(g_guard_mutex);
                     g_xemu_guard = guard;
+                    g_xemu_guarded = true;
                 }
         }
         if (!ok)
@@ -676,11 +713,8 @@ void Nv2aVblank()
     {
         if (!g_xemu_ready)
             return;
-        if (!g_xemu_guard.empty() && ++g_xemu_vblanks == 30 * 60) // half a minute: it draws here
-        {
-            std::remove(g_xemu_guard.c_str());
-            g_xemu_guard.clear();
-        }
+        if (g_xemu_guarded && ++g_xemu_vblanks == 30 * 60) // half a minute: it draws here
+            ClearXemuGuard();
         return xb_nv2a_vblank();
     }
 #endif

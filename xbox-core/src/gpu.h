@@ -68,8 +68,15 @@ struct BlendState
 // that fails it says why once and stays off.
 bool Enabled();
 void SetWanted(bool on); // the PS4's setting, before the first draw
-void SetGuardFile(const std::string& path); // the console's step file (a start that dies is skipped next time)
+// the console's step file (a start that dies is skipped next time), and the game it's for: a start's
+// ends are counted for that game alone (another game's start isn't changed by them)
+void SetGuardFile(const std::string& path, const std::string& game = "");
 const std::string& GuardFile(); // its path, "" if none
+const std::string& GuardGame(); // the game the steps are counted for
+// The program ended (by itself, or with an error of its own): the start got through, and the step
+// file's count goes. Without this a game that crashed in its first seconds, closed then with the PS
+// button, counted as the GPU's start failing.
+void ClearGuard();
 const char* Status();    // for the log and the diagnostics: the device, or why not
 // the draws left to software since the last call, by reason ("" if none): for the stats line
 std::string DeclinedSince();

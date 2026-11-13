@@ -181,6 +181,52 @@ int main(void)
             if (all[i])
                 MmFreeContiguousMemory(all[i]);
     }
+    {
+        // Virtual memory as XAPI's heap grows by a segment (RtlpExtendHeap): reserve, then commit the
+        // block's size and a page, not a whole number of pages; the kernel writes back the pages it
+        // covers, and the heap puts the segment's uncommitted rest at base + that. (Without it, Jet Set
+        // Radio Future's heap looked for a block 0x600 short of its segment's end, and crashed.)
+        PVOID base = NULL, at;
+        SIZE_T reserve = 0x10000, commit = 0x9a00 + 0x1000, bit = 0x10, whole = 0;
+        NTSTATUS s = NtAllocateVirtualMemory(&base, 0, &reserve, MEM_RESERVE, PAGE_READWRITE);
+        check("NtAllocateVirtualMemory: a reservation at a 64 KiB boundary, its size in whole pages",
+              s == 0 && base && ((ULONG_PTR)base & 0xffff) == 0 && reserve == 0x10000);
+        at = base;
+        s = NtAllocateVirtualMemory(&at, 0, &commit, MEM_COMMIT, PAGE_READWRITE);
+        check("NtAllocateVirtualMemory: a commit in a reservation writes back its pages (0xaa00 -> 0xb000)",
+              s == 0 && at == base && commit == 0xb000);
+        at = (PVOID)((ULONG_PTR)base + 0xb234);
+        s = NtAllocateVirtualMemory(&at, 0, &bit, MEM_COMMIT, PAGE_READWRITE);
+        check("NtAllocateVirtualMemory: a commit inside a page: that page",
+              s == 0 && at == (PVOID)((ULONG_PTR)base + 0xb000) && bit == 0x1000);
+        // decommitted pages read as zeros when committed again
+        memset(base, 0x5a, 0xc000);
+        at = (PVOID)((ULONG_PTR)base + 0x2010);
+        bit = 0x1ff0;
+        s = NtFreeVirtualMemory(&at, &bit, MEM_DECOMMIT);
+        check("NtFreeVirtualMemory: a decommit writes back its pages",
+              s == 0 && at == (PVOID)((ULONG_PTR)base + 0x2000) && bit == 0x2000);
+        at = (PVOID)((ULONG_PTR)base + 0x2000);
+        bit = 0x2000;
+        NtAllocateVirtualMemory(&at, 0, &bit, MEM_COMMIT, PAGE_READWRITE);
+        const unsigned char *m = (const unsigned char *)base;
+        check("NtFreeVirtualMemory: decommitted pages are zeros committed again, the rest kept",
+              m[0x1fff] == 0x5a && m[0x2000] == 0 && m[0x3fff] == 0 && m[0x4000] == 0x5a);
+        at = base;
+        s = NtFreeVirtualMemory(&at, &whole, MEM_RELEASE);
+        check("NtFreeVirtualMemory: a release writes back the whole reservation", s == 0 && whole == 0x10000);
+        // the same addresses asked for again: new memory, zeros
+        at = base;
+        reserve = 0x4000;
+        s = NtAllocateVirtualMemory(&at, 0, &reserve, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check("NtAllocateVirtualMemory: memory at an address asked for reads as zeros",
+              s == 0 && at == base && m[0] == 0 && m[0x3fff] == 0);
+        if (s == 0)
+        {
+            whole = 0;
+            NtFreeVirtualMemory(&at, &whole, MEM_RELEASE);
+        }
+    }
     // the retail kernel's data: three cache partitions (XAPI's utility drive divides by them), no
     // debugger, a disk with a model number
     check("HalDiskCachePartitionCount is 3", HalDiskCachePartitionCount == 3);

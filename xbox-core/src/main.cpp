@@ -172,7 +172,7 @@ int main(int argc, char** argv)
     // the GPU's start-up guard files (as the PS4's: ps4/main_ps4.cpp), for testing them here:
     // XB_GPU_GUARD=<folder>/gpu-step.txt (xemu's renderer's is beside it)
     if (const char* guard = std::getenv("XB_GPU_GUARD"); guard && *guard)
-        gpu::SetGuardFile(guard);
+        gpu::SetGuardFile(guard, xbe);
     // XB_TEST_DISPLAY_POLL=1: the display read from another thread all along, from before the devices
     // are made, as the PS4's presenter does (its loading screen polls every few milliseconds)
     if (std::getenv("XB_TEST_DISPLAY_POLL"))
@@ -247,7 +247,11 @@ int main(int argc, char** argv)
             }
         }).detach();
     }
-    RunXbe();
+    // the program ended by itself (not --seconds' limit): its start-up got through
+    if (RunXbe() == 0)
+        ClearStartGuards();
+    if (!ProgramEndReason().empty())
+        Log("the program ended: %s", ProgramEndReason().c_str());
     if (!png.empty())
         SaveFramebuffer(png);
     if (wav_file)

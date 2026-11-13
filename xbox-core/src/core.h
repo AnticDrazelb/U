@@ -102,6 +102,8 @@ void InitMemory();
 // the XBE. Returns 0 if out of memory.
 u32 AllocVirtual(u32 size, u32 at = 0);
 bool FreeVirtual(u32 base);
+// MEM_DECOMMIT's pages zeroed (committed again, they read as zeros, as the console's), inside an allocation
+void DecommitVirtual(u32 base, u32 size);
 u32 AllocContiguous(u32 size, u32 alignment, u32 lowest, u32 highest);
 // The contiguous memory's dirty log (dirty.cpp): which pages were written since a reader (xemu's
 // renderer) last looked, from write faults on the pages it has looked at.
@@ -249,7 +251,7 @@ void KernelCall(GateFrame* frame, GuestThread* thread);
 void BackpatchedAccess(GateFrame* frame);
 u64 BackpatchedAccessCount();
 u32 BackpatchedSiteCount();
-int RunXbe(); // the start-up thread; returns when the program ends (or the time limit passes)
+int RunXbe(); // the start-up thread; returns when the program ends (0) or the time limit passes (1)
 extern std::atomic<bool> g_quit;
 extern double g_time_limit;
 
@@ -261,6 +263,11 @@ void WakeAll();
 
 void InitDevices();
 void SetNv2aChoice(bool own); // before InitDevices: xbox-core's own NV2A instead of xemu's (where built)
+// The program ended (by itself, or with an error of its own): the GPU's start-up guards cleared (the
+// renderers got through; a close from the home screen after it isn't counted as theirs)
+void ClearStartGuards();
+// Why the program ended: "" by itself (HalReturnToFirmware), else the error it didn't handle
+const std::string& ProgramEndReason();
 void SetApuDsp(bool on);      // before InitDevices: the APU's DSPs run (effects), not just its voices
 // An access to device memory, from the fault handler: returns false if not emulated.
 bool DeviceRead(u32 address, u32 size, u32& value, u32 eip = 0); // eip: the guest instruction, for the reports

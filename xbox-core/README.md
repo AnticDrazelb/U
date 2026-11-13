@@ -75,7 +75,13 @@ tests inside.
 - The DualShock 4 is the Xbox controller: Cross/Circle/Square/Triangle are A/B/X/Y, L1/R1
   white/black, L2/R2 the triggers, OPTIONS start, the touch pad's click back. Rumble reaches it.
 - The log is also in `/data/xbox-core/log.txt`, and crash reports in `/data/xbox-core/crash.log`.
-- To run another program, close the app and open it again.
+- To run another program, close the app and open it again. When a game ends, or stops with an
+  error it didn't handle, a line at the top of the screen says so (and the error), over its last
+  picture, with the log's last lines.
+- A game whose first half minute in xemu's renderer ends three starts in a row (the console stopping
+  the app, or the app closed then) starts once with Midway's own NV2A, slower. That count is the
+  game's own: another game's starts don't change it, and a game that ends or stops by itself
+  doesn't add to it.
 
 Its first log lines check the hardware path:
 - `cpu self-test: 32-bit code runs, its fs is its KPCR (...)` means the switch into 32-bit code,

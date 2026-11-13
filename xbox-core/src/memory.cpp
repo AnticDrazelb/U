@@ -422,11 +422,28 @@ u32 AllocVirtual(u32 size, u32 at)
 {
     std::lock_guard lock(g_mem);
     if (at)
-        return g_virtual.AllocAt(at & ~(kPage - 1), size + (at & (kPage - 1))) ? (at & ~(kPage - 1)) : 0;
+    {
+        // new memory reads as zeros, at an address asked for too (a range freed before kept what it had)
+        const u32 first = at & ~(kPage - 1), bytes = size + (at & (kPage - 1));
+        if (!g_virtual.AllocAt(first, bytes))
+            return 0;
+        std::memset(Ptr(first), 0, bytes);
+        return first;
+    }
     const u32 p = g_virtual.Alloc(size, 0x10000);
     if (p)
         std::memset(Ptr(p), 0, size);
     return p;
+}
+
+void DecommitVirtual(u32 base, u32 size)
+{
+    std::lock_guard lock(g_mem);
+    u32 start, existing;
+    // only the program's own memory (the virtual range's), and only inside one allocation
+    if (!g_virtual.Find(base, start, existing) || u64(base) + size > u64(start) + existing)
+        return;
+    std::memset(Ptr(base), 0, size);
 }
 
 bool FreeVirtual(u32 base)
