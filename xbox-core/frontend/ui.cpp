@@ -696,7 +696,7 @@ void LibraryUi::DrawAbout(Canvas& c)
 {
     c.RoundRect(62, 176, 1796, 590, 30, kPanel);
     c.RoundRect(62, 176, 1796, 590, 30, kPanelEdge, 2);
-    bold.Draw(c, 100, 204, "xbox-core " + version, 44, kText);
+    bold.Draw(c, 100, 204, "Midway " + version, 44, kText);
     regular.Draw(c, 100, 264, "Runs original Xbox programs natively on the PS4: their code on its CPU, a kernel of its own, the GPU, sound and controllers emulated.", 24, kDim);
     int y = 324;
     semibold.Draw(c, 100, y, "ADDING GAMES", 20, kAccent);

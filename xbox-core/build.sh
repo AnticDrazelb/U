@@ -21,7 +21,9 @@ ps4)
     # Variants (each its own app, so they install side by side), as xbox-bench 01.04's:
     #   XB_IMAGE_BASE=0x1000000000   link the app there (default: 0, loaded at 0x400000)
     #   XB_ELF_TYPE=exec             make it a fixed-address program (../xbox-bench/tools/set-elf-type.py)
-    #   XB_TITLE_ID, XB_NAME         its title ID and file name
+    #   XB_TITLE_ID, XB_NAME         its title ID and its name in the content ID (kept, so a new build
+    #                                installs over the last); XB_TITLE: the name the console shows
+    #                                (default Midway; Midway Lite for the package at 0x400000)
     #   XB_GPU_LINK=ON/OFF           RADV linked in or not (default: only with XB_IMAGE_BASE)
     # shellcheck disable=SC1091
     source "$HERE/../scripts/ps4-env.sh"
@@ -47,7 +49,7 @@ for p in lines:
 ' > "$stage/symbols.txt"
     cp "$build/xbox-core_eboot/eboot.bin" "$stage/"
     [ -z "${XB_ELF_TYPE:-}" ] || python3 "$HERE/../xbox-bench/tools/set-elf-type.py" "$stage/eboot.bin" "$XB_ELF_TYPE"
-    cp "$HERE/../xbox-bench/sce_sys/icon0.png" "$stage/sce_sys/"
+    cp "$HERE/sce_sys/icon0.png" "$stage/sce_sys/" # Midway's icon (512x512)
     for s in "${SAMPLES[@]}"; do
         xbe="$NXDK_DIR/samples/$s/bin/default.xbe"
         if [ -f "$xbe" ]; then
@@ -76,12 +78,14 @@ for p in lines:
         cp "$HERE/tests/disc-test/disc-test.iso" "$stage/samples/test-disc.iso"
     fi
     name="${XB_NAME:-xbox-core}"
+    title="${XB_TITLE:-$([ -n "${XB_IMAGE_BASE:-}" ] && echo Midway || echo "Midway Lite")}"
     mkdir -p "$build/no-modules" "$HERE/../out"
     pkg="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR="$build/no-modules" \
-        "$HERE/../scripts/make-pkg.sh" "$stage" "${XB_TITLE_ID:-XBCR00001}" "$name" "$(cat "$HERE/VERSION")" \
+        "$HERE/../scripts/make-pkg.sh" "$stage" "${XB_TITLE_ID:-XBCR00001}" "$title" "$(cat "$HERE/VERSION")" \
         "$(echo "$name" | tr -cd 'A-Za-z0-9' | tr a-z A-Z)" "$build/out" | tail -1)"
-    cp "$pkg" "$HERE/../out/$name.pkg"
-    echo "$HERE/../out/$name.pkg"
+    file="$(echo "$title" | tr ' ' '-').pkg"
+    cp "$pkg" "$HERE/../out/$file"
+    echo "$HERE/../out/$file"
     ;;
 *)
     echo "usage: build.sh host|ps4" >&2
