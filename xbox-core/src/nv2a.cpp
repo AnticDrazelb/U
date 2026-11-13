@@ -533,6 +533,11 @@ uint32_t xb_nv2a_display_start(void);
 }
 namespace {
 bool g_xemu_nv2a = false;
+// xemu's device made and its renderer started: until then (from the choice of xemu's at the start of
+// InitNv2a), its registers mustn't be read. The presenter reads the display's (start address, video
+// overlay) from before the devices are made; while xemu's device wasn't there yet that read went
+// through its null pointer (g_nv2a), and the app died at "the device's state" (Halo 2, twice)
+std::atomic<bool> g_xemu_ready{false};
 }
 #endif
 
@@ -624,6 +629,7 @@ void InitNv2a()
         xb_nv2a_write(0x100204, 0x11448000, 4); // PFB_CFG1
         AddDevice({kDeviceBase, kSize, "nv2a", [](u32 offset, u32 size) { return u32(xb_nv2a_read(offset, size)); },
                    [](u32 offset, u32 size, u32 value) { xb_nv2a_write(offset, value, size); }});
+        g_xemu_ready = true;
         return;
     }
 #endif
@@ -668,6 +674,8 @@ void Nv2aVblank()
 #ifdef XB_XEMU_NV2A
     if (g_xemu_nv2a)
     {
+        if (!g_xemu_ready)
+            return;
         if (!g_xemu_guard.empty() && ++g_xemu_vblanks == 30 * 60) // half a minute: it draws here
         {
             std::remove(g_xemu_guard.c_str());
@@ -686,6 +694,8 @@ std::string Nv2aWorkStats(double seconds)
 #ifdef XB_XEMU_NV2A
     if (g_xemu_nv2a)
     {
+        if (!g_xemu_ready)
+            return "";
         char out[700];
         xb_nv2a_profile(out, sizeof(out), seconds);
         return out;
@@ -709,7 +719,7 @@ u32 Nv2aDisplayStart()
 {
 #ifdef XB_XEMU_NV2A
     if (g_xemu_nv2a)
-        return xb_nv2a_display_start();
+        return g_xemu_ready ? xb_nv2a_display_start() : 0;
 #endif
     std::lock_guard lock(g_m);
     return R(PCRTC_START);
@@ -719,7 +729,7 @@ u32 Nv2aPvideo(u32 reg)
 {
 #ifdef XB_XEMU_NV2A
     if (g_xemu_nv2a)
-        return u32(xb_nv2a_read(0x8000 + reg, 4));
+        return g_xemu_ready ? u32(xb_nv2a_read(0x8000 + reg, 4)) : 0;
 #endif
     std::lock_guard lock(g_m);
     return R(0x8000 + reg);

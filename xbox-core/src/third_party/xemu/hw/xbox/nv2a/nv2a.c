@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <unistd.h>
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/xb_profile.h"
 #include "qemu/main-loop.h"
@@ -326,6 +327,10 @@ int xb_nv2a_profile(char *out, int size, double seconds)
 bool xb_nv2a_init(uint8_t *ram, uint64_t ram_size)
 {
     xb_nv2a_step("the device's state");
+    /* XB_NV2A_INIT_DELAY_MS: a test's longer start here (the time before g_nv2a is set) */
+    if (getenv("XB_NV2A_INIT_DELAY_MS")) {
+        usleep((useconds_t)atoi(getenv("XB_NV2A_INIT_DELAY_MS")) * 1000);
+    }
     qemu_event_init(&g_renderer_started, false);
     NV2AState *d = calloc(1, sizeof(NV2AState));
     PCIDevice *dev = PCI_DEVICE(d);

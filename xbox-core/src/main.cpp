@@ -173,6 +173,16 @@ int main(int argc, char** argv)
     // XB_GPU_GUARD=<folder>/gpu-step.txt (xemu's renderer's is beside it)
     if (const char* guard = std::getenv("XB_GPU_GUARD"); guard && *guard)
         gpu::SetGuardFile(guard);
+    // XB_TEST_DISPLAY_POLL=1: the display read from another thread all along, from before the devices
+    // are made, as the PS4's presenter does (its loading screen polls every few milliseconds)
+    if (std::getenv("XB_TEST_DISPLAY_POLL"))
+        std::thread([] {
+            for (;;)
+            {
+                (void)GetDisplay();
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+        }).detach();
     InitDevices();
     InitKernel();
     std::string error;
