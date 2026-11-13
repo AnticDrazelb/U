@@ -14,8 +14,7 @@ struct LoadingScreen
 {
     std::string name, publisher;
     Image icon;              // the game's tile (its cover), else a plain tile
-    bool white_theme = false; // the HOME menu's theme
-    bool retro_theme = false; // its Retro theme
+    bool white_theme = false; // the HOME menu's theme: Light (black on white), else Dark
     std::vector<std::string> lines; // the log's last lines, small, along the bottom (none: no log)
 };
 

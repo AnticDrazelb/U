@@ -556,6 +556,7 @@ std::string Library(const std::vector<std::string>& system)
         paths.usb.push_back("/usb" + std::to_string(i)); // where some consoles show an app its drives
     paths.settings = kSettingsFile;
     paths.autostart = kAutostartFile;
+    paths.picture = "/data/xbox-core/picture-1.png";
     paths.version = XB_VERSION;
     paths.system = system.size() > 2 ? system[2] + "; " + system[1] : system.empty() ? "" : system.back();
     paths.write_logs = [](const std::vector<fe::Game>& games) { return WriteLogBundle(games); };
@@ -970,7 +971,6 @@ int main()
         if (g_loading.name == "default.xbe" && slash != std::string::npos && slash > 0)
             g_loading.name = xbe.substr(xbe.find_last_of('/', slash - 1) + 1, slash - xbe.find_last_of('/', slash - 1) - 1);
         g_loading.white_theme = g_settings.theme == 1;
-        g_loading.retro_theme = g_settings.theme == 2;
     }
     Log("starting %s", xbe.c_str());
     g_running = xbe;

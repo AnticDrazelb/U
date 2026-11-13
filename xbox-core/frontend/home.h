@@ -1,8 +1,9 @@
-// Midway's launcher behind the HOME menu (ui/home_menu.h, New Eden's): the library made into the
-// menu's titles (covers made square, samples given art), the menu's settings kept in settings.txt,
-// and what its choices ask for done: a game copied from a USB drive (one at a time, its progress in
-// a message), every USB game copied, the logs written to the drives, a title set to start at launch.
-// Drawn into a Ui::Canvas: the PS4's screen (ps4/main_ps4.cpp) or a PNG (tools/ui-preview.cpp).
+// Midway's launcher behind the HOME menu (ui/home_menu.h): the library made into the menu's titles
+// (covers made square, samples given art, play history, the last picture shown), the menu's settings
+// kept in settings.txt, and what its choices ask for done: a game copied from a USB drive (one at a
+// time, its progress in a message), every USB game copied, the logs written to the drives, a title
+// set to start at launch. Drawn into a Ui::Canvas: the PS4's screen (ps4/main_ps4.cpp) or a PNG
+// (tools/ui-preview.cpp).
 #pragma once
 
 #include <atomic>
@@ -28,7 +29,8 @@ struct HomePaths
     std::string autostart;         // autostart.txt: a title to start without the menu
     std::string version;           // "00.01"
     std::string system;            // About: a line on where it runs
-    // every log onto the USB drives (Games and USB, Triangle); returns where it was written
+    std::string picture;           // the last picture shown (picture-1.png): the last played game's
+    // every log onto the USB drives (the USB tab, Triangle); returns where it was written
     std::function<std::vector<std::string>(const std::vector<Game>&)> write_logs;
 };
 
@@ -60,6 +62,8 @@ private:
     Ui::HomeMenu menu;
     std::vector<Game> games;
     std::vector<Ui::Image> covers; // by game, made square (empty: none)
+    Ui::Image picture;             // the last picture shown, and the game it's of
+    std::string picture_of;
     std::string autostart, chosen;
     Copier copier;
     size_t copies_queued = 0;

@@ -39,5 +39,25 @@ for name, seed in (("Neon Drift", 3), ("Crystal Caverns", 7), ("Moonlit Manor", 
     img.save(f"{lib}/games/{name}/cover.jpg", quality=90)
 PY
 now=$(date +%s)
-printf '%s\t3\t%s\tShowed its picture\n' "$LIB/games/Crystal Caverns/default.xbe" "$((now - 3600))" > "$LIB/history.txt"
+{
+    printf '%s\t7\t%s\tShowed its picture\n' "$LIB/games/Crystal Caverns/default.xbe" "$((now - 1800))"
+    printf '%s\t2\t%s\tEnded by itself\n' "$LIB/games/Neon Drift/default.xbe" "$((now - 3 * 86400))"
+} > "$LIB/history.txt"
+# the last picture shown: Crystal Caverns's (a made-up scene)
+python3 - "$LIB/picture-1.png" <<'PY'
+import sys, random
+from PIL import Image, ImageDraw
+random.seed(5)
+img = Image.new("RGB", (640, 480))
+d = ImageDraw.Draw(img)
+for y in range(480):
+    t = y / 480
+    d.line([(0, y), (640, y)], fill=(int(30 + 60 * t), int(20 + 90 * t), int(70 + 100 * t)))
+for _ in range(40):
+    x, y = random.randint(0, 640), random.randint(200, 480)
+    r = random.randint(10, 60)
+    d.polygon([(x, y - r * 2), (x - r, y + r), (x + r, y + r)], fill=(random.randint(80, 200), random.randint(140, 255), 255))
+d.rectangle([0, 440, 640, 480], fill=(20, 20, 30))
+img.save(sys.argv[1])
+PY
 "$HOME/xc-host/ui-preview" "$LIB" "$OUT"

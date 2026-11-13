@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <sys/stat.h>
 
 namespace fe {
 
@@ -44,6 +46,37 @@ std::vector<unsigned char> ReadFile(const std::string& file, size_t limit)
         std::fclose(f);
     }
     return out;
+}
+
+// "30 mins ago", "Yesterday", or the date
+std::string Ago(int64_t when)
+{
+    if (!when)
+        return "Never";
+    const int64_t s = int64_t(std::time(nullptr)) - when;
+    const auto count = [](int64_t n, const char* one, const char* many) {
+        return std::to_string(n) + " " + (n == 1 ? one : many) + " ago";
+    };
+    if (s < 60)
+        return "Just now";
+    if (s < 3600)
+        return count(s / 60, "min", "mins");
+    if (s < 86400)
+        return count(s / 3600, "hour", "hours");
+    if (s < 2 * 86400)
+        return "Yesterday";
+    if (s < 30 * 86400)
+        return count(s / 86400, "day", "days");
+    return FormatDate(when);
+}
+
+void Grey(Ui::Image& image)
+{
+    for (uint32_t& p : image.pixels)
+    {
+        const uint32_t l = ((p & 0xFF) * 77 + (p >> 8 & 0xFF) * 150 + (p >> 16 & 0xFF) * 29) >> 8;
+        p = (p & 0xFF000000u) | l << 16 | l << 8 | l;
+    }
 }
 
 // the package's samples: art for the ones it has a picture for (by file name), else a cover
@@ -142,8 +175,7 @@ Ui::Image SquareCover(const Ui::Image& cover, int size)
 Ui::MenuSettings ToMenu(const Settings& s)
 {
     Ui::MenuSettings m;
-    m.white_theme = s.theme == 1;
-    m.retro_theme = s.theme == 2;
+    m.white_theme = s.theme == 1; // (2, the Retro theme of before, is Dark)
     m.nv2a = s.nv2a;
     m.picture = s.picture;
     m.show_log = s.show_log;
@@ -158,7 +190,7 @@ Ui::MenuSettings ToMenu(const Settings& s)
 
 void FromMenu(const Ui::MenuSettings& m, Settings& s)
 {
-    s.theme = m.retro_theme ? 2 : m.white_theme ? 1 : 0;
+    s.theme = m.white_theme ? 1 : 0;
     s.nv2a = m.nv2a;
     s.picture = m.picture;
     s.show_log = m.show_log;
@@ -181,23 +213,23 @@ Home::Home(Settings& settings_, HomePaths paths_, std::string user) : settings(s
          "An original Xbox emulator for the PS4. The Xbox's own code runs on the PS4's CPU as it is (both are x86), "
          "with a kernel of Midway's own; the Xbox's GPU, sound chip, USB and network are xemu's, its GPU drawn by "
          "the PS4's through Vulkan."},
-        {"This HOME menu",
-         "New Eden's, made Midway's: the row of your games (their covers, when there are), All Software, and "
-         "the buttons below. OPTIONS on a game: what it is, a copy from a USB drive to the PS4, or starting it "
-         "as soon as Midway opens. System Settings has the themes: Basic Black, Basic White and Retro."},
+        {"A new HOME menu",
+         "In black and white (Settings, Themes: Dark or Light), with tabs: Games, Library, USB and Settings, L1 and "
+         "R1 between them. Games: the selected game stands larger, with when you last played it, how often, how its "
+         "last run went and the last picture it showed. OPTIONS on a game: its details, a copy from a USB drive to "
+         "the PS4, or starting it as soon as Midway opens."},
         {"Faster drawing",
          "What the Xbox's GPU draws stays on the PS4's GPU until the game's own code looks at it (most never do), "
-         "instead of being copied back after every frame: several times the frames of before in 3D games. "
-         "Shaders are kept in one file (hdd/shaders.pack), so a game that has run before starts without "
-         "building them again."},
+         "instead of being copied back after every frame: several times the frames of before in 3D games. Shaders "
+         "are kept in one file (hdd/shaders.pack), so a game that has run before starts without building them again."},
         {"Where games go",
          "/data/xbox-core/games: a folder with the game's default.xbe and its files, or a disc image (.iso). On a "
          "USB drive (its top folder, or games/, xbox/ or xbox-core/games/) they're listed too, and can be copied "
-         "to the PS4 from here. A cover: cover.jpg or cover.png in the game's folder, <name>.jpg beside an .iso, "
-         "or /data/xbox-core/covers/<title ID>.jpg."},
+         "to the PS4 from the USB tab. A cover: cover.jpg or cover.png in the game's folder, <name>.jpg beside an "
+         ".iso, or /data/xbox-core/covers/<title ID>.jpg."},
         {"When something goes wrong",
          "Every log goes to xbox-core-logs.txt at the top of each USB drive: as the app opens, every minute while a "
-         "game runs, and when it crashes. Games and USB, Triangle writes it at once. That file is what to send."},
+         "game runs, and when it crashes. On the USB tab, Triangle writes it at once. That file is what to send."},
     });
     autostart = ReadFirstLine(paths.autostart);
     Rescan();
@@ -250,9 +282,11 @@ void Home::Sort()
             if (g.region)
                 t.details += ", " + RegionName(g.region);
         }
-        if (g.plays)
-            t.details += (t.details.empty() ? "" : "\n") + std::string("Last played ") + FormatDate(g.last_played) +
-                         (g.last_result.empty() ? "" : ": " + g.last_result);
+        t.last_played = Ago(g.last_played);
+        t.plays = g.plays;
+        t.last_result = g.last_result;
+        if (g.path == picture_of)
+            t.picture = picture;
         t.on_usb = !g.usb.empty();
         t.autostart = !autostart.empty() && autostart == g.path;
         t.art = g.sample ? SampleArt(g) : Ui::Art::None;
@@ -277,6 +311,27 @@ void Home::Rescan()
                                }),
                 games.end());
     covers.assign(games.size(), Ui::Image{});
+    // the last picture shown (picture-1.png, every 10 s of a run) is the last played game's, when it was
+    // written after that game started
+    picture = Ui::Image{};
+    picture_of.clear();
+    const Game* last = nullptr;
+    for (const Game& g : games)
+        if (g.last_played && (!last || g.last_played > last->last_played))
+            last = &g;
+    struct stat st;
+    if (last && !paths.picture.empty() && stat(paths.picture.c_str(), &st) == 0 && int64_t(st.st_mtime) >= last->last_played)
+    {
+        const std::vector<unsigned char> data = ReadFile(paths.picture, 16u << 20);
+        Ui::Image shown = data.empty() ? Ui::Image{} : Ui::DecodeImage(data.data(), data.size());
+        if (!shown.Empty())
+        {
+            // at the size the panel shows it (272 units wide, 1.5 pixels a unit)
+            const int w = std::min(shown.width, 408), h = std::max(1, shown.height * w / shown.width);
+            picture = Ui::ResizeImage(shown, w, h);
+            picture_of = last->path;
+        }
+    }
     for (size_t i = 0; i < games.size(); i++)
     {
         if (games[i].cover.empty())
@@ -303,6 +358,7 @@ void Home::SetStatus()
                     std::to_string(on_ps4) + (on_ps4 == 1 ? " game in " : " games in ") + paths.library.games, on_ps4 > 0});
     const std::vector<std::string> roots = UsbRoots(paths.usb);
     const std::vector<UsbGame> usb = FindUsbGames(roots, paths.library.games);
+    menu.SetUsb(!roots.empty(), std::any_of(usb.begin(), usb.end(), [](const UsbGame& u) { return !u.on_hdd; }));
     if (roots.empty())
         rows.push_back({"No USB drive", "A drive's games are listed with the others, to start from it or copy to the PS4.", false});
     for (const std::string& root : roots)
@@ -473,7 +529,6 @@ Ui::LoadingScreen Home::Loading() const
 {
     Ui::LoadingScreen screen;
     screen.white_theme = settings.theme == 1;
-    screen.retro_theme = settings.theme == 2;
     for (size_t i = 0; i < games.size(); i++)
     {
         if (games[i].path != chosen)
@@ -484,10 +539,8 @@ Ui::LoadingScreen Home::Loading() const
         if (screen.icon.Empty())
         {
             const Ui::Art art = games[i].sample ? SampleArt(games[i]) : Ui::Art::None;
-            screen.icon = art != Ui::Art::None
-                              ? Ui::MakeTileArt(art, 384)
-                              : Ui::MakeCover(games[i].title, games[i].kind, 384,
-                                              screen.retro_theme ? Ui::FontFamily::Pixel : Ui::FontFamily::Inter);
+            screen.icon = art != Ui::Art::None ? Ui::MakeTileArt(art, 384) : Ui::MakeCover(games[i].title, games[i].kind, 384);
+            Grey(screen.icon); // as the menu shows it
         }
     }
     if (screen.name.empty())

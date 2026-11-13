@@ -26,39 +26,20 @@ std::string Thousands(unsigned value)
 void DrawLoadingScreen(Canvas& c, const LoadingScreen& screen, int stage, unsigned done, unsigned total, double now,
                        bool failed)
 {
-    // the HOME menu's Basic Black and Basic White colours, or its Retro ones and pixel font
-    const bool white = screen.white_theme && !screen.retro_theme, retro = screen.retro_theme;
-    const uint32_t bg = retro ? Rgb(0x2B2F66) : white ? Rgb(0xEBEBEB) : Rgb(0x2D2D2D);
-    const uint32_t text = retro ? Rgb(0xF6F2E4) : white ? Rgb(0x2D2D2D) : Rgb(0xFFFFFF);
-    const uint32_t dim = retro ? Rgb(0xAEB0DA) : white ? Rgb(0x707070) : Rgb(0xB0B0B0);
-    const uint32_t track = retro ? Rgb(0x565DA8) : white ? Rgb(0xC6C6C6) : Rgb(0x585858);
-    const uint32_t accent = retro ? Rgb(0xFFD447) : white ? Rgb(0x3254E6) : Rgb(0x00C8F0);
-    const uint32_t tile = retro ? Rgb(0x474E99) : white ? Rgb(0xFFFFFF) : Rgb(0x464646);
+    // the HOME menu's Dark or Light: white on black, or black on white
+    const bool white = screen.white_theme;
+    const uint32_t text = white ? Rgb(0x111111) : Rgb(0xFFFFFF);
+    const uint32_t dim = white ? Rgb(0x666666) : Rgb(0xA0A0A0);
+    const uint32_t track = white ? Rgb(0x000000, 40) : Rgb(0xFFFFFF, 40);
+    const uint32_t accent = text;
+    const uint32_t tile = white ? Rgb(0xFFFFFF) : Rgb(0x2A2A2A);
 
-    c.SetFontFamily(retro ? FontFamily::Pixel : FontFamily::Inter);
-    if (retro)
-        c.Gradient(0, 0, 1280, 720, Rgb(0x31377C), Rgb(0x222659));
-    else
-        c.Clear(bg);
-    // the game's icon, as its HOME menu tile
+    c.SetFontFamily(FontFamily::Inter);
+    c.Gradient(0, 0, 1280, 720, white ? Rgb(0xFBFBFB) : Rgb(0x2C2C2C), white ? Rgb(0xD9D9D9) : Rgb(0x080808));
+    // the game's tile, as the menu showed it, with a soft shadow
     constexpr float kIcon = 256, kIconX = (1280 - kIcon) / 2, kIconY = 132;
-    if (retro)
-    {
-        // the Retro theme's chunky tile: a hard shadow, a dark outline, a cream frame
-        const uint32_t ink = Rgb(0x15173B);
-        c.RoundRect(kIconX + 6, kIconY + 7, kIcon, kIcon, 18, Fade(ink, 0.8f));
-        c.RoundRect(kIconX, kIconY, kIcon, kIcon, 18, ink);
-        if (!screen.icon.Empty())
-            c.DrawImage(kIconX + 9, kIconY + 9, kIcon - 18, kIcon - 18, screen.icon);
-        else
-        {
-            c.Rect(kIconX + 9, kIconY + 9, kIcon - 18, kIcon - 18, tile);
-            c.Text(640, kIconY + kIcon / 2 + 22, screen.name.empty() ? "?" : screen.name.substr(0, 1), 64,
-                   Weight::SemiBold, dim, Align::Center);
-        }
-        c.RoundRectOutline(kIconX + 4, kIconY + 4, kIcon - 8, kIcon - 8, 14, 6, Rgb(0xEDEAF8));
-    }
-    else if (!screen.icon.Empty())
+    c.RoundRect(kIconX + 4, kIconY + 8, kIcon, kIcon, 10, Rgb(0x000000, white ? 40 : 130));
+    if (!screen.icon.Empty())
     {
         c.DrawImage(kIconX, kIconY, kIcon, kIcon, screen.icon);
     }
@@ -76,9 +57,8 @@ void DrawLoadingScreen(Canvas& c, const LoadingScreen& screen, int stage, unsign
     if (failed)
     {
         // it won't get further: say so, and how to leave
-        const uint32_t red = white ? Rgb(0xE60012) : Rgb(0xF0483E);
-        c.Text(640, 574, "The game stopped with an error", 21, Weight::SemiBold, red, Align::Center);
-        c.RoundRect(kBarX, kBarY, kBarW, kBarH, kBarH / 2, red);
+        c.Text(640, 574, "The game stopped with an error", 21, Weight::SemiBold, text, Align::Center);
+        c.RoundRect(kBarX, kBarY, kBarW, kBarH, kBarH / 2, text);
         c.Text(640, 640, "The log says why. To leave: the PS button, then Close Application", 18, Weight::Regular, text,
                Align::Center);
         return;

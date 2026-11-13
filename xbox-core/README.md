@@ -101,12 +101,29 @@ Xbox's addresses below it. The real console could (xbox-bench).
 
 ## The PS4 HOME menu
 
-The app opens on a HOME menu laid out as the Switch's: New Eden's (its `eden-ps4/src/ui`), made
-Midway's. Along the top are your icon and the time. Below that is a row of your games (the selected
-one framed, its name above it) ending in **All Software**. Under the row sit the round buttons:
-**News**, **Games and USB**, **Controllers**, **System Settings** and **Power**. The bottom line
-shows the buttons' hints. There are three themes: Basic Black, Basic White, and Retro (a pixel font
-and a starry night).
+The app opens on a dashboard in black and white: Dark (white on black) or Light (black on white).
+Only your covers are in colour.
+
+Along the top are Midway's name, the time, a USB stick when a drive is plugged in, your name and
+your icon. Under them are the tabs **Games**, **Library**, **USB** and **Settings**; L1/R1 move
+between them, or Up to the tabs and then Left/Right. A dot on USB means a drive holds games that
+aren't on the PS4 yet.
+
+- **Games** is a row of covers. The selected one stands larger, with its name, what it is and how
+  to start it beside it. Under the row, a panel shows what Midway knows of the game: when you last
+  played it, how often, how its last run ended, its facts, and the last picture it showed (from
+  your last session). The row ends in *All games*, which opens the Library.
+- **Library** is every title in a grid.
+- **USB** shows what the drives hold.
+- **Settings** has these sections:
+  - the theme;
+  - graphics (the GPU's emulation, the picture's scaling, the loading log);
+  - sound effects;
+  - the title order, and Close Midway;
+  - your nickname and icon;
+  - the controls;
+  - what's new;
+  - about.
 
 The games are the samples the app carries, your games in `/data/xbox-core/games` (a folder with
 `default.xbe` and its files, or a disc image `<name>.iso`), and the games on USB drives (at a
@@ -122,25 +139,15 @@ OPTIONS on a game opens its details and two choices:
   progress shown.
 - **Start at Launch**, for any other game. Hold L1 while the app opens to get the menu back.
 
-**Games and USB** says what was found. Square there copies every USB game that isn't on the PS4
-yet. Triangle writes every log to `xbox-core-logs.txt` on the drives.
-
-**System Settings** has the following:
-- the theme;
-- the GPU's emulation (xemu's or Midway's own);
-- the picture's scaling;
-- the loading log;
-- the sound effects (the APU's DSPs);
-- the title order.
-
-Your nickname and icon are on the User Page (the icon at the top left).
+On the **USB** tab, Square copies every USB game that isn't on the PS4 yet, and Triangle writes
+every log to `xbox-core-logs.txt` on the drives.
 
 When you choose a game, a loading screen shows its tile until its first picture, with the log's
 last lines under it. If it stops with an error, the whole log is shown instead.
 
-The screen is drawn in software (`frontend/home.cpp`, `frontend/ui/`). The fonts are Inter and
-Pixelify Sans, both under the SIL OFL; they are built into the program, and their licences are in
-the package's `licenses/`. `tools/ui-preview.sh` (after `build.sh host`) draws every screen to PNG
+The screen is drawn in software (`frontend/home.cpp`, `frontend/ui/`). The canvas, fonts, dialogs and
+keyboard were begun from New Eden's menu. The fonts are Inter and Pixelify Sans, both under the SIL
+OFL; they are built into the program, and their licences are in the package's `licenses/`. `tools/ui-preview.sh` (after `build.sh host`) draws every screen to PNG
 files from a made-up library.
 
 ## Logs and diagnostics

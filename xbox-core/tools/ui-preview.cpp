@@ -1,10 +1,12 @@
-// The PS4 front end's HOME menu (frontend/home.h, New Eden's menu) on the desktop: each screen drawn
-// to a PNG (1920x1080, as on the PS4), from a library folder made by tools/ui-preview.sh.
+// The PS4 front end's HOME menu (frontend/home.h) on the desktop: each screen drawn to a PNG
+// (1920x1080, as on the PS4), from a library folder made by tools/ui-preview.sh.
 //   ui-preview <library folder> <output folder>
-// The library folder: games/ (the player's), samples/, covers/, usb0/ (a USB drive), history.txt.
+// The library folder: games/ (the player's), samples/, covers/, usb0/ (a USB drive), history.txt,
+// picture-1.png (the last picture shown).
 
 #include <cstdio>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,7 +40,7 @@ void Save(const Canvas& canvas, const std::string& name)
 void Shot(fe::Home& home, const char* name)
 {
     Canvas canvas(1920, 1080, 1.5f);
-    for (int i = 0; i < 40; i++) // a few frames, so that scrolling settles
+    for (int i = 0; i < 40; i++) // a few frames, so that scrolling and growing settle
     {
         home.Update(0, g_now);
         home.Draw(canvas, g_now, "21:47", true);
@@ -58,141 +60,130 @@ int main(int argc, char** argv)
     }
     const std::string lib = argv[1];
     g_out = argv[2];
-    // (Settings must outlive Home: kept here)
-    static fe::Settings keep[4];
-    const auto home_with = [&](int theme) {
-        keep[theme].theme = theme;
+    static fe::Settings keep[4]; // (each Home keeps a reference)
+    const auto home_with = [&](int index, int theme) {
+        keep[index].theme = theme;
         fe::HomePaths paths;
         paths.library = {{lib + "/samples"}, lib + "/games", {}, lib + "/covers", lib + "/history.txt"};
         paths.usb = {lib + "/usb0"};
         paths.settings = lib + "/settings.txt";
         paths.autostart = lib + "/autostart.txt";
+        paths.picture = lib + "/picture-1.png";
         paths.version = "00.01";
         paths.system = "PS4 firmware 13.52, its code clear of the Xbox's addresses";
         paths.write_logs = [lib](const std::vector<fe::Game>&) { return std::vector<std::string>{lib + "/usb0/xbox-core-logs.txt"}; };
-        return std::make_unique<fe::Home>(keep[theme], paths, "Jordan");
+        return std::make_unique<fe::Home>(keep[index], paths, "Jordan");
     };
 
-    auto home = home_with(0);
-    Shot(*home, "home");
+    auto home = home_with(0, 0);
+    Shot(*home, "games");
     Press(*home, kRight);
-    Shot(*home, "home-game");
+    Shot(*home, "games-played"); // Crystal Caverns: played, its last picture
+    for (int i = 0; i < 3; i++)
+        Press(*home, kRight);
+    Shot(*home, "games-scrolled");
     for (int i = 0; i < 12; i++)
         Press(*home, kRight);
-    Shot(*home, "home-all-software");
+    Shot(*home, "games-all");
+    Press(*home, kUp);
+    Shot(*home, "tabs");
+    Press(*home, kRight);
     Press(*home, kDown);
     Press(*home, kRight);
-    Press(*home, kRight);
-    Press(*home, kRight);
-    Shot(*home, "home-buttons");
-    Press(*home, kCross);
+    Press(*home, kDown);
+    Shot(*home, "library");
+    Press(*home, kR1);
+    Shot(*home, "usb");
+    Press(*home, kR1);
     Shot(*home, "settings");
     Press(*home, kDown);
     Press(*home, kRight);
     Shot(*home, "settings-graphics");
     Press(*home, kLeft);
+    for (int i = 0; i < 3; i++)
+        Press(*home, kDown);
+    Shot(*home, "settings-user");
     Press(*home, kDown);
-    Press(*home, kRight);
-    Shot(*home, "settings-sound");
-    Press(*home, kLeft);
+    Shot(*home, "settings-controls");
     Press(*home, kDown);
+    Shot(*home, "settings-news");
     Press(*home, kDown);
     Shot(*home, "settings-about");
-    Press(*home, kCircle);
-    for (int i = 0; i < 3; i++)
-        Press(*home, kLeft);
-    Press(*home, kCross);
-    Shot(*home, "news");
-    Press(*home, kCircle);
+    for (int i = 0; i < 4; i++)
+        Press(*home, kUp);
     Press(*home, kRight);
+    Press(*home, kDown);
     Press(*home, kCross);
-    Shot(*home, "games");
+    Shot(*home, "dialog-close");
     Press(*home, kCircle);
-    Press(*home, kRight);
-    Press(*home, kCross);
-    Shot(*home, "controllers");
     Press(*home, kCircle);
-    Press(*home, kRight);
-    Press(*home, kRight);
-    Press(*home, kCross);
-    Shot(*home, "dialog-power");
-    Press(*home, kCircle);
-    Press(*home, kUp);
-    for (int i = 0; i < 13; i++)
+    Press(*home, kCircle); // back to Games
+    for (int i = 0; i < 16; i++)
         Press(*home, kLeft);
     Press(*home, kOptions);
     Shot(*home, "dialog-info");
     Press(*home, kCircle);
     for (int i = 0; i < 5; i++) // Orbital Golf, on the USB drive
         Press(*home, kRight);
+    Shot(*home, "games-usb");
     Press(*home, kOptions);
     Shot(*home, "dialog-info-usb");
     // its copy to the PS4: the message's progress, then its result, and the library read again
     Press(*home, kLeft);
     Press(*home, kCross);
-    for (int i = 0; i < 200 && home->Games().size() == 14; i++)
+    bool copied = false;
+    for (int i = 0; i < 200 && !copied; i++)
     {
         Press(*home, 0);
-        bool copied = false;
         for (const fe::Game& g : home->Games())
             copied |= g.title == "Orbital Golf" && g.usb.empty();
-        if (copied)
-            break;
         struct timespec ts{0, 20 * 1000 * 1000};
         nanosleep(&ts, nullptr);
     }
     Shot(*home, "copy-done");
-    size_t on_ps4 = 0;
-    for (const fe::Game& g : home->Games())
-        on_ps4 += g.title == "Orbital Golf" && g.usb.empty();
-    std::printf("copy to the PS4: %s (%zu titles)\n", on_ps4 ? "done" : "NOT DONE", home->Games().size());
-    Press(*home, kCross);
+    std::printf("copy to the PS4: %s (%zu titles)\n", copied ? "done" : "NOT DONE", home->Games().size());
 
-    // All Software
-    auto all = home_with(1);
-    for (int i = 0; i < 12; i++)
-        Press(*all, kRight);
-    Press(*all, kCross);
-    Press(*all, kRight);
-    Press(*all, kDown);
-    Shot(*all, "all-software-white");
-    Press(*all, kCircle);
-    Press(*all, kLeft);
-    Shot(*all, "home-white");
-
-    auto retro = home_with(2);
-    Press(*retro, kRight);
-    Shot(*retro, "retro-home");
-    Press(*retro, kDown);
-    Press(*retro, kRight);
-    Press(*retro, kRight);
-    Press(*retro, kRight);
-    Press(*retro, kCross);
-    Shot(*retro, "retro-settings");
-
-    // the user page
-    auto user = home_with(3);
-    Press(*user, kUp);
-    Shot(*user, "user-home");
-    Press(*user, kCross);
-    Shot(*user, "user-page");
+    auto light = home_with(1, 1);
+    Press(*light, kRight);
+    Shot(*light, "light-games");
+    Press(*light, kR1);
+    Shot(*light, "light-library");
+    Press(*light, kL1);
+    Press(*light, kL1);
+    Press(*light, kDown);
+    Press(*light, kDown);
+    Press(*light, kDown);
+    Press(*light, kDown);
+    Press(*light, kRight);
+    Press(*light, kDown);
+    Press(*light, kCross);
+    Press(*light, kCross);
+    Shot(*light, "light-icon-shade");
+    Press(*light, kCircle);
+    Press(*light, kCircle);
+    Press(*light, kUp);
+    Press(*light, kCross);
+    Shot(*light, "light-keyboard");
 
     // the loading screen, in each theme
-    for (int theme = 0; theme < 3; theme++)
+    for (int theme = 0; theme < 2; theme++)
     {
-        auto loading = home_with(theme);
-        for (int i = 0; i < 2; i++)
-            Press(*loading, kRight);
+        auto loading = home_with(2 + theme, theme);
+        Press(*loading, kRight);
         loading->Update(kCross, g_now);
         LoadingScreen screen = loading->Loading();
         screen.lines = {"[    2.114] launch: kernel", "[    2.361] nv2a: xemu's (PGRAPH on its Vulkan renderer)",
-                        "[    2.902] launch: loading /data/xbox-core/games/Moonlit Manor/default.xbe"};
+                        "[    2.902] launch: loading /data/xbox-core/games/Crystal Caverns/default.xbe"};
         Canvas canvas(1920, 1080, 1.5f);
         DrawLoadingScreen(canvas, screen, 1, 0, 0, 1.0);
-        Save(canvas, std::string("loading-") + (theme == 0 ? "black" : theme == 1 ? "white" : "retro"));
-        if (theme == 0)
+        Save(canvas, std::string("loading-") + (theme == 0 ? "dark" : "light"));
+        if (theme == 1)
         {
-            DrawLoadingScreen(canvas, screen, 3, 0, 0, 20.0, true);
+            loading->Update(0, g_now += 0.05);
+            for (int i = 0; i < 2; i++)
+                Press(*loading, kRight); // a game without a cover: its tile in grey
+            loading->Update(kCross, g_now);
+            DrawLoadingScreen(canvas, loading->Loading(), 3, 0, 0, 20.0, true);
             Save(canvas, "loading-failed");
         }
     }

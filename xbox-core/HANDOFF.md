@@ -47,7 +47,7 @@ capture everything.
 
 | what | where |
 |---|---|
-| the emulator | `xbox-core/` (`src/` core, `ps4/` PS4 main and platform, `frontend/` library and HOME menu (New Eden's, `frontend/ui/`), `tests/`) |
+| the emulator | `xbox-core/` (`src/` core, `ps4/` PS4 main and platform, `frontend/` library and HOME menu (a black-and-white dashboard, `frontend/ui/`), `tests/`) |
 | build script | `xbox-core/build.sh host` (desktop, into `~/xc-host`) and `xbox-core/build.sh ps4` (`out/xbox-core.pkg`, build in `~/xc-ps4`) |
 | how it works | `xbox-core/README.md` (component table) |
 | PS4 toolchain setup | `docs/BUILDING.md` (OpenOrbis SDK at `/opt/pacbrew/ps4/openorbis`, sysroot in `~/cemups4-build`) |
